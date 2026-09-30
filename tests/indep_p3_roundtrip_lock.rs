@@ -1,4 +1,4 @@
-//! INDEPENDENT SUITE (2026-09-30) — P3 security items F14-Q1 / F14-Q2 (Sentinel), written from the
+//! INDEPENDENT SUITE — P3 round-trip senior lock repro (58e379f1). Helpers copied verbatim from indep_p3_f14q.rs.
 //! security finding text, not the fix:
 //!   Q1: bound-vault NAV = per-domain NAV with impairment FLOORED at each domain's principal, then
 //!       SUMMED — overstates cover when one domain's impairment > its principal while the other is
@@ -144,7 +144,7 @@ impl P3 {
         let admin = self.env.admin.insecure_clone();
         let (m, r, mint) = (self.env.market, self.registry, self.lp_mint);
         self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: std::env::var("RT_FEE_SHARE").ok().and_then(|v| v.parse().ok()).unwrap_or(0), redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -1370,134 +1370,127 @@ fn lossrule_hlock_only_after_seniors_exhausted() {
     assert!(g2.bankruptcy_hlock_active || g2.loss_stale_active, "RULE: once junior + seniors are exhausted, the bankrupt/h-lock path is reachable");
 }
 
-// ═════════════ C-7 (rehearsal-22, real validator): immediate-Recovery wind-down lock ═════════════
-// Rehearsal shape (hlock-drill.log): vault LP max leverage 5x (tag 99), small junior vs a big
-// senior C, trader opens long vs the LP, then +450 bps pushes with ~524-slot gaps and ONLY the
-// TRADER cranked each time (the keeper does not refresh the LP during the move). The LP's whole
-// loss (> junior) is realised at once by the first LP crank -> the engine goes straight to
-// Recovery (no bankrupt close stays open) -> a stranger crank -> Resolved. Then the documented
-// wind-down (101, tag 8, CloseResolved, 78, 76/77, 102) must pay everyone. On the validator it
-// returned 21/84 everywhere with 12.3B locked. My earlier LiteSVM probe diverged because
-// q1_world cranks the LP after EVERY push (gradual loss -> bankrupt close path, not immediate
-// Recovery). This test reproduces the rehearsal ORDER.
-/// WIP (does not yet reach the rehearsal state: the vault-LP crank never liquidates in LiteSVM).
-#[test]
-#[ignore]
-fn c7_immediate_recovery_winddown_pays_everyone() {
-    // Rehearsal market allows 5x (IM 20%); the default test market is IM 100%.
-    TL_IM.with(|c| c.set(2_000));
+// ═══════════════ ROUND-TRIP SENIOR LOCK (builder report, 58e379f1) ═══════════════
+// Trader LOSES ~6M against the vault LP, closes; then WINS ~16.5M, closes. Fresh marks (keeper
+// push + crank to catch-up) throughout. Then: senior 77, winner ConvertReleasedPnl.
+
+fn rt_set_mark(w: &mut P3, mark: u64, ports: &[Pubkey]) {
+    MARK.with(|c| c.set(mark));
+    w.push(mark);
+    w.catch_up(ports, 40);
+}
+
+fn rt_close(w: &mut P3, t: &Keypair, tp: Pubkey, label: &str) {
+    let lp = w.lp;
+    for _ in 0..10 {
+        let p = w.pos(tp);
+        if p == 0 { break; }
+        let r = w.trade_vs_lp(t, tp, -p);
+        eprintln!("   {label} close {} -> {:?}", p, r.as_ref().map_err(|e| code(e)));
+        w.catch_up(&[tp, lp], 3);
+    }
+}
+
+fn rt_open(w: &mut P3, t: &Keypair, tp: Pubkey, want: i128, label: &str) {
+    let lp = w.lp;
+    for _ in 0..10 {
+        let p = w.pos(tp);
+        if p >= want { break; }
+        let r = w.trade_vs_lp(t, tp, want - p);
+        eprintln!("   {label} open {} -> {:?} pos {}", want - p, r.as_ref().map_err(|e| code(e)), w.pos(tp));
+        w.catch_up(&[tp, lp], 2);
+        if r.is_err() { break; }
+    }
+}
+
+fn rt_dump(w: &P3, label: &str) {
+    let g = w.env.market_state().1;
+    let lp = w.lp_state();
+    let d = w.domains();
+    eprintln!("RT[{label}] C {} | d0 (principal, loss, recov, unavail, phys) {:?} d1 {:?} | buckets {:?} | LP cap {} pnl {} legs {} close_active {} | hlock {} loss_stale {} mode {:?} eff {} tgt {} slot {}",
+        w.c(), d[0], d[1],
+        g.source_backing_buckets.iter().take(2).map(|b| (b.status, b.expiry_slot, b.fresh_unliened_backing_num / percolator::BOUND_SCALE, b.valid_liened_backing_num / percolator::BOUND_SCALE, b.consumed_liened_backing_num / percolator::BOUND_SCALE, b.impaired_liened_backing_num / percolator::BOUND_SCALE)).collect::<Vec<_>>(),
+        lp.capital, lp.pnl, lp.legs.iter().filter(|l| l.active).count(), lp.close_progress.active,
+        g.bankruptcy_hlock_active, g.loss_stale_active, g.mode, g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, g.current_slot);
+}
+
+/// Returns (world, seniors, (trader kp, trader portfolio)) after the round trip.
+fn rt_world() -> (P3, Vec<(Keypair, Pubkey)>, (Keypair, Pubkey)) {
     let mut w = P3::new();
     w.create_vault();
     let s0 = Keypair::new();
-    let a0 = w.earn_deposit_domain(&s0, 10_000_000, false, 0).expect("75 senior");
+    let s1 = Keypair::new();
+    let a0 = w.earn_deposit_domain(&s0, 45_000_000, false, 0).expect("75 senior d0");
+    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 0).expect("75 senior d0 (2nd)");
     let admin = w.env.admin.insecure_clone();
     w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
     let up = w.upgrade.insecure_clone();
-    w.set_risk(&up, 50_000).unwrap_or_else(|e| panic!("99 lev 5x: {e}"));
-    // P1's LP exposure cap also binds (k default = 1e8 / initial_margin_bps = 1x on this test
-    // market); the rehearsal market's IM allows 5x. Tag 93 (upgrade authority) sets k = 5x.
-    {
-        let mut b = vec![93u8];
-        b.extend_from_slice(&0u16.to_le_bytes()); // asset
-        b.extend_from_slice(&0u16.to_le_bytes()); // exec_band_bps (default)
-        b.extend_from_slice(&50_000u32.to_le_bytes()); // lp_exposure_k_bps = 5x
-        b.extend_from_slice(&0u128.to_le_bytes()); // lp_floor
-        b.extend_from_slice(&0u128.to_le_bytes()); // side_oi_cap
-        let metas = vec![AccountMeta::new(up.pubkey(), true), AccountMeta::new_readonly(w.program_data, false), AccountMeta::new(w.env.market, false)];
-        let r = w.send_raw(b, metas, &[&up]);
-        eprintln!("C7 tag 93 k=5x -> {:?}", r.as_ref().map_err(|e| code(e)));
-    }
-    w.junior_deposit(&admin, 300_000).unwrap_or_else(|e| panic!("96: {e}"));
-    let (seed, seedp) = w.trader(500_000); // an unrelated flat trader (rehearsal's seed trader)
-    let (t, tp) = w.trader(2_000_000);
+    w.set_risk(&up, 0).unwrap_or_else(|e| panic!("99: {e}"));
+    w.junior_deposit(&admin, 30_000_000).unwrap_or_else(|e| panic!("96: {e}"));
+    let (t, tp) = w.trader(80_000_000);
     let lp = w.lp;
-    let v0 = w.tok(&w.env.vault) as u128;
-    // Open as large a long as the 5x cap allows (1.5M notional at mark 1.0).
-    // Accumulate up to the 5x cap with repeated fills (each TradeCpi may clip).
-    for _ in 0..12 {
-        let s = w.slot() + 1;
-        w.env.svm.warp_to_slot(s);
-        let _ = w.crank(lp);
-        let _ = w.crank(tp);
-        let r = w.trade_vs_lp(&t, tp, 500_000);
-        if let Err(e) = &r { eprintln!("C7 open fill -> {:?}", code(e)); }
-    }
-    let opened = w.pos(tp);
-    eprintln!("C7 open long vs vault LP: pos {opened}");
-    assert!(opened > 0, "vacuity: long opened");
-    MARK.with(|c| c.set(PRICE));
-    for _ in 0..9 {
-        let m = MARK.with(|c| c.get()) * 10_450 / 10_000;
-        MARK.with(|c| c.set(m));
-        let s = w.slot() + 524;
-        w.env.svm.warp_to_slot(s);
-        w.push(m);
-        let _ = w.crank(tp); // trader only — LP not refreshed during the move
-    }
-    {
-        let g = w.env.market_state().1;
-        let tr = w.env.portfolio_state(tp);
-        eprintln!("C7 after move: eff {} tgt {} | trader pos {} cap {} pnl {}", g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, w.pos(tp), tr.capital, tr.pnl);
-    }
-    for i in 0..12 {
-        let s = w.slot() + 50;
-        w.env.svm.warp_to_slot(s);
-        let r = w.crank(lp);
-        let g = w.env.market_state().1;
-        let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.legs.iter().filter(|l| l.active).count(), p.close_progress.active));
-        eprintln!("C7 crank(LP) #{i} -> {:?}; mode {:?} eff {} tgt {} LP {:?}", r.as_ref().map_err(|e| code(e)), g.mode, g.assets[0].effective_price, g.assets[0].raw_oracle_target_price, lpp);
-        if g.mode != percolator::MarketModeV16::Live || lpp.map_or(false, |x| x.2 == 0) { break; }
-    }
-    let g = w.env.market_state().1;
-    let lpp = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.close_progress.active));
-    eprintln!("C7 after LP crank: mode {:?} LP {:?} hlock {}", g.mode, lpp, g.bankruptcy_hlock_active);
-    // stranger crank(s) while in Recovery
-    for _ in 0..4 {
-        if w.env.market_state().1.mode == percolator::MarketModeV16::Resolved { break; }
-        let s = w.slot() + 1;
-        w.env.svm.warp_to_slot(s);
-        let _ = w.crank(lp);
-    }
-    let mode = w.env.market_state().1.mode;
-    eprintln!("C7 mode after stranger cranks: {mode:?}");
-    // Documented wind-down, in the rehearsal order.
-    let jo = admin.pubkey();
-    let (_, r101) = w.settle_resolved(jo, 0);
-    eprintln!("C7 101 -> {:?}", r101.as_ref().map_err(|e| code(e)));
-    let r8lp = w.close_portfolio_permissionless(lp, w.registry);
-    eprintln!("C7 tag 8 vault LP -> {:?}", r8lp.as_ref().map_err(|e| code(e)));
+    rt_dump(&w, "start");
+    // Phase 1: long 20 @1.00, mark -> 0.70 : trader loses 6M.
+    rt_open(&mut w, &t, tp, 20 * U, "P1");
+    rt_set_mark(&mut w, 700_000, &[tp, lp]);
+    rt_close(&mut w, &t, tp, "P1");
+    let tr = w.env.portfolio_state(tp);
+    eprintln!("RT after loss: trader cap {} pnl {}", tr.capital, tr.pnl);
+    rt_dump(&w, "after loss");
+    // Phase 2: long 30 @0.70, mark -> 1.25 : trader wins 16.5M.
+    rt_open(&mut w, &t, tp, 30 * U, "P2");
+    rt_set_mark(&mut w, 1_250_000, &[tp, lp]);
+    rt_close(&mut w, &t, tp, "P2");
+    let tr = w.env.portfolio_state(tp);
+    eprintln!("RT after win: trader cap {} pnl {}", tr.capital, tr.pnl);
+    rt_dump(&w, "after win");
+    (w, vec![(s0, a0), (s1, a1)], (t, tp))
+}
+
+fn rt_convert(w: &mut P3, t: &Keypair, tp: Pubkey) -> Result<u64, String> {
+    let pnl = w.env.portfolio_state(tp).pnl;
+    let (pid, _, pep) = w.env.portfolio_identity(tp);
     let m = w.env.market;
-    let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
-    let mut paid = |w: &mut P3, k: &Keypair, p: Pubkey| -> u128 {
-        let mut tot = 0u128;
-        for _ in 0..4 {
-            let dest = w.token(k.pubkey(), 0);
-            let _ = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
-                AccountMeta::new_readonly(k.pubkey(), false), AccountMeta::new(m, false), AccountMeta::new(p, false),
-                AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
-                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[]);
-            tot += w.tok(&dest) as u128;
-        }
-        tot
-    };
-    let winner_paid = paid(&mut w, &t, tp);
-    let r8t = w.close_portfolio_permissionless(tp, t.pubkey());
-    let seed_paid = paid(&mut w, &seed, seedp);
-    let r8s = w.close_portfolio_permissionless(seedp, seed.pubkey());
-    eprintln!("C7 winner paid {winner_paid}, tag 8 winner -> {:?}; seed paid {seed_paid}, tag 8 seed -> {:?}", r8t.as_ref().map_err(|e| code(e)), r8s.as_ref().map_err(|e| code(e)));
-    let g = w.env.market_state().1;
-    eprintln!("C7 terminal-flat? materialized {} c_tot {}", g.materialized_portfolio_count, g.c_tot);
-    let r78 = w.crank_fees_78();
-    eprintln!("C7 78 -> {:?}", r78.as_ref().map_err(|e| code(e)));
-    let shares = w.tok(&a0) as u128;
-    let _ = w.request_redeem(&s0, a0, shares);
-    let (d, r77) = w.execute_redeem(&s0, true);
-    let senior_paid = w.tok(&d) as u128;
-    eprintln!("C7 77 -> {:?} senior paid {senior_paid}", r77.as_ref().map_err(|e| code(e)));
-    let junior_paid = w.junior_release_resolved(&admin);
-    let left = w.tok(&w.env.vault) as u128;
-    eprintln!("C7 junior paid {junior_paid}; vault {v0} -> left {left}");
-    assert!(winner_paid > 0, "C-7: winner paid 0 after immediate-Recovery wind-down");
-    assert!(senior_paid > 0, "C-7: seniors paid 0 (77 -> {:?})", r77.as_ref().map_err(|e| code(e)));
-    assert!(left <= 2_000, "C-7: {left} atoms locked after the documented wind-down");
+    w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl.max(1) as u128 },
+        vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[t])
+}
+
+fn rt_senior_77(w: &mut P3, k: &Keypair, ata: Pubkey, shares: u128) -> (Result<u64, String>, Result<u64, String>) {
+    // K1/L2 prefix: tag 78 then a crank of the vault LP, as the doc bundles.
+    let lp = w.lp;
+    let _ = w.crank_fees_78();
+    let _ = w.crank(lp);
+    let rq = w.request_redeem(k, ata, shares);
+    let (_d, ex) = w.execute_redeem(k, true);
+    (rq, ex)
+}
+
+fn logs_of(e: &str) -> String {
+    e.split("\\\"").filter(|l| l.contains("GATE") || l.contains("Program log")).map(|l| l.chars().take(160).collect::<String>()).collect::<Vec<_>>().join(" | ")
+}
+
+#[test]
+#[ignore]
+fn rt_round_trip_then_senior_redeem_and_winner_convert() {
+    let (mut w, seniors, (t, tp)) = rt_world();
+    let lp = w.lp;
+    if std::env::var("RT_NO_CRANK").is_ok() {
+        let s = w.slot() + 30;
+        w.env.svm.warp_to_slot(s);
+        let cv0 = rt_convert(&mut w, &t, tp);
+        eprintln!("RT winner convert WITHOUT a fresh crank (30 slots later) -> {:?}", cv0.as_ref().map_err(|e| code(e)));
+    }
+    let _ = w.crank(lp);
+    let _ = w.crank(tp);
+    let cv = rt_convert(&mut w, &t, tp);
+    eprintln!("RT winner convert -> {:?} {}", cv.as_ref().map_err(|e| code(e)), cv.as_ref().err().map(|e| logs_of(e)).unwrap_or_default());
+    let (k, ata) = (&seniors[1].0, seniors[1].1);
+    let (rq, ex) = rt_senior_77(&mut w, k, ata, 1_000_000);
+    eprintln!("RT senior 77 (1M shares): request {:?} execute {:?}", rq.as_ref().map_err(|e| code(e)), ex.as_ref().map_err(|e| code(e)));
+    if let Err(e) = &ex { eprintln!("RT 77 FULL ERR: {}", &e[e.len().saturating_sub(1500)..]); }
+    rt_dump(&w, "after attempts");
+    let lock = ex.is_err() && cv.is_err();
+    eprintln!("RT LOCK REPRODUCED: {lock}");
+    assert!(ex.is_ok(), "senior 77 must succeed after the round trip: {:?}", ex.as_ref().map_err(|e| code(e)));
+    assert!(cv.is_ok(), "winner convert must succeed: {:?}", cv.as_ref().map_err(|e| code(e)));
 }
