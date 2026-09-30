@@ -29324,7 +29324,10 @@ pub mod processor {
                         let consumed = non_owned0
                             .saturating_add(crys1.saturating_sub(crys0))
                             .saturating_sub(non_owned1);
-                        vlp_claim_payout = consumed.max(claims0).min(payout);
+                        // Security review of 5544302a (LOW): never more than BOTH the measured
+                        // consumption and the claims registered before this settlement. `max`
+                        // labelled vault capital non-owned when the claims realised below claims0.
+                        vlp_claim_payout = consumed.min(claims0).min(payout);
 
                     }
                     vault_lp_refuse_new_bankrupt_close(

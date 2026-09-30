@@ -1015,7 +1015,17 @@ impl World {
         if let (Ok(_), Some(b)) = (&r, before) {
             if b.legs.iter().all(|l| !l.active) && b.pnl > 0 {
                 let paid = self.env.token_amount(dst) as u128;
-                let (ac, ap) = if self.port_alive(u) { let a = self.env.portfolio_state(p); (a.capital, a.pnl.max(0) as u128) } else { (0, 0) };
+                // An open receipt's unpaid remainder is still owed (tag 46 pays it once the rate
+                // rises), so it is HELD, not burned; whatever is still unpaid at the end of the
+                // wind-down is counted as a haircut there.
+                let (ac, ap) = if self.port_alive(u) {
+                    let a = self.env.portfolio_state(p);
+                    let rc = a.resolved_payout_receipt;
+                    let owed = if rc.present && !rc.finalized { rc.terminal_positive_claim_face.saturating_sub(rc.paid_effective) } else { 0 };
+                    (a.capital, a.pnl.max(0) as u128 + owed)
+                } else {
+                    (0, 0)
+                };
                 let before_v = b.capital + b.pnl as u128;
                 let after_v = paid + ac + ap;
                 if before_v > after_v + 2 {
@@ -1490,6 +1500,36 @@ impl World {
         }
         if self.p3.is_some() {
             self.p3_terminal_settle()?;
+            // Keeper/app bundle (decided 2026-10-01): once the vault LP has settled (101), a
+            // permissionless tag-46 sweep finalises every open receipt. A trader who closed before
+            // the vault LP was paid at a rate diluted by the vault LP's not-yet-released claims;
+            // the vault LP's release raises the rate and this sweep pays the remainder.
+            // ANVIL_NO_KEEPER_TOPUP=1 is the negative control (the pre-fix ordering).
+            if std::env::var("ANVIL_NO_KEEPER_TOPUP").map_or(true, |v| v != "1") {
+                for u in 0..=N_USERS {
+                    let open = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()).map_or(false, |p| p.resolved_payout_receipt.present && !p.resolved_payout_receipt.finalized);
+                    if open {
+                        match self.do_claim_topup(u) {
+                            Ok(_) => *self.stats.ok.entry("winddown_topup46_after_101").or_default() += 1,
+                            Err(e) => {
+                                let code = custom_code(&e).map(|c| c.to_string()).unwrap_or_else(|| e.chars().take(40).collect());
+                                *self.stats.err.entry(format!("winddown_topup46_after_101:{code}")).or_default() += 1;
+                            }
+                        }
+                        self.check()?;
+                    }
+                }
+            }
+            for u in 0..=N_USERS {
+                if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                    let rc = pf.resolved_payout_receipt;
+                    if rc.present && !rc.finalized {
+                        let owed = rc.terminal_positive_claim_face.saturating_sub(rc.paid_effective);
+                        *self.stats.soft.entry("close_resolved_haircut_events").or_default() += 1;
+                        *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += owed.min(u64::MAX as u128) as u64;
+                    }
+                }
+            }
         }
         // Earn LP holders redeem everything (76/77 are allowed after resolution per the
         // LP-vault teardown tests).
@@ -4433,4 +4473,77 @@ fn p3_classb_vault_lp_winner_never_haircut_while_junior_paid() {
         assert_eq!(haircuts, 0, "{label}: a winner who faced only the vault LP was haircut");
         assert_eq!(shortfall, 0, "{label}: receipt shortfall");
     }
+}
+
+/// Security review of 5544302a: the reviewer's PoC `sec_g1_postbind_trader_vs_trader_via_vault` at
+/// its own defaults (size 300 x 5 rounds; credit: security reviewer). Seniors are never drawn for
+/// the trader default.
+#[test]
+fn sec_g1_postbind_trader_vs_trader_via_vault() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let (c0, out, haircuts) = g1_bypass_run(300, 5);
+    eprintln!("SECG1 300x5: seniors paid {out} of C {c0}; winner haircut events {haircuts}");
+    assert!(out + 2_000 >= c0, "G-1: seniors drawn for a trader default: paid {out} of {c0}");
+}
+
+/// P3-f SENIORS LOCKED (gate seed eedb6cfded3bc5be) and class-(b) P3-J hits on 5544302a (gate seeds
+/// 0xe96869355e57ea78 plain, 0xcacb2ba7ac0053e7 std, 0x1369782909421d4f std), shrunk. Root cause:
+/// a trader's CloseResolved is paid at `snapshot_residual / all claim bounds`, and the bound includes
+/// the vault LP's own claim, which is pot-backed and released into the residual only when the vault
+/// LP settles (101), after every trader. No value is missing: once 101 has run, a tag-46 top-up pays
+/// every receipt in full and the seniors exit. The negative control (no post-101 sweep) must fail.
+fn diluted_receipt_cases() -> Vec<(&'static str, u64, bool, Vec<Op>)> {
+    vec![
+        ("eedb std fee30", 30, false, vec![Op::Warp { n: 51 }, Op::TradeCpi { u: 109, size_tenths: 11 }, Op::Push { delta_bps: -2058 }, Op::Crank { u: 241 }, Op::Push { delta_bps: 2380 }, Op::P3JuniorWithdraw { frac_bps: 4408 }, Op::Warp { n: 30 }, Op::Crank { u: 192 }, Op::TradeCpi { u: 145, size_tenths: 288 }, Op::TradeCpi { u: 181, size_tenths: -299 }]),
+        ("e968 plain fee0", 0, true, vec![Op::TradeCpi { u: 218, size_tenths: 184 }, Op::TradeCpi { u: 152, size_tenths: 19 }, Op::Push { delta_bps: 1121 }, Op::Warp { n: 41 }, Op::TradeCpi { u: 126, size_tenths: -208 }]),
+        ("cacb std fee5", 5, false, vec![Op::TradeCpi { u: 253, size_tenths: 228 }, Op::Push { delta_bps: 1379 }, Op::Push { delta_bps: -1454 }, Op::Warp { n: 43 }, Op::Crank { u: 181 }, Op::TradeCpi { u: 59, size_tenths: 41 }, Op::Push { delta_bps: 2487 }]),
+        ("1369 std fee0", 0, false, vec![Op::P3JuniorDeposit { amt: 738728 }, Op::TradeCpi { u: 82, size_tenths: 250 }, Op::TradeCpi { u: 143, size_tenths: 60 }, Op::Warp { n: 29 }, Op::LpDeposit { u: 36, amt: 7874550 }, Op::Push { delta_bps: 224 }, Op::TradeCpi { u: 190, size_tenths: -309 }]),
+    ]
+}
+
+fn diluted_receipt_run(fee: u64, plain: bool, ops: &[Op]) -> (Result<(), String>, u64, u128) {
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::remove_var("FUZZ_LP_DOMAINS");
+    std::env::set_var("FUZZ_P3_PRECRANK", if plain { "0" } else { "1" });
+    let mut w = World::new(fee);
+    for op in ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants");
+    }
+    let r = w.wind_down();
+    let st = w.stats.clone();
+    (r, st.soft.get("close_resolved_haircut_atoms").copied().unwrap_or(0), w.shortfall)
+}
+
+#[test]
+fn p3_diluted_receipts_finalise_after_vault_lp_settles() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
+    for (label, fee, plain, ops) in diluted_receipt_cases() {
+        let (r, haircut, shortfall) = diluted_receipt_run(fee, plain, &ops);
+        eprintln!("{label}: wind-down {:?} haircut {haircut} shortfall {shortfall}", r.as_ref().err());
+        r.unwrap_or_else(|e| panic!("{label}: {e}"));
+        assert_eq!(haircut, 0, "{label}: a winner stayed short after the post-101 top-up");
+        assert_eq!(shortfall, 0, "{label}: receipt shortfall");
+    }
+}
+
+/// Negative control: without the post-101 tag-46 sweep (the gate's ordering) the eedb case locks
+/// the seniors (P3-f, materialized 1, 77 -> 21) with its winner 1,340 short. The other three cases
+/// discriminate in the gate harness (deedd0fc World: `anvil_probe_{e968,cacb,1369}`), not in this
+/// @1827c83a World copy, where they pass with or without the sweep.
+#[test]
+fn p3_diluted_receipts_negative_control_without_post_101_topup() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("ANVIL_NO_KEEPER_TOPUP", "1");
+    let mut failed = Vec::new();
+    for (label, fee, plain, ops) in diluted_receipt_cases() {
+        let (r, haircut, _) = diluted_receipt_run(fee, plain, &ops);
+        eprintln!("{label} (no sweep): {:?} haircut {haircut}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()));
+        if r.is_err() || haircut > 2 {
+            failed.push(label);
+        }
+    }
+    std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
+    assert!(failed.contains(&"eedb std fee30"), "control: eedb must fail without the sweep, failed {failed:?}");
 }
