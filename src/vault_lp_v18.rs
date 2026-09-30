@@ -433,10 +433,7 @@ pub fn senior_claim_after_draw(c: u128, deficit: u128, junior_surplus: u128) -> 
 /// The claim 75/76/77 price against: C with any deficit not yet drawn and booked netted out
 /// (== C after that draw is booked), so no depositor or redeemer can trade on the timing.
 pub fn vault_lp_senior_pricing_claim(c: u128, undrawn_deficit: u128, junior_surplus: u128) -> u128 {
-    match senior_claim_after_draw(c, undrawn_deficit, junior_surplus) {
-        Some(v) => v,
-        None => 0,
-    }
+    senior_claim_after_draw(c, undrawn_deficit, junior_surplus).unwrap_or_default()
 }
 
 /// A later vault-LP recovery (value above C) restores the seniors FIRST, up to the outstanding
@@ -546,10 +543,7 @@ pub fn vault_lp_draw_step(s: DrawState, current_deficit: u128) -> (DrawState, u1
     let (junior_cover, senior_draw) =
         vault_lp_draw_move(current_deficit, s.junior_surplus, s.drawable);
     let moved = junior_cover + senior_draw;
-    let new_c = match senior_claim_after_draw(s.senior_claim, moved, s.junior_surplus) {
-        Some(v) => v,
-        None => 0,
-    };
+    let new_c = senior_claim_after_draw(s.senior_claim, moved, s.junior_surplus).unwrap_or_default();
     let senior_loss = s.senior_claim - new_c;
     (
         DrawState {

@@ -26508,15 +26508,6 @@ pub mod processor {
         Err(PercolatorError::VaultLpValuationStale.into())
     }
 
-    /// P3 F-8: the vault's IDLE backing that physically sits in its two pots, in atoms
-    /// (`fresh_unliened_backing_num / BOUND_SCALE`, floored, own + sibling domain).
-    ///
-    /// In a RESOLVED market whose vault LP has settled there are no positions and no liens left,
-    /// so this is exactly what the seniors can be paid from. The backing LEDGERS can lag it:
-    /// a vault-LP win realised against the vault's own pot is booked as a ledger "loss", while
-    /// the counterparty's realised loss lands in the same pot as fresh backing the ledger never
-    /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
-    /// valuation therefore uses the pots, not the ledgers.
     // ── P3 senior draw (loss rule 2026-09-30: junior first, then Earn seniors pro rata via C;
     //    winners are never haircut while senior backing remains) ─────────────────────────────
     //
@@ -26604,7 +26595,7 @@ pub mod processor {
         if asset_index >= group.markets.len() {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let (source_acc, bucket_acc) = if domain % 2 == 0 {
+        let (source_acc, bucket_acc) = if domain.is_multiple_of(2) {
             (
                 &mut group.markets[asset_index].engine.source_credit_long,
                 &mut group.markets[asset_index].engine.backing_long,
@@ -26834,6 +26825,7 @@ pub mod processor {
     /// FAIL-CLOSED post-check: an engine call on the bound vault LP must not have OPENED a
     /// bankrupt close while the vault's pots could still have funded the deficit.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn vault_lp_refuse_new_bankrupt_close(
         program_id: &Pubkey,
         market_key: &Pubkey,
@@ -27160,13 +27152,15 @@ pub mod processor {
             )?
         };
         group.validate_shape().map_err(map_v16_error)?;
-        drop(group);
         drop(market_data);
         if booked || st.senior_draw_outstanding_atoms != rec.outstanding_mirror_atoms {
             state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, st)?;
         }
         Ok(booked)
     }
+
+    /// (asset, vault LP is account_a, close marker before, senior backing exhausted by the draw).
+    type VaultLpTradeDraw = (usize, bool, (bool, u64), bool);
 
     /// Trade-path hook (every single and batch executor): if either side is the bound vault LP,
     /// draw its realised deficit BEFORE the engine trade can realise it into a bankrupt close,
@@ -27182,7 +27176,7 @@ pub mod processor {
         account_b: &mut percolator::PortfolioV16ViewMut<'_>,
         key_a: &Pubkey,
         key_b: &Pubkey,
-    ) -> Result<Option<(usize, bool, (bool, u64), bool)>, ProgramError> {
+    ) -> Result<Option<VaultLpTradeDraw>, ProgramError> {
         let Some(i) = market_bound_vault_asset(group)? else {
             return Ok(None);
         };
@@ -27306,6 +27300,15 @@ pub mod processor {
             < 0
     }
 
+    /// P3 F-8: the vault's IDLE backing that physically sits in its two pots, in atoms
+    /// (`fresh_unliened_backing_num / BOUND_SCALE`, floored, own + sibling domain).
+    ///
+    /// In a RESOLVED market whose vault LP has settled there are no positions and no liens left,
+    /// so this is exactly what the seniors can be paid from. The backing LEDGERS can lag it:
+    /// a vault-LP win realised against the vault's own pot is booked as a ledger "loss", while
+    /// the counterparty's realised loss lands in the same pot as fresh backing the ledger never
+    /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
+    /// valuation therefore uses the pots, not the ledgers.
     /// F14-Q2: the asset a vault LP is bound to on this market, if any (one vault per market).
     fn market_bound_vault_asset(group: &state::MarketViewMutV16<'_>) -> Result<Option<usize>, ProgramError> {
         let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
