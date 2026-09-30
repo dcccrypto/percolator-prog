@@ -1994,6 +1994,12 @@ impl World {
                     seen.push(format!("crank:{:?}", custom_code(&e)));
                 }
             }
+            // P3 mode: the vault LP is not in `ports`; a keeper cranks it too (permissionless).
+            if let Some(lp) = self.p3.as_ref().map(|c| c.lp) {
+                if self.env.svm.get_account(&lp).map_or(false, |a| a.lamports > 0) {
+                    let _ = self.p3_crank_port(lp);
+                }
+            }
             for d in 0..2u16 {
                 if std::env::var("INDEP_NO_EXPIRE").is_err() {
                     let _ = self.do_expire(d);
