@@ -623,6 +623,25 @@ pub fn pinned_matcher_caps(price_e6: u64) -> Option<PinnedMatcherCaps> {
     })
 }
 
+/// P3 Live senior EXIT value (tag 77), priced at the price WORSE for the vault LP (E-1 fix).
+/// `lp_equity_worse` is the vault LP's equity re-valued at the worse of eff / pending target
+/// (`vault_lp_equity_lag_bounds_ro`), `lp_value_at_eff` its value at eff, `nav` the pots' senior
+/// NAV and `c` the claim. A deficit at the worse price is drawn OUT OF THE POTS, junior first:
+///   C' = c - max(0, |worse| - (nav - c)+)            (the booking rule), when worse < 0
+///   V  = nav + min(lp_value_at_eff, worse)  if worse >= 0
+///      = nav - |worse|                      if worse <  0
+///   senior value = min(V, C')
+pub fn live_exit_senior_value(c: u128, nav: u128, lp_value_at_eff: u128, lp_equity_worse: i128) -> u128 {
+    if lp_equity_worse >= 0 {
+        let v = nav.saturating_add(lp_value_at_eff.min(lp_equity_worse as u128));
+        tranche_split(v, c).senior
+    } else {
+        let d = lp_equity_worse.unsigned_abs();
+        let c_p = vault_lp_senior_pricing_claim(c, d, nav.saturating_sub(c));
+        tranche_split(nav.saturating_sub(d), c_p).senior
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -751,5 +770,30 @@ mod tests {
         assert!(junior_withdraw_allowed(70, 0, 0, 70, 1_000));
         assert_eq!(recall_limit(100, 60), 40);
         assert_eq!(recall_limit(100, 160), 0);
+    }
+
+    /// E-1 regression (security delta dfa4559b..3245e861): nav < C and a pending adverse move d
+    /// beyond the vault LP's equity e. The pre-fix handler paid min(nav, C') (800k / 600k).
+    #[test]
+    fn e1_live_exit_senior_value_nav_below_c_deficit_beyond_equity() {
+        let (c, nav, e) = (1_000_000u128, 800_000u128, 200_000u128);
+        // d = 300,000: worse = e - d = -100,000 -> V = 700,000 (true value), C' = C - 100,000.
+        assert_eq!(live_exit_senior_value(c, nav, e, 200_000 - 300_000), 700_000);
+        // d = 600,000: worse = -400,000 -> V = 400,000.
+        assert_eq!(live_exit_senior_value(c, nav, e, 200_000 - 600_000), 400_000);
+        // d <= e: worse >= 0 -> V = nav + worse, no deficit.
+        assert_eq!(live_exit_senior_value(c, nav, e, 200_000 - 150_000), 850_000);
+        assert_eq!(live_exit_senior_value(c, nav, e, 200_000), 1_000_000);
+        // nav >= C (unchanged from ede691b6): C' = C - max(0, |w| - (nav - C)).
+        assert_eq!(live_exit_senior_value(c, 1_200_000, 0, -100_000), 1_000_000);
+        assert_eq!(live_exit_senior_value(c, 1_200_000, 0, -300_000), 900_000);
+        // Negative control: the pre-fix formula (value = min(nav, C') when worse < 0).
+        let prefix = |w: i128| {
+            let d = w.unsigned_abs();
+            let c_p = vault_lp_senior_pricing_claim(c, d, nav.saturating_sub(c));
+            tranche_split(nav, c_p).senior
+        };
+        assert_eq!(prefix(-100_000), 800_000, "the old formula overpays by 100,000");
+        assert_eq!(prefix(-400_000), 600_000, "the old formula overpays by 200,000");
     }
 }

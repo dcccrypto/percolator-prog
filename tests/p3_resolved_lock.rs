@@ -262,6 +262,12 @@ impl World {
         if std::env::var("FUZZ_LPVAULT").map_or(true, |v| v != "0") || p3_mode() {
             w.create_lp_vault();
         }
+        // ANVIL (G-1 regression, the one change to the copied World): ANVIL_PREBIND_NOCPI=<tenths>
+        // opens a trader-vs-trader position u1 long / u2 short BEFORE the vault LP is bound.
+        if let Some(t) = std::env::var("ANVIL_PREBIND_NOCPI").ok().and_then(|v| v.parse::<i128>().ok()) {
+            let q = t * (POS_SCALE as i128 / 10);
+            w.do_trade_nocpi(1, 2, q, INITIAL_MARK).expect("pre-bind trader-vs-trader fill");
+        }
         if p3_mode() {
             w.p3_bind();
         }
@@ -4289,4 +4295,47 @@ fn p3_resolved_cover_is_junior_first_no_senior_c_drop() {
         Op::Warp { n: 52 }, Op::Push { delta_bps: 1849 }, Op::Push { delta_bps: 1713 }, Op::Push { delta_bps: 1790 }];
     let (w, st) = anvil_resolved_exit(30, "0", &ops);
     anvil_assert_full_exit(&w, &st, "junior-first cover");
+}
+
+/// G-1 (owner decision): a winner whose loser is a bankrupt TRADER (a position that predates the
+/// bind) is haircut by the engine at the resolved close, exactly as in Live; the Earn seniors are
+/// NOT drawn for it (C never drops: the World's P3-a invariant runs after every step).
+#[test]
+fn p3_resolved_cover_does_not_backstop_trader_vs_trader_default() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("ANVIL_PREBIND_NOCPI", "1500");
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "0");
+    std::env::set_var("FUZZ_LP_DOMAINS", "0");
+    let mut w = World::new(0);
+    std::env::set_var("ANVIL_PREBIND_NOCPI", "");
+    let c0 = w.p3_c();
+    assert!(w.env.portfolio_state(w.ports[1]).legs.iter().any(|l| l.active), "vacuity: pre-bind position");
+    for d in [2000i32, 2000, 2000, 2000] {
+        let _ = w.apply(&Op::Push { delta_bps: d });
+        let _ = w.apply(&Op::Warp { n: 60 });
+        w.check().expect("invariants");
+    }
+    let r = w.wind_down();
+    let st = w.stats.clone();
+    eprintln!("G1: wind-down {:?}; soft {:?}; C {} -> {}", r.as_ref().err(), st.soft, c0, w.p3_c());
+    r.expect("wind-down completes; seniors never drawn for a trader default");
+    let c = w.p3.as_ref().unwrap();
+    eprintln!("G1: seniors in {} out {}", c.senior_in, c.senior_out);
+    assert!(st.soft.get("close_resolved_haircut_events").copied().unwrap_or(0) >= 1, "vacuity: the trader default haircut the winner (engine rule)");
+    assert!(c.senior_out + 2_000 >= c0, "G-1: Earn seniors were drawn for a trader default: paid {} of C {c0}", c.senior_out);
+}
+
+#[test]
+#[ignore]
+fn anvil_probe_nocpi_in_p3() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "0");
+    std::env::set_var("FUZZ_LP_DOMAINS", "0");
+    let mut w = World::new(0);
+    let q = 1_000i128 * (POS_SCALE as i128 / 10);
+    let r = w.do_trade_nocpi(1, 2, q, INITIAL_MARK);
+    eprintln!("NOCPI -> {:?}", r.as_ref().map_err(|e| e.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>()));
+    eprintln!("pos u1 {:?}", w.env.portfolio_state(w.ports[1]).legs.iter().filter(|l| l.active).map(|l| l.basis_pos_q).collect::<Vec<_>>());
 }

@@ -416,6 +416,13 @@ pub mod constants {
     /// (77, 102, the senior draw, rebalances). Loss backing the ENGINE routes into a pot for
     /// winners who have not been touched yet is NOT counted: the senior draw may only take
     /// vault-owned atoms (C-7 exhausted / single-pot race: winners were short 8,511 / 8,699).
+    /// P3 (G-1, 2026-09-30): 1 byte at [672, 673) of the asset wrapper slot, set by tag 94 when
+    /// the asset already had open interest at bind (positions that predate the vault LP, so
+    /// trader-vs-trader). After a bind every risk-increasing fill must face the vault LP (77
+    /// VaultLpExclusiveCounterparty), so with the flag clear every winner's counterparty is the
+    /// vault LP. Zero spare headroom (P1 risk limits end at 672): NO LAYOUT CHANGE.
+    pub const ASSET_VAULT_PREBIND_OI_OFF: usize = 672;
+    const _: () = assert!(ASSET_VAULT_PREBIND_OI_OFF >= 672 && ASSET_VAULT_PREBIND_OI_OFF < 800);
     pub const ASSET_VAULT_POT_OWNED_OFF: usize = 800;
     pub const ASSET_VAULT_POT_OWNED_LEN: usize = 32;
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF + ASSET_VAULT_POT_OWNED_LEN == 832);
@@ -25282,29 +25289,19 @@ pub mod processor {
                 } else {
                     with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?.0
                 };
-                let senior_claim = if lp_equity_worse < 0 {
-                    vault_lp_v18::vault_lp_senior_pricing_claim(
-                        senior_claim,
-                        lp_equity_worse.unsigned_abs(),
-                        nav.saturating_sub(senior_claim),
-                    )
-                } else {
-                    senior_claim
-                };
                 let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
                 let senior_value = if resolved {
                     vault_lp_v18::tranche_split(physical, senior_claim).senior
-                } else if nav >= senior_claim {
-                    senior_claim
                 } else {
-                    // P3 fairness: the vault LP's value at the price worse for it.
-                    let lp_value =
+                    // P3 fairness (E-1, security delta dfa4559b..3245e861): value the vault at the
+                    // price worse for it, ALWAYS (no `nav >= C` shortcut); a deficit at that price
+                    // is drawn out of the pots (`vault_lp_v18::live_exit_senior_value`).
+                    let lp_value_at_eff = if lp_equity_worse >= 0 {
                         with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?
-                            .min(lp_equity_worse.max(0) as u128);
-                    let v = nav
-                        .checked_add(lp_value)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                    vault_lp_v18::tranche_split(v, senior_claim).senior
+                    } else {
+                        0
+                    };
+                    vault_lp_v18::live_exit_senior_value(senior_claim, nav, lp_value_at_eff, lp_equity_worse)
                 };
                 let atoms = vault_lp_v18::senior_atoms_for_redemption(
                     redemption.shares,
@@ -26964,6 +26961,14 @@ pub mod processor {
         let Some(a) = market_bound_vault_asset(group)? else {
             return Ok(0);
         };
+        // G-1 (owner decision): Earn seniors back the VAULT LP only; they are not insurance for
+        // trader-vs-trader defaults (the Live path haircuts those winners through the engine,
+        // Resolved must match). The cover therefore runs only when every position on the bound
+        // asset faces the vault LP: no open interest predated the bind (after the bind every
+        // risk-increasing fill must face the vault LP, 77 VaultLpExclusiveCounterparty).
+        if group.markets[a].wrapper[crate::constants::ASSET_VAULT_PREBIND_OI_OFF] != 0 {
+            return Ok(0);
+        }
         {
             let saved_header: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*group.header).to_vec();
             let saved_markets: alloc::vec::Vec<u8> = bytemuck::cast_slice::<_, u8>(&*group.markets).to_vec();
@@ -27985,8 +27990,12 @@ pub mod processor {
             if d == target {
                 vault_pot_owned_adjust(group, d, x, true)?;
             } else {
-                vault_pot_principal_decrement(group, d, x)?; // vault -x, owned(d) -x (saturating)
-                vault_pot_owned_adjust(group, d, x, true)?; // the stray was never owned there
+                // F-1: the stray was never owned there; restore exactly what the saturating
+                // decrement took from owned(d), never more.
+                let owned_before = vault_pot_owned(group, d)?;
+                vault_pot_principal_decrement(group, d, x)?; // vault -x, owned(d) -min(owned, x)
+                let owned_after = vault_pot_owned(group, d)?;
+                vault_pot_owned_adjust(group, d, owned_before - owned_after, true)?;
                 group.header.vault = percolator::V16PodU128::new(
                     group
                         .header
@@ -28297,6 +28306,13 @@ pub mod processor {
 
             rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
+            {
+                // G-1: remember whether positions that predate the vault LP exist on this asset.
+                let asset = &group.markets[asset_index].engine.asset;
+                let prebind_oi = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
+                group.markets[asset_index].wrapper[crate::constants::ASSET_VAULT_PREBIND_OI_OFF] =
+                    prebind_oi as u8;
+            }
             rec.lp_net_q = 0;
             rec.lp_net_slot = last_fee_slot;
             // Auto-pin: canonical matcher approved; 1x exposure default (0 => 10_000 bps).

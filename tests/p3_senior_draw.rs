@@ -1985,3 +1985,154 @@ fn p3_valve_fires_only_after_senior_backing_is_exhausted() {
     assert!(left <= 2_000, "stranded {left}");
 }
 
+
+// ── D-1 directed test (security delta dfa4559b..3245e861) ──────────────────────────────────────
+/// Two longs W (never touched until the end) and W2 against the vault LP; seniors 5M in each pot,
+/// junior 300k. Move 1 (+10%): the vault LP's settled loss lands in a pot as backing for BOTH
+/// winners (neither registered). `convert_first_order`:
+///   * `false` (reviewer's order): W's backing lands, THEN W2 registers and converts (consuming
+///     its own loss backing -> provider_receivable rises, owned unchanged), THEN a deficit move and
+///     the senior draw.
+///   * `true`: W2 converts gains whose counterparty loss has NOT landed yet (the vault LP is
+///     un-refreshed), i.e. W2 borrows senior principal, then the draw.
+/// Assert: W is paid capital + its full pnl at the resolved close.
+fn d1_run(convert_before_lp_refresh: bool, w2_converts: bool) -> (u128, u128) {
+    TL_IM.with(|c| c.set(2_000));
+    let mut w = P3::new();
+    w.create_vault();
+    let s0 = Keypair::new();
+    let _a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).expect("75 d0");
+    let s1 = Keypair::new();
+    let _a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap_or_else(|e| panic!("99: {e}"));
+    {
+        let mut b = vec![93u8];
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&50_000u32.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        let metas = vec![AccountMeta::new(up.pubkey(), true), AccountMeta::new_readonly(w.program_data, false), AccountMeta::new(w.env.market, false)];
+        w.send_raw(b, metas, &[&up]).expect("93");
+    }
+    w.junior_deposit(&admin, 300_000).unwrap_or_else(|e| panic!("96: {e}"));
+    let (wt, wp) = w.trader(2_000_000);
+    let (w2t, w2p) = w.trader(2_000_000);
+    let lp = w.lp;
+    for (t, p) in [(&wt, wp), (&w2t, w2p)] {
+        for _ in 0..4 {
+            let s = w.slot() + 1;
+            w.env.svm.warp_to_slot(s);
+            let _ = w.crank(lp);
+            let _ = w.crank(p);
+            let _ = w.trade_vs_lp(t, p, 300_000);
+        }
+    }
+    assert!(w.pos(wp) > 0 && w.pos(w2p) > 0, "vacuity: both longs open");
+    let m = w.env.market;
+    let convert = |w: &mut P3, k: &Keypair, p: Pubkey| {
+        let _ = w.crank(p);
+        let pnl = w.env.portfolio_state(p).pnl;
+        if pnl > 0 {
+            let (pid, _, pep) = w.env.portfolio_identity(p);
+            let r = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+                vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false)], &[k]);
+            eprintln!("D1 W2 convert {pnl} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        }
+    };
+    // A dummy portfolio advances the market clock without touching W, W2 or the vault LP.
+    let (_dk, dp) = w.trader(1_000);
+    let (w2t, w2p) = (w2t, w2p);
+    let step = |w: &mut P3, mark: u64| {
+        MARK.with(|c| c.set(mark));
+        let s = w.slot() + 524;
+        w.env.svm.warp_to_slot(s);
+        w.push(mark);
+        for _ in 0..40 { let _ = w.crank(dp); }
+    };
+    let dump = |w: &P3, label: &str| {
+        let g = w.env.market_state().1;
+        let bs = percolator::BOUND_SCALE;
+        let l = w.env.portfolio_state(w.lp);
+        eprintln!("D1[{label}] pots {:?} pcb {:?} recv {:?} | LP cap {} pnl {} | drawn {}", g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num / bs, b.consumed_liened_backing_num / bs)).collect::<Vec<_>>(),
+            g.source_credit.iter().take(2).map(|c| c.positive_claim_bound_num / bs).collect::<Vec<_>>(), g.source_credit.iter().take(2).map(|c| c.provider_receivable_num / bs).collect::<Vec<_>>(), l.capital, l.pnl, drawn(w));
+    };
+    let mut mark = PRICE;
+    // Move 1 (+~10%, inside the junior): then a bound Earn deposit runs the draw hook's refresh on
+    // the vault LP, so its settled loss LANDS in its side's pot as backing for W and W2, both
+    // still untouched (unregistered claims).
+    for _ in 0..2 { mark = mark * 10_450 / 10_000; step(&mut w, mark); }
+    if !convert_before_lp_refresh {
+        let x = Keypair::new();
+        let r = w.earn_deposit_domain(&x, 1_000, true, 0);
+        eprintln!("D1 refresh via bound 75 -> {:?}", r.as_ref().map_err(|e| code(e)));
+    }
+    dump(&w, "after move 1");
+    // Move 2 (more gain, vault LP NOT refreshed): W2 registers and converts everything, so part
+    // of what it consumes is backing whose counterparty loss has not landed (senior principal).
+    for _ in 0..2 { mark = mark * 10_450 / 10_000; step(&mut w, mark); }
+    let _ = w.crank(w2p); // register W2's claim, close its position, let the profit mature
+    for _ in 0..4 {
+        let q = w.pos(w2p);
+        if q == 0 { break; }
+        let r = w.trade_vs_lp(&w2t, w2p, -q.min(300_000));
+        if r.is_err() { eprintln!("D1 W2 close -> {:?}", r.as_ref().map_err(|e| code(e))); let _ = w.crank(w2p); }
+    }
+    for _ in 0..6 { step(&mut w, mark); let _ = w.crank(w2p); }
+    if w2_converts { convert(&mut w, &w2t, w2p); }
+    dump(&w, "after W2 convert");
+    // Move 3: past the junior; the vault LP's crank runs the senior draw.
+    for _ in 0..6 { mark = mark * 10_450 / 10_000; step(&mut w, mark); }
+    for _ in 0..6 { let _ = w.crank(lp); }
+    dump(&w, "after draw");
+    let g = w.env.market_state().1;
+    let bs = percolator::BOUND_SCALE;
+    eprintln!("D1 before resolve: pots {:?} drawn {}", g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num / bs, b.consumed_liened_backing_num / bs)).collect::<Vec<_>>(), drawn(&w));
+    let s = w.slot() + 1;
+    w.env.svm.warp_to_slot(s);
+    w.push(mark);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    assert_eq!(w.env.market_state().1.mode, percolator::MarketModeV16::Resolved);
+    let jo = admin.pubkey();
+    for _ in 0..20 {
+        let l = w.env.portfolio_state(lp);
+        if l.pnl >= 0 && l.legs.iter().all(|x| !x.active) { break; }
+        let _ = w.settle_resolved(jo, 0);
+    }
+    let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+    let mut owed = 0u128;
+    let mut paid = 0u128;
+    for round in 0..40 {
+        let st = w.env.portfolio_state(wp);
+        if round == 0 || owed == 0 { owed = st.capital + st.pnl.max(0) as u128; }
+        if st.capital == 0 && st.pnl == 0 && st.legs.iter().all(|x| !x.active) { break; }
+        let dest = w.token(wt.pubkey(), 0);
+        let rc = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+            AccountMeta::new_readonly(wt.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(wp, false),
+            AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[&wt]);
+        if round < 3 { eprintln!("D1 W CloseResolved #{round} -> {:?}", rc.as_ref().map_err(|e| code(e))); }
+        paid += w.tok(&dest) as u128;
+        let after = w.env.portfolio_state(wp);
+        if after.pnl > 0 || after.capital > 0 { owed = owed.max(after.capital + after.pnl.max(0) as u128 + paid); }
+        let _ = w.settle_resolved(jo, 0);
+    }
+    eprintln!("D1 (convert_before_lp_refresh={convert_before_lp_refresh}): W owed {owed} paid {paid}; drawn {}", drawn(&w));
+    (owed, paid)
+}
+
+/// Assert: W's resolved payout with W2's conversion equals the null control where W2 never
+/// converts (W's own claim is identical in both runs), in both orders.
+#[test]
+fn p3_d1_untouched_winner_paid_in_full_after_registered_winner_converts() {
+    for order in [false, true] {
+        let (_, paid) = d1_run(order, true);
+        let (_, null) = d1_run(order, false);
+        eprintln!("D1 order convert_before_lp_refresh={order}: W paid {paid} (null control {null})");
+        assert!(null > 2_000_000, "vacuity: W had a profit");
+        assert!(paid + 2 >= null, "D-1 (convert_before_lp_refresh={order}): untouched winner W paid {paid} < null {null}");
+    }
+}
