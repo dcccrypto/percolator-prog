@@ -15373,9 +15373,12 @@ pub mod processor {
         lp_account_id: u64,
         // (asset_index, oracle_price_e6, signed req_size) per leg
         legs: &[(u16, u64, i128)],
+        // F-10: one 24-byte P1/P2 call extension per leg (18+26n+24n wire), or `None` for the
+        // legacy 18+26n call. Same bytes the single TradeCpi route sends.
+        exts: Option<&[[u8; 24]]>,
         seeds: &[&[u8]],
     ) -> ProgramResult {
-        let mut data = Vec::with_capacity(18 + legs.len() * 26);
+        let mut data = Vec::with_capacity(18 + legs.len() * 50);
         data.push(3u8);
         data.push(legs.len() as u8);
         data.extend_from_slice(&req_id.to_le_bytes());
@@ -15384,6 +15387,14 @@ pub mod processor {
             data.extend_from_slice(&asset_index.to_le_bytes());
             data.extend_from_slice(&oracle_price_e6.to_le_bytes());
             data.extend_from_slice(&req_size.to_le_bytes());
+        }
+        if let Some(exts) = exts {
+            if exts.len() != legs.len() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            for e in exts {
+                data.extend_from_slice(e);
+            }
         }
         let mut metas = Vec::with_capacity(2 + tail.len());
         metas.push(AccountMeta::new_readonly(*matcher_delegate.key, true));
@@ -15492,7 +15503,7 @@ pub mod processor {
         // freezes non-base legs too and a hostile matcher is never invoked once the market has
         // matured stale (previously this preflight had NO staleness gate at all; staleness was
         // only caught after the CPI returned, inside handle_batch_execute_zero_copy).
-        let (mode_pre, oracle_prices, stale_matured, trade_fee_base_bps_pre) = {
+        let (mode_pre, oracle_prices, stale_matured, trade_fee_base_bps_pre, leg_mark_slots) = {
             let market_data = market_ai.try_borrow_data()?;
             let (cfg_pre, mode_pre, current_slot_pre, oracle_prices, market_ids) =
                 state::read_asset_effective_prices(&market_data, &asset_indices)?;
@@ -15517,11 +15528,20 @@ pub mod processor {
                     break;
                 }
             }
+            // F-10: each leg's authenticated mark slot, for the per-leg P2 call extension.
+            let mut leg_mark_slots: Vec<u64> = Vec::with_capacity(legs.len());
+            for leg in legs {
+                leg_mark_slots.push(
+                    read_oracle_profile_for_asset(&market_data, &cfg_pre, leg.asset_index as usize)?
+                        .last_good_oracle_slot,
+                );
+            }
             (
                 mode_pre,
                 oracle_prices,
                 stale_matured,
                 cfg_pre.trade_fee_base_bps,
+                leg_mark_slots,
             )
         };
         if mode_pre != MarketModeV16::Live {
@@ -15624,6 +15644,32 @@ pub mod processor {
             max_market_slots_pre,
             &cpi_requests,
         )?;
+        // F-10: behavioural parity with TradeCpi. When ANY leg's asset has the P2 call
+        // extension on, every leg carries its 24-byte extension (a mode-0 leg gets the all-zero
+        // version-0 block), so the matcher applies MARK_SLOT (stale-mark refusal of opening
+        // legs), EXEC_BAND and TAKER_REDUCING per leg exactly as on the single route. HEADROOM
+        // is the leg's own |size|: a batch is atomic (no clip) and the wrapper's post-fill cap
+        // check still names 68. The fee-request channel is not offered on the batch route.
+        let batch_exts: Option<Vec<[u8; 24]>> =
+            if p1_pre.iter().any(|l| l.matcher_ext_mode == state::MATCHER_EXT_MODE_V1) {
+                Some(
+                    legs.iter()
+                        .enumerate()
+                        .map(|(i, leg)| {
+                            risk_limits_v17::encode_matcher_call_ext(
+                                p1_pre[i].matcher_ext_mode,
+                                leg_mark_slots[i],
+                                leg.size_q.unsigned_abs(),
+                                p1_pre[i].band_bps,
+                                p1_pre[i].taker_reducing,
+                                false,
+                            )
+                        })
+                        .collect(),
+                )
+            } else {
+                None
+            };
 
         invoke_matcher_batch(
             matcher_prog,
@@ -15633,6 +15679,7 @@ pub mod processor {
             req_id,
             lp_account_id,
             &matcher_legs,
+            batch_exts.as_deref(),
             &[
                 b"matcher",
                 market_ai.key.as_ref(),

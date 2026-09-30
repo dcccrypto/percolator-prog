@@ -671,6 +671,52 @@ impl Env {
         )
     }
 
+    /// BatchTradeCpi (single asset 0 legs), taker-signed base fee per leg.
+    fn batch_cpi(
+        &mut self,
+        taker: &Keypair,
+        taker_account: Pubkey,
+        lp: &Lp,
+        sizes: &[i128],
+    ) -> Result<u64, String> {
+        let (a_id, _, a_epoch) = self.identity(taker_account);
+        let (b_id, b_seq, b_epoch) = self.identity(lp.account);
+        let market_id = self.market_id();
+        let (mp, market) = (self.matcher_program, self.market);
+        let legs = sizes
+            .iter()
+            .map(|s| percolator_prog::ix::BatchTradeCpiLeg {
+                asset_index: 0,
+                market_id,
+                size_q: *s,
+                fee_bps: BASE_BPS,
+                limit_price: 0,
+            })
+            .collect();
+        self.send(
+            ProgInstruction::BatchTradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_epoch,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_epoch,
+                account_b_matcher_sequence: b_seq,
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(lp.account, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new(lp.ctx, false),
+                AccountMeta::new_readonly(lp.delegate, false),
+            ],
+            &[taker],
+        )
+    }
+
     /// Tag 93 SetAssetRiskLimits (upgrade-authority signed): band, P2 ext mode, fee max.
     fn set_limits(&mut self, exec_band_bps: u16, matcher_ext_mode: u8, max_requested_fee_bps: u16) {
         let ua = self.upgrade_authority.insecure_clone();
@@ -1288,4 +1334,45 @@ fn p2_legacy_mode0_trades_against_p2_and_deployed_v1_matcher() {
         matches!(&r, Err(e) if e.contains("InstructionError(2, InvalidInstructionData)")),
         "v1 matcher rejects non-zero call bytes 43..67: {r:?}"
     );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// F-10: BatchTradeCpi sends the SAME P1/P2 call extension as TradeCpi (it sent legacy bytes,
+//       so a batch filled an opening leg through a stale mark). Mirror of test 5.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+#[test]
+fn p3_f10_batch_stale_mark_refuses_open_allows_taker_reducing_close() {
+    let m = MatcherParams {
+        kind: 2,
+        trading_fee_bps: 0,
+        base_spread_bps: 0,
+        max_total_bps: 100,
+        impact_k_bps: 0,
+        liquidity_notional_e6: 0,
+    };
+    let (mut env, taker_a, a, lp) = setup(p2_matcher_path(), PRICE_ONE, BASE_BPS, m);
+    let taker_b = Keypair::new();
+    let b = env.portfolio(&taker_b, 1_000_000_000);
+    env.set_limits(0, 1, 0);
+    // Fresh mark: batches fill; the CU of a single-leg batch with the extension is recorded.
+    let cu = env.batch_cpi(&taker_a, a, &lp, &[5 * Q]).expect("fresh batch open (A long 5)");
+    println!("F-10: single-leg BatchTradeCpi with ext: {cu} CU");
+    assert!(cu < 400_000, "batch CU {cu}");
+    env.batch_cpi(&taker_b, b, &lp, &[-10 * Q]).expect("fresh batch open (B short 10)");
+    assert_eq!(env.pos(lp.account), 5 * Q, "LP long 5");
+    // Age the mark past the P2 ctx's 150-slot max age.
+    let mark_slot = env.last_good_oracle_slot();
+    let mut clock = env.svm.get_sysvar::<Clock>();
+    clock.slot = mark_slot + 1_000;
+    env.svm.set_sysvar::<Clock>(&clock);
+    // B opens more short via a BATCH: not taker-reducing -> the matcher refuses (stale mark).
+    let keys = [env.market, a, b, lp.account, lp.ctx];
+    let before = env.snapshot(&keys);
+    let r = env.batch_cpi(&taker_b, b, &lp, &[-Q]);
+    println!("stale batch B open: {r:?}");
+    assert_err_code(&r, ERR_STALE_MARK, "stale mark: a batch open is refused like TradeCpi");
+    assert_eq!(env.snapshot(&keys), before, "refused batch mutates nothing");
+    // A closes via a BATCH: reduce-only for A -> TAKER_REDUCING -> fills under the stale mark.
+    env.batch_cpi(&taker_a, a, &lp, &[-5 * Q]).expect("stale mark: TAKER_REDUCING batch close fills");
+    assert_eq!(env.pos(a), 0, "A is flat");
 }
