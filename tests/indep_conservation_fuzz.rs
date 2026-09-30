@@ -3327,6 +3327,16 @@ impl World {
 
     /// 102 VaultLpReleaseSurplus (junior owner). `resolved` adds the SPL payout tail.
     fn p3_release(&mut self, amt: u128, resolved: bool) -> Result<u64, String> {
+        // FUZZ_LP_DOMAINS=2: the junior surplus can sit in either pot; try pot 0, then pot 1.
+        let r = self.p3_release_domain(amt, resolved, 0);
+        if r.is_err() && std::env::var("FUZZ_LP_DOMAINS").map_or(false, |v| v == "2") {
+            let r1 = self.p3_release_domain(amt, resolved, 1);
+            if r1.is_ok() { return r1; }
+        }
+        r
+    }
+
+    fn p3_release_domain(&mut self, amt: u128, resolved: bool, domain: u16) -> Result<u64, String> {
         let Some(c) = self.p3.as_ref() else { return Err("not p3".into()) };
         let (jr, st, lp) = (c.junior.insecure_clone(), c.state_pda, c.lp);
         let (reg, _, _) = self.lp_vault.unwrap();
@@ -3352,7 +3362,7 @@ impl World {
             ]);
         }
         let mut b = amt.to_le_bytes().to_vec();
-        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&domain.to_le_bytes());
         self.p3_send_raw(p3_raw(102, &b), metas, &[&jr])
     }
 
@@ -3526,7 +3536,8 @@ impl World {
                     let _ = &closes;
                     if std::env::var("FUZZ_DEBUG_P3").is_ok() { eprintln!("  P3F closes {:?}", closes); }
                     let alive: Vec<String> = (0..=N_USERS).filter(|&u| self.port_alive(u)).map(|u| { let x = self.env.portfolio_state(self.ports[u]); format!("u{u}(cap {} pnl {} legs {} close {})", x.capital, x.pnl, x.legs.iter().filter(|l| l.active).count(), x.close_progress.active) }).collect();
-                    return Err(format!("{tag}: {} senior shares outstanding after Resolve; LP fee leg harvestable {h}; last execute error {why}; C {}; materialized {} c_tot {}; alive {:?}", r.total_lp_shares_outstanding - floor, self.p3_c(), g.materialized_portfolio_count, g.c_tot, alive));
+                    let vlp = self.p3.as_ref().map(|c| c.lp).and_then(|k| self.env.svm.get_account(&k).filter(|a| a.lamports > 0).map(|_| { let x = self.env.portfolio_state(k); format!("vaultLP(cap {} pnl {} legs {} close {})", x.capital, x.pnl, x.legs.iter().filter(|l| l.active).count(), x.close_progress.active) })).unwrap_or_else(|| "vaultLP GONE".into());
+                    return Err(format!("{tag}: {} senior shares outstanding after Resolve; LP fee leg harvestable {h}; last execute error {why}; C {}; materialized {} c_tot {} neg {} blockers {} snapshot {}; alive {:?} {vlp}", r.total_lp_shares_outstanding - floor, self.p3_c(), g.materialized_portfolio_count, g.c_tot, g.negative_pnl_account_count, g.resolved_payout_blocker_count, g.payout_snapshot_captured, alive));
                 }
             }
         }
