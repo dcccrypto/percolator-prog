@@ -122,8 +122,12 @@ fn wrapper_bytes(which: Bytes) -> Vec<u8> {
 }
 
 fn matcher_bytes() -> Vec<u8> {
-    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    p.push("../percolator-match/target/deploy/percolator_match.so");
+    // CI dumps the live matcher bytes and passes them here (as for the P1 fork suite).
+    let p = std::env::var_os("P1_FORK_MATCHER_SO").map(PathBuf::from).unwrap_or_else(|| {
+        let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        p.push("../percolator-match/target/deploy/percolator_match.so");
+        p
+    });
     let b = std::fs::read(&p).unwrap_or_else(|e| panic!("read matcher .so {}: {e}", p.display()));
     assert_eq!(sha256_hex(&b), MATCHER_SO_SHA256, "matcher .so is not deployed 12bd671");
     b

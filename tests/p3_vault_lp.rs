@@ -2390,9 +2390,15 @@ fn p3_init_vault_lp_protocol_path_names_a_signing_junior() {
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
 fn p2_matcher_so() -> PathBuf {
-    std::env::var("P2_MATCHER_SO")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("/Users/khubair/wt-p3-wrapper/out/p2-matcher-4a0f696.so"))
+    // Same resolution as tests/p1_fee_channel.rs: env, else the CI sibling checkout.
+    if let Some(p) = std::env::var_os("P2_MATCHER_SO") {
+        return PathBuf::from(p);
+    }
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.pop();
+    p.push("percolator-match-p2/target/deploy/percolator_match.so");
+    assert!(p.exists(), "P2 matcher BPF not found at {p:?} (set P2_MATCHER_SO)");
+    p
 }
 
 impl Env {
