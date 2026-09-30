@@ -64,7 +64,9 @@ fn kani_design_p3_00s_mul_div_floor_u8() {
     }
     let p = a as u128 * b as u128;
     let q = r.unwrap();
-    assert!(q * d as u128 <= p && p - q * d as u128 < d as u128);
+    let dd = d as u128;
+    let qd = q * dd;
+    assert!(qd <= p && p - qd < dd);
     kani::cover!(q > 0 && p % d as u128 != 0, "non-exact floor");
 }
 
