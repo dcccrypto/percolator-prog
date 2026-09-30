@@ -2828,3 +2828,62 @@ fn c7_assert_conservation(o: &C7Out) {
     assert!(pots <= 1_000, "pots hold {pots} > the 1,000 dead shares' value after every senior exited");
     assert!(ins >= proto + creator, "insurance {ins} < protocol {proto} + creator {creator} legs it carries");
 }
+
+/// F-NEW probe (relaunch params = TRUMP seed): how long does counterparty backing created by a
+/// trader's loss stay Fresh, and can a winner who does not convert lose support at the lapse?
+/// Prints bucket expiry vs slot through the life of a claim; ends with the winner converting.
+#[test]
+#[ignore]
+fn fnew_backing_lifetime_probe() {
+    TL_IM.with(|c| c.set(1_000));
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    let mut w = P3::new();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    w.create_vault();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 0).unwrap();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 1).unwrap();
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap();
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap();
+    w.junior_deposit(&admin, 300_000).unwrap();
+    let (loser, lpo) = w.trader(2_000_000);
+    let (winner, wpo) = w.trader(2_000_000);
+    let lp = w.lp;
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); let _ = w.crank(lp);
+    let _ = w.trade_vs_lp_fee(&loser, lpo, 1_000_000, 30);   // long (loses on a drop)
+    let _ = w.trade_vs_lp_fee(&winner, wpo, -600_000, 30);   // short (wins on a drop)
+    let dump = |w: &P3, label: &str| {
+        let g = w.env.market_state().1;
+        let bs = percolator::BOUND_SCALE;
+        let b: Vec<String> = (0..2).map(|d| { let b = &g.source_backing_buckets[d]; format!("d{d} {:?} fresh {} expiry {} (in {} slots)", b.status, b.fresh_unliened_backing_num / bs, b.expiry_slot, b.expiry_slot as i128 - w.slot() as i128) }).collect();
+        let x = w.env.portfolio_state(wpo);
+        eprintln!("FNEW[{label}] slot {} | {} | winner cap {} pnl {} claim {:?} | sc rate {:?}", w.slot(), b.join(" | "), x.capital, x.pnl, x.source_claim_bound_num.iter().map(|v| v / bs).collect::<Vec<_>>(), g.source_credit.iter().take(2).map(|c| c.credit_rate_num).collect::<Vec<_>>());
+    };
+    dump(&w, "open");
+    MARK.with(|c| c.set(PRICE * 80 / 100));
+    for _ in 0..60 { let s = w.slot() + 500; w.env.svm.warp_to_slot(s); w.push(PRICE * 80 / 100); let _ = w.crank(lpo); let _ = w.crank(wpo); let _ = w.crank(lp); }
+    let _ = w.trade_vs_lp_fee(&loser, lpo, -w.pos(lpo), 30);
+    let _ = w.trade_vs_lp_fee(&winner, wpo, -w.pos(wpo), 30);
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lpo); let _ = w.crank(wpo); let _ = w.crank(lp); }
+    dump(&w, "after the drop, both flat");
+    // Keeper-style life: a fresh push + crank every 25 slots (~10 s) for H slots, winner not converting.
+    let horizon: u64 = std::env::var("FNEW_WAIT").ok().and_then(|v| v.parse().ok()).unwrap_or(120_000);
+    let m = w.env.market;
+    let mut t = 0u64;
+    while t < horizon {
+        let step = 2_000; t += step;
+        let s = w.slot() + step; w.env.svm.warp_to_slot(s); w.push(PRICE * 80 / 100); let _ = w.crank(wpo); let _ = w.crank(lp);
+        for d in 0..2u16 { let _ = w.send(ProgInstruction::ExpireBackingBucket { domain: d }, vec![AccountMeta::new(m, false)], &[]); }
+        if t % 20_000 == 0 { dump(&w, &format!("+{t} slots, 89 attempted")); }
+    }
+    let pnl = w.env.portfolio_state(wpo).pnl;
+    let cap0 = w.env.portfolio_state(wpo).capital;
+    if pnl > 0 {
+        let (pid, _, pep) = w.env.portfolio_identity(wpo);
+        let r = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(winner.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(wpo, false)], &[&winner]);
+        eprintln!("FNEW convert {pnl} after {horizon} slots -> {:?}; capital {} -> {}", r.as_ref().map_err(|e| code(e)), cap0, w.env.portfolio_state(wpo).capital);
+    }
+    dump(&w, "end");
+}
