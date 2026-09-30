@@ -4275,3 +4275,18 @@ fn p3_resolved_close_single_winner_covered_from_sibling_pot() {
     assert!(st.ok.get("close_resolved").copied().unwrap_or(0) >= 1, "vacuity: the winner closed");
     assert_eq!(w.shortfall, 0);
 }
+
+/// Gate repro `indep_p3_resolved_c_drop_without_redemption_or_draw_repro` (seed 0x7dc9d4dacc52f9,
+/// regression in f0b990e1): one long winner (profit ~1.5M, inside the 3M junior). The Resolved
+/// claim cover ran before the vault LP's loss reached the claim pot; booked when the vault LP
+/// settled, it charged the seniors 994 although the junior's value (left in the pot as stray
+/// backing) covered everything. Booking in Resolved now waits for terminal-flat and counts the
+/// stray: senior C never drops, the junior takes the loss.
+#[test]
+fn p3_resolved_cover_is_junior_first_no_senior_c_drop() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let ops = vec![Op::Push { delta_bps: 1822 }, Op::TradeCpi { u: 212, size_tenths: 172 }, Op::Push { delta_bps: 1387 }, Op::Warp { n: 27 },
+        Op::Warp { n: 52 }, Op::Push { delta_bps: 1849 }, Op::Push { delta_bps: 1713 }, Op::Push { delta_bps: 1790 }];
+    let (w, st) = anvil_resolved_exit(30, "0", &ops);
+    anvil_assert_full_exit(&w, &st, "junior-first cover");
+}

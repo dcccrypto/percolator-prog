@@ -27374,9 +27374,24 @@ pub mod processor {
             st.senior_fee_share_bps,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // Resolved terminal-flat: backing left in the pots beyond vault-owned principal and beyond
+        // any claim (the stray: loss backing whose winners were paid, or a claim cover that the
+        // loser's settled loss made redundant) is vault value the ledger NAV does not see; it
+        // absorbs the move before any senior loss (junior first), and tag 78 then makes it the
+        // vault's own. senior_loss = max(0, C_eff - nav - harvestable - stray).
+        let stray = if group.header.mode == 1
+            && group.header.materialized_portfolio_count.get() == 0
+            && group.header.c_tot.get() == 0
+        {
+            let x = vault_terminal_stray_atoms(group, a)?;
+            x[0].checked_add(x[1]).ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            0
+        };
         let cover_before = nav_after
             .checked_add(pending)
             .and_then(|v| v.checked_add(harvestable))
+            .and_then(|v| v.checked_add(stray))
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // CURRENT junior surplus: the pots' value over C before this move, net of every earlier
         // (already booked) draw because the ledgers and C already reflect those.
@@ -27401,8 +27416,9 @@ pub mod processor {
         write_vault_lp_draw_to_view(group, a, &rec)?;
         let _ = lp_value;
         solana_program::log::sol_log(&alloc::format!(
-            "p3_senior_draw_booked nav={} c_eff={} harvestable={} moved={} junior_cover={} senior_loss={} C={} outstanding={}",
+            "p3_senior_draw_booked nav={} stray={} c_eff={} harvestable={} moved={} junior_cover={} senior_loss={} C={} outstanding={}",
             nav_after,
+            stray,
             c_eff,
             harvestable,
             pending,
@@ -27500,20 +27516,18 @@ pub mod processor {
         // is invisible to the pots' NAV, so booking now would charge the seniors a loss the
         // junior must take first. Resolved senior/junior exits (77/102) require terminal-flat,
         // i.e. a settled vault LP, so nothing prices against the unbooked move meanwhile.
-        if has_pending && group.header.mode == 1 {
-            if let Some(lp_ai) = lp_ai {
-                if lp_ai.owner == program_id {
-                    let unsettled = with_portfolio_header_ro(lp_ai, |h| {
-                        Ok(h.capital.get() != 0
-                            || h.pnl.get() != 0
-                            || !percolator::active_bitmap_is_empty(h.active_bitmap.map(percolator::V16PodU64::get)))
-                    })
-                    .unwrap_or(false);
-                    if unsettled {
-                        return Ok(false);
-                    }
-                }
-            }
+        // (f0b990e1 regression, gate repro indep_p3_resolved_c_drop_without_redemption_or_draw):
+        // deferring only until the vault LP settled was not enough. A Resolved claim cover can run
+        // BEFORE the loser's loss reaches the claim pot, and that loss backing then sits in the
+        // pot as junior value the NAV cannot see. So in Resolved a pending move is booked only
+        // at TERMINAL-FLAT (no materialized portfolio, c_tot == 0): every loss is realised, every
+        // winner is paid, and whatever backing is left beyond vault-owned principal (the stray)
+        // is counted as vault value in the booking (`vault_lp_book_pending_draw`).
+        if has_pending
+            && group.header.mode == 1
+            && !(group.header.materialized_portfolio_count.get() == 0 && group.header.c_tot.get() == 0)
+        {
+            return Ok(false);
         }
         // Current vault-LP value for the seniors-first recovery (0 when not passed/current).
         let lp_value = match lp_ai {
