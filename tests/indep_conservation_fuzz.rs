@@ -1219,7 +1219,12 @@ impl World {
             let drop = c.c_last.saturating_sub(cnow);
             let drawn_delta = drawn.saturating_sub(c.drawn_last);
             if drop > 0 && !c.c_may_drop && drop > drawn_delta {
-                return Err(format!("P3-a SENIOR PRINCIPAL DROPPED without a redemption: C {} -> {cnow} (draw booked only {drawn_delta})", c.c_last));
+                let outst = if st.len() >= 256 { u128::from_le_bytes(st[240..256].try_into().unwrap()) } else { 0 };
+                let jdep = if st.len() >= 176 { u128::from_le_bytes(st[160..176].try_into().unwrap()) } else { 0 };
+                let jwd = if st.len() >= 192 { u128::from_le_bytes(st[176..192].try_into().unwrap()) } else { 0 };
+                let lp = self.env.portfolio_state(c.lp);
+                let pots: Vec<(u128, u128)> = g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num / BOUND_SCALE, b.consumed_liened_backing_num / BOUND_SCALE)).collect();
+                return Err(format!("P3-a SENIOR PRINCIPAL DROPPED without a redemption: C {} -> {cnow} (draw booked only {drawn_delta}; drawn {drawn} outstanding {outst}; junior dep/wd {jdep}/{jwd}; vault LP cap {} pnl {} legs {}; pots (fresh, consumed) {:?}; mode {:?} c_tot {} ins {})", c.c_last, lp.capital, lp.pnl, lp.legs.iter().filter(|l| l.active).count(), pots, g.mode, g.c_tot, g.insurance));
             }
             if drop > 0 && drawn_delta > 0 { *self.stats.soft.entry("p3_c_drop_by_senior_draw").or_default() += 1; }
             c.c_last = cnow;
