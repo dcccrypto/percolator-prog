@@ -4292,3 +4292,24 @@ fn indep_p3_winner_haircut_while_junior_paid_no_trader_default_repro() {
     eprintln!("soft {:?}", st.soft);
     r.expect("no winner haircut beyond bankrupt-trader deficits while Earn is paid");
 }
+
+/// Shrunk fuzz repros on 5544302a (class (b) P3-J: winner haircut, no trader default, junior paid).
+/// Run with FUZZ_P3=1 FUZZ_RANDLEN=1 FUZZ_P3_PRECRANK=0 INDEP_CANONICAL_MATCHER=<pinned id>.
+#[test]
+#[ignore]
+fn indep_p3j_b_5544_plain_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::TradeCpi { u: 218, size_tenths: 184 }, Op::TradeCpi { u: 152, size_tenths: 19 }, Op::Push { delta_bps: 1121 }, Op::Warp { n: 41 }, Op::TradeCpi { u: 126, size_tenths: -208 }];
+    let (r, st) = run_seq(0, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("no winner haircut beyond bankrupt-trader deficits while Earn is paid");
+}
+#[test]
+#[ignore]
+fn indep_p3j_b_5544_std_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::TradeCpi { u: 253, size_tenths: 228 }, Op::Push { delta_bps: 1379 }, Op::Push { delta_bps: -1454 }, Op::Warp { n: 43 }, Op::Crank { u: 181 }, Op::TradeCpi { u: 59, size_tenths: 41 }, Op::Push { delta_bps: 2487 }];
+    let (r, st) = run_seq(5, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("no winner haircut beyond bankrupt-trader deficits while Earn is paid");
+}
