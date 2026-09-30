@@ -3771,3 +3771,61 @@ fn indep_p3_f12_residual_two_trades_then_resolve() {
     }
     r.expect("seniors exit after resolve with pending fees");
 }
+
+/// Tag-98 recall bound (P3 §0.3 row 98 / §line 149): permissionless; moves vault-LP capital into
+/// the backing pot (no SPL move, header.vault nets 0); bounded by the senior liquidity shortfall
+/// C_eff − backing; LP must be flat. A shortfall is FORCED by a large OUTSIDE winner (a NoCpi
+/// pair not involving the vault LP) whose PnL is paid from the vault's domain backing, then the
+/// loser is liquidated. Run: FUZZ_P3=1 --ignored indep_p3_recall_bound_after_outside_winner_shortfall
+#[test]
+#[ignore]
+fn indep_p3_recall_bound_after_outside_winner_shortfall() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(0);
+    // Outside pair (users 2 long, 3 short) — big, then a large adverse move for the long.
+    w.do_deposit(3, 50_000_000).unwrap();
+    let q = POS_SCALE as i128;
+    w.do_trade_nocpi(2, 3, 150 * q, w.mark).expect("outside open");
+    for d in [-2400, -2400, -2400] {
+        let _ = w.apply(&Op::Push { delta_bps: d });
+        let _ = w.permissionless_repair(40);
+    }
+    // Winner realizes: crank + convert released PnL.
+    for _ in 0..6 {
+        let _ = w.permissionless_repair(5);
+        let pnl = w.env.portfolio_state(w.ports[3]).pnl;
+        if pnl > 0 {
+            let _ = w.do_convert(3, pnl as u128);
+        }
+    }
+    let (_, g) = w.env.market_state();
+    let backing: u128 = g.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).sum();
+    let c = w.p3_c();
+    let shortfall = c.saturating_sub(backing);
+    let spent: Vec<u128> = g.source_credit.iter().take(2).map(|s| s.spent_backing_num / BOUND_SCALE).collect();
+    eprintln!("recall: C {c} backing {backing} shortfall {shortfall} spent {spent:?} winner pnl {} cap {}", w.env.portfolio_state(w.ports[3]).pnl, w.env.portfolio_state(w.ports[3]).capital);
+    assert!(shortfall > 0, "vacuity: an outside winner must create a senior shortfall (C {c} vs backing {backing})");
+    let v0 = w.token_amount(&w.env.vault);
+    let hv0 = g.vault;
+    let st0 = w.p3_state();
+    let recalled0 = u128::from_le_bytes(st0[208..224].try_into().unwrap());
+    // Over the bound: refused (76) or clipped — record and require no over-recall.
+    let over = w.p3_recall(shortfall + 1);
+    eprintln!("recall shortfall+1 -> {:?}", over.as_ref().map_err(|e| custom_code(e)));
+    let exact = if over.is_ok() { Ok(0) } else { w.p3_recall(shortfall) };
+    eprintln!("recall exact shortfall -> {:?}", exact.as_ref().map_err(|e| custom_code(e)));
+    w.check().unwrap();
+    let st1 = w.p3_state();
+    let recalled1 = u128::from_le_bytes(st1[208..224].try_into().unwrap());
+    let (_, g1) = w.env.market_state();
+    assert_eq!(w.token_amount(&w.env.vault), v0, "recall moves no SPL");
+    assert_eq!(g1.vault, hv0, "header.vault nets 0");
+    assert!(recalled1 - recalled0 <= shortfall, "recall must never exceed the shortfall (recalled {})", recalled1 - recalled0);
+    assert!(recalled1 > recalled0, "vacuity: the recall path must actually move capital (LP flat, shortfall {shortfall})");
+    let backing1: u128 = g1.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).sum();
+    eprintln!("after recall: backing {backing1} recalled {}", recalled1 - recalled0);
+    // Seniors can now redeem their full claim (Live).
+    let r = w.wind_down();
+    eprintln!("wind-down after recall -> {r:?}");
+    r.unwrap();
+}
