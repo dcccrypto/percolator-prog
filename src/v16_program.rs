@@ -421,6 +421,10 @@ pub mod constants {
     /// and skew funding (plus the separate creator fee leg); a junior fee share would sit in
     /// backing where the junior cannot reach it (junior exits only through the vault LP).
     pub const VAULT_LP_SENIOR_FEE_SHARE_BPS: u16 = 10_000;
+    // Security INFO (2026-09-30): tag 102's live surplus formula `(nav + H) - C_eff = nav - C`
+    // and tag 78's "credit all of H to C" are exact ONLY at a 100% senior fee share. Changing
+    // this constant must first generalise those formulas (and their tests), so refuse to build.
+    const _: () = assert!(VAULT_LP_SENIOR_FEE_SHARE_BPS == 10_000);
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.

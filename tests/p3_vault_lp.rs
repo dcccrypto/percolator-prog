@@ -184,12 +184,16 @@ struct Trader {
 
 impl Env {
     fn new(p: Params) -> Env {
+        Self::new_with_matcher(p, matcher_program_path())
+    }
+
+    fn new_with_matcher(p: Params, matcher_so: PathBuf) -> Env {
         let mut svm = LiteSVM::new();
         let pid = percolator_prog::id();
         svm.add_program(pid, &std::fs::read(program_path()).unwrap());
         svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).unwrap());
         let matcher = Pubkey::new_unique();
-        svm.add_program(matcher, &std::fs::read(matcher_program_path()).unwrap());
+        svm.add_program(matcher, &std::fs::read(&matcher_so).unwrap());
         let payer = Keypair::new();
         let admin = Keypair::new();
         let market = Pubkey::new_unique();
@@ -490,6 +494,15 @@ impl Env {
     }
 
     fn vault_lp_set_matcher_as(&mut self, signer: &Keypair, lp: Pubkey) -> Result<Lp, String> {
+        self.vault_lp_set_matcher_spread_as(signer, lp, 0)
+    }
+
+    fn vault_lp_set_matcher_spread_as(
+        &mut self,
+        signer: &Keypair,
+        lp: Pubkey,
+        base_spread_bps: u32,
+    ) -> Result<Lp, String> {
         let ctx = Pubkey::new_unique();
         let delegate = Pubkey::find_program_address(
             &[
@@ -540,7 +553,7 @@ impl Env {
                 expiry_slot: u64::MAX,
                 kind: 0,
                 trading_fee_bps: 0,
-                base_spread_bps: 0,
+                base_spread_bps,
                 max_total_bps: 100,
                 impact_k_bps: 0,
                 liquidity_notional_e6: 0,
@@ -890,13 +903,17 @@ impl Env {
     }
 
     fn trade(&mut self, t: &Trader, lp: &Lp, size_q: i128) -> Result<(), String> {
+        let (cfg, _) = self.market_state();
+        self.trade_signing_fee(t, lp, size_q, cfg.trade_fee_base_bps)
+    }
+
+    fn trade_signing_fee(&mut self, t: &Trader, lp: &Lp, size_q: i128, fee_bps: u64) -> Result<(), String> {
         let (a_id, _, a_epoch) = self.identity(t.portfolio);
         let (b_id, b_seq, b_epoch) = self.identity(lp.portfolio);
         let market_id =
             state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, 0)
                 .unwrap()
                 .3;
-        let (cfg, _) = self.market_state();
         let kp = t.kp.insecure_clone();
         self.send(
             ProgInstruction::TradeCpi {
@@ -908,7 +925,7 @@ impl Env {
                 account_b_matcher_sequence: b_seq,
                 asset_index: 0,
                 size_q,
-                fee_bps: cfg.trade_fee_base_bps,
+                fee_bps,
                 limit_price: 0,
                 backing_fee_cap_bps: 10_000,
             },
@@ -2363,4 +2380,107 @@ fn p3_init_vault_lp_protocol_path_names_a_signing_junior() {
     env.junior_deposit_as(&junior, lp, 7_000_000).expect("named junior deposits");
     assert_eq!(env.vlp().junior_deposited_atoms, 7_000_000);
     env.assert_conserved("protocol-path junior deposit");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// P2 negotiated fee (P1 fee-request channel) on the vault LP: the requested part is credited
+// to the vault LP's capital, i.e. to V and so to the junior; C never moves; the size of the
+// request is bounded by the PROTOCOL (tag 93 `max_requested_fee_bps`, upgrade authority) and
+// the ctx that produces it is protocol-configured (tag 95). Real P2 matcher BPF.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+fn p2_matcher_so() -> PathBuf {
+    std::env::var("P2_MATCHER_SO")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/Users/khubair/wt-p3-wrapper/out/p2-matcher-4a0f696.so"))
+}
+
+impl Env {
+    /// Tag 93 SetAssetRiskLimits, upgrade-authority signed (ProgramData mocked = admin by
+    /// `approve_matcher`).
+    fn set_fee_channel(&mut self, matcher_ext_mode: u8, max_requested_fee_bps: u16) -> Result<(), String> {
+        let admin = self.admin.insecure_clone();
+        let (pd, _) = Pubkey::find_program_address(&[self.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+        let market = self.market;
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::SetAssetRiskLimits {
+                asset_index: 0,
+                exec_band_bps: 0,
+                lp_exposure_k_bps: 0,
+                lp_floor_atoms: 0,
+                side_oi_cap_q: 0,
+                matcher_ext_mode,
+                max_requested_fee_bps,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .map(|_| ())
+    }
+}
+
+/// ceil(ceil(size*price/POS)*bps/1e4) — the engine's fee rounding.
+fn engine_fee_atoms(size_abs: u128, price: u64, bps: u64) -> u128 {
+    let notional = (size_abs * price as u128).div_ceil(POS as u128);
+    (notional * bps as u128).div_ceil(10_000)
+}
+
+fn p2_fee_run(ext_mode: u8, max_req: u16) -> (Result<(), String>, i128, i128, u128, u128) {
+    let mut env = Env::new_with_matcher(
+        Params { fee_bps: 10, ..Params::default() },
+        p2_matcher_so(),
+    );
+    let lpk = env.init_vault_lp(1_000);
+    env.approve_matcher();
+    let admin = env.admin.insecure_clone();
+    let lp = env.vault_lp_set_matcher_spread_as(&admin, lpk, 30).expect("protocol sets a 30 bps spread");
+    env.set_fee_channel(ext_mode, max_req).expect("tag 93");
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 50_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    let t = env.new_trader(10_000_000);
+    let c0 = env.vlp().senior_claim_atoms;
+    let nav0 = env.backing_nav();
+    let lp0 = env.portfolio(lp.portfolio);
+    let t0 = env.portfolio(t.portfolio);
+    // Taker signs base 10 + requested 30 = 40 bps.
+    let r = env.trade_signing_fee(&t, &lp, 10 * POS, 40);
+    let lp1 = env.portfolio(lp.portfolio);
+    let t1 = env.portfolio(t.portfolio);
+    assert_eq!(env.vlp().senior_claim_atoms, c0, "C never moves on a fill");
+    assert_eq!(env.backing_nav(), nav0, "senior backing untouched by the fill");
+    (
+        r,
+        lp1.capital as i128 - lp0.capital as i128,
+        t0.capital as i128 - t1.capital as i128,
+        c0,
+        nav0,
+    )
+}
+
+#[test]
+fn p3_p2_negotiated_fee_accrues_to_vault_nav_junior_and_is_protocol_bounded() {
+    let size = 10 * POS as u128;
+    let total = engine_fee_atoms(size, PRICE, 40);
+    let base = engine_fee_atoms(size, PRICE, 10);
+    // Channel ON (P2 ext mode 1, protocol max 100 bps): the requested 30 bps goes to the vault LP.
+    let (r, lp_gain, taker_paid, c0, nav0) = p2_fee_run(1, 100);
+    r.expect("fill with the fee channel on");
+    println!("P2 fee on vault LP: taker paid {taker_paid}, vault LP capital +{lp_gain}, base {base}, total {total}, C {c0}, nav {nav0}");
+    assert_eq!(taker_paid as u128, total, "taker pays base + requested");
+    assert_eq!(lp_gain as u128, total - base, "the requested part lands in vault-LP capital = V = junior");
+    assert!(lp_gain > 0);
+    // CONTROL 1: channel OFF — same fill, only the base fee, nothing credited to the vault LP.
+    let (r, lp_gain_off, taker_paid_off, _, _) = p2_fee_run(0, 100);
+    r.expect("fill with the fee channel off");
+    assert_eq!(lp_gain_off, 0, "no request -> no LP credit");
+    assert_eq!(taker_paid_off as u128, base);
+    // CONTROL 2: the protocol max (20 bps) is below the matcher's 30 bps request -> refused.
+    let (r, _, _, _, _) = p2_fee_run(1, 20);
+    assert!(r.is_err(), "a request above the protocol max is refused");
 }
