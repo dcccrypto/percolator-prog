@@ -1257,3 +1257,115 @@ fn hlock_exit_via_recovery_everyone_paid() {
     assert!(senior_paid > 0, "seniors must be paid after the Recovery exit");
     assert!(left <= 2_000, "value stranded after every exit: {left} atoms left in the vault");
 }
+
+// ═════════════ NEW P3 LOSS RULE (user decision 2026-09-30): junior first, then Earn seniors
+// pro rata; winners are NEVER haircut. h-lock/bankrupt only once seniors are exhausted. ═════════════
+
+/// Runs the full exit (Live convert+withdraw if possible, else resolve path) and returns
+/// (winner_received, senior_paid_per_senior, junior_paid, vault_left).
+fn lossrule_exit(w: &mut P3, seniors: &[(Keypair, Pubkey)], t: &Keypair, tp: Pubkey) -> (u128, Vec<u128>, u128, u128) {
+    let m = w.env.market;
+    let lp = w.lp;
+    let mut winner = 0u128;
+    // Live: winner converts its whole PnL and withdraws everything.
+    for _ in 0..10 {
+        let s = w.slot() + 5;
+        w.env.svm.warp_to_slot(s);
+        let _ = w.crank(lp);
+        let _ = w.crank(tp);
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl > 0 {
+            let (pid, _, pep) = w.env.portfolio_identity(tp);
+            let _ = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+                vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[t]);
+        }
+        if w.env.portfolio_state(tp).pnl <= 0 { break; }
+    }
+    let cap = w.env.portfolio_state(tp).capital;
+    if cap > 0 && w.env.portfolio_state(tp).pnl <= 0 {
+        let dest = w.token(t.pubkey(), 0);
+        let (pid, seq, _) = w.env.portfolio_identity(tp);
+        let r = w.send(ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: cap },
+            vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false), AccountMeta::new(dest, false),
+                 AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false)], &[t]);
+        if r.is_ok() { winner += w.tok(&dest) as u128; }
+    }
+    eprintln!("lossrule: Live winner received {winner}; trader pnl now {}", w.env.portfolio_state(tp).pnl);
+    // Resolve (admin) and finish everyone on the resolved path.
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    let jo = w.env.admin.pubkey();
+    for _ in 0..6 {
+        let _ = w.settle_resolved(jo, 0);
+        let _ = w.settle_resolved(jo, 1);
+        let dest = w.token(t.pubkey(), 0);
+        let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+        let _ = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+            AccountMeta::new_readonly(t.pubkey(), false), AccountMeta::new(m, false), AccountMeta::new(tp, false),
+            AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[]);
+        winner += w.tok(&dest) as u128;
+        let s = w.slot() + 50;
+        w.env.svm.warp_to_slot(s);
+    }
+    let _ = w.terminal_cleanup(&[(tp, t.pubkey())]);
+    let mut per = Vec::new();
+    for (k, ata) in seniors {
+        let shares = w.tok(ata) as u128;
+        if shares == 0 { per.push(0); continue; }
+        let _ = w.request_redeem(k, *ata, shares);
+        let (mut dest, mut r) = w.execute_redeem(k, true);
+        if r.is_err() { let x = w.execute_redeem_domain(k, 1); dest = x.0; r = x.1; }
+        per.push(if r.is_ok() { w.tok(&dest) as u128 } else { 0 });
+    }
+    let jr = w.env.admin.insecure_clone();
+    let junior = w.junior_release_resolved(&jr);
+    let left = w.tok(&w.env.vault) as u128;
+    (winner, per, junior, left)
+}
+
+/// Rule 1: a winner is paid IN FULL after a vault-LP loss beyond the junior; seniors absorb
+/// exactly the shortfall, pro rata; conservation (<= dust left).
+#[test]
+fn lossrule_winner_paid_in_full_seniors_absorb_exact_shortfall_pro_rata() {
+    let (d0, d1, junior) = (9_000_000u64, 1_000_000u64, 1_000_000u64);
+    let (mut w, seniors, (t, tp)) = q1_world(d0, d1, junior, 6);
+    let t0 = w.env.portfolio_state(tp);
+    let (cap0, pnl0) = (t0.capital, t0.pnl.max(0) as u128);
+    let lpp = w.env.svm.get_account(&w.lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl));
+    let g = w.env.market_state().1;
+    eprintln!("lossrule start: trader cap {cap0} pnl {pnl0}; LP {:?}; hlock {} C {}", lpp, g.bankruptcy_hlock_active, w.c());
+    assert!(pnl0 > junior as u128, "vacuity: the LP loss must exceed the junior");
+    let (winner, per, jr_paid, left) = lossrule_exit(&mut w, &seniors, &t, tp);
+    let shortfall = pnl0 - junior as u128;
+    let c = (d0 + d1) as u128;
+    let expected_total = c - shortfall;
+    let senior_total: u128 = per.iter().sum();
+    eprintln!("lossrule: winner {winner} (owed {} = cap {cap0} + pnl {pnl0}); seniors {per:?} total {senior_total} (expected {expected_total} = C {c} - shortfall {shortfall}); junior {jr_paid}; left {left}", cap0 + pnl0);
+    assert!(winner + 2 >= cap0 + pnl0, "RULE: winners are never haircut: received {winner} < owed {}", cap0 + pnl0);
+    assert!(senior_total + 2_000 >= expected_total && senior_total <= expected_total + 2_000, "RULE: seniors absorb exactly the shortfall: {senior_total} vs {expected_total}");
+    // pro rata: each senior's loss share proportional to its principal (+-2 atoms rounding, dead shares)
+    let shares = [d0 as u128, d1 as u128];
+    for (i, p) in per.iter().enumerate() {
+        let fair = shares[i] * expected_total / c;
+        assert!((*p as i128 - fair as i128).abs() <= 2_000, "RULE: senior {i} paid {p}, pro-rata share {fair}");
+    }
+    assert_eq!(jr_paid, 0, "junior is wiped first");
+    assert!(left <= 2_000, "conservation: {left} left in the vault");
+}
+
+/// Rule 2: while seniors still cover the loss, the market must NOT enter bankruptcy h-lock.
+/// Then with tiny seniors (loss > junior + seniors) h-lock/bankruptcy is reachable.
+#[test]
+fn lossrule_hlock_only_after_seniors_exhausted() {
+    let (w, _s, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 6);
+    let g = w.env.market_state().1;
+    eprintln!("lossrule big seniors: hlock {} loss_stale {}", g.bankruptcy_hlock_active, g.loss_stale_active);
+    assert!(!g.bankruptcy_hlock_active, "RULE: seniors (C 10M) cover a ~1.6M shortfall, so no bankruptcy h-lock");
+    let (w2, _s2, (_t2, tp2)) = q1_world(200_000, 100_000, 100_000, 6);
+    let g2 = w2.env.market_state().1;
+    let pnl = w2.env.portfolio_state(tp2).pnl;
+    eprintln!("lossrule tiny seniors: hlock {} trader pnl {pnl} C {}", g2.bankruptcy_hlock_active, w2.c());
+    // Vacuity: the loss must exceed junior + seniors for the second leg to mean anything.
+    assert!(pnl as i128 > 400_000, "vacuity: loss must exceed junior + seniors");
+    assert!(g2.bankruptcy_hlock_active || g2.loss_stale_active, "RULE: once junior + seniors are exhausted, the bankrupt/h-lock path is reachable");
+}
