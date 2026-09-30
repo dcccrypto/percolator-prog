@@ -109,6 +109,7 @@ impl P3 {
         k
     }
     fn lp_share_ata(&mut self, owner: Pubkey) -> Pubkey {
+        if let Some(k) = FORCE_SHARE_ATA.with(|c| c.get()) { return k; }
         self.env.token_account_for_mint(self.lp_mint, owner, 0)
     }
     fn tok(&self, k: &Pubkey) -> u64 {
@@ -666,6 +667,12 @@ thread_local! { static C7_NO_D1_LEDGER: std::cell::Cell<bool> = std::cell::Cell:
 thread_local! { static C7_SINGLE_DOMAIN: std::cell::Cell<bool> = std::cell::Cell::new(false); }
 /// Funding on the TRUMP-param market (max_abs_funding_e9_per_slot); 0 = seed default (off).
 thread_local! { static TL_FUNDING: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+/// Reuse this LP-share ATA for the next deposits (one wallet holding both domains' shares).
+thread_local! { static FORCE_SHARE_ATA: std::cell::Cell<Option<Pubkey>> = std::cell::Cell::new(None); }
+/// C-7 variant: ONE senior wallet deposits into BOTH domains (rehearse.sh's seed senior).
+thread_local! { static C7_ONE_SENIOR: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+/// C-7 variant: configure permissionless stale resolve (rehearsal: 216,000 slots) and resolve by tag 39.
+thread_local! { static C7_STALE_RESOLVE: std::cell::Cell<u64> = std::cell::Cell::new(0); }
 thread_local! { static TL_FEE_SHARE: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
@@ -1536,8 +1543,13 @@ fn c7_world(senior_per_domain: u64) -> C7 {
     let s0 = Keypair::new();
     // rehearse.sh: LP_VAULT_DEPOSIT_PER_DOMAIN = 5e9 (HLOCK_SENIOR_PER_DOMAIN), i.e. C = 1e10 over d0 + d1.
     let a0 = w.earn_deposit_domain(&s0, senior_per_domain, false, 0).expect("75 senior d0");
-    let s1 = Keypair::new();
+    let one = C7_ONE_SENIOR.with(|c| c.get());
+    let s1 = if one { s0.insecure_clone() } else { Keypair::new() };
+    if one { FORCE_SHARE_ATA.with(|c| c.set(Some(a0))); }
     let a1 = w.earn_deposit_domain(&s1, senior_per_domain, false, if C7_SINGLE_DOMAIN.with(|c| c.get()) { 0 } else { 1 }).expect("75 senior d1");
+    FORCE_SHARE_ATA.with(|c| c.set(None));
+    let stale = C7_STALE_RESOLVE.with(|c| c.get());
+    if stale > 0 { w.env.configure_permissionless_resolve_with_cu(stale, stale); } // seed: stale = force-close delay = 216,000
     if C7_SINGLE_DOMAIN.with(|c| c.get()) && !C7_NO_D1_LEDGER.with(|c| c.get()) {
         // A 1,000-atom d1 depositor so the d1 ledger exists (the relaunch seed funds both domains).
         let dust = Keypair::new();
@@ -1637,10 +1649,17 @@ fn c7_to_terminal(w: &mut P3, lp: Pubkey) {
     }
     let path = w.env.market_state().1.mode;
     if path == percolator::MarketModeV16::Live {
-        let s = w.slot() + 1;
-        w.env.svm.warp_to_slot(s);
-        w.push(MARK.with(|c| c.get()));
-        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        let stale = C7_STALE_RESOLVE.with(|c| c.get());
+        if stale > 0 {
+            // Rehearsal-23: nobody pushes; a STRANGER resolves by tag 39 after the stale window.
+            let now = w.slot() + stale + 1;
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve_stale_permissionless_with_cu(now); }));
+        } else {
+            let s = w.slot() + 1;
+            w.env.svm.warp_to_slot(s);
+            w.push(MARK.with(|c| c.get()));
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+        }
     }
     let mode = w.env.market_state().1.mode;
     eprintln!("C7 path after the liquidating crank {path:?}; mode now {mode:?}");
@@ -1692,13 +1711,16 @@ fn c7_finish(w: &mut P3, admin: &Keypair, t: &Keypair, tp: Pubkey, seed: &Keypai
         let mut n = 0u32;
         while n < 1_000 {
             let dest = w.token(k.pubkey(), 0);
+            // Owner-signed (the seeded markets set force_close_delay_slots, so a non-owner close of
+            // an open position waits for the delay; the owner can always close).
             let r = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
-                AccountMeta::new_readonly(k.pubkey(), false), AccountMeta::new(m, false), AccountMeta::new(p, false),
+                AccountMeta::new_readonly(k.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false),
                 AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
-                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[]);
+                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[k]);
             n += 1;
             let got = w.tok(&dest) as u128;
             tot += got;
+            if r.is_err() && n > 3 { eprintln!("C7 CloseResolved refused: {:?} {}", r.as_ref().map_err(|e| code(e)), r.as_ref().err().map(|e| e.chars().rev().take(200).collect::<String>().chars().rev().collect::<String>()).unwrap_or_default()); }
             if got > 0 || (r.is_err() && n > 3) { break; }
         }
         (tot, n)
@@ -2651,3 +2673,28 @@ fn atomic_one_tx_redeem_with_trades_deposit_harvest_extracts_nothing_fees_pendin
 /// priced after the draw).
 #[test]
 fn atomic_one_tx_redeem_with_trades_deposit_harvest_extracts_nothing_draw_pending() { atomic_check(1); }
+
+
+/// REHEARSAL-23 (real validator, 39b138c8, ~/deploycand-v183/fork/runs/rehearsal-23-39b138c8/
+/// hlock-drill.log, base variant): ONE seed-senior wallet funds BOTH domains (5M + 5M, one share
+/// ATA), the draw absorbs the loss in Live, a stranger resolves by tag 39 after the stale window,
+/// the winner is paid in full and terminal-flat is reached -- then the senior's 77 (d0 and d1)
+/// returns 21 and the junior's 102 returns 83. Expected: the senior redeems C - shortfall.
+#[test]
+fn rehearsal23_one_senior_both_domains_redeems_after_stale_resolve() {
+    C7_ONE_SENIOR.with(|c| c.set(true));
+    C7_STALE_RESOLVE.with(|c| c.set(216_000));
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, lp, v0, owed, lp_loss_beyond_junior, .. } = c7_world(5_000_000);
+    C7_ONE_SENIOR.with(|c| c.set(false));
+    C7_STALE_RESOLVE.with(|c| c.set(0));
+    let shares = w.tok(&a0) as u128;
+    assert!(shares >= 9_990_000, "vacuity: one wallet holds both domains' shares ({shares})");
+    // Wind-down with the senior listed once per domain (the second entry redeems what is left).
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s0, a0, 1)], v0);
+    let paid: u128 = o.per.iter().sum();
+    let exp = 10_000_000 - lp_loss_beyond_junior;
+    eprintln!("R23 winner {} (owed {owed}); senior paid {paid} (expected {exp}); 77s {:?}; left {}", o.winner_paid, o.r77s, o.left);
+    assert!(o.winner_paid + 2_000 >= owed, "winner {} < {owed}", o.winner_paid);
+    assert!(paid + 2_000 >= exp, "REHEARSAL-23: the senior is locked after resolve: paid {paid} of {exp} (77s {:?})", o.r77s);
+    assert!(o.left <= 2_000, "{} atoms left", o.left);
+}
