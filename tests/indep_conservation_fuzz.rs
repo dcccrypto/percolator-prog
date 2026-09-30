@@ -63,6 +63,10 @@ pub enum Op {
     TradeNoCpiA1 { a: u8, b: u8, size_tenths: i32 },
     PushA1 { delta_bps: i32 },
     BatchNoCpi { a: u8, b: u8, s0: i32, s1: i32 },
+    P3JuniorDeposit { amt: u64 },
+    P3JuniorWithdraw { frac_bps: u16 },
+    P3Recall { amt: u64 },
+    P3Release { amt: u64 },
 }
 
 #[derive(Default, Debug, Clone)]
@@ -119,6 +123,10 @@ fn op_name(op: &Op) -> &'static str {
         Op::TradeNoCpiA1 { .. } => "trade_nocpi_asset1",
         Op::PushA1 { .. } => "push_mark_asset1",
         Op::BatchNoCpi { .. } => "batch_nocpi",
+        Op::P3JuniorDeposit { .. } => "p3_junior_deposit96",
+        Op::P3JuniorWithdraw { .. } => "p3_junior_withdraw97",
+        Op::P3Recall { .. } => "p3_recall98",
+        Op::P3Release { .. } => "p3_release102",
     }
 }
 
@@ -142,6 +150,8 @@ pub struct World {
     pub nassets: usize,
     pub mark1: u64,
     pub pending_violation: Option<String>,
+    pub p3: Option<P3Ctx>,
+    pub minted_by: std::collections::BTreeMap<Pubkey, u128>,
 }
 
 impl World {
@@ -224,6 +234,8 @@ impl World {
             nassets,
             mark1: INITIAL_MARK,
             pending_violation: None,
+            p3: None,
+            minted_by: Default::default(),
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -236,8 +248,11 @@ impl World {
         let (ctx, delegate, _) = w.env.init_matcher_context(&lp_owner, matcher_prog, lp_port);
         w.ctx = ctx;
         w.delegate = delegate;
-        if std::env::var("FUZZ_LPVAULT").map_or(true, |v| v != "0") {
+        if std::env::var("FUZZ_LPVAULT").map_or(true, |v| v != "0") || p3_mode() {
             w.create_lp_vault();
+        }
+        if p3_mode() {
+            w.p3_bind();
         }
         if std::env::var("FUZZ_STAKE").map_or(false, |v| v == "1") {
             // Real-staker vs dead-shares-only pools, 50/50 by market key parity.
@@ -405,9 +420,18 @@ impl World {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new(l1, false),
-            ],
+            ]
+            .into_iter()
+            .chain(self.p3.as_ref().map(|c| vec![AccountMeta::new(c.state_pda, false), AccountMeta::new(c.lp, false)]).unwrap_or_default())
+            .collect(),
             &[&owner],
         )
+        .map(|cu| {
+            if let Some(c) = self.p3.as_mut() {
+                c.senior_in += amt as u128;
+            }
+            cu
+        })
     }
 
     fn do_lp_crank(&mut self, d: u16) -> Result<u64, String> {
@@ -424,7 +448,10 @@ impl World {
                 AccountMeta::new(own, false),
                 AccountMeta::new(sib, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            ],
+            ]
+            .into_iter()
+            .chain(self.p3.as_ref().map(|c| vec![AccountMeta::new(c.state_pda, false)]).unwrap_or_default())
+            .collect(),
             &[],
         )
     }
@@ -437,6 +464,9 @@ impl World {
             return Err("no lp shares".into());
         }
         let shares = (held * frac_bps as u128 / 10_000).max(1);
+        if self.p3.is_some() {
+            self.p3_prep();
+        }
         let owner = self.owners[u].insecure_clone();
         let red = state::derive_lp_redemption(&self.env.program_id, &reg, &owner.pubkey()).0;
         self.send(
@@ -453,6 +483,14 @@ impl World {
             ],
             &[&owner],
         )?;
+        self.do_lp_execute(u)
+    }
+
+    /// ExecuteRedemption (77) for `u`'s pending redemption PDA (permissionless crank).
+    fn do_lp_execute(&mut self, u: usize) -> Result<u64, String> {
+        let (reg, lmint, esc) = self.lp_vault.ok_or("no lp vault")?;
+        let owner = self.owners[u].insecure_clone();
+        let red = state::derive_lp_redemption(&self.env.program_id, &reg, &owner.pubkey()).0;
         let dst = self.new_token(owner.pubkey(), 0);
         let (m, v, va, payer) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.payer.pubkey());
         let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
@@ -472,9 +510,27 @@ impl World {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(l1, false),
                 AccountMeta::new(owner.pubkey(), false),
-            ],
+            ]
+            .into_iter()
+            .chain(self.p3.as_ref().map(|c| vec![AccountMeta::new(c.state_pda, false), AccountMeta::new(c.lp, false)]).unwrap_or_default())
+            .collect(),
             &[],
         )
+        .map(|cu| {
+            // Runtime semantics: an account left with 0 lamports is garbage-collected at the
+            // end of the transaction. LiteSVM 0.1 keeps it (with its data), which would make
+            // the owner's NEXT RequestRedeem fail AlreadyInitialized — a harness artifact.
+            if self.env.svm.get_account(&red).map_or(false, |a| a.lamports == 0) {
+                let _ = self.env.svm.set_account(red, Account::default());
+            }
+            let paid = self.token_amount(&dst);
+            if let Some(c) = self.p3.as_mut() {
+                c.senior_out += paid;
+                c.n_redeem += 1;
+                c.c_may_drop = true;
+            }
+            cu
+        })
     }
 
     fn slot(&self) -> u64 {
@@ -497,6 +553,7 @@ impl World {
             )
             .unwrap();
         self.minted += amount as u128;
+        *self.minted_by.entry(owner).or_default() += amount as u128;
         self.tokens.push(k);
         k
     }
@@ -644,6 +701,9 @@ impl World {
     }
 
     fn do_trade_cpi(&mut self, u: usize, size_q: i128) -> Result<u64, String> {
+        if self.p3.is_some() {
+            return self.p3_trade_vs_vault_lp(u, size_q);
+        }
         let taker = self.owners[u].insecure_clone();
         let pa = self.ports[u];
         let pb = self.ports[N_USERS];
@@ -857,6 +917,11 @@ impl World {
     fn do_close_portfolio(&mut self, u: usize) -> Result<u64, String> {
         let owner = self.owners[u].insecure_clone();
         let p = self.ports[u];
+        if self.env.svm.get_account(&p).map_or(true, |a| state::read_portfolio(&a.data).is_err()) {
+            // Already freed (e.g. P3 permissionless resolved cleanup).
+            self.closed[u] = true;
+            return Ok(0);
+        }
         let (pid, seq, pep) = self.env.portfolio_identity(p);
         let m = self.env.market;
         let r = self.send(
@@ -1057,8 +1122,31 @@ impl World {
                 }
             }
         }
+        if let Some(c) = self.p3.as_ref() {
+            if let Some(a) = self.env.svm.get_account(&c.lp) {
+                if let Ok(pf) = state::read_portfolio(&a.data) {
+                    cap += pf.capital;
+                    if pf.pnl > 0 {
+                        pos += pf.pnl as u128;
+                    }
+                    if pf.pnl < 0 {
+                        negs += 1;
+                    }
+                }
+            }
+        }
         if cap != g.c_tot {
             return Err(format!("I4 C_tot AGGREGATE: Σcapital {cap} != c_tot {}", g.c_tot));
+        }
+        // P3-a: senior principal C only drops through senior redemptions.
+        if self.p3.is_some() {
+            let cnow = self.p3_c();
+            let c = self.p3.as_mut().unwrap();
+            if cnow < c.c_last && !c.c_may_drop {
+                return Err(format!("P3-a SENIOR PRINCIPAL DROPPED without a redemption: C {} -> {cnow}", c.c_last));
+            }
+            c.c_last = cnow;
+            c.c_may_drop = false;
         }
         if g.mode == MarketModeV16::Live {
             if pos != g.pnl_pos_tot {
@@ -1142,7 +1230,8 @@ impl World {
                 self.do_trade_nocpi(a, b, size, exec)
             }
             Op::TradeCpi { u, size_tenths } => {
-                let size = size_tenths as i128 * (POS_SCALE as i128 / 10);
+                // P3: the vault LP's 1x capacity (junior-sized) is a few units; scale down.
+                let size = if self.p3.is_some() { size_tenths as i128 * (POS_SCALE as i128 / 100) } else { size_tenths as i128 * (POS_SCALE as i128 / 10) };
                 self.do_trade_cpi(u as usize % N_USERS, size)
             }
             Op::Push { delta_bps } => {
@@ -1197,9 +1286,23 @@ impl World {
                 }
                 r
             }
-            Op::LpDeposit { u, amt } => self.do_lp_deposit(u as usize % N_USERS, amt),
+            Op::LpDeposit { u, amt } => {
+                if self.p3.is_some() {
+                    self.p3_prep();
+                    self.do_lp_deposit(u as usize % 3 + 1, amt)
+                } else {
+                    self.do_lp_deposit(u as usize % N_USERS, amt)
+                }
+            }
+            Op::P3JuniorDeposit { amt } => self.p3_junior_deposit(amt),
+            Op::P3JuniorWithdraw { frac_bps } => self.p3_junior_withdraw(frac_bps),
+            Op::P3Recall { amt } => self.p3_recall(amt as u128),
+            Op::P3Release { amt } => self.p3_release(amt as u128, false),
             Op::LpCrank { d } => self.do_lp_crank((d % 2) as u16),
-            Op::LpRedeem { u, frac_bps } => self.do_lp_redeem(u as usize % N_USERS, frac_bps),
+            Op::LpRedeem { u, frac_bps } => {
+                let u = if self.p3.is_some() { u as usize % 3 + 1 } else { u as usize % N_USERS };
+                self.do_lp_redeem(u, frac_bps)
+            }
             Op::ClosePortfolio { u } => {
                 let u = u as usize % N_USERS;
                 if self.closed[u] {
@@ -1225,6 +1328,11 @@ impl World {
             if g.assets[0].effective_price == g.assets[0].raw_oracle_target_price {
                 break;
             }
+        }
+        // P3: the keeper harvests the LP fee leg (tag 78) right before resolution (plan: "crank
+        // 78/87 before any ResolveMarket"). FUZZ_P3_PRECRANK=0 reproduces F-12 instead.
+        if self.p3.is_some() && std::env::var("FUZZ_P3_PRECRANK").map_or(true, |v| v != "0") {
+            self.p3_prep();
         }
         if self.do_resolve().is_err() {
             *self.stats.err.entry("winddown_resolve".into()).or_default() += 1;
@@ -1276,14 +1384,24 @@ impl World {
             let s = self.slot() + 5;
             self.env.svm.warp_to_slot(s);
         }
+        if self.p3.is_some() {
+            self.p3_terminal_settle()?;
+        }
         // Earn LP holders redeem everything (76/77 are allowed after resolution per the
         // LP-vault teardown tests).
         let holders: Vec<usize> = self.lp_atas.keys().copied().collect();
         for u in holders {
-            if self.do_lp_redeem(u, 10_000).is_ok() {
+            let r = self.do_lp_redeem(u, 10_000);
+            if std::env::var("FUZZ_DEBUG_P3").is_ok() {
+                eprintln!("  WINDDOWN-REDEEM u{u}: {:?} C {}", r.as_ref().map_err(|e| custom_code(e)), self.p3_c());
+            }
+            if r.is_ok() {
                 *self.stats.ok.entry("winddown_lp_redeem").or_default() += 1;
             }
             self.check()?;
+        }
+        if self.p3.is_some() {
+            self.p3_terminal_checks()?;
         }
         let _ = self.do_claim_protocol();
         let _ = self.do_claim_creator();
@@ -1485,7 +1603,7 @@ impl World {
 
 pub fn gen_op(rng: &mut XorShiftRng) -> Op {
     let u = rng.gen::<u8>();
-    match rng.gen_range(0..124) {
+    match rng.gen_range(0..if p3_mode() { 132 } else { 124 }) {
         0..=9 => Op::Deposit { u, amt: rng.gen_range(1_000..30_000_000) },
         10..=17 => Op::Withdraw { u, frac_bps: rng.gen_range(1..=10_000) },
         18..=33 => Op::TradeNoCpi {
@@ -1508,6 +1626,10 @@ pub fn gen_op(rng: &mut XorShiftRng) -> Op {
         112..=116 => Op::TradeNoCpiA1 { a: u, b: rng.gen(), size_tenths: rng.gen_range(-400..=400) },
         117..=119 => Op::PushA1 { delta_bps: rng.gen_range(-2500..=2500) },
         120..=123 => Op::BatchNoCpi { a: u, b: rng.gen(), s0: rng.gen_range(-300..=300), s1: rng.gen_range(-300..=300) },
+        124..=125 => Op::P3JuniorDeposit { amt: rng.gen_range(1_000..3_000_000) },
+        126..=127 => Op::P3JuniorWithdraw { frac_bps: rng.gen_range(1..=10_000) },
+        128..=129 => Op::P3Recall { amt: rng.gen_range(1..5_000_000) },
+        130..=131 => Op::P3Release { amt: rng.gen_range(1..5_000_000) },
         _ => match rng.gen_range(0..4) {
             3 => Op::Stake87Accrue,
             0 => Op::LpDeposit { u, amt: rng.gen_range(1_000..10_000_000) },
@@ -2728,4 +2850,702 @@ fn indep_f9_recovery_into_dead_shares_only_pool_is_not_booked_to_dead_shares() {
     eprintln!("F-9 dead-shares: retired {retired}; wrapper vault {}", if retired { 0 } else { w.token_amount(&w.env.vault) });
     w.check_tokens().unwrap();
     assert!(retired, "the terminal budget must leave the wrapper vault and the market retire");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// P3 MODE (FUZZ_P3=1): relaunch configuration — a vault-owned LP on every market.
+// Written from ledger/p3-vault-owned-lp-2026-09-29.md §0.3 (tags 94-102, errors 72-85)
+// and §2.2 waterfall: senior = min(V, C_eff), junior = V − senior (junior first loss).
+// Setup follows the design bind order: 74 → 75 (genesis senior) → 94 (path B: protocol +
+// named signing junior owner = the "creator") → 99 → 95 → 96 junior.
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn p3_mode() -> bool {
+    std::env::var("FUZZ_P3").map_or(false, |v| v == "1")
+}
+
+pub struct P3Ctx {
+    pub lp: Pubkey,
+    pub state_pda: Pubkey,
+    pub junior: Keypair,
+    pub upgrade: Keypair,
+    pub program_data: Pubkey,
+    pub ctx: Pubkey,
+    pub delegate: Pubkey,
+    pub senior_in: u128,
+    pub senior_out: u128,
+    pub n_redeem: u64,
+    pub c_last: u128,
+    pub c_may_drop: bool,
+    pub fees_credited0: u128,
+}
+
+fn p3_raw(tag: u8, body: &[u8]) -> Vec<u8> {
+    let mut v = vec![tag];
+    v.extend_from_slice(body);
+    v
+}
+
+impl World {
+    fn p3_send_raw(&mut self, data: Vec<u8>, metas: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
+        self.env.svm.expire_blockhash();
+        let ix = solana_sdk::instruction::Instruction { program_id: self.env.program_id, accounts: metas, data };
+        send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, signers)
+    }
+
+    fn p3_state(&self) -> Vec<u8> {
+        self.p3.as_ref().and_then(|c| self.env.svm.get_account(&c.state_pda)).map(|a| a.data).unwrap_or_default()
+    }
+
+    fn p3_c(&self) -> u128 {
+        let d = self.p3_state();
+        if d.len() < 160 { 0 } else { u128::from_le_bytes(d[144..160].try_into().unwrap()) }
+    }
+
+    fn p3_fees_credited(&self) -> u128 {
+        let d = self.p3_state();
+        if d.len() < 208 { 0 } else { u128::from_le_bytes(d[192..208].try_into().unwrap()) }
+    }
+
+    fn p3_bind(&mut self) {
+        let (reg, _, _) = self.lp_vault.expect("74 CreateLpVault first");
+        let pid = self.env.program_id;
+        let m = self.env.market;
+        let state_pda = Pubkey::find_program_address(&[b"vault_lp", m.as_ref()], &pid).0;
+        let upgrade = Keypair::new();
+        let junior = Keypair::new();
+        self.env.svm.airdrop(&upgrade.pubkey(), 10_000_000_000).unwrap();
+        self.env.svm.airdrop(&junior.pubkey(), 10_000_000_000).unwrap();
+        let program_data = Pubkey::find_program_address(&[pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0;
+        let mut pd = vec![0u8; 45];
+        pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+        pd[12] = 1;
+        pd[13..45].copy_from_slice(upgrade.pubkey().as_ref());
+        self.env.svm.set_account(program_data, Account { lamports: 1_000_000_000, data: pd, owner: solana_sdk::bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 }).unwrap();
+        // 75 genesis senior deposit (unbound) by Earn wallet = user 1.
+        self.do_lp_deposit(1, 10_000_000).expect("75 genesis senior deposit");
+        let genesis = 10_000_000u128;
+        // 94 path B.
+        let lp = Pubkey::new_unique();
+        let len = self.env.portfolio_account_len;
+        self.env.svm.set_account(lp, Account { lamports: 1_000_000_000, data: vec![0; len], owner: pid, executable: false, rent_epoch: 0 }).unwrap();
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        let metas = vec![
+            AccountMeta::new(upgrade.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(reg, false),
+            AccountMeta::new(state_pda, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new(l0, false),
+            AccountMeta::new(l1, false),
+            AccountMeta::new_readonly(program_data, false),
+            AccountMeta::new_readonly(junior.pubkey(), true),
+        ];
+        let up = upgrade.insecure_clone();
+        // Path B was REMOVED (user decision 2026-09-30). Default: path A — marketauth binds and
+        // becomes the junior owner (the creator). FUZZ_P3_PATH_B=1 keeps the old path for ee29b5ac.
+        let junior = if std::env::var("FUZZ_P3_PATH_B").map_or(false, |v| v == "1") {
+            let jr = junior.insecure_clone();
+            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), metas, &[&up, &jr]).unwrap_or_else(|e| panic!("94 InitVaultLp path B: {}", &e[..e.len().min(500)]));
+            junior
+        } else {
+            let admin = self.env.admin.insecure_clone();
+            let mut ma = metas[..8].to_vec();
+            ma[0] = AccountMeta::new(admin.pubkey(), true);
+            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), ma, &[&admin]).unwrap_or_else(|e| panic!("94 InitVaultLp path A: {}", &e[..e.len().min(500)]));
+            admin
+        };
+        // 99 SetVaultLpRisk: skew on (slope/max 1_000 e9), lev step-down off, 1x cap, approve matcher.
+        let mut b = Vec::new();
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&1_000u64.to_le_bytes());
+        b.extend_from_slice(&1_000u64.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(self.matcher_prog.as_ref());
+        let metas = vec![AccountMeta::new(up.pubkey(), true), AccountMeta::new_readonly(program_data, false), AccountMeta::new(m, false)];
+        self.p3_send_raw(p3_raw(99, &b), metas, &[&up]).unwrap_or_else(|e| panic!("99 SetVaultLpRisk: {}", &e[..e.len().min(400)]));
+        // 95 VaultLpSetMatcher (passive kind 0, finite caps).
+        let ctx = Pubkey::new_unique();
+        self.env.svm.set_account(ctx, Account { lamports: 1_000_000_000, data: vec![0; 320], owner: self.matcher_prog, executable: false, rent_epoch: 0 }).unwrap();
+        let delegate = Pubkey::find_program_address(&[b"matcher", m.as_ref(), lp.as_ref(), reg.as_ref(), self.matcher_prog.as_ref(), ctx.as_ref()], &pid).0;
+        self.env.svm.set_account(delegate, Account { lamports: 1_000_000_000, data: vec![], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+        let (_, seq, _) = self.env.portfolio_identity(lp);
+        let fr = state::read_market_asset_generation_frontier(&self.env.svm.get_account(&m).unwrap().data).unwrap();
+        let mut b = Vec::new();
+        b.extend_from_slice(&seq.to_le_bytes());
+        b.extend_from_slice(&fr.to_le_bytes());
+        b.extend_from_slice(&10_000u16.to_le_bytes());
+        b.extend_from_slice(&u64::MAX.to_le_bytes());
+        b.push(0);
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&100u32.to_le_bytes());
+        b.extend_from_slice(&0u32.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        b.extend_from_slice(&(1_000 * POS_SCALE).to_le_bytes());
+        b.extend_from_slice(&(1_000 * POS_SCALE).to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        let mp = self.matcher_prog;
+        let metas = vec![
+            AccountMeta::new(up.pubkey(), true),
+            AccountMeta::new_readonly(program_data, false),
+            AccountMeta::new_readonly(m, false),
+            AccountMeta::new_readonly(state_pda, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new_readonly(mp, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ];
+        self.p3_send_raw(p3_raw(95, &b), metas, &[&up]).unwrap_or_else(|e| panic!("95 VaultLpSetMatcher: {}", &e[..e.len().min(400)]));
+        self.p3 = Some(P3Ctx {
+            lp, state_pda, junior, upgrade, program_data, ctx, delegate,
+            senior_in: genesis, senior_out: 0, n_redeem: 0, c_last: 0, c_may_drop: false, fees_credited0: 0,
+        });
+        // 96 junior deposit (creator first loss).
+        self.p3_junior_deposit(3_000_000).unwrap_or_else(|e| panic!("96 junior deposit: {}", &e[..e.len().min(400)]));
+        let c0 = self.p3_c();
+        let f0 = self.p3_fees_credited();
+        let c = self.p3.as_mut().unwrap();
+        c.c_last = c0;
+        c.fees_credited0 = f0;
+    }
+
+    /// K1 + L2 prep: permissionless crank of the vault LP, then bound tag 78.
+    fn p3_prep(&mut self) {
+        let lp = self.p3.as_ref().unwrap().lp;
+        let _ = self.p3_crank_port(lp);
+        let _ = self.do_lp_crank(0);
+    }
+
+    fn p3_crank_port(&mut self, p: Pubkey) -> Result<u64, String> {
+        let slot = self.slot();
+        let payer = self.env.payer.pubkey();
+        let m = self.env.market;
+        self.send(
+            ProgInstruction::PermissionlessCrank { now_slot: slot, observations: (0..self.nassets as u16).map(|a| CrankObservationHint { asset_index: a, oracle_accounts: 0 }).collect() },
+            vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
+            &[],
+        )
+    }
+
+    fn p3_trade_vs_vault_lp(&mut self, u: usize, size_q: i128) -> Result<u64, String> {
+        let (lp, mp, ctx, del) = { let c = self.p3.as_ref().unwrap(); (c.lp, self.matcher_prog, c.ctx, c.delegate) };
+        let taker = self.owners[u].insecure_clone();
+        let pa = self.ports[u];
+        let (aid, _, aep) = self.env.portfolio_identity(pa);
+        let (bid, bseq, bep) = self.env.portfolio_identity(lp);
+        let m = self.env.market;
+        let _ = self.p3_crank_port(lp);
+        self.send(
+            ProgInstruction::TradeCpi {
+                account_a_portfolio_id: aid, account_a_position_epoch: aep,
+                account_b_portfolio_id: bid, account_b_position_epoch: bep,
+                market_id: 1, account_b_matcher_sequence: bseq, asset_index: 0, size_q,
+                fee_bps: self.fee_bps, limit_price: 0, backing_fee_cap_bps: 10_000,
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(pa, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(del, false),
+            ],
+            &[&taker],
+        )
+    }
+
+    fn p3_junior_deposit(&mut self, amt: u64) -> Result<u64, String> {
+        let Some(c) = self.p3.as_ref() else { return Err("not p3".into()) };
+        let (jr, st, lp) = (c.junior.insecure_clone(), c.state_pda, c.lp);
+        let src = self.new_token(jr.pubkey(), amt);
+        let (m, v) = (self.env.market, self.env.vault);
+        let metas = vec![
+            AccountMeta::new(jr.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(st, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new(src, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ];
+        self.p3_send_raw(p3_raw(96, &(amt as u128).to_le_bytes()), metas, &[&jr])
+    }
+
+    fn p3_junior_withdraw(&mut self, frac_bps: u16) -> Result<u64, String> {
+        let Some(c) = self.p3.as_ref() else { return Err("not p3".into()) };
+        let (jr, st, lp) = (c.junior.insecure_clone(), c.state_pda, c.lp);
+        let (reg, _, _) = self.lp_vault.unwrap();
+        let _ = self.p3_crank_port(lp);
+        let cap = self.env.portfolio_state(lp).capital;
+        let amt = (cap * frac_bps as u128 / 10_000).max(1);
+        let dest = self.new_token(jr.pubkey(), 0);
+        let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        let metas = vec![
+            AccountMeta::new(jr.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new_readonly(reg, false),
+            AccountMeta::new(st, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new(l0, false),
+            AccountMeta::new(l1, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ];
+        self.p3_send_raw(p3_raw(97, &amt.to_le_bytes()), metas, &[&jr])
+    }
+
+    fn p3_recall(&mut self, amt: u128) -> Result<u64, String> {
+        let Some(c) = self.p3.as_ref() else { return Err("not p3".into()) };
+        let (st, lp) = (c.state_pda, c.lp);
+        let (reg, _, _) = self.lp_vault.unwrap();
+        let cranker = Keypair::new();
+        self.env.ensure_signer_account(cranker.pubkey());
+        let m = self.env.market;
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        let metas = vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new_readonly(reg, false),
+            AccountMeta::new(st, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new(l0, false),
+            AccountMeta::new(l1, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ];
+        let mut b = amt.to_le_bytes().to_vec();
+        b.extend_from_slice(&0u16.to_le_bytes());
+        self.p3_send_raw(p3_raw(98, &b), metas, &[&cranker])
+    }
+
+    /// 102 VaultLpReleaseSurplus (junior owner). `resolved` adds the SPL payout tail.
+    fn p3_release(&mut self, amt: u128, resolved: bool) -> Result<u64, String> {
+        let Some(c) = self.p3.as_ref() else { return Err("not p3".into()) };
+        let (jr, st, lp) = (c.junior.insecure_clone(), c.state_pda, c.lp);
+        let (reg, _, _) = self.lp_vault.unwrap();
+        let m = self.env.market;
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        let mut metas = vec![
+            AccountMeta::new(jr.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new_readonly(reg, false),
+            AccountMeta::new(st, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new(l0, false),
+            AccountMeta::new(l1, false),
+        ];
+        if resolved {
+            let dest = self.new_token(jr.pubkey(), 0);
+            let (v, va) = (self.env.vault, self.env.vault_authority);
+            metas.extend([
+                AccountMeta::new(dest, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ]);
+        }
+        let mut b = amt.to_le_bytes().to_vec();
+        b.extend_from_slice(&0u16.to_le_bytes());
+        self.p3_send_raw(p3_raw(102, &b), metas, &[&jr])
+    }
+
+    fn p3_settle(&mut self, topup: u8) -> Result<u64, String> {
+        let (jr, st, lp) = { let c = self.p3.as_ref().unwrap(); (c.junior.pubkey(), c.state_pda, c.lp) };
+        let (reg, _, _) = self.lp_vault.unwrap();
+        let dest = self.new_token(jr, 0);
+        let (m, v, va, payer) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.payer.pubkey());
+        let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        let metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(m, false),
+            AccountMeta::new_readonly(reg, false),
+            AccountMeta::new(st, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new(l0, false),
+            AccountMeta::new_readonly(l1, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ];
+        self.p3_send_raw(p3_raw(101, &[topup]), metas, &[])
+    }
+
+    fn holdings_of(&self, owner: &Pubkey) -> u128 {
+        self.tokens
+            .iter()
+            .filter_map(|k| self.env.svm.get_account(k))
+            .filter_map(|a| TokenAccount::unpack(&a.data).ok())
+            .filter(|t| t.owner == *owner && t.mint == self.env.mint)
+            .map(|t| t.amount as u128)
+            .sum()
+    }
+
+    fn net_of(&self, owner: &Pubkey) -> i128 {
+        self.holdings_of(owner) as i128 - *self.minted_by.get(owner).unwrap_or(&0) as i128
+    }
+
+    /// Resolved wind-down for the vault LP: settle (101), let winning traders finish their
+    /// resolved close, release junior surplus (102 resolved), free the vault LP permissionlessly.
+    fn p3_terminal_settle(&mut self) -> Result<(), String> {
+        let lp = self.p3.as_ref().unwrap().lp;
+        for topup in [0u8, 0, 1, 1] {
+            match self.p3_settle(topup) {
+                Ok(_) => *self.stats.ok.entry("p3_settle101").or_default() += 1,
+                Err(e) => *self.stats.err.entry(format!("p3_settle101:{:?}", custom_code(&e))).or_default() += 1,
+            }
+            self.check()?;
+        }
+        for round in 0..8 {
+            for u in 0..=N_USERS {
+                if self.closed[u] {
+                    continue;
+                }
+                let _ = self.do_close_resolved(u);
+                let _ = self.do_claim_topup(u);
+                self.check()?;
+            }
+            let s = self.slot() + 10 * (round + 1);
+            self.env.svm.warp_to_slot(s);
+        }
+        // Junior surplus (Resolved, terminal-flat only) — try decreasing amounts.
+        let mut amt = self.token_amount(&self.env.vault);
+        while amt > 0 {
+            if self.p3_release(amt, true).is_ok() {
+                *self.stats.ok.entry("p3_release102_resolved").or_default() += 1;
+                break;
+            }
+            amt /= 4;
+        }
+        self.check()?;
+        // Permissionless resolved cleanup of the vault LP (F-4 fix: account [3] = owner).
+        let (reg, _, _) = self.lp_vault.unwrap();
+        let (pid, seq, ep) = self.env.portfolio_identity(lp);
+        let m = self.env.market;
+        let payer = self.env.payer.insecure_clone();
+        let r = self.send(
+            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
+            vec![AccountMeta::new(payer.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(lp, false), AccountMeta::new(reg, false)],
+            &[],
+        );
+        *self.stats.ok.entry(if r.is_ok() { "p3_vault_lp_closed" } else { "p3_vault_lp_close_refused" }).or_default() += 1;
+        self.check()
+    }
+
+    /// P3-b / P3-d / P3-e terminal checks (after seniors redeemed, junior released).
+    fn p3_terminal_checks(&mut self) -> Result<(), String> {
+        // Resolved Earn redemption needs a terminal-flat market (#377): free every EMPTY
+        // portfolio permissionlessly first (F-4 fix: account [3] = owner).
+        for u in 0..=N_USERS {
+            if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                let (pid, seq, ep) = self.env.portfolio_identity(self.ports[u]);
+                let (m, p, owner) = (self.env.market, self.ports[u], Pubkey::new_from_array(pf.owner));
+                let payer = self.env.payer.pubkey();
+                if self.send(
+                    ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
+                    vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(owner, false)],
+                    &[],
+                ).is_ok() {
+                    self.closed[u] = true;
+                    *self.stats.ok.entry("p3_permissionless_close").or_default() += 1;
+                }
+                self.check()?;
+            }
+        }
+        // seniors: execute any pending redemption, then redeem everything
+        // (bound, Resolved: senior value = min(physical, C)).
+        let holders: Vec<usize> = self.lp_atas.keys().copied().collect();
+        for _ in 0..2 {
+            for &u in &holders {
+                self.p3_prep();
+                let a = self.do_lp_execute(u);
+                self.check()?;
+                let b = self.do_lp_redeem(u, 10_000);
+                if std::env::var("FUZZ_DEBUG_P3").is_ok() {
+                    let (_, g) = self.env.market_state();
+                    eprintln!("  P3EXIT u{u}: execute {:?} redeem {:?} | C {} backing {:?} sc {:?}", a.as_ref().map_err(|e| custom_code(e)), b.as_ref().map_err(|e| custom_code(e)), self.p3_c(), g.source_backing_buckets.iter().map(|x| (x.status, x.fresh_unliened_backing_num / BOUND_SCALE)).collect::<Vec<_>>(), g.source_credit.iter().map(|c| (c.spent_backing_num / BOUND_SCALE, c.provider_receivable_num / BOUND_SCALE)).collect::<Vec<_>>());
+                }
+                self.check()?;
+            }
+        }
+        // P3-f: after Resolve every senior must be able to exit (H1). Registry shares left
+        // beyond the 1,000 dead floor (+ escrowed pending) = seniors locked.
+        if let Some((reg, _, _)) = self.lp_vault {
+            if let Some(r) = self.env.svm.get_account(&reg).and_then(|a| state::read_lp_vault_registry(&a.data).ok()) {
+                let floor = percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY as u128;
+                if r.total_lp_shares_outstanding > floor {
+                    let (cfg, _) = self.env.market_state();
+                    let h = cfg.lp_fee_accrued_atoms.saturating_sub(cfg.lp_fee_withdrawn_atoms);
+                    let mut why = String::new();
+                    let hs: Vec<usize> = self.lp_atas.keys().copied().collect();
+                    for u in hs {
+                        if let Err(e) = self.do_lp_execute(u) { why = format!("{:?}", custom_code(&e)); }
+                    }
+                    let tag = if h > 0 && why.contains("84") { "P3-f(F-12) SENIORS LOCKED BY HARVEST GATE" } else if why.contains("25") { "P3-f(F-14) SENIOR REDEMPTION UNDERFLOW" } else { "P3-f SENIORS LOCKED" };
+                    return Err(format!("{tag}: {} senior shares outstanding after Resolve; LP fee leg harvestable {h}; last execute error {why}; C {}", r.total_lp_shares_outstanding - floor, self.p3_c()));
+                }
+            }
+        }
+        let c = self.p3.as_ref().unwrap();
+        let (jr, sin, sout, nred, f0) = (c.junior.pubkey(), c.senior_in, c.senior_out, c.n_redeem, c.fees_credited0);
+        let credited = self.p3_fees_credited().saturating_sub(f0);
+        let c_rem = self.p3_c();
+        // Rounding: floor per redemption plus the resolved split; losses below 1,000 atoms are
+        // recorded soft (not a waterfall violation).
+        let tol = (nred as i128 + 2).max(1_000);
+        // P3-b: seniors never extract more than deposits + fee credit.
+        if sout > sin + credited + tol as u128 {
+            return Err(format!("P3-b SENIOR OVER-EXTRACTION: paid {sout} > deposits {sin} + credited {credited}"));
+        }
+        let senior_loss = sin as i128 + credited as i128 - sout as i128 - c_rem as i128;
+        let junior_received = self.holdings_of(&jr);
+        let creator_net = self.net_of(&jr) + self.net_of(&self.owners[0].pubkey());
+        if senior_loss > tol {
+            *self.stats.soft.entry("p3_senior_loss_events").or_default() += 1;
+            if junior_received > 0 {
+                return Err(format!("P3-a JUNIOR PAID BEFORE SENIORS WHOLE: senior loss {senior_loss}, junior received {junior_received}"));
+            }
+            if creator_net > 0 {
+                return Err(format!("P3-e CREATOR FREE OPTION: seniors lost {senior_loss} while creator (junior + trader wallet) netted +{creator_net}"));
+            }
+        }
+        // P3-d: after every exit, nothing stranded beyond insurance + remaining senior claim.
+        if !self.is_tombstone() {
+            let (_, g) = self.env.market_state();
+            let v = self.token_amount(&self.env.vault);
+            let stranded = v as i128 - g.insurance as i128 - c_rem as i128 - g.c_tot as i128;
+            if stranded > 10_000 {
+                if std::env::var("FUZZ_DEBUG_P3").is_ok() {
+                    for u in 0..self.ports.len() {
+                        if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                            eprintln!("  P3DBG u{u} closed {} cap {} pnl {} legs {} receipt {:?} tokens_net {}", self.closed[u], pf.capital, pf.pnl, pf.legs.iter().filter(|l| l.active).count(), (pf.resolved_payout_receipt.present, pf.resolved_payout_receipt.finalized, pf.resolved_payout_receipt.terminal_positive_claim_face, pf.resolved_payout_receipt.paid_effective), self.net_of(&self.owners[u].pubkey()));
+                        } else {
+                            eprintln!("  P3DBG u{u} (freed) tokens_net {}", self.net_of(&self.owners[u].pubkey()));
+                        }
+                    }
+                    eprintln!("  P3DBG buckets {:?} sc {:?} budget {} ins {} spent {:?} earn {}", g.source_backing_buckets.iter().map(|b| (b.status, b.fresh_unliened_backing_num / BOUND_SCALE, b.valid_liened_backing_num / BOUND_SCALE)).collect::<Vec<_>>(), g.source_credit.iter().map(|c| (c.fresh_reserved_backing_num / BOUND_SCALE, c.spent_backing_num / BOUND_SCALE, c.provider_receivable_num / BOUND_SCALE, c.positive_claim_bound_num / BOUND_SCALE)).collect::<Vec<_>>(), g.insurance_domain_budget_remaining_total, g.insurance, g.insurance_domain_spent, g.backing_provider_earnings_total);
+                    let st = self.p3_state();
+                    let rd = |o: usize| u128::from_le_bytes(st[o..o + 16].try_into().unwrap());
+                    eprintln!("  P3DBG state C {} jdep {} jwd {} fees {} recalled {}", rd(144), rd(160), rd(176), rd(192), rd(208));
+                }
+                let lpd = self.env.svm.get_account(&self.p3.as_ref().unwrap().lp).and_then(|a| state::read_portfolio(&a.data).ok())
+                    .map(|lp| format!("cap {} pnl {} legs {}", lp.capital, lp.pnl, lp.legs.iter().filter(|l| l.active).count()))
+                    .unwrap_or_else(|| "closed".into());
+                let fresh = g.source_fresh_backing_total_num / BOUND_SCALE;
+                return Err(format!(
+                    "P3-d STRANDED: vault {v} − insurance {} − C_rem {c_rem} − c_tot {} = {stranded} (vault LP {lpd}; fresh backing {fresh}; senior in/out {}/{} junior held {})",
+                    g.insurance, g.c_tot, sin, sout, junior_received
+                ));
+            }
+        }
+        *self.stats.soft.entry("p3_terminal_checked").or_default() += 1;
+        Ok(())
+    }
+}
+
+/// P3 fuzz shrink (seed 0xb54cda58fbbf476b, P3 424fe7e4): no trade ever touches the vault LP,
+/// yet after resolve + settle (101) + every exit, junior value is missing and the same atoms
+/// sit in the wrapper vault outside C, insurance and c_tot. Run: FUZZ_P3=1 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_no_stranded_value_after_unrelated_bankruptcy() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(30);
+    for op in [
+        Op::Push { delta_bps: -1350 },
+        Op::BatchNoCpi { a: 255, b: 122, s0: -131, s1: 95 },
+        Op::Warp { n: 6 },
+        Op::Crank { u: 35 },
+        Op::Push { delta_bps: 2471 },
+    ] {
+        let r = w.apply(&op);
+        eprintln!("op {op:?} -> {:?}", r.map_err(|e| custom_code(&e)));
+        w.check().unwrap();
+    }
+    let (_, g) = w.env.market_state();
+    eprintln!("pre-resolve: sc {:?}", g.source_credit.iter().map(|c| (c.fresh_reserved_backing_num / BOUND_SCALE, c.spent_backing_num / BOUND_SCALE, c.provider_receivable_num / BOUND_SCALE)).collect::<Vec<_>>());
+    let r = w.wind_down();
+    let jr = w.p3.as_ref().unwrap().junior.pubkey();
+    eprintln!("wind_down -> {r:?}; junior net {}", w.net_of(&jr));
+    if !w.is_tombstone() {
+        // every junior-surplus / recall path once more, with codes
+        for amt in [1u128, 1_000, 100_000, 1_000_000] {
+            eprintln!("  resolved 102({amt}) -> {:?}", w.p3_release(amt, true).map_err(|e| custom_code(&e)));
+        }
+        eprintln!("  98 recall -> {:?}", w.p3_recall(1).map_err(|e| custom_code(&e)));
+        eprintln!("  101 settle again -> {:?}", w.p3_settle(0).map_err(|e| custom_code(&e)));
+        let ata = *w.lp_atas.get(&1).unwrap();
+        eprintln!("  senior u1 shares {}", w.token_amount(&ata));
+        let c78 = w.do_lp_crank(0);
+        let (cfg, g) = w.env.market_state();
+        eprintln!("  tag78 after resolve -> {:?}; lp_fee accrued {} withdrawn {}; ins {} budget {}", c78.as_ref().map_err(|e| custom_code(e)), cfg.lp_fee_accrued_atoms, cfg.lp_fee_withdrawn_atoms, g.insurance, g.insurance_domain_budget_remaining_total);
+        w.p3_prep();
+        let ex = w.do_lp_execute(1);
+        eprintln!("  senior u1 execute pending -> {:?}", ex.as_ref().map_err(|e| (custom_code(e), e.chars().filter(|c| c.is_ascii()).collect::<String>().split("Program log: ").skip(1).map(|l| l.chars().take(90).collect::<String>()).collect::<Vec<_>>())));
+        for i in 0..3 {
+            let cs = w.do_close_slab();
+            let _ = w.do_claim_protocol();
+            let (cfg2, _) = w.env.market_state();
+            let ex2 = w.do_lp_execute(1);
+            eprintln!("  closeslab#{i} -> {:?}; lp_fee acc/wd {}/{}; execute -> {:?}", cs.as_ref().map_err(|e| custom_code(e)), cfg2.lp_fee_accrued_atoms, cfg2.lp_fee_withdrawn_atoms, ex2.as_ref().map_err(|e| custom_code(e)));
+            if w.is_tombstone() { break; }
+        }
+        let rr = w.do_lp_redeem(1, 10_000);
+        eprintln!("  senior u1 redeem -> {:?}", rr.as_ref().map_err(|e| (custom_code(e), e.split("Program log").skip(1).map(|l| l.chars().take(100).collect::<String>()).collect::<Vec<_>>())));
+        let (_, g) = w.env.market_state();
+        eprintln!("  mode {:?} mat {} c_tot {}", g.mode, g.materialized_portfolio_count, g.c_tot);
+    }
+    r.unwrap();
+}
+
+/// P3 shrink: one live partial senior redemption, then Resolve; the remaining senior shares
+/// cannot be redeemed after resolution. Run: FUZZ_P3=1 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_senior_can_exit_after_resolve_following_partial_redeem() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(30);
+    let r = w.apply(&Op::LpRedeem { u: 99, frac_bps: 8721 });
+    eprintln!("live partial redeem -> {:?}", r.map_err(|e| custom_code(&e)));
+    let (reg, _, _) = w.lp_vault.unwrap();
+    let red = state::derive_lp_redemption(&w.env.program_id, &reg, &w.owners[1].pubkey()).0;
+    let pa = w.env.svm.get_account(&red);
+    eprintln!("redemption PDA after executed live redeem: {:?}", pa.map(|a| (a.lamports, a.data.len(), a.data.iter().any(|b| *b != 0), a.owner)));
+    let r2 = w.apply(&Op::LpRedeem { u: 99, frac_bps: 5000 });
+    eprintln!("second live redeem -> {:?}", r2.map_err(|e| custom_code(&e)));
+    let wd = w.wind_down();
+    eprintln!("wind_down -> {wd:?}");
+    let u = 99usize % 3 + 1;
+    let ata = *w.lp_atas.get(&u).unwrap();
+    eprintln!("u{u} shares {}", w.token_amount(&ata));
+    w.p3_prep();
+    let (cfg, g) = w.env.market_state();
+    eprintln!("H {} mode {:?} mat {}", cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms, g.mode, g.materialized_portfolio_count);
+    let rr = w.do_lp_redeem(u, 10_000);
+    eprintln!("terminal full redeem -> {:?}", rr.as_ref().map_err(|e| custom_code(e)));
+    wd.unwrap();
+}
+
+/// F-12 (P3): ONE fee-bearing trade, then Resolve. The LP fee leg H > 0 cannot be harvested
+/// after Resolve (tag 78 is Live-only -> 21), and bound ExecuteRedemption refuses with 84
+/// (VaultLpHarvestPending) while H > 0 — so every senior is locked forever.
+/// Design §0.3: "77 in Resolved mode on a bound vault: senior value = min(physical, C)".
+/// Run: FUZZ_P3=1 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_f12_seniors_exit_after_resolve_with_unharvested_lp_fee() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(30);
+    w.apply(&Op::TradeCpi { u: 128, size_tenths: -300 }).expect("one fee-bearing trade vs the vault LP");
+    let (cfg, _) = w.env.market_state();
+    let h = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+    assert!(h > 0, "vacuity: LP fee leg accrued");
+    let pre = std::env::var("F12_PRECRANK").is_ok();
+    if pre {
+        eprintln!("keeper tag 78 before resolve -> {:?}", w.do_lp_crank(0).map_err(|e| custom_code(&e)));
+    }
+    let r = w.wind_down();
+    eprintln!("F-12 (H={h}, precrank={pre}): wind_down -> {r:?}");
+    r.expect("seniors must be able to exit after Resolve");
+}
+
+/// P3 shrink (seed 0xf1bbcdcbfa543f95, fee 30): a second senior deposits, an unrelated NoCpi
+/// trade and a small price move; after Resolve the second senior's redemption fails with
+/// Custom(25) EngineCounterUnderflow and its shares are locked. Run: FUZZ_P3=1 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_second_senior_can_exit_after_resolve() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(30);
+    for op in [
+        Op::LpDeposit { u: 74, amt: 228_224 },
+        Op::Push { delta_bps: -285 },
+        Op::TradeNoCpi { a: 85, b: 51, size_tenths: -133, off_bps: 2514 },
+    ] {
+        let r = w.apply(&op);
+        eprintln!("op {op:?} -> {:?}", r.map_err(|e| custom_code(&e)));
+        w.check().unwrap();
+    }
+    let (_, g) = w.env.market_state();
+    eprintln!("pre-resolve C {} backing {:?}", w.p3_c(), g.source_backing_buckets.iter().map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).collect::<Vec<_>>());
+    let r = w.wind_down();
+    for (&u, ata) in w.lp_atas.clone().iter() {
+        eprintln!("senior u{u}: shares left {} net tokens {}", w.token_amount(ata), w.net_of(&w.owners[u].pubkey()));
+    }
+    if !w.is_tombstone() {
+        let (_, g) = w.env.market_state();
+        eprintln!("post: C {} backing {:?} sc {:?}", w.p3_c(), g.source_backing_buckets.iter().map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).collect::<Vec<_>>(), g.source_credit.iter().map(|c| (c.spent_backing_num / BOUND_SCALE, c.provider_receivable_num / BOUND_SCALE)).collect::<Vec<_>>());
+    }
+    let jr = w.p3.as_ref().unwrap().junior.pubkey();
+    eprintln!("junior net {} (deposited 3,000,000); trader nets u0 {} u2 {} u3 {} u4 {}", w.net_of(&jr), w.net_of(&w.owners[0].pubkey()), w.net_of(&w.owners[2].pubkey()), w.net_of(&w.owners[3].pubkey()), w.net_of(&w.owners[4].pubkey()));
+    r.expect("every senior exits after Resolve");
+}
+
+/// F-14 variants: same 3 ops; (a) Live, both seniors redeem fully before any Resolve;
+/// (b) Resolved, the SECOND senior redeems first. Run: FUZZ_P3=1 --ignored.
+#[test]
+#[ignore]
+fn indep_p3_f14_variants() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    for variant in ["live_both", "resolved_second_first", "resolved_genesis_first", "resolved_genesis_first_late", "resolved_pending_before_close"] {
+        let mut w = World::new(30);
+        for op in [
+            Op::LpDeposit { u: 74, amt: 228_224 },
+            Op::Push { delta_bps: -285 },
+            Op::TradeNoCpi { a: 85, b: 51, size_tenths: -133, off_bps: 2514 },
+        ] {
+            let _ = w.apply(&op);
+        }
+        let second = 74usize % 3 + 1;
+        if variant == "live_both" {
+            for _ in 0..30 { let s = w.slot() + 5; w.env.svm.warp_to_slot(s); let _ = w.do_push(w.mark); let _ = w.do_crank(N_USERS); }
+            for u in [1usize, second] {
+                w.p3_prep();
+                let r = w.do_lp_redeem(u, 10_000);
+                eprintln!("F-14 {variant}: senior u{u} live redeem -> {:?}", r.map_err(|e| custom_code(&e)));
+            }
+        } else {
+            w.p3_prep();
+            w.do_resolve().unwrap();
+            if variant == "resolved_pending_before_close" {
+                for u in [1usize, second] {
+                    let r = w.do_lp_redeem(u, 10_000);
+                    eprintln!("F-14 {variant}: senior u{u} redeem BEFORE close-out -> {:?}", r.map_err(|e| custom_code(&e)));
+                }
+            }
+            let _ = w.p3_terminal_settle();
+            if variant == "resolved_genesis_first_late" {
+                let s = w.slot() + 3_000;
+                w.env.svm.warp_to_slot(s);
+            }
+            for u in 0..=N_USERS { let _ = w.do_close_resolved(u); let _ = w.do_claim_topup(u); }
+            for u in 0..=N_USERS {
+                if let Some(pf) = w.env.svm.get_account(&w.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
+                    let (pid, seq, ep) = w.env.portfolio_identity(w.ports[u]);
+                    let (m, p, owner, payer) = (w.env.market, w.ports[u], Pubkey::new_from_array(pf.owner), w.env.payer.pubkey());
+                    let _ = w.send(ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep },
+                        vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(owner, false)], &[]);
+                }
+            }
+            let order = if variant == "resolved_second_first" { [second, 1usize] } else { [1usize, second] };
+            for u in order {
+                if variant == "resolved_pending_before_close" {
+                    let r = w.do_lp_execute(u);
+                    eprintln!("F-14 {variant}: senior u{u} execute pending after close-out -> {:?}", r.map_err(|e| custom_code(&e)));
+                    continue;
+                }
+                let r = w.do_lp_redeem(u, 10_000);
+                eprintln!("F-14 {variant}: senior u{u} resolved redeem -> {:?}", r.map_err(|e| custom_code(&e)));
+            }
+        }
+    }
 }
