@@ -995,6 +995,14 @@ impl World {
                 if before_v > after_v + 2 {
                     let burned = before_v - after_v;
                     *self.stats.soft.entry("close_resolved_haircut_events").or_default() += 1;
+                    if std::env::var("FUZZ_RT_TRACE").is_ok() {
+                        let g = self.env.market_state().1;
+                        let lp = self.env.portfolio_state(self.ports[N_USERS]);
+                        eprintln!("  RTDBG u{u} burned {burned} before cap {} pnl {} claim_bound {:?} | buckets {:?} | sc {:?} | ins {} C {} | vault {} c_tot {} pnl_pos_tot {}", b.capital, b.pnl, b.source_claim_bound_num.iter().map(|x| x / BOUND_SCALE).collect::<Vec<_>>(),
+                            g.source_backing_buckets.iter().take(2).map(|x| (x.status, x.fresh_unliened_backing_num / BOUND_SCALE, x.consumed_liened_backing_num / BOUND_SCALE)).collect::<Vec<_>>(),
+                            g.source_credit.iter().take(2).map(|c| (c.positive_claim_bound_num / BOUND_SCALE, c.credit_rate_num)).collect::<Vec<_>>(), g.insurance, if self.p3.is_some() { self.p3_c() } else { 0 }, g.vault, g.c_tot, g.pnl_pos_tot);
+                        let _ = lp;
+                    }
                     *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += burned.min(u64::MAX as u128) as u64;
                     if self.p3.is_some() {
                         let c = self.p3_c();
@@ -4086,4 +4094,18 @@ fn roundtrip_ordinary_lp_control_probe() {
     dump(&w, "after convert");
     let cap = w.env.portfolio_state(w.ports[u]).capital;
     eprintln!("RTC SUMMARY: trader owed at close {owed}; capital after convert {cap} (haircut {})", owed.saturating_sub(cap));
+}
+
+/// Shrunk fuzz repro (seed 0x886b6a9743bb4326, P3 mode, 39b138c8): TradeCpi-only history against the
+/// vault LP; at the resolved close a winner is haircut while the seniors still hold C. Run with
+/// FUZZ_P3=1 FUZZ_STRICT_RT=1 (FUZZ_RT_TRACE=1 prints the state at the burn).
+#[test]
+#[ignore]
+fn indep_p3_rt_winner_haircut_at_resolved_close_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::TradeCpi { u: 22, size_tenths: 74 }, Op::TradeCpi { u: 139, size_tenths: 200 }, Op::Warp { n: 58 }, Op::Push { delta_bps: 608 },
+        Op::LpDeposit { u: 218, amt: 8_973_011 }, Op::TradeCpi { u: 176, size_tenths: 232 }, Op::TradeCpi { u: 17, size_tenths: -154 }, Op::Push { delta_bps: 2228 }];
+    let (r, st) = run_seq(30, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("RT: a winner haircut at the resolved close while seniors hold C");
 }
