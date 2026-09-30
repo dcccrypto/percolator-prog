@@ -13398,6 +13398,12 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // P3 (F-14): see handle_trade_nocpi — outside portfolios may not grow on a bound asset.
+        ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let assets: Vec<u16> = legs.iter().map(|l| l.asset_index).collect();
+        let vault_lp_pre =
+            vault_lp_capture_pre_fill(market_ai, account_a_ai, account_b_ai, &assets, max_market_slots)?;
         handle_batch_execute_zero_copy(
             program_id,
             signer_a.key,
@@ -13413,7 +13419,8 @@ pub mod processor {
             max_market_slots,
             None,
             P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
-        )
+        )?;
+        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -13968,6 +13975,19 @@ pub mod processor {
         if backing_fee_cap_bps > 10_000 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // P3 (F-14 root cause): on an asset with a bound vault LP, the vault LP is the EXCLUSIVE
+        // counterparty. A NoCpi pair of outside portfolios draws its winner's payout from the
+        // SAME backing pots the Earn seniors and the junior own (the engine's counterparty
+        // backing), so any risk-increasing NoCpi fill there is refused; unwinding is allowed.
+        ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
+        let vault_lp_pre = vault_lp_capture_pre_fill(
+            market_ai,
+            account_a_ai,
+            account_b_ai,
+            &[asset_index],
+            max_market_slots,
+        )?;
         handle_trade_nocpi_zero_copy(
             program_id,
             signer_a.key,
@@ -13989,7 +14009,39 @@ pub mod processor {
             max_market_slots,
             P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
             0,
-        )
+        )?;
+        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)
+    }
+
+    /// P3: refuse a NoCpi fill that grows EITHER outside portfolio on a bound asset (the vault LP
+    /// is never a NoCpi party: its owner, the registry PDA, cannot sign).
+    fn vault_lp_refuse_outside_growth(
+        market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        pre: &VaultLpPreFill,
+        max_market_slots: usize,
+    ) -> ProgramResult {
+        if pre.is_empty() {
+            return Ok(());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let mut a_data = account_a_ai.try_borrow_mut_data()?;
+        let mut b_data = account_b_ai.try_borrow_mut_data()?;
+        let a = state::portfolio_view_mut_for_market_slots(&mut a_data, max_market_slots)?;
+        let b = state::portfolio_view_mut_for_market_slots(&mut b_data, max_market_slots)?;
+        for &(asset, b_before, a_before) in pre.iter() {
+            let idx = asset as usize;
+            let a_after = signed_position_for_asset_view(&group, &a, idx)?;
+            let b_after = signed_position_for_asset_view(&group, &b, idx)?;
+            if vault_lp_v18::joins_crowd(a_before, a_after)
+                || vault_lp_v18::joins_crowd(b_before, b_after)
+            {
+                return Err(PercolatorError::VaultLpExclusiveCounterparty.into());
+            }
+        }
+        Ok(())
     }
 
     fn active_leg_for_asset_view(
@@ -16499,6 +16551,77 @@ pub mod processor {
         )?;
         own.checked_add(sib)
             .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+    }
+
+    /// P3 (F-14): one domain's (available principal, NAV) with impairment FLOORED at the
+    /// principal. The engine's `lp_vault_nav_atoms` fails closed (CounterUnderflow) when booked
+    /// impairment exceeds principal, which happens on a bound vault when backing lent to a winner
+    /// is still outstanding as a provider receivable; that bricked recall (98), junior withdraw
+    /// (97), release (102) and bound deposits/redemptions. A floored NAV is the conservative
+    /// reading (the impaired pot is worth zero, never negative) for senior-protecting gates.
+    fn lp_vault_domain_nav_parts_floored(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        ledger_data: &[u8],
+    ) -> Result<(u128, u128), ProgramError> {
+        let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+        let (mut ledger, _) = read_or_new_backing_domain_ledger(
+            ledger_data,
+            market_group,
+            authority,
+            domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        if fee_share_bps as u64 > percolator::MAX_MARGIN_BPS {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        let net_impairment = ledger
+            .cumulative_loss_atoms
+            .saturating_sub(ledger.cumulative_recovery_atoms);
+        let available = ledger.total_principal_atoms.saturating_sub(net_impairment);
+        let net_earnings = ledger
+            .total_earnings_atoms
+            .saturating_sub(ledger.total_earnings_withdrawn_atoms);
+        let lp_earnings = percolator::wide_math::wide_mul_div_floor_u128(
+            net_earnings,
+            fee_share_bps as u128,
+            percolator::MAX_MARGIN_BPS as u128,
+        );
+        let nav = available
+            .checked_add(lp_earnings)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((available, nav))
+    }
+
+    /// Both pots, floored (see `lp_vault_domain_nav_parts_floored`): (available principal, NAV).
+    fn lp_vault_combined_nav_parts_p3(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        own_ledger_data: &[u8],
+        sibling_ledger_data: &[u8],
+    ) -> Result<(u128, u128), ProgramError> {
+        let (a0, n0) = lp_vault_domain_nav_parts_floored(
+            group, market_group, authority, domain, fee_share_bps, own_ledger_data,
+        )?;
+        let (a1, n1) = lp_vault_domain_nav_parts_floored(
+            group,
+            market_group,
+            authority,
+            sibling_domain(domain),
+            fee_share_bps,
+            sibling_ledger_data,
+        )?;
+        Ok((
+            a0.checked_add(a1).ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            n0.checked_add(n1).ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        ))
     }
 
     /// W-GEN-L: a zeroed ledger record for `(market_group, authority, domain)`
@@ -23738,15 +23861,29 @@ pub mod processor {
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let ledger_data = ledger_ai.try_borrow_data()?;
             let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
-            let nav = lp_vault_combined_nav_atoms(
-                &group,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                registry.domain,
-                registry.fee_share_bps,
-                &ledger_data,
-                &sibling_ledger_data,
-            )?;
+            let nav = if state::registry_vault_lp_bound(&registry)? {
+                // P3 (F-14): floored NAV on a bound vault (never bricks on lent-out backing).
+                lp_vault_combined_nav_parts_p3(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &ledger_data,
+                    &sibling_ledger_data,
+                )
+                .map(|p| p.1)
+            } else {
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &ledger_data,
+                    &sibling_ledger_data,
+                )
+            }?;
             // #411: NAV above is derived ENTIRELY from the backing-domain ledgers, so it
             // does not see the vault's own accrued fee pool. Those fees belong to the LPs
             // who were carrying the vault while they were earned, but they only enter NAV
@@ -24594,23 +24731,48 @@ pub mod processor {
             // NAV and available_principal BOTH span the vault's two pots — see
             // lp_vault_combined_available_principal_atoms for why they must agree.
             let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
-            let available_principal = lp_vault_combined_available_principal_atoms(
-                &group,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                registry.domain,
-                &ledger_data,
-                &sibling_ledger_data,
-            )?;
-            let nav = lp_vault_combined_nav_atoms(
-                &group,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                registry.domain,
-                registry.fee_share_bps,
-                &ledger_data,
-                &sibling_ledger_data,
-            )?;
+            // F-14: a BOUND vault in Resolved mode is priced ONLY on the pots' physical idle
+            // backing (F-8) and never reads the ledger NAV. The ledger books a consumed
+            // counterparty lien (backing lent to an outside winner) as impairment even when the
+            // pots' fresh backing is fully token-backed, so after an earlier senior's
+            // physically-priced exit `principal - impairment` underflows
+            // (lp_vault_domain_available_principal_atoms, EngineCounterUnderflow) and every
+            // later senior was locked. Skip the ledger NAV terms on that path.
+            let bound_resolved = bound_tail.is_some() && group.header.mode == 1;
+            let (available_principal, nav) = if bound_resolved {
+                (0, 0)
+            } else if bound_tail.is_some() {
+                // P3 (F-14): floored NAV / available principal on a bound vault.
+                lp_vault_combined_nav_parts_p3(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &ledger_data,
+                    &sibling_ledger_data,
+                )?
+            } else {
+                (
+                    lp_vault_combined_available_principal_atoms(
+                        &group,
+                        market_ai.key.to_bytes(),
+                        registry_pda.to_bytes(),
+                        registry.domain,
+                        &ledger_data,
+                        &sibling_ledger_data,
+                    )?,
+                    lp_vault_combined_nav_atoms(
+                        &group,
+                        market_ai.key.to_bytes(),
+                        registry_pda.to_bytes(),
+                        registry.domain,
+                        registry.fee_share_bps,
+                        &ledger_data,
+                        &sibling_ledger_data,
+                    )?,
+                )
+            };
             let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) =
                 bound_tail.as_ref()
             {
@@ -24619,6 +24781,15 @@ pub mod processor {
                 // would pay out atoms that are not yet in backing. Require the harvest first
                 // (bundle tag 78 before 77 in the same transaction).
                 if lp_vault_harvestable_fee_atoms(&cfg_nav, &group)? != 0 {
+                    return Err(PercolatorError::VaultLpHarvestPending.into());
+                }
+                // F-14: on a terminal-flat Resolved market any claim-free residual belongs in
+                // the pots before seniors are priced; tag 78 absorbs it. Bundle 78 first.
+                if group.header.mode == 1
+                    && group.header.materialized_portfolio_count.get() == 0
+                    && group.header.c_tot.get() == 0
+                    && vault_terminal_residual_atoms(&group)? != 0
+                {
                     return Err(PercolatorError::VaultLpHarvestPending.into());
                 }
                 // P3: payout = floor(shares * senior / S), senior = min(V, C). The LP is valued
@@ -24792,7 +24963,12 @@ pub mod processor {
             // Liveness guard: principal_portion must not exceed available principal.
             // (Pre-split bug: this compared `atoms` which includes earnings — could
             // incorrectly block redemptions once earnings make NAV > total_principal.)
-            if principal_portion > ledger.total_principal_atoms {
+            // F-14: on a bound vault in Resolved mode the payout is priced and gated on the pots'
+            // PHYSICAL fresh backing (checked below); the ledger principal can trail it (the
+            // engine's resolved close can return backing to the pot without a wrapper ledger
+            // write), so it is not a gate there and is decremented saturating.
+            let ledger_gate = !(bound_tail.is_some() && group.header.mode == 1);
+            if ledger_gate && principal_portion > ledger.total_principal_atoms {
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
             // Same withdrawability gate as handle_withdraw_backing_bucket
@@ -24846,7 +25022,8 @@ pub mod processor {
             // (accept path) and execute_redemption_oi_reservation_violation_rejects
             // (genuine-lien reject path, solvency-preserving) in
             // tests/v16_fork_lp_vault_redeem.rs.
-            if registry.oi_reservation_threshold_bps != 0 {
+            let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
+            if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
                 let outstanding_post = bucket.valid_liened_backing_num;
                 // Post-redeem NAV: recompute with post-withdrawal counters.
                 let post_principal = ledger
@@ -24985,10 +25162,14 @@ pub mod processor {
             );
             // ── Ledger updates. ──
             // Principal ledger: only principal_portion (NOT earnings_portion).
-            ledger.total_principal_atoms = ledger
-                .total_principal_atoms
-                .checked_sub(principal_portion)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            ledger.total_principal_atoms = if ledger_gate {
+                ledger
+                    .total_principal_atoms
+                    .checked_sub(principal_portion)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?
+            } else {
+                ledger.total_principal_atoms.saturating_sub(principal_portion)
+            };
             ledger.total_principal_withdrawn_atoms = ledger
                 .total_principal_withdrawn_atoms
                 .checked_add(principal_portion)
@@ -25560,12 +25741,55 @@ pub mod processor {
             // cross-leg accounting, so an unclamped claim makes the last leg to crank fail
             // out of the engine) now lives on the helper.
             let available = lp_vault_harvestable_fee_atoms(&cfg, &group)?;
+            // F-14 (P3-d): on a TERMINAL claim-free Resolved bound market, first let the engine
+            // run its own claim-free recredit for this asset (insurance's entitled overlap,
+            // upstream 76a86f48), then absorb whatever claim-free RESIDUAL is left
+            // (vault - c_tot - insurance - provider earnings - fresh backing: tokens nobody's
+            // counter owns, created when outside winners were paid from these pots and the
+            // loss side refilled them) into the vault's OWN pot. Seniors then take it first
+            // through min(physical, C); the junior only what is left over C (tag 102).
+            let absorbed = if resolved_terminal_harvest {
+                match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(domain / 2) {
+                    Ok(_) => {
+                        let residual = vault_terminal_residual_atoms(&group)?;
+                        if residual != 0 {
+                            add_fresh_counterparty_backing_view(
+                                &mut group,
+                                domain,
+                                residual
+                                    .checked_mul(BOUND_SCALE)
+                                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                            )?;
+                            {
+                                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                                ledger.last_observed_unavailable_principal_atoms =
+                                    backing_unavailable_principal_atoms(&bucket_after)?;
+                            }
+                            ledger.total_principal_atoms = ledger
+                                .total_principal_atoms
+                                .checked_add(residual)
+                                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                            group.validate_shape().map_err(map_v16_error)?;
+                        }
+                        residual
+                    }
+                    Err(percolator::V16Error::LockActive) => 0,
+                    Err(e) => return Err(map_v16_error(e)),
+                }
+            } else {
+                0
+            };
             // Zero case: nothing accrued, or the surplus pool is currently dry
             // (another leg got there first). Same error either way — the claim
             // is NOT marked withdrawn, so it stays fully claimable next crank.
-            if available == 0 {
+            if available == 0 && absorbed == 0 {
                 return Err(PercolatorError::LpVaultNoFeesToCrank.into());
             }
+            if available == 0 {
+                write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+                (te, 0u128, cfg)
+            } else {
 
             // ── Reclassify `available` atoms: senior insurance → LP backing. ──
             // No token moves. See the MECHANISM block on this handler.
@@ -25613,6 +25837,7 @@ pub mod processor {
                 .checked_add(available)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             (te, available, cfg)
+            }
         };
 
         {
@@ -25854,6 +26079,19 @@ pub mod processor {
     /// the counterparty's realised loss lands in the same pot as fresh backing the ledger never
     /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
     /// valuation therefore uses the pots, not the ledgers.
+    /// Claim-free residual (engine `residual()`): vault tokens no header counter owns.
+    fn vault_terminal_residual_atoms(group: &state::MarketViewMutV16<'_>) -> Result<u128, ProgramError> {
+        let owned = group
+            .header
+            .c_tot
+            .get()
+            .checked_add(group.header.insurance.get())
+            .and_then(|v| v.checked_add(group.header.backing_provider_earnings_total.get()))
+            .and_then(|v| v.checked_add(group.header.source_fresh_backing_total_num.get() / BOUND_SCALE))
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok(group.header.vault.get().saturating_sub(owned))
+    }
+
     fn vault_physical_idle_backing_atoms(
         group: &state::MarketViewMutV16<'_>,
         domain: u16,
@@ -26074,7 +26312,7 @@ pub mod processor {
             let nav = {
                 let own = own_ledger_ai.try_borrow_data()?;
                 let sib = sibling_ledger_ai.try_borrow_data()?;
-                lp_vault_combined_nav_atoms(
+                lp_vault_combined_nav_parts_p3(
                     &group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
@@ -26082,7 +26320,7 @@ pub mod processor {
                     registry.fee_share_bps,
                     &own,
                     &sib,
-                )?
+                )?.1
             };
             let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
             // C such that C_eff = C + senior_part(H) = nav + H: everything the vault holds or is
@@ -26623,7 +26861,7 @@ pub mod processor {
             let nav = {
                 let own = own_ledger_ai.try_borrow_data()?;
                 let sib = sibling_ledger_ai.try_borrow_data()?;
-                lp_vault_combined_nav_atoms(
+                lp_vault_combined_nav_parts_p3(
                     &group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
@@ -26631,7 +26869,7 @@ pub mod processor {
                     registry.fee_share_bps,
                     &own,
                     &sib,
-                )?
+                )?.1
             };
             let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
             let cover = nav
@@ -26778,7 +27016,7 @@ pub mod processor {
             let nav = {
                 let own = own_ledger_ai.try_borrow_data()?;
                 let sib = sibling_ledger_ai.try_borrow_data()?;
-                lp_vault_combined_nav_atoms(
+                lp_vault_combined_nav_parts_p3(
                     &group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
@@ -26786,7 +27024,7 @@ pub mod processor {
                     registry.fee_share_bps,
                     &own,
                     &sib,
-                )?
+                )?.1
             };
             let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
             let cover = nav
@@ -26868,10 +27106,11 @@ pub mod processor {
     /// 10 token_program · 11 system_program.
     ///
     /// `topup == 0` runs the engine's resolved close on the vault LP (the tag-30 step);
-    /// `topup == 1` claims its resolved payout top-up (the tag-46 step). The payout `P` is split by
-    /// `vault_lp_v18::resolved_settle_split`: the senior shortfall `C - NAV` goes back into the
-    /// vault's OWN backing pot (registry domain), where Earn holders redeem it through tag 77; the
-    /// residual is paid in SPL to the junior owner. `header.vault` moves only by the junior's SPL.
+    /// `topup == 1` claims its resolved payout top-up (the tag-46 step). The WHOLE payout `P` goes
+    /// back into the vault's OWN backing pot (registry domain). Earn holders redeem through tag 77
+    /// (senior = min(physical, C)); the junior takes the remainder over C through tag 102 once the
+    /// market is terminal-flat (F-14: seniors first regardless of settlement order). Accounts [7]
+    /// junior_dest .. [10] token_program are still validated but no SPL moves here.
     /// During `force_close_delay_slots` only the junior owner may run the close step, mirroring
     /// tag 30's owner-only window.
     #[inline(never)]
@@ -26996,24 +27235,20 @@ pub mod processor {
                         .map_err(map_v16_error)?
                 }
             };
-            let nav = {
-                let own = own_ledger_ai.try_borrow_data()?;
-                let sib = sibling_ledger_ai.try_borrow_data()?;
-                lp_vault_combined_nav_atoms(
-                    &group,
-                    market_ai.key.to_bytes(),
-                    registry_pda.to_bytes(),
-                    registry.domain,
-                    registry.fee_share_bps,
-                    &own,
-                    &sib,
-                )?
-            };
-            // F-8: compare the senior claim with what physically backs it, not the lagging ledger.
-            let _ = nav;
-            let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
-            let (to_backing, to_junior) =
-                vault_lp_v18::resolved_settle_split(payout, st.senior_claim_atoms, physical);
+            // F-8 / F-14: compare the senior claim with what physically backs it, never the
+            // ledger NAV. (A discarded ledger-NAV computation used to sit here; it underflows
+            // (EngineCounterUnderflow) once backing lent to an outside winner is booked as
+            // impairment exceeding the ledger principal, which blocked every settlement.)
+            //
+            // F-14 (senior-first, order-independent): the WHOLE vault-LP payout goes back into
+            // the vault's own backing pot. Paying the junior here (the old
+            // `resolved_settle_split`) was order-dependent: an outside winner closing AFTER
+            // this settlement is paid from those same pots (consumed counterparty lien), so a
+            // junior paid "the surplus over C" at settle time left the seniors short. The junior
+            // now takes only what is left over C once the market is terminal-flat (tag 102,
+            // Resolved path: surplus = physical - C), which is after every other claim.
+            let _ = st.senior_claim_atoms;
+            let (to_backing, to_junior) = (payout, 0u128);
             if to_backing != 0 {
                 // Senior-first: the payout already left header.vault inside the engine close;
                 // route the senior part back in as the vault's own backing principal (the same
@@ -27185,10 +27420,14 @@ pub mod processor {
             if authorities.backing_bucket_authority != registry_pda.to_bytes() {
                 return Err(PercolatorError::LpVaultAuthorityMismatch.into());
             }
-            let nav = {
+            // F-14: the Resolved path is priced on physical backing only (never the ledger NAV,
+            // which can underflow once lent-out backing is booked as impairment).
+            let nav = if resolved {
+                0
+            } else {
                 let own = own_ledger_ai.try_borrow_data()?;
                 let sib = sibling_ledger_ai.try_borrow_data()?;
-                lp_vault_combined_nav_atoms(
+                lp_vault_combined_nav_parts_p3(
                     &group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
@@ -27196,7 +27435,7 @@ pub mod processor {
                     registry.fee_share_bps,
                     &own,
                     &sib,
-                )?
+                )?.1
             };
             let harvestable = lp_vault_harvestable_fee_atoms(&cfg_v, &group)?;
             let cover = nav
@@ -27244,7 +27483,9 @@ pub mod processor {
                 &bucket,
             )?;
             sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            if amount > ledger.total_principal_atoms
+            // F-14: the Resolved (terminal) path is gated on physical backing only; the ledger
+            // principal can trail the pot (see handle_execute_redemption).
+            if (!resolved && amount > ledger.total_principal_atoms)
                 || bucket.status != BackingBucketStatusV16::Fresh
                 || bucket.fresh_unliened_backing_num < backing_num
                 || source.fresh_reserved_backing_num < backing_num
@@ -27300,7 +27541,7 @@ pub mod processor {
                     .checked_sub(amount)
                     .ok_or(PercolatorError::EngineCounterUnderflow)?,
             );
-            ledger.total_principal_atoms -= amount;
+            ledger.total_principal_atoms = ledger.total_principal_atoms.saturating_sub(amount);
             ledger.total_principal_withdrawn_atoms = ledger
                 .total_principal_withdrawn_atoms
                 .checked_add(amount)

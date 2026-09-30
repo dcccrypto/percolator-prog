@@ -1605,11 +1605,15 @@ fn p3_h1_settle_resolved_pays_the_junior_when_seniors_are_covered() {
     let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
     let stranger = Keypair::new();
     env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("permissionless settle");
+    // F-14: tag 101 pays NO SPL; the whole payout returns to the vault's backing.
+    assert_eq!(env.tok(junior_dest), 0, "settlement pays the junior nothing directly");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    let swept = env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
     let got = env.tok(junior_dest) as u128;
     env.paid_out += got;
-    println!("P3-H1 settle (covered): junior received {got}, C={} nav={}", env.vlp().senior_claim_atoms, env.backing_nav());
-    assert_eq!(got, 20_000_000, "junior receives its full capital");
-    assert_eq!(env.backing_nav(), 10_000_000, "senior backing untouched");
+    println!("P3-H1 settle (covered): junior swept {swept}, C={} nav={}", env.vlp().senior_claim_atoms, env.backing_nav());
+    assert_eq!(got, 20_000_000, "junior receives its full capital at terminal-flat");
     env.assert_conserved("settle resolved, covered");
 }
 
@@ -1630,12 +1634,7 @@ fn p3_h1_settle_resolved_refills_the_senior_shortfall_before_the_junior() {
     let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
     let stranger = Keypair::new();
     env.settle_resolved(&stranger, lp.portfolio, 0, junior_dest).expect("settle");
-    let got = env.tok(junior_dest) as u128;
-    env.paid_out += got;
-    println!("P3-H1 settle (shortfall): junior {got}, nav {}", env.backing_nav());
-    assert_eq!(got, 17_000_000, "junior gets the payout minus the 3M senior shortfall");
-    assert_eq!(env.backing_nav(), 13_000_000, "backing refilled to exactly C");
-    env.assert_conserved("settle resolved, shortfall");
+    assert_eq!(env.tok(junior_dest), 0, "F-14: settlement pays the junior nothing directly");
     let (_, g) = env.market_state();
     println!("after settle: c_tot {} materialized {}", g.c_tot, g.materialized_portfolio_count);
     // Terminal cleanup (existing rule for EVERY portfolio): resolved redemption needs a
@@ -1657,6 +1656,12 @@ fn p3_h1_settle_resolved_refills_the_senior_shortfall_before_the_junior() {
         &[&admin],
     )
     .expect("terminal cleanup of the settled vault LP");
+    let swept = env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    let got = env.tok(junior_dest) as u128;
+    env.paid_out += got;
+    println!("P3-H1 settle (shortfall): junior {got} (swept {swept}), nav {}", env.backing_nav());
+    assert_eq!(got, 17_000_000, "junior gets the payout minus the 3M senior shortfall");
+    env.assert_conserved("settle resolved, shortfall");
     // The Earn holder now redeems against the refilled backing (resolved, terminal-flat).
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
@@ -1930,8 +1935,7 @@ fn settle_order_run(settle_first: bool) -> (u64, u64, u64, u128) {
         }
         tr += env.trader_close_resolved(&t);
     }
-    let (junior, trader) = (env.tok(junior_dest), tr);
-    env.paid_out += junior as u128;
+    let trader = tr;
     let tp = env.portfolio(t.portfolio);
     println!(
         "settle_first={settle_first}: trader after close cap {} pnl {} bitmap_empty {} receipt {:?}",
@@ -1940,7 +1944,6 @@ fn settle_order_run(settle_first: bool) -> (u64, u64, u64, u128) {
         percolator::active_bitmap_is_empty(tp.active_bitmap),
         tp.resolved_payout_receipt
     );
-    let nav = env.backing_nav();
     env.assert_conserved("after both resolved closes");
     // F-4: nobody's signature needed to reach terminal-flat.
     let registry = env.registry;
@@ -1950,8 +1953,12 @@ fn settle_order_run(settle_first: bool) -> (u64, u64, u64, u128) {
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
     let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("resolved redemption");
-    env.assert_conserved("after resolved redemption");
-    (junior, trader, senior, nav)
+    env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    let junior = env.tok(junior_dest);
+    env.paid_out += junior as u128;
+    env.assert_conserved("after resolved redemption + junior sweep");
+    let (_, g) = env.market_state();
+    (junior, trader, senior, g.vault)
 }
 
 /// Sentinel settle-order question: tag 101 reads backing at settle time — the outcome must not
@@ -1961,9 +1968,10 @@ fn p3_settle_order_does_not_change_anyones_outcome() {
     let a = settle_order_run(true);
     let b = settle_order_run(false);
     println!("P3 settle-order: settle-first {a:?} | trader-first {b:?}");
-    assert_eq!(a, b, "junior / trader / senior / backing must be order-independent");
+    assert_eq!(a, b, "junior / trader / senior / residual must be order-independent");
     assert!(a.1 > 10_000_000, "the trader won ({})", a.1);
-    assert_eq!(a.3, 50_000_000, "senior backing untouched by the trader's win");
+    assert_eq!(a.2, 49_999_000, "the senior redeems its full claim (less dead shares)");
+    assert!(a.3 <= 1_001, "nothing stranded beyond dead-share dust ({})", a.3);
 }
 
 /// F-4 PoC: before the fix, a trader who never closes (or whose owner key is gone) blocked every
@@ -2163,6 +2171,23 @@ fn p3_r3_textit_one_sided_reconstruction() {
 }
 
 impl Env {
+    /// F-14 semantics: at terminal-flat the junior takes `physical - C` through tag 102
+    /// (Resolved). Runs the tag-78 terminal step first (harvest + residual absorption; "no
+    /// fees" is fine). Returns the amount swept.
+    fn junior_terminal_sweep(&mut self, junior: &Keypair, lp: Pubkey, dest: Pubkey) -> u128 {
+        self.svm.expire_blockhash();
+        let _ = self.crank_fees(true);
+        let (_, g) = self.market_state();
+        let physical = (g.source_backing_buckets[0].fresh_unliened_backing_num
+            + g.source_backing_buckets[1].fresh_unliened_backing_num)
+            / percolator::BOUND_SCALE;
+        let sweep = physical.saturating_sub(self.vlp().senior_claim_atoms);
+        if sweep > 0 {
+            self.release_surplus_resolved(junior, lp, sweep, dest).expect("junior terminal sweep");
+        }
+        sweep
+    }
+
     fn release_surplus_resolved(&mut self, signer: &Keypair, lp: Pubkey, amount: u128, dest: Pubkey) -> Result<(), String> {
         self.svm.expire_blockhash();
         self.send(
@@ -2207,9 +2232,9 @@ fn p3_f8_vault_lp_win_reaches_the_junior_at_resolution() {
     let tr = env.trader_close_resolved(&t);
     env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
     let after_settle = env.tok(junior_dest);
-    // The settlement ITSELF must pay the win (no phantom senior shortfall), independent of the
-    // later terminal sweep.
-    assert_eq!(after_settle, 3_900_000, "tag 101 pays principal + win directly");
+    // F-14: the settlement pays no SPL; principal + win reach the junior through the terminal
+    // sweep below (after every other claim).
+    assert_eq!(after_settle, 0, "tag 101 routes the whole payout to backing");
     // Terminal cleanup (F-4 path), senior exit, then the junior's terminal sweep.
     let registry = env.registry;
     env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
@@ -2324,13 +2349,15 @@ fn p3_f8_terminal_sweep_pays_exactly_the_surplus_over_c() {
     // STATE POKE (see poke_senior_claim): C lowered by 2M, standing in for terminal junior
     // surplus that sits in backing (e.g. a counterparty loss landing after settlement).
     poke_senior_claim(&mut env, 8_000_000);
-    err_has(&env.release_surplus_resolved(&admin, lp.portfolio, 2_000_001, junior_dest), PercolatorError::VaultLpReleaseRefused);
+    // F-14: the settlement returned the whole 3M junior payout to backing, so the terminal
+    // surplus is physical 13M - C 8M = 5M.
+    err_has(&env.release_surplus_resolved(&admin, lp.portfolio, 5_000_001, junior_dest), PercolatorError::VaultLpReleaseRefused);
     let stranger = Keypair::new();
     env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
     err_has(&env.release_surplus_resolved(&stranger, lp.portfolio, 1, junior_dest), PercolatorError::Unauthorized);
     let before = env.tok(junior_dest);
-    env.release_surplus_resolved(&admin, lp.portfolio, 2_000_000, junior_dest).expect("sweep exactly the surplus");
-    assert_eq!(env.tok(junior_dest) - before, 2_000_000);
+    env.release_surplus_resolved(&admin, lp.portfolio, 5_000_000, junior_dest).expect("sweep exactly the surplus");
+    assert_eq!(env.tok(junior_dest) - before, 5_000_000);
     env.paid_out += env.tok(junior_dest) as u128;
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
@@ -2884,4 +2911,290 @@ fn p3_c4b_redemption_survives_the_vault_lp_account_being_garbage_collected() {
     let d2 = env.new_depositor();
     let _ = d2;
     env.assert_conserved("C-4(b)");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// F-14 root cause: outside NoCpi pairs on a bound asset spent the vault's backing (their
+// winner is paid from the same pots). The vault LP is now the EXCLUSIVE counterparty on
+// every route: risk-increasing TradeNoCpi / BatchTradeNoCpi on a bound asset -> 77.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn trade_nocpi(&mut self, a: &Trader, b: &Trader, size_q: i128) -> Result<(), String> {
+        let (a_id, _, a_ep) = self.identity(a.portfolio);
+        let (b_id, _, b_ep) = self.identity(b.portfolio);
+        let market_id =
+            state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, 0)
+                .unwrap()
+                .3;
+        let (cfg, _) = self.market_state();
+        let (ka, kb) = (a.kp.insecure_clone(), b.kp.insecure_clone());
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_ep,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_ep,
+                asset_index: 0,
+                market_id,
+                size_q,
+                exec_price: PRICE,
+                fee_bps: cfg.trade_fee_base_bps,
+                backing_fee_cap_bps: 10_000,
+            },
+            vec![
+                AccountMeta::new(ka.pubkey(), true),
+                AccountMeta::new(kb.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(a.portfolio, false),
+                AccountMeta::new(b.portfolio, false),
+            ],
+            &[&ka, &kb],
+        )
+        .map(|_| ())
+    }
+}
+
+#[test]
+fn p3_f14_outside_nocpi_cannot_grow_on_a_bound_asset() {
+    let mut env = Env::new(Params::default());
+    let a = env.new_trader(10_000_000);
+    let b = env.new_trader(10_000_000);
+    // Before binding, a NoCpi pair may open (the pre-P3 market shape).
+    env.trade_nocpi(&a, &b, 5 * POS).expect("unbound: NoCpi open");
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    // Bound: growing either outside side is refused...
+    err_has(&env.trade_nocpi(&a, &b, POS), PercolatorError::VaultLpExclusiveCounterparty);
+    let c = env.new_trader(10_000_000);
+    let d = env.new_trader(10_000_000);
+    err_has(&env.trade_nocpi(&c, &d, POS), PercolatorError::VaultLpExclusiveCounterparty);
+    // ...but the pre-existing pair can always unwind.
+    env.trade_nocpi(&a, &b, -5 * POS).expect("bound: NoCpi unwind allowed");
+    assert_eq!(env.position(a.portfolio), 0);
+    // Trading still works through the vault LP.
+    env.trade(&c, &lp, 2 * POS).expect("vault LP route");
+    env.assert_conserved("F-14 NoCpi exclusivity");
+}
+
+/// F-14 (independent fuzz, CPI-only shape of `anvil_c`): two traders on opposite sides of the
+/// vault LP, a price move, Resolve, closes in either order. Two senior Earn holders exit (in
+/// either order), then the junior sweeps. Every senior is paid in full before the junior gets
+/// anything, nothing is stranded, and the outcome does not depend on the order.
+fn f14_two_trader_run(traders_first: bool, senior_b_first: bool) -> (u64, u64, u64, u128) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let da = env.new_depositor();
+    env.earn_deposit(&da, 10_000_000, Some(lp.portfolio)).expect("earn A");
+    let db = env.new_depositor();
+    env.earn_deposit(&db, 228_224, Some(lp.portfolio)).expect("earn B");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t1 = env.new_trader(5_000_000);
+    let t2 = env.new_trader(5_000_000);
+    env.trade(&t1, &lp, 13 * POS + POS * 8 / 10).expect("t1 long 13.8");
+    env.move_price(825_000, &[lp.portfolio, t1.portfolio]);
+    env.svm.expire_blockhash();
+    env.trade(&t2, &lp, -(15 * POS + POS * 2 / 10)).expect("t2 short 15.2");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let mut paid_traders = 0u64;
+    let close_traders = |env: &mut Env, paid: &mut u64| {
+        for t in [&t1, &t2] {
+            for _ in 0..4 {
+                let (r, dest) = env.stranger_close_resolved(t.portfolio, t.kp.pubkey());
+                *paid += env.tok(dest);
+                if r.is_ok() && env.portfolio(t.portfolio).capital == 0 && env.portfolio(t.portfolio).pnl == 0 {
+                    break;
+                }
+            }
+        }
+    };
+    if traders_first {
+        close_traders(&mut env, &mut paid_traders);
+        for topup in [0u8, 1u8] {
+            let _ = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        }
+        close_traders(&mut env, &mut paid_traders);
+    } else {
+        for topup in [0u8, 1u8] {
+            let _ = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        }
+        close_traders(&mut env, &mut paid_traders);
+        for topup in [0u8, 1u8] {
+            let _ = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        }
+    }
+    env.paid_out += paid_traders as u128;
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
+    for t in [&t1, &t2] {
+        env.permissionless_close_portfolio(t.portfolio, t.kp.pubkey()).expect("cleanup trader");
+    }
+    assert_eq!(env.materialized_count(), 0, "terminal-flat");
+    env.svm.expire_blockhash();
+    let _ = env.crank_fees(true); // terminal harvest + residual absorption (78)
+    let order = if senior_b_first { [&db, &da] } else { [&da, &db] };
+    let mut senior_paid = [0u64; 2];
+    for (i, d) in order.iter().enumerate() {
+        let shares = env.lp_shares(d);
+        env.earn_request(d, shares);
+        env.svm.expire_blockhash();
+        senior_paid[i] = env.earn_execute(d, Some(lp.portfolio)).expect("every senior exits after Resolve");
+    }
+    let (pa, pb) = if senior_b_first { (senior_paid[1], senior_paid[0]) } else { (senior_paid[0], senior_paid[1]) };
+    env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    let junior = env.tok(junior_dest);
+    env.paid_out += junior as u128;
+    env.assert_conserved("F-14 two traders");
+    let (_, g) = env.market_state();
+    println!(
+        "F-14 two-trader traders_first={traders_first} b_first={senior_b_first}: traders {paid_traders}, seniors A {pa} B {pb}, junior {junior}, left vault {} ins {}",
+        g.vault, g.insurance
+    );
+    // Seniors whole before the junior: each gets its full claim less dead-share dust.
+    assert!(pa as u128 >= 10_000_000 - 1_000 && pb as u128 >= 228_224 - 25, "seniors whole: {pa} {pb}");
+    // Nothing stranded beyond insurance + dead-share dust.
+    assert!(g.vault <= g.insurance + 1_100, "stranded {}", g.vault - g.insurance);
+    (pa, pb, junior, g.vault)
+}
+
+#[test]
+fn p3_f14_two_traders_every_senior_exits_nothing_strands_any_order() {
+    let base = f14_two_trader_run(false, false);
+    for (tf, bf) in [(true, false), (false, true), (true, true)] {
+        let r = f14_two_trader_run(tf, bf);
+        assert!(r.0.abs_diff(base.0) <= 1 && r.1.abs_diff(base.1) <= 1, "senior payouts order-independent: {r:?} vs {base:?}");
+        assert!(r.2.abs_diff(base.2) <= 2, "junior order-independent: {r:?} vs {base:?}");
+    }
+}
+
+impl Env {
+    /// Tag 99 (upgrade authority = admin mock): protocol raises the vault-LP leverage cap.
+    fn set_vault_lp_lev(&mut self, lev_bps: u32) {
+        let admin = self.admin.insecure_clone();
+        let (pd, _) = Pubkey::find_program_address(&[self.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+        let (market, matcher) = (self.market, self.matcher);
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::SetVaultLpRisk {
+                asset_index: 0,
+                skew_slope_e9: 0,
+                skew_max_e9: 0,
+                lev_cap_q: 0,
+                lev_max_imr_bps: 0,
+                vault_lp_max_lev_bps: lev_bps,
+                approved_matcher_program: matcher.to_bytes(),
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .expect("tag 99 lev adjust");
+    }
+}
+
+/// F-14 class on tag 98 (independent lane: 25 EngineCounterUnderflow at a 1-atom shortfall on
+/// 07a1d0eb). The underflow is the engine NAV's fail-closed `principal - impairment` when the
+/// ledger books more impairment than principal (backing lent to a winner still outstanding as a
+/// provider receivable). STATE POKE (as `poke_senior_claim`): the own-domain ledger's
+/// cumulative loss is set 1 atom above its principal and C above the backing, a real senior
+/// shortfall; recall must then be bounded and never underflow (floored NAV = 0).
+#[test]
+fn p3_f14_recall_with_impairment_above_principal_never_underflows() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let mut acct = env.svm.get_account(&env.ledger).unwrap();
+    let mut l = state::read_backing_domain_ledger(&acct.data).unwrap();
+    l.cumulative_loss_atoms = l.total_principal_atoms + 1;
+    state::write_backing_domain_ledger(&mut acct.data, &l).unwrap();
+    env.svm.set_account(env.ledger, acct).unwrap();
+    poke_senior_claim(&mut env, 10_000_001);
+    // Shortfall = C_eff - floored NAV = 10,000,001 - 0. Over the bound: refused cleanly.
+    env.svm.expire_blockhash();
+    err_has(&env.recall(lp.portfolio, 10_000_002, DOMAIN), PercolatorError::VaultLpRecallRefused);
+    // Within it: recall 1 atom of junior capital (never an underflow).
+    env.svm.expire_blockhash();
+    let r = env.recall(lp.portfolio, 1, DOMAIN);
+    println!("F-14/98: recall 1 with impairment > principal -> {:?}", r.as_ref().map(|_| ()).map_err(|e| &e[..e.len().min(90)]));
+    r.expect("recall is bounded by the floored shortfall, never an underflow");
+}
+
+/// E2E B9 (HIGH, found on 6377376a): after a resolve, winners' payouts depended on the LP owner
+/// signing and on call order. On a P3 market the LP owner is the registry PDA (cannot sign):
+/// three winners against the vault LP (loser), NO LP-owner signature anywhere (101 and
+/// CloseResolved are both called by strangers), every call order — every winner is paid in full
+/// and the payouts are identical across orders.
+fn b9_run(order: u8) -> Vec<u64> {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 30_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..3).map(|_| env.new_trader(5_000_000)).collect();
+    for (i, t) in ts.iter().enumerate() {
+        env.svm.expire_blockhash();
+        env.trade(t, &lp, (4 + i as i128) * POS).expect("winner opens long vs vault LP");
+    }
+    let ports: Vec<Pubkey> = std::iter::once(lp.portfolio).chain(ts.iter().map(|t| t.portfolio)).collect();
+    env.move_price(1_200_000, &ports);
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let mut paid = vec![0u64; 3];
+    let close = |env: &mut Env, paid: &mut Vec<u64>, i: usize| {
+        let (_, dest) = env.stranger_close_resolved(ts[i].portfolio, ts[i].kp.pubkey());
+        paid[i] += env.tok(dest);
+    };
+    let settle = |env: &mut Env| {
+        for topup in [0u8, 1u8] {
+            let _ = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        }
+    };
+    let seq: Vec<i8> = match order {
+        0 => vec![-1, 0, 1, 2],
+        1 => vec![2, 1, 0, -1, 2, 1, 0],
+        2 => vec![1, -1, 2, 0, 1],
+        _ => vec![0, 2, -1, 1, 0, 2],
+    };
+    for step in seq {
+        if step < 0 { settle(&mut env) } else { close(&mut env, &mut paid, step as usize) }
+    }
+    for _ in 0..3 {
+        for i in 0..3 {
+            if env.portfolio(ts[i].portfolio).capital != 0 || env.portfolio(ts[i].portfolio).pnl != 0 {
+                close(&mut env, &mut paid, i);
+            }
+        }
+        settle(&mut env);
+    }
+    for (i, t) in ts.iter().enumerate() {
+        let p = env.portfolio(t.portfolio);
+        assert!(p.capital == 0 && p.pnl == 0, "winner {i} fully paid out (cap {} pnl {})", p.capital, p.pnl);
+    }
+    env.paid_out += paid.iter().map(|x| *x as u128).sum::<u128>();
+    env.assert_conserved("B9");
+    println!("B9 order {order}: winners paid {paid:?}");
+    paid
+}
+
+#[test]
+fn p3_b9_every_winner_paid_in_full_without_lp_signature_any_order() {
+    let base = b9_run(0);
+    for (i, p) in base.iter().enumerate() {
+        // capital 5,000,000 + a +20% win on (4+i) units at $1 (less fees at 0 bps)
+        assert!(*p >= 5_000_000 + (4 + i as u64) * 200_000 - 1_000, "winner {i} got {p}");
+    }
+    for order in 1..4 {
+        assert_eq!(b9_run(order), base, "winners' payouts must not depend on call order");
+    }
 }

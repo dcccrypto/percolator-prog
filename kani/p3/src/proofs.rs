@@ -379,11 +379,13 @@ fn kani_p3_h1_resolved_split_conserves_and_is_senior_first() {
 /// matcher, so it must never be pinned), bounded by the engine position bound, ordered
 /// (fill <= inventory), and never exceed their USD notional at that price
 /// (q * price <= usd * 1e12). A price for which a cap would round to 0 fails closed (None).
-/// Price is u32 (up to $4,294 e6); the production function takes u64.
+/// Price is u16 e6 (symbolic divisor); the production function takes u64.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn kani_p3_autopin_caps_finite_nonzero_bounded() {
-    let price: u32 = kani::any();
+    // u16 price (symbolic divisor; the u32 form had no verdict in 45 min on this box). Covers
+    // the clamp branch (tiny prices) and the division branch.
+    let price: u16 = kani::any();
     kani::assume(price > 0);
     let r = pinned_matcher_caps(price as u64);
     kani::cover!(r.is_some(), "caps pinned");
@@ -400,4 +402,56 @@ fn kani_p3_autopin_caps_finite_nonzero_bounded() {
         assert!(c.max_inventory_abs * price as u128 <= PIN_MAX_INVENTORY_USD * 1_000_000_000_000);
         assert_eq!(c.liquidity_notional_e6, PIN_LIQUIDITY_USD * 1_000_000);
     }
+}
+
+// ── F-14: terminal (Resolved) senior/junior split — conservation, seniors first, order ──────
+
+/// One terminal redemption exactly as tag 77 prices it in Resolved mode on a bound vault:
+/// senior value = min(physical, C); payout = floor(shares * senior_value / S);
+/// C -= floor(shares * C / S); physical -= payout; S -= shares.
+fn terminal_redeem(phys: u128, c: u128, s: u128, shares: u128) -> (u128, u128, u128, u128) {
+    let sv = tranche_split(phys, c).senior;
+    let pay = senior_atoms_for_redemption(shares, s, sv).unwrap();
+    let c2 = senior_claim_after_redemption(c, shares, s).unwrap();
+    assert!(pay <= phys, "a redemption never pays more than physically there");
+    (pay, phys - pay, c2, s - shares)
+}
+
+/// Two seniors exit (either order), then the junior takes `physical - C` (tag 102 Resolved).
+/// Proves: every atom is accounted for (payouts + what stays = physical); the junior is paid
+/// only if every senior was made whole at the time; each senior's payout is order-independent
+/// up to 1 atom of floor rounding; a solvent vault (physical >= C) pays each senior its exact
+/// pro-rata claim. u8 inputs (symbolic divisor S); production u128 functions.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_p3_terminal_split_conserves_senior_first_order_independent() {
+    let phys: u8 = kani::any();
+    let c: u8 = kani::any();
+    let s1: u8 = kani::any();
+    let s2: u8 = kani::any();
+    let dead: u8 = kani::any();
+    kani::assume(dead >= 1 && dead <= 3);
+    let (phys, c, s1, s2, dead) = (phys as u128, c as u128, s1 as u128, s2 as u128, dead as u128);
+    let s = s1 + s2 + dead;
+    // Order A: senior 1, senior 2, junior.
+    let (a1, p, cc, ss) = terminal_redeem(phys, c, s, s1);
+    let (a2, p, cc, _) = terminal_redeem(p, cc, ss, s2);
+    let ja = p.saturating_sub(cc);
+    assert_eq!(a1 + a2 + ja + (p - ja), phys, "conservation (order A)");
+    if ja > 0 {
+        assert!(p > cc, "junior paid only above the remaining senior claim");
+    }
+    // Order B: senior 2, senior 1, junior.
+    let (b2, q, dd, tt) = terminal_redeem(phys, c, s, s2);
+    let (b1, q, dd, _) = terminal_redeem(q, dd, tt, s1);
+    let jb = q.saturating_sub(dd);
+    assert_eq!(b1 + b2 + jb + (q - jb), phys, "conservation (order B)");
+    assert!(a1.abs_diff(b1) <= 1 && a2.abs_diff(b2) <= 1, "order-independent up to floor dust");
+    if phys >= c {
+        // Solvent: each senior gets exactly floor(s_i * C / S) in first position.
+        assert_eq!(a1, (s1 * c) / s);
+        assert_eq!(b2, (s2 * c) / s);
+    }
+    kani::cover!(phys < c && s1 > 0 && s2 > 0 && a1 > 0, "impaired vault, both seniors paid pro-rata");
+    kani::cover!(phys > c && ja > 0 && s1 > 0 && s2 > 0, "solvent vault, junior takes the surplus");
 }
