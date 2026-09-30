@@ -1002,6 +1002,20 @@ impl World {
         // Round-trip winner-underpayment probe at the resolved close (flat portfolios only, so
         // the pnl field is the whole claim): value before = capital + positive pnl; value after
         // = what was paid + what the portfolio still holds.
+        // Repeat closes finalise open receipts once diluting claimants have closed (rate -> 1):
+        // credit every payout after a provisional shortfall against it.
+        if r.is_ok() {
+            let paid_now = self.env.token_amount(dst) as u128;
+            if paid_now > 0 {
+                if let Some(pb) = self.provisional_burn.get_mut(&u) {
+                    if *pb > 0 {
+                        let credit = paid_now.min(*pb);
+                        *pb -= credit;
+                        *self.stats.soft.entry("repeat_close_credited_atoms").or_default() += credit.min(u64::MAX as u128) as u64;
+                    }
+                }
+            }
+        }
         if let (Ok(_), Some(b)) = (&r, before) {
             if b.legs.iter().all(|l| !l.active) && b.pnl > 0 {
                 let paid = self.env.token_amount(dst) as u128;
