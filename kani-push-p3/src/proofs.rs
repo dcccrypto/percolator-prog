@@ -603,6 +603,117 @@ fn kani_push_p3_lemma_crank_senior_part_full() {
     }
 }
 
+// Sub-range split of `_scaled` (its clean run hit 2400 s): the per-side A pair is fixed per
+// harness (constant divisors), everything else as in `_scaled`. Pairs cover both asymmetry
+// directions and the extremes (0.1 and 1.0 of ADL_ONE).
+macro_rules! skew_scaled_fixed {
+    ($name:ident, $kl:expr, $ks:expr) => {
+        #[kani::proof]
+        #[kani::solver(kissat)]
+        fn $name() {
+            let premium: i8 = kani::any();
+            let lp_net: i16 = kani::any();
+            let oi: u16 = kani::any();
+            let slope: u8 = kani::any();
+            let cap: u8 = kani::any();
+            let max_abs: u8 = kani::any();
+            let dt: u8 = kani::any();
+            let p16: u16 = kani::any();
+            let q8: u8 = kani::any();
+            kani::assume(p16 > 0);
+            let a_long = MIN_A_SIDE * $kl;
+            let a_short = MIN_A_SIDE * $ks;
+            let price = p16 as i128 * 1_000;
+            let q = q8 as i128 * 10_000;
+            let skew = skew_funding_rate_e9(lp_net as i128, oi as u128, slope as u64, cap as u64);
+            let rate = combine_funding_rate_e9(premium as i128, skew, max_abs as u64);
+            let fid = floor_div_signed_conservative_i128(rate * dt as i128 * price, FUNDING_DEN);
+            let (_kl, _ks, f_long, f_short) =
+                percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short).unwrap();
+            #[cfg(feature = "neg_flat_a")]
+            let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+            let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
+            let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+            let net = long_pnl + short_pnl;
+            kani::cover!(fid != 0 && long_pnl < -1, "material transfer");
+            kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
+            assert!(net <= 0 && net >= -1);
+        }
+    };
+}
+skew_scaled_fixed!(kani_push_p3_skew_scaled_a_3_10, 3u128, 10u128);
+skew_scaled_fixed!(kani_push_p3_skew_scaled_a_10_3, 10u128, 3u128);
+skew_scaled_fixed!(kani_push_p3_skew_scaled_a_1_10, 1u128, 10u128);
+skew_scaled_fixed!(kani_push_p3_skew_scaled_a_7_2, 7u128, 2u128);
+
+/// SKEW FUNDING ZERO-SUM, tractable AND bug-sensitive: same pipeline as `_scaled`
+/// (real wrapper rate fns -> engine fid formula -> REAL engine kernel -> engine signed floor), with
+/// 8-bit symbolic factors and constant scale-ups so that |q * fid| reaches ~4e7 (above the
+/// ~1e6 needed for the flat-A #114 bug to mint), and per-side A on the asymmetric grid.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_push_p3_skew_funding_conserves_mid() {
+    let premium: i8 = kani::any();
+    let lp_net: i8 = kani::any();
+    let oi: u8 = kani::any();
+    let slope: u8 = kani::any();
+    let cap: u8 = kani::any();
+    let max_abs: u8 = kani::any();
+    let dt: u8 = kani::any();
+    let p8: u8 = kani::any();
+    let q8: u8 = kani::any();
+    let kl: u8 = kani::any();
+    let ks: u8 = kani::any();
+    kani::assume(kl >= 1 && kl <= 10 && ks >= 1 && ks <= 10 && p8 > 0);
+    let a_long = MIN_A_SIDE * kl as u128;
+    let a_short = MIN_A_SIDE * ks as u128;
+    let price = p8 as i128 * 1_000_000; // $1 .. $255
+    let q = q8 as i128 * 10_000;
+    let skew = skew_funding_rate_e9(lp_net as i128 * 1_000, oi as u128 * 1_000, slope as u64 * 100, cap as u64 * 100);
+    let rate = combine_funding_rate_e9(premium as i128 * 100, skew, max_abs as u64 * 100);
+    let fid = floor_div_signed_conservative_i128(rate * dt as i128 * price, FUNDING_DEN);
+    let (_kl, _ks, f_long, f_short) =
+        percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short).unwrap();
+    #[cfg(feature = "neg_flat_a")]
+    let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+    let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
+    let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+    let net = long_pnl + short_pnl;
+    kani::cover!(kl != ks && fid != 0 && long_pnl < -1, "asymmetric-A material transfer");
+    kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
+    assert!(net <= 0 && net >= -1);
+}
+
+/// SKEW ZERO-SUM, lemma K (full width): the REAL engine kernel scales each side's funding index
+/// delta by THAT side's live A: `F_long = -fid*a_long`, `F_short = +fid*a_short`, for any fid the
+/// wrapper's clamped rate can produce and any A in [MIN_A_SIDE, ADL_ONE]. With the engine's realize
+/// rule `floor(q*dF/(a_basis*POS_SCALE))` and a_basis = the side's live A, each matched leg of size
+/// q then realizes exactly floor(-q*fid/POS_SCALE) resp. floor(q*fid/POS_SCALE), whose sum is in
+/// [-1, 0] (floor(x) + floor(-x) ∈ {-1, 0}). The flat-A (#114) bug is exactly a violation of K.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_push_p3_lemma_engine_kernel_scales_funding_per_side() {
+    let premium: i64 = kani::any();
+    let skew: i64 = kani::any();
+    let max_abs: u32 = kani::any();
+    let dt: u32 = kani::any();
+    let price: u64 = kani::any();
+    kani::assume(price as u128 <= percolator::MAX_ORACLE_PRICE as u128);
+    let rate = combine_funding_rate_e9(premium as i128, skew as i128, max_abs as u64);
+    let fid = floor_div_signed_conservative_i128(rate * dt as i128 * price as i128, FUNDING_DEN);
+    let a_long: u128 = kani::any();
+    let a_short: u128 = kani::any();
+    kani::assume(a_long >= MIN_A_SIDE && a_long <= ADL_ONE);
+    kani::assume(a_short >= MIN_A_SIDE && a_short <= ADL_ONE);
+    let r = percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short);
+    kani::cover!(r.is_ok() && a_long != a_short && fid != 0, "asymmetric A, non-zero funding");
+    let (_kl, _ks, f_long, f_short) = r.unwrap();
+    #[cfg(feature = "neg_flat_a")]
+    let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+    assert_eq!(f_long, -(fid * a_long as i128));
+    assert_eq!(f_short, fid * a_short as i128);
+}
+
 // ── Solver diagnostics (2026-09-30 03:00): the smallest division lemma, three solvers. ──
 fn diag_body() {
     let a: u8 = kani::any();
