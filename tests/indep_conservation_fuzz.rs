@@ -1398,6 +1398,13 @@ impl World {
             if self.stake.is_some() {
                 let _ = self.do_stake87_accrue();
                 self.pending_violation = None;
+                // F-9 fix (stake f9b9190): permissionless terminal insurance recovery (tag 29).
+                if std::env::var("FUZZ_STAKE_TAG29").map_or(true, |v| v != "0") {
+                    let rb = self.env.market_state().1.insurance_domain_budget_remaining_total;
+                    if rb > 0 && self.do_stake_recover_terminal(rb as u64, None).is_ok() {
+                        *self.stats.ok.entry("winddown_stake_tag29").or_default() += 1;
+                    }
+                }
             }
             let rb = self.env.market_state().1.insurance_domain_budget_remaining_total;
             if rb > 0 && self.do_withdraw_terminal_insurance(rb).is_ok() {
