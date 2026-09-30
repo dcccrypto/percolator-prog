@@ -3974,3 +3974,65 @@ fn indep_p3_terminal_recredit_only_seniors_can_redeem() {
     eprintln!("terminal-recredit-only: wind_down -> {r:?}; 78 errors {e78:?}");
     r.expect("seniors must always redeem on a terminal-flat Resolved market with no fees pending");
 }
+
+/// Round-trip control with an ORDINARY matcher LP (v18.2 shape; non-P3 World): an Earn vault
+/// (9M in domain 0), trader long 10 units vs the LP, price 1.0 -> 0.4 (trader -6M) -> 2.05
+/// (trader +16.5M), marks fresh; the trader then closes, converts and withdraws. Prints what the
+/// trader receives vs owes and the domain buckets (is there a consumed lien in the vault pot, and
+/// is the winner haircut?). Run on the v18.2 baseline and on the P3 bytes (non-P3 mode).
+#[test]
+#[ignore]
+fn roundtrip_ordinary_lp_control_probe() {
+    let mut w = World::new(0);
+    if w.lp_vault.is_none() { w.create_lp_vault(); }
+    let r = w.do_lp_deposit(0, 9_000_000);
+    eprintln!("RTC 75 senior 9M d0 -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    let u = 1usize;
+    let lp = N_USERS;
+    let r = w.do_trade_cpi(u, 10 * POS_SCALE as i128);
+    eprintln!("RTC open long 10 -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    let dump = |w: &World, label: &str| {
+        let g = w.env.market_state().1;
+        let bs = percolator::BOUND_SCALE;
+        let t = w.env.portfolio_state(w.ports[u]);
+        let l = w.env.portfolio_state(w.ports[lp]);
+        let b: Vec<String> = (0..2).map(|d| { let b = &g.source_backing_buckets[d]; let c = &g.source_credit[d];
+            format!("d{d} {:?} fresh {} vlien {} consumed {} | sc claim {} rate {}", b.status, b.fresh_unliened_backing_num / bs, b.valid_liened_backing_num / bs, b.consumed_liened_backing_num / bs, c.positive_claim_bound_num / bs, c.credit_rate_num) }).collect();
+        eprintln!("RTC[{label}] eff {} | T cap {} pnl {} | LP cap {} pnl {} | {} | ins {} vault {}", g.assets[0].effective_price, t.capital, t.pnl, l.capital, l.pnl, b.join(" | "), g.insurance, w.env.token_amount(w.env.vault));
+    };
+    let walk = |w: &mut World, target: u64| {
+        for _ in 0..400 {
+            let s = w.slot() + 20;
+            w.env.svm.warp_to_slot(s);
+            let _ = w.do_push(target);
+            let _ = w.do_crank(u);
+            let _ = w.do_crank(lp);
+            if w.env.market_state().1.assets[0].effective_price == target { break; }
+        }
+        for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.do_crank(u); let _ = w.do_crank(lp); }
+    };
+    walk(&mut w, 400_000);
+    dump(&w, "after loss leg");
+    walk(&mut w, 2_050_000);
+    dump(&w, "after reversal");
+    for _ in 0..6 {
+        let pos = w.env.portfolio_state(w.ports[u]).legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| l.basis_pos_q).unwrap_or(0);
+        if pos == 0 { break; }
+        let r = w.do_trade_cpi(u, -pos);
+        eprintln!("RTC close -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+        let s = w.slot() + 5; w.env.svm.warp_to_slot(s); let _ = w.do_crank(u); let _ = w.do_crank(lp);
+    }
+    dump(&w, "after close");
+    let t = w.env.portfolio_state(w.ports[u]);
+    let owed = t.capital + t.pnl.max(0) as u128;
+    for i in 0..4 {
+        let pnl = w.env.portfolio_state(w.ports[u]).pnl;
+        if pnl <= 0 { break; }
+        let r = w.do_convert(u, pnl as u128);
+        eprintln!("RTC convert #{i} {pnl} -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+        let s = w.slot() + 5; w.env.svm.warp_to_slot(s); let _ = w.do_crank(u); let _ = w.do_crank(lp);
+    }
+    dump(&w, "after convert");
+    let cap = w.env.portfolio_state(w.ports[u]).capital;
+    eprintln!("RTC SUMMARY: trader owed at close {owed}; capital after convert {cap} (haircut {})", owed.saturating_sub(cap));
+}

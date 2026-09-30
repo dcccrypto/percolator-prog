@@ -3686,7 +3686,13 @@ pub fn send_tx(
         svm.latest_blockhash(),
     );
     let r = svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
+        .map(|meta| {
+            if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
+                let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
+                if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
+            }
+            meta.compute_units_consumed
+        })
         .map_err(|e| format!("{e:?}"));
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
@@ -3708,7 +3714,7 @@ pub fn log_error_sites(r: &Result<u64, String>) {
                         .split(", ")
                         .filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
                         .collect();
-                    if v.first() == Some(&0xB1) { format!("b1{:?}", &v[1..]) } else { format!("{:x}@{}", v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)) }
+                    if matches!(v.first(), Some(&0xB1) | Some(&0xB2) | Some(&0xB3)) { format!("{:x}{:?}", v[0], &v[1..]) } else { format!("{:x}@{}", v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)) }
                 })
                 .collect();
             eprintln!("ERR-SITES {:?}", sites);
@@ -3733,7 +3739,13 @@ pub fn send_raw_tx(
         svm.latest_blockhash(),
     );
     let r = svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
+        .map(|meta| {
+            if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
+                let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
+                if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
+            }
+            meta.compute_units_consumed
+        })
         .map_err(|e| format!("{e:?}"));
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);

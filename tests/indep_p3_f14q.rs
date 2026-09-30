@@ -144,7 +144,7 @@ impl P3 {
         let admin = self.env.admin.insecure_clone();
         let (m, r, mint) = (self.env.market, self.registry, self.lp_mint);
         self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: TL_FEE_SHARE.with(|c| c.get()).or_else(|| std::env::var("P3_FEE_SHARE_BPS").ok().and_then(|v| v.parse().ok())).unwrap_or(0), redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -454,6 +454,22 @@ impl P3 {
         r78
     }
 
+    /// 98 VaultLpRecall (permissionless), into `target_domain`.
+    fn recall_to(&mut self, amount: u128, target_domain: u16) -> Result<u64, String> {
+        let cranker = Keypair::new();
+        self.env.ensure_signer_account(cranker.pubkey());
+        let (own, sib) = if target_domain == 0 { (self.ledger0, self.ledger1) } else { (self.ledger1, self.ledger0) };
+        let metas = vec![
+            AccountMeta::new(cranker.pubkey(), true), AccountMeta::new(self.env.market, false), AccountMeta::new_readonly(self.registry, false),
+            AccountMeta::new(self.state_pda, false), AccountMeta::new(self.lp, false), AccountMeta::new(own, false), AccountMeta::new(sib, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ];
+        let mut b = vec![98u8];
+        b.extend_from_slice(&amount.to_le_bytes());
+        b.extend_from_slice(&target_domain.to_le_bytes());
+        self.send_raw(b, metas, &[&cranker])
+    }
+
     fn crank(&mut self, p: Pubkey) -> Result<u64, String> {
         let slot = self.slot();
         let payer = self.env.payer.pubkey();
@@ -588,6 +604,7 @@ fn code(e: &str) -> Option<u32> {
 }
 
 thread_local! { static TL_IM: std::cell::Cell<u64> = std::cell::Cell::new(10_000); }
+thread_local! { static TL_FEE_SHARE: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
     if im == 1_000 {
@@ -1767,4 +1784,201 @@ fn c7_permissionless_exit_sweep() {
     let jr = w.junior_release_resolved(&admin);
     c7_dump(&w, "final", &ports);
     eprintln!("C7S SUMMARY: trader payouts (winner + seed) {out}, seniors {sen}, junior {jr}, vault {v0} -> left {}; winner owed {owed} (beyond-junior loss {lp_loss_beyond_junior})", w.tok(&w.env.vault));
+}
+
+/// Round-trip lock probe (builder report, p3-vault-owned-lp-2026-09-29.md §7: trader loses 6M,
+/// the price reverses, the trader wins 16.5M vs the vault LP, marks fresh; every 77 -> 21, the
+/// winner's convert -> 19, a 6M consumed lien in d0). Prints the state and each exit's result.
+/// RT="junior,d0,d1,trader_cap,units,low_bps,high_bps" (prices in bps of 1.0).
+fn rt_world() -> (P3, Vec<(Keypair, Pubkey)>, (Keypair, Pubkey), Keypair) {
+    let v: Vec<u64> = std::env::var("RT").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect())
+        .unwrap_or_else(|| vec![20_000_000, 9_000_000, 1_000_000, 50_000_000, 10, 4_000, 20_500]);
+    let (junior, d0, d1, tcap, units, low, high) = (v[0], v[1], v[2], v[3], v[4] as i128, v[5], v[6]);
+    // TRUMP-seed params (accrual dt 500, move 1 bps/slot): with the default dt = 1 every crank
+    // stops at the bounded catch-up and PnL is never realised mid-path (the C-7 divergence).
+    TL_IM.with(|c| c.set(1_000));
+    let mut w = P3::new();
+    w.create_vault();
+    let s0 = Keypair::new();
+    let s1 = Keypair::new();
+    let a0 = w.earn_deposit_domain(&s0, d0, false, 0).expect("75 d0");
+    let a1 = w.earn_deposit_domain(&s1, d1, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 0).unwrap_or_else(|e| panic!("99: {e}"));
+    w.junior_deposit(&admin, junior).unwrap_or_else(|e| panic!("96: {e}"));
+    let (t, tp) = w.trader(tcap);
+    let lp = w.lp;
+    let r = w.trade_vs_lp_fee(&t, tp, units * U, 30);
+    eprintln!("RT open long {units} -> {:?} pos {}", r.as_ref().map_err(|e| code(e)), w.pos(tp));
+    let ports = [("LP", lp), ("T", tp)];
+    MARK.with(|c| c.set(PRICE));
+    let walk = |w: &mut P3, target: u64| {
+        MARK.with(|c| c.set(target));
+        for _ in 0..200 {
+            let s = w.slot() + 500;
+            w.env.svm.warp_to_slot(s);
+            w.env.push_auth_mark_for_asset_as_admin(0, s, target);
+            let rt_ = w.crank(tp);
+            let rl_ = w.crank(lp);
+            if std::env::var("RT_TRACE").is_ok() {
+                let g = w.env.market_state().1;
+                let b0 = &g.source_backing_buckets[0];
+                let b1 = &g.source_backing_buckets[1];
+                let bs = percolator::BOUND_SCALE;
+                let lpx = w.env.portfolio_state(lp);
+                let tx = w.env.portfolio_state(tp);
+                eprintln!("RT trace eff {} | crank T {:?} LP {:?} | T cap {} pnl {} | LP cap {} pnl {} | d0 fresh {} vlien {} consumed {} | d1 fresh {} vlien {} consumed {} | sc0 claim {} sc1 claim {}",
+                    g.assets[0].effective_price, rt_.as_ref().map_err(|e| code(e)), rl_.as_ref().map_err(|e| code(e)), tx.capital, tx.pnl, lpx.capital, lpx.pnl,
+                    b0.fresh_unliened_backing_num / bs, b0.valid_liened_backing_num / bs, b0.consumed_liened_backing_num / bs,
+                    b1.fresh_unliened_backing_num / bs, b1.valid_liened_backing_num / bs, b1.consumed_liened_backing_num / bs,
+                    g.source_credit[0].positive_claim_bound_num / bs, g.source_credit[1].positive_claim_bound_num / bs);
+            }
+            if w.env.market_state().1.assets[0].effective_price == target { break; }
+        }
+        for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(tp); let _ = w.crank(lp); }
+        eprintln!("RT walk -> eff {} (target {target})", w.env.market_state().1.assets[0].effective_price);
+    };
+    walk(&mut w, PRICE * low / 10_000);
+    c7_dump(&w, "RT after the loss leg", &ports);
+    walk(&mut w, PRICE * high / 10_000);
+    c7_dump(&w, "RT after the reversal", &ports);
+    (w, vec![(s0, a0), (s1, a1)], (t, tp), admin)
+}
+
+#[test]
+#[ignore]
+fn roundtrip_lock_probe_and_permissionless_sweep() {
+    let (mut w, seniors, (t, tp), admin) = rt_world();
+    let m = w.env.market;
+    let lp = w.lp;
+    let ports = [("LP", lp), ("T", tp)];
+    let convert = |w: &mut P3| {
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl <= 0 { return None; }
+        let (pid, _, pep) = w.env.portfolio_identity(tp);
+        Some(w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[&t]).map_err(|e| code(&e)))
+    };
+    let try77 = |w: &mut P3, label: &str| {
+        for (i, (k, a)) in seniors.iter().enumerate() {
+            let sh = (w.tok(a) as u128).min(1_000_000);
+            if sh == 0 { continue; }
+            let rq = w.request_redeem(k, *a, sh);
+            let r78 = w.crank_fees_78();
+            let (d, r) = w.execute_redeem_domain(k, i as u16);
+            eprintln!("RT[{label}] senior {i}: 76 {:?} 78 {:?} 77 d{i} ({sh} shares) {:?} paid {}", rq.as_ref().map_err(|e| code(e)), r78.as_ref().map_err(|e| code(e)), r.as_ref().map_err(|e| code(e)), w.tok(&d));
+            if let Err(e) = &r { if code(e).is_none() { eprintln!("RT[{label}] 77 raw: {}", &e[..e.len().min(300)]); let l: Vec<&str> = e.split("\"").filter(|x| x.len() > 3 && !x.starts_with(", ")).collect(); eprintln!("RT[{label}] 77 logs: {:?}", l); } }
+            if r.is_err() {
+                let red = state::derive_lp_redemption(&w.env.program_id, &w.registry, &k.pubkey()).0;
+                let (reg_, mint_, esc_) = (w.registry, w.lp_mint, w.escrow);
+                let _ = w.send(ProgInstruction::CancelRedemption, vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new_readonly(reg_, false), AccountMeta::new(red, false), AccountMeta::new_readonly(mint_, false), AccountMeta::new(*a, false), AccountMeta::new(esc_, false), AccountMeta::new_readonly(spl_token::ID, false)], &[k]);
+            }
+        }
+    };
+    eprintln!("RT winner convert (position open) -> {:?}", convert(&mut w));
+    try77(&mut w, "open");
+    // Winner closes, then converts.
+    for _ in 0..6 {
+        let r = w.trade_vs_lp_fee(&t, tp, -w.pos(tp), 30);
+        eprintln!("RT close -> {:?}", r.as_ref().map_err(|e| code(e)));
+        if r.is_ok() { break; }
+        w.catch_up(&[tp, lp], 5);
+    }
+    w.catch_up(&[tp, lp], 10);
+    c7_dump(&w, "RT after close", &ports);
+    for i in 0..4 { eprintln!("RT winner convert #{i} (flat) -> {:?}", convert(&mut w)); w.catch_up(&[tp, lp], 10); }
+    try77(&mut w, "flat");
+    // Permissionless sweep (Live): crank bursts, 45, 89, 98 recall, 78, keeper-style fresh pushes, long waits.
+    let phases: [(&str, u64, u64); 3] = [("A crank burst", 200, 1), ("B keeper refresh every 20", 4_000, 20), ("C long wait every 500", 100_000, 500)];
+    for (name, span, step) in phases {
+        let end = w.slot() + span;
+        while w.slot() < end {
+            let s = w.slot() + step;
+            w.env.svm.warp_to_slot(s);
+            let mark = MARK.with(|c| c.get());
+            if w.env.market_state().1.mode == percolator::MarketModeV16::Live { w.env.push_auth_mark_for_asset_as_admin(0, s, mark); }
+            let _ = w.crank(lp);
+            let _ = w.crank(tp);
+            for side in 0..2u8 { let _ = w.send(ProgInstruction::FinalizeResetSide { asset_index: 0, side }, vec![AccountMeta::new(m, false)], &[]); }
+            for d in 0..2u16 { let _ = w.send(ProgInstruction::ExpireBackingBucket { domain: d }, vec![AccountMeta::new(m, false)], &[]); }
+            let _ = w.crank_fees_78();
+        }
+        let r98a = w.recall_to(1_000_000, 0);
+        let r98b = w.recall_to(1_000_000, 1);
+        c7_dump(&w, &format!("RT sweep {name}"), &ports);
+        eprintln!("RT sweep {name}: 98 d0 {:?} d1 {:?}; winner convert -> {:?}", r98a.as_ref().map_err(|e| code(e)), r98b.as_ref().map_err(|e| code(e)), convert(&mut w));
+        try77(&mut w, name);
+    }
+    // Phase D: permissionless 98 recall repeated (1M per call, d0 then d1) until refused, then 77.
+    let mut nrec = 0;
+    for _ in 0..40 {
+        let r0 = w.recall_to(1_000_000, 0);
+        let r1 = if r0.is_err() { w.recall_to(1_000_000, 1) } else { Ok(0) };
+        if r0.is_err() && r1.is_err() { eprintln!("RT D: 98 stops after {nrec}: d0 {:?} d1 {:?}", r0.as_ref().map_err(|e| code(e)), r1.as_ref().map_err(|e| code(e))); break; }
+        nrec += 1;
+    }
+    c7_dump(&w, "RT after recall loop", &ports);
+    try77(&mut w, "after recall loop");
+    let _ = admin;
+}
+
+/// ROUND-TRIP LOCK gate (builder report p3 §7, reproduced independently on 58e379f1 with the
+/// rehearsal seed's vault config: fee_share 1000 bps, TRUMP params): the trader loses 6M against
+/// the vault LP, the price reverses and it wins 16.5M, marks fresh. The junior (20M) covers the
+/// net LP loss (10.5M), so NOBODY should lose: the winner converts its full 16.5M, and every
+/// senior (d0 9M, d1 1M) redeems in full. On 58e379f1 (NEGATIVE CONTROL, fails): the 6M the
+/// trader lost stays in pot d0 as a CONSUMED lien owned by nobody; the winner's convert pays only
+/// the 11.5M in d1 (including the d1 senior's 1M); every 77 -> 21 (d0: all-"earnings" payout at
+/// the earnings gate, v16_program.rs:25070-25072; d1: empty pot, :25062-25068).
+#[test]
+fn roundtrip_lock_winner_and_seniors_exit_in_full() {
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    let (mut w, seniors, (t, tp), _admin) = rt_world();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    let m = w.env.market;
+    let lp = w.lp;
+    let t_ = w.env.portfolio_state(tp);
+    let (cap_rev, pnl_rev) = (t_.capital, t_.pnl);
+    eprintln!("RTG after reversal: trader cap {cap_rev} pnl {pnl_rev}");
+    assert!(pnl_rev >= 16_000_000, "vacuity: the reversal leaves the trader ~+16.5M (pnl {pnl_rev})");
+    let d0 = w.env.market_state().1.source_backing_buckets[0].consumed_liened_backing_num / percolator::BOUND_SCALE;
+    eprintln!("RTG d0 consumed lien {d0}");
+    for _ in 0..6 {
+        let r = w.trade_vs_lp_fee(&t, tp, -w.pos(tp), 30);
+        if r.is_ok() { break; }
+        w.catch_up(&[tp, lp], 5);
+    }
+    w.catch_up(&[tp, lp], 10);
+    let t_ = w.env.portfolio_state(tp);
+    let owed = t_.capital + t_.pnl.max(0) as u128;
+    for _ in 0..4 {
+        let pnl = w.env.portfolio_state(tp).pnl;
+        if pnl <= 0 { break; }
+        let (pid, _, pep) = w.env.portfolio_identity(tp);
+        let r = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false)], &[&t]);
+        eprintln!("RTG convert {pnl} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        w.catch_up(&[tp, lp], 10);
+    }
+    let cap = w.env.portfolio_state(tp).capital;
+    let dest = w.token(t.pubkey(), 0);
+    let (pid, seq, _) = w.env.portfolio_identity(tp);
+    let rw = w.send(ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: cap },
+        vec![AccountMeta::new(t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(tp, false), AccountMeta::new(dest, false),
+             AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&t]);
+    let winner = w.tok(&dest) as u128;
+    eprintln!("RTG winner withdraw {cap} -> {:?}; received {winner}, owed at close {owed}", rw.as_ref().map_err(|e| code(e)));
+    let mut paid = vec![];
+    for (i, (k, a)) in seniors.iter().enumerate() {
+        let sh = w.tok(a) as u128;
+        let _ = w.request_redeem(k, *a, sh);
+        let _ = w.crank_fees_78();
+        let (d, r) = w.execute_redeem_domain(k, i as u16);
+        eprintln!("RTG senior d{i} 77 ({sh} shares) -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+        paid.push(w.tok(&d) as u128);
+    }
+    assert!(winner + 2 >= owed, "RULE: the winner is paid in full after the round trip: {winner} < {owed}");
+    assert!(paid[0] + 1_000 >= 9_000_000 && paid[1] + 1_000 >= 1_000_000, "no senior loss (junior covers the net 10.5M): seniors paid {paid:?}");
 }
