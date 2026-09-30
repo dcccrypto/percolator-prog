@@ -28,20 +28,22 @@ fn kani_design_p3_33_recall_capped_by_lp_equity_and_halted_while_pending() {
     kani::cover!(!pending && e < 0 && existing > 0, "negative LP equity: nothing recalled");
 }
 
-/// D-P3-33c  The composition tag 98 actually evaluates, on the REAL `recall_limit` as the
-/// existing limit: after ANY draw step (including a junior-covered one — the retired D-P3-30
-/// counterexample C=100, J=50, B=80, D=50), the recall allowed is bounded by the LP's positive
-/// certified equity, whatever the raw shortfall became.
+/// D-P3-33c (review §11 revision)  The retired D-P3-30 stated on the FIXED code: right after ANY
+/// draw step (junior-covered or senior), the vault LP's certified equity is `moved − deficit`
+/// (the deficit is −certified_equity, per `vault_lp_senior_draw_amount`'s doc), so the recall tag 98
+/// allows — `vault_lp_recall_limit` over the REAL `recall_limit` of the post-draw state — is 0,
+/// whatever the raw shortfall became and whether or not a draw is pending.
 #[kani::proof]
-fn kani_design_p3_33c_recall_after_any_draw_bounded_by_equity() {
+fn kani_design_p3_33c_no_recall_right_after_any_draw() {
     let s = DrawState { senior_claim: kani::any(), outstanding: kani::any(), junior_surplus: kani::any(), drawable: kani::any() };
     let d: u128 = kani::any();
+    kani::assume(d <= i128::MAX as u128);
     let (n, moved, _) = vault_lp_draw_step(s, d);
-    let e: i128 = kani::any();
+    let e: i128 = moved as i128 - d as i128; // moved <= d, so e <= 0
     let pending: bool = kani::any();
-    let r = vault_lp_recall_limit(recall_limit(n.senior_claim, s.drawable - moved), e, pending);
-    let eq_pos: u128 = if e > 0 { e as u128 } else { 0 };
-    assert!(r <= eq_pos);
-    kani::cover!(!pending && moved > 0 && r > 0, "recall after a draw, within equity");
-    kani::cover!(recall_limit(n.senior_claim, s.drawable - moved) > recall_limit(s.senior_claim, s.drawable) && r <= eq_pos, "raw shortfall grew (old D-P3-30 case) yet recall stays within equity");
+    let raw = recall_limit(n.senior_claim, s.drawable - moved);
+    let r = vault_lp_recall_limit(raw, e, pending);
+    assert_eq!(r, 0, "no recall can re-open a deficit a draw just funded");
+    kani::cover!(!pending && moved > 0 && moved == d && raw > 0, "fully funded draw, shortfall exists, still no recall");
+    kani::cover!(raw > recall_limit(s.senior_claim, s.drawable) && !pending, "raw shortfall grew (old D-P3-30 case) yet no recall");
 }
