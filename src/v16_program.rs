@@ -30179,4 +30179,34 @@ mod p1_kani_proofs {
         kani::cover!(fast == Some(false), "over cap");
     }
 
+
+    #[kani::proof]
+    fn kani_p1_cap_check_monotone_no_overflow() {
+        // The processor decides the LP cap with the division-free `exposure_within_cap_fast`
+        // whenever it fits (always, for realistic magnitudes); prove that form is monotone and
+        // overflow-safe (checked arithmetic: `None`, never a panic).
+        let abs1: u32 = kani::any();
+        let abs2: u32 = kani::any();
+        let e1: u32 = kani::any();
+        let e2: u32 = kani::any();
+        let k1: u16 = kani::any();
+        let k2: u16 = kani::any();
+        let price: u32 = kani::any();
+        kani::assume(price != 0 && abs2 <= abs1 && e1 <= e2 && k1 <= k2);
+        let a = p1::exposure_within_cap_fast(abs1 as u128, e1 as u128, k1 as u32, price as u64, 1_000_000);
+        let b = p1::exposure_within_cap_fast(abs2 as u128, e2 as u128, k2 as u32, price as u64, 1_000_000);
+        assert!(a.is_some() && b.is_some());
+        // Within cap at (abs1, e1, k1) => within cap for a smaller position, more equity, larger k.
+        if a == Some(true) {
+            assert_eq!(b, Some(true));
+        }
+        // Zero position always fits; zero equity admits only a zero position.
+        assert_eq!(p1::exposure_within_cap_fast(0, e1 as u128, k1 as u32, price as u64, 1_000_000), Some(true));
+        if e1 == 0 && abs1 > 0 {
+            assert_eq!(a, Some(false));
+        }
+        kani::cover!(a == Some(true) && abs1 > 0, "non-trivial position within cap");
+        kani::cover!(a == Some(false) && b == Some(true), "monotone step across the cap");
+    }
+
 }
