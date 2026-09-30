@@ -2317,6 +2317,125 @@ fn indep_f3_wrapper_flow_accrue_to_dead_shares_books_nothing() {
     assert_eq!(after.2, before.2, "F3: AccrueFees booked {} fee atoms to a dead-shares-only pool", after.2 - before.2);
 }
 
+impl World {
+    /// F-9 fix: stake tag 29 RecoverTerminalInsurance (percolator-stake
+    /// fix/stake-f9-terminal-insurance). Permissionless; `stray` is the optional
+    /// account-9 vault_auth-owned token account to sweep.
+    fn do_stake_recover_terminal(&mut self, amount: u64, stray: Option<Pubkey>) -> Result<u64, String> {
+        let (pool, va, sv) = self.stake.ok_or("no stake pool")?;
+        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        let (m, v, wva, pid) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.program_id);
+        let mut accounts = vec![
+            AccountMeta::new_readonly(self.env.payer.pubkey(), false),
+            AccountMeta::new(pool, false),
+            AccountMeta::new(sv, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new(m, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(wva, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(pid, false),
+        ];
+        if let Some(k) = stray {
+            accounts.push(AccountMeta::new(k, false));
+        }
+        let mut data = vec![29u8];
+        data.extend_from_slice(&amount.to_le_bytes());
+        let ix = solana_sdk::instruction::Instruction { program_id: stake_id, accounts, data };
+        self.env.svm.expire_blockhash();
+        send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, &[])
+    }
+
+    /// Wrapper tag 41 sent DIRECTLY by a third party (no stake program), naming the
+    /// stake vault_auth PDA as `authority` (unsigned: tag 41 is permissionless) and
+    /// `dest` as the payout account. `dest` must be owned by vault_auth.
+    fn do_third_party_tag41(&mut self, amount: u128, dest: Pubkey) -> Result<u64, String> {
+        let (_, va, _) = self.stake.ok_or("no stake pool")?;
+        let (m, v, wva) = (self.env.market, self.env.vault, self.env.vault_authority);
+        self.send(
+            ProgInstruction::WithdrawInsurance { amount },
+            vec![
+                AccountMeta::new_readonly(va, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(wva, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[],
+        )
+    }
+}
+
+/// F-9 shared prefix: bound market, 5M insurance budget, stale resolve, everyone out.
+fn f9_bound_resolved_world() -> (World, u128) {
+    let mut w = World::new(0);
+    w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
+    w.do_topup_insurance(5_000_000).expect("insurance top-up");
+    w.setup_stake(1_000 + 5_000_000);
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    let s = w.slot() + 9_005;
+    w.env.svm.warp_to_slot(s);
+    let _ = w.do_crank(N_USERS);
+    w.do_resolve_stale().expect("stale resolve");
+    let (_paid, stuck) = w.permissionless_close_out().unwrap();
+    assert!(stuck.is_empty(), "users closed out");
+    for u in 0..w.ports.len() {
+        let _ = w.do_close_portfolio(u);
+    }
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.materialized_portfolio_count, 0);
+    (w, g.insurance_domain_budget_remaining_total)
+}
+
+/// F-9 fix, griefing variant 1: a third party pushes the whole terminal budget into
+/// pool.vault with a DIRECT wrapper tag 41 (bypassing stake). Stake tag 29 with
+/// amount 0 must still book it to stakers, and the market must retire.
+#[test]
+#[ignore]
+fn indep_f9_frontrun_direct_tag41_into_pool_vault_is_still_booked() {
+    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    let (mut w, budget) = f9_bound_resolved_world();
+    assert_eq!(budget, 5_000_000, "vacuity: the full top-up is the terminal budget");
+    let sv = w.stake.unwrap().2;
+    let fees0 = w.pool_fields().unwrap().2;
+    w.do_third_party_tag41(budget, sv).expect("tag 41 is permissionless into a vault_auth-owned dest");
+    assert_eq!(w.token_amount(&sv), budget, "front-run landed in pool.vault");
+    assert_eq!(w.pool_fields().unwrap().2, fees0, "PRE: the front-run is unbooked");
+    let r = w.do_stake_recover_terminal(0, None);
+    eprintln!("F-9 frontrun: tag29(0) -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    r.expect("stake tag 29 books a surplus pushed by a third party");
+    assert_eq!(w.pool_fields().unwrap().2, fees0 + budget as u64, "stakers credited the full budget");
+    let retired = try_retire(&mut w);
+    w.check_tokens().unwrap();
+    assert!(retired, "market retires after the front-run + booking");
+    // Idempotent: a second call finds nothing to book (31).
+    assert_eq!(custom_code(&w.do_stake_recover_terminal(0, None).unwrap_err()), Some(31));
+}
+
+/// F-9 fix, griefing variant 2: a third party points the permissionless wrapper tag
+/// 41 at a STRAY token account it created with owner = vault_auth (not pool.vault).
+/// Stake tag 29 sweeps it (account 9) into pool.vault and books it.
+#[test]
+#[ignore]
+fn indep_f9_stray_vault_auth_account_payout_is_swept_and_booked() {
+    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    let (mut w, budget) = f9_bound_resolved_world();
+    let (_, va, sv) = w.stake.unwrap();
+    let stray = w.new_token(va, 0);
+    let fees0 = w.pool_fields().unwrap().2;
+    w.do_third_party_tag41(budget, stray).expect("tag 41 into a stray vault_auth-owned account");
+    assert_eq!(w.token_amount(&stray), budget, "PRE: budget stranded in the stray account");
+    // Without the sweep account there is nothing to book (pool.vault is empty): 31.
+    assert_eq!(custom_code(&w.do_stake_recover_terminal(0, None).unwrap_err()), Some(31));
+    w.do_stake_recover_terminal(0, Some(stray)).expect("sweep + book");
+    assert_eq!(w.token_amount(&stray), 0);
+    assert_eq!(w.token_amount(&sv), budget);
+    assert_eq!(w.pool_fields().unwrap().2, fees0 + budget as u64);
+    w.check_tokens().unwrap();
+    assert!(try_retire(&mut w), "market retires");
+}
+
 /// F-9 candidate: on a stake-BOUND market the asset-0 insurance authority is the stake
 /// pool's vault_auth PDA. The stake program has no CPI for the wrapper's terminal
 /// WithdrawInsurance (tag 41) and its RecoverFlushedInsurance (tag 23 -> wrapper 57) is
@@ -2350,6 +2469,16 @@ fn indep_f9_bound_market_insurance_budget_recoverable_after_stale_resolve() {
     eprintln!("F-9: mat {} budget {budget}; tag 41 by former admin -> {:?}", g.materialized_portfolio_count, r41.as_ref().map_err(|e| custom_code(e)));
     let ins_auth = state::read_asset_oracle_profile(&w.env.svm.get_account(&w.env.market).unwrap().data, 0).map(|p| Pubkey::new_from_array(p.insurance_authority));
     eprintln!("F-9: asset0 insurance_authority {:?} (stake vault_auth {:?})", ins_auth, w.stake.map(|s| s.1));
+    // F-9 FIX: the keeper's wind-down step, stake tag 29 RecoverTerminalInsurance
+    // (permissionless). Pays the budget into pool.vault via wrapper tag 41 and books it.
+    let sv = w.stake.unwrap().2;
+    let (fees0, sv0) = (w.pool_fields().unwrap().2, w.token_amount(&sv));
+    let r29 = w.do_stake_recover_terminal(budget as u64, None);
+    eprintln!("F-9: stake tag 29 RecoverTerminalInsurance({budget}) -> {:?}", r29.as_ref().map_err(|e| custom_code(e)));
+    if r29.is_ok() {
+        assert_eq!(w.token_amount(&sv) - sv0, budget, "pool vault receives exactly the released budget");
+        assert_eq!(w.pool_fields().unwrap().2 - fees0, budget as u64, "stakers credited exactly the released budget");
+    }
     let retired = try_retire(&mut w);
     let vault = if retired { 0 } else { w.token_amount(&w.env.vault) };
     eprintln!("F-9: retired {retired}; vault left {vault}");
