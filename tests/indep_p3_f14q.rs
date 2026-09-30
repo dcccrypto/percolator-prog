@@ -182,7 +182,7 @@ impl P3 {
         let admin = self.env.admin.insecure_clone();
         let (m, r, mint) = (self.env.market, self.registry, self.lp_mint);
         self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: TL_FEE_SHARE.with(|c| c.get()).or_else(|| std::env::var("P3_FEE_SHARE_BPS").ok().and_then(|v| v.parse().ok())).unwrap_or(0), redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: TL_FEE_SHARE.with(|c| c.get()).or_else(|| std::env::var("P3_FEE_SHARE_BPS").ok().and_then(|v| v.parse().ok())).unwrap_or(0), redemption_cooldown_slots: TL_COOLDOWN.with(|c| c.get()), oi_reservation_threshold_bps: 0, domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -673,6 +673,8 @@ thread_local! { static FORCE_SHARE_ATA: std::cell::Cell<Option<Pubkey>> = std::c
 thread_local! { static C7_ONE_SENIOR: std::cell::Cell<bool> = std::cell::Cell::new(false); }
 /// C-7 variant: configure permissionless stale resolve (rehearsal: 216,000 slots) and resolve by tag 39.
 thread_local! { static C7_STALE_RESOLVE: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+/// Earn redemption cooldown for CreateLpVault (default 0).
+thread_local! { static TL_COOLDOWN: std::cell::Cell<u64> = std::cell::Cell::new(0); }
 thread_local! { static TL_FEE_SHARE: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
@@ -2697,4 +2699,106 @@ fn rehearsal23_one_senior_both_domains_redeems_after_stale_resolve() {
     assert!(o.winner_paid + 2_000 >= owed, "winner {} < {owed}", o.winner_paid);
     assert!(paid + 2_000 >= exp, "REHEARSAL-23: the senior is locked after resolve: paid {paid} of {exp} (77s {:?})", o.r77s);
     assert!(o.left <= 2_000, "{} atoms left", o.left);
+}
+
+
+// ═════════════ COOLDOWN 0 vs COOLDOWN > PUSH INTERVAL: timing attacks around oracle pushes ═════════════
+// (a) a senior exits one slot BEFORE a deficit-causing push; (b) a newcomer deposits one slot before a
+// RECOVERY push and redeems right after it. Same world, cooldown 0 vs cooldown 600 (> the 520-slot
+// push interval). Reported as the attacker's gain over the fair outcome; the test asserts the
+// cooldown-600 run is not worse for the victims than cooldown 0 and prints the cooldown-0 gain.
+
+struct TimingWorld { w: P3, a: Keypair, a_ata: Pubkey, v: Keypair, v_ata: Pubkey, t: Keypair, tp: Pubkey, lp: Pubkey }
+
+fn timing_world(cooldown: u64) -> TimingWorld {
+    TL_IM.with(|c| c.set(1_000));
+    TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
+    TL_COOLDOWN.with(|c| c.set(cooldown));
+    let mut w = P3::new();
+    TL_FEE_SHARE.with(|c| c.set(None));
+    w.create_vault();
+    TL_COOLDOWN.with(|c| c.set(0));
+    let (a, v) = (Keypair::new(), Keypair::new());
+    let a_ata = w.earn_deposit_domain(&a, 5_000_000, false, 0).unwrap();
+    let v_ata = w.earn_deposit_domain(&v, 5_000_000, false, 0).unwrap();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 1_000, false, 1).unwrap();
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap();
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap();
+    w.junior_deposit(&admin, 300_000).unwrap();
+    let (t, tp) = w.trader(2_000_000);
+    let lp = w.lp;
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); let _ = w.crank(lp);
+    let mut want: i128 = 1_300_000;
+    for _ in 0..6 { if want <= 0 { break; } let b = w.pos(tp); let _ = w.trade_vs_lp_fee(&t, tp, want.min(500_000), 30); want -= w.pos(tp) - b; }
+    MARK.with(|c| c.set(PRICE));
+    TimingWorld { w, a, a_ata, v, v_ata, t, tp, lp }
+}
+
+fn timing_move(w: &mut P3, tp: Pubkey, lp: Pubkey, up: bool, steps: usize) {
+    for _ in 0..steps {
+        let m = MARK.with(|c| c.get());
+        let m = if up { m * 10_450 / 10_000 } else { m * 10_000 / 10_450 };
+        MARK.with(|c| c.set(m));
+        let s = w.slot() + 520; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(tp);
+    }
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(tp); }
+}
+
+/// 76 now; 77 as soon as the cooldown allows (same slot for cooldown 0), with the market moving
+/// (`during`) between the two when the cooldown is longer than a push interval.
+fn timing_redeem(w: &mut P3, k: &Keypair, ata: Pubkey, cooldown: u64, during: &mut dyn FnMut(&mut P3)) -> u128 {
+    let sh = w.tok(&ata) as u128;
+    let _ = w.request_redeem(k, ata, sh);
+    if cooldown > 0 { during(w); let s = w.slot() + cooldown; w.env.svm.warp_to_slot(s); w.push(MARK.with(|c| c.get())); }
+    let _ = w.crank_fees_78();
+    let (d, r) = w.execute_redeem_domain(k, 0);
+    if cooldown == 0 { during(w); }
+    if r.is_ok() { w.tok(&d) as u128 } else { eprintln!("TIMING 77 -> {:?}", r.as_ref().map_err(|e| code(e))); 0 }
+}
+
+fn timing_a(cooldown: u64) -> (u128, u128) {
+    let TimingWorld { mut w, a, a_ata, v, v_ata, tp, lp, .. } = timing_world(cooldown);
+    // A exits one slot before the deficit-causing move.
+    let a_paid = timing_redeem(&mut w, &a, a_ata, cooldown, &mut |w: &mut P3| timing_move(w, tp, lp, true, 9));
+    if cooldown == 0 { /* move already applied inside timing_redeem after the exit */ }
+    let v_paid = timing_redeem(&mut w, &v, v_ata, cooldown, &mut |_w: &mut P3| {});
+    eprintln!("TIMING(a) cooldown {cooldown}: A (exits before the push) {a_paid}; V (stays) {v_paid}");
+    (a_paid, v_paid)
+}
+
+fn timing_b(cooldown: u64) -> (u128, u128, u128) {
+    let TimingWorld { mut w, v, v_ata, a: a0, a_ata: a0_ata, tp, lp, t, .. } = timing_world(cooldown);
+    // Loss first (draw books), then the trader closes so a reversal is a pure recovery of the vault LP.
+    timing_move(&mut w, tp, lp, true, 9);
+    let _ = (t, tp);
+    // Newcomer N deposits one slot before a recovery move and redeems right after it.
+    let n = Keypair::new();
+    let n_ata = w.earn_deposit_domain(&n, 5_000_000, true, 0);
+    let n_ata = match n_ata { Ok(k) => k, Err(e) => { eprintln!("TIMING(b) cooldown {cooldown}: newcomer 75 refused {:?}", code(&e)); return (0, 0, 0); } };
+    let n_paid = timing_redeem(&mut w, &n, n_ata, cooldown, &mut |w: &mut P3| timing_move(w, tp, lp, false, 9));
+    let a_paid = timing_redeem(&mut w, &a0, a0_ata, cooldown, &mut |_w: &mut P3| {});
+    let v_paid = timing_redeem(&mut w, &v, v_ata, cooldown, &mut |_w: &mut P3| {});
+    eprintln!("TIMING(b) cooldown {cooldown}: newcomer N (in 5,000,000 before the recovery push) out {n_paid}; incumbents A {a_paid} V {v_paid}");
+    (n_paid, a_paid, v_paid)
+}
+
+#[test]
+fn timing_a_exit_one_slot_before_deficit_push_cooldown0_vs_long() {
+    let (a0, v0) = timing_a(0);
+    let (a1, v1) = timing_a(600);
+    eprintln!("TIMING(a) SUMMARY: cooldown 0: A {a0} V {v0} (A-V gap {}); cooldown 600: A {a1} V {v1} (gap {})", a0 as i128 - v0 as i128, a1 as i128 - v1 as i128);
+    // Fair: the two seniors each bear half of the ~331k loss beyond the junior.
+    let fair = 5_000_000u128 - RACE_BEYOND / 2;
+    assert!(v1 + 2_000 >= fair, "cooldown 600: the stayer bore more than its half: {v1} < {fair}");
+    assert!(v0 + 2_000 >= fair, "COOLDOWN 0 FRONT-RUN: a senior exiting one slot before the deficit push leaves the stayer with {v0} < fair {fair} (A took {a0})");
+}
+
+#[test]
+fn timing_b_deposit_redeem_around_recovery_push_cooldown0_vs_long() {
+    let (n0, a0, v0) = timing_b(0);
+    let (n1, a1, v1) = timing_b(600);
+    eprintln!("TIMING(b) SUMMARY: cooldown 0: newcomer gain {} incumbents {} ; cooldown 600: newcomer gain {} incumbents {}", n0 as i128 - 5_000_000, a0 + v0, n1 as i128 - 5_000_000, a1 + v1);
+    assert!(n0 == 0 || n0 <= 5_000_000 + 2_000, "cooldown 0: the newcomer captured the incumbents' recovery: out {n0} for 5,000,000 in");
 }
