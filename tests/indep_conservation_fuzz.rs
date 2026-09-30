@@ -1860,6 +1860,11 @@ fn indep_conservation_fuzz_global_invariants() {
                             Some(s) => s,
                             None => seed0.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
                         };
+                        // FUZZ_WARM=N: burn N process-global nonces (intent ids, Pubkey::new_unique) first,
+                        // to test whether a single-seed replay depends on state left by earlier sequences.
+                        if let Some(n) = std::env::var("FUZZ_WARM").ok().and_then(|v| v.parse::<u64>().ok()) {
+                            for _ in 0..n { let _ = next_intent_id(); let _ = Pubkey::new_unique(); }
+                        }
                         let mut rng = XorShiftRng::seed_from_u64(seed);
                         // FUZZ_FEE0=1: no trading fees at all (no LP fee leg pending at resolve), so any
                         // claim-free residual can only be cleared by 78's insurance recredit.
