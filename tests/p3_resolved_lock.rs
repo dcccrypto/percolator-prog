@@ -4234,3 +4234,44 @@ fn p3_resolved_close_no_winner_haircut_while_seniors_hold_c() {
     assert_eq!(st.soft.get("close_resolved_haircut_events").copied().unwrap_or(0), 0, "winner haircut at CloseResolved");
     assert_eq!(w.shortfall, 0);
 }
+
+/// Gate repro `indep_p3_stranded_pot_backing_after_all_exits_repro` (seed 0xbc092f9ecb8941ee, on
+/// ede691b6): Earn deposits only in d0; the vault LP's settled loss sits in d1 (no ledger) as
+/// loss backing whose winner then exits paid from elsewhere; after every exit 85,918 atoms were
+/// stranded (102 d1 -> IncorrectProgramId, 102 d0 -> 21). Tag 78 at terminal-flat now absorbs
+/// that stray backing into the vault's own pot; nothing is left behind.
+#[test]
+fn p3_terminal_stray_pot_backing_is_recovered() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let ops = vec![Op::TradeCpi { u: 175, size_tenths: 175 }, Op::Push { delta_bps: 1603 }, Op::Warp { n: 55 }, Op::TradeCpi { u: 162, size_tenths: -212 },
+        Op::TradeCpi { u: 201, size_tenths: -162 }, Op::Push { delta_bps: -2020 }, Op::LpDeposit { u: 212, amt: 3_862_642 }];
+    let (w, st) = anvil_resolved_exit(0, "0", &ops);
+    anvil_assert_full_exit(&w, &st, "stranded d1");
+}
+
+/// Gate repro `indep_p3_resolved_close_single_winner_haircut_repro` (pre-existing, also on
+/// 58e379f1): one long winner vs the vault LP, +13.82%, resolve. Its claim pot d1 held 55 atoms
+/// less than the claim while d0 held the seniors' 10M: CloseResolved haircut the winner. Senior
+/// backing in the sibling pot now covers it, booked junior-first (the junior takes the 55).
+#[test]
+fn p3_resolved_close_single_winner_covered_from_sibling_pot() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("FUZZ_STRICT_RT", "1");
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "1");
+    std::env::set_var("FUZZ_LP_DOMAINS", "0");
+    let ops = vec![Op::TradeCpi { u: 178, size_tenths: 100 }, Op::Warp { n: 55 }, Op::Crank { u: 237 }, Op::Push { delta_bps: 1382 }];
+    let mut w = World::new(30);
+    w.check().expect("setup");
+    for op in &ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants after every op");
+    }
+    let r = w.wind_down();
+    std::env::set_var("FUZZ_STRICT_RT", "0");
+    r.expect("wind-down: winner paid in full while seniors hold C; senior C never drops (junior first)");
+    let st = w.stats.clone();
+    assert_eq!(st.soft.get("close_resolved_haircut_events").copied().unwrap_or(0), 0, "winner haircut at CloseResolved");
+    assert!(st.ok.get("close_resolved").copied().unwrap_or(0) >= 1, "vacuity: the winner closed");
+    assert_eq!(w.shortfall, 0);
+}

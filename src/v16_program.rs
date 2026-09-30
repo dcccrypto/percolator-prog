@@ -22941,6 +22941,10 @@ pub mod processor {
             {
                 expect_signer(owner)?;
             }
+            // P3 (2026-09-30, resolved-close winner haircut): on a bound vault market, senior
+            // backing in the SIBLING pot covers a winner's claim pot before the engine realises
+            // it at a sub-unit credit rate (the Resolved twin of the Live relabel / top-up).
+            vault_cover_resolved_claim_shortfall(program_id, market_ai.key, &cfg, &mut group, &mut portfolio)?;
             let insurance_before = group.header.insurance.get();
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
@@ -25250,7 +25254,8 @@ pub mod processor {
                 if group.header.mode == 1
                     && group.header.materialized_portfolio_count.get() == 0
                     && group.header.c_tot.get() == 0
-                    && vault_terminal_residual_atoms(&group)? != 0
+                    && (vault_terminal_residual_atoms(&group)? != 0
+                        || vault_terminal_stray_atoms(&group, asset_index)?.iter().any(|x| *x != 0))
                 {
                     return Err(PercolatorError::VaultLpHarvestPending.into());
                 }
@@ -26322,7 +26327,21 @@ pub mod processor {
                                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
                             group.validate_shape().map_err(map_v16_error)?;
                         }
+                        // Stranded pot backing: loss backing whose winners all exited sits in a
+                        // pot the vault never funded (often ledger-less). Make it the vault's.
+                        let stray = vault_absorb_terminal_stray(&mut group, domain)?;
+                        if stray != 0 {
+                            let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                            ledger.last_observed_unavailable_principal_atoms =
+                                backing_unavailable_principal_atoms(&bucket_after)?;
+                            ledger.total_principal_atoms = ledger
+                                .total_principal_atoms
+                                .checked_add(stray)
+                                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        }
                         residual
+                            .checked_add(stray)
+                            .ok_or(PercolatorError::EngineArithmeticOverflow)?
                     }
                     Err(percolator::V16Error::LockActive) => 0,
                     Err(e) => return Err(map_v16_error(e)),
@@ -26921,6 +26940,127 @@ pub mod processor {
         Ok(())
     }
 
+    /// P3 (2026-09-30): Resolved CloseResolved on a bound vault market. Register the closing
+    /// portfolio's claims (the tolerated, byte-restored refresh), then for each pot of the bound
+    /// asset whose registered winner claims exceed its available backing (the engine's formula:
+    /// `positive_claim_bound - ((fresh_reserved - valid_liened) + (insurance_reserved -
+    /// insurance liens))`), move vault-owned senior
+    /// backing from the SIBLING pot into it (principal decrement there, winners' backing here;
+    /// `header.vault` nets to 0, no SPL) and record the move as a PENDING senior draw from the
+    /// sibling, so the one booking rule charges it junior-first, then seniors pro rata. Winners
+    /// are never haircut while senior backing remains; what the seniors cannot cover stays the
+    /// engine's credit-rate haircut. Returns the atoms moved.
+    #[inline(never)]
+    fn vault_cover_resolved_claim_shortfall(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        cfg: &state::WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<u128, ProgramError> {
+        if group.header.mode != 1 {
+            return Ok(0);
+        }
+        let Some(a) = market_bound_vault_asset(group)? else {
+            return Ok(0);
+        };
+        {
+            let saved_header: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*group.header).to_vec();
+            let saved_markets: alloc::vec::Vec<u8> = bytemuck::cast_slice::<_, u8>(&*group.markets).to_vec();
+            let saved_p: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*portfolio.header).to_vec();
+            if group.full_account_refresh_not_atomic(portfolio).is_err() {
+                bytemuck::bytes_of_mut(&mut *group.header).copy_from_slice(&saved_header);
+                bytemuck::cast_slice_mut::<_, u8>(&mut *group.markets).copy_from_slice(&saved_markets);
+                bytemuck::bytes_of_mut(&mut *portfolio.header).copy_from_slice(&saved_p);
+            }
+        }
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_key);
+        let reg = registry_pda.to_bytes();
+        let mut moved = 0u128;
+        for d in [a * 2, a * 2 + 1] {
+            let (source, bucket) = backing_domain_parts_view(group, d)?;
+            if source.positive_claim_bound_num == 0 {
+                continue;
+            }
+            // The engine's own available-backing formula
+            // (`available_backing_num_for_source_credit_state`): counterparty + insurance credit.
+            let available = source
+                .fresh_reserved_backing_num
+                .saturating_sub(source.valid_liened_backing_num)
+                .saturating_add(source.insurance_credit_reserved_num.saturating_sub(
+                    source
+                        .valid_liened_insurance_num
+                        .saturating_add(source.impaired_liened_insurance_num),
+                ));
+            let need_num = source.positive_claim_bound_num.saturating_sub(available);
+            if need_num == 0 {
+                continue;
+            }
+            let expiry = match bucket.status {
+                BackingBucketStatusV16::Fresh => bucket.expiry_slot,
+                BackingBucketStatusV16::Empty | BackingBucketStatusV16::Expired => {
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                }
+                _ => continue,
+            };
+            if expiry <= group.header.current_slot.get() {
+                continue;
+            }
+            let sib = if d % 2 == 0 { d + 1 } else { d - 1 };
+            let x = need_num
+                .div_ceil(BOUND_SCALE)
+                .min(vault_pot_drawable_atoms(group, cfg, &reg, sib)?);
+            if x == 0 {
+                continue;
+            }
+            vault_pot_principal_decrement(group, sib, x)?; // vault -x, owned(sib) -x
+            group.header.vault = percolator::V16PodU128::new(
+                group
+                    .header
+                    .vault
+                    .get()
+                    .checked_add(x)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            );
+            add_fresh_counterparty_backing_view_owned(
+                group,
+                d,
+                x.checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                expiry,
+                false,
+            )?;
+            let mut rec = read_vault_lp_draw_from_view(group, a)?;
+            if sib % 2 == 0 {
+                rec.pending_out_even_atoms = rec
+                    .pending_out_even_atoms
+                    .checked_add(x)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            } else {
+                rec.pending_out_odd_atoms = rec
+                    .pending_out_odd_atoms
+                    .checked_add(x)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+            rec.pending_moved_atoms = rec
+                .pending_moved_atoms
+                .checked_add(x)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            write_vault_lp_draw_to_view(group, a, &rec)?;
+            moved = moved
+                .checked_add(x)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            solana_program::log::sol_log(&alloc::format!(
+                "p3_resolved_claim_cover from={} to={} atoms={}",
+                sib, d, x
+            ));
+        }
+        if moved != 0 {
+            group.validate_shape().map_err(map_v16_error)?;
+        }
+        Ok(moved)
+    }
+
     /// The physical senior draw on the bound vault LP (see the section note). Returns the atoms
     /// moved. `D` is read from a certificate refreshed HERE on the engine's current (clamped)
     /// state, so a stale certificate alone can never trigger a draw, and a second call in the
@@ -27261,7 +27401,10 @@ pub mod processor {
         write_vault_lp_draw_to_view(group, a, &rec)?;
         let _ = lp_value;
         solana_program::log::sol_log(&alloc::format!(
-            "p3_senior_draw_booked moved={} junior_cover={} senior_loss={} C={} outstanding={}",
+            "p3_senior_draw_booked nav={} c_eff={} harvestable={} moved={} junior_cover={} senior_loss={} C={} outstanding={}",
+            nav_after,
+            c_eff,
+            harvestable,
             pending,
             pending - senior_loss.min(pending),
             senior_loss,
@@ -27351,6 +27494,26 @@ pub mod processor {
             || rec.outstanding_mirror_atoms != st.senior_draw_outstanding_atoms;
         if !needs_book {
             return Ok(false);
+        }
+        // P3 (2026-09-30): in Resolved, a pending move is booked only once the vault LP has
+        // settled (101). Until then the junior's value still sits in the vault LP's capital and
+        // is invisible to the pots' NAV, so booking now would charge the seniors a loss the
+        // junior must take first. Resolved senior/junior exits (77/102) require terminal-flat,
+        // i.e. a settled vault LP, so nothing prices against the unbooked move meanwhile.
+        if has_pending && group.header.mode == 1 {
+            if let Some(lp_ai) = lp_ai {
+                if lp_ai.owner == program_id {
+                    let unsettled = with_portfolio_header_ro(lp_ai, |h| {
+                        Ok(h.capital.get() != 0
+                            || h.pnl.get() != 0
+                            || !percolator::active_bitmap_is_empty(h.active_bitmap.map(percolator::V16PodU64::get)))
+                    })
+                    .unwrap_or(false);
+                    if unsettled {
+                        return Ok(false);
+                    }
+                }
+            }
         }
         // Current vault-LP value for the seniors-first recovery (0 when not passed/current).
         let lp_value = match lp_ai {
@@ -27767,6 +27930,77 @@ pub mod processor {
             .and_then(|v| v.checked_add(group.header.source_fresh_backing_total_num.get() / BOUND_SCALE))
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         Ok(group.header.vault.get().saturating_sub(owned))
+    }
+
+    /// P3 (2026-09-30, stranded pot backing): per pot of asset `a`, the Fresh backing that is
+    /// neither vault-owned nor reserved for a registered claim: engine-routed loss backing whose
+    /// winners have all exited. Only meaningful at terminal-flat (no portfolio left to claim it).
+    fn vault_terminal_stray_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        a: usize,
+    ) -> Result<[u128; 2], ProgramError> {
+        let mut out = [0u128; 2];
+        for (i, d) in [a * 2, a * 2 + 1].into_iter().enumerate() {
+            let (source, bucket) = backing_domain_parts_view(group, d)?;
+            if bucket.status != BackingBucketStatusV16::Fresh || source.positive_claim_bound_num != 0 {
+                continue;
+            }
+            out[i] = (bucket.fresh_unliened_backing_num / BOUND_SCALE).saturating_sub(vault_pot_owned(group, d)?);
+        }
+        Ok(out)
+    }
+
+    /// Terminal-flat Resolved (tag 78): make the stray backing of BOTH pots vault-owned value in
+    /// `target` (the pot whose ledger 78 holds), so seniors take it first through
+    /// min(physical, C) and the junior only the rest (102). The sibling's stray moves with the
+    /// sibling top-up mechanics (principal decrement there, sentinel add here; `header.vault`
+    /// nets to 0, no SPL). Returns the atoms credited to `target` (caller books its ledger).
+    #[inline(never)]
+    fn vault_absorb_terminal_stray(
+        group: &mut state::MarketViewMutV16<'_>,
+        target: usize,
+    ) -> Result<u128, ProgramError> {
+        let a = target / 2;
+        let stray = vault_terminal_stray_atoms(group, a)?;
+        let mut credited = 0u128;
+        for (i, d) in [a * 2, a * 2 + 1].into_iter().enumerate() {
+            let x = stray[i];
+            if x == 0 {
+                continue;
+            }
+            if d == target {
+                vault_pot_owned_adjust(group, d, x, true)?;
+            } else {
+                vault_pot_principal_decrement(group, d, x)?; // vault -x, owned(d) -x (saturating)
+                vault_pot_owned_adjust(group, d, x, true)?; // the stray was never owned there
+                group.header.vault = percolator::V16PodU128::new(
+                    group
+                        .header
+                        .vault
+                        .get()
+                        .checked_add(x)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                );
+                add_fresh_counterparty_backing_view(
+                    group,
+                    target,
+                    x.checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                )?;
+            }
+            credited = credited
+                .checked_add(x)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            solana_program::log::sol_log(&alloc::format!(
+                "p3_terminal_stray_absorbed from={} to={} atoms={}",
+                d, target, x
+            ));
+        }
+        if credited != 0 {
+            group.validate_shape().map_err(map_v16_error)?;
+        }
+        Ok(credited)
     }
 
     fn vault_physical_idle_backing_atoms(
