@@ -18415,6 +18415,24 @@ fn v17_lapsed_backing_bucket_bricks_settlement_until_expired() {
     // catch-up and is the first to reach dispatch (and therefore the first to attempt, and
     // revert against, the lapsed-bucket settlement).
     catch_up_asset0_to_one_short_of(&mut env, a, lapsed_slot);
+    // Source reclassification (engine fix/roundtrip-source-reclass-2026-09-30, #175): B's
+    // slot-3 loss nets against B's own domain-0 claim, and the consumed support is now booked
+    // into domain 1, B's loss domain, so A's +100 claim is BACKED there. Before the fix,
+    // domain 1 stayed Empty and A's claim was unbacked. That domain-1 bucket has lapsed too,
+    // and it is one of A's own source domains, so the first post-lapse crank legitimately
+    // takes the lapsed-backing continuation (c09d4575): it expires domain 1 and returns Ok.
+    // That call is pinned exactly here; the brick this test is about then fires on the next
+    // crank, which is the first to attempt the domain-0 settlement.
+    if env.market_state().1.source_backing_buckets[1].status == BackingBucketStatusV16::Fresh {
+        try_refresh(&mut env, a, lapsed_slot)
+            .expect("the first post-lapse crank expires A's own lapsed source domain 1");
+        assert_eq!(
+            env.market_state().1.source_backing_buckets[1].status,
+            BackingBucketStatusV16::Expired,
+            "that crank's only effect is the domain-1 expiry transition"
+        );
+        env.svm.expire_blockhash();
+    }
     let bricked = try_refresh(&mut env, a, lapsed_slot)
         .expect_err("settling a loss against a lapsed backing bucket must revert");
     assert_eq!(
