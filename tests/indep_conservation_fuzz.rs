@@ -3572,6 +3572,12 @@ impl World {
                 return Err(format!("P3-e CREATOR FREE OPTION: seniors lost {senior_loss} while creator (junior + trader wallet) netted +{creator_net}"));
             }
         }
+        // P3-J (F absorption check): the junior must not be paid while any winner was haircut at
+        // the resolved close -- stray pot backing that belongs to unpaid winners never goes to the junior.
+        let haircut_atoms = *self.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0) as u128;
+        if haircut_atoms > 2 && junior_received > 0 {
+            return Err(format!("P3-J JUNIOR PAID WHILE WINNERS HAIRCUT: winners burned {haircut_atoms}, junior received {junior_received}"));
+        }
         // P3-d: after every exit, nothing stranded beyond insurance + remaining senior claim.
         if !self.is_tombstone() {
             let (_, g) = self.env.market_state();
