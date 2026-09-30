@@ -1,0 +1,23 @@
+[package]
+name = "kani-push-p3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Kani push 2026-09-30 (Anvil): P3 proofs over the EXACT production src/vault_lp_v18.rs plus the real engine funding kernel."
+
+# Standalone so a negative control (mutant swap) recompiles in seconds, not the whole wrapper.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+percolator = { path = "../../percolator", features = ["fork-facade"] }
+
+[features]
+# Negative controls: swap the production file for mutants/<NAME>.rs via KANI_PUSH_MUTANT.
+mutant = []
+neg_flat_a = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
