@@ -1211,7 +1211,19 @@ impl World {
         Ok(())
     }
 
+    fn port_alive(&self, u: usize) -> bool {
+        u < self.ports.len() && self.env.svm.get_account(&self.ports[u]).map_or(false, |a| !a.data.is_empty() && a.lamports > 0)
+    }
+
     pub fn apply(&mut self, op: &Op) -> Result<u64, String> {
+        // Runtime-parity GC deletes closed portfolios; ops on them are refused, not panics.
+        let dead = |u: u8, n: usize| -> Option<usize> { let i = u as usize % n; if self.port_alive(i) { None } else { Some(i) } };
+        match *op {
+            Op::Withdraw { u, .. } | Op::Convert { u, .. } | Op::Deposit { u, .. } | Op::Crank { u } => {
+                if let Some(i) = dead(u, N_USERS + 1) { return Err(format!("portfolio {i} closed")); }
+            }
+            _ => {}
+        }
         match *op {
             Op::Deposit { u, amt } => self.do_deposit(u as usize % (N_USERS + 1), amt),
             Op::Withdraw { u, frac_bps } => {

@@ -612,7 +612,12 @@ impl V16CuEnv {
     /// prior Deposits/trades/etc. this specific portfolio has already seen in
     /// this test.
     pub fn portfolio_identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
-        let data = self.svm.get_account(&portfolio).unwrap().data;
+        // Runtime-parity GC can DELETE a closed portfolio; an op on it must fail in the program
+        // (not panic the harness), so report a zero identity for a missing/emptied account.
+        let data = match self.svm.get_account(&portfolio) {
+            Some(a) if !a.data.is_empty() => a.data,
+            _ => return (0, 0, 0),
+        };
         (
             state::read_portfolio_id(&data).unwrap(),
             state::read_portfolio_matcher_sequence(&data).unwrap(),
