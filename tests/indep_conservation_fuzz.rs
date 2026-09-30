@@ -3328,8 +3328,9 @@ impl World {
     /// 102 VaultLpReleaseSurplus (junior owner). `resolved` adds the SPL payout tail.
     fn p3_release(&mut self, amt: u128, resolved: bool) -> Result<u64, String> {
         // FUZZ_LP_DOMAINS=2: the junior surplus can sit in either pot; try pot 0, then pot 1.
+        // The junior can target either pot (102's source_domain); a surplus can sit in either.
         let r = self.p3_release_domain(amt, resolved, 0);
-        if r.is_err() && std::env::var("FUZZ_LP_DOMAINS").map_or(false, |v| v == "2") {
+        if r.is_err() {
             let r1 = self.p3_release_domain(amt, resolved, 1);
             if r1.is_ok() { return r1; }
         }
@@ -3590,6 +3591,9 @@ impl World {
                     let st = self.p3_state();
                     let rd = |o: usize| u128::from_le_bytes(st[o..o + 16].try_into().unwrap());
                     eprintln!("  P3DBG state C {} jdep {} jwd {} fees {} recalled {}", rd(144), rd(160), rd(176), rd(192), rd(208));
+                    let amt = stranded as u128;
+                    for d in 0..2u16 { let r = self.p3_release_domain(amt, true, d); eprintln!("  P3DBG 102 d{d} ({amt}) -> {:?}", r.as_ref().map_err(|e| custom_code(e))); }
+                    let r = self.p3_release_domain(1, true, 1); eprintln!("  P3DBG 102 d1 (1) -> {:?}", r.as_ref().map_err(|e| e.split("\"").filter(|x| x.contains("Program log") || x.contains("failed")).collect::<Vec<_>>().join(" | ")));
                 }
                 let lpd = self.env.svm.get_account(&self.p3.as_ref().unwrap().lp).and_then(|a| state::read_portfolio(&a.data).ok())
                     .map(|lp| format!("cap {} pnl {} legs {}", lp.capital, lp.pnl, lp.legs.iter().filter(|l| l.active).count()))

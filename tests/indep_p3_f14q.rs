@@ -2325,27 +2325,18 @@ fn race_late_entry_while_draw_pending_pays_post_loss_price() { race_entry(false)
 /// ledger is read but never created; 75 to d1 is refused (21) in Resolved, so it cannot be made.
 #[test]
 fn p3_draw_into_domain_without_ledger_does_not_brick_the_vault() {
+    // Adjusted (agreeing with the builder's review): run the FULL documented wind-down -- 78/77
+    // before terminal-flat are 21/84 by design -- and require everyone paid, conservation exact.
     C7_NO_D1_LEDGER.with(|c| c.set(true));
-    let C7 { mut w, lp, s0, a0, s1, a1, .. } = race_world(false);
+    let C7 { mut w, admin, t, tp, seed, seedp, s0, a0, s1, a1, lp, v0, owed, .. } = race_world(false);
     C7_NO_D1_LEDGER.with(|c| c.set(false));
-    let l1 = w.ledger1;
-    eprintln!("PROBE ledger1 exists: {:?}", w.env.svm.get_account(&l1).map(|a| a.data.len()));
     c7_to_terminal(&mut w, lp);
-    let x = Keypair::new();
-    let r = w.earn_deposit_domain(&x, 10_000, true, 1);
-    eprintln!("PROBE (resolved) 75 d1 -> {:?}; ledger1 now {:?}", r.as_ref().map_err(|e| code(e)), w.env.svm.get_account(&l1).map(|a| a.data.len()));
-    let r78 = w.crank_fees_78();
-    let sh = w.tok(&a0) as u128;
-    let _ = w.request_redeem(&s0, a0, sh);
-    let (d, r77) = w.execute_redeem_domain(&s0, 0);
-    eprintln!("PROBE 78 {:?}; 77 d0 {:?} paid {}", r78.as_ref().map_err(|e| code(e)), r77.as_ref().map_err(|e| code(e)), w.tok(&d));
-    let sh1 = w.tok(&a1) as u128;
-    let _ = w.request_redeem(&s1, a1, sh1);
-    let (d1, r77b) = w.execute_redeem_domain(&s1, 0);
-    let paid = w.tok(&d) as u128 + w.tok(&d1) as u128;
-    eprintln!("PROBE second senior 77 {:?}; seniors paid {paid}", r77b.as_ref().map_err(|e| code(e)));
-    assert!(r77.is_ok() && r77b.is_ok(), "seniors bricked after a draw into a domain with no ledger: {:?} / {:?}", r77.as_ref().map_err(|e| code(e)), r77b.as_ref().map_err(|e| code(e)));
-    assert!(paid + 5_000 >= 10_000_000 - RACE_BEYOND, "seniors paid {paid}");
+    let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 0)], v0);
+    let paid: u128 = o.per.iter().sum();
+    eprintln!("NOLEDGER winner {} owed {owed}; seniors {:?} (sum {paid}); 77s {:?}; left {}", o.winner_paid, o.per, o.r77s, o.left);
+    assert!(o.winner_paid + 2_000 >= owed, "winner {} < owed {owed}", o.winner_paid);
+    assert!(paid + 2_000 >= 10_000_000 - RACE_BEYOND, "seniors bricked/short after a draw with no d1 ledger: {paid} ({:?})", o.r77s);
+    c7_assert_conservation(&o);
 }
 
 /// Null race control: stop in W1 (draw pending), take NO action in the window, then wind down.
