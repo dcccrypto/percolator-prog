@@ -196,9 +196,13 @@ jobs:
           solana program dump GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ /tmp/wrapper-live.so -u https://api.devnet.solana.com
           head -c 1533512 /tmp/wrapper-live.so > /tmp/wrapper-v18.2.so
           shasum -a 256 /tmp/wrapper-v18.2.so
+          solana program dump 4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT /tmp/matcher-live.so -u https://api.devnet.solana.com
+          head -c 58488 /tmp/matcher-live.so > /tmp/matcher-12bd671.so
+          shasum -a 256 /tmp/matcher-12bd671.so
       - name: run suite and diff against the allowlist
         working-directory: percolator-prog
         env:
           NFT_PIN: ci_sibling
           P1_FORK_DEPLOYED_SO: /tmp/wrapper-v18.2.so
+          P1_FORK_MATCHER_SO: /tmp/matcher-12bd671.so
         run: ./scripts/ci-test.sh

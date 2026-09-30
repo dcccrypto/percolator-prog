@@ -108,8 +108,12 @@ fn wrapper_bytes(which: Bytes) -> Vec<u8> {
 }
 
 fn matcher_bytes() -> Vec<u8> {
+    // `P1_FORK_MATCHER_SO` (CI: the live 4seJWjv3 bytes dumped from devnet -- a matcher rebuilt
+    // with another toolchain is not byte-identical) or the sibling build. Either way the bytes
+    // must be the deployed matcher (sha pinned below).
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("../percolator-match/target/deploy/percolator_match.so");
+    let p = std::env::var_os("P1_FORK_MATCHER_SO").map(PathBuf::from).unwrap_or(p);
     let b = std::fs::read(&p).unwrap_or_else(|e| panic!("read matcher .so {}: {e}", p.display()));
     assert_eq!(sha256_hex(&b), MATCHER_SO_SHA256, "matcher .so is not deployed 12bd671");
     b
