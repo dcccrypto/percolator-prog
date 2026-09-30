@@ -309,14 +309,21 @@ fn assert_claims_backed(env: &V16CuEnv, label: &str) {
 /// provider's principal; the market must end with nothing ownerless in the vault.
 fn exit_everyone_and_assert_drained(w: &mut Witness, profitable_first: bool, label: &str) {
     flatten(w, profitable_first);
-    let slot = now_slot(w);
     for (owner, portfolio) in [
         (w.taker_owner.insecure_clone(), w.taker),
         (w.lp_owner.insecure_clone(), w.lp),
     ] {
         let pnl = w.env.portfolio_state(portfolio).pnl;
         if pnl > 0 {
-            let _ = try_crank(&mut w.env, portfolio, slot);
+            // A prior conversion moves the risk epoch: recertify with fresh marks (same
+            // prices) at a new slot before converting.
+            let slot = now_slot(w) + 1;
+            w.env.svm.warp_to_slot(slot);
+            let (_, group) = w.env.market_state();
+            let (p1, p0) = (group.assets[1].effective_price, group.assets[0].effective_price);
+            w.env.push_auth_mark_for_asset_as_admin(PROFIT_ASSET, slot, p1);
+            w.env.push_auth_mark_for_asset_as_admin(LOSS_ASSET, slot, p0);
+            crank_at(&mut w.env, portfolio, slot, &[PROFIT_ASSET, LOSS_ASSET]);
             try_convert(&mut w.env, &owner, portfolio, pnl as u128)
                 .unwrap_or_else(|e| panic!("{label}: backed claim must convert: {e}"));
         }
@@ -450,6 +457,19 @@ fn boyle175_asw_full_deposit_lock_at_ten_percent_margin() {
         (0, DEPOSIT as i128),
         "boyle: one refresh locks 100% of the LP's deposit behind an unsupported claim"
     );
+    let (_, group) = w.env.market_state();
+    assert_eq!(
+        group.source_backing_buckets[LOSS_SOURCE_DOMAIN].fresh_unliened_backing_num, 0,
+        "boyle: no asset-0 backing behind the LP's claim"
+    );
+    w_trade(&mut w, PROFIT_ASSET, -SIZE_Q);
+    w_trade(&mut w, LOSS_ASSET, -SIZE_Q);
+    let (lo, lp_key) = (w.lp_owner.insecure_clone(), w.lp);
+    let convert = try_convert(&mut w.env, &lo, lp_key, DEPOSIT);
+    assert!(
+        convert.as_ref().is_err_and(|e| e.contains("Custom(21)")),
+        "boyle: entire-deposit claim stays EngineLockActive in Live: {convert:?}"
+    );
 }
 
 #[test]
@@ -529,6 +549,17 @@ fn boyle175_ok_full_deposit_ten_percent_margin() {
         DEPOSIT as i128,
         "LP equity is its deposit (+1000 on asset 0, -1000 on asset 1)"
     );
+    // The flattened LP converts its whole claim and withdraws its deposit.
+    w_trade(&mut w, PROFIT_ASSET, -SIZE_Q);
+    w_trade(&mut w, LOSS_ASSET, -SIZE_Q);
+    let (lo, lp_key) = (w.lp_owner.insecure_clone(), w.lp);
+    let pnl = w.env.portfolio_state(lp_key).pnl;
+    if pnl > 0 {
+        try_convert(&mut w.env, &lo, lp_key, pnl as u128)
+            .unwrap_or_else(|e| panic!("full-deposit: backed claim must convert: {e}"));
+    }
+    try_withdraw(&mut w.env, &lo, lp_key, DEPOSIT)
+        .unwrap_or_else(|e| panic!("full-deposit: LP withdraws its deposit: {e}"));
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -595,6 +626,8 @@ struct Rollover {
     b_capital: u128,
     b_pnl: i128,
     d_convert: Option<Result<u64, String>>,
+    a_convert: Option<Result<u64, String>>,
+    provider: Result<(), String>,
     group_vault: u128,
     group_c_tot: u128,
     group_pnl_pos_tot: u128,
@@ -650,6 +683,23 @@ fn rollover_world() -> Rollover {
         trade(&mut env, &c_o, c, &d_o, d, d_route, LOSS_ASSET, -(POS_SCALE as i128));
         d_convert = Some(try_convert(&mut env, &d_o, d, PNL));
     }
+    // Every remaining claim must convert and the provider must withdraw its principal:
+    // nothing is left ownerless.
+    let a_pnl = env.portfolio_state(a).pnl;
+    let a_convert = if a_pnl > 0 {
+        // B's conversion moved the risk epoch; recertify A with fresh marks first.
+        let slot = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot + 1;
+        env.svm.warp_to_slot(slot);
+        let (_, group) = env.market_state();
+        let (p1, p0) = (group.assets[1].effective_price, group.assets[0].effective_price);
+        env.push_auth_mark_for_asset_as_admin(PROFIT_ASSET, slot, p1);
+        env.push_auth_mark_for_asset_as_admin(LOSS_ASSET, slot, p0);
+        crank_at(&mut env, a, slot, &[PROFIT_ASSET, LOSS_ASSET]);
+        Some(try_convert(&mut env, &a_o, a, a_pnl as u128))
+    } else {
+        None
+    };
+    let provider = try_withdraw_backing(&mut env, PNL).map(|_| ());
     let bs = env.portfolio_state(b);
     let (_, group) = env.market_state();
     Rollover {
@@ -657,6 +707,8 @@ fn rollover_world() -> Rollover {
         b_capital: bs.capital,
         b_pnl: bs.pnl,
         d_convert,
+        a_convert,
+        provider,
         group_vault: group.vault,
         group_c_tot: group.c_tot,
         group_pnl_pos_tot: group.pnl_pos_tot,
@@ -673,6 +725,12 @@ fn boyle175_ok_rollover_old_claim_is_backed() {
     );
     assert_eq!((r.b_capital, r.b_pnl), (DEPOSIT + PNL, 0));
     assert!(r.d_convert.is_none());
+    assert!(
+        matches!(r.a_convert, Some(Ok(_))),
+        "A's asset-1 claim converts against the provider-backed domain: {:?}",
+        r.a_convert
+    );
+    assert!(r.provider.is_ok(), "provider withdraws its principal: {:?}", r.provider);
     assert_eq!(r.group_pnl_pos_tot, 0);
-    assert_eq!(r.group_vault, r.group_c_tot + PNL, "only the provider's ten atoms are not capital");
+    assert_eq!(r.group_vault, r.group_c_tot, "every atom is owned capital");
 }
