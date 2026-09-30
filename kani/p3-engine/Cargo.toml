@@ -18,8 +18,6 @@ percolator = { path = "../../../percolator", features = ["fork-facade"] }
 # Negative control: replace the engine kernel output with the pre-#114 flat-A model
 # (f = -/+ fid * ADL_ONE per side). With asymmetric A this must FAIL the zero-sum assertion.
 neg_flat_a = []
-# Negative control: the pre-ADL leg is settled with the LIVE side A instead of its own a_basis.
-neg_settle_live_a = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

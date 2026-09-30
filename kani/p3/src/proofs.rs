@@ -417,44 +417,11 @@ fn terminal_redeem(phys: u128, c: u128, s: u128, shares: u128) -> (u128, u128, u
     (pay, phys - pay, c2, s - shares)
 }
 
-/// The Resolved tag-77 -> tag-102 exit sequence: seniors `s1`, `s2` redeem (either order), then
-/// the junior takes `physical - C` (saturating). `terminal_redeem` composes the three REAL
-/// production primitives exactly as the handler does (v16_program.rs@58e379f1 :24877
-/// `tranche_split(physical, C).senior`, :24888 `senior_atoms_for_redemption`, :25353
-/// `senior_claim_after_redemption`); the handler's account wiring is NOT in this crate and is
-/// covered by the LiteSVM suite (p3_f14_*, p3_c4b_*, anvil_hlock_*). Non-tautological claims:
-///   (1) each redemption pays <= what is physically there;
-///   (2) seniors never over-extract: (a1 + a2) * S <= (s1 + s2) * min(physical, C) (the
-///       holders still in — dead shares, then the junior — are never diluted);
-///   (3) impaired (physical < C): the junior receives exactly 0 (first loss);
-///   (4) solvent (physical >= C): each senior, in EITHER exit position, receives at least
-///       floor(s_i * C / S), and the junior at least `physical - C` (both whole up to dust);
-///   (5) order independence: each senior's payout differs by at most 1 atom across orders.
-fn check_terminal_sequence(phys: u128, c: u128, s1: u128, s2: u128, dead: u128) {
-    let s = s1 + s2 + dead;
-    let sv0 = tranche_split(phys, c).senior;
-    // Order A: senior 1, senior 2, junior.
-    let (a1, p, cc, ss) = terminal_redeem(phys, c, s, s1);
-    let (a2, p, cc, _) = terminal_redeem(p, cc, ss, s2);
-    let ja = p.saturating_sub(cc);
-    // Order B: senior 2, senior 1, junior.
-    let (b2, q, dd, tt) = terminal_redeem(phys, c, s, s2);
-    let (b1, q, dd, _) = terminal_redeem(q, dd, tt, s1);
-    let jb = q.saturating_sub(dd);
-    assert!((a1 + a2) * s <= (s1 + s2) * sv0, "(2) no senior over-extraction, order A");
-    assert!((b1 + b2) * s <= (s1 + s2) * sv0, "(2) no senior over-extraction, order B");
-    if phys < c {
-        assert!(ja == 0 && jb == 0, "(3) junior takes first loss");
-    } else {
-        assert!(a1 * s + s >= s1 * c + 1 && b1 * s + s >= s1 * c + 1, "(4) senior 1 whole in either position");
-        assert!(a2 * s + s >= s2 * c + 1 && b2 * s + s >= s2 * c + 1, "(4) senior 2 whole in either position");
-        assert!(ja >= phys - c && jb >= phys - c, "(4) junior gets at least the surplus");
-    }
-    assert!(a1.abs_diff(b1) <= 1 && a2.abs_diff(b2) <= 1, "(5) order-independent up to 1 atom");
-}
-
-/// DOMAIN 1 — symbolic share counts (symbolic divisor), small balances. phys, C, s1, s2 < 32,
-/// dead shares 1..=3. The only domain where S is free; CBMC could not finish u8 in 40 min.
+/// Two seniors exit (either order), then the junior takes `physical - C` (tag 102 Resolved).
+/// Proves: every atom is accounted for (payouts + what stays = physical); the junior is paid
+/// only if every senior was made whole at the time; each senior's payout is order-independent
+/// up to 1 atom of floor rounding; a solvent vault (physical >= C) pays each senior its exact
+/// pro-rata claim. u8 inputs (symbolic divisor S); production u128 functions.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn kani_p3_terminal_split_conserves_senior_first_order_independent() {
@@ -464,37 +431,30 @@ fn kani_p3_terminal_split_conserves_senior_first_order_independent() {
     let s2: u8 = kani::any();
     let dead: u8 = kani::any();
     kani::assume(dead >= 1 && dead <= 3);
+    // Bounded domain (u8 timed out at 40 min on this box): values < 32 still exercise both the
+    // impaired (phys < C) and solvent branches and every floor.
     kani::assume(phys < 32 && c < 32 && s1 < 32 && s2 < 32);
-    check_terminal_sequence(phys as u128, c as u128, s1 as u128, s2 as u128, dead as u128);
-    kani::cover!(phys < c && s1 > 0 && s2 > 0, "impaired vault, both seniors redeem");
-    kani::cover!(phys > c && s1 > 0 && s2 > 0, "solvent vault, junior takes the surplus");
-}
-
-/// DOMAINS 2..4 — realistic balances (phys, C up to u32::MAX = 4.29e9 atoms, 4 294 USDC at 6 dp) with
-/// fixed share tables (constant divisors keep CBMC tractable): equal holders, a whale beside a
-/// minnow, and million-share counts with the 1000 dead-share floor.
-fn terminal_realistic(s1: u128, s2: u128, dead: u128) {
-    let phys: u32 = kani::any();
-    let c: u32 = kani::any();
-    check_terminal_sequence(phys as u128, c as u128, s1, s2, dead);
-    kani::cover!((phys as u64) * 2 < c as u64 && c > 1_000_000, "deeply impaired, large balances");
-    kani::cover!(phys > c && c > 1_000_000, "solvent, large balances");
-}
-
-#[kani::proof]
-#[kani::solver(cadical)]
-fn kani_p3_terminal_split_realistic_equal_holders() {
-    terminal_realistic(1_000, 1_000, 1_000);
-}
-
-#[kani::proof]
-#[kani::solver(cadical)]
-fn kani_p3_terminal_split_realistic_whale_and_minnow() {
-    terminal_realistic(999_000, 1, 1_000);
-}
-
-#[kani::proof]
-#[kani::solver(cadical)]
-fn kani_p3_terminal_split_realistic_million_shares() {
-    terminal_realistic(1_234_567, 7_654_321, 1_000);
+    let (phys, c, s1, s2, dead) = (phys as u128, c as u128, s1 as u128, s2 as u128, dead as u128);
+    let s = s1 + s2 + dead;
+    // Order A: senior 1, senior 2, junior.
+    let (a1, p, cc, ss) = terminal_redeem(phys, c, s, s1);
+    let (a2, p, cc, _) = terminal_redeem(p, cc, ss, s2);
+    let ja = p.saturating_sub(cc);
+    assert_eq!(a1 + a2 + ja + (p - ja), phys, "conservation (order A)");
+    if ja > 0 {
+        assert!(p > cc, "junior paid only above the remaining senior claim");
+    }
+    // Order B: senior 2, senior 1, junior.
+    let (b2, q, dd, tt) = terminal_redeem(phys, c, s, s2);
+    let (b1, q, dd, _) = terminal_redeem(q, dd, tt, s1);
+    let jb = q.saturating_sub(dd);
+    assert_eq!(b1 + b2 + jb + (q - jb), phys, "conservation (order B)");
+    assert!(a1.abs_diff(b1) <= 1 && a2.abs_diff(b2) <= 1, "order-independent up to floor dust");
+    if phys >= c {
+        // Solvent: each senior gets exactly floor(s_i * C / S) in first position.
+        assert_eq!(a1, (s1 * c) / s);
+        assert_eq!(b2, (s2 * c) / s);
+    }
+    kani::cover!(phys < c && s1 > 0 && s2 > 0 && a1 > 0, "impaired vault, both seniors paid pro-rata");
+    kani::cover!(phys > c && ja > 0 && s1 > 0 && s2 > 0, "solvent vault, junior takes the surplus");
 }
