@@ -28349,6 +28349,9 @@ pub mod processor {
                 let mut lp =
                     state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
                 expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                // Reviewer LOW (39b138c8): the maintenance fee is senior to the recall, so it is
+                // collected FIRST and the cap below is taken on POST-fee equity.
+                collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
                 // D-P3-30: a recall may NEVER take the vault LP's certified equity below zero
                 // (it must not re-open a deficit a draw just funded), and none runs while a draw
                 // is pending. Pure rule: `vault_lp_v18::vault_lp_recall_limit`.
@@ -28363,7 +28366,6 @@ pub mod processor {
                 if amount > limit {
                     return Err(PercolatorError::VaultLpRecallRefused.into());
                 }
-                collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
                 group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             }
             // Backing side: MIRRORS handle_deposit_to_lp_vault phase 3 (and #413's re-baseline).

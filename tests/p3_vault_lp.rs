@@ -131,6 +131,8 @@ struct Params {
     fee_bps: u64,
     /// Configured asset slots (F14-Q2 tests use 2).
     assets: u16,
+    /// Maintenance fee per slot (0 = off).
+    maint_fee: u128,
 }
 
 impl Default for Params {
@@ -141,6 +143,7 @@ impl Default for Params {
             move_bps: 500,
             fee_bps: 0,
             assets: 1,
+            maint_fee: 0,
         }
     }
 }
@@ -294,7 +297,7 @@ impl Env {
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 100,
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
-                maintenance_fee_per_slot: 0,
+                maintenance_fee_per_slot: p.maint_fee,
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
@@ -3284,4 +3287,46 @@ fn p3_terminal_crank_is_a_noop_success_when_nothing_is_pending() {
     env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
     env.paid_out += env.tok(junior_dest) as u128;
     env.assert_conserved("terminal no-op crank");
+}
+
+/// Reviewer LOW (39b138c8): 98 capped the recall at the vault LP's certified equity computed
+/// BEFORE the maintenance fee was collected, so recalling the full equity left the LP at -fee.
+/// The cap is now taken on POST-fee equity: a recall of the pre-fee equity is refused, and a recall
+/// of the post-fee equity leaves the LP at >= 0.
+#[test]
+fn p3_recall_cap_is_post_maintenance_fee() {
+    let mut env = Env::new(Params { maint_fee: 100, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("senior");
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000).expect("junior");
+    // Senior shortfall so the recall limit itself is not the binding constraint.
+    poke_senior_claim(&mut env, 12_000_000);
+    // Let the maintenance fee accrue on the (flat) vault LP.
+    env.slot += 1_000;
+    env.svm.warp_to_slot(env.slot);
+    let pre = env.portfolio(lp.portfolio);
+    let pre_equity = pre.capital as i128 + pre.pnl.min(0) + pre.fee_credits.min(0);
+    env.svm.expire_blockhash();
+    let r = env.recall(lp.portfolio, pre_equity as u128, DOMAIN);
+    let post = env.portfolio(lp.portfolio);
+    let post_equity = post.capital as i128 + post.pnl.min(0) + post.fee_credits.min(0);
+    println!("recall of pre-fee equity {pre_equity} -> {r:?}; LP capital {} fee_credits {} equity {post_equity}", post.capital, post.fee_credits);
+    assert!(post_equity >= 0, "a recall must never leave the vault LP below zero (equity {post_equity})");
+    // The wrapper's own post-fee cap refuses it by name (on 39b138c8 the pre-fee cap let it
+    // through to the engine, which failed it with a generic 21).
+    err_has(&r, PercolatorError::VaultLpRecallRefused);
+    // Recalling exactly the post-fee equity succeeds and leaves the LP at >= 0.
+    env.svm.expire_blockhash();
+    let lp_now = env.portfolio(lp.portfolio);
+    let fee_due = 100u128 * 1_000; // maint_fee x slots elapsed (upper bound)
+    let post_fee = lp_now.capital.saturating_sub(fee_due);
+    let r2 = env.recall(lp.portfolio, post_fee, DOMAIN);
+    let after = env.portfolio(lp.portfolio);
+    let after_equity = after.capital as i128 + after.pnl.min(0) + after.fee_credits.min(0);
+    println!("recall of post-fee equity {post_fee} -> {r2:?}; LP equity after {after_equity}");
+    assert!(r2.is_ok(), "the post-fee equity is recallable");
+    assert!(after_equity >= 0);
+    env.assert_conserved("recall post-fee");
 }
