@@ -119,6 +119,11 @@ pub fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usiz
 /// Wrapper mount id. INDEP_MAINNET_ID=1 mounts at the mainnet id (ESa89R5…), which the
 /// stake program's Bind/InitPool allowlist (plain build) requires.
 pub fn harness_program_id() -> Pubkey {
+    // INDEP_PROGRAM_ID=<base58>: mount the wrapper at an arbitrary id (e.g. the fresh devnet id
+    // ETDLAdi… that a --features devnet stake build allowlists).
+    if let Ok(k) = std::env::var("INDEP_PROGRAM_ID") {
+        return k.parse().expect("INDEP_PROGRAM_ID base58");
+    }
     if std::env::var("INDEP_MAINNET_ID").map_or(false, |v| v == "1") {
         "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv".parse().unwrap()
     } else {

@@ -265,7 +265,7 @@ impl World {
 
     fn setup_stake(&mut self, total_lp_supply: u64) {
         let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
-        assert_eq!(self.env.program_id.to_string(), "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv", "FUZZ_STAKE needs INDEP_MAINNET_ID=1");
+        assert!(self.env.program_id.to_string() == "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv" || std::env::var("INDEP_PROGRAM_ID").is_ok(), "FUZZ_STAKE needs INDEP_MAINNET_ID=1 (plain stake) or INDEP_PROGRAM_ID=<id the stake build allowlists>");
         let so = std::env::var("INDEP_STAKE_SO").unwrap_or_else(|_| format!("{}/wt-indep/so/stake-e0ace2c-plain.so", std::env::var("HOME").unwrap()));
         if self.env.svm.get_account(&stake_id).map_or(true, |a| !a.executable) {
             self.env.svm.add_program(stake_id, &std::fs::read(&so).expect("stake so"));
@@ -2563,7 +2563,7 @@ fn f9_bound_resolved_world_lp(total_lp_supply: u64) -> (World, u128) {
 #[test]
 #[ignore]
 fn indep_f9_frontrun_direct_tag41_into_pool_vault_is_still_booked() {
-    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    assert!(std::env::var("INDEP_MAINNET_ID").as_deref() == Ok("1") || std::env::var("INDEP_PROGRAM_ID").is_ok(), "run with INDEP_MAINNET_ID=1 or INDEP_PROGRAM_ID");
     let (mut w, budget) = f9_bound_resolved_world();
     assert_eq!(budget, 5_000_000, "vacuity: the full top-up is the terminal budget");
     let sv = w.stake.unwrap().2;
@@ -2588,7 +2588,7 @@ fn indep_f9_frontrun_direct_tag41_into_pool_vault_is_still_booked() {
 #[test]
 #[ignore]
 fn indep_f9_stray_vault_auth_account_payout_is_swept_and_booked() {
-    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    assert!(std::env::var("INDEP_MAINNET_ID").as_deref() == Ok("1") || std::env::var("INDEP_PROGRAM_ID").is_ok(), "run with INDEP_MAINNET_ID=1 or INDEP_PROGRAM_ID");
     let (mut w, budget) = f9_bound_resolved_world();
     let (_, va, sv) = w.stake.unwrap();
     let stray = w.new_token(va, 0);
@@ -2615,7 +2615,7 @@ fn indep_f9_stray_vault_auth_account_payout_is_swept_and_booked() {
 #[test]
 #[ignore]
 fn indep_f9_bound_market_insurance_budget_recoverable_after_stale_resolve() {
-    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    assert!(std::env::var("INDEP_MAINNET_ID").as_deref() == Ok("1") || std::env::var("INDEP_PROGRAM_ID").is_ok(), "run with INDEP_MAINNET_ID=1 or INDEP_PROGRAM_ID");
     let mut w = World::new(0);
     w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
     w.do_topup_insurance(5_000_000).expect("insurance top-up (e.g. staker flush / seed)");
@@ -2908,7 +2908,7 @@ fn indep_multi_asset_resolved_closeout_pays_every_user() {
 #[test]
 #[ignore]
 fn indep_f9_recovery_into_dead_shares_only_pool_is_not_booked_to_dead_shares() {
-    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    assert!(std::env::var("INDEP_MAINNET_ID").as_deref() == Ok("1") || std::env::var("INDEP_PROGRAM_ID").is_ok(), "run with INDEP_MAINNET_ID=1 or INDEP_PROGRAM_ID");
     let (mut w, budget) = f9_bound_resolved_world_lp(1_000);
     let sv = w.stake.unwrap().2;
     let fees0 = w.pool_fields().unwrap().2;
@@ -3712,7 +3712,7 @@ fn b12_bound_resolved_world_all_abandoned() -> (World, u128) {
 #[test]
 #[ignore]
 fn indep_b12_stranger_cleanup_then_stake_tag29_recovers_whole_budget() {
-    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"));
+    assert!(std::env::var("INDEP_MAINNET_ID").as_deref() == Ok("1") || std::env::var("INDEP_PROGRAM_ID").is_ok());
     let (mut w, budget) = b12_bound_resolved_world_all_abandoned();
     assert!(budget > 0, "vacuity: terminal budget exists");
     let stranger = Keypair::new();
