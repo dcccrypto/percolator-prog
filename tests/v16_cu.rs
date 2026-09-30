@@ -25711,3 +25711,56 @@ mod p3_vault_lp_skew {
         }
     }
 }
+
+/// ADOPT upstream `13b3a8b2` ("Fix expired close auto-crank liveness"): the expired-close
+/// recovery valve must use the AUTHENTICATED slot, not the stale market `current_slot`.
+/// Ported to this fork's PermissionlessCrank ABI (now_slot + observation hints).
+#[test]
+fn v16_attack_auto_crank_expired_close_uses_authenticated_slot_not_stale_market_slot() {
+    let mut env = V16CuEnv::new();
+    // This fork's policy floor rejects upstream's (5, 5); 9000 is the smallest value the other
+    // tests here use. The claim under test (authenticated vs stale slot) does not depend on it.
+    env.configure_permissionless_resolve_with_cu(9000, 5);
+    env.configure_auth_mark_with_cu(0, 100);
+
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    env.deposit(&owner, portfolio, 100);
+    env.seed_cancellable_close_progress(portfolio);
+
+    let (_, group_before) = env.market_state();
+    assert_eq!(group_before.current_slot, 0);
+    assert!(
+        env.portfolio_state(portfolio).close_progress.max_close_slot > group_before.current_slot,
+        "setup keeps the market slot stale enough that the old summary would not classify expiration"
+    );
+
+    env.svm.warp_to_slot(40);
+    env.svm.expire_blockhash();
+    let cu = env
+        .send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 40,
+                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[],
+        )
+        .expect("expired close recovery must use the authenticated slot, not stale market current_slot");
+    assert_cu_within(
+        "PermissionlessCrank expired-close authenticated-slot recovery",
+        cu,
+        CRANK_CU_LIMIT,
+    );
+
+    let (_, group_after) = env.market_state();
+    assert_eq!(group_after.mode, MarketModeV16::Recovery);
+    assert_eq!(
+        group_after.recovery_reason,
+        Some(PermissionlessRecoveryReasonV16::ActiveBankruptCloseCannotProgress)
+    );
+}
