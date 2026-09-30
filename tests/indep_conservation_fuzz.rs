@@ -796,7 +796,8 @@ impl World {
         let p = self.ports[u];
         let (pid, _, pep) = self.env.portfolio_identity(p);
         let m = self.env.market;
-        self.send(
+        let before = self.env.portfolio_state(p);
+        let r = self.send(
             ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: amt },
             vec![
                 AccountMeta::new(owner.pubkey(), true),
@@ -804,7 +805,30 @@ impl World {
                 AccountMeta::new(p, false),
             ],
             &[&owner],
-        )
+        );
+        if r.is_ok() && self.port_alive(u) {
+            // Round-trip winner-underpayment probe: face burned at convert = pnl consumed minus
+            // capital credited. Under the P3 senior-draw rule a winner is never haircut while the
+            // seniors still hold a claim (C > dust).
+            let after = self.env.portfolio_state(p);
+            let consumed = (before.pnl - after.pnl).max(0) as u128;
+            let credited = after.capital.saturating_sub(before.capital);
+            let burned = consumed.saturating_sub(credited);
+            if burned > 2 {
+                *self.stats.soft.entry("convert_haircut_events").or_default() += 1;
+                *self.stats.soft.entry("convert_haircut_atoms").or_default() += burned.min(u64::MAX as u128) as u64;
+                if self.p3.is_some() {
+                    let c = self.p3_c();
+                    if c > 3_000 {
+                        *self.stats.soft.entry("convert_haircut_while_seniors_hold_C").or_default() += 1;
+                        if std::env::var("FUZZ_STRICT_RT").map_or(false, |v| v == "1") && self.pending_violation.is_none() {
+                            self.pending_violation = Some(format!("RT-winner-haircut u{u}: convert burned {burned} (consumed {consumed}, credited {credited}) while seniors hold C {c}"));
+                        }
+                    }
+                }
+            }
+        }
+        r
     }
 
     fn do_topup_insurance(&mut self, amt: u64) -> Result<u64, String> {
@@ -944,7 +968,8 @@ impl World {
         let owner = self.owners[u].pubkey();
         let dst = self.new_token(owner, 0);
         let (m, v, va, p) = (self.env.market, self.env.vault, self.env.vault_authority, self.ports[u]);
-        self.send(
+        let before = if self.port_alive(u) { Some(self.env.portfolio_state(p)) } else { None };
+        let r = self.send(
             ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
             vec![
                 AccountMeta::new_readonly(owner, false),
@@ -957,7 +982,33 @@ impl World {
                 AccountMeta::new_readonly(nft_registry_pda(&m), false),
             ],
             &[],
-        )
+        );
+        // Round-trip winner-underpayment probe at the resolved close (flat portfolios only, so
+        // the pnl field is the whole claim): value before = capital + positive pnl; value after
+        // = what was paid + what the portfolio still holds.
+        if let (Ok(_), Some(b)) = (&r, before) {
+            if b.legs.iter().all(|l| !l.active) && b.pnl > 0 {
+                let paid = self.env.token_amount(dst) as u128;
+                let (ac, ap) = if self.port_alive(u) { let a = self.env.portfolio_state(p); (a.capital, a.pnl.max(0) as u128) } else { (0, 0) };
+                let before_v = b.capital + b.pnl as u128;
+                let after_v = paid + ac + ap;
+                if before_v > after_v + 2 {
+                    let burned = before_v - after_v;
+                    *self.stats.soft.entry("close_resolved_haircut_events").or_default() += 1;
+                    *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += burned.min(u64::MAX as u128) as u64;
+                    if self.p3.is_some() {
+                        let c = self.p3_c();
+                        if c > 3_000 {
+                            *self.stats.soft.entry("close_resolved_haircut_while_seniors_hold_C").or_default() += 1;
+                            if std::env::var("FUZZ_STRICT_RT").map_or(false, |v| v == "1") && self.pending_violation.is_none() {
+                                self.pending_violation = Some(format!("RT-winner-haircut u{u}: CloseResolved burned {burned} (value {before_v} -> paid {paid} + held {}) while seniors hold C {c}", ac + ap));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        r
     }
 
     pub fn do_claim_topup(&mut self, u: usize) -> Result<u64, String> {
