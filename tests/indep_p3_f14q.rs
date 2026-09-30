@@ -3043,3 +3043,99 @@ fn directed_collusion(resolve_only: bool) {
 
 #[test]
 fn directed_postbind_collusion_via_vault_lp_never_draws_seniors() { directed_collusion(true); }
+
+/// G-1 negative control, multi-round (the security reviewer's PoC shape): each round a fresh pair
+/// nets THROUGH the vault LP -- A long, B short with thin capital -- then the price rises and B
+/// defaults. After `rounds` rounds the market resolves and everyone winds down. Earn must never
+/// fund the trader defaults: seniors redeem >= C - dust; conservation to the atom.
+fn collusion_rounds(rounds: usize) {
+    let mut w = d1_market();
+    let (s0, s1) = (Keypair::new(), Keypair::new());
+    let a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).unwrap();
+    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).unwrap();
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap();
+    w.junior_deposit(&admin, 300_000).unwrap();
+    let lp = w.lp;
+    let mut m = PRICE;
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(m); let _ = w.crank(lp);
+    let mut pairs: Vec<(Keypair, Pubkey)> = Vec::new();
+    let mut opened = 0usize;
+    for _r in 0..rounds {
+        let (a, ap) = w.trader(2_000_000);
+        let (b, bp) = w.trader(150_000);
+        let q = (500_000u128 * PRICE as u128 / m as u128) as i128;
+        let ra = w.trade_vs_lp_fee(&a, ap, q, 30);
+        let rb = w.trade_vs_lp_fee(&b, bp, -q, 30);
+        if ra.is_ok() && rb.is_ok() { opened += 1; }
+        pairs.push((a, ap));
+        pairs.push((b, bp));
+        for _ in 0..6 {
+            m = m * 10_450 / 10_000; MARK.with(|c| c.set(m));
+            let s = w.slot() + 520; w.env.svm.warp_to_slot(s);
+            { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
+            let live: Vec<Pubkey> = pairs.iter().map(|x| x.1).collect();
+            for p in live { let _ = w.crank(p); }
+            let _ = w.crank(lp);
+        }
+        if w.env.market_state().1.mode != percolator::MarketModeV16::Live { break; }
+    }
+    eprintln!("G1x{rounds}: pairs opened {opened}; mark {m}; mode {:?}; C {}", w.env.market_state().1.mode, w.c());
+    assert!(opened >= 1, "vacuity: at least one colluding pair traded against the vault LP");
+    if w.env.market_state().1.mode == percolator::MarketModeV16::Live {
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
+        { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    }
+    let jo = admin.pubkey();
+    let mk = w.env.market;
+    let nft = Pubkey::find_program_address(&[b"nft_registry", mk.as_ref()], &w.env.program_id).0;
+    let mut traders_paid = 0u128;
+    for _round in 0..400 {
+        let _ = w.settle_resolved(jo, 0);
+        let _ = w.close_portfolio_permissionless(lp, w.registry);
+        let mut open = 0;
+        for (k, p) in pairs.iter() {
+            if w.env.svm.get_account(p).map_or(true, |x| x.lamports == 0) { continue; }
+            open += 1;
+            let dest = w.token(k.pubkey(), 0);
+            let _ = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+                AccountMeta::new_readonly(k.pubkey(), true), AccountMeta::new(mk, false), AccountMeta::new(*p, false),
+                AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[k]);
+            traders_paid += w.tok(&dest) as u128;
+            let _ = w.close_portfolio_permissionless(*p, k.pubkey());
+        }
+        if open == 0 && w.env.svm.get_account(&lp).map_or(true, |x| x.lamports == 0) { break; }
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
+    }
+    let _ = w.crank_fees_78();
+    let mut seniors = 0u128;
+    for (k, at, dom) in [(&s0, a0, 0u16), (&s1, a1, 1u16)] {
+        let sh = w.tok(&at) as u128; let _ = w.request_redeem(k, at, sh);
+        let (d, r) = w.execute_redeem_domain(k, dom);
+        eprintln!("G1x{rounds}: senior d{dom} 77 -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+        seniors += w.tok(&d) as u128;
+    }
+    let junior = w.junior_release_resolved(&admin);
+    let g = w.env.market_state().1;
+    let left = w.tok(&w.env.vault) as u128;
+    let (pots, ins, _, _) = c7_vault_accounting(&w);
+    eprintln!("G1x{rounds}: traders paid {traders_paid}; seniors {seniors}; junior {junior}; terminal mat {} c_tot {}; vault left {left} = pots {pots} + insurance {ins}", g.materialized_portfolio_count, g.c_tot);
+    assert!(seniors + 2_000 >= 10_000_000, "G-1: colluding pairs through the vault LP drew the seniors: paid {seniors} of 10,000,000 after {rounds} rounds");
+    assert_eq!(g.materialized_portfolio_count, 0, "wind-down did not complete (materialized {})", g.materialized_portfolio_count);
+    assert_eq!(left, pots + ins, "conservation: vault {left} != pots {pots} + insurance {ins}");
+}
+
+// NOT YET A VALID G-1 CONTROL: only the first pair opens (later fills are refused as the mark
+// compounds), and after B's default the vault LP is left short against A alone, so the seniors'
+// loss here is the VAULT LP's own loss (drawn by design), not a trader default. Kept ignored until
+// the shape re-balances each round (flat price between rounds) like the reviewer's PoC.
+#[test]
+#[ignore]
+fn directed_g1_collusion_12_rounds_never_draws_seniors() { collusion_rounds(12); }
+#[test]
+#[ignore]
+fn directed_g1_collusion_25_rounds_never_draws_seniors() { collusion_rounds(25); }
