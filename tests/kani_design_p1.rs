@@ -317,3 +317,24 @@ fn kani_design_p1_fast_cap_equals_division_engine_domain() {
     kani::cover!(fast == Some(true) && abs == cap && abs > 0, "exactly at the cap");
     kani::cover!(fast == Some(false) && abs == cap + 1, "one past the cap");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// D-P1-11  `effective_exec_band_bps` is total and exact over every stored u16 (the value the
+// processor feeds D-P1-01's predicate). Folded in from my earlier review file (PASS 1/1 in the
+// P1 builder's partial run on c8ccbf2a); exhaustive over u16, seconds.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+#[kani::proof]
+fn kani_design_p1_effective_band_total() {
+    let stored: u16 = kani::any();
+    let b = p1::effective_exec_band_bps(stored);
+    if stored == 0 {
+        assert_eq!(b, p1::DEFAULT_EXEC_BAND_BPS);
+    } else if stored <= p1::MAX_EXEC_BAND_BPS {
+        assert_eq!(b, stored);
+    } else {
+        assert_eq!(b, p1::MAX_EXEC_BAND_BPS);
+    }
+    kani::cover!(stored > p1::MAX_EXEC_BAND_BPS, "corrupt slot clamped");
+    kani::cover!(stored == 0, "zeroed slot defaults");
+    kani::cover!(stored > 0 && stored <= p1::MAX_EXEC_BAND_BPS, "stored band used as-is");
+}
