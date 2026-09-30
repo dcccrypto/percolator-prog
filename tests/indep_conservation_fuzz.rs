@@ -1610,6 +1610,10 @@ impl World {
 
 pub fn gen_op(rng: &mut XorShiftRng) -> Op {
     let u = rng.gen::<u8>();
+    // FUZZ_INS_HEAVY=1: extra, large insurance top-ups (recredit large relative to residual).
+    if std::env::var("FUZZ_INS_HEAVY").map_or(false, |v| v == "1") && rng.gen_range(0..8) == 0 {
+        return Op::TopUpInsurance { amt: rng.gen_range(1_000_000..20_000_000) };
+    }
     match rng.gen_range(0..if p3_mode() { 132 } else { 124 }) {
         0..=9 => Op::Deposit { u, amt: rng.gen_range(1_000..30_000_000) },
         10..=17 => Op::Withdraw { u, frac_bps: rng.gen_range(1..=10_000) },
@@ -1750,7 +1754,9 @@ fn indep_conservation_fuzz_global_invariants() {
                             None => seed0.wrapping_add(i.wrapping_mul(0x9E37_79B9_7F4A_7C15)),
                         };
                         let mut rng = XorShiftRng::seed_from_u64(seed);
-                        let fee_bps = [0u64, 5, 30][rng.gen_range(0..3)];
+                        // FUZZ_FEE0=1: no trading fees at all (no LP fee leg pending at resolve), so any
+                        // claim-free residual can only be cleared by 78's insurance recredit.
+                        let fee_bps = if std::env::var("FUZZ_FEE0").map_or(false, |v| v == "1") { 0 } else { [0u64, 5, 30][rng.gen_range(0..3)] };
                         // FUZZ_RANDLEN=1: resolve at a random point (random sequence length),
                         // so wind-down (resolve) lands with fees/positions outstanding anywhere.
                         let n = if std::env::var("FUZZ_RANDLEN").map_or(false, |v| v == "1") { rng.gen_range(1..=len) } else { len };
@@ -3904,4 +3910,30 @@ fn indep_p3_recall_bound_after_vault_lp_shortfall() {
     let r = w.wind_down();
     eprintln!("wind-down after recall -> {r:?}");
     r.unwrap();
+}
+
+/// Suspected deadlock (coordinator): terminal-flat Resolved, NO LP fees pending, and the only
+/// thing that clears the claim-free residual is the engine's insurance recredit inside tag 78.
+/// If 78 fails with NoFeesToCrank (38) — reverting the recredit — while 77 returns 84, seniors
+/// are locked. Spec (P3 doc §86): 78 "succeeds if either fees or residual were moved".
+/// Run: FUZZ_P3=1 --ignored indep_p3_terminal_recredit_only
+#[test]
+#[ignore]
+fn indep_p3_terminal_recredit_only_seniors_can_redeem() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let mut w = World::new(0); // fee 0: no LP fee leg can ever be pending
+    w.do_topup_insurance(4_000_000).expect("insurance budget (the recredit source)");
+    // A trader loses heavily against the vault LP (insurance/backing absorb), and an
+    // outside-flow-free residual can arise from lent-out backing refills.
+    let _ = w.apply(&Op::TradeCpi { u: 2, size_tenths: 30 });
+    for d in [-2400, -2400, 1800] {
+        let _ = w.apply(&Op::Push { delta_bps: d });
+        let _ = w.permissionless_repair(30);
+    }
+    let (cfg, _) = w.env.market_state();
+    assert_eq!(cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms, 0, "vacuity: no LP fees pending");
+    let r = w.wind_down();
+    let e78: Vec<String> = w.stats.err.iter().filter(|(k, _)| k.starts_with("lp_crank78") || k.contains("78")).map(|(k, v)| format!("{k}={v}")).collect();
+    eprintln!("terminal-recredit-only: wind_down -> {r:?}; 78 errors {e78:?}");
+    r.expect("seniors must always redeem on a terminal-flat Resolved market with no fees pending");
 }
