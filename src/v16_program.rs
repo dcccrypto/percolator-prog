@@ -409,6 +409,17 @@ pub mod constants {
     /// (64 B) at [832, 896) of the asset's wrapper slot, directly below `AssetVaultLpV18`. Those
     /// bytes were zero spare headroom (P1's risk limits end at 672): NO LAYOUT CHANGE.
     pub const ASSET_VAULT_LP_DRAW_OFF: usize = 832;
+    /// P3 (2026-09-30): per-pot VAULT-OWNED atoms `[even, odd]` (2 x u128, 32 B) at [800, 832) of
+    /// the asset wrapper slot — zero spare headroom above P1's risk limits (end 672): NO LAYOUT
+    /// CHANGE. Counts backing the LP-vault registry put into its own pots (Earn deposits, fee
+    /// harvest, recall, the vault LP's resolved payout, rebalances) minus what it took out
+    /// (77, 102, the senior draw, rebalances). Loss backing the ENGINE routes into a pot for
+    /// winners who have not been touched yet is NOT counted: the senior draw may only take
+    /// vault-owned atoms (C-7 exhausted / single-pot race: winners were short 8,511 / 8,699).
+    pub const ASSET_VAULT_POT_OWNED_OFF: usize = 800;
+    pub const ASSET_VAULT_POT_OWNED_LEN: usize = 32;
+    const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF + ASSET_VAULT_POT_OWNED_LEN == 832);
+    const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF >= 672);
     pub const ASSET_VAULT_LP_DRAW_LEN: usize = 64;
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF + ASSET_VAULT_LP_DRAW_LEN == ASSET_VAULT_LP_OFF);
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF >= 672);
@@ -5856,6 +5867,26 @@ pub mod state {
             .get_mut(off..off + crate::constants::ASSET_VAULT_LP_DRAW_LEN)
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(v));
+        Ok(())
+    }
+
+    /// Vault-owned atoms of pot `parity` (0 = even/long, 1 = odd/short) of this asset.
+    pub fn vault_pot_owned_from_wrapper_bytes(wrapper: &[u8], parity: usize) -> Result<u128, ProgramError> {
+        let off = crate::constants::ASSET_VAULT_POT_OWNED_OFF + 16 * (parity & 1);
+        let bytes: [u8; 16] = wrapper
+            .get(off..off + 16)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .try_into()
+            .map_err(|_| PercolatorError::InvalidAccountLen)?;
+        Ok(u128::from_le_bytes(bytes))
+    }
+
+    pub fn vault_pot_owned_to_wrapper_bytes(wrapper: &mut [u8], parity: usize, v: u128) -> Result<(), ProgramError> {
+        let off = crate::constants::ASSET_VAULT_POT_OWNED_OFF + 16 * (parity & 1);
+        wrapper
+            .get_mut(off..off + 16)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&v.to_le_bytes());
         Ok(())
     }
 
@@ -11597,7 +11628,8 @@ pub mod processor {
         }
     }
 
-    /// P3 (2026-09-30): every Fresh backing pot owned by this market's LP-vault registry carries
+    /// P3 (2026-09-30): every Fresh backing pot owned by this market's LP-vault registry, on an
+    /// asset whose vault LP is BOUND, carries
     /// the sentinel expiry `LP_VAULT_BACKING_EXPIRY_SLOT`, so a pot never lapses and never
     /// forfeits senior principal or the winners' loss backing to the junior pool.
     ///
@@ -11642,9 +11674,15 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         group: &mut state::MarketViewMutV16<'_>,
     ) -> ProgramResult {
-        let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        // ONLY the two pots of the asset whose vault LP is BOUND (tag 94; one vault per market,
+        // F14-Q2) — never an unbound registry pot (pre-bind tag-89 expiry, CloseSlab's terminal
+        // scan and CreateLpVault's empty-pot guard keep their own view of those), and never a
+        // bucket whose backing authority is not this market's LP-vault registry PDA.
+        let Ok(Some(a)) = market_bound_vault_asset(group) else {
+            return Ok(());
+        };
         let mut registry: Option<[u8; 32]> = None;
-        for d in 0..n.saturating_mul(2) {
+        for d in [a * 2, a * 2 + 1] {
             let (_, bucket) = backing_domain_parts_view(group, d)?;
             if bucket.status != BackingBucketStatusV16::Fresh
                 || bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
@@ -11657,7 +11695,7 @@ pub mod processor {
             if domain_authorities_from_view(group, cfg, d)?.backing_bucket_authority != reg {
                 continue;
             }
-            let slot = &mut group.markets[d / 2].engine;
+            let slot = &mut group.markets[a].engine;
             let bucket_acc = if d % 2 == 0 { &mut slot.backing_long } else { &mut slot.backing_short };
             let mut b = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
             let was = b.expiry_slot;
@@ -24871,6 +24909,7 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineCounterUnderflow)?,
             );
             from_ledger.total_principal_atoms -= amount;
+            vault_pot_owned_adjust(&mut group, from_domain as usize, amount, false)?;
             write_or_init_backing_domain_ledger(
                 &mut from_ledger_data,
                 &from_ledger,
@@ -25618,6 +25657,7 @@ pub mod processor {
             } else {
                 ledger.total_principal_atoms.saturating_sub(principal_portion)
             };
+            vault_pot_owned_adjust(&mut group, domain, principal_portion, false)?;
             ledger.total_principal_withdrawn_atoms = ledger
                 .total_principal_withdrawn_atoms
                 .checked_add(principal_portion)
@@ -26648,6 +26688,39 @@ pub mod processor {
         state::asset_vault_lp_draw_to_wrapper_bytes(&mut market.wrapper[..], v)
     }
 
+    /// Adjust pot `domain`'s vault-owned counter by `atoms` (saturating on the way down: engine
+    /// consumption of senior backing by winners can leave the counter above the pot).
+    #[inline(never)]
+    fn vault_pot_owned_adjust(
+        group: &mut state::MarketViewMutV16<'_>,
+        domain: usize,
+        atoms: u128,
+        add: bool,
+    ) -> ProgramResult {
+        if atoms == 0 {
+            return Ok(());
+        }
+        let market = group
+            .markets
+            .get_mut(domain / 2)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let cur = state::vault_pot_owned_from_wrapper_bytes(&market.wrapper[..], domain % 2)?;
+        let next = if add {
+            cur.checked_add(atoms).ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            cur.saturating_sub(atoms)
+        };
+        state::vault_pot_owned_to_wrapper_bytes(&mut market.wrapper[..], domain % 2, next)
+    }
+
+    fn vault_pot_owned(group: &state::MarketViewMutV16<'_>, domain: usize) -> Result<u128, ProgramError> {
+        let market = group
+            .markets
+            .get(domain / 2)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::vault_pot_owned_from_wrapper_bytes(&market.wrapper[..], domain % 2)
+    }
+
     /// Atoms of one pot the draw may take: fresh idle backing, while the pot is Fresh and owned
     /// by this market's LP-vault registry.
     #[inline(never)]
@@ -26671,7 +26744,9 @@ pub mod processor {
             .fresh_reserved_backing_num
             .saturating_sub(source.positive_claim_bound_num);
         let num = bucket.fresh_unliened_backing_num.min(unreserved);
-        Ok(num / BOUND_SCALE)
+        // Only VAULT-OWNED atoms: loss backing the engine routed here for winners whose claims
+        // are not registered yet (untouched) is theirs, not the seniors'.
+        Ok((num / BOUND_SCALE).min(vault_pot_owned(group, domain)?))
     }
 
     /// Principal-only decrement of one vault pot: MIRRORS tag 77's inline withdraw (principal
@@ -26757,6 +26832,7 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?,
         );
         group.header.vault = percolator::V16PodU128::new(vault_before - atoms);
+        vault_pot_owned_adjust(group, domain, atoms, false)?;
         Ok(())
     }
 
@@ -27392,12 +27468,13 @@ pub mod processor {
                 }
                 _ => continue,
             };
-            add_fresh_counterparty_backing_view(
+            add_fresh_counterparty_backing_view_owned(
                 group,
                 d,
                 amt.checked_mul(BOUND_SCALE)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?,
                 expiry,
+                false,
             )?;
             residual -= amt;
             total += amt;
@@ -29133,6 +29210,7 @@ pub mod processor {
                     .ok_or(PercolatorError::EngineCounterUnderflow)?,
             );
             ledger.total_principal_atoms = ledger.total_principal_atoms.saturating_sub(amount);
+            vault_pot_owned_adjust(&mut group, domain, amount, false)?;
             ledger.total_principal_withdrawn_atoms = ledger
                 .total_principal_withdrawn_atoms
                 .checked_add(amount)
@@ -29745,6 +29823,17 @@ pub mod processor {
         amount_num: u128,
         expiry_slot: u64,
     ) -> ProgramResult {
+        add_fresh_counterparty_backing_view_owned(group, domain, amount_num, expiry_slot, true)
+    }
+
+    /// `vault_owned = false` only for the residual relabel (the winners' backing).
+    fn add_fresh_counterparty_backing_view_owned(
+        group: &mut state::MarketViewMutV16<'_>,
+        domain: usize,
+        amount_num: u128,
+        expiry_slot: u64,
+        vault_owned: bool,
+    ) -> ProgramResult {
         let max_markets = group.header.config.max_market_slots.get() as usize;
         let asset_index = domain / 2;
         if domain >= max_markets.saturating_mul(2)
@@ -29778,7 +29867,13 @@ pub mod processor {
         // the sentinel first: a later expiry only keeps the winners' loss backing live longer
         // (the same state as loss backing that joins an already-funded vault pot), and a vault
         // pot must never carry a horizon that would forfeit senior principal on lapse.
-        if expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+        // Bound vault only (tag 94 done): before the bind a registry pot at a foreign expiry
+        // still refuses the Earn seed with 21 (p3_fork_earn_seed_blocked_by_foreign_fresh_bucket).
+        let asset_bound = state::asset_vault_lp_from_wrapper_bytes(&group.markets[asset_index].wrapper[..])
+            .map(|v| v.vault_lp_portfolio != [0u8; 32])
+            .unwrap_or(false);
+        if asset_bound
+            && expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
             && bucket.status == BackingBucketStatusV16::Fresh
             && bucket.expiry_slot != expiry_slot
             && bucket.expiry_slot > group.header.current_slot.get()
@@ -29837,6 +29932,9 @@ pub mod processor {
         );
         *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
         *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+        if vault_owned {
+            vault_pot_owned_adjust(group, domain, amount_num / BOUND_SCALE, true)?;
+        }
         Ok(())
     }
 
