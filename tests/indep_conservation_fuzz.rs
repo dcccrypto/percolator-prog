@@ -408,7 +408,7 @@ impl World {
         let (m, v) = (self.env.market, self.env.vault);
         let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
         self.send(
-            ProgInstruction::DepositToLpVault { amount: amt as u128, domain: 0 },
+            ProgInstruction::DepositToLpVault { amount: amt as u128, domain: fuzz_lp_domain(amt) },
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -489,6 +489,16 @@ impl World {
 
     /// ExecuteRedemption (77) for `u`'s pending redemption PDA (permissionless crank).
     fn do_lp_execute(&mut self, u: usize) -> Result<u64, String> {
+        // FUZZ_LP_DOMAINS=2: seniors sit in both pots, so a redeemer tries its pot, then the other.
+        let r = self.do_lp_execute_domain(u, 0);
+        if r.is_err() && std::env::var("FUZZ_LP_DOMAINS").map_or(false, |v| v == "2") {
+            let r1 = self.do_lp_execute_domain(u, 1);
+            if r1.is_ok() { return r1; }
+        }
+        r
+    }
+
+    fn do_lp_execute_domain(&mut self, u: usize, domain: u16) -> Result<u64, String> {
         let (reg, lmint, esc) = self.lp_vault.ok_or("no lp vault")?;
         let owner = self.owners[u].insecure_clone();
         let red = state::derive_lp_redemption(&self.env.program_id, &reg, &owner.pubkey()).0;
@@ -496,7 +506,7 @@ impl World {
         let (m, v, va, payer) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.payer.pubkey());
         let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
         self.send(
-            ProgInstruction::ExecuteRedemption { domain: 0 },
+            ProgInstruction::ExecuteRedemption { domain },
             vec![
                 AccountMeta::new(payer, true),
                 AccountMeta::new(m, false),
@@ -4120,4 +4130,10 @@ fn indep_p3_rt_winner_haircut_at_resolved_close_repro() {
     let (r, st) = run_seq(30, &ops, true);
     eprintln!("soft {:?}", st.soft);
     r.expect("RT: a winner haircut at the resolved close while seniors hold C");
+}
+
+/// FUZZ_LP_DOMAINS=2: Earn deposits alternate between pot 0 and pot 1 (by amount parity), like
+/// the relaunch seed (LP_VAULT_DEPOSIT_PER_DOMAIN) and users choosing either side's pot.
+fn fuzz_lp_domain(amt: u64) -> u16 {
+    if std::env::var("FUZZ_LP_DOMAINS").map_or(false, |v| v == "2") { (amt % 2) as u16 } else { 0 }
 }
