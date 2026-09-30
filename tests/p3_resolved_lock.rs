@@ -4398,3 +4398,39 @@ fn p3_g1_trader_vs_trader_via_vault_lp_never_draws_seniors() {
         assert!(out + 2_000 >= c0, "G-1 bypass: seniors drawn for a trader default: paid {out} of {c0}");
     }
 }
+
+/// Gate class-(b) repros (deedd0fc, on 592286b4): a winner who faced ONLY the vault LP was haircut
+/// at the resolved close with no trader default anywhere, while the junior was paid its surplus.
+/// The vault LP's claim-originated payout (its own claims realised in 101 or earlier in Live) is
+/// now recycled as non-owned pot backing and the Resolved cover moves the sibling's free backing.
+fn classb_run(fee: u64, dom: &str, randlen_precrank0: bool, ops: &[Op]) -> (u64, u128) {
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_LP_DOMAINS", dom);
+    std::env::set_var("FUZZ_P3_PRECRANK", if randlen_precrank0 { "0" } else { "1" });
+    let mut w = World::new(fee);
+    for op in ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants");
+    }
+    w.wind_down().expect("wind-down completes");
+    let st = w.stats.clone();
+    (st.soft.get("close_resolved_haircut_events").copied().unwrap_or(0), w.shortfall)
+}
+
+#[test]
+fn p3_classb_vault_lp_winner_never_haircut_while_junior_paid() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let cases: Vec<(&str, u64, &str, bool, Vec<Op>)> = vec![
+        ("gate repro (af0e shrunk, two-pot)", 0, "2", true, vec![Op::P3JuniorDeposit { amt: 2_437_649 }, Op::TradeCpi { u: 152, size_tenths: 377 }, Op::TradeCpi { u: 183, size_tenths: 1 }, Op::Warp { n: 58 },
+            Op::Crank { u: 100 }, Op::TradeCpi { u: 74, size_tenths: -144 }, Op::Push { delta_bps: 639 }]),
+        ("af0e 8-op", 0, "0", true, vec![Op::P3JuniorDeposit { amt: 2437649 }, Op::TradeCpi { u: 152, size_tenths: 377 }, Op::TradeCpi { u: 183, size_tenths: 1 }, Op::Warp { n: 58 }, Op::Crank { u: 100 }, Op::Warp { n: 20 }, Op::TradeCpi { u: 79, size_tenths: 284 }, Op::Push { delta_bps: 639 }]),
+        ("af0e 7-op standard", 0, "2", false, vec![Op::P3JuniorDeposit { amt: 2437649 }, Op::TradeCpi { u: 152, size_tenths: 377 }, Op::Warp { n: 58 }, Op::Crank { u: 100 }, Op::TradeCpi { u: 74, size_tenths: -144 }, Op::TradeCpi { u: 79, size_tenths: 284 }, Op::Push { delta_bps: 639 }]),
+        ("645b 6-op (payer's netted funding)", 0, "0", false, vec![Op::TradeCpi { u: 117, size_tenths: 86 }, Op::TradeCpi { u: 42, size_tenths: -260 }, Op::Push { delta_bps: -906 }, Op::Warp { n: 57 }, Op::Crank { u: 31 }, Op::Warp { n: 29 }]),
+    ];
+    for (label, fee, dom, rl, ops) in cases {
+        let (haircuts, shortfall) = classb_run(fee, dom, rl, &ops);
+        eprintln!("CLASSB {label}: haircut events {haircuts}, receipt shortfall {shortfall}");
+        assert_eq!(haircuts, 0, "{label}: a winner who faced only the vault LP was haircut");
+        assert_eq!(shortfall, 0, "{label}: receipt shortfall");
+    }
+}

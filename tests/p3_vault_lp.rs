@@ -2246,6 +2246,9 @@ fn p3_f8_vault_lp_win_reaches_the_junior_at_resolution() {
     env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
     let towner = t.kp.pubkey();
     env.permissionless_close_portfolio(t.portfolio, towner).expect("cleanup trader");
+    // Terminal 78 first (keeper step): the vault LP's claim-originated payout is recycled as
+    // non-owned pot backing at 101 (class-(b) fix); 78 makes it the vault's before 77 (84 until).
+    env.crank_fees(true).expect("terminal 78");
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
     let senior = env.earn_execute(&d, Some(lp.portfolio)).expect("senior redeems");
@@ -2308,6 +2311,7 @@ fn p3_f8_settle_first_then_terminal_sweep_pays_the_junior_its_win() {
     env.permissionless_close_portfolio(lp.portfolio, registry).expect("cleanup vault LP");
     let towner = t.kp.pubkey();
     env.permissionless_close_portfolio(t.portfolio, towner).expect("cleanup trader");
+    env.crank_fees(true).expect("terminal 78");
     // Before the seniors leave the junior may already take the surplus over C.
     let (_, g) = env.market_state();
     let physical = (g.source_backing_buckets[0].fresh_unliened_backing_num

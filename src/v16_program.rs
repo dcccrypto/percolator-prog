@@ -27020,12 +27020,38 @@ pub mod processor {
             } else {
                 asset.stored_pos_count_short.get()
             };
+            // The closing portfolio's OWN leg on that side detaches inside this same close before
+            // its claim is realised; it is not another (unregistered) claimant.
+            let own_side_legs = portfolio
+                .header
+                .legs
+                .iter()
+                .filter_map(|l| l.try_to_runtime().ok())
+                .filter(|l| l.active && l.asset_index as usize == a && ((d % 2 == 0) == matches!(l.side, SideV16::Long)))
+                .count() as u64;
+            let side_positions = side_positions.saturating_sub(own_side_legs);
             if side_positions != 0 {
                 continue;
             }
             let sib = if d % 2 == 0 { d + 1 } else { d - 1 };
-            let orphan = vault_terminal_stray_atoms(group, a)?[sib % 2];
-            let x = need_num.div_ceil(BOUND_SCALE).min(orphan);
+            // Free sibling backing: Fresh, not vault-owned, beyond the sibling's REGISTERED claims.
+            // With no position left on the claimants' side every such claim is registered, so the
+            // excess is nobody's: the vault LP's netted/recycled claim backing, or a payer's
+            // netted funding. Never senior/junior principal.
+            let orphan = {
+                let (ss, sb) = backing_domain_parts_view(group, sib)?;
+                if sb.status != BackingBucketStatusV16::Fresh {
+                    0
+                } else {
+                    (sb.fresh_unliened_backing_num / BOUND_SCALE)
+                        .saturating_sub(vault_pot_owned(group, sib)?)
+                        .saturating_sub(ss.positive_claim_bound_num.div_ceil(BOUND_SCALE))
+                }
+            };
+            // Move the WHOLE orphan once any shortfall is registered: the engine close can grow the
+            // claim further inside the same call (funding / fee settlement after this read), and
+            // any excess is claim-free backing that tag 78 hands back to the vault at terminal-flat.
+            let x = orphan;
             if x == 0 {
                 continue;
             }
@@ -28022,6 +28048,16 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
         }
         Ok(credited)
+    }
+
+    /// Σ over the bound asset's two pots of Fresh backing that is NOT vault-owned (atoms).
+    fn vault_pots_non_owned_atoms(group: &state::MarketViewMutV16<'_>, a: usize) -> Result<u128, ProgramError> {
+        let mut t = 0u128;
+        for d in [a * 2, a * 2 + 1] {
+            let (_, b) = backing_domain_parts_view(group, d)?;
+            t = t.saturating_add((b.fresh_unliened_backing_num / BOUND_SCALE).saturating_sub(vault_pot_owned(group, d)?));
+        }
+        Ok(t)
     }
 
     fn vault_physical_idle_backing_atoms(
@@ -29226,6 +29262,13 @@ pub mod processor {
             group
                 .advance_resolved_slot_not_atomic(authenticated_slot)
                 .map_err(map_v16_error)?;
+            // P3 (2026-09-30, class-(b) winner haircut): the part of the vault LP's resolved payout
+            // that realised its OWN source claims is backing a counterparty's loss put in a pot for
+            // the vault LP; its settled loss to the SAME counterparty was netted against that claim,
+            // so the winners' claim pot is short by exactly it. It is recycled below as NON-owned
+            // pot backing (the Resolved cover moves it to the claim pot; tag 78 makes any leftover
+            // the vault's at terminal-flat), never as senior/junior principal.
+            let mut vlp_claim_payout = 0u128;
             let payout = {
                 let mut lp_data = lp_ai.try_borrow_mut_data()?;
                 let mut lp =
@@ -29243,7 +29286,17 @@ pub mod processor {
                     // pots BEFORE the resolved close, so the close never books a bankrupt
                     // residual against the winners while senior backing remains.
                     let close_before = vault_lp_close_marker(&lp)?;
-                    let (_, exhausted) = vault_lp_physical_draw(
+                    let crys0 = lp.header.residual_crystallized_loss_atoms_total.get();
+                    let non_owned0 = vault_pots_non_owned_atoms(&group, st.asset_index as usize)?;
+                    // The vault LP's registered source claims before its settlement: the most its
+                    // resolved payout can hold of counterparty-loss backing.
+                    let claims0: u128 = lp
+                        .header
+                        .source_domains
+                        .iter()
+                        .map(|sd| sd.source_claim_bound_num.get().div_ceil(BOUND_SCALE))
+                        .fold(0u128, |acc, x| acc.saturating_add(x));
+                    let (drawn_now, exhausted) = vault_lp_physical_draw(
                         program_id,
                         market_ai.key,
                         &cfg,
@@ -29256,6 +29309,24 @@ pub mod processor {
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
+                    if let percolator::ResolvedCloseOutcomeV16::Closed { payout } = outcome {
+                        // Capital left after this instruction's loss settlement = capital before
+                        // + the draw it funded - the loss the engine routed out as backing
+                        // (`residual_crystallized_loss_atoms_total` delta). Anything paid above
+                        // that is the vault LP's source-claim realisation.
+                        // Non-owned pot backing that left the pots during this settlement, net of
+                        // the loss the vault LP routed IN (`residual_crystallized_loss_atoms_total`
+                        // delta): the counterparty-loss backing its own claims consumed. (The draw
+                        // moves owned atoms only, so it does not enter this measure.)
+                        let _ = drawn_now;
+                        let crys1 = lp.header.residual_crystallized_loss_atoms_total.get();
+                        let non_owned1 = vault_pots_non_owned_atoms(&group, st.asset_index as usize)?;
+                        let consumed = non_owned0
+                            .saturating_add(crys1.saturating_sub(crys0))
+                            .saturating_sub(non_owned1);
+                        vlp_claim_payout = consumed.max(claims0).min(payout);
+
+                    }
                     vault_lp_refuse_new_bankrupt_close(
                         program_id,
                         market_ai.key,
@@ -29296,6 +29367,45 @@ pub mod processor {
             // Resolved path: surplus = physical - C), which is after every other claim.
             let _ = st.senior_claim_atoms;
             let (to_backing, to_junior) = (payout, 0u128);
+            // Backing the vault LP's own claims consumed from its pot EARLIER (a Live crank or
+            // refresh realised them into its capital) shows as that pot's provider receivable; the
+            // payout now refills it first. That part is also counterparty-loss backing, not
+            // senior/junior principal.
+            let recv_atoms = {
+                let (src, _) = backing_domain_parts_view(&group, domain)?;
+                src.provider_receivable_num / BOUND_SCALE
+            };
+            let recycled = vlp_claim_payout.max(recv_atoms.min(to_backing)).min(to_backing);
+            let to_backing = to_backing - recycled;
+            if recycled != 0 {
+                let (_, rb) = backing_domain_parts_view(&group, domain)?;
+                let expiry = if rb.status == BackingBucketStatusV16::Fresh {
+                    rb.expiry_slot
+                } else {
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                };
+                add_fresh_counterparty_backing_view_owned(
+                    &mut group,
+                    domain,
+                    recycled
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    expiry,
+                    false,
+                )?;
+                group.header.vault = percolator::V16PodU128::new(
+                    group
+                        .header
+                        .vault
+                        .get()
+                        .checked_add(recycled)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                );
+                solana_program::log::sol_log(&alloc::format!(
+                    "p3_vault_lp_claim_payout_recycled domain={} atoms={}",
+                    domain, recycled
+                ));
+            }
             if to_backing != 0 {
                 // Senior-first: the payout already left header.vault inside the engine close;
                 // route the senior part back in as the vault's own backing principal (the same
