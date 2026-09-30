@@ -4186,3 +4186,31 @@ fn indep_p3_resolved_vault_lp_unattributed_pnl_locks_everyone_repro() {
     let (r, _st) = run_seq(5, &ops, true);
     r.expect("resolved wind-down must complete (vault LP settles, winners paid, seniors exit)");
 }
+
+/// Shrunk fuzz repro on ede691b6 (seed 0xcb96b350121a8493, random resolve, fee 30): ONE winner long
+/// vs the vault LP, +13.82%, no reversal; at the resolved close the winner is haircut (56 atoms of a
+/// 138,130 claim; 34,794 in the unshrunk sequence) while seniors hold C 10M. Pot d1 (the claim
+/// domain) is Fresh 1 + consumed 138,074. Run with FUZZ_P3=1 FUZZ_RANDLEN=1 FUZZ_P3_PRECRANK=0.
+#[test]
+#[ignore]
+fn indep_p3_resolved_close_single_winner_haircut_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    std::env::set_var("FUZZ_STRICT_RT", "1");
+    let ops = vec![Op::TradeCpi { u: 178, size_tenths: 100 }, Op::Warp { n: 55 }, Op::Crank { u: 237 }, Op::Push { delta_bps: 1382 }];
+    let (r, st) = run_seq(30, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("winner paid in full at the resolved close while seniors hold C");
+}
+
+/// Shrunk fuzz repro on ede691b6 (seed 0xbc092f9ecb8941ee, random resolve, fee 0): after every exit
+/// 84,918 atoms stay as Fresh backing nobody can claim (P3-d). Run with FUZZ_P3=1 FUZZ_RANDLEN=1
+/// FUZZ_P3_PRECRANK=0 (FUZZ_DEBUG_P3=1 prints the pots and the junior's 102 results per pot).
+#[test]
+#[ignore]
+fn indep_p3_stranded_pot_backing_after_all_exits_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::TradeCpi { u: 175, size_tenths: 175 }, Op::Push { delta_bps: 1603 }, Op::Warp { n: 55 }, Op::TradeCpi { u: 162, size_tenths: -212 },
+        Op::TradeCpi { u: 201, size_tenths: -162 }, Op::Push { delta_bps: -2020 }, Op::LpDeposit { u: 212, amt: 3_862_642 }];
+    let (r, _st) = run_seq(0, &ops, true);
+    r.expect("nothing stranded after every exit");
+}
