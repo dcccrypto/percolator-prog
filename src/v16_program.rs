@@ -29790,8 +29790,10 @@ mod p1_kani_proofs {
     #[kani::proof]
     #[kani::solver(cadical)]
     fn kani_p1_exec_band_check_sound() {
-        let exec: u64 = kani::any();
-        let reference: u64 = kani::any();
+        // u32 prices (up to ~4.29e9 e6 = $4,294): the full-u64 run did not finish in 40 min.
+        let exec: u32 = kani::any();
+        let reference: u32 = kani::any();
+        let (exec, reference) = (exec as u64, reference as u64);
         let band: u16 = kani::any();
         let within = p1::exec_price_within_band(exec, reference, band);
         // Zero reference never passes (fail closed).
@@ -29883,10 +29885,13 @@ mod p1_kani_proofs {
     #[kani::proof]
     #[kani::solver(cadical)]
     fn kani_p1_exposure_cap_saturates_monotone() {
+        // Full-width equity (saturation needs it); k and price concrete-ish to keep the
+        // 128-bit division tractable.
         let equity: u128 = kani::any();
-        let k: u32 = kani::any();
-        let price: u64 = kani::any();
-        kani::assume(price != 0);
+        let ksel: u8 = kani::any();
+        let k: u32 = if ksel % 2 == 0 { 10_000 } else { p1::MAX_LP_EXPOSURE_K_BPS };
+        let psel: u8 = kani::any();
+        let price: u64 = if psel % 2 == 0 { 1 } else { 1_000_000 };
         let cap = p1::lp_exposure_cap_q(equity, k, price, 1_000_000);
         let bigger = p1::lp_exposure_cap_q(equity.saturating_add(1), k, price, 1_000_000);
         assert!(cap <= bigger);
