@@ -3691,7 +3691,29 @@ pub fn send_tx(
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
+    log_error_sites(&r);
     r
+}
+
+/// Debug aid for instrumented builds: with INDEP_ERR_SITES=1, print the `sol_log_64` error-site
+/// lines ("Program log: 0x<tag>, 0x<line>, ...") of a failed transaction.
+pub fn log_error_sites(r: &Result<u64, String>) {
+    if let Err(e) = r {
+        if std::env::var("INDEP_ERR_SITES").map_or(false, |v| v == "1") {
+            let sites: Vec<String> = e
+                .split("\"")
+                .filter(|l| l.starts_with("Program log: 0x"))
+                .map(|l| {
+                    let v: Vec<u64> = l["Program log: ".len()..]
+                        .split(", ")
+                        .filter_map(|h| u64::from_str_radix(h.trim_start_matches("0x"), 16).ok())
+                        .collect();
+                    if v.first() == Some(&0xB1) { format!("b1{:?}", &v[1..]) } else { format!("{:x}@{}", v.first().copied().unwrap_or(0), v.get(1).copied().unwrap_or(0)) }
+                })
+                .collect();
+            eprintln!("ERR-SITES {:?}", sites);
+        }
+    }
 }
 
 pub fn send_raw_tx(
@@ -3716,6 +3738,7 @@ pub fn send_raw_tx(
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
+    log_error_sites(&r);
     r
 }
 
