@@ -4002,6 +4002,16 @@ fn indep_p3_recall_bound_after_vault_lp_shortfall() {
     let (c, backing, (lpcap, _, lplegs)) = state(&w);
     let shortfall = c.saturating_sub(backing);
     eprintln!("recall: C {c} backing {backing} shortfall {shortfall} lp capital {lpcap} legs {lplegs}");
+    if shortfall == 0 && lplegs == 0 {
+        // Senior-draw rule (d119eebd+): a vault-LP loss writes C down instead of leaving a senior
+        // shortfall, so this construction has nothing to recall. Pin the refusal (76, or 89
+        // while a draw is pending) and record the gap.
+        let r = w.p3_recall(1);
+        let rc = r.as_ref().err().and_then(|e| custom_code(e));
+        eprintln!("RECALL-GAP (senior draw): no shortfall (C {c} backing {backing}); recall(1) -> {rc:?}");
+        assert!(rc == Some(76) || rc == Some(89), "no shortfall -> recall refused (76/89), got {rc:?}");
+        return;
+    }
     assert!(shortfall > 0 && lpcap > 0 && lplegs == 0, "vacuity: need LP flat with capital and a senior shortfall (C {c} backing {backing} lpcap {lpcap} legs {lplegs})");
     let v0 = w.token_amount(&w.env.vault);
     let hv0 = w.env.market_state().1.vault;
