@@ -3504,7 +3504,19 @@ impl World {
                         if let Err(e) = self.do_lp_execute(u) { why = format!("{:?}", custom_code(&e)); }
                     }
                     let tag = if h > 0 && why.contains("84") { "P3-f(F-12) SENIORS LOCKED BY HARVEST GATE" } else if why.contains("25") { "P3-f(F-14) SENIOR REDEMPTION UNDERFLOW" } else { "P3-f SENIORS LOCKED" };
-                    return Err(format!("{tag}: {} senior shares outstanding after Resolve; LP fee leg harvestable {h}; last execute error {why}; C {}", r.total_lp_shares_outstanding - floor, self.p3_c()));
+                    let g = self.env.market_state().1;
+                    let alive_ix: Vec<usize> = (0..=N_USERS).filter(|&u| self.port_alive(u)).collect();
+                    let mut closes = Vec::new();
+                    for &u in &alive_ix {
+                        let mut n = 0; let mut last = None;
+                        while self.port_alive(u) && n < 2_000 { let r = self.do_close_resolved(u); last = Some(r.as_ref().map(|_| ()).map_err(|e| custom_code(e))); n += 1; let _ = self.do_close_portfolio(u); }
+                        let x = if self.port_alive(u) { let st = self.env.portfolio_state(self.ports[u]); format!("still alive cap {} pnl {} receipt fin {}", st.capital, st.pnl, st.resolved_payout_receipt.finalized) } else { "closed".into() };
+                        closes.push(format!("u{u} 30 x{n} last {:?}: {x}", last));
+                    }
+                    let _ = &closes;
+                    if std::env::var("FUZZ_DEBUG_P3").is_ok() { eprintln!("  P3F closes {:?}", closes); }
+                    let alive: Vec<String> = (0..=N_USERS).filter(|&u| self.port_alive(u)).map(|u| { let x = self.env.portfolio_state(self.ports[u]); format!("u{u}(cap {} pnl {} legs {} close {})", x.capital, x.pnl, x.legs.iter().filter(|l| l.active).count(), x.close_progress.active) }).collect();
+                    return Err(format!("{tag}: {} senior shares outstanding after Resolve; LP fee leg harvestable {h}; last execute error {why}; C {}; materialized {} c_tot {}; alive {:?}", r.total_lp_shares_outstanding - floor, self.p3_c(), g.materialized_portfolio_count, g.c_tot, alive));
                 }
             }
         }
