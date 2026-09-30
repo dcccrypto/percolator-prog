@@ -395,6 +395,7 @@ fn band_statements(exec: u64, reference: u64, band: u16) {
     let accepted = p1::exec_price_within_band(exec, reference, band);
     let d4 = (exec.abs_diff(reference) as u128) * 10_000;
     let rb = (reference as u128) * (band as u128);
+    kani::cover!(reference == 0, "zero reference");
     if reference == 0 {
         assert!(!accepted, "zero reference fails closed");
         return;
