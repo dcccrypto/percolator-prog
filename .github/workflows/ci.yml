@@ -187,8 +187,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: percolator-prog }
 
+      # P1 fork regressions (tests/p1_fork_regressions.rs) replay live devnet state against the
+      # DEPLOYED v18.2 wrapper bytes as their negative control. Dump them from chain (read-only,
+      # public RPC) and truncate the zero-padded ProgramData to the true .so length; the test
+      # itself pins sha256 4472b383... and fails loudly on any other bytes.
+      - name: dump the live v18.2 wrapper bytes (fork-regression control)
+        run: |
+          solana program dump GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ /tmp/wrapper-live.so -u https://api.devnet.solana.com
+          head -c 1533512 /tmp/wrapper-live.so > /tmp/wrapper-v18.2.so
+          shasum -a 256 /tmp/wrapper-v18.2.so
       - name: run suite and diff against the allowlist
         working-directory: percolator-prog
         env:
           NFT_PIN: ci_sibling
+          P1_FORK_DEPLOYED_SO: /tmp/wrapper-v18.2.so
         run: ./scripts/ci-test.sh
