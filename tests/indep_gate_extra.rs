@@ -424,20 +424,30 @@ fn gate_p1_batch_cpi_ext1_two_assets_fills_both_legs() {
     }
 }
 
-/// P1 doc (P2 row): the call extension is "TradeCpi only (batch sends legacy bytes)". So with
-/// ext_mode = 1 a BatchTradeCpi against the DEPLOYED v1 matcher must still fill (legacy bytes are
-/// what v1 accepts) — the ABI-doc §4 send rule is honoured on the batch route by never sending.
+/// F-10 fix (P3 head 5191af8b/31efd250, credit: P3 builder): BatchTradeCpi now sends the SAME
+/// per-leg call extension as TradeCpi when ext_mode = 1. So against the DEPLOYED v1 matcher a
+/// batch with ext_mode 1 must fail closed with no state change (as single TradeCpi does), and with
+/// ext_mode 0 (legacy bytes) the v1 matcher still fills.
 #[test]
 fn gate_p1_batch_cpi_sends_legacy_bytes_so_v1_matcher_still_fills() {
+    // ext_mode 1: fail closed.
     let mut w = W::new(2);
     let lp = w.lp(50_000_000, w.v1, 0, 0, 100);
     let (t, tp) = w.user(50_000_000);
     for a in 0..2 {
         w.set_limits(a, 0, 0, 0, 1).expect("tag 93");
     }
+    let before = w.snapshot();
     let r = w.batch_cpi(&t, tp, &lp, &[(0, 2 * U), (1, -3 * U)]);
-    assert!(r.is_ok(), "batch with ext_mode 1 sends legacy bytes; v1 matcher must fill: {:?}", code(&r));
-    assert_eq!((w.pos(tp, 0), w.pos(tp, 1)), (2 * U, -3 * U));
+    eprintln!("batch ext1 vs v1 matcher -> {:?}", code(&r));
+    assert!(r.is_err(), "ext_mode 1 batch must send the extension; the v1 matcher rejects it (fail closed)");
+    assert_eq!(w.snapshot(), before, "fail closed: nothing moved");
+    // ext_mode 0: legacy bytes, v1 fills.
+    let mut w0 = W::new(2);
+    let lp0 = w0.lp(50_000_000, w0.v1, 0, 0, 100);
+    let (t0, tp0) = w0.user(50_000_000);
+    w0.batch_cpi(&t0, tp0, &lp0, &[(0, 2 * U), (1, -3 * U)]).expect("legacy batch vs v1 fills");
+    assert_eq!((w0.pos(tp0, 0), w0.pos(tp0, 1)), (2 * U, -3 * U));
 }
 
 /// P1 doc: "BatchTradeCpi is atomic → no clip, named refusal". Over-headroom must be 68
@@ -482,9 +492,10 @@ fn gate_p1_batch_cpi_ext1_halted_lp_named_69() {
     assert_eq!((w.pos(tp, 0), w.pos(tp, 1)), (0, 0));
 }
 
-/// EXEC_BAND on the batch route: the batch sends legacy bytes (P1 doc), so the matcher does NOT
-/// clamp; the wrapper band is the defence and a wide quote is refused 66 with ext_mode 0 AND 1.
-/// A quote inside the band fills.
+/// EXEC_BAND on the batch route (F-10 fix: per-leg extension). ext_mode 1: the P2 matcher clamps
+/// every leg inside the band, so a 300 bps-spread LP FILLS (no 66) — same as single TradeCpi
+/// (p1p2_ext1_exec_band_makes_wide_kind2_quote_clip_inside_band). ext_mode 0: no clamp, the
+/// wrapper band refuses 66 atomically. A 50 bps quote fills in both modes.
 #[test]
 fn gate_p1_batch_cpi_band_is_wrapper_enforced_on_every_leg() {
     for ext_mode in [1u8, 0u8] {
@@ -497,9 +508,16 @@ fn gate_p1_batch_cpi_band_is_wrapper_enforced_on_every_leg() {
         }
         let before = w.snapshot();
         let r = w.batch_cpi(&t, tp, &lp_wide, &[(0, U), (1, -U)]);
-        assert_eq!(code(&r), Some(66), "ext {ext_mode}: a leg quoted 300 bps outside a 100 bps band -> 66");
-        assert_eq!(w.snapshot(), before, "atomic");
-        w.batch_cpi(&t, tp, &lp_ok, &[(0, U), (1, -U)]).unwrap_or_else(|e| panic!("ext {ext_mode}: 50 bps legs fill: {:?}", custom_code(&e)));
+        eprintln!("ext {ext_mode}: wide batch -> {:?}", code(&r));
+        if ext_mode == 1 {
+            assert!(r.is_ok(), "ext 1: EXEC_BAND clamps each leg inside the band -> fills: {:?}", code(&r));
+            assert_eq!((w.pos(tp, 0), w.pos(tp, 1)), (U, -U));
+        } else {
+            assert_eq!(code(&r), Some(66), "ext 0: a leg quoted 300 bps outside a 100 bps band -> 66");
+            assert_eq!(w.snapshot(), before, "atomic");
+        }
+        let (t2, tp2) = w.user(50_000_000);
+        w.batch_cpi(&t2, tp2, &lp_ok, &[(0, U), (1, -U)]).unwrap_or_else(|e| panic!("ext {ext_mode}: 50 bps legs fill: {:?}", custom_code(&e)));
     }
 }
 

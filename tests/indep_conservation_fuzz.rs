@@ -1228,7 +1228,10 @@ impl World {
                 }
                 let size = size_tenths as i128 * (POS_SCALE as i128 / 10);
                 let exec = ((self.mark as i128) * (10_000 + off_bps as i128) / 10_000).max(1) as u64;
-                self.do_trade_nocpi(a, b, size, exec)
+                let before = (self.pos0(a), self.pos0(b));
+                let r = self.do_trade_nocpi(a, b, size, exec);
+                self.p3g_check("TradeNoCpi", &r, &[(a, before.0), (b, before.1)]);
+                r
             }
             Op::TradeCpi { u, size_tenths } => {
                 // P3: the vault LP's 1x capacity (junior-sized) is a few units; scale down.
@@ -1276,7 +1279,10 @@ impl World {
                 let mut b = b as usize % (N_USERS + 1);
                 if a == b { b = (b + 1) % (N_USERS + 1); }
                 let q = POS_SCALE as i128 / 10;
-                self.do_batch_nocpi(a, b, s0 as i128 * q, s1 as i128 * q)
+                let before = (self.pos0(a), self.pos0(b));
+                let r = self.do_batch_nocpi(a, b, s0 as i128 * q, s1 as i128 * q);
+                self.p3g_check("BatchTradeNoCpi", &r, &[(a, before.0), (b, before.1)]);
+                r
             }
             Op::Stake87Accrue => {
                 let r = self.do_stake87_accrue();
@@ -1778,7 +1784,16 @@ fn indep_conservation_fuzz_global_invariants() {
         st.winddowns, st.closeslab_ok, st.burned_at_close, st.legs_outstanding_at_close
     );
     // Non-vacuity: the fuzz must actually exercise value-moving paths.
+    // P3 mode (F-14 head): NoCpi growth on the bound asset is refused (77), so NoCpi successes
+    // are not required there — instead require that the refusal was actually exercised (P3-g).
+    if p3_mode() {
+        assert!(st.ok.get("p3g_nocpi_growth_refused_77").copied().unwrap_or(0) > 0 || st.ok.get("trade_nocpi").copied().unwrap_or(0) > 0,
+            "vacuous P3 fuzz: NoCpi neither succeeded nor was refused with 77");
+    }
     for k in ["deposit", "withdraw", "trade_nocpi", "trade_cpi", "push_mark", "crank"] {
+        if p3_mode() && k == "trade_nocpi" && st.ok.get("p3g_nocpi_growth_refused_77").copied().unwrap_or(0) > 0 {
+            continue; // covered by the P3-g refusal requirement above
+        }
         assert!(st.ok.get(k).copied().unwrap_or(0) > 0, "vacuous fuzz: no successful {k}");
     }
     let f = failures.lock().unwrap();
@@ -2670,6 +2685,36 @@ fn indep_f9_control_unbound_market_insurance_recoverable_after_stale_resolve() {
 // ═══════════════════════════════════════════════════════════════════════════
 
 impl World {
+    /// Signed position on asset 0 (0 if flat/closed).
+    fn pos0(&self, u: usize) -> i128 {
+        self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok())
+            .and_then(|p| p.legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| l.basis_pos_q)).unwrap_or(0)
+    }
+
+    /// P3-g (P3 doc F-14 head, credit: P3 builder 31efd250): on a P3 (bound) asset, TradeNoCpi /
+    /// BatchTradeNoCpi that GROW either side are refused (77) — the vault LP is the exclusive
+    /// counterparty. A successful NoCpi may only reduce. Hard violation otherwise.
+    fn p3g_check(&mut self, what: &str, r: &Result<u64, String>, parties: &[(usize, i128)]) {
+        if !p3_mode() || self.p3.is_none() {
+            return;
+        }
+        match r {
+            Ok(_) => {
+                for &(u, before) in parties {
+                    let after = self.pos0(u);
+                    if after.unsigned_abs() > before.unsigned_abs() || (before != 0 && after != 0 && before.signum() != after.signum()) {
+                        self.pending_violation = Some(format!("P3-g {what} GREW u{u} on a bound asset: {before} -> {after} (must be refused 77)"));
+                    }
+                }
+            }
+            Err(e) => {
+                if custom_code(e) == Some(77) {
+                    *self.stats.ok.entry("p3g_nocpi_growth_refused_77").or_default() += 1;
+                }
+            }
+        }
+    }
+
     fn do_rebalance_reduce(&mut self, u: usize, asset: u16, reduce_q: u128) -> Result<u64, String> {
         let owner = self.owners[u].insecure_clone();
         let p = self.ports[u];
@@ -3327,6 +3372,22 @@ impl World {
                 self.check()?;
             }
         }
+        // Junior terminal exit (P3 doc row 102 / §128, F-14 head; credit: P3 builder patch
+        // indep-fuzz-anvil-f14): the junior owner calls Resolved tag 102 for `physical − C` AFTER
+        // the seniors. A real user step. Largest accepted amount first, then halving. P3-a/P3-b still
+        // check that it can never take senior value.
+        {
+            let mut amt = self.token_amount(&self.env.vault);
+            while amt > 0 {
+                if self.p3_release(amt, true).is_ok() {
+                    *self.stats.ok.entry("p3_release102_resolved_after_seniors").or_default() += 1;
+                    self.check()?;
+                    amt = self.token_amount(&self.env.vault);
+                    continue;
+                }
+                amt /= 2;
+            }
+        }
         // P3-f: after Resolve every senior must be able to exit (H1). Registry shares left
         // beyond the 1,000 dead floor (+ escrowed pending) = seniors locked.
         if let Some((reg, _, _)) = self.lp_vault {
@@ -3772,59 +3833,74 @@ fn indep_p3_f12_residual_two_trades_then_resolve() {
     r.expect("seniors exit after resolve with pending fees");
 }
 
-/// Tag-98 recall bound (P3 §0.3 row 98 / §line 149): permissionless; moves vault-LP capital into
-/// the backing pot (no SPL move, header.vault nets 0); bounded by the senior liquidity shortfall
-/// C_eff − backing; LP must be flat. A shortfall is FORCED by a large OUTSIDE winner (a NoCpi
-/// pair not involving the vault LP) whose PnL is paid from the vault's domain backing, then the
-/// loser is liquidated. Run: FUZZ_P3=1 --ignored indep_p3_recall_bound_after_outside_winner_shortfall
+/// Tag-98 recall bound (P3 §0.3 row 98 / §149): permissionless; moves vault-LP capital into the
+/// backing pot (no SPL move, header.vault nets 0); bounded by the senior liquidity shortfall
+/// C_eff − backing; LP must be flat; refused 76 otherwise. Outside NoCpi pairs are refused on a
+/// bound asset (F-14 head), so the shortfall is forced THROUGH THE VAULT LP: (1) a trader goes
+/// long vs the vault LP and the mark rises (the LP's loss draws the backing pot below C), trader
+/// closes; (2) a second trader goes short vs the LP and the mark falls (the LP wins into capital),
+/// trader closes -> LP flat, capital > 0, backing < C. Run: FUZZ_P3=1 --ignored indep_p3_recall_bound
 #[test]
 #[ignore]
-fn indep_p3_recall_bound_after_outside_winner_shortfall() {
+fn indep_p3_recall_bound_after_vault_lp_shortfall() {
     assert!(p3_mode(), "run with FUZZ_P3=1");
     let mut w = World::new(0);
-    // Outside pair (users 2 long, 3 short) — big, then a large adverse move for the long.
-    w.do_deposit(3, 50_000_000).unwrap();
     let q = POS_SCALE as i128;
-    w.do_trade_nocpi(2, 3, 150 * q, w.mark).expect("outside open");
-    for d in [-2400, -2400, -2400] {
-        let _ = w.apply(&Op::Push { delta_bps: d });
-        let _ = w.permissionless_repair(40);
-    }
-    // Winner realizes: crank + convert released PnL.
+    let state = |w: &World| {
+        let (_, g) = w.env.market_state();
+        let backing: u128 = g.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).sum();
+        let lp = w.p3.as_ref().unwrap().lp;
+        let lpc = w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map(|p| (p.capital, p.pnl, p.legs.iter().filter(|l| l.active).count())).unwrap_or((0, 0, 0));
+        (w.p3_c(), backing, lpc)
+    };
+    let step = |w: &mut World, label: &str| {
+        let _ = w.permissionless_repair(30);
+        eprintln!("recall[{label}]: (C, backing, (lp cap, lp pnl, lp legs)) = {:?}", state(w));
+    };
+    // Phase 1: trader u2 long, mark up 3x ~+24%; close.
+    let r = w.p3_trade_vs_vault_lp(2, 3 * q);
+    eprintln!("open long vs LP -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    for _ in 0..7 { let _ = w.apply(&Op::Push { delta_bps: 2400 }); step(&mut w, "up"); }
+    let mut r = Err(String::new());
     for _ in 0..6 {
-        let _ = w.permissionless_repair(5);
-        let pnl = w.env.portfolio_state(w.ports[3]).pnl;
-        if pnl > 0 {
-            let _ = w.do_convert(3, pnl as u128);
-        }
+        r = w.p3_trade_vs_vault_lp(2, -3 * q);
+        if r.is_ok() { break; }
+        step(&mut w, "retry close");
     }
-    let (_, g) = w.env.market_state();
-    let backing: u128 = g.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).sum();
-    let c = w.p3_c();
-    let shortfall = c.saturating_sub(backing);
-    let spent: Vec<u128> = g.source_credit.iter().take(2).map(|s| s.spent_backing_num / BOUND_SCALE).collect();
-    eprintln!("recall: C {c} backing {backing} shortfall {shortfall} spent {spent:?} winner pnl {} cap {}", w.env.portfolio_state(w.ports[3]).pnl, w.env.portfolio_state(w.ports[3]).capital);
-    assert!(shortfall > 0, "vacuity: an outside winner must create a senior shortfall (C {c} vs backing {backing})");
-    let v0 = w.token_amount(&w.env.vault);
-    let hv0 = g.vault;
-    let st0 = w.p3_state();
-    let recalled0 = u128::from_le_bytes(st0[208..224].try_into().unwrap());
-    // Over the bound: refused (76) or clipped — record and require no over-recall.
-    let over = w.p3_recall(shortfall + 1);
-    eprintln!("recall shortfall+1 -> {:?}", over.as_ref().map_err(|e| custom_code(e)));
-    let exact = if over.is_ok() { Ok(0) } else { w.p3_recall(shortfall) };
-    eprintln!("recall exact shortfall -> {:?}", exact.as_ref().map_err(|e| custom_code(e)));
+    eprintln!("close long -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    step(&mut w, "after long close");
+    // Phase 2: the junior tops the flat vault LP back up (tag 96); that capital is what tag 98
+    // may recall into the senior backing pot, bounded by the shortfall.
+    let rj = w.p3_junior_deposit(1_000_000);
+    eprintln!("junior re-deposit 1,000,000 -> {:?}", rj.as_ref().map_err(|e| custom_code(e)));
+    step(&mut w, "after junior re-deposit");
     w.check().unwrap();
-    let st1 = w.p3_state();
-    let recalled1 = u128::from_le_bytes(st1[208..224].try_into().unwrap());
-    let (_, g1) = w.env.market_state();
-    assert_eq!(w.token_amount(&w.env.vault), v0, "recall moves no SPL");
-    assert_eq!(g1.vault, hv0, "header.vault nets 0");
-    assert!(recalled1 - recalled0 <= shortfall, "recall must never exceed the shortfall (recalled {})", recalled1 - recalled0);
-    assert!(recalled1 > recalled0, "vacuity: the recall path must actually move capital (LP flat, shortfall {shortfall})");
-    let backing1: u128 = g1.source_backing_buckets.iter().take(2).map(|b| b.fresh_unliened_backing_num / BOUND_SCALE).sum();
-    eprintln!("after recall: backing {backing1} recalled {}", recalled1 - recalled0);
-    // Seniors can now redeem their full claim (Live).
+    let (c, backing, (lpcap, _, lplegs)) = state(&w);
+    let shortfall = c.saturating_sub(backing);
+    eprintln!("recall: C {c} backing {backing} shortfall {shortfall} lp capital {lpcap} legs {lplegs}");
+    assert!(shortfall > 0 && lpcap > 0 && lplegs == 0, "vacuity: need LP flat with capital and a senior shortfall (C {c} backing {backing} lpcap {lpcap} legs {lplegs})");
+    let v0 = w.token_amount(&w.env.vault);
+    let hv0 = w.env.market_state().1.vault;
+    let rec = |w: &World| { let st = w.p3_state(); u128::from_le_bytes(st[208..224].try_into().unwrap()) };
+    let r0 = rec(&w);
+    let bound = shortfall.min(lpcap);
+    let over = w.p3_recall(bound + 1);
+    eprintln!("recall bound+1 ({}) -> {:?}", bound + 1, over.as_ref().map_err(|e| custom_code(e)));
+    assert!(over.is_err(), "recall above min(shortfall, LP capital) must be refused");
+    assert_eq!(custom_code(over.as_ref().unwrap_err()), Some(76), "over-bound recall refused with 76");
+    let ok = w.p3_recall(bound);
+    eprintln!("recall exact bound ({bound}) -> {:?}", ok.as_ref().map_err(|e| custom_code(e)));
+    ok.expect("recall of exactly the bound succeeds");
+    w.check().unwrap();
+    assert_eq!(rec(&w) - r0, bound, "recalled_atoms counter += exactly the bound");
+    assert_eq!(w.token_amount(&w.env.vault), v0, "no SPL moves");
+    assert_eq!(w.env.market_state().1.vault, hv0, "header.vault nets 0");
+    let (_, backing1, (lpcap1, _, _)) = state(&w);
+    assert_eq!(backing1, backing + bound, "backing pot += bound");
+    assert_eq!(lpcap1, lpcap - bound, "LP capital -= bound");
+    let again = w.p3_recall(1);
+    if shortfall == bound { assert!(again.is_err(), "no shortfall left: further recall refused"); }
+    // Seniors redeem their full claim afterwards.
     let r = w.wind_down();
     eprintln!("wind-down after recall -> {r:?}");
     r.unwrap();
