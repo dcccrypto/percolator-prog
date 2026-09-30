@@ -1686,7 +1686,7 @@ fn c7_immediate_recovery_winddown_pays_everyone() { c7_winddown(5_000_000); }
 #[test]
 fn c7_seniors_exhausted_chunked_winddown_completes() { c7_winddown(50_000); }
 
-struct C7Out { winner_paid: u128, per: Vec<u128>, r77s: Vec<Result<u64, Option<u32>>>, left: u128, closed: bool, v0: u128 }
+struct C7Out { winner_paid: u128, per: Vec<u128>, r77s: Vec<Result<u64, Option<u32>>>, left: u128, closed: bool, v0: u128, acct: (u128, u128, u128, u128) }
 
 /// The looped terminal wind-down of a Resolved C-7 world; `seniors` = (keypair, share ATA, domain).
 fn c7_finish(w: &mut P3, admin: &Keypair, t: &Keypair, tp: Pubkey, seed: &Keypair, seedp: Pubkey, lp: Pubkey, seniors: &[(&Keypair, Pubkey, u16)], v0: u128) -> C7Out {
@@ -1757,7 +1757,23 @@ fn c7_finish(w: &mut P3, admin: &Keypair, t: &Keypair, tp: Pubkey, seed: &Keypai
     eprintln!("C7 junior paid {junior_paid}; vault {v0} -> left {left}");
     let _ = r77;
     let closed = [lp, tp, seedp].iter().all(|p| w.env.svm.get_account(p).map_or(true, |a| a.lamports == 0));
-    C7Out { winner_paid, per, r77s, left, closed, v0 }
+    let acct = c7_vault_accounting(w);
+    eprintln!("C7 conservation: vault left {left} = pots {} + insurance {} + protocol fee {} + creator fee {} + other {} ", acct.0, acct.1, acct.2, acct.3, left as i128 - (acct.0 + acct.1 + acct.2 + acct.3) as i128);
+    C7Out { winner_paid, per, r77s, left, closed, v0, acct }
+}
+
+/// (pot fresh backing incl. dead-share value, insurance, protocol fee unwithdrawn, creator fee claimable).
+fn c7_vault_accounting(w: &P3) -> (u128, u128, u128, u128) {
+    let mut data = w.env.svm.get_account(&w.env.market).unwrap().data;
+    let (cfg, _, _, _) = state::read_market_config_mode_and_capacity(&data).unwrap();
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let n = core::mem::size_of::<state::AssetOracleProfileV16>();
+    let prof: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(&group.markets[0].wrapper[..n]);
+    let g = w.env.market_state().1;
+    let pots: u128 = g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num + b.valid_liened_backing_num) / percolator::BOUND_SCALE).sum();
+    let proto = cfg.protocol_fee_accrued_atoms.saturating_sub(cfg.protocol_fee_withdrawn_atoms);
+    let creator = cfg.creator_fee_claimable_atoms as u128 + prof.creator_fee_claimable_atoms as u128;
+    (pots, g.insurance, proto, creator)
 }
 
 fn c7_winddown(senior_per_domain: u64) {
@@ -1767,14 +1783,14 @@ fn c7_winddown(senior_per_domain: u64) {
     let owed = owed_full - (lp_loss_beyond_junior - drawn); // capped at what junior + seniors can pay
     let exp = c_total - drawn;
     let o = c7_finish(&mut w, &admin, &t, tp, &seed, seedp, lp, &[(&s0, a0, 0), (&s1, a1, 1)], v0);
-    let (winner_paid, senior_paid, left, r77s) = (o.winner_paid, o.per.iter().sum::<u128>(), o.left, o.r77s);
+    let (winner_paid, senior_paid, left, r77s) = (o.winner_paid, o.per.iter().sum::<u128>(), o.left, o.r77s.clone());
     eprintln!("C7 owed winner {owed} (cap + junior 300000 + drawn {drawn} of beyond {lp_loss_beyond_junior}); seniors expected {exp} (C {c_total})");
     assert!(winner_paid > 0, "C-7: winner paid 0 after the wind-down");
     assert!(winner_paid + 2_000 >= owed, "RULE: winner paid in full while senior backing remains: {winner_paid} < owed {owed}");
     assert!(senior_paid + 2_000 >= exp && senior_paid <= exp + 2_000, "RULE: seniors absorb exactly the shortfall: {senior_paid} vs {exp}");
     if exp > 2_000 { assert!(r77s.iter().all(|r| r.is_ok()), "C-7: a senior's full-share 77 refused in Resolved: {:?}", r77s); }
     assert!(o.closed, "C-7: the chunked wind-down did not close every portfolio");
-    assert!(left <= 2_000, "C-7: {left} atoms locked after the documented wind-down");
+    c7_assert_conservation(&o);
 }
 
 fn c7_dump(w: &P3, label: &str, ports: &[(&str, Pubkey)]) {
@@ -2698,7 +2714,7 @@ fn rehearsal23_one_senior_both_domains_redeems_after_stale_resolve() {
     eprintln!("R23 winner {} (owed {owed}); senior paid {paid} (expected {exp}); 77s {:?}; left {}", o.winner_paid, o.r77s, o.left);
     assert!(o.winner_paid + 2_000 >= owed, "winner {} < {owed}", o.winner_paid);
     assert!(paid + 2_000 >= exp, "REHEARSAL-23: the senior is locked after resolve: paid {paid} of {exp} (77s {:?})", o.r77s);
-    assert!(o.left <= 2_000, "{} atoms left", o.left);
+    c7_assert_conservation(&o);
 }
 
 
@@ -2801,4 +2817,14 @@ fn timing_b_deposit_redeem_around_recovery_push_cooldown0_vs_long() {
     let (n1, a1, v1) = timing_b(600);
     eprintln!("TIMING(b) SUMMARY: cooldown 0: newcomer gain {} incumbents {} ; cooldown 600: newcomer gain {} incumbents {}", n0 as i128 - 5_000_000, a0 + v0, n1 as i128 - 5_000_000, a1 + v1);
     assert!(n0 == 0 || n0 <= 5_000_000 + 2_000, "cooldown 0: the newcomer captured the incumbents' recovery: out {n0} for 5,000,000 in");
+}
+
+/// Conservation to the atom after the terminal wind-down: every atom left in the vault is owned --
+/// the pots hold only the genesis dead shares' value (< 1,000 atoms, the 1,000 dead shares priced
+/// at or below 1), and `insurance` holds the unclaimed protocol + creator + insurance fee legs.
+fn c7_assert_conservation(o: &C7Out) {
+    let (pots, ins, proto, creator) = o.acct;
+    assert_eq!(o.left, pots + ins, "conservation: vault {} != pots {pots} + insurance {ins} (unowned {} atoms)", o.left, o.left as i128 - (pots + ins) as i128);
+    assert!(pots <= 1_000, "pots hold {pots} > the 1,000 dead shares' value after every senior exited");
+    assert!(ins >= proto + creator, "insurance {ins} < protocol {proto} + creator {creator} legs it carries");
 }
