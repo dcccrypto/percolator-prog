@@ -3052,7 +3052,7 @@ pub fn p3_legacy_bind() -> bool {
 
 /// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
 pub fn p3_canonical_matcher() -> Pubkey {
-    "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse().unwrap()
+    std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()).as_str().parse().unwrap()
 }
 
 pub fn p3_mode() -> bool {

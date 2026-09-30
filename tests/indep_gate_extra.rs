@@ -645,7 +645,7 @@ mod p3 {
         pub fn new() -> Self {
             let mut env = V16CuEnv::new_with_init_params(market_params());
             // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()).as_str().parse::<Pubkey>().unwrap() };
             env.svm.add_program(matcher, &std::fs::read(matcher_program_path()).expect("matcher so"));
             env.svm.warp_to_slot(1);
             env.configure_auth_mark_for_asset_as_admin(0, 1, PX);

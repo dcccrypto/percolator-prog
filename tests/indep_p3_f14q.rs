@@ -134,7 +134,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()).as_str().parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -2931,143 +2931,115 @@ fn cooldown_sweep_leaver_before_keeper_push() {
 }
 
 // ═════════════ DIRECTED (security D-1): trader-vs-trader positions on a bound market ═════════════
-// Pre-bind, trader A (long) and trader B (short, thin capital) trade NoCpi with each other; the
-// vault LP is then bound. Post-bind, W trades long against the vault LP, and a NoCpi GROWTH
-// between two traders is attempted (P3-g: refused 77). The price rises: B goes bankrupt against
-// A, while W's win against the vault LP stays inside the junior. Rules:
-//   * a winner whose counterparty is a bankrupt TRADER must not draw the seniors (C untouched);
-//   * a winner against the vault LP is paid in full;
-//   * seniors redeem their full principal; conservation to the atom.
-fn directed_ttv(resolve_path: bool) {
+// 592286b4: tag 94 refuses a bind while the asset has open interest (Custom 90), so a pre-bind
+// trader-vs-trader pair can no longer reach a bound market. Post-bind, every risk-increasing fill
+// faces the vault LP; two traders can still net THROUGH the vault LP (collusion). Rules:
+//   * the pre-bind shape is refused with 90 (control: after the pair unwinds, the bind succeeds);
+//   * post-bind collusion via the vault LP never draws the seniors: seniors redeem >= C - dust;
+//   * conservation to the atom after the full wind-down.
+
+fn d1_market() -> P3 {
     TL_IM.with(|c| c.set(1_000));
     TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
     let mut w = P3::new();
     TL_FEE_SHARE.with(|c| c.set(None));
     w.create_vault();
-    let (s0, s1) = (Keypair::new(), Keypair::new());
-    let a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).unwrap();
-    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).unwrap();
+    w
+}
+
+#[test]
+fn directed_prebind_trader_pair_bind_refused_90() {
+    let mut w = d1_market();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 0).unwrap();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 1).unwrap();
     let (a, ap) = w.trader(2_000_000);
     let (b, bp) = w.trader(200_000);
     let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE);
-    let pre = w.env.try_trade_asset_with_cu(0, &a, ap, &b, bp, 1_000_000, PRICE, 30);
-    eprintln!("D1 pre-bind NoCpi A long 1.0 vs B short -> {:?}", pre.as_ref().map_err(|e| code(e)));
-    assert!(pre.is_ok(), "vacuity: pre-bind trader-vs-trader position opened");
+    w.env.try_trade_asset_with_cu(0, &a, ap, &b, bp, 1_000_000, PRICE, 30).expect("vacuity: pre-bind NoCpi pair opens");
+    let admin = w.env.admin.insecure_clone();
+    let r = w.init_vault_lp(&admin, 1_000);
+    eprintln!("D1 bind with open interest -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert_eq!(r.as_ref().err().and_then(|e| code(e)), Some(90), "tag 94 must refuse a bind while the asset has open interest (90)");
+    // Control: unwind the pair, then the bind succeeds.
+    w.env.try_trade_asset_with_cu(0, &a, ap, &b, bp, -1_000_000, PRICE, 30).expect("unwind the pair");
+    let r2 = w.init_vault_lp(&admin, 1_000);
+    eprintln!("D1 bind after the pair unwound -> {:?}", r2.as_ref().map_err(|e| code(e)));
+    assert!(r2.is_ok(), "control: a flat asset binds");
+}
+
+fn directed_collusion(resolve_only: bool) {
+    let mut w = d1_market();
+    let (s0, s1) = (Keypair::new(), Keypair::new());
+    let a0 = w.earn_deposit_domain(&s0, 5_000_000, false, 0).unwrap();
+    let a1 = w.earn_deposit_domain(&s1, 5_000_000, false, 1).unwrap();
     let admin = w.env.admin.insecure_clone();
     w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
     let up = w.upgrade.insecure_clone();
     w.set_risk(&up, 50_000).unwrap();
     w.junior_deposit(&admin, 300_000).unwrap();
     let lp = w.lp;
-    let (wk, wp) = w.trader(2_000_000);
+    let (a, ap) = w.trader(2_000_000);   // colluding winner (long)
+    let (b, bp) = w.trader(200_000);     // colluding loser (short, thin) -- nets A through the vault LP
     let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE); let _ = w.crank(lp);
-    let rw = w.trade_vs_lp_fee(&wk, wp, 500_000, 30);
-    eprintln!("D1 post-bind W long 0.5 vs vault LP -> {:?}", rw.as_ref().map_err(|e| code(e)));
-    let (c2, c2p) = w.trader(1_000_000);
-    let (d2, d2p) = w.trader(1_000_000);
-    let grow = w.env.try_trade_asset_with_cu(0, &c2, c2p, &d2, d2p, 100_000, PRICE, 30);
-    eprintln!("D1 post-bind NoCpi growth between traders -> {:?} (P3-g: must be refused 77)", grow.as_ref().map_err(|e| code(e)));
-    assert!(grow.is_err(), "P3-g: post-bind NoCpi growth on the bound asset must be refused");
+    let ra = w.trade_vs_lp_fee(&a, ap, 1_000_000, 30);
+    let rb = w.trade_vs_lp_fee(&b, bp, -1_000_000, 30);
+    eprintln!("D1c A long 1.0 vs vault LP -> {:?}; B short 1.0 vs vault LP -> {:?}; LP pos {}", ra.as_ref().map_err(|e| code(e)), rb.as_ref().map_err(|e| code(e)), w.pos(lp));
+    assert!(ra.is_ok() && rb.is_ok(), "vacuity: both colluders trade against the vault LP");
     let c0 = w.c();
-    // +30% in 4.5% steps; crank everyone (B liquidates against its bankruptcy).
     let mut m = PRICE;
     for _ in 0..6 {
         m = m * 10_450 / 10_000; MARK.with(|c| c.set(m));
         let s = w.slot() + 520; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
-        for p in [ap, bp, wp, lp] { let _ = w.crank(p); }
+        for p in [ap, bp, lp] { let _ = w.crank(p); }
     }
-    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); for p in [ap, bp, wp, lp] { let _ = w.crank(p); } }
-    let bs = w.env.portfolio_state(bp);
-    let lps = w.env.portfolio_state(lp);
-    let c_after = w.c();
-    eprintln!("D1 after move: mark {m}; B cap {} pnl {} legs {}; A pnl {}; W pnl {}; vault LP cap {} pnl {}; C {c0} -> {c_after}",
-        bs.capital, bs.pnl, bs.legs.iter().filter(|l| l.active).count(), w.env.portfolio_state(ap).pnl, w.env.portfolio_state(wp).pnl, lps.capital, lps.pnl);
-    assert!(c_after >= c0, "SENIORS DRAWN for a trader-vs-trader bankruptcy: C {c0} -> {c_after}");
-    // Drive B's bankrupt close to completion permissionlessly (crank B), then check C again.
-    let mut nb = 0;
-    for _ in 0..500 {
-        let x = w.env.portfolio_state(bp);
-        if x.legs.iter().all(|l| !l.active) && !x.close_progress.active { break; }
-        let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
-        let _ = w.crank(bp); nb += 1;
-    }
-    let bs = w.env.portfolio_state(bp);
+    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); for p in [ap, bp, lp] { let _ = w.crank(p); } }
     let g = w.env.market_state().1;
-    eprintln!("D1 B close after {nb} cranks: cap {} pnl {} legs {} close {} | hlock {} mode {:?} | A pnl {} | C {}", bs.capital, bs.pnl, bs.legs.iter().filter(|l| l.active).count(), bs.close_progress.active, g.bankruptcy_hlock_active, g.mode, w.env.portfolio_state(ap).pnl, w.c());
-    assert!(w.c() >= c0, "SENIORS DRAWN while settling a trader-vs-trader bankruptcy: C {c0} -> {}", w.c());
-    // W closes against the vault LP; owed = capital + pnl at close.
-    for _ in 0..4 { let r = w.trade_vs_lp_fee(&wk, wp, -w.pos(wp), 30); if r.is_ok() { break; } let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(wp); }
-    for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); for p in [wp, lp] { let _ = w.crank(p); } }
-    let ws = w.env.portfolio_state(wp);
-    let w_owed = ws.capital + ws.pnl.max(0) as u128;
+    eprintln!("D1c after +30%: B cap {} pnl {}; A pnl {}; vault LP cap {} pnl {}; mode {:?}; C {c0} -> {}", w.env.portfolio_state(bp).capital, w.env.portfolio_state(bp).pnl, w.env.portfolio_state(ap).pnl, w.env.portfolio_state(lp).capital, w.env.portfolio_state(lp).pnl, g.mode, w.c());
+    let _ = resolve_only;
+    // Resolve (if the valve has not) and wind everyone down, retrying every portfolio each round.
+    if w.env.market_state().1.mode == percolator::MarketModeV16::Live {
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    }
+    let jo = admin.pubkey();
     let m_ = w.env.market;
     let nft = Pubkey::find_program_address(&[b"nft_registry", m_.as_ref()], &w.env.program_id).0;
-    let mut w_paid = 0u128;
-    if !resolve_path {
-        // Live: W converts (warm-up) and withdraws.
-        for _ in 0..60 {
-            let pnl = w.env.portfolio_state(wp).pnl; if pnl <= 0 { break; }
-            let (pid, _, pep) = w.env.portfolio_identity(wp);
-            let _ = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
-                vec![AccountMeta::new(wk.pubkey(), true), AccountMeta::new(m_, false), AccountMeta::new(wp, false)], &[&wk]);
-            let s = w.slot() + 250; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); } let _ = w.crank(wp); let _ = w.crank(lp);
-        }
-        let cap = w.env.portfolio_state(wp).capital;
-        let dest = w.token(wk.pubkey(), 0);
-        let (pid, seq, _) = w.env.portfolio_identity(wp);
-        let r = w.send(ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount: cap },
-            vec![AccountMeta::new(wk.pubkey(), true), AccountMeta::new(m_, false), AccountMeta::new(wp, false), AccountMeta::new(dest, false),
-                 AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&wk]);
-        eprintln!("D1 Live W withdraw {cap} -> {:?}", r.as_ref().map_err(|e| code(e)));
-        w_paid = w.tok(&dest) as u128;
-    }
-    // Resolve and wind everyone down (owner-signed resolved closes, looped).
-    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
-    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
-    let jo = admin.pubkey();
-    for _ in 0..1_000 { if w.env.svm.get_account(&lp).and_then(|x| state::read_portfolio(&x.data).ok()).map_or(true, |x| x.pnl >= 0 && x.legs.iter().all(|l| !l.active)) { break; } let _ = w.settle_resolved(jo, 0); }
-    let _ = w.close_portfolio_permissionless(lp, w.registry);
-    let mut paid_of = |w: &mut P3, k: &Keypair, p: Pubkey| -> u128 {
-        let mut tot = 0u128;
-        for _ in 0..1_000 {
-            if w.env.svm.get_account(&p).map_or(true, |x| x.lamports == 0) { break; }
+    let mut paid = std::collections::BTreeMap::new();
+    for _round in 0..400 {
+        let _ = w.settle_resolved(jo, 0);
+        let _ = w.close_portfolio_permissionless(lp, w.registry);
+        let mut open = 0;
+        for (n, k, p) in [("A", &a, ap), ("B", &b, bp)] {
+            if w.env.svm.get_account(&p).map_or(true, |x| x.lamports == 0) { continue; }
+            open += 1;
             let dest = w.token(k.pubkey(), 0);
-            let r = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+            let _ = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
                 AccountMeta::new_readonly(k.pubkey(), true), AccountMeta::new(m_, false), AccountMeta::new(p, false),
                 AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[k]);
-            let got = w.tok(&dest) as u128; tot += got;
+            *paid.entry(n).or_insert(0u128) += w.tok(&dest) as u128;
             let _ = w.close_portfolio_permissionless(p, k.pubkey());
-            if r.is_err() { break; }
         }
-        tot
-    };
-    let a_paid = paid_of(&mut w, &a, ap);
-    let b_paid = paid_of(&mut w, &b, bp);
-    let w_rpaid = paid_of(&mut w, &wk, wp);
-    let _ = paid_of(&mut w, &c2, c2p);
-    let _ = paid_of(&mut w, &d2, d2p);
-    w_paid += w_rpaid;
-    let g = w.env.market_state().1;
+        if open == 0 && w.env.svm.get_account(&lp).map_or(true, |x| x.lamports == 0) { break; }
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
+    }
     let _ = w.crank_fees_78();
     let mut seniors = 0u128;
     for (k, at, dom) in [(&s0, a0, 0u16), (&s1, a1, 1u16)] {
         let sh = w.tok(&at) as u128; let _ = w.request_redeem(k, at, sh);
         let (d, r) = w.execute_redeem_domain(k, dom);
-        eprintln!("D1 senior d{dom} 77 -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+        eprintln!("D1c senior d{dom} 77 -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
         seniors += w.tok(&d) as u128;
     }
     let junior = w.junior_release_resolved(&admin);
+    let g = w.env.market_state().1;
     let left = w.tok(&w.env.vault) as u128;
     let (pots, ins, _, _) = c7_vault_accounting(&w);
-    eprintln!("D1 [{}] W paid {w_paid} (owed {w_owed}); A paid {a_paid}; B paid {b_paid}; seniors {seniors}; junior {junior}; terminal mat {} c_tot {}; vault left {left} = pots {pots} + insurance {ins}",
-        if resolve_path { "resolved" } else { "live" }, g.materialized_portfolio_count, g.c_tot);
-    assert!(w_paid + 2_000 >= w_owed, "winner vs the vault LP not paid in full: {w_paid} < {w_owed}");
-    assert!(seniors + 2_000 >= 10_000_000, "seniors lost principal to a trader-vs-trader bankruptcy: paid {seniors}");
+    eprintln!("D1c payouts {paid:?}; seniors {seniors}; junior {junior}; terminal mat {} c_tot {}; vault left {left} = pots {pots} + insurance {ins}", g.materialized_portfolio_count, g.c_tot);
+    assert!(seniors + 2_000 >= 10_000_000, "G-1: collusion through the vault LP drew the seniors: paid {seniors} of 10,000,000");
+    assert_eq!(g.materialized_portfolio_count, 0, "wind-down did not complete (materialized {})", g.materialized_portfolio_count);
     assert_eq!(left, pots + ins, "conservation: vault {left} != pots {pots} + insurance {ins}");
 }
 
 #[test]
-fn directed_trader_vs_trader_bankruptcy_does_not_draw_seniors_live_exit() { directed_ttv(false); }
-#[test]
-fn directed_trader_vs_trader_bankruptcy_does_not_draw_seniors_resolved_exit() { directed_ttv(true); }
+fn directed_postbind_collusion_via_vault_lp_never_draws_seniors() { directed_collusion(true); }

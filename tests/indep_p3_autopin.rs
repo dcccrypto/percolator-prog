@@ -97,7 +97,7 @@ impl P3 {
         std::env::set_var("INDEP_WRAPPER_SO", p3_so());
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams { initial_price: PRICE, ..V16CuMarketParams::default() });
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()).as_str().parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -489,7 +489,7 @@ fn code(e: &str) -> Option<u32> {
 // trade right after tag 94 (+96). Tags 95/99 remain upgrade-authority-only adjustments.
 // ═══════════════════════════════════════════════════════════════════════════
 
-const CANONICAL: &str = "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT";
+fn canonical() -> String { std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()) }
 const PIN_MAX_FILL_USD: u128 = 5_000;
 const ENGINE_MAX_POSITION_ABS_Q: u128 = 100_000_000_000_000;
 
@@ -515,7 +515,7 @@ fn autopinned(senior: u64, junior: u64) -> (P3, Keypair) {
 #[test]
 fn autopin_market_trades_immediately_after_94() {
     let (mut w, _s) = autopinned(10_000_000, 3_000_000);
-    assert_eq!(w.matcher.to_string(), CANONICAL, "vacuity: bound to the canonical matcher id");
+    assert_eq!(w.matcher.to_string(), canonical(), "vacuity: bound to the canonical matcher id");
     let (t, tp) = w.trader(20_000_000);
     let _ = w.crank(w.lp);
     let r = w.trade_vs_lp(&t, tp, POS_SCALE as i128);

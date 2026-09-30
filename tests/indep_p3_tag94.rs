@@ -63,7 +63,7 @@ impl T {
             .set_account(program_data, Account { lamports: 1_000_000_000, data: pd_bytes(Some(&upgrade.pubkey())), owner: solana_sdk::bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 })
             .unwrap();
         // 07a1d0eb auto-pin: mount the matcher at the CANONICAL id.
-        let matcher: Pubkey = "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse().unwrap();
+        let matcher: Pubkey = std::env::var("INDEP_CANONICAL_MATCHER").unwrap_or_else(|_| "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".to_string()).as_str().parse().unwrap();
         env.svm.add_program(matcher, &std::fs::read(matcher_program_path()).expect("matcher so"));
         let mut t = T { env, registry, lp_mint, ledger0, ledger1, state_pda, upgrade, program_data, matcher };
         t.create_vault();
