@@ -3678,6 +3678,12 @@ impl World {
             *self.stats.soft.entry(if haircut_atoms <= deficits + tol { "p3j_haircut_within_trader_deficits" } else { "p3j_haircut_beyond_trader_deficits" }).or_default() += 1;
             if std::env::var("FUZZ_DEBUG_P3J").is_ok() { eprintln!("  P3J haircut {haircut_atoms} trader deficits {:?} (sum {deficits}) junior {junior_received} sout {sout} sin {sin} c_rem {c_rem}", self.trader_deficit); }
         }
+        // P3-R (security, strict): whenever the seniors still hold C (they end whole), every winner
+        // receipt must end finalised with paid == face -- net unpaid remainder <= rounding.
+        let seniors_whole = sin > 0 && sout + tol as u128 >= sin;
+        if seniors_whole && haircut_atoms > deficits + tol {
+            return Err(format!("P3-R WINNER RECEIPT UNPAID WHILE SENIORS HOLD C: net unpaid {haircut_atoms} (bankrupt-trader deficits {deficits}), seniors out {sout} of in {sin}"));
+        }
         if haircut_atoms > deficits + tol && (junior_received > 0 || sout + tol as u128 > sin + credited) {
             return Err(format!("P3-J EARN PAID WHILE WINNERS HAIRCUT BEYOND TRADER DEFAULTS: winners burned {haircut_atoms}, bankrupt-trader deficits {deficits}, junior received {junior_received}, seniors out {sout} (in {sin} + credited {credited})"));
         }
