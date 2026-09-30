@@ -1181,6 +1181,7 @@ fn hlock_after_vault_lp_bankruptcy_permissionless_exits() {
 /// Recovery step reaches Resolved, and then every claim is paid permissionlessly: the winner
 /// (resolved close), the seniors (77 at min(physical, C)), the junior (102, nothing left).
 #[test]
+#[ignore = "58e379f1 loss rule (winner haircut via the valve); superseded by p3_senior_draw::p3_draw_* / p3_c7_* under the senior draw"]
 fn anvil_hlock_exits_via_recovery_and_everyone_is_paid() {
     // Senior-draw FINAL (2026-09-30): the h-lock/valve path is reachable ONLY once senior backing
     // is exhausted, so the seniors here are tiny (150k vs a ~1.6M shortfall past the junior).
@@ -1258,6 +1259,7 @@ fn anvil_hlock_exits_via_recovery_and_everyone_is_paid() {
 /// `max_close_slot`, and DOES declare Recovery at `max_close_slot + 1`; the market then
 /// reaches Resolved and every claim pays with seniors whole and tokens conserved.
 #[test]
+#[ignore = "58e379f1 loss rule (winner haircut via the valve); superseded by p3_senior_draw::p3_draw_* / p3_c7_* under the senior draw"]
 fn anvil_hlock_stranger_crank_escalates_only_after_max_close_slot() {
     let mut w = P3::new();
     w.create_vault();

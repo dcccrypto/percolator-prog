@@ -19805,6 +19805,11 @@ pub mod processor {
             // The v16 engine converts the currently released residual-bounded
             // amount atomically. Preserve the wrapper caller cap by staging the
             // conversion and only committing it when the converted amount fits.
+            // P3: a winner's claim is backed by the vault LP's settled loss before it converts.
+            if vault_lp_relabel_residual_to_claims(group).map_err(|_| V16Error::InvalidConfig)? != 0 {
+                // The relabel moved the pot's credit epoch: re-certify before converting.
+                group.full_account_refresh_not_atomic(portfolio)?;
+            }
             let converted = group.convert_released_pnl_to_capital_not_atomic(portfolio)?;
             if converted == 0 || converted > amount {
                 return Err(V16Error::LockActive);
@@ -25218,6 +25223,14 @@ pub mod processor {
         // remains in the vault as un-withdrawn insurance reserve.
         let gross_consumed: u128 = if earnings_portion == 0 {
             0
+        } else if registry.fee_share_bps == 0 {
+            // Lane MEDIUM (2026-09-30): on the P3 path the payout is priced off the senior value,
+            // so an "earnings" slice can exist with fee_share 0 (it is really value that sits in
+            // the vault LP, not LP earnings). Never divide by zero: name it (bound) or refuse.
+            if bound_tail.is_some() {
+                return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
+            }
+            return Err(PercolatorError::EngineInvalidConfig.into());
         } else {
             // fee_share_bps > 0 is guaranteed when earnings_portion > 0:
             // lp_earnings = floor(net * fee_share / 10_000). If fee_share == 0
@@ -26152,14 +26165,85 @@ pub mod processor {
                 .withdraw_insurance_surplus_not_atomic(available) // I−a, V−a
                 .map_err(map_v16_error)?;
             group.header.vault = percolator::V16PodU128::new(v_before); // restore V
-            add_fresh_counterparty_backing_view(
-                &mut group,
-                domain,
-                available
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?, // FB += a·BOUND_SCALE
-                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
-            )?;
+            // Lane MEDIUM (2026-09-30): on a BOUND vault the seniors' claim is pooled across both
+            // pots, but every redemption draws from ONE pot, so a harvest booked into one pot
+            // left the other pot's seniors short of their fee share. Split the harvest pro rata
+            // to the two pots' principal (when the other ledger is passed writable).
+            let other_ledger_ai = if ledger_ai.key == own_ledger_ai.key {
+                sibling_ledger_ai
+            } else {
+                own_ledger_ai
+            };
+            let other_domain = sibling_domain(domain as u16) as usize;
+            let other_part = if bound_tail.is_some()
+                && other_ledger_ai.is_writable
+                && !other_ledger_ai.data_is_empty()
+            {
+                let od = other_ledger_ai.try_borrow_data()?;
+                let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
+                let (ol, _) = read_or_new_backing_domain_ledger(
+                    &od,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    other_domain as u16,
+                    &ob,
+                )?;
+                let p_t = ledger.total_principal_atoms;
+                let p_o = ol.total_principal_atoms;
+                match p_t.checked_add(p_o) {
+                    Some(tot) if tot != 0 && p_o != 0 => {
+                        vault_lp_v18::mul_div_floor(available, p_o, tot)
+                            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                    }
+                    _ => 0,
+                }
+            } else {
+                0
+            };
+            let target_part = available - other_part;
+            if target_part != 0 {
+                add_fresh_counterparty_backing_view(
+                    &mut group,
+                    domain,
+                    target_part
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?, // FB += a·BOUND_SCALE
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                )?;
+            }
+            if other_part != 0 {
+                let mut od = other_ledger_ai.try_borrow_mut_data()?;
+                let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
+                let (mut ol, oinit) = read_or_new_backing_domain_ledger(
+                    &od,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    other_domain as u16,
+                    &ob,
+                )?;
+                sync_backing_domain_ledger(&mut ol, &ob)?;
+                let expiry = if ob.status == BackingBucketStatusV16::Fresh {
+                    ob.expiry_slot
+                } else {
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                };
+                add_fresh_counterparty_backing_view(
+                    &mut group,
+                    other_domain,
+                    other_part
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    expiry,
+                )?;
+                let (_, ob_after) = backing_domain_parts_view(&group, other_domain)?;
+                ol.last_observed_unavailable_principal_atoms =
+                    backing_unavailable_principal_atoms(&ob_after)?;
+                ol.total_principal_atoms = ol
+                    .total_principal_atoms
+                    .checked_add(other_part)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                write_or_init_backing_domain_ledger(&mut od, &ol, oinit)?;
+            }
             // #413: re-baseline before booking the principal — same reasoning as the
             // deposit and rebalance paths. The refill above lowers
             // `consumed_liened_backing_num`, and the NEXT sync would otherwise read that
@@ -26176,7 +26260,7 @@ pub mod processor {
             // strictly larger redeemable claim for every existing LP.
             ledger.total_principal_atoms = ledger
                 .total_principal_atoms
-                .checked_add(available)
+                .checked_add(target_part)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             // Conservation: C + (I−a) + E + (FB+a) = S against an unchanged V.
             group.validate_shape().map_err(map_v16_error)?;
@@ -26707,36 +26791,13 @@ pub mod processor {
             let capital_funded = lp.header.capital.get();
             // Settle the refilled capital against the LP's loss (engine refresh path).
             group.full_account_refresh_not_atomic(lp).map_err(map_v16_error)?;
-            let realised = capital_funded.saturating_sub(lp.header.capital.get()).min(moved);
-            // The settled loss is now unowned vault residual. In Live the winners' positive
-            // claims are realisable ONLY against the source backing of the LP's side domain, so
-            // re-label exactly that residual as fresh backing there (no vault change): the
-            // winners convert at full rate instead of being haircut at conversion.
-            if realised != 0 && lp_pos != 0 {
-                let claim_domain = if lp_pos < 0 { odd } else { even };
-                // Same helper Earn deposits use. A pot that is already Fresh keeps its expiry
-                // (the engine may have opened it when it routed the junior's settled loss
-                // there); an empty pot is stamped with the vault-backing expiry.
-                let (_, claim_bucket) = backing_domain_parts_view(group, claim_domain)?;
-                let expiry = if claim_bucket.status == BackingBucketStatusV16::Fresh {
-                    claim_bucket.expiry_slot
-                } else {
-                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
-                };
-                add_fresh_counterparty_backing_view(
-                    group,
-                    claim_domain,
-                    realised
-                        .checked_mul(BOUND_SCALE)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
-                    expiry,
-                )?;
-                if claim_domain == even {
-                    relabelled.0 = realised;
-                } else {
-                    relabelled.1 = realised;
-                }
-                // Re-certify on the post-draw risk epoch (valuation paths need a current cert).
+            let _ = (capital_funded, lp_pos);
+            // The settled loss is now unowned vault residual; in Live the winners' claims are
+            // realisable only against their pot's backing, so re-label it there (exactly the
+            // claims' shortfall) and re-certify on the post-draw risk epoch.
+            let rl = vault_lp_relabel_residual_to_claims(group)?;
+            if rl != 0 {
+                relabelled.0 = rl;
                 group.full_account_refresh_not_atomic(lp).map_err(map_v16_error)?;
             }
         } else {
@@ -27165,6 +27226,71 @@ pub mod processor {
             undrawn,
             nav.saturating_sub(claim),
         ))
+    }
+
+    /// Residual relabel (P3, bound single-asset markets, Live): the vault LP's settled loss that
+    /// the engine left as unowned vault RESIDUAL instead of routing it into its side's pot (the
+    /// senior draw's settled deficit, and the round-trip case) backs nothing in Live, so the
+    /// winners' conversions were haircut. Re-label exactly `min(residual, outstanding claims)` per
+    /// pot of the bound asset as fresh backing there, via the Earn-deposit helper (no vault
+    /// change, no write to any trader). Returns the atoms relabelled.
+    #[inline(never)]
+    fn vault_lp_relabel_residual_to_claims(
+        group: &mut state::MarketViewMutV16<'_>,
+    ) -> Result<u128, ProgramError> {
+        if group.header.mode != 0 {
+            return Ok(0);
+        }
+        let Some(a) = market_bound_vault_asset(group)? else {
+            return Ok(0);
+        };
+        let h = &group.header;
+        let owned = h
+            .c_tot
+            .get()
+            .saturating_add(h.insurance.get())
+            .saturating_add(h.backing_provider_earnings_total.get())
+            .saturating_add(h.source_fresh_backing_total_num.get() / BOUND_SCALE);
+        let mut residual = h.vault.get().saturating_sub(owned);
+        let mut total = 0u128;
+        for d in [a * 2, a * 2 + 1] {
+            if residual == 0 {
+                break;
+            }
+            let (source, bucket) = backing_domain_parts_view(group, d)?;
+            // Capped by the winners' outstanding claims on this pot (not by the pot's shortfall:
+            // the pot's existing fresh backing includes the SENIORS' principal, which the winners
+            // must not consume while the vault LP's own settled loss sits unowned).
+            let claims = source.positive_claim_bound_num / BOUND_SCALE;
+            let amt = claims.min(residual);
+            if amt == 0 {
+                continue;
+            }
+            let expiry = match bucket.status {
+                BackingBucketStatusV16::Fresh => bucket.expiry_slot,
+                BackingBucketStatusV16::Empty | BackingBucketStatusV16::Expired => {
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                }
+                _ => continue,
+            };
+            add_fresh_counterparty_backing_view(
+                group,
+                d,
+                amt.checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                expiry,
+            )?;
+            residual -= amt;
+            total += amt;
+            solana_program::log::sol_log(&alloc::format!(
+                "p3_residual_relabel domain={} atoms={}",
+                d, amt
+            ));
+        }
+        if total != 0 {
+            group.validate_shape().map_err(map_v16_error)?;
+        }
+        Ok(total)
     }
 
     /// Cheap pre-filter: an LP that is flat with non-negative capital+pnl cannot be insolvent;
