@@ -54,6 +54,10 @@ fn kani_p3e_skew_funding_conserves_through_engine_kernel() {
     kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
 }
 
+/// NOT A RELEASE-GATE PROOF: the Kani lane's negative control showed this grid domain is too
+/// weak (flat-A survives: |fid| <= 4 rounds into [-1, 0]). Kept for the record only; the gate is
+/// `kani_p3e_skew_funding_conserves_fixed_asym_a` below.
+///
 /// Bounded companion of the harness above (in case the full symbolic A does not finish): the
 /// per-side A ranges over the ten asymmetric grid points k·MIN_A_SIDE (k = 1..=10, i.e. 0.1 ..
 /// 1.0 of ADL_ONE) and the size/price/rate fields are narrower. Same assertions, same kernel.
@@ -87,6 +91,44 @@ fn kani_p3e_skew_funding_conserves_grid_a() {
     let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
     let net = long_pnl + short_pnl;
     kani::cover!(kl != ks && fid != 0 && q > 0 && long_pnl != 0, "asymmetric-A transfer");
+    kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
+    assert!(net <= 0 && net >= -1);
+}
+
+
+/// Audit fix for `_grid_a` (its negative control SURVIVED: with u8/u16 magnitudes the funding
+/// index delta is ≤ 4, so even the flat-A bug rounds to [-1, 0] and the grid domain cannot see
+/// the bug class). Here the per-side A is a fixed ASYMMETRIC pair (0.3 vs 1.0 of ADL_ONE; the
+/// constant divisors keep CBMC tractable) and the magnitudes are realistic: rate up to the
+/// u16 bound, dt up to 65 535 slots, e6 price up to 4.29e9, |q| up to 4.29e9 Q.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_p3e_skew_funding_conserves_fixed_asym_a() {
+    let premium: i16 = kani::any();
+    let lp_net: i32 = kani::any();
+    let oi: u32 = kani::any();
+    let slope: u16 = kani::any();
+    let cap: u16 = kani::any();
+    let max_abs: u16 = kani::any();
+    let dt: u16 = kani::any();
+    let price: u32 = kani::any();
+    let q: u32 = kani::any();
+    kani::assume(price > 0);
+    let a_long = MIN_A_SIDE * 3;
+    let a_short = ADL_ONE;
+    let skew = skew_funding_rate_e9(lp_net as i128, oi as u128, slope as u64, cap as u64);
+    let rate = combine_funding_rate_e9(premium as i128, skew, max_abs as u64);
+    let fid = floor_div_signed_conservative_i128(rate * dt as i128 * price as i128, FUNDING_DEN);
+    let (_kl, _ks, f_long, f_short) =
+        percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short).unwrap();
+    // NEGATIVE CONTROL (feature neg_flat_a): the pre-#114 engine bug, flat ADL_ONE per side.
+    #[cfg(feature = "neg_flat_a")]
+    let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+    let q = q as i128;
+    let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
+    let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+    let net = long_pnl + short_pnl;
+    kani::cover!(fid != 0 && long_pnl < -1_000, "material transfer");
     kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
     assert!(net <= 0 && net >= -1);
 }
