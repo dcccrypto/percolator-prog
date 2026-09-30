@@ -280,7 +280,7 @@ impl World {
     }
 
     fn setup_stake(&mut self, total_lp_supply: u64) {
-        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
         assert!(self.env.program_id.to_string() == "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv" || std::env::var("INDEP_PROGRAM_ID").is_ok(), "FUZZ_STAKE needs INDEP_MAINNET_ID=1 (plain stake) or INDEP_PROGRAM_ID=<id the stake build allowlists>");
         let so = std::env::var("INDEP_STAKE_SO").unwrap_or_else(|_| format!("{}/wt-indep/so/stake-e0ace2c-plain.so", std::env::var("HOME").unwrap()));
         if self.env.svm.get_account(&stake_id).map_or(true, |a| !a.executable) {
@@ -330,7 +330,7 @@ impl World {
 
     fn do_stake87_accrue(&mut self) -> Result<u64, String> {
         let (pool, _va, sv) = self.stake.ok_or("no stake pool")?;
-        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
         let payer = self.env.payer.pubkey();
         let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
         let r87 = self.send(
@@ -2590,7 +2590,7 @@ impl World {
     /// account-9 vault_auth-owned token account to sweep.
     fn do_stake_recover_terminal(&mut self, amount: u64, stray: Option<Pubkey>) -> Result<u64, String> {
         let (pool, va, sv) = self.stake.ok_or("no stake pool")?;
-        let stake_id: Pubkey = "GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3".parse().unwrap();
+        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
         let (m, v, wva, pid) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.program_id);
         let mut accounts = vec![
             AccountMeta::new_readonly(self.env.payer.pubkey(), false),
@@ -3026,7 +3026,7 @@ pub fn p3_legacy_bind() -> bool {
 
 /// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
 pub fn p3_canonical_matcher() -> Pubkey {
-    "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse().unwrap()
+    "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse().unwrap()
 }
 
 pub fn p3_mode() -> bool {
@@ -4297,10 +4297,34 @@ fn p3_resolved_cover_is_junior_first_no_senior_c_drop() {
     anvil_assert_full_exit(&w, &st, "junior-first cover");
 }
 
-/// G-1 (owner decision): a winner whose loser is a bankrupt TRADER (a position that predates the
-/// bind) is haircut by the engine at the resolved close, exactly as in Live; the Earn seniors are
-/// NOT drawn for it (C never drops: the World's P3-a invariant runs after every step).
+/// Gate HIGH lock (c7a926fc, `directed_trader_vs_trader_bankruptcy_does_not_draw_seniors_*`):
+/// positions that predate the vault LP are trader-vs-trader; a bankrupt one left the vault LP's
+/// winners short and blocked terminal-flat forever. Tag 94 now REFUSES a bind while the asset has
+/// open interest: Custom(90) VaultLpBindRequiresFlatAsset.
 #[test]
+fn p3_bind_refused_while_asset_has_open_interest() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "0");
+    std::env::set_var("FUZZ_LP_DOMAINS", "0");
+    std::env::set_var("ANVIL_PREBIND_NOCPI", "1500");
+    let r = std::panic::catch_unwind(|| { let _ = World::new(0); });
+    std::env::set_var("ANVIL_PREBIND_NOCPI", "");
+    let msg = match r {
+        Ok(()) => String::from("bind SUCCEEDED"),
+        Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_else(|| e.downcast_ref::<&str>().map(|s| s.to_string()).unwrap_or_default()),
+    };
+    assert!(msg.contains("94 InitVaultLp") && msg.contains("Custom(90)"), "bind with open interest must be refused with 90: {}", &msg[..msg.len().min(300)]);
+    // Control: the same World without the pre-bind position binds fine.
+    let w = World::new(0);
+    assert!(w.p3.is_some(), "control: bind on a flat asset succeeds");
+}
+
+/// G-1 defense in depth (only reachable on a build without the bind refusal, or on a market bound
+/// by an earlier build): the Resolved sibling cover never backstops a trader-vs-trader default.
+/// Run against such a build with --ignored.
+#[test]
+#[ignore]
 fn p3_resolved_cover_does_not_backstop_trader_vs_trader_default() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("ANVIL_PREBIND_NOCPI", "1500");
@@ -4310,7 +4334,6 @@ fn p3_resolved_cover_does_not_backstop_trader_vs_trader_default() {
     let mut w = World::new(0);
     std::env::set_var("ANVIL_PREBIND_NOCPI", "");
     let c0 = w.p3_c();
-    assert!(w.env.portfolio_state(w.ports[1]).legs.iter().any(|l| l.active), "vacuity: pre-bind position");
     for d in [2000i32, 2000, 2000, 2000] {
         let _ = w.apply(&Op::Push { delta_bps: d });
         let _ = w.apply(&Op::Warp { n: 60 });
@@ -4318,7 +4341,6 @@ fn p3_resolved_cover_does_not_backstop_trader_vs_trader_default() {
     }
     let r = w.wind_down();
     let st = w.stats.clone();
-    eprintln!("G1: wind-down {:?}; soft {:?}; C {} -> {}", r.as_ref().err(), st.soft, c0, w.p3_c());
     r.expect("wind-down completes; seniors never drawn for a trader default");
     let c = w.p3.as_ref().unwrap();
     eprintln!("G1: seniors in {} out {}", c.senior_in, c.senior_out);
@@ -4338,4 +4360,41 @@ fn anvil_probe_nocpi_in_p3() {
     let r = w.do_trade_nocpi(1, 2, q, INITIAL_MARK);
     eprintln!("NOCPI -> {:?}", r.as_ref().map_err(|e| e.chars().rev().take(300).collect::<String>().chars().rev().collect::<String>()));
     eprintln!("pos u1 {:?}", w.env.portfolio_state(w.ports[1]).legs.iter().filter(|l| l.active).map(|l| l.basis_pos_q).collect::<Vec<_>>());
+}
+
+/// Security review of 592a77e2 (G-1 bypass PoC `sec_g1_postbind_trader_vs_trader_via_vault`,
+/// credit: security reviewer): after the bind two colluding traders build opposing positions
+/// THROUGH the vault LP (every fill faces it), leaving it near flat; a price run then bankrupts
+/// the short. The Resolved cover must not draw the Earn seniors for that trader default: the
+/// winner takes the engine's credit-rate haircut, exactly as in Live.
+fn g1_bypass_run(size: i32, rounds: usize) -> (u128, u128, u64) {
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "0");
+    std::env::set_var("FUZZ_LP_DOMAINS", "0");
+    let mut w = World::new(0);
+    let c0 = w.p3_c();
+    for _ in 0..rounds {
+        let _ = w.apply(&Op::TradeCpi { u: 1, size_tenths: size });
+        let _ = w.apply(&Op::TradeCpi { u: 2, size_tenths: -size });
+    }
+    assert!(w.env.portfolio_state(w.ports[1]).legs.iter().any(|l| l.active) && w.env.portfolio_state(w.ports[2]).legs.iter().any(|l| l.active), "vacuity: both traders hold opposing positions via the vault LP");
+    for d in [2000i32, 2000, 2000, 2000] {
+        let _ = w.apply(&Op::Push { delta_bps: d });
+        let _ = w.apply(&Op::Warp { n: 60 });
+    }
+    w.wind_down().expect("wind-down completes");
+    let st = w.stats.clone();
+    let c = w.p3.as_ref().unwrap();
+    (c0, c.senior_out, st.soft.get("close_resolved_haircut_events").copied().unwrap_or(0))
+}
+
+#[test]
+fn p3_g1_trader_vs_trader_via_vault_lp_never_draws_seniors() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    for (size, rounds) in [(300i32, 12usize), (300, 25)] {
+        let (c0, out, haircuts) = g1_bypass_run(size, rounds);
+        eprintln!("G1-bypass size {size}x{rounds}: seniors paid {out} of C {c0}; winner haircut events {haircuts}");
+        assert!(haircuts >= 1, "vacuity: the trader default reached the winner (engine haircut)");
+        assert!(out + 2_000 >= c0, "G-1 bypass: seniors drawn for a trader default: paid {out} of {c0}");
+    }
 }

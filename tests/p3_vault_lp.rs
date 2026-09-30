@@ -35,7 +35,7 @@ const DOMAIN: u16 = 0; // asset 0, long side
 const MATCHER_CONTEXT_LEN: usize = 320;
 /// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
 /// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
-const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
+const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
 fn code(e: PercolatorError) -> String {
@@ -2967,19 +2967,21 @@ fn p3_f14_outside_nocpi_cannot_grow_on_a_bound_asset() {
     let mut env = Env::new(Params::default());
     let a = env.new_trader(10_000_000);
     let b = env.new_trader(10_000_000);
-    // Before binding, a NoCpi pair may open (the pre-P3 market shape).
+    // Before binding, a NoCpi pair may open (the pre-P3 market shape)...
     env.trade_nocpi(&a, &b, 5 * POS).expect("unbound: NoCpi open");
+    // ...but a vault can no longer be bound while it is open (gate HIGH lock, 2026-09-30: tag 94
+    // refuses with VaultLpBindRequiresFlatAsset while the asset has open interest; see
+    // p3_resolved_lock::p3_bind_refused_while_asset_has_open_interest). Unwind it first.
+    env.trade_nocpi(&a, &b, -5 * POS).expect("unbound: NoCpi unwind");
+    assert_eq!(env.position(a.portfolio), 0);
     let lp = env.bind(1_000);
     let admin = env.admin.insecure_clone();
     env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
-    // Bound: growing either outside side is refused...
+    // Bound: growing either outside side is refused.
     err_has(&env.trade_nocpi(&a, &b, POS), PercolatorError::VaultLpExclusiveCounterparty);
     let c = env.new_trader(10_000_000);
     let d = env.new_trader(10_000_000);
     err_has(&env.trade_nocpi(&c, &d, POS), PercolatorError::VaultLpExclusiveCounterparty);
-    // ...but the pre-existing pair can always unwind.
-    env.trade_nocpi(&a, &b, -5 * POS).expect("bound: NoCpi unwind allowed");
-    assert_eq!(env.position(a.portfolio), 0);
     // Trading still works through the vault LP.
     env.trade(&c, &lp, 2 * POS).expect("vault LP route");
     env.assert_conserved("F-14 NoCpi exclusivity");

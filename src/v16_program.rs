@@ -416,13 +416,6 @@ pub mod constants {
     /// (77, 102, the senior draw, rebalances). Loss backing the ENGINE routes into a pot for
     /// winners who have not been touched yet is NOT counted: the senior draw may only take
     /// vault-owned atoms (C-7 exhausted / single-pot race: winners were short 8,511 / 8,699).
-    /// P3 (G-1, 2026-09-30): 1 byte at [672, 673) of the asset wrapper slot, set by tag 94 when
-    /// the asset already had open interest at bind (positions that predate the vault LP, so
-    /// trader-vs-trader). After a bind every risk-increasing fill must face the vault LP (77
-    /// VaultLpExclusiveCounterparty), so with the flag clear every winner's counterparty is the
-    /// vault LP. Zero spare headroom (P1 risk limits end at 672): NO LAYOUT CHANGE.
-    pub const ASSET_VAULT_PREBIND_OI_OFF: usize = 672;
-    const _: () = assert!(ASSET_VAULT_PREBIND_OI_OFF >= 672 && ASSET_VAULT_PREBIND_OI_OFF < 800);
     pub const ASSET_VAULT_POT_OWNED_OFF: usize = 800;
     pub const ASSET_VAULT_POT_OWNED_LEN: usize = 32;
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF + ASSET_VAULT_POT_OWNED_LEN == 832);
@@ -455,12 +448,13 @@ pub mod constants {
         crate::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q == percolator::MAX_POSITION_ABS_Q
     );
     /// P3 auto-pin: the ONE matcher program a vault LP is bound to at tag 94. Protocol constant
-    /// (never instruction data). devnet = the live matcher `4seJWjv3…`. There is deliberately
+    /// (never instruction data). devnet = the RELAUNCH matcher `EDKKgRaV…` (all-fresh program IDs,
+    /// 2026-09-30; the pre-relaunch matcher was `4seJWjv3…`). There is deliberately
     /// no mainnet arm yet: tag 94 fails closed off-devnet until the mainnet matcher ID is set
     /// here (same compile-time-absent / runtime-fail-closed pattern as STAKE_PROGRAM_ID).
     #[cfg(feature = "devnet")]
     pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
-        solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
+        solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -879,6 +873,9 @@ pub mod constants {
     //   rebuild of percolator-stake@1e08d35, `cargo build-sbf --features devnet`:
     //     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
     //   ⇒ MATCH. GCHhcgw IS percolator-stake@1e08d35.
+    //   RELAUNCH (2026-09-30, all-fresh program IDs): the devnet pin is now the fresh stake
+    //   deployment `VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w`; the lineage note above is the
+    //   pre-relaunch `GCHhcgw…` deployment (old world, kept by the live-fork test fixtures).
     //   GOTCHA: the build is PATH-DEPENDENT (root-crate `-C metadata` hash).
     //   Rebuilding at any path other than the canonical `~/v17/percolator-stake`
     //   yields a function-REORDERED ELF (identical `.rodata`, identical section
@@ -906,7 +903,7 @@ pub mod constants {
     // the matching `declare_id!` arm in percolator-stake, in the same change.
     #[cfg(feature = "devnet")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
-        solana_program::pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
+        solana_program::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w");
 
     /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
     /// the wrapper market it is bound to, so there is exactly ONE pool per
@@ -1293,6 +1290,12 @@ VaultLpMultiAssetMarket,
         /// (97), recall (98) and junior release (102) until the seniors are restored. Appended
         /// at the END of the enum (no existing code shifts).
         VaultLpPausedForSeniorDraw,
+        /// P3 (2026-09-30, gate HIGH lock): VaultLp bind (94) refused because the asset already has
+        /// open interest. Positions that predate the vault LP are trader-vs-trader; a bankrupt one
+        /// leaves the vault LP's winners short and can block terminal-flat forever. Bind a vault
+        /// at market creation (relaunch seeds and the wizard do), before any trade. Custom(90),
+        /// appended at the END (no existing code shifts). SDK: add to the client error map.
+        VaultLpBindRequiresFlatAsset,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -26938,15 +26941,25 @@ pub mod processor {
     }
 
     /// P3 (2026-09-30): Resolved CloseResolved on a bound vault market. Register the closing
-    /// portfolio's claims (the tolerated, byte-restored refresh), then for each pot of the bound
+    /// portfolio's claims (the tolerated, byte-restored refresh); then, for each pot of the bound
     /// asset whose registered winner claims exceed its available backing (the engine's formula:
     /// `positive_claim_bound - ((fresh_reserved - valid_liened) + (insurance_reserved -
-    /// insurance liens))`), move vault-owned senior
-    /// backing from the SIBLING pot into it (principal decrement there, winners' backing here;
-    /// `header.vault` nets to 0, no SPL) and record the move as a PENDING senior draw from the
-    /// sibling, so the one booking rule charges it junior-first, then seniors pro rata. Winners
-    /// are never haircut while senior backing remains; what the seniors cannot cover stays the
-    /// engine's credit-rate haircut. Returns the atoms moved.
+    /// insurance liens))`), move ORPHANED backing of the SIBLING pot into it.
+    ///
+    /// Orphaned = the sibling's Fresh backing that is neither vault-owned (senior/junior value)
+    /// nor reserved for a registered claim (`vault_terminal_stray_atoms`), and ONLY once no
+    /// account holds a position on the side whose winners that backing could still belong to
+    /// (the claim pot's own side; any such winner would still be unregistered). That is the
+    /// vault LP's own netted contribution: loss backing the engine routed to the sibling for the
+    /// vault LP's earlier gain, which the vault LP then netted against its later loss, so its
+    /// settled loss reached the claim pot short by exactly that (the single-winner repro).
+    ///
+    /// Security review of 592a77e2 (G-1 bypass, `sec_g1_postbind_trader_vs_trader_via_vault`):
+    /// Earn SENIOR principal is never moved here. The vault LP's own deficit is funded by the
+    /// senior draw BEFORE its settlement (101), which routes it to the winners' pot; a
+    /// trader-vs-trader default (pre-bind positions, or two traders netting through the vault LP)
+    /// is the engine's credit-rate haircut, exactly as in Live. `header.vault` nets to 0, no SPL,
+    /// no ledger or C change. Returns the atoms moved.
     #[inline(never)]
     fn vault_cover_resolved_claim_shortfall(
         program_id: &Pubkey,
@@ -26955,20 +26968,13 @@ pub mod processor {
         group: &mut state::MarketViewMutV16<'_>,
         portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
     ) -> Result<u128, ProgramError> {
+        let _ = (program_id, market_key, cfg);
         if group.header.mode != 1 {
             return Ok(0);
         }
         let Some(a) = market_bound_vault_asset(group)? else {
             return Ok(0);
         };
-        // G-1 (owner decision): Earn seniors back the VAULT LP only; they are not insurance for
-        // trader-vs-trader defaults (the Live path haircuts those winners through the engine,
-        // Resolved must match). The cover therefore runs only when every position on the bound
-        // asset faces the vault LP: no open interest predated the bind (after the bind every
-        // risk-increasing fill must face the vault LP, 77 VaultLpExclusiveCounterparty).
-        if group.markets[a].wrapper[crate::constants::ASSET_VAULT_PREBIND_OI_OFF] != 0 {
-            return Ok(0);
-        }
         {
             let saved_header: alloc::vec::Vec<u8> = bytemuck::bytes_of(&*group.header).to_vec();
             let saved_markets: alloc::vec::Vec<u8> = bytemuck::cast_slice::<_, u8>(&*group.markets).to_vec();
@@ -26979,16 +26985,12 @@ pub mod processor {
                 bytemuck::bytes_of_mut(&mut *portfolio.header).copy_from_slice(&saved_p);
             }
         }
-        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_key);
-        let reg = registry_pda.to_bytes();
         let mut moved = 0u128;
         for d in [a * 2, a * 2 + 1] {
             let (source, bucket) = backing_domain_parts_view(group, d)?;
             if source.positive_claim_bound_num == 0 {
                 continue;
             }
-            // The engine's own available-backing formula
-            // (`available_backing_num_for_source_credit_state`): counterparty + insurance credit.
             let available = source
                 .fresh_reserved_backing_num
                 .saturating_sub(source.valid_liened_backing_num)
@@ -27011,14 +27013,27 @@ pub mod processor {
             if expiry <= group.header.current_slot.get() {
                 continue;
             }
+            // Nobody left on the claim pot's side who could still own the sibling's backing.
+            let asset = &group.markets[a].engine.asset;
+            let side_positions = if d % 2 == 0 {
+                asset.stored_pos_count_long.get()
+            } else {
+                asset.stored_pos_count_short.get()
+            };
+            if side_positions != 0 {
+                continue;
+            }
             let sib = if d % 2 == 0 { d + 1 } else { d - 1 };
-            let x = need_num
-                .div_ceil(BOUND_SCALE)
-                .min(vault_pot_drawable_atoms(group, cfg, &reg, sib)?);
+            let orphan = vault_terminal_stray_atoms(group, a)?[sib % 2];
+            let x = need_num.div_ceil(BOUND_SCALE).min(orphan);
             if x == 0 {
                 continue;
             }
-            vault_pot_principal_decrement(group, sib, x)?; // vault -x, owned(sib) -x
+            // The atoms leave the sibling's NON-owned backing: keep owned(sib) exactly as it was.
+            let owned_before = vault_pot_owned(group, sib)?;
+            vault_pot_principal_decrement(group, sib, x)?; // vault -x
+            let owned_after = vault_pot_owned(group, sib)?;
+            vault_pot_owned_adjust(group, sib, owned_before - owned_after, true)?;
             group.header.vault = percolator::V16PodU128::new(
                 group
                     .header
@@ -27035,28 +27050,11 @@ pub mod processor {
                 expiry,
                 false,
             )?;
-            let mut rec = read_vault_lp_draw_from_view(group, a)?;
-            if sib % 2 == 0 {
-                rec.pending_out_even_atoms = rec
-                    .pending_out_even_atoms
-                    .checked_add(x)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            } else {
-                rec.pending_out_odd_atoms = rec
-                    .pending_out_odd_atoms
-                    .checked_add(x)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            }
-            rec.pending_moved_atoms = rec
-                .pending_moved_atoms
-                .checked_add(x)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            write_vault_lp_draw_to_view(group, a, &rec)?;
             moved = moved
                 .checked_add(x)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             solana_program::log::sol_log(&alloc::format!(
-                "p3_resolved_claim_cover from={} to={} atoms={}",
+                "p3_resolved_claim_cover_orphan from={} to={} atoms={}",
                 sib, d, x
             ));
         }
@@ -28216,6 +28214,21 @@ pub mod processor {
         if max_market_slots != 1 {
             return Err(PercolatorError::VaultLpMultiAssetMarket.into());
         }
+        // Gate HIGH (2026-09-30): no open interest on the asset at bind, so every position on a
+        // bound asset faces the vault LP (after the bind, 77 VaultLpExclusiveCounterparty).
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let asset = &group
+                .markets
+                .get(asset_index)
+                .ok_or(PercolatorError::InvalidInstruction)?
+                .engine
+                .asset;
+            if asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0 {
+                return Err(PercolatorError::VaultLpBindRequiresFlatAsset.into());
+            }
+        }
 
         let (vault_lp_pda, vault_lp_bump) = state::derive_vault_lp_state(program_id, market_ai.key);
         expect_key(vault_lp_ai, &vault_lp_pda)?;
@@ -28306,13 +28319,6 @@ pub mod processor {
 
             rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
-            {
-                // G-1: remember whether positions that predate the vault LP exist on this asset.
-                let asset = &group.markets[asset_index].engine.asset;
-                let prebind_oi = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-                group.markets[asset_index].wrapper[crate::constants::ASSET_VAULT_PREBIND_OI_OFF] =
-                    prebind_oi as u8;
-            }
             rec.lp_net_q = 0;
             rec.lp_net_slot = last_fee_slot;
             // Auto-pin: canonical matcher approved; 1x exposure default (0 => 10_000 bps).

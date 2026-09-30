@@ -101,7 +101,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -2135,4 +2135,127 @@ fn p3_d1_untouched_winner_paid_in_full_after_registered_winner_converts() {
         assert!(null > 2_000_000, "vacuity: W had a profit");
         assert!(paid + 2 >= null, "D-1 (convert_before_lp_refresh={order}): untouched winner W paid {paid} < null {null}");
     }
+}
+
+/// D-1 OPPOSITE-POT variant (security review of 592a77e2): W's loss backing sits in the pot the
+/// vault LP's later settled loss does NOT route into. W and W2 go SHORT vs the vault LP (it is
+/// long); the price falls, a bound 75 refresh lands the vault LP's loss in the LONG-side pot d0 as
+/// backing for both (untouched); W2 closes and converts; then T goes long big (vault LP net
+/// short) and the price rises past the junior: the senior draw runs and the vault LP's settled
+/// loss routes into the SHORT-side pot d1. W's resolved payout must equal the null control.
+/// LIMITATION (recorded, 2026-09-30): in this harness T's risk-increasing fill after the move is
+/// refused (21) even with eff == target, so the draw phase is NOT reached (drawn 0). The test
+/// therefore covers the opposite-pot CONSUMPTION half only (W2 consumes 48,782 from d0, receivable
+/// 48,782) and W's payout equals the null control; the draw half is covered by
+/// p3_d1_untouched_winner_paid_in_full_after_registered_winner_converts.
+fn d1_opposite_run(w2_converts: bool) -> (u128, u128) {
+    TL_IM.with(|c| c.set(2_000));
+    let mut w = P3::new();
+    w.create_vault();
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 0).expect("75 d0");
+    let _ = w.earn_deposit_domain(&Keypair::new(), 5_000_000, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap_or_else(|e| panic!("94: {e}"));
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 50_000).unwrap_or_else(|e| panic!("99: {e}"));
+    {
+        let mut b = vec![93u8];
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        b.extend_from_slice(&50_000u32.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        b.extend_from_slice(&0u128.to_le_bytes());
+        let metas = vec![AccountMeta::new(up.pubkey(), true), AccountMeta::new_readonly(w.program_data, false), AccountMeta::new(w.env.market, false)];
+        w.send_raw(b, metas, &[&up]).expect("93");
+    }
+    w.junior_deposit(&admin, 300_000).unwrap_or_else(|e| panic!("96: {e}"));
+    let (wt, wp) = w.trader(2_000_000);
+    let (w2t, w2p) = w.trader(2_000_000);
+    let (tt, tp) = w.trader(4_000_000);
+    let (_dk, dp) = w.trader(1_000);
+    let lp = w.lp;
+    for (t, p) in [(&wt, wp), (&w2t, w2p)] {
+        for _ in 0..2 {
+            let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
+            let _ = w.crank(lp); let _ = w.crank(p);
+            let _ = w.trade_vs_lp(t, p, -100_000);
+        }
+    }
+    assert!(w.pos(wp) < 0 && w.pos(w2p) < 0, "vacuity: both shorts open");
+
+    let step = |w: &mut P3, mark: u64| {
+        MARK.with(|c| c.set(mark));
+        let s = w.slot() + 524; w.env.svm.warp_to_slot(s);
+        w.push(mark);
+        for _ in 0..40 { let _ = w.crank(dp); }
+    };
+    let dump = |w: &P3, label: &str| {
+        let g = w.env.market_state().1;
+        let bs = percolator::BOUND_SCALE;
+        let l = w.env.portfolio_state(w.lp);
+        eprintln!("D1o[{label}] pots {:?} recv {:?} | LP cap {} pnl {} pos {:?}", g.source_backing_buckets.iter().take(2).map(|b| (b.fresh_unliened_backing_num / bs, b.consumed_liened_backing_num / bs)).collect::<Vec<_>>(),
+            g.source_credit.iter().take(2).map(|c| c.provider_receivable_num / bs).collect::<Vec<_>>(), l.capital, l.pnl, l.legs.iter().filter(|x| x.active).map(|x| x.basis_pos_q).collect::<Vec<_>>());
+    };
+    let mut mark = PRICE;
+    for _ in 0..6 { mark = mark * 9_550 / 10_000; step(&mut w, mark); }
+    let _ = w.earn_deposit_domain(&Keypair::new(), 1_000, true, 0); // refresh: the vault LP's loss lands
+    dump(&w, "after fall + refresh");
+    for _ in 0..200 {
+        let a = &w.env.market_state().1.assets[0];
+        if a.effective_price == a.raw_oracle_target_price { break; }
+        let s = w.slot() + 50; w.env.svm.warp_to_slot(s); w.push(mark); let _ = w.crank(dp);
+    }
+    { let a = &w.env.market_state().1.assets[0]; eprintln!("D1o eff {} tgt {}", a.effective_price, a.raw_oracle_target_price); }
+    for i in 0..14 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(tp); let r = w.trade_vs_lp(&tt, tp, 100_000); if i < 1 { eprintln!("D1o T long -> {:?} :: {}", r.as_ref().map_err(|e| code(e)), r.as_ref().err().map(|e| e.split("Program log:").skip(1).map(|x| x.chars().take(150).collect::<String>()).collect::<Vec<_>>().join(" | ")).unwrap_or_default()); } }
+    dump(&w, "after T long");
+    let _ = w.crank(w2p);
+    for _ in 0..4 { let q = w.pos(w2p); if q == 0 { break; } let _ = w.trade_vs_lp(&w2t, w2p, (-q).min(100_000)); }
+    for _ in 0..6 { step(&mut w, mark); let _ = w.crank(w2p); }
+    if w2_converts {
+        let pnl = w.env.portfolio_state(w2p).pnl;
+        if pnl > 0 {
+            let m = w.env.market;
+            let (pid, _, pep) = w.env.portfolio_identity(w2p);
+            let r = w.send(ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+                vec![AccountMeta::new(w2t.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(w2p, false)], &[&w2t]);
+            eprintln!("D1o W2 convert {pnl} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        }
+    }
+    dump(&w, "after W2 convert");
+    for _ in 0..6 { mark = mark * 10_450 / 10_000; step(&mut w, mark); }
+    for _ in 0..6 { let _ = w.crank(lp); }
+    dump(&w, "after rise + draw");
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(mark);
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    let jo = admin.pubkey();
+    for _ in 0..20 { let l = w.env.portfolio_state(lp); if l.pnl >= 0 && l.legs.iter().all(|x| !x.active) { break; } let _ = w.settle_resolved(jo, 0); }
+    let m = w.env.market;
+    let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+    let mut paid = 0u128;
+    // T and W2 close first so W's close can realise (no blockers).
+    for round in 0..40 {
+        for (k, p) in [(&tt, tp), (&w2t, w2p), (&wt, wp)] {
+            if w.env.svm.get_account(&p).map_or(true, |x| x.lamports == 0) { continue; }
+            let dest = w.token(k.pubkey(), 0);
+            let _ = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+                AccountMeta::new_readonly(k.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false),
+                AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[k]);
+            if p == wp { paid += w.tok(&dest) as u128; }
+            let _ = w.close_portfolio_permissionless(p, k.pubkey());
+        }
+        let _ = round;
+        let _ = w.settle_resolved(jo, 0);
+    }
+    eprintln!("D1o (w2_converts={w2_converts}): W paid {paid}; drawn {}", drawn(&w));
+    (paid, drawn(&w))
+}
+
+#[test]
+fn p3_d1_opposite_pot_untouched_winner_paid_in_full() {
+    let (paid, drawn_c) = d1_opposite_run(true);
+    let (null, drawn_n) = d1_opposite_run(false);
+    eprintln!("D1o: W paid {paid} (null control {null}); drawn {drawn_c}/{drawn_n}");
+    assert!(null > 2_000_000, "vacuity: W had a profit");
+    assert!(paid + 2 >= null, "D-1 opposite pot: untouched winner W paid {paid} < null {null}");
 }

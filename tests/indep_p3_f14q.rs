@@ -134,7 +134,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -3006,4 +3006,68 @@ fn p3_exit_front_run_leaver_advantage_is_rounding_at_cooldown_150() {
         }
     }
     assert!(worst <= 2_000, "front-run at cooldown 150: leaver advantage / stayer charge up to {worst} atoms");
+}
+
+/// Anvil probe (gate HIGH lock, question 2): the SAME trader-vs-trader bankruptcy on a PLAIN
+/// market with no LP vault at all (A long 1.0 vs B short, B 200k capital, +30%): does B's bankrupt
+/// close progress, and does the resolved wind-down reach terminal-flat?
+fn plain_ttv(b_cap: u64) -> (u128, usize, bool, u128, u64) {
+    TL_IM.with(|c| c.set(1_000));
+    let mut w = P3::new();
+    let (a, ap) = w.trader(2_000_000);
+    let (b, bp) = w.trader(b_cap);
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); w.push(PRICE);
+    let pre = w.env.try_trade_asset_with_cu(0, &a, ap, &b, bp, 1_000_000, PRICE, 30);
+    assert!(pre.is_ok(), "vacuity: NoCpi position opened: {:?}", pre.as_ref().map_err(|e| code(e)));
+    let mut m = PRICE;
+    for _ in 0..6 {
+        m = m * 10_450 / 10_000; MARK.with(|c| c.set(m));
+        let s = w.slot() + 520; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
+        for p in [ap, bp] { let _ = w.crank(p); }
+    }
+    let mut nb = 0usize;
+    for _ in 0..500 {
+        let x = w.env.portfolio_state(bp);
+        if x.legs.iter().all(|l| !l.active) && !x.close_progress.active { break; }
+        let s = w.slot() + 1; w.env.svm.warp_to_slot(s);
+        let r = w.crank(bp); nb += 1;
+        if nb <= 3 || nb == 500 { eprintln!("PLAIN crank B #{nb} -> {:?}", r.as_ref().map_err(|e| code(e))); }
+    }
+    let bs = w.env.portfolio_state(bp);
+    let g = w.env.market_state().1;
+    eprintln!("PLAIN B after {nb} cranks: cap {} pnl {} legs {} close {:?} | hlock {} mode {:?} | A pnl {} | mark {m} eff {}", bs.capital, bs.pnl, bs.legs.iter().filter(|l| l.active).count(), bs.close_progress, g.bankruptcy_hlock_active, g.mode, w.env.portfolio_state(ap).pnl, g.assets[0].effective_price);
+    let stuck = bs.legs.iter().any(|l| l.active);
+    let s = w.slot() + 1; w.env.svm.warp_to_slot(s); { let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| w.push(m))); }
+    let rr = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| { w.env.resolve(); }));
+    eprintln!("PLAIN resolve -> {:?} mode {:?}", rr.is_ok(), w.env.market_state().1.mode);
+    let m_ = w.env.market;
+    let nft = Pubkey::find_program_address(&[b"nft_registry", m_.as_ref()], &w.env.program_id).0;
+    let mut paid_of = |w: &mut P3, k: &Keypair, p: Pubkey| -> u128 {
+        let mut tot = 0u128;
+        for i in 0..1_000 {
+            if w.env.svm.get_account(&p).map_or(true, |x| x.lamports == 0) { break; }
+            let dest = w.token(k.pubkey(), 0);
+            let r = w.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 }, vec![
+                AccountMeta::new_readonly(k.pubkey(), true), AccountMeta::new(m_, false), AccountMeta::new(p, false),
+                AccountMeta::new(dest, false), AccountMeta::new(w.env.vault, false), AccountMeta::new_readonly(w.env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false), AccountMeta::new_readonly(nft, false)], &[k]);
+            tot += w.tok(&dest) as u128;
+            let _ = w.close_portfolio_permissionless(p, k.pubkey());
+            if i < 2 || r.is_err() { eprintln!("PLAIN CloseResolved {} #{i} -> {:?}", if p == ap { "A" } else { "B" }, r.as_ref().map_err(|e| code(e))); }
+            if r.is_err() { break; }
+        }
+        tot
+    };
+    let b_paid = paid_of(&mut w, &b, bp);
+    let a_paid = paid_of(&mut w, &a, ap);
+    let g = w.env.market_state().1;
+    eprintln!("PLAIN terminal: A paid {a_paid}, B paid {b_paid}; materialized {} c_tot {}", g.materialized_portfolio_count, g.c_tot);
+    (a_paid, nb, stuck, g.c_tot, g.materialized_portfolio_count.into())
+}
+
+#[test]
+#[ignore]
+fn anvil_probe_plain_market_trader_bankruptcy_close() {
+    let (a_paid, nb, stuck, c_tot, mat) = plain_ttv(200_000);
+    eprintln!("PLAIN SUMMARY: A paid {a_paid}; B stuck {stuck} after {nb}; terminal c_tot {c_tot} materialized {mat}");
 }

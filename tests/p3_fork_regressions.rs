@@ -75,7 +75,12 @@ use spl_token::state::{Account as TokenAccount, AccountState};
 use std::path::PathBuf;
 
 const WRAPPER_ID: Pubkey = pubkey!("GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ");
+/// OLD world (live fork fixtures): the matcher every captured account was written under.
 const MATCHER_ID: Pubkey = pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
+/// RELAUNCH (all-fresh program IDs, 2026-09-30): the candidate wrapper's tag-94 auto-pin matcher
+/// (`CANONICAL_VAULT_LP_MATCHER_PROGRAM`, devnet). The same matcher bytes are mounted at both ids;
+/// every vault-LP bind / trade on the fork uses this one.
+const VAULT_MATCHER_ID: Pubkey = pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
 const STAKE_ID: Pubkey = pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 
 const DEPLOYED_SO_DEFAULT: &str = "/Users/khubair/deploycand-v182/out/wrapper-v18.2.so";
@@ -289,6 +294,7 @@ fn env(fx: &Fixture, which: Bytes) -> Env {
     let mut svm = LiteSVM::new().with_sigverify(false);
     svm.add_program(WRAPPER_ID, &wrapper_bytes(which));
     svm.add_program(MATCHER_ID, &matcher_bytes());
+    svm.add_program(VAULT_MATCHER_ID, &matcher_bytes());
     svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).unwrap());
     for (k, a) in &fx.accounts {
         svm.set_account(*k, a.clone()).unwrap();
@@ -618,15 +624,15 @@ impl Env {
 
     /// Auto-pin tail for tag 94: [8] canonical matcher, [9] fresh ctx, [10] delegate.
     fn autopin_tail(&mut self, lp: Pubkey) -> (Vec<AccountMeta>, Pubkey, Pubkey) {
-        let ctx = self.create_owned(&MATCHER_ID, MATCHER_CONTEXT_LEN);
+        let ctx = self.create_owned(&VAULT_MATCHER_ID, MATCHER_CONTEXT_LEN);
         let delegate = Pubkey::find_program_address(
-            &[b"matcher", self.slab.as_ref(), lp.as_ref(), self.registry.as_ref(), MATCHER_ID.as_ref(), ctx.as_ref()],
+            &[b"matcher", self.slab.as_ref(), lp.as_ref(), self.registry.as_ref(), VAULT_MATCHER_ID.as_ref(), ctx.as_ref()],
             &WRAPPER_ID,
         )
         .0;
         (
             vec![
-                AccountMeta::new_readonly(MATCHER_ID, false),
+                AccountMeta::new_readonly(VAULT_MATCHER_ID, false),
                 AccountMeta::new(ctx, false),
                 AccountMeta::new_readonly(delegate, false),
             ],
@@ -707,7 +713,7 @@ impl Env {
                 lev_cap_q: 0,
                 lev_max_imr_bps: 0,
                 vault_lp_max_lev_bps,
-                approved_matcher_program: MATCHER_ID.to_bytes(),
+                approved_matcher_program: VAULT_MATCHER_ID.to_bytes(),
             },
             vec![
                 AccountMeta::new(auth, true),
@@ -786,6 +792,11 @@ impl Env {
 
     /// TradeCpi (tag 10): `taker` against the vault LP.
     fn trade(&mut self, taker: &Pubkey, lp: &VaultLp, size_q: i128) -> Outcome {
+        // The LP's own matcher program: the relaunch matcher for the vault LP, the old-world
+        // matcher for a captured live LP.
+        let matcher_prog = state::read_portfolio_matcher_config(&self.data(&lp.portfolio))
+            .map(|m| Pubkey::new_from_array(m.matcher_program))
+            .unwrap_or(VAULT_MATCHER_ID);
         let md = self.data(&self.slab);
         let (cfg, _, _, market_id, _, _) = state::read_market_trade_preflight(&md, ASSET as usize).unwrap();
         let td = self.data(taker);
@@ -810,7 +821,7 @@ impl Env {
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new(*taker, false),
                 AccountMeta::new(lp.portfolio, false),
-                AccountMeta::new_readonly(MATCHER_ID, false),
+                AccountMeta::new_readonly(matcher_prog, false),
                 AccountMeta::new(lp.ctx, false),
                 AccountMeta::new_readonly(lp.delegate, false),
             ],
@@ -939,7 +950,7 @@ fn bind_single(e: &mut Env, max_lev_bps: u32) -> Bound {
     assert_eq!(e.capital_pnl(&lp).0, JUNIOR as u128, "junior capital lands in the vault LP");
     let rec = e.asset_rec();
     assert_eq!(rec.vault_lp_portfolio, lp.to_bytes());
-    assert_eq!(rec.approved_matcher_program, MATCHER_ID.to_bytes());
+    assert_eq!(rec.approved_matcher_program, VAULT_MATCHER_ID.to_bytes());
     eprintln!(
         "[{}] BOUND: vault LP {lp}, C = {}, junior capital = {}, max_lev_bps = {}",
         e.label, st.senior_claim_atoms, JUNIOR, rec.vault_lp_max_lev_bps

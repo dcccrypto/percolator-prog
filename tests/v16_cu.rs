@@ -25111,7 +25111,7 @@ mod p3_vault_lp_skew {
         env.configure_auth_mark_with_cu(1, P3_PRICE);
         // P3 auto-pin: tag 94 accepts only the canonical matcher id (devnet constant).
         let matcher_program =
-            solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
+            solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         setup_on(env, matcher_program, earn, junior)
@@ -25451,14 +25451,14 @@ mod p3_vault_lp_skew {
     // ── exclusive LP ─────────────────────────────────────────────────────────────────────────
 
     #[test]
-    fn p3_exclusive_lp_refuses_growing_another_lp_but_lets_it_unwind() {
+    fn p3_bind_refused_while_another_lp_holds_inventory() {
         // Build the market WITHOUT binding first, give a creator-owned LP some inventory, then
         // bind the vault LP and check the other LP can only shrink.
         let mut env = V16CuEnv::new_with_init_params(p3_params());
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_with_cu(1, P3_PRICE);
         let matcher_program =
-            solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT"); // canonical (auto-pin)
+            solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX"); // canonical (auto-pin)
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         let creator = Keypair::new();
@@ -25474,28 +25474,22 @@ mod p3_vault_lp_skew {
         )
         .expect("pre-bind fill against the creator LP");
 
-        // Now bind a vault LP on the same asset (reuse the setup steps on this env).
-        let p_env = env;
-        let mut p = setup_on(p_env, matcher_program, 50_000_000, 20_000_000);
-        // Growing the creator LP (another long vs it) is refused...
-        let r = p.env.try_trade_cpi_with_cu_on_asset(
-            &t_owner, t, &creator, creator_lp, matcher_program, c_ctx, c_del, 0,
-            POS_SCALE as i128, 0,
+        // Gate HIGH lock (2026-09-30): a vault can no longer be bound while the asset carries
+        // open interest (pre-bind positions are not the vault LP's; a bankrupt one left the vault
+        // LP's winners short). Tag 94 refuses with VaultLpBindRequiresFlatAsset (90)...
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = setup_on(env, matcher_program, 50_000_000, 20_000_000);
+        }));
+        let msg = match r {
+            Ok(()) => String::from("bind SUCCEEDED"),
+            Err(e) => e.downcast_ref::<String>().cloned().unwrap_or_default(),
+        };
+        assert!(
+            msg.contains("init vault lp") && msg.contains(&format!("Custom({})", PercolatorError::VaultLpBindRequiresFlatAsset as u32)),
+            "bind with open interest must be refused with VaultLpBindRequiresFlatAsset: {}",
+            &msg[..msg.len().min(300)]
         );
-        assert_err_code(
-            r,
-            PercolatorError::VaultLpExclusiveCounterparty,
-            "growing a non-vault LP on a bound asset",
-        );
-        // ...reducing it (trader sells back) is allowed.
-        p.env
-            .try_trade_cpi_with_cu_on_asset(
-                &t_owner, t, &creator, creator_lp, matcher_program, c_ctx, c_del, 0,
-                -(POS_SCALE as i128), 0,
-            )
-            .expect("unwinding the legacy creator LP stays allowed");
-        // And the vault LP itself takes new risk normally.
-        trade_vs_vault(&mut p, &t_owner, t, POS_SCALE as i128).expect("vault LP fill");
+        let _ = (t_owner, t, creator, creator_lp, c_ctx, c_del);
     }
 
     /// `setup` on an existing env (used by the exclusive-LP test, which needs pre-bind state).
