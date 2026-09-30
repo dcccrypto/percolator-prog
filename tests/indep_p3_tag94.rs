@@ -159,21 +159,26 @@ fn refused(r: &Result<u64, String>) -> Option<u32> {
 
 /// (1) Positive: upgrade authority + junior both sign, correct ProgramData -> bound, junior := [9].
 #[test]
-fn tag94_b_positive_ua_plus_signing_junior_binds_named_junior() {
+fn tag94_b_removed_path_b_invocation_is_refused() {
+    // USER DECISION (2026-09-30): path B is REMOVED from the relaunch. The full path-B
+    // invocation (upgrade authority [0] + ProgramData [8] + signing junior [9], signer is NOT
+    // marketauth) must now be REFUSED with no state change and no junior bound.
     let mut t = T::new();
     let junior = Keypair::new();
     t.env.svm.airdrop(&junior.pubkey(), 1_000_000_000).unwrap();
     let (ua, pd) = (t.upgrade.insecure_clone(), t.program_data);
+    let before = t.snapshot();
     let r = t.init_b(&ua, pd, &junior, true);
-    assert!(r.is_ok(), "path B must bind: {:?}", r.as_ref().map_err(|e| custom_code(e)));
-    assert_eq!(t.junior_owner(), Some(junior.pubkey()), "junior owner must be the named [9] signer");
-    assert_ne!(t.junior_owner(), Some(ua.pubkey()), "the upgrade authority must NOT become the junior");
+    eprintln!("tag94 path-B invocation (removed) -> {:?}", refused(&r));
+    assert!(r.is_err(), "path B was removed: the UA + ProgramData + junior invocation must be refused");
+    assert_eq!(t.snapshot(), before, "refusal must not change state");
+    assert_eq!(t.junior_owner(), None, "no junior may be bound via the removed path");
 }
 
 /// (2) A non-authority in the upgrade-authority slot (marketauth, random) with a real
 /// ProgramData and a signing junior -> refused, no state change.
 #[test]
-fn tag94_b_non_authority_signer_refused() {
+fn tag94_b_removed_refused_for_any_non_marketauth_signer() {
     let mut t = T::new();
     let junior = Keypair::new();
     t.env.svm.airdrop(&junior.pubkey(), 1_000_000_000).unwrap();
@@ -193,11 +198,16 @@ fn tag94_b_non_authority_signer_refused() {
     let r = t.init_b(&admin, pd, &junior, true);
     eprintln!("tag94 B-shaped by marketauth -> {:?}; junior {:?}", refused(&r), t.junior_owner());
     assert_ne!(t.junior_owner(), Some(junior.pubkey()), "marketauth must not be able to name a different junior via the protocol tail");
-    // positive control on a fresh market
+    // Path B removed: even the REAL upgrade authority is refused on a fresh market.
     let mut t2 = T::new();
     let (ua, pd2) = (t2.upgrade.insecure_clone(), t2.program_data);
     t2.env.svm.airdrop(&junior.pubkey(), 1_000_000_000).unwrap();
-    assert!(t2.init_b(&ua, pd2, &junior, true).is_ok(), "control: real UA succeeds");
+    let before2 = t2.snapshot();
+    assert!(t2.init_b(&ua, pd2, &junior, true).is_err(), "path B removed: real UA is refused too");
+    assert_eq!(t2.snapshot(), before2);
+    // Vacuity: path A by marketauth still works on that market.
+    let admin2 = t2.env.admin.insecure_clone();
+    t2.init_a(&admin2).expect("path A still binds");
 }
 
 /// (3) Wrong ProgramData: another program's PDA, wrong owner, spoofed authority, authority=None.
@@ -276,8 +286,11 @@ fn tag94_repoint_existing_vault_lp_refused() {
     t.env.svm.airdrop(&j1.pubkey(), 1_000_000_000).unwrap();
     t.env.svm.airdrop(&j2.pubkey(), 1_000_000_000).unwrap();
     let (ua, pd) = (t.upgrade.insecure_clone(), t.program_data);
-    t.init_b(&ua, pd, &j1, true).expect("first bind");
-    assert_eq!(t.junior_owner(), Some(j1.pubkey()));
+    let admin0 = t.env.admin.insecure_clone();
+    t.init_a(&admin0).expect("first bind via path A (path B removed)");
+    let bound = t.junior_owner();
+    assert_eq!(bound, Some(admin0.pubkey()));
+    let _ = &j1;
     let before = t.snapshot();
     let r = t.init_b(&ua, pd, &j2, true);
     eprintln!("tag94 re-point via B -> {:?}", refused(&r));
@@ -287,7 +300,7 @@ fn tag94_repoint_existing_vault_lp_refused() {
     eprintln!("tag94 re-point via A -> {:?}", refused(&r2));
     assert!(r2.is_err(), "re-point via A must be refused");
     assert_eq!(t.snapshot(), before, "re-point attempts must not change state");
-    assert_eq!(t.junior_owner(), Some(j1.pubkey()));
+    assert_eq!(t.junior_owner(), bound);
     for (lbl, rr) in [("B", &r), ("A", &r2)] {
         if refused(rr) != Some(E_ALREADY_BOUND) {
             eprintln!("NOTE: re-point via {lbl} refused with {:?}, not 72 VaultLpAlreadyBound", refused(rr));
