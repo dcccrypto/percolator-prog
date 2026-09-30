@@ -2369,10 +2369,14 @@ impl World {
 
 /// F-9 shared prefix: bound market, 5M insurance budget, stale resolve, everyone out.
 fn f9_bound_resolved_world() -> (World, u128) {
+    f9_bound_resolved_world_lp(1_000 + 5_000_000)
+}
+
+fn f9_bound_resolved_world_lp(total_lp_supply: u64) -> (World, u128) {
     let mut w = World::new(0);
     w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
     w.do_topup_insurance(5_000_000).expect("insurance top-up");
-    w.setup_stake(1_000 + 5_000_000);
+    w.setup_stake(total_lp_supply);
     w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
     let s = w.slot() + 9_005;
     w.env.svm.warp_to_slot(s);
@@ -2696,4 +2700,25 @@ fn indep_multi_asset_resolved_closeout_pays_every_user() {
     }
     let (_, g) = w.env.market_state();
     assert_eq!(g.c_tot, 0, "every user's capital must be paid after resolution (c_tot {})", g.c_tot);
+}
+
+/// Sieve review of the F-9 fix (stake f9b9190): F-9 x F-3 interplay. If the pool has ONLY the
+/// 1,000 dead shares when the market resolves, tag 29 must not book the recovered terminal
+/// insurance to dead shares (that would make it permanently unredeemable, the F3 class), and
+/// the market must still retire (the budget must leave the wrapper vault).
+#[test]
+#[ignore]
+fn indep_f9_recovery_into_dead_shares_only_pool_is_not_booked_to_dead_shares() {
+    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"), "run with INDEP_MAINNET_ID=1");
+    let (mut w, budget) = f9_bound_resolved_world_lp(1_000);
+    let sv = w.stake.unwrap().2;
+    let fees0 = w.pool_fields().unwrap().2;
+    let r = w.do_stake_recover_terminal(budget as u64, None);
+    let booked = w.pool_fields().unwrap().2 - fees0;
+    eprintln!("F-9 dead-shares: tag29 -> {:?}; booked {booked}; pool vault {}", r.as_ref().map_err(|e| custom_code(e)), w.token_amount(&sv));
+    assert_eq!(booked, 0, "terminal insurance booked to the 1,000 dead shares (unredeemable)");
+    let retired = try_retire(&mut w);
+    eprintln!("F-9 dead-shares: retired {retired}; wrapper vault {}", if retired { 0 } else { w.token_amount(&w.env.vault) });
+    w.check_tokens().unwrap();
+    assert!(retired, "the terminal budget must leave the wrapper vault and the market retire");
 }
