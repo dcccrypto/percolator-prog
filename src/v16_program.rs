@@ -25865,13 +25865,12 @@ pub mod processor {
         Ok((vault_lp_ai, lp_ai, st))
     }
 
-    /// P3 — InitVaultLp (tag 94). marketauth- OR upgrade-authority-gated, Live only.
+    /// P3 — InitVaultLp (tag 94). marketauth-gated, Live only.
     ///
-    /// Accounts: 0 marketauth or upgrade authority [signer, w] · 1 market [w] · 2 registry [w] ·
-    /// 3 vault_lp_state [w] (`["vault_lp", market]`, fresh) · 4 lp_portfolio [w] (program-owned,
-    /// uninitialised, pre-created by the client exactly as for InitPortfolio) · 5 system_program
-    /// · 6 own ledger · 7 sibling ledger · (upgrade-authority path only) 8 ProgramData ·
-    /// 9 junior_owner [signer].
+    /// Accounts: 0 marketauth [signer, w] · 1 market [w] · 2 registry [w] · 3 vault_lp_state
+    /// [w] (`["vault_lp", market]`, fresh) · 4 lp_portfolio [w] (program-owned, uninitialised,
+    /// pre-created by the client exactly as for InitPortfolio) · 5 system_program ·
+    /// 6 own ledger · 7 sibling ledger.
     ///
     /// Creates a portfolio whose OWNER IS THE REGISTRY PDA, binds it as the asset's exclusive
     /// matcher LP (`AssetVaultLpV18`), and seeds the senior claim at the vault's current
@@ -25933,30 +25932,9 @@ pub mod processor {
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
-        // Authorisation. (A) the marketauth runs it and becomes the junior owner. (B) the
-        // protocol (upgrade authority, ProgramData tail [8]) runs it and names a SIGNING junior
-        // owner at [9]: live stake-bound markets have a keyless stake-pool PDA as marketauth,
-        // which can sign no wrapper instruction, so without (B) P3 could never be enabled on
-        // them. Path B only picks WHO holds the first-loss tranche; it moves no value (the
-        // senior claim is seeded from NAV exactly as in A and the junior starts at zero).
-        let junior_owner_key: [u8; 32] = if admin.key.to_bytes() == cfg.marketauth {
-            admin.key.to_bytes()
-        } else {
-            let program_data_ai = accounts
-                .get(8)
-                .ok_or(PercolatorError::Unauthorized)?;
-            let junior_ai = accounts.get(9).ok_or(PercolatorError::Unauthorized)?;
-            let (program_data_key, _) = derive_program_data_address(program_id);
-            expect_key(program_data_ai, &program_data_key)?;
-            if read_program_data_upgrade_authority(program_data_ai)? != Some(*admin.key) {
-                return Err(PercolatorError::Unauthorized.into());
-            }
-            expect_signer(junior_ai)?;
-            if junior_ai.key == &registry_pda || *junior_ai.key == Pubkey::default() {
-                return Err(PercolatorError::InvalidInstruction.into());
-            }
-            junior_ai.key.to_bytes()
-        };
+        if admin.key.to_bytes() != cfg.marketauth {
+            return Err(PercolatorError::Unauthorized.into());
+        }
         let asset_index = registry.domain as usize / 2;
 
         let (vault_lp_pda, vault_lp_bump) = state::derive_vault_lp_state(program_id, market_ai.key);
@@ -26073,7 +26051,7 @@ pub mod processor {
             market_group: market_bytes,
             registry: registry_pda.to_bytes(),
             lp_portfolio: lp_portfolio_ai.key.to_bytes(),
-            junior_owner: junior_owner_key,
+            junior_owner: admin.key.to_bytes(),
             senior_claim_atoms: senior_claim,
             junior_deposited_atoms: 0,
             junior_withdrawn_atoms: 0,

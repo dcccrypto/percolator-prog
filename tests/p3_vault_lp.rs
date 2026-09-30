@@ -2283,9 +2283,9 @@ fn p3_f8_terminal_sweep_pays_exactly_the_surplus_over_c() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
-// Live-market enablement: stake-bound markets have a keyless stake-pool PDA as marketauth
-// (found by the live-state fork run), so tag 94 also accepts the protocol (upgrade
-// authority, ProgramData tail [8]) naming a SIGNING junior owner at [9].
+// Tag 94 is marketauth-only. A protocol path (upgrade authority + ProgramData [8] + signing
+// junior [9]) existed briefly and was REMOVED by decision (2026-09-30): relaunch markets are
+// created fresh and bound by the marketauth before stake InitPool.
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
 impl Env {
@@ -2350,36 +2350,29 @@ impl Env {
 }
 
 #[test]
-fn p3_init_vault_lp_protocol_path_names_a_signing_junior() {
+fn p3_init_vault_lp_former_protocol_path_is_refused() {
+    // The removed "path B" (upgrade authority signs [0], ProgramData [8], a signing junior at
+    // [9]) must be refused: tag 94 is marketauth-only, trailing accounts are ignored.
     let mut env = Env::new(Params::default());
     let protocol = Keypair::new();
     let junior = Keypair::new();
-    let stranger = Keypair::new();
-    for k in [&protocol, &junior, &stranger] {
+    for k in [&protocol, &junior] {
         env.svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
     }
     let pd = env.set_program_data_authority(&protocol.pubkey());
-    // A stranger presenting the real ProgramData is not its authority.
-    err_has(&env.init_vault_lp_protocol(&stranger, pd, &junior, true), PercolatorError::Unauthorized);
-    // The protocol cannot name a junior who does not sign.
-    err_has(&env.init_vault_lp_protocol(&protocol, pd, &junior, false), PercolatorError::ExpectedSigner);
-    // A spoofed ProgramData (right bytes, wrong address) is refused.
-    let fake_pd = Pubkey::new_unique();
-    let acct = env.svm.get_account(&pd).unwrap();
-    env.svm.set_account(fake_pd, acct).unwrap();
-    assert!(env.init_vault_lp_protocol(&protocol, fake_pd, &junior, true).is_err());
-    // The honest protocol path binds with the named junior; seniors seeded as in the marketauth path.
-    let lp = env.init_vault_lp_protocol(&protocol, pd, &junior, true).expect("protocol bind");
-    assert_eq!(env.vlp().junior_owner, junior.pubkey().to_bytes());
-    assert_eq!(env.vlp().lp_portfolio, lp.to_bytes());
-    // Only that junior drives the tranche: the marketauth is now a stranger to it.
+    err_has(&env.init_vault_lp_protocol(&protocol, pd, &junior, true), PercolatorError::Unauthorized);
+    assert!(
+        env.svm.get_account(&env.vault_lp).map(|a| a.data.is_empty()).unwrap_or(true),
+        "no vault-LP state was created"
+    );
+    // The marketauth path still binds, and the junior is the marketauth, even with the old
+    // path-B tail appended (ignored).
     let admin = env.admin.insecure_clone();
+    let lp = env.init_vault_lp_protocol(&admin, pd, &junior, true).expect("marketauth bind with ignored tail");
+    assert_eq!(env.vlp().junior_owner, admin.pubkey().to_bytes());
+    assert_eq!(env.vlp().lp_portfolio, lp.to_bytes());
     env.svm.expire_blockhash();
-    err_has(&env.junior_deposit_as(&admin, lp, 1_000), PercolatorError::Unauthorized);
-    env.svm.expire_blockhash();
-    env.junior_deposit_as(&junior, lp, 7_000_000).expect("named junior deposits");
-    assert_eq!(env.vlp().junior_deposited_atoms, 7_000_000);
-    env.assert_conserved("protocol-path junior deposit");
+    err_has(&env.junior_deposit_as(&junior, lp, 1_000), PercolatorError::Unauthorized);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════

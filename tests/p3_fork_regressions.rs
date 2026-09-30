@@ -29,15 +29,13 @@
 //! * SIGNERS are listed with a default signature (`with_sigverify(false)`), as in P1:
 //!   - the upgrade authority `FbTbDe…` (tags 99 and 95; the protocol holds it);
 //!   - new traders and depositors;
-//!   - the junior owner, which is a REAL keypair signing tags 94 [9] and 96.
-//! * THE MARKETAUTH NEVER SIGNS. On all four markets the marketauth is the
-//!   percolator-stake POOL PDA `["stake_pool", slab]` (owner `GCHhcgw…`). That PDA is
-//!   off-curve, and the deployed stake program (`e62aa4a`; also `e0ace2c` and `origin/main`)
-//!   has no proxy for wrapper tags 94, 96, 97 or 102. So the marketauth path (A) of tag 94 is
-//!   unusable on these markets, and a control pins that: listing the PDA without a signature
-//!   gets `MissingRequiredSignature`. Binding uses the protocol path (B) from `424fe7e4`:
-//!   the upgrade authority signs at [0], ProgramData is at [8], and the junior owner signs
-//!   at [9].
+//!   - the MARKETAUTH for tags 94 and 96. On all four markets the marketauth is the
+//!     percolator-stake POOL PDA `["stake_pool", slab]` (owner `GCHhcgw…`): off-curve, and the
+//!     deployed stake program has no proxy for wrapper tags 94/96/97/102, so ON CHAIN these
+//!     markets can never bind. The replay SIMULATES the marketauth's signature, standing in
+//!     for the relaunch flow (fresh market, admin marketauth binds before stake InitPool).
+//!     Controls pin both facts: listing the PDA without a signature gets ExpectedSigner, and
+//!     the removed protocol path B (upgrade authority + ProgramData + junior) gets Unauthorized.
 //!   - the live oracle authority `FbTbDe…`, for AUTH_MARK pushes (the keeper holds this key).
 //! * PERMISSIONLESS REPAIRS run before every replay. Each is a real instruction anyone
 //!   can send:
@@ -281,7 +279,7 @@ struct Env {
     supplied_in: u128,
     /// Every live portfolio in the fixture.
     live_portfolios: Vec<Pubkey>,
-    /// The junior owner named by the protocol on tag 94 (path B): a real keypair.
+    /// A real keypair used only as the junior in the removed-path-B control.
     junior: Keypair,
 }
 
@@ -618,18 +616,17 @@ impl Env {
         ]
     }
 
-    /// tag 94, PROTOCOL path (B): [0] = the live upgrade authority `FbTbDe…` (signer; fake
-    /// signature, the protocol holds it), [8] = ProgramData, [9] = the junior owner. That is
-    /// a REAL keypair signing. The stake-pool marketauth does not sign.
+    /// tag 94, marketauth path (the ONLY path since the path-B removal): [0] = the live
+    /// marketauth (the stake-pool PDA), listed as a FAKE signer. SIMULATED: on chain that PDA
+    /// cannot sign; relaunch markets are created fresh and bound by the admin marketauth BEFORE
+    /// stake InitPool, which is the state this replay stands in for. The junior owner is
+    /// therefore the marketauth.
     fn init_vault_lp(&mut self, floor_bps: u16) -> (Pubkey, Outcome) {
         let lp = self.prepare_vault_lp();
-        let (auth, pd) = self.mount_programdata();
-        let mut accts = self.init_vault_lp_accounts(auth, lp);
-        accts.push(AccountMeta::new_readonly(pd, false));
-        accts.push(AccountMeta::new_readonly(self.junior.pubkey(), true));
+        let accts = self.init_vault_lp_accounts(self.marketauth, lp);
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
-        let junior = self.junior.insecure_clone();
-        (lp, self.send(vec![ix], &[auth], &[&junior]))
+        let ma = self.marketauth;
+        (lp, self.send(vec![ix], &[ma], &[]))
     }
 
     /// tag 94, LEGACY marketauth path (A), sent the only way the chain allows for these
@@ -643,18 +640,17 @@ impl Env {
         self.send(vec![ix], &[], &[])
     }
 
-    /// tag 94, protocol shape, but [0] is a random signer that is NOT the upgrade authority.
-    fn init_vault_lp_impostor(&mut self, floor_bps: u16) -> Outcome {
+    /// tag 94 in the REMOVED protocol shape ("path B"): [0] = the live upgrade authority
+    /// (fake-signed), [8] = ProgramData, [9] = a real signing junior. Must be refused.
+    fn init_vault_lp_former_path_b(&mut self, floor_bps: u16) -> Outcome {
         let lp = self.prepare_vault_lp();
-        let (_, pd) = self.mount_programdata();
-        let imp = Keypair::new();
-        self.svm.airdrop(&imp.pubkey(), 10_000_000_000).unwrap();
-        let mut accts = self.init_vault_lp_accounts(imp.pubkey(), lp);
+        let (auth, pd) = self.mount_programdata();
+        let mut accts = self.init_vault_lp_accounts(auth, lp);
         accts.push(AccountMeta::new_readonly(pd, false));
         accts.push(AccountMeta::new_readonly(self.junior.pubkey(), true));
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
         let junior = self.junior.insecure_clone();
-        self.send(vec![ix], &[], &[&imp, &junior])
+        self.send(vec![ix], &[auth], &[&junior])
     }
 
     fn mount_programdata(&mut self) -> (Pubkey, Pubkey) {
@@ -744,14 +740,14 @@ impl Env {
         (VaultLp { portfolio: lp, ctx, delegate }, self.send(vec![ix], &[auth], &[]))
     }
 
-    /// tag 96 signed by the junior owner (a real keypair).
+    /// tag 96 signed by the junior owner = the marketauth (fake signer, see `init_vault_lp`).
     fn junior_deposit(&mut self, lp: Pubkey, amount: u64) -> Outcome {
-        let j = self.junior.insecure_clone();
-        let src = self.new_token(self.mint, j.pubkey(), amount);
+        let ma = self.marketauth;
+        let src = self.new_token(self.mint, ma, amount);
         let ix = self.wrapper_ix(
             ProgInstruction::DepositJuniorTranche { amount: amount as u128 },
             vec![
-                AccountMeta::new(j.pubkey(), true),
+                AccountMeta::new(ma, true),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new(self.vault_lp, false),
                 AccountMeta::new(lp, false),
@@ -760,7 +756,7 @@ impl Env {
                 AccountMeta::new_readonly(spl_token::ID, false),
             ],
         );
-        let o = self.send(vec![ix], &[], &[&j]);
+        let o = self.send(vec![ix], &[ma], &[]);
         if o.0.is_ok() {
             self.supplied_in += amount as u128;
         }
@@ -929,7 +925,7 @@ fn bind(e: &mut Env, max_lev_bps: u32) -> Bound {
     };
     let (lp, o) = e.init_vault_lp(2_000);
     show(&format!("{} tag94", e.label), &o);
-    expect_ok(&o, &format!("{} tag94 InitVaultLp (protocol path, stake-pool marketauth not signing)", e.label));
+    expect_ok(&o, &format!("{} tag94 InitVaultLp (marketauth path, simulated PDA signature)", e.label));
     let o = e.set_vault_lp_risk(max_lev_bps);
     show(&format!("{} tag99", e.label), &o);
     expect_ok(&o, &format!("{} tag99 SetVaultLpRisk", e.label));
@@ -941,8 +937,7 @@ fn bind(e: &mut Env, max_lev_bps: u32) -> Bound {
     expect_ok(&o, &format!("{} tag96 DepositJuniorTranche", e.label));
     let st = e.vlp();
     assert_eq!(st.lp_portfolio, lp.to_bytes());
-    assert_eq!(st.junior_owner, e.junior.pubkey().to_bytes(), "junior owner = the protocol-named signing key");
-    assert_ne!(st.junior_owner, e.marketauth.to_bytes());
+    assert_eq!(st.junior_owner, e.marketauth.to_bytes(), "junior owner = the marketauth (path A only)");
     assert_eq!(e.capital_pnl(&lp).0, JUNIOR as u128, "junior capital lands in the vault LP");
     let rec = e.asset_rec();
     assert_eq!(rec.vault_lp_portfolio, lp.to_bytes());
@@ -987,16 +982,17 @@ fn p3_fork_bind_survey() {
             percolator_prog::error::PercolatorError::ExpectedSigner as u32,
             &format!("{}: legacy path needs the PDA's signature (ExpectedSigner)", c.label),
         );
-        // (b) The protocol path signed by a key that is NOT the upgrade authority. Refused.
-        let o = c.init_vault_lp_impostor(2_000);
-        show(&format!("{} tag94 impostor", c.label), &o);
-        expect_code(&o, percolator_prog::error::PercolatorError::Unauthorized as u32, &format!("{} impostor", c.label));
+        // (b) The REMOVED protocol path B (upgrade authority + ProgramData + signing junior),
+        //     even signed by the REAL upgrade authority. Refused: tag 94 is marketauth-only.
+        let o = c.init_vault_lp_former_path_b(2_000);
+        show(&format!("{} tag94 former path B", c.label), &o);
+        expect_code(&o, percolator_prog::error::PercolatorError::Unauthorized as u32, &format!("{} former path B", c.label));
         assert!(
             c.svm.get_account(&c.vault_lp).map(|a| a.owner != WRAPPER_ID).unwrap_or(true),
             "{}: refused paths created no vault-LP state",
             c.label
         );
-        // Candidate: full bind through the protocol path.
+        // Candidate: full bind through the marketauth path (simulated PDA signature).
         let mut c = env(&fx, Bytes::Candidate);
         let b = bind(&mut c, 0);
         c.dump(&fx);
