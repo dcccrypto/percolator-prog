@@ -181,23 +181,9 @@ fn kani_design_p3_29_draw_move_conserves_vault_value() {
     kani::cover!(x > 0 && v0.is_some(), "real move");
 }
 
-/// D-P3-30  NON-GATING CHARACTERIZATION (review §10): after the owner's fix tag 98 calls
-/// `vault_lp_recall_limit`, not the raw `recall_limit`, so this harness is EXPECTED RED on a correct
-/// program and is excluded from the "red = real bug" gate; D-P3-33 is the gate for recall.
-/// A draw never enlarges the recall a later tag 98 could make:
-/// recall_limit(C', B − moved) <= recall_limit(C, B).
-/// PRE-RUN FINDING (design lead, by hand): a JUNIOR-covered move lowers backing without lowering
-/// C, so when backing < C + junior surplus this goes RED — e.g. C=100, J=50, B=80, D=50:
-/// moved 50 (all junior), C'=100, recall 20 -> 70. Kept as designed so the run records it; the
-/// owner must decide (halt recall while ANY draw/pending exists, or make reachable backing >= C+J).
-#[kani::proof]
-fn kani_design_p3_30_draw_never_enlarges_recall() {
-    let s = DrawState { senior_claim: kani::any(), outstanding: kani::any(), junior_surplus: kani::any(), drawable: kani::any() };
-    let d: u128 = kani::any();
-    let (n, moved, _) = vault_lp_draw_step(s, d);
-    assert!(recall_limit(n.senior_claim, s.drawable - moved) <= recall_limit(s.senior_claim, s.drawable));
-    kani::cover!(moved > 0 && recall_limit(s.senior_claim, s.drawable) > 0, "shortfall exists and a draw happens");
-}
+// D-P3-30 RETIRED into D-P3-33 (coordinator 2026-09-30): the recall gate is
+// `proofs_recall.rs` on `vault_lp_recall_limit`; the junior-covered counterexample
+// (C=100, J=50, B=80, D=50) is a LiteSVM regression test (builder), not a Kani harness.
 
 /// D-P3-31 (D-6)  The ONE production booking fn: pending 0 is the identity; otherwise pending is
 /// booked exactly once (pending' = 0, a second booking is the identity), C + outstanding is
