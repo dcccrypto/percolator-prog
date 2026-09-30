@@ -1249,6 +1249,11 @@ pub mod error {
         /// P3-L2: the vault LP holds inventory and its health certificate is not current, so the
         /// vault cannot be valued. Prepend a permissionless crank (tag 5) of the vault LP.
         VaultLpValuationStale,
+        /// P3 F14-Q2: a vault LP needs a single-ASSET market: binding (94) is refused while
+        /// another asset has positions or backing, and on a bound market no other asset may
+        /// be activated, traded (risk-increasing) or backed. The terminal residual is
+        /// market-wide and is credited to the one vault.
+        VaultLpMultiAssetMarket,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -16559,14 +16564,15 @@ pub mod processor {
     /// is still outstanding as a provider receivable; that bricked recall (98), junior withdraw
     /// (97), release (102) and bound deposits/redemptions. A floored NAV is the conservative
     /// reading (the impaired pot is worth zero, never negative) for senior-protecting gates.
-    fn lp_vault_domain_nav_parts_floored(
+    /// One pot's (principal, net impairment, LP earnings) from its synced ledger.
+    fn lp_vault_domain_nav_terms(
         group: &state::MarketViewMutV16<'_>,
         market_group: [u8; 32],
         authority: [u8; 32],
         domain: u16,
         fee_share_bps: u16,
         ledger_data: &[u8],
-    ) -> Result<(u128, u128), ProgramError> {
+    ) -> Result<(u128, u128, u128), ProgramError> {
         let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
         let (mut ledger, _) = read_or_new_backing_domain_ledger(
             ledger_data,
@@ -16582,7 +16588,6 @@ pub mod processor {
         let net_impairment = ledger
             .cumulative_loss_atoms
             .saturating_sub(ledger.cumulative_recovery_atoms);
-        let available = ledger.total_principal_atoms.saturating_sub(net_impairment);
         let net_earnings = ledger
             .total_earnings_atoms
             .saturating_sub(ledger.total_earnings_withdrawn_atoms);
@@ -16591,10 +16596,7 @@ pub mod processor {
             fee_share_bps as u128,
             percolator::MAX_MARGIN_BPS as u128,
         );
-        let nav = available
-            .checked_add(lp_earnings)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        Ok((available, nav))
+        Ok((ledger.total_principal_atoms, net_impairment, lp_earnings))
     }
 
     /// Both pots, floored (see `lp_vault_domain_nav_parts_floored`): (available principal, NAV).
@@ -16607,10 +16609,10 @@ pub mod processor {
         own_ledger_data: &[u8],
         sibling_ledger_data: &[u8],
     ) -> Result<(u128, u128), ProgramError> {
-        let (a0, n0) = lp_vault_domain_nav_parts_floored(
+        let (p0, i0, e0) = lp_vault_domain_nav_terms(
             group, market_group, authority, domain, fee_share_bps, own_ledger_data,
         )?;
-        let (a1, n1) = lp_vault_domain_nav_parts_floored(
+        let (p1, i1, e1) = lp_vault_domain_nav_terms(
             group,
             market_group,
             authority,
@@ -16618,10 +16620,18 @@ pub mod processor {
             fee_share_bps,
             sibling_ledger_data,
         )?;
-        Ok((
-            a0.checked_add(a1).ok_or(PercolatorError::EngineArithmeticOverflow)?,
-            n0.checked_add(n1).ok_or(PercolatorError::EngineArithmeticOverflow)?,
-        ))
+        // F14-Q1: floor ONCE across both pots (a per-pot floor overstates the combined value
+        // when one pot is impaired past its principal), then cap at the backing the vault still
+        // owns, so no Live gate (75/77/97/98/102) can price against value that is not there.
+        let principal = p0.checked_add(p1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let impairment = i0.checked_add(i1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let owned = vault_owned_backing_atoms(group, domain)?;
+        let available = principal.saturating_sub(impairment).min(owned);
+        let earnings = e0.checked_add(e1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let nav = available
+            .checked_add(earnings)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((available, nav))
     }
 
     /// W-GEN-L: a zeroed ledger record for `(market_group, authority, domain)`
@@ -20715,6 +20725,17 @@ pub mod processor {
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
+        // F14-Q2: a market with a bound vault LP stays single-asset — no other asset may be
+        // activated (appended or reused).
+        if is_activation {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_c, group) = state::market_view_mut(&mut market_data)?;
+            if let Some(bound) = market_bound_vault_asset(&group)? {
+                if bound != asset_index {
+                    return Err(PercolatorError::VaultLpMultiAssetMarket.into());
+                }
+            }
+        }
         // Same funding warning as InitMarket: activating an asset is creating a
         // market, and an asset priced below the funding threshold has the
         // identical silent-dead-funding failure. `max_abs_funding_e9_per_slot`
@@ -22947,6 +22968,59 @@ pub mod processor {
                 // `cfg` is untouched on this path, so there is nothing to write back
                 // (upstream returns here the same way).
                 return Ok(());
+            }
+
+            // H-lock liveness (independent lane, P3 blocker): ADOPT upstream's expired
+            // bankrupt-close short-circuit (upstream/main `handle_permissionless_crank_zero_copy`,
+            // `authenticated_expired_close` .. `summary.expired_close`), previously omitted here
+            // as "adaptation (3)". A Live bankrupt close whose `max_close_slot` has passed with
+            // residual left (e.g. a vault LP whose loss exceeded its capital while the opposite
+            // side has no loss weight) can only progress through the engine's DeclareRecovery
+            // escalation; without the short-circuit the oracle/stale gates below returned first
+            // and the market stayed h-locked forever. Recovery then has its own bounded public
+            // step to Resolved (the mode == 2 branch above). No signature is involved: this is
+            // the engine's own permissionless valve, taken BEFORE any oracle read.
+            {
+                let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+                let mut portfolio = state::portfolio_view_mut_for_market_slots(
+                    &mut portfolio_data,
+                    max_market_slots,
+                )?;
+                expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                let close_ledger = portfolio
+                    .header
+                    .close_progress
+                    .try_to_runtime()
+                    .map_err(map_v16_error)?;
+                let authenticated_expired_close = group.header.mode == 0
+                    && close_ledger.active
+                    && close_ledger.residual_remaining > 0
+                    && authenticated_now_slot > close_ledger.max_close_slot;
+                if authenticated_expired_close {
+                    if group.header.current_slot.get() < authenticated_now_slot {
+                        group.header.current_slot = percolator::V16PodU64::new(authenticated_now_slot);
+                    }
+                    let summary = group
+                        .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
+                        .map_err(map_v16_error)?;
+                    if summary.expired_close {
+                        let result = group
+                            .permissionless_auto_crank_not_atomic(
+                                &mut portfolio,
+                                AutoCrankWorkV16 {
+                                    now_slot: authenticated_now_slot,
+                                    observations: &[],
+                                    resolved_close_fee_rate_per_slot: 0,
+                                },
+                            )
+                            .map_err(map_v16_error)?;
+                        if !matches!(result.selected, AutoCrankPlanV16::DeclareRecovery { .. }) {
+                            return Err(PercolatorError::InvalidInstruction.into());
+                        }
+                        group.validate_shape().map_err(map_v16_error)?;
+                        return Ok(());
+                    }
+                }
             }
 
             // Split the reward-eligible cranker account off the tail BEFORE the per-hint oracle
@@ -25783,7 +25857,10 @@ pub mod processor {
             // Zero case: nothing accrued, or the surplus pool is currently dry
             // (another leg got there first). Same error either way — the claim
             // is NOT marked withdrawn, so it stays fully claimable next crank.
-            if available == 0 && absorbed == 0 {
+            // Deadlock fix (frontend-lane review): on a terminal Resolved bound market the
+            // crank is also the residual step 77 waits for; if the engine's own recredit cleared
+            // the residual (or nothing was pending), succeed as a no-op instead of reverting it.
+            if available == 0 && absorbed == 0 && !resolved_terminal_harvest {
                 return Err(PercolatorError::LpVaultNoFeesToCrank.into());
             }
             if available == 0 {
@@ -26079,6 +26156,39 @@ pub mod processor {
     /// the counterparty's realised loss lands in the same pot as fresh backing the ledger never
     /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
     /// valuation therefore uses the pots, not the ledgers.
+    /// F14-Q2: the asset a vault LP is bound to on this market, if any (one vault per market).
+    fn market_bound_vault_asset(group: &state::MarketViewMutV16<'_>) -> Result<Option<usize>, ProgramError> {
+        let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        for i in 0..n {
+            if read_asset_vault_lp_from_view(group, i)?.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0 {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
+
+    /// F14-Q1: backing the vault still OWNS across both pots (idle + liened for live claims;
+    /// consumed and impaired backing excluded).
+    fn vault_owned_backing_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        domain: u16,
+    ) -> Result<u128, ProgramError> {
+        let mut total = 0u128;
+        for d in [domain, sibling_domain(domain)] {
+            let (_, bucket) = backing_domain_parts_view(group, d as usize)?;
+            total = total
+                .checked_add(
+                    bucket
+                        .fresh_unliened_backing_num
+                        .checked_add(bucket.valid_liened_backing_num)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                        / BOUND_SCALE,
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        }
+        Ok(total)
+    }
+
     /// Claim-free residual (engine `residual()`): vault tokens no header counter owns.
     fn vault_terminal_residual_atoms(group: &state::MarketViewMutV16<'_>) -> Result<u128, ProgramError> {
         let owned = group
@@ -26276,6 +26386,12 @@ pub mod processor {
             return Err(PercolatorError::VaultLpMatcherNotApproved.into());
         }
         let asset_index = registry.domain as usize / 2;
+        // F14-Q2: single-ASSET markets only (the terminal residual is market-wide and is
+        // credited to this one vault): exactly one configured asset slot. A second asset can
+        // never be activated afterwards (handle_update_asset_lifecycle refuses it).
+        if max_market_slots != 1 {
+            return Err(PercolatorError::VaultLpMultiAssetMarket.into());
+        }
 
         let (vault_lp_pda, vault_lp_bump) = state::derive_vault_lp_state(program_id, market_ai.key);
         expect_key(vault_lp_ai, &vault_lp_pda)?;

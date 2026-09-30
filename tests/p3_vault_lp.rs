@@ -129,6 +129,8 @@ struct Params {
     im_bps: u64,
     move_bps: u64,
     fee_bps: u64,
+    /// Configured asset slots (F14-Q2 tests use 2).
+    assets: u16,
 }
 
 impl Default for Params {
@@ -138,6 +140,7 @@ impl Default for Params {
             im_bps: 1_000,
             move_bps: 500,
             fee_bps: 0,
+            assets: 1,
         }
     }
 }
@@ -219,7 +222,7 @@ impl Env {
             market,
             Account {
                 lamports: 1_000_000_000,
-                data: vec![0u8; state::market_account_len_for_capacity(1).unwrap()],
+                data: vec![0u8; state::market_account_len_for_capacity(p.assets as usize).unwrap()],
                 owner: pid,
                 executable: false,
                 rent_epoch: 0,
@@ -261,7 +264,7 @@ impl Env {
             sibling,
             vault_lp,
             matcher,
-            plen: state::portfolio_account_len_for_market_slots(1).unwrap(),
+            plen: state::portfolio_account_len_for_market_slots(p.assets as usize).unwrap(),
             slot: 1,
             paid_in: 0,
             paid_out: 0,
@@ -270,7 +273,7 @@ impl Env {
         let admin = env.admin.insecure_clone();
         env.send(
             ProgInstruction::InitMarket {
-                max_portfolio_assets: 1,
+                max_portfolio_assets: p.assets,
                 h_min: 0,
                 h_max: 10,
                 initial_price: PRICE,
@@ -3071,33 +3074,6 @@ fn p3_f14_two_traders_every_senior_exits_nothing_strands_any_order() {
     }
 }
 
-impl Env {
-    /// Tag 99 (upgrade authority = admin mock): protocol raises the vault-LP leverage cap.
-    fn set_vault_lp_lev(&mut self, lev_bps: u32) {
-        let admin = self.admin.insecure_clone();
-        let (pd, _) = Pubkey::find_program_address(&[self.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
-        let (market, matcher) = (self.market, self.matcher);
-        self.svm.expire_blockhash();
-        self.send(
-            ProgInstruction::SetVaultLpRisk {
-                asset_index: 0,
-                skew_slope_e9: 0,
-                skew_max_e9: 0,
-                lev_cap_q: 0,
-                lev_max_imr_bps: 0,
-                vault_lp_max_lev_bps: lev_bps,
-                approved_matcher_program: matcher.to_bytes(),
-            },
-            vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new_readonly(pd, false),
-                AccountMeta::new(market, false),
-            ],
-            &[&admin],
-        )
-        .expect("tag 99 lev adjust");
-    }
-}
 
 /// F-14 class on tag 98 (independent lane: 25 EngineCounterUnderflow at a 1-atom shortfall on
 /// 07a1d0eb). The underflow is the engine NAV's fail-closed `principal - impairment` when the
@@ -3170,8 +3146,8 @@ fn b9_run(order: u8) -> Vec<u64> {
         if step < 0 { settle(&mut env) } else { close(&mut env, &mut paid, step as usize) }
     }
     for _ in 0..3 {
-        for i in 0..3 {
-            if env.portfolio(ts[i].portfolio).capital != 0 || env.portfolio(ts[i].portfolio).pnl != 0 {
+        for (i, t) in ts.iter().enumerate() {
+            if env.portfolio(t.portfolio).capital != 0 || env.portfolio(t.portfolio).pnl != 0 {
                 close(&mut env, &mut paid, i);
             }
         }
@@ -3197,4 +3173,122 @@ fn p3_b9_every_winner_paid_in_full_without_lp_signature_any_order() {
     for order in 1..4 {
         assert_eq!(b9_run(order), base, "winners' payouts must not depend on call order");
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// F14-Q2: a vault LP needs a single-asset market (the terminal residual is market-wide and is
+// credited to the one vault). 94 refuses while another asset has activity; after binding, no
+// other asset may be backed / traded / activated.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+
+#[test]
+fn p3_q2_bind_refused_on_a_multi_asset_market() {
+    // Two configured asset slots (even with asset 1 idle): refused, no state created.
+    let mut env = Env::new(Params { assets: 2, ..Params::default() });
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    let m0 = env.svm.get_account(&env.market).unwrap().data;
+    err_has(&env.init_vault_lp_full(&admin, 1_000, m, &[]).map(|_| ()), PercolatorError::VaultLpMultiAssetMarket);
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, m0, "market unchanged");
+    assert!(env.svm.get_account(&env.vault_lp).map(|a| a.data.is_empty()).unwrap_or(true), "no vault-LP state");
+    // Control: the single-asset market binds.
+    let mut env1 = Env::new(Params::default());
+    let admin1 = env1.admin.insecure_clone();
+    let m1 = env1.matcher;
+    env1.init_vault_lp_full(&admin1, 1_000, m1, &[]).expect("single-asset market binds");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// F14-Q1: per-pot NAV floors overstated the combined value when one pot's impairment exceeds
+// its principal while the other pot is positive. The bound-vault NAV now floors ONCE across
+// both pots (and is capped at the backing the vault still owns).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn earn_deposit_domain(&mut self, d: &Depositor, amount: u64, domain: u16, tail: Option<Pubkey>) -> Result<(), String> {
+        // [7] is always registry.domain's ledger, [10] the sibling's (the target pot is `domain`).
+        let accts = self.deposit_accounts(d, tail);
+        let kp = d.kp.insecure_clone();
+        self.svm.expire_blockhash();
+        let r = self.send(ProgInstruction::DepositToLpVault { amount: amount as u128, domain }, accts, &[&kp]);
+        if r.is_ok() {
+            self.paid_in += amount as u128;
+        }
+        r
+    }
+}
+
+#[test]
+fn p3_q1_cross_pot_impairment_is_not_overstated() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let a = env.new_depositor();
+    env.earn_deposit(&a, 10_000_000, Some(lp.portfolio)).expect("A into pot 0");
+    let b = env.new_depositor();
+    env.earn_deposit_domain(&b, 5_000_000, 1, Some(lp.portfolio)).expect("B into pot 1");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_200_000).expect("junior 10.2M");
+    assert_eq!(env.vlp().senior_claim_atoms, 15_000_000);
+    // STATE POKE (as poke_senior_claim): pot 0 impaired 0.5M PAST its 10M principal (backing
+    // lent to a winner, still a receivable). True combined NAV = 15M - 10.5M = 4.5M; the old
+    // per-pot floor read 0 + 5M = 5M.
+    let mut acct = env.svm.get_account(&env.ledger).unwrap();
+    let mut l = state::read_backing_domain_ledger(&acct.data).unwrap();
+    l.cumulative_loss_atoms = l.total_principal_atoms + 500_000;
+    state::write_backing_domain_ledger(&mut acct.data, &l).unwrap();
+    env.svm.set_account(env.ledger, acct).unwrap();
+    // True V = 4.5M + LP 10.2M = 14.7M < C 15M: the vault is impaired -> 75 refused (74).
+    // (Overstated: 5M + 10.2M = 15.2M >= C, which would have admitted the deposit.)
+    let c = env.new_depositor();
+    err_has(&env.earn_deposit(&c, 1_000_000, Some(lp.portfolio)), PercolatorError::VaultLpSeniorImpaired);
+    // 97: backing (4.5M) does not cover C -> junior withdraw refused.
+    env.svm.expire_blockhash();
+    err_has(&env.junior_withdraw_as(&admin, lp.portfolio, 1), PercolatorError::VaultLpJuniorWithdrawRefused);
+    // 102 live: no surplus over C -> refused.
+    env.svm.expire_blockhash();
+    err_has(&env.release_surplus(&admin, lp.portfolio, 1, DOMAIN), PercolatorError::VaultLpReleaseRefused);
+    // 77: the value sits in the vault LP, so first a permissionless recall (98) of the whole
+    // junior capital into the pot (bounded by the true shortfall 15M - 4.5M = 10.5M), then an
+    // early senior redeems at the IMPAIRED value 14.7M / S, not at C / S.
+    env.svm.expire_blockhash();
+    env.recall(lp.portfolio, 10_200_000, DOMAIN).expect("recall the junior capital");
+    let shares = env.lp_shares(&a);
+    env.earn_request(&a, shares);
+    let s = env.registry_state().total_lp_shares_outstanding;
+    env.svm.expire_blockhash();
+    let paid = env.earn_execute(&a, Some(lp.portfolio)).expect("impaired redemption");
+    let impaired = shares * 14_700_000 / s;
+    let full = shares * 15_000_000 / s;
+    println!("Q1: A paid {paid} (impaired {impaired}, full {full})");
+    assert_eq!(paid as u128, impaired, "priced on the combined (not per-pot) NAV");
+    assert!((paid as u128) < full);
+}
+
+/// Deadlock review (frontend lane): on a terminal-flat Resolved bound market with nothing to
+/// harvest and nothing to absorb (e.g. the engine's own recredit already cleared the residual),
+/// tag 78 must SUCCEED as a no-op — it is the step 77 waits for — instead of reverting with
+/// NoFeesToCrank (which would also revert that recredit and leave 77 at 84 forever).
+#[test]
+fn p3_terminal_crank_is_a_noop_success_when_nothing_is_pending() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 5_000_000).expect("junior");
+    env.resolve();
+    env.stranger_wind_down(&lp, &[]);
+    let (cfg, _) = env.market_state();
+    assert_eq!(cfg.lp_fee_accrued_atoms, cfg.lp_fee_withdrawn_atoms, "fixture: no fees pending");
+    env.svm.expire_blockhash();
+    env.crank_fees(true).expect("terminal 78 with nothing pending is a no-op success");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.svm.expire_blockhash();
+    env.earn_execute(&d, Some(lp.portfolio)).expect("the senior exits");
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    env.paid_out += env.tok(junior_dest) as u128;
+    env.assert_conserved("terminal no-op crank");
 }
