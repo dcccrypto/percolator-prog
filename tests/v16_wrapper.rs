@@ -15467,6 +15467,7 @@ fn v16_wrapper_tradecpi_executes_manual_consented_wide_price() {
     let (_, before_group) = state::read_market(&market.data).unwrap();
     let size_q = POS_SCALE;
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
+    p1_widen_exec_band_for_wide_price_test(&mut market, 0);
     run_trade_cpi_with_matcher(
         &mut owner_a,
         &mut owner_b,
@@ -15530,6 +15531,7 @@ fn v16_wrapper_tradecpi_executes_on_added_asset_and_binds_matcher_asset_echo() {
     deposit(&mut owner_b, &mut market, &mut account_b, 1_000_000);
 
     let (_, before_group) = state::read_market(&market.data).unwrap();
+    p1_widen_exec_band_for_wide_price_test(&mut market, 2);
     run_trade_cpi_with_matcher(
         &mut owner_a,
         &mut owner_b,
@@ -15626,6 +15628,7 @@ fn v16_wrapper_tradecpi_hybrid_regular_and_after_hours_follow_mark_policy() {
     let (regular_cfg_before, regular_group_before) = state::read_market(&market.data).unwrap();
     let size_q = 10 * POS_SCALE;
     let regular_exec_price = regular_group_before.assets[0].effective_price * 150 / 100;
+    p1_widen_exec_band_for_wide_price_test(&mut market, 0);
     run_trade_cpi_with_matcher(
         &mut owner_a,
         &mut owner_b,
@@ -15762,6 +15765,7 @@ fn v16_wrapper_tradecpi_ewma_mark_trade_moves_mark_without_refreshing_liveness()
     let (before_cfg, before_group) = state::read_market(&market.data).unwrap();
     let size_q = 10 * POS_SCALE;
     let exec_price = before_group.assets[0].effective_price * 150 / 100;
+    p1_widen_exec_band_for_wide_price_test(&mut market, 0);
     run_trade_cpi_with_matcher(
         &mut owner_a,
         &mut owner_b,
@@ -21270,6 +21274,19 @@ fn v16_wrapper_withdraw_protocol_fee_resolved_requires_all_portfolios_closed() {
 
 /// Raw `UpgradeableLoaderState::ProgramData` bytes matching the manual parse
 /// in `read_program_data_upgrade_authority` (45-byte metadata: 4-byte LE
+
+/// P1 (2026-09-29): the matcher exec-price band (default 500 bps, `risk_limits_v17`) now refuses
+/// the deliberately wide CPI prices these legacy tests use to exercise mark-discovery / echo
+/// mechanics. The protocol can widen the band per asset (tag 93 `SetAssetRiskLimits`, tested
+/// in `tests/p1_band_owner.rs`); this writes the same `AssetRiskLimitsV17` bytes directly so
+/// each legacy test keeps exercising exactly what it did before, under an explicitly widened
+/// (100%) band. No assertion in those tests is changed.
+fn p1_widen_exec_band_for_wide_price_test(market: &mut TestAccount, asset_index: usize) {
+    let mut limits = state::read_asset_risk_limits(&market.data, asset_index).unwrap();
+    limits.exec_band_bps = percolator_prog::risk_limits_v17::MAX_EXEC_BAND_BPS;
+    state::write_asset_risk_limits(&mut market.data, asset_index, &limits).unwrap();
+}
+
 /// discriminant=3, 8-byte slot, 1-byte Option tag, 32-byte pubkey).
 fn program_data_account(upgrade_authority: Option<Pubkey>) -> TestAccount {
     let mut data = vec![0u8; 45];

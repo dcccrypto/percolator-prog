@@ -168,20 +168,41 @@ jobs:
           token: '${{ secrets.GITHUB_TOKEN }}'
       # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
       # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
+      # P1: tests/p1_fee_channel.rs drives the P2 matcher (feat/p2-matcher-v2, NOT deployed).
+      - name: checkout P2 matcher (tests only, not deployed)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-match, path: percolator-match-p2, ref: feat/p2-matcher-v2, token: '${{ secrets.GITHUB_TOKEN }}' }
       - name: checkout stake (pinned to the deployed commit)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
       - uses: dtolnay/rust-toolchain@stable
       - name: install solana toolchain (cargo build-sbf)
+        env:
+          SOLANA_CLI_VERSION: "4.2.2"
         run: |
-          sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+          # Pinned: `stable` moved to an SBPF-v3 toolchain whose .so litesvm 0.1 cannot load.
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
       - uses: Swatinem/rust-cache@v2
         with: { workspaces: percolator-prog }
 
+      # P1 fork regressions (tests/p1_fork_regressions.rs) replay live devnet state against the
+      # DEPLOYED v18.2 wrapper bytes as their negative control. Dump them from chain (read-only,
+      # public RPC) and truncate the zero-padded ProgramData to the true .so length; the test
+      # itself pins sha256 4472b383... and fails loudly on any other bytes.
+      - name: dump the live v18.2 wrapper bytes (fork-regression control)
+        run: |
+          solana program dump GnwdeQrAh4qzChJeVLrM21CXXWC1akjLH3DiijwzEEYZ /tmp/wrapper-live.so -u https://api.devnet.solana.com
+          head -c 1533512 /tmp/wrapper-live.so > /tmp/wrapper-v18.2.so
+          shasum -a 256 /tmp/wrapper-v18.2.so
+          solana program dump 4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT /tmp/matcher-live.so -u https://api.devnet.solana.com
+          head -c 58488 /tmp/matcher-live.so > /tmp/matcher-12bd671.so
+          shasum -a 256 /tmp/matcher-12bd671.so
       - name: run suite and diff against the allowlist
         working-directory: percolator-prog
         env:
           NFT_PIN: ci_sibling
+          P1_FORK_DEPLOYED_SO: /tmp/wrapper-v18.2.so
+          P1_FORK_MATCHER_SO: /tmp/matcher-12bd671.so
         run: ./scripts/ci-test.sh
