@@ -425,6 +425,16 @@ pub mod constants {
     // and tag 78's "credit all of H to C" are exact ONLY at a 100% senior fee share. Changing
     // this constant must first generalise those formulas (and their tests), so refuse to build.
     const _: () = assert!(VAULT_LP_SENIOR_FEE_SHARE_BPS == 10_000);
+    const _: () = assert!(
+        crate::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q == percolator::MAX_POSITION_ABS_Q
+    );
+    /// P3 auto-pin: the ONE matcher program a vault LP is bound to at tag 94. Protocol constant
+    /// (never instruction data). devnet = the live matcher `4seJWjv3…`. There is deliberately
+    /// no mainnet arm yet: tag 94 fails closed off-devnet until the mainnet matcher ID is set
+    /// here (same compile-time-absent / runtime-fail-closed pattern as STAKE_PROGRAM_ID).
+    #[cfg(feature = "devnet")]
+    pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
+        solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -23595,6 +23605,7 @@ pub mod processor {
                 market_ai.key,
                 &registry_pda,
                 true,
+                false,
             )?;
             expect_writable(t.0)?;
             Some(t)
@@ -24457,6 +24468,11 @@ pub mod processor {
         expect_owner(source_ledger_ai, program_id)?;
         // P3: bound vaults redeem against the SENIOR tranche. Tail: [13] vault_lp_state (w),
         // [14] vault LP portfolio. Required (fail closed) while the registry is bound.
+        // C-4(b): in Resolved mode the vault LP may already be closed and garbage-collected;
+        // the Resolved pricing below never reads it (physical backing only).
+        let redeem_lp_may_be_closed =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
+                == MarketModeV16::Resolved;
         let bound_tail = if state::registry_vault_lp_bound(&registry)? {
             let t = load_bound_vault_lp_tail(
                 program_id,
@@ -24465,6 +24481,7 @@ pub mod processor {
                 &market_key,
                 &registry_pda,
                 true,
+                redeem_lp_may_be_closed,
             )?;
             expect_writable(t.0)?;
             Some(t)
@@ -25333,6 +25350,7 @@ pub mod processor {
                 &market_key,
                 &registry_pda,
                 false,
+                false,
             )?;
             expect_writable(t.0)?;
             Some(t)
@@ -25444,10 +25462,24 @@ pub mod processor {
             // The claim is NOT lost in any of these states: nothing is marked
             // withdrawn on a rejected crank, so `lp_fee_accrued - lp_fee_withdrawn`
             // stays fully claimable if the market returns to Live.
-            if group.header.mode != 0 {
+            // P3 (Earn redeem-lock fix, 2026-09-30): on a BOUND vault, a Resolved market that is
+            // TERMINAL-FLAT (no materialized portfolio, c_tot == 0 — exactly the state in which
+            // Resolved Earn redemption is allowed, #377) may harvest the LP fee leg into backing
+            // and the senior claim. Otherwise fees accrued before resolution could never reach
+            // NAV and bound redemption (which requires H == 0) would be locked forever. At
+            // terminal-flat no trader payout can still draw on insurance, so the Finding-1
+            // hazard (converting insurance that still backs traders) cannot arise; the clamp in
+            // `lp_vault_harvestable_fee_atoms` keeps reserved/budgeted insurance untouched.
+            let resolved_terminal_harvest = bound_tail.is_some()
+                && group.header.mode == 1
+                && group.header.materialized_portfolio_count.get() == 0
+                && group.header.c_tot.get() == 0;
+            if group.header.mode != 0 && !resolved_terminal_harvest {
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            if !resolved_terminal_harvest {
+                reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            }
             // PROG-1: verify the vault is still the backing authority for this domain.
             // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
             // without the check here, a fee crank after an asset_admin authority rotation
@@ -25845,6 +25877,7 @@ pub mod processor {
         market_key: &Pubkey,
         registry_pda: &Pubkey,
         need_lp: bool,
+        lp_may_be_closed: bool,
     ) -> Result<(&'a AccountInfo<'a>, Option<&'a AccountInfo<'a>>, state::VaultLpStateV18), ProgramError>
     {
         let vault_lp_ai = account(accounts, idx)?;
@@ -25854,9 +25887,15 @@ pub mod processor {
         }
         let lp_ai = if need_lp {
             let lp_ai = account(accounts, idx + 1)?;
-            expect_owner(lp_ai, program_id)?;
             if lp_ai.key.to_bytes() != st.lp_portfolio {
                 return Err(PercolatorError::VaultLpNotBound.into());
+            }
+            // C-4(b): after resolution the vault LP is settled (tag 101) and CLOSED (tag 8);
+            // the runtime then garbage-collects the 0-lamport account (system-owned, empty).
+            // Callers that never read the LP in that state pass `lp_may_be_closed` and accept
+            // the pinned key alone; everything else still requires a live wrapper-owned LP.
+            if !lp_may_be_closed {
+                expect_owner(lp_ai, program_id)?;
             }
             Some(lp_ai)
         } else {
@@ -25870,7 +25909,14 @@ pub mod processor {
     /// Accounts: 0 marketauth [signer, w] · 1 market [w] · 2 registry [w] · 3 vault_lp_state
     /// [w] (`["vault_lp", market]`, fresh) · 4 lp_portfolio [w] (program-owned, uninitialised,
     /// pre-created by the client exactly as for InitPortfolio) · 5 system_program ·
-    /// 6 own ledger · 7 sibling ledger.
+    /// 6 own ledger · 7 sibling ledger · 8 matcher_program (== CANONICAL_VAULT_LP_MATCHER_PROGRAM)
+    /// · 9 matcher_ctx [w] (pre-created, owner = matcher program, zeroed) · 10 matcher_delegate
+    /// (`["matcher", market, lp_portfolio, registry, matcher_program, matcher_ctx]`).
+    ///
+    /// AUTO-PIN (2026-09-30): the program itself approves the canonical matcher, keeps the 1x
+    /// vault-LP exposure default, and initialises the matcher context with the protocol's
+    /// `vault_lp_v18::PIN_*` parameters and price-derived FINITE fill/inventory caps. The
+    /// creator supplies none of these; the market can trade right after tag 94 (+ tag 96).
     ///
     /// Creates a portfolio whose OWNER IS THE REGISTRY PDA, binds it as the asset's exclusive
     /// matcher LP (`AssetVaultLpV18`), and seeds the senior claim at the vault's current
@@ -25896,6 +25942,7 @@ pub mod processor {
         expect_writable(registry_ai)?;
         expect_writable(vault_lp_ai)?;
         expect_writable(lp_portfolio_ai)?;
+
         expect_owner(market_ai, program_id)?;
         expect_owner(registry_ai, program_id)?;
         expect_owner(lp_portfolio_ai, program_id)?;
@@ -25934,6 +25981,14 @@ pub mod processor {
         }
         if admin.key.to_bytes() != cfg.marketauth {
             return Err(PercolatorError::Unauthorized.into());
+        }
+        // Auto-pin: only the protocol's canonical matcher is accepted (fail closed off-devnet).
+        let matcher_prog = account(accounts, 8)?;
+        let matcher_ctx = account(accounts, 9)?;
+        let matcher_delegate = account(accounts, 10)?;
+        let canonical_matcher = canonical_vault_lp_matcher_program()?;
+        if matcher_prog.key != &canonical_matcher {
+            return Err(PercolatorError::VaultLpMatcherNotApproved.into());
         }
         let asset_index = registry.domain as usize / 2;
 
@@ -26028,9 +26083,16 @@ pub mod processor {
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
             rec.lp_net_q = 0;
             rec.lp_net_slot = last_fee_slot;
+            // Auto-pin: canonical matcher approved; 1x exposure default (0 => 10_000 bps).
+            rec.approved_matcher_program = canonical_matcher.to_bytes();
+            rec.vault_lp_max_lev_bps = 0;
             write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
-            senior_claim
+            let price = group.markets[asset_index].engine.asset.effective_price.get();
+            let caps = vault_lp_v18::pinned_matcher_caps(price)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            (senior_claim, caps)
         };
+        let (senior_claim, pinned_caps) = senior_claim;
 
         let market_bytes = market_ai.key.to_bytes();
         let bump_bytes = [vault_lp_bump];
@@ -26068,7 +26130,48 @@ pub mod processor {
         state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         state::set_registry_vault_lp_bound(&mut registry);
         state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
-        Ok(())
+
+        // Auto-pin the matcher context (SetMatcherConfig + InitMatcherCtx for the registry-owned
+        // LP) with PROTOCOL parameters only.
+        let expected_sequence = state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
+        let asset_generation_frontier =
+            state::read_market_asset_generation_frontier(&market_ai.try_borrow_data()?)?;
+        pin_vault_lp_matcher_ctx(
+            program_id,
+            market_ai,
+            lp_portfolio_ai,
+            &registry_pda,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            VaultLpMatcherParams {
+                expected_sequence,
+                asset_generation_frontier,
+                trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
+                expiry_slot: u64::MAX,
+                kind: vault_lp_v18::PIN_MATCHER_KIND,
+                trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
+                base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
+                max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
+                impact_k_bps: vault_lp_v18::PIN_IMPACT_K_BPS,
+                liquidity_notional_e6: pinned_caps.liquidity_notional_e6,
+                max_fill_abs: pinned_caps.max_fill_abs,
+                max_inventory_abs: pinned_caps.max_inventory_abs,
+                fee_to_insurance_bps: vault_lp_v18::PIN_FEE_TO_INSURANCE_BPS,
+                skew_spread_mult_bps: vault_lp_v18::PIN_SKEW_SPREAD_MULT_BPS,
+            },
+        )
+    }
+
+    fn canonical_vault_lp_matcher_program() -> Result<Pubkey, ProgramError> {
+        #[cfg(feature = "devnet")]
+        {
+            Ok(crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM)
+        }
+        #[cfg(not(feature = "devnet"))]
+        {
+            Err(PercolatorError::VaultLpMatcherNotApproved.into())
+        }
     }
 
     /// Matcher parameters for tag 94 (grouped to keep the handler signature sane).
@@ -26158,14 +26261,6 @@ pub mod processor {
         if state::read_portfolio_matcher_sequence(&lp_ai.try_borrow_data()?)? != p.expected_sequence {
             return Err(PercolatorError::EngineStale.into());
         }
-        if matcher_prog.key == program_id
-            || !matcher_prog.executable
-            || matcher_ctx.executable
-            || matcher_ctx.owner != matcher_prog.key
-            || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
-        {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
         // P3-H2: the creator (marketauth) picks neither the program nor unbounded caps. Only the
         // matcher program the protocol approved for this asset via tag 99 is accepted, and its
         // fill/inventory caps must be finite (0 means "unlimited" to the matcher). The wrapper's
@@ -26177,12 +26272,72 @@ pub mod processor {
             )?;
             if rec.approved_matcher_program == [0u8; 32]
                 || rec.approved_matcher_program != matcher_prog.key.to_bytes()
-                || p.max_fill_abs == 0
-                || p.max_inventory_abs == 0
             {
                 return Err(PercolatorError::VaultLpMatcherNotApproved.into());
             }
         }
+        pin_vault_lp_matcher_ctx(
+            program_id,
+            market_ai,
+            lp_ai,
+            &registry_key,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            p,
+        )
+    }
+
+    /// Shared by tag 94 (auto-pin) and tag 95 (protocol adjustment): SetMatcherConfig +
+    /// InitMatcherCtx for the registry-owned vault LP, signed by the matcher delegate PDA.
+    /// Caller has authenticated the signer and the matcher program; this validates the ctx
+    /// shape, requires FINITE caps, binds sequence/frontier, and performs the CPI.
+    #[allow(clippy::too_many_arguments)]
+    fn pin_vault_lp_matcher_ctx<'a>(
+        program_id: &Pubkey,
+        market_ai: &'a AccountInfo<'a>,
+        lp_ai: &'a AccountInfo<'a>,
+        registry_key: &Pubkey,
+        matcher_prog: &'a AccountInfo<'a>,
+        matcher_ctx: &'a AccountInfo<'a>,
+        matcher_delegate: &'a AccountInfo<'a>,
+        p: VaultLpMatcherParams,
+    ) -> ProgramResult {
+        expect_writable(lp_ai)?;
+        expect_writable(matcher_ctx)?;
+        let current_slot = authenticated_slot_or_fallback(0);
+        if !state::matcher_capability_config_is_valid(1, p.trade_fee_cap_bps, p.expiry_slot, current_slot)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        {
+            let data = market_ai.try_borrow_data()?;
+            let live_frontier = state::read_market_asset_generation_frontier(&data)?;
+            if live_frontier != p.asset_generation_frontier {
+                return Err(PercolatorError::EngineStale.into());
+            }
+        }
+        if state::read_portfolio_matcher_sequence(&lp_ai.try_borrow_data()?)? != p.expected_sequence {
+            return Err(PercolatorError::EngineStale.into());
+        }
+        if matcher_prog.key == program_id
+            || !matcher_prog.executable
+            || matcher_ctx.executable
+            || matcher_ctx.owner != matcher_prog.key
+            || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // Protocol bounds (auto-pin and tag-95 adjustments alike): FINITE, non-zero caps no
+        // larger than the engine's own position bound.
+        if p.max_fill_abs == 0
+            || p.max_inventory_abs == 0
+            || p.max_fill_abs > vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q
+            || p.max_inventory_abs > vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q
+        {
+            return Err(PercolatorError::VaultLpMatcherNotApproved.into());
+        }
+        let registry_key = *registry_key;
         ensure_portfolio_storage_for_market_slots(lp_ai, 0)?;
         let (delegate, bump) = derive_matcher_delegate(
             program_id,

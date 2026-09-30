@@ -380,7 +380,7 @@ pub fn usd_to_q_capped(usd: u128, price_e6: u64) -> Option<u128> {
         return None;
     }
     let q = usd.checked_mul(1_000_000_000_000)? / price_e6 as u128;
-    let q = core::cmp::min(q, ENGINE_MAX_POSITION_ABS_Q);
+    // MUTANT m7: engine-bound clamp removed
     if q == 0 {
         None
     } else {

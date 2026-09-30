@@ -616,17 +616,38 @@ impl Env {
         ]
     }
 
+    /// Auto-pin tail for tag 94: [8] canonical matcher, [9] fresh ctx, [10] delegate.
+    fn autopin_tail(&mut self, lp: Pubkey) -> (Vec<AccountMeta>, Pubkey, Pubkey) {
+        let ctx = self.create_owned(&MATCHER_ID, MATCHER_CONTEXT_LEN);
+        let delegate = Pubkey::find_program_address(
+            &[b"matcher", self.slab.as_ref(), lp.as_ref(), self.registry.as_ref(), MATCHER_ID.as_ref(), ctx.as_ref()],
+            &WRAPPER_ID,
+        )
+        .0;
+        (
+            vec![
+                AccountMeta::new_readonly(MATCHER_ID, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            ctx,
+            delegate,
+        )
+    }
+
     /// tag 94, marketauth path (the ONLY path since the path-B removal): [0] = the live
     /// marketauth (the stake-pool PDA), listed as a FAKE signer. SIMULATED: on chain that PDA
     /// cannot sign; relaunch markets are created fresh and bound by the admin marketauth BEFORE
     /// stake InitPool, which is the state this replay stands in for. The junior owner is
     /// therefore the marketauth.
-    fn init_vault_lp(&mut self, floor_bps: u16) -> (Pubkey, Outcome) {
+    fn init_vault_lp(&mut self, floor_bps: u16) -> (VaultLp, Outcome) {
         let lp = self.prepare_vault_lp();
-        let accts = self.init_vault_lp_accounts(self.marketauth, lp);
+        let mut accts = self.init_vault_lp_accounts(self.marketauth, lp);
+        let (tail, ctx, delegate) = self.autopin_tail(lp);
+        accts.extend(tail);
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
         let ma = self.marketauth;
-        (lp, self.send(vec![ix], &[ma], &[]))
+        (VaultLp { portfolio: lp, ctx, delegate }, self.send(vec![ix], &[ma], &[]))
     }
 
     /// tag 94, LEGACY marketauth path (A), sent the only way the chain allows for these
@@ -699,47 +720,6 @@ impl Env {
 
     /// tag 95 as the live upgrade authority. The ctx is a NEW matcher-owned account
     /// (real system create_account).
-    fn set_matcher(&mut self, lp: Pubkey) -> (VaultLp, Outcome) {
-        let (auth, pd) = self.mount_programdata();
-        let ctx = self.create_owned(&MATCHER_ID, MATCHER_CONTEXT_LEN);
-        let delegate = Pubkey::find_program_address(
-            &[b"matcher", self.slab.as_ref(), lp.as_ref(), self.registry.as_ref(), MATCHER_ID.as_ref(), ctx.as_ref()],
-            &WRAPPER_ID,
-        )
-        .0;
-        let ld = self.data(&lp);
-        let frontier = state::read_market_asset_generation_frontier(&self.data(&self.slab)).unwrap();
-        let ix = self.wrapper_ix(
-            ProgInstruction::VaultLpSetMatcher {
-                expected_sequence: state::read_portfolio_matcher_sequence(&ld).unwrap(),
-                asset_generation_frontier: frontier,
-                trade_fee_cap_bps: 10_000,
-                expiry_slot: u64::MAX,
-                kind: 0,
-                trading_fee_bps: 0,
-                base_spread_bps: 0,
-                max_total_bps: 100,
-                impact_k_bps: 0,
-                liquidity_notional_e6: 0,
-                max_fill_abs: u128::MAX,
-                max_inventory_abs: u128::MAX,
-                fee_to_insurance_bps: 0,
-                skew_spread_mult_bps: 0,
-            },
-            vec![
-                AccountMeta::new(auth, true),
-                AccountMeta::new_readonly(pd, false),
-                AccountMeta::new_readonly(self.slab, false),
-                AccountMeta::new_readonly(self.vault_lp, false),
-                AccountMeta::new(lp, false),
-                AccountMeta::new_readonly(MATCHER_ID, false),
-                AccountMeta::new(ctx, false),
-                AccountMeta::new_readonly(delegate, false),
-            ],
-        );
-        (VaultLp { portfolio: lp, ctx, delegate }, self.send(vec![ix], &[auth], &[]))
-    }
-
     /// tag 96 signed by the junior owner = the marketauth (fake signer, see `init_vault_lp`).
     fn junior_deposit(&mut self, lp: Pubkey, amount: u64) -> Outcome {
         let ma = self.marketauth;
@@ -923,15 +903,17 @@ fn bind(e: &mut Env, max_lev_bps: u32) -> Bound {
         );
         0
     };
-    let (lp, o) = e.init_vault_lp(2_000);
+    let (vlp, o) = e.init_vault_lp(2_000);
     show(&format!("{} tag94", e.label), &o);
-    expect_ok(&o, &format!("{} tag94 InitVaultLp (marketauth path, simulated PDA signature)", e.label));
-    let o = e.set_vault_lp_risk(max_lev_bps);
-    show(&format!("{} tag99", e.label), &o);
-    expect_ok(&o, &format!("{} tag99 SetVaultLpRisk", e.label));
-    let (vlp, o) = e.set_matcher(lp);
-    show(&format!("{} tag95", e.label), &o);
-    expect_ok(&o, &format!("{} tag95 VaultLpSetMatcher", e.label));
+    expect_ok(&o, &format!("{} tag94 InitVaultLp + auto-pin (marketauth path, simulated PDA signature)", e.label));
+    let lp = vlp.portfolio;
+    // Tag 95 is no longer needed (auto-pin); tag 99 remains a protocol ADJUSTMENT (the 5x
+    // negative controls use it).
+    if max_lev_bps != 0 {
+        let o = e.set_vault_lp_risk(max_lev_bps);
+        show(&format!("{} tag99", e.label), &o);
+        expect_ok(&o, &format!("{} tag99 SetVaultLpRisk", e.label));
+    }
     let o = e.junior_deposit(lp, JUNIOR);
     show(&format!("{} tag96", e.label), &o);
     expect_ok(&o, &format!("{} tag96 DepositJuniorTranche", e.label));
@@ -1266,11 +1248,10 @@ fn p3_fork_ansem_creator_win_is_paid_by_the_junior() {
     n.apply_live_repairs();
     let o = n.earn_deposit(EARN_SEED, None);
     expect_ok(&o, "NC seed");
-    let (lp, o) = n.init_vault_lp(2_000);
-    expect_ok(&o, "NC tag94");
-    expect_ok(&n.set_vault_lp_risk(50_000), "NC tag99 5x");
-    let (vlp, o) = n.set_matcher(lp);
-    expect_ok(&o, "NC tag95");
+    let (vlp, o) = n.init_vault_lp(2_000);
+    expect_ok(&o, "NC tag94 (+ auto-pin)");
+    let lp = vlp.portfolio;
+    expect_ok(&n.set_vault_lp_risk(50_000), "NC tag99 5x (protocol adjustment)");
     let thin: u64 = 5_000_000;
     expect_ok(&n.junior_deposit(lp, thin), "NC tag96");
     let nsize = units_for(thin as u128, px0, 45_000); // 4.5x the thin junior

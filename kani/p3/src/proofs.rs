@@ -372,3 +372,32 @@ fn kani_p3_h1_resolved_split_conserves_and_is_senior_first() {
     kani::cover!(to_junior == 0 && p > 0, "all to seniors");
     kani::cover!(to_backing == 0 && p > 0, "seniors covered, all to junior");
 }
+
+// ── Auto-pin: caps invariant at bind time (tag 94) ───────────────────────────────────────
+
+/// For ANY positive price, the caps tag 94 pins are FINITE and NON-ZERO (0 = unlimited to the
+/// matcher, so it must never be pinned), bounded by the engine position bound, ordered
+/// (fill <= inventory), and never exceed their USD notional at that price
+/// (q * price <= usd * 1e12). A price for which a cap would round to 0 fails closed (None).
+/// Price is u32 (up to $4,294 e6); the production function takes u64.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_p3_autopin_caps_finite_nonzero_bounded() {
+    let price: u32 = kani::any();
+    kani::assume(price > 0);
+    let r = pinned_matcher_caps(price as u64);
+    kani::cover!(r.is_some(), "caps pinned");
+    kani::cover!(
+        r.map(|c| c.max_inventory_abs == ENGINE_MAX_POSITION_ABS_Q).unwrap_or(false),
+        "tiny price clamps to the engine bound"
+    );
+    if let Some(c) = r {
+        assert!(c.max_fill_abs > 0 && c.max_inventory_abs > 0);
+        assert!(c.max_fill_abs <= ENGINE_MAX_POSITION_ABS_Q);
+        assert!(c.max_inventory_abs <= ENGINE_MAX_POSITION_ABS_Q);
+        assert!(c.max_fill_abs <= c.max_inventory_abs);
+        assert!(c.max_fill_abs * price as u128 <= PIN_MAX_FILL_USD * 1_000_000_000_000);
+        assert!(c.max_inventory_abs * price as u128 <= PIN_MAX_INVENTORY_USD * 1_000_000_000_000);
+        assert_eq!(c.liquidity_notional_e6, PIN_LIQUIDITY_USD * 1_000_000);
+    }
+}

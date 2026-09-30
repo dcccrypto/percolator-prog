@@ -25109,7 +25109,9 @@ mod p3_vault_lp_skew {
         let mut env = V16CuEnv::new_with_init_params(p3_params());
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_with_cu(1, P3_PRICE);
-        let matcher_program = Pubkey::new_unique();
+        // P3 auto-pin: tag 94 accepts only the canonical matcher id (devnet constant).
+        let matcher_program =
+            solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         setup_on(env, matcher_program, earn, junior)
@@ -25455,7 +25457,8 @@ mod p3_vault_lp_skew {
         let mut env = V16CuEnv::new_with_init_params(p3_params());
         env.svm.warp_to_slot(1);
         env.configure_auth_mark_with_cu(1, P3_PRICE);
-        let matcher_program = Pubkey::new_unique();
+        let matcher_program =
+            solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT"); // canonical (auto-pin)
         let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
         env.svm.add_program(matcher_program, &matcher_bytes);
         let creator = Keypair::new();
@@ -25551,6 +25554,22 @@ mod p3_vault_lp_skew {
         .expect("earn deposit");
         let lp = env.program_account(env.portfolio_account_len);
         let (vault_lp_state, _) = state::derive_vault_lp_state(&program_id, &market);
+        // Tag 94 auto-pins the canonical matcher (tail [8] program, [9] ctx, [10] delegate).
+        let pin_ctx = Pubkey::new_unique();
+        env.svm
+            .set_account(
+                pin_ctx,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: matcher_program,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let pin_delegate =
+            matcher_delegate_key(&program_id, &market, &lp, &registry, &matcher_program, &pin_ctx);
         env.send(
             ProgInstruction::InitVaultLp {
                 junior_floor_bps: 1_000,
@@ -25564,10 +25583,13 @@ mod p3_vault_lp_skew {
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(own_ledger, false),
                 AccountMeta::new_readonly(sibling_ledger, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(pin_ctx, false),
+                AccountMeta::new_readonly(pin_delegate, false),
             ],
             &[&admin],
         )
-        .expect("init vault lp");
+        .expect("init vault lp (+ auto-pin)");
         // Harness-only state write (no instruction creates a ProgramData account): the mocked
         // BPF-upgradeable ProgramData (upgrade authority = admin), same bytes as the tag-85 tests.
         let (program_data, _) = Pubkey::find_program_address(
@@ -25639,8 +25661,8 @@ mod p3_vault_lp_skew {
                 max_total_bps: 100,
                 impact_k_bps: 0,
                 liquidity_notional_e6: 0,
-                max_fill_abs: u128::MAX,
-                max_inventory_abs: u128::MAX,
+                max_fill_abs: percolator_prog::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q,
+                max_inventory_abs: percolator_prog::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q,
                 fee_to_insurance_bps: 0,
                 skew_spread_mult_bps: 0,
             },

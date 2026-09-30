@@ -133,3 +133,34 @@ fn kani_p3e_skew_funding_conserves_fixed_asym_a() {
     assert!(net <= 0 && net >= -1);
 }
 
+
+/// TRACTABLE GATE FORM (2026-09-30): the two wide harnesses above have NO VERDICT on this
+/// machine (30-45 min timeouts, symbolic 128-bit divisors). Here every DIVISOR is a constant:
+/// the per-side A pair is fixed and asymmetric (0.3 vs 1.0 of ADL_ONE) and the rate is taken
+/// directly as a symbolic i32 bounded by the engine cap (the production skew/combine path is
+/// separately proven to stay within `max_abs`: `kani_p3_combine_within_engine_bound`). The
+/// property is universal in the rate, so this is the zero-sum statement through the REAL
+/// engine kernel and the engine's own signed floor. Negative control: `--features neg_flat_a`.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_p3e_skew_funding_conserves_const_divisor() {
+    let rate: i32 = kani::any();
+    let dt: u16 = kani::any();
+    let price: u32 = kani::any();
+    let q: u32 = kani::any();
+    kani::assume(price > 0);
+    let a_long = MIN_A_SIDE * 3;
+    let a_short = ADL_ONE;
+    let fid = floor_div_signed_conservative_i128(rate as i128 * dt as i128 * price as i128, FUNDING_DEN);
+    let (_kl, _ks, f_long, f_short) =
+        percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short).unwrap();
+    #[cfg(feature = "neg_flat_a")]
+    let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
+    let q = q as i128;
+    let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
+    let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+    let net = long_pnl + short_pnl;
+    kani::cover!(fid != 0 && long_pnl < -1_000, "material transfer, longs pay");
+    kani::cover!(fid < 0 && short_pnl < -1_000, "material transfer, shorts pay");
+    assert!(net <= 0 && net >= -1);
+}

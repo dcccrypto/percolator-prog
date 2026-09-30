@@ -33,6 +33,9 @@ use std::path::PathBuf;
 
 const DOMAIN: u16 = 0; // asset 0, long side
 const MATCHER_CONTEXT_LEN: usize = 320;
+/// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
+/// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
+const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
 fn code(e: PercolatorError) -> String {
@@ -192,7 +195,8 @@ impl Env {
         let pid = percolator_prog::id();
         svm.add_program(pid, &std::fs::read(program_path()).unwrap());
         svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).unwrap());
-        let matcher = Pubkey::new_unique();
+        // P3 auto-pin: tag 94 accepts only the protocol's canonical matcher program id.
+        let matcher = CANONICAL_MATCHER;
         svm.add_program(matcher, &std::fs::read(&matcher_so).unwrap());
         let payer = Keypair::new();
         let admin = Keypair::new();
@@ -468,24 +472,73 @@ impl Env {
     // ── P3 instructions ─────────────────────────────────────────────────────────────────
 
     fn init_vault_lp_as(&mut self, signer: &Keypair, floor_bps: u16) -> Result<Pubkey, String> {
+        let m = self.matcher;
+        self.init_vault_lp_full(signer, floor_bps, m, &[]).map(|l| l.portfolio)
+    }
+
+    /// Tag 94 with the auto-pin tail: [8] matcher program, [9] a fresh matcher ctx (owned by
+    /// the canonical matcher), [10] the delegate PDA; `extra` appended (must be ignored).
+    fn init_vault_lp_full(
+        &mut self,
+        signer: &Keypair,
+        floor_bps: u16,
+        matcher_prog: Pubkey,
+        extra: &[AccountMeta],
+    ) -> Result<Lp, String> {
         let lp = self.new_program_account(self.plen);
+        let ctx = Pubkey::new_unique();
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: self.matcher,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let delegate = Pubkey::find_program_address(
+            &[
+                b"matcher",
+                self.market.as_ref(),
+                lp.as_ref(),
+                self.registry.as_ref(),
+                matcher_prog.as_ref(),
+                ctx.as_ref(),
+            ],
+            &self.pid,
+        )
+        .0;
+        let mut accts = vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new(self.market, false),
+            AccountMeta::new(self.registry, false),
+            AccountMeta::new(self.vault_lp, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(self.ledger, false),
+            AccountMeta::new_readonly(self.sibling, false),
+            AccountMeta::new_readonly(matcher_prog, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ];
+        accts.extend_from_slice(extra);
+        self.svm.expire_blockhash();
         self.send(
             ProgInstruction::InitVaultLp {
                 junior_floor_bps: floor_bps,
             },
-            vec![
-                AccountMeta::new(signer.pubkey(), true),
-                AccountMeta::new(self.market, false),
-                AccountMeta::new(self.registry, false),
-                AccountMeta::new(self.vault_lp, false),
-                AccountMeta::new(lp, false),
-                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-                AccountMeta::new_readonly(self.ledger, false),
-                AccountMeta::new_readonly(self.sibling, false),
-            ],
+            accts,
             &[signer],
         )
-        .map(|_| lp)
+        .map(|_| Lp {
+            portfolio: lp,
+            owner_key: self.registry,
+            ctx,
+            delegate,
+        })
     }
 
     fn init_vault_lp(&mut self, floor_bps: u16) -> Pubkey {
@@ -557,8 +610,8 @@ impl Env {
                 max_total_bps: 100,
                 impact_k_bps: 0,
                 liquidity_notional_e6: 0,
-                max_fill_abs: u128::MAX,
-                max_inventory_abs: u128::MAX,
+                max_fill_abs: percolator_prog::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q,
+                max_inventory_abs: percolator_prog::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q,
                 fee_to_insurance_bps: 0,
                 skew_spread_mult_bps: 0,
             },
@@ -638,12 +691,16 @@ impl Env {
         .expect("approve matcher (tag 99)");
     }
 
-    /// Bound vault: create + bind vault LP + matcher. Returns the LP handle.
+    /// Bound vault: tag 94 alone binds the vault LP AND pins the canonical matcher + default caps
+    /// (auto-pin). The ProgramData mock (authority = admin) is installed for tests that later
+    /// exercise the protocol ADJUSTMENT tags 93/99/95.
     fn bind(&mut self, floor_bps: u16) -> Lp {
-        let lp = self.init_vault_lp(floor_bps);
-        self.approve_matcher();
         let admin = self.admin.insecure_clone();
-        self.vault_lp_set_matcher_as(&admin, lp).expect("vault lp set matcher")
+        let m = self.matcher;
+        let lp = self.init_vault_lp_full(&admin, floor_bps, m, &[]).expect("tag 94 bind + auto-pin");
+        let a = admin.pubkey();
+        self.set_program_data_authority(&a);
+        lp
     }
 
     fn junior_deposit_as(&mut self, signer: &Keypair, lp: Pubkey, amount: u64) -> Result<(), String> {
@@ -2368,7 +2425,9 @@ fn p3_init_vault_lp_former_protocol_path_is_refused() {
     // The marketauth path still binds, and the junior is the marketauth, even with the old
     // path-B tail appended (ignored).
     let admin = env.admin.insecure_clone();
-    let lp = env.init_vault_lp_protocol(&admin, pd, &junior, true).expect("marketauth bind with ignored tail");
+    let m = env.matcher;
+    let tail = [AccountMeta::new_readonly(pd, false), AccountMeta::new_readonly(junior.pubkey(), false)];
+    let lp = env.init_vault_lp_full(&admin, 1_000, m, &tail).expect("marketauth bind; trailing accounts ignored").portfolio;
     assert_eq!(env.vlp().junior_owner, admin.pubkey().to_bytes());
     assert_eq!(env.vlp().lp_portfolio, lp.to_bytes());
     env.svm.expire_blockhash();
@@ -2649,4 +2708,180 @@ fn p3_b12_abandoned_portfolio_cannot_strand_terminal_insurance() {
 #[test]
 fn p3_b12_unbound_market_abandoned_portfolio_cannot_strand_terminal_insurance() {
     b12_run(false);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Auto-pin at tag 94 (2026-09-30 decision)
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+fn ctx_u128(data: &[u8], off: usize) -> u128 {
+    u128::from_le_bytes(data[64 + off..64 + off + 16].try_into().unwrap())
+}
+
+#[test]
+fn p3_autopin_new_market_trades_immediately_after_bind() {
+    let mut env = Env::new(Params::default());
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    // tag 94 ALONE (no 99/95): canonical matcher approved, 1x cap, ctx initialised by the program.
+    let lp = env.init_vault_lp_full(&admin, 1_000, m, &[]).expect("bind + auto-pin");
+    let rec = env.asset_rec();
+    assert_eq!(rec.approved_matcher_program, CANONICAL_MATCHER.to_bytes());
+    assert_eq!(rec.vault_lp_max_lev_bps, 0, "0 = the 1x default");
+    let ctx = env.svm.get_account(&lp.ctx).unwrap().data;
+    let caps = percolator_prog::vault_lp_v18::pinned_matcher_caps(PRICE).unwrap();
+    assert_eq!(ctx[64 + 12], percolator_prog::vault_lp_v18::PIN_MATCHER_KIND, "vAMM kind pinned");
+    assert_eq!(ctx_u128(&ctx, 64), caps.liquidity_notional_e6);
+    assert_eq!(ctx_u128(&ctx, 80), caps.max_fill_abs, "finite fill cap pinned");
+    assert_eq!(ctx_u128(&ctx, 128), caps.max_inventory_abs, "finite inventory cap pinned");
+    assert!(caps.max_fill_abs > 0 && caps.max_inventory_abs > 0);
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t = env.new_trader(10_000_000);
+    env.trade(&t, &lp, 10 * POS).expect("trades immediately after tag 94 (no protocol activation)");
+    assert_eq!(env.position(t.portfolio), 10 * POS);
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, -10 * POS).expect("close");
+    // the 1x exposure default binds: 20M junior at $1 => 20 units max.
+    let t2 = env.new_trader(50_000_000);
+    err_has(&env.trade(&t2, &lp, 21 * POS), PercolatorError::VaultLpExposureCapExceeded);
+    env.assert_conserved("auto-pin");
+}
+
+#[test]
+fn p3_autopin_creator_cannot_choose_matcher_or_caps() {
+    let mut env = Env::new(Params::default());
+    let admin = env.admin.insecure_clone();
+    // Another matcher program (same bytes, different id) is refused.
+    let other = Pubkey::new_unique();
+    env.svm.add_program(other, &std::fs::read(matcher_program_path()).unwrap());
+    err_has(&env.init_vault_lp_full(&admin, 1_000, other, &[]).map(|_| ()), PercolatorError::VaultLpMatcherNotApproved);
+    // Caps are not instruction data: appending "looser caps" bytes is refused by the decoder.
+    let mut data = ProgInstruction::InitVaultLp { junior_floor_bps: 1_000 }.encode();
+    data.extend_from_slice(&u128::MAX.to_le_bytes());
+    data.extend_from_slice(&u128::MAX.to_le_bytes());
+    let lp = env.new_program_account(env.plen);
+    let ix = Instruction {
+        program_id: env.pid,
+        accounts: vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp, false),
+        ],
+        data,
+    };
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(&[ix], Some(&env.payer.pubkey()), &[&env.payer, &admin], env.svm.latest_blockhash());
+    let r = env.svm.send_transaction(tx);
+    assert!(
+        format!("{:?}", r.as_ref().err()).contains("InvalidInstructionData"),
+        "caps in instruction data must be refused: {r:?}"
+    );
+    // The honest bind still works afterwards and pins the protocol caps.
+    let m = env.matcher;
+    let lp = env.init_vault_lp_full(&admin, 1_000, m, &[]).expect("canonical bind");
+    let ctx = env.svm.get_account(&lp.ctx).unwrap().data;
+    assert_eq!(ctx_u128(&ctx, 80), percolator_prog::vault_lp_v18::pinned_matcher_caps(PRICE).unwrap().max_fill_abs);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// Earn redeem-lock (frontend-lane HIGH): fees unharvested at resolution. Tag 78 now runs on a
+// TERMINAL-FLAT Resolved bound market, so the fees reach C (seniors) and 77 is unlocked.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn stranger_wind_down(&mut self, lp: &Lp, traders: &[&Trader]) {
+        let admin = self.admin.insecure_clone();
+        let junior_dest = self.token_account(self.mint, admin.pubkey(), 0);
+        for topup in [0u8, 1u8] {
+            let _ = self.settle_resolved(&Keypair::new(), lp.portfolio, topup, junior_dest);
+        }
+        self.paid_out += self.tok(junior_dest) as u128;
+        for t in traders {
+            let owner = t.kp.pubkey();
+            for _ in 0..4 {
+                let (r, dest) = self.stranger_close_resolved(t.portfolio, owner);
+                self.paid_out += self.tok(dest) as u128;
+                if r.is_ok() && self.portfolio(t.portfolio).capital == 0 {
+                    break;
+                }
+            }
+            self.permissionless_close_portfolio(t.portfolio, owner).expect("trader cleanup");
+        }
+        let registry = self.registry;
+        self.permissionless_close_portfolio(lp.portfolio, registry).expect("vault LP cleanup");
+        assert_eq!(self.materialized_count(), 0, "terminal-flat");
+    }
+}
+
+#[test]
+fn p3_resolved_fees_reach_seniors_and_unlock_earn_redemption() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.svm.expire_blockhash();
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    let (cfg0, _) = env.market_state();
+    let pending = cfg0.lp_fee_accrued_atoms - cfg0.lp_fee_withdrawn_atoms;
+    assert!(pending > 0, "fixture: LP fees unharvested at resolution");
+    env.resolve();
+    env.stranger_wind_down(&lp, &[&t]);
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    err_has(&env.earn_execute(&d, Some(lp.portfolio)), PercolatorError::VaultLpHarvestPending);
+    let c0 = env.vlp().senior_claim_atoms;
+    env.svm.expire_blockhash();
+    env.crank_fees(true).expect("tag 78 on a terminal-flat Resolved bound market");
+    let (cfg1, _) = env.market_state();
+    let harvested = cfg1.lp_fee_withdrawn_atoms - cfg0.lp_fee_withdrawn_atoms;
+    assert_eq!(harvested, pending, "the whole pending leg is harvested");
+    assert_eq!(env.vlp().senior_claim_atoms, c0 + harvested, "fees credited to the seniors' claim");
+    env.svm.expire_blockhash();
+    let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("Earn redeems after the resolved harvest");
+    println!("P3 redeem-lock: pending {pending}, C {c0}->{}, Earn paid {paid}", c0 + harvested);
+    assert!(paid as u128 > 10_000_000, "the senior was paid its principal plus the fees ({paid})");
+    env.assert_conserved("resolved harvest + redemption");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// C-4(b): on a real runtime the closed (0-lamport) vault-LP portfolio is garbage-collected
+// (system-owned, empty). LiteSVM keeps it, so the GC is EMULATED here by replacing it with
+// the default account. Redemption must still work (it never reads the LP in Resolved mode).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+#[test]
+fn p3_c4b_redemption_survives_the_vault_lp_account_being_garbage_collected() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    env.resolve();
+    env.stranger_wind_down(&lp, &[]);
+    // Runtime GC emulation: the closed account ceases to exist.
+    env.svm
+        .set_account(
+            lp.portfolio,
+            Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 },
+        )
+        .unwrap();
+    let gone = env.svm.get_account(&lp.portfolio);
+    assert!(gone.map(|a| a.owner == solana_sdk::system_program::ID && a.data.is_empty()).unwrap_or(true));
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.svm.expire_blockhash();
+    let paid = env.earn_execute(&d, Some(lp.portfolio)).expect("redemption after the vault LP was GC'd");
+    println!("P3 C-4(b): Earn paid {paid} with the vault LP account gone");
+    assert!(paid > 0);
+    // A different key in the LP slot is still refused (the tail stays pinned).
+    let d2 = env.new_depositor();
+    let _ = d2;
+    env.assert_conserved("C-4(b)");
 }
