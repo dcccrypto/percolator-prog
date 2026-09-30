@@ -100,7 +100,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").is_ok_and(|v| v == "1") { Pubkey::new_unique() } else { "4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -247,7 +247,7 @@ impl P3 {
             AccountMeta::new(self.ledger1, false),
         ];
         let mut metas = metas;
-        if !std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") {
+        if !std::env::var("P3_LEGACY_BIND").is_ok_and(|v| v == "1") {
             // 07a1d0eb auto-pin tail: [8] canonical matcher, [9] ctx (w, zeroed, matcher-owned),
             // [10] delegate ["matcher", market, lp, registry, matcher, ctx].
             let ctx = Pubkey::new_unique();
@@ -579,7 +579,7 @@ impl P3 {
         w.init_vault_lp(&admin, floor_bps).unwrap_or_else(|e| panic!("94 InitVaultLp by marketauth: {e}"));
         let up = w.upgrade.insecure_clone();
         w.set_risk(&up, 0).unwrap_or_else(|e| panic!("99 SetVaultLpRisk by upgrade authority: {e}"));
-        if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { w.set_matcher(&up).unwrap_or_else(|e| panic!("95 VaultLpSetMatcher by upgrade authority: {e}")); }
+        if std::env::var("P3_LEGACY_BIND").is_ok_and(|v| v == "1") { w.set_matcher(&up).unwrap_or_else(|e| panic!("95 VaultLpSetMatcher by upgrade authority: {e}")); }
         if junior > 0 {
             w.junior_deposit(&admin, junior).unwrap_or_else(|e| panic!("96 junior deposit: {e}"));
         }
@@ -591,7 +591,7 @@ fn code(e: &str) -> Option<u32> {
     custom_code(e)
 }
 
-thread_local! { static TL_IM: std::cell::Cell<u64> = std::cell::Cell::new(10_000); }
+thread_local! { static TL_IM: std::cell::Cell<u64> = const { std::cell::Cell::new(10_000) }; }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
     if im >= 10_000 {
@@ -696,7 +696,7 @@ impl P3 {
 }
 
 const U: i128 = POS_SCALE as i128;
-thread_local! { static MARK: std::cell::Cell<u64> = std::cell::Cell::new(PRICE); }
+thread_local! { static MARK: std::cell::Cell<u64> = const { std::cell::Cell::new(PRICE) }; }
 
 /// Builds the Q1 cross-domain state with REAL flows: seniors in BOTH domains (tag 75 domain
 /// field), a small junior, then a trader win against the vault LP large enough to exceed the
@@ -1030,7 +1030,7 @@ fn market_with_capacity(cap: u16) -> P3 {
     CAP.with(|c| c.set(1));
     w
 }
-thread_local! { static CAP: std::cell::Cell<u16> = std::cell::Cell::new(1); }
+thread_local! { static CAP: std::cell::Cell<u16> = const { std::cell::Cell::new(1) }; }
 
 /// Positive control: a single-asset market binds.
 #[test]
@@ -1160,7 +1160,7 @@ fn hlock_after_vault_lp_bankruptcy_permissionless_exits() {
         let line = format!("phase {name}: cleared {:?} (slots), status {:?}, convert -> {:?}", cleared_at, status(&w), conv);
         eprintln!("HLOCK {line}");
         log.push(line);
-        if cleared_at.is_some() && conv.map_or(true, |c| c == 0) {
+        if cleared_at.is_some() && conv.is_none_or(|c| c == 0) {
             break;
         }
     }
@@ -1173,7 +1173,7 @@ fn hlock_after_vault_lp_bankruptcy_permissionless_exits() {
         eprintln!("HLOCK privileged probe: admin ResolveMarket -> {}; mode {:?} hlock {}", if r.is_ok() { "ok" } else { "FAILED" }, g.mode, g.bankruptcy_hlock_active);
     }
     assert!(!st.0 && !st.1, "H-lock/loss_stale never cleared via permissionless paths: {log:?}");
-    assert!(try_convert(&mut w).map_or(true, |c| c == 0), "winner still cannot convert after h-lock cleared");
+    assert!(try_convert(&mut w).is_none_or(|c| c == 0), "winner still cannot convert after h-lock cleared");
 }
 
 /// [Anvil local] H-lock exit on the fixed head: the expired bankrupt close of the vault LP
@@ -1226,7 +1226,7 @@ fn anvil_hlock_exits_via_recovery_and_everyone_is_paid() {
         w.env.svm.warp_to_slot(s);
     }
     eprintln!("ANVIL hlock: winner cap0 {t_cap0} pnl0 {t_pnl0} paid {paid_t}; hlock {}", w.env.market_state().1.bankruptcy_hlock_active);
-    assert!(paid_t >= t_cap0 as u128, "winner gets at least its capital back");
+    assert!(paid_t >= t_cap0, "winner gets at least its capital back");
     let r = w.terminal_cleanup(&[(tp, t.pubkey())]);
     eprintln!("ANVIL hlock terminal cleanup 78 -> {:?}", r.as_ref().map_err(|e| code(e)));
     let mut senior_paid = 0u128;
