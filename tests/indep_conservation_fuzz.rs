@@ -2356,6 +2356,11 @@ impl World {
         Ok((self.user_token_total() - before, stuck))
     }
 
+    fn user_token_total_of(&self, u: usize) -> u128 {
+        let o = self.owners[u].pubkey();
+        self.tokens.iter().filter_map(|k| self.env.svm.get_account(k)).filter_map(|a| TokenAccount::unpack(&a.data).ok()).filter(|t| t.owner == o).map(|t| t.amount as u128).sum()
+    }
+
     fn user_token_total(&self) -> u128 {
         let owners: Vec<Pubkey> = self.owners.iter().map(|k| k.pubkey()).collect();
         self.tokens
@@ -3548,4 +3553,112 @@ fn indep_p3_f14_variants() {
             }
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// B12 (P3 b2b2559e, E2E HIGH): an ABANDONED portfolio cannot strand terminal insurance.
+// Resolved mode: a STRANGER runs CloseResolved (permissionless, pays the owner), then
+// ClosePortfolio (tag 8) with account [3] = the portfolio's owner (rent to owner), and then
+// wrapper tag 41 / stake tag 29 recovers the WHOLE budget. A stranger must NOT be able to
+// close a portfolio that still holds a claim, nor redirect its rent.
+// ═══════════════════════════════════════════════════════════════════════════
+
+impl World {
+    fn do_stranger_close_portfolio(&mut self, u: usize, stranger: &Keypair, rent_to: Pubkey) -> Result<u64, String> {
+        let p = self.ports[u];
+        let (pid, seq, pep) = self.env.portfolio_identity(p);
+        let m = self.env.market;
+        self.env.ensure_signer_account(stranger.pubkey());
+        self.send(
+            ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: pep },
+            vec![AccountMeta::new(stranger.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(p, false), AccountMeta::new(rent_to, false)],
+            &[stranger],
+        )
+    }
+}
+
+fn b12_bound_resolved_world_all_abandoned() -> (World, u128) {
+    let mut w = World::new(0);
+    w.do_configure_stale_resolve(9_000, 100).expect("stale policy");
+    w.do_topup_insurance(5_000_000).expect("insurance top-up");
+    w.setup_stake(1_000 + 5_000_000);
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    let s = w.slot() + 9_005;
+    w.env.svm.warp_to_slot(s);
+    let _ = w.do_crank(N_USERS);
+    w.do_resolve_stale().expect("stale resolve (keeper dead)");
+    let budget = w.env.market_state().1.insurance_domain_budget_remaining_total;
+    (w, budget)
+}
+
+/// B12 positive: every owner walked away; only strangers act. Run alone with INDEP_MAINNET_ID=1.
+#[test]
+#[ignore]
+fn indep_b12_stranger_cleanup_then_stake_tag29_recovers_whole_budget() {
+    assert_eq!(std::env::var("INDEP_MAINNET_ID").as_deref(), Ok("1"));
+    let (mut w, budget) = b12_bound_resolved_world_all_abandoned();
+    assert!(budget > 0, "vacuity: terminal budget exists");
+    let stranger = Keypair::new();
+    let owner_bal0: Vec<u128> = (0..w.ports.len()).map(|u| w.user_token_total_of(u)).collect();
+    // CloseResolved + tag 46 by anyone (pays only the owner's receipt accounts).
+    let (_paid, stuck) = w.permissionless_close_out().unwrap();
+    assert!(stuck.is_empty(), "users closed out permissionlessly");
+    for u in 0..w.ports.len() {
+        let owner = w.owners[u].pubkey();
+        let lam0 = w.env.svm.get_account(&owner).map_or(0, |a| a.lamports);
+        let r = w.do_stranger_close_portfolio(u, &stranger, owner);
+        assert!(r.is_ok(), "B12: stranger ClosePortfolio of empty u{u} with [3]=owner must succeed: {:?}", r.map_err(|e| custom_code(&e)));
+        w.closed[u] = true;
+        let lam1 = w.env.svm.get_account(&owner).map_or(0, |a| a.lamports);
+        assert!(lam1 > lam0, "rent must return to the OWNER");
+    }
+    let (_, g) = w.env.market_state();
+    assert_eq!(g.materialized_portfolio_count, 0);
+    let sv = w.stake.unwrap().2;
+    let (fees0, sv0) = (w.pool_fields().unwrap().2, w.token_amount(&sv));
+    w.do_stake_recover_terminal(budget as u64, None).expect("stake tag 29 recovers the budget");
+    assert_eq!(w.token_amount(&sv) - sv0, budget, "whole budget recovered to the pool vault");
+    assert_eq!(w.pool_fields().unwrap().2 - fees0, budget as u64, "whole budget booked to stakers");
+    assert!(try_retire(&mut w), "market retires");
+    w.check_tokens().unwrap();
+    for u in 0..w.ports.len() {
+        assert!(w.user_token_total_of(u) >= owner_bal0[u], "owners were paid, never debited");
+    }
+}
+
+/// B12 negative: a stranger cannot close a portfolio that still holds a claim (capital /
+/// unfinalized receipt / position), and cannot redirect the rent to itself.
+#[test]
+fn indep_b12_stranger_cannot_close_claim_holding_portfolio_or_redirect_rent() {
+    let mut w = World::new(0);
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    w.do_resolve().expect("resolve");
+    let stranger = Keypair::new();
+    // u2 holds capital (never traded); u0 holds a resolved position/claim.
+    for u in [2usize, 0] {
+        let before = w.env.svm.get_account(&w.ports[u]).unwrap();
+        let owner = w.owners[u].pubkey();
+        let r = w.do_stranger_close_portfolio(u, &stranger, owner);
+        eprintln!("B12 neg: stranger close of claim-holding u{u} -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+        assert!(r.is_err(), "a stranger must not close a portfolio that still holds a claim (u{u})");
+        assert_eq!(w.env.svm.get_account(&w.ports[u]).unwrap().data, before.data);
+    }
+    // Empty it the permissionless way, then try to steer rent to the stranger.
+    for _ in 0..6 {
+        let _ = w.do_close_resolved(2);
+        let _ = w.do_claim_topup(2);
+        let s = w.slot() + 10;
+        w.env.svm.warp_to_slot(s);
+    }
+    let p = w.env.portfolio_state(w.ports[2]);
+    assert!(p.capital == 0 && p.active_bitmap == percolator::active_bitmap_empty(), "vacuity: u2 emptied by CloseResolved");
+    let lam_s0 = w.env.svm.get_account(&stranger.pubkey()).map_or(0, |a| a.lamports);
+    let r = w.do_stranger_close_portfolio(2, &stranger, stranger.pubkey());
+    eprintln!("B12 neg: stranger close with [3]=stranger -> {:?}", r.as_ref().map_err(|e| custom_code(e)));
+    assert!(r.is_err(), "rent must not be redirectable to a stranger");
+    assert!(w.env.svm.get_account(&stranger.pubkey()).map_or(0, |a| a.lamports) <= lam_s0);
+    let other = Keypair::new();
+    let r2 = w.do_stranger_close_portfolio(2, &stranger, other.pubkey());
+    assert!(r2.is_err(), "rent must not be redirectable to an arbitrary account");
+    w.check().unwrap();
 }
