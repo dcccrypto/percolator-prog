@@ -3221,6 +3221,12 @@ impl Env {
 
 #[test]
 fn p3_q1_cross_pot_impairment_is_not_overstated() {
+    // 2026-09-30 (senior draw FINAL): a bound vault is now priced on the backing it PHYSICALLY
+    // owns free of live winner claims, not on the pot ledgers (the ledgers booked consumption of
+    // non-principal backing as impairment and under-priced seniors). A ledger-only impairment
+    // poke therefore no longer moves the price in EITHER direction: it can neither overstate nor
+    // understate the vault. Real consumption (backing lent to a winner) is exercised end to end by
+    // `p3_draw_*` (tests/p3_senior_draw.rs).
     let mut env = Env::new(Params::default());
     let lp = env.bind(1_000);
     let admin = env.admin.insecure_clone();
@@ -3230,39 +3236,26 @@ fn p3_q1_cross_pot_impairment_is_not_overstated() {
     env.earn_deposit_domain(&b, 5_000_000, 1, Some(lp.portfolio)).expect("B into pot 1");
     env.junior_deposit_as(&admin, lp.portfolio, 10_200_000).expect("junior 10.2M");
     assert_eq!(env.vlp().senior_claim_atoms, 15_000_000);
-    // STATE POKE (as poke_senior_claim): pot 0 impaired 0.5M PAST its 10M principal (backing
-    // lent to a winner, still a receivable). True combined NAV = 15M - 10.5M = 4.5M; the old
-    // per-pot floor read 0 + 5M = 5M.
+    // STATE POKE: pot 0's LEDGER says 0.5M past its principal is impaired; the pots are intact.
     let mut acct = env.svm.get_account(&env.ledger).unwrap();
     let mut l = state::read_backing_domain_ledger(&acct.data).unwrap();
     l.cumulative_loss_atoms = l.total_principal_atoms + 500_000;
     state::write_backing_domain_ledger(&mut acct.data, &l).unwrap();
     env.svm.set_account(env.ledger, acct).unwrap();
-    // True V = 4.5M + LP 10.2M = 14.7M < C 15M: the vault is impaired -> 75 refused (74).
-    // (Overstated: 5M + 10.2M = 15.2M >= C, which would have admitted the deposit.)
+    // Physical free backing = 15M = C: not impaired, so a deposit is priced at C/S.
     let c = env.new_depositor();
-    err_has(&env.earn_deposit(&c, 1_000_000, Some(lp.portfolio)), PercolatorError::VaultLpSeniorImpaired);
-    // 97: backing (4.5M) does not cover C -> junior withdraw refused.
-    env.svm.expire_blockhash();
-    err_has(&env.junior_withdraw_as(&admin, lp.portfolio, 1), PercolatorError::VaultLpJuniorWithdrawRefused);
+    env.earn_deposit(&c, 1_000_000, Some(lp.portfolio)).expect("priced on physical backing");
     // 102 live: no surplus over C -> refused.
     env.svm.expire_blockhash();
     err_has(&env.release_surplus(&admin, lp.portfolio, 1, DOMAIN), PercolatorError::VaultLpReleaseRefused);
-    // 77: the value sits in the vault LP, so first a permissionless recall (98) of the whole
-    // junior capital into the pot (bounded by the true shortfall 15M - 4.5M = 10.5M), then an
-    // early senior redeems at the IMPAIRED value 14.7M / S, not at C / S.
-    env.svm.expire_blockhash();
-    env.recall(lp.portfolio, 10_200_000, DOMAIN).expect("recall the junior capital");
+    // 77 pays the full pro-rata claim (physical backing covers C).
     let shares = env.lp_shares(&a);
     env.earn_request(&a, shares);
     let s = env.registry_state().total_lp_shares_outstanding;
+    let cc = env.vlp().senior_claim_atoms;
     env.svm.expire_blockhash();
-    let paid = env.earn_execute(&a, Some(lp.portfolio)).expect("impaired redemption");
-    let impaired = shares * 14_700_000 / s;
-    let full = shares * 15_000_000 / s;
-    println!("Q1: A paid {paid} (impaired {impaired}, full {full})");
-    assert_eq!(paid as u128, impaired, "priced on the combined (not per-pot) NAV");
-    assert!((paid as u128) < full);
+    let paid = env.earn_execute(&a, Some(lp.portfolio)).expect("redemption");
+    assert_eq!(paid as u128, shares * cc / s, "priced on physical backing, not the ledger poke");
 }
 
 /// Deadlock review (frontend lane): on a terminal-flat Resolved bound market with nothing to

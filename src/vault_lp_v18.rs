@@ -346,6 +346,223 @@ pub fn resolved_settle_split(payout: u128, senior_claim: u128, backing_nav: u128
     (to_backing, payout - to_backing)
 }
 
+/// F14-Q1 combined NAV of the vault's two backing pots (extracted, behaviour-identical, from
+/// `lp_vault_combined_nav_parts_p3`). Floor ONCE across both pots (a per-pot floor overstates the
+/// combined value when one pot is impaired past its principal), cap at the backing the vault
+/// still owns, then add LP earnings. Returns `(available_principal, nav)`; `None` on overflow.
+pub fn combined_nav(
+    p0: u128,
+    i0: u128,
+    e0: u128,
+    p1: u128,
+    i1: u128,
+    e1: u128,
+    owned: u128,
+) -> Option<(u128, u128)> {
+    let principal = p0.checked_add(p1)?;
+    let impairment = i0.checked_add(i1)?;
+    let floored = principal.saturating_sub(impairment);
+    let available = if floored < owned { floored } else { owned };
+    let earnings = e0.checked_add(e1)?;
+    let nav = available.checked_add(earnings)?;
+    Some((available, nav))
+}
+
+/// Bound-vault NAV (2026-09-30): per pot the vault owns `min(principal, held)` (backing above the
+/// principal is the vault LP's settled loss reserved for the winners; below it is a real loss),
+/// plus the pots' LP earnings. Returns `(available_principal, nav)`; `None` on overflow.
+pub fn bound_vault_nav(
+    p0: u128,
+    held0: u128,
+    p1: u128,
+    held1: u128,
+    e0: u128,
+    e1: u128,
+) -> Option<(u128, u128)> {
+    let a0 = if p0 < held0 { p0 } else { held0 };
+    let a1 = if p1 < held1 { p1 } else { held1 };
+    let available = a0.checked_add(a1)?;
+    let nav = available.checked_add(e0.checked_add(e1)?)?;
+    Some((available, nav))
+}
+
+// ── P3 senior draw (loss rule 2026-09-30: junior first, then Earn seniors pro rata via C;
+//    winners are never haircut while senior backing remains) ──────────────────────────────────
+
+/// Atoms to move from SENIOR-owned backing into the vault LP's capital now:
+/// `min(deficit - min(deficit, junior_surplus) - outstanding, owned_backing)` (saturating).
+/// `deficit` is the vault LP's realised deficit (`-certified_equity`), `junior_surplus` the
+/// junior's value still sitting in the pots (it is spent first), `owned_backing` the senior-owned
+/// drawable backing, `outstanding` what was already drawn against this same deficit.
+pub fn vault_lp_senior_draw_amount(
+    deficit: u128,
+    junior_surplus: u128,
+    owned_backing: u128,
+    outstanding: u128,
+) -> u128 {
+    let junior_cover = if deficit < junior_surplus { deficit } else { junior_surplus };
+    let owed = deficit.saturating_sub(junior_cover).saturating_sub(outstanding);
+    if owed < owned_backing {
+        owed
+    } else {
+        owned_backing
+    }
+}
+
+/// The physical move for one draw: `(junior_cover, senior_draw)`. The junior's surplus in the
+/// pots covers first (not a senior loss); the senior part is `vault_lp_senior_draw_amount` over
+/// the backing left after the junior cover. Both come out of `drawable_backing`.
+pub fn vault_lp_draw_move(deficit: u128, junior_surplus: u128, drawable_backing: u128) -> (u128, u128) {
+    let jc = if deficit < junior_surplus { deficit } else { junior_surplus };
+    let junior_cover = if jc < drawable_backing { jc } else { drawable_backing };
+    let senior = vault_lp_senior_draw_amount(
+        deficit,
+        junior_surplus,
+        drawable_backing - junior_cover,
+        0,
+    );
+    (junior_cover, senior)
+}
+
+/// C after a draw: `c - max(0, deficit - junior_surplus)`, saturating at 0. C is one pooled claim
+/// over S shares, so this IS the pro-rata rule (every share's C/S falls by the same fraction).
+pub fn senior_claim_after_draw(c: u128, deficit: u128, junior_surplus: u128) -> Option<u128> {
+    Some(c.saturating_sub(deficit.saturating_sub(junior_surplus)))
+}
+
+/// The claim 75/76/77 price against: C with any deficit not yet drawn and booked netted out
+/// (== C after that draw is booked), so no depositor or redeemer can trade on the timing.
+pub fn vault_lp_senior_pricing_claim(c: u128, undrawn_deficit: u128, junior_surplus: u128) -> u128 {
+    match senior_claim_after_draw(c, undrawn_deficit, junior_surplus) {
+        Some(v) => v,
+        None => 0,
+    }
+}
+
+/// A later vault-LP recovery (value above C) restores the seniors FIRST, up to the outstanding
+/// draw; only the rest is junior surplus. `to_seniors + to_junior == recovery`.
+pub fn vault_lp_recovery_split(recovery: u128, draw_outstanding: u128) -> (u128, u128) {
+    let to_seniors = if recovery < draw_outstanding { recovery } else { draw_outstanding };
+    (to_seniors, recovery - to_seniors)
+}
+
+/// Operations gated while a senior draw is outstanding.
+pub const DRAW_OP_LP_RISK_INCREASING_FILL: u8 = 1;
+pub const DRAW_OP_JUNIOR_WITHDRAW_97: u8 = 2;
+pub const DRAW_OP_JUNIOR_RELEASE_102: u8 = 3;
+pub const DRAW_OP_SENIOR_DEPOSIT_75: u8 = 4;
+pub const DRAW_OP_SENIOR_REQUEST_76: u8 = 5;
+pub const DRAW_OP_SENIOR_REDEEM_77: u8 = 6;
+pub const DRAW_OP_RECALL_98: u8 = 7;
+
+/// Owner rule (2026-09-30): while a draw is outstanding HALT the vault LP's risk-increasing fills,
+/// junior withdraw (97), junior release (102) and recall (98); NEVER halt senior deposit /
+/// request / redeem (75/76/77).
+pub fn vault_lp_draw_halts(draw_outstanding: u128, op: u8) -> bool {
+    draw_outstanding > 0
+        && (op == DRAW_OP_LP_RISK_INCREASING_FILL
+            || op == DRAW_OP_JUNIOR_WITHDRAW_97
+            || op == DRAW_OP_JUNIOR_RELEASE_102
+            || op == DRAW_OP_RECALL_98)
+}
+
+/// The persisted draw ledger of one vault (`VaultLpStateV18` fields + the market's pending move).
+///
+/// REACHABLE-STATE INVARIANT (every processor write preserves it; Kani may assume it):
+/// * `outstanding <= drawn` (only booked senior loss can be outstanding; recovery lowers
+///   `outstanding` and raises `senior_claim` by the same amount, never `drawn`);
+/// * `pending` is the physical move not yet booked; it is booked EXACTLY ONCE
+///   (`vault_lp_book_pending` returns `pending == 0`);
+/// * every booked unit of senior loss lowered `senior_claim` by the same unit
+///   (`senior_claim + outstanding` is invariant across a booking, up to the C == 0 floor).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawLedger {
+    pub senior_claim: u128,
+    pub drawn: u128,
+    pub outstanding: u128,
+    pub pending: u128,
+}
+
+/// BOOK a pending physical move (the ONE booking rule). Idempotent: with `pending == 0` it is the
+/// identity; otherwise it books the move once through `vault_lp_draw_step` on the CURRENT
+/// junior surplus and returns `pending == 0`. Returns `(new_ledger, senior_loss)`.
+pub fn vault_lp_book_pending(l: DrawLedger, junior_surplus: u128) -> (DrawLedger, u128) {
+    if l.pending == 0 {
+        return (l, 0);
+    }
+    let (next, _moved, senior_loss) = vault_lp_draw_step(
+        DrawState {
+            senior_claim: l.senior_claim,
+            outstanding: l.outstanding,
+            junior_surplus,
+            drawable: l.pending,
+        },
+        l.pending,
+    );
+    (
+        DrawLedger {
+            senior_claim: next.senior_claim,
+            drawn: l.drawn.saturating_add(senior_loss),
+            outstanding: next.outstanding,
+            pending: 0,
+        },
+        senior_loss,
+    )
+}
+
+/// RECOVERY, seniors first, from the ledger's OWN outstanding senior loss: `value_above_c` (vault
+/// value over C) restores C up to `outstanding`. Returns `(new_ledger, to_seniors)`.
+pub fn vault_lp_recover(l: DrawLedger, value_above_c: u128) -> (DrawLedger, u128) {
+    let (to_seniors, _to_junior) = vault_lp_recovery_split(value_above_c, l.outstanding);
+    (
+        DrawLedger {
+            senior_claim: l.senior_claim.saturating_add(to_seniors),
+            drawn: l.drawn,
+            outstanding: l.outstanding - to_seniors,
+            pending: l.pending,
+        },
+        to_seniors,
+    )
+}
+
+/// The draw's state, as the processor holds it at booking time.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DrawState {
+    /// C (the pooled senior claim).
+    pub senior_claim: u128,
+    /// Cumulative senior loss not yet restored.
+    pub outstanding: u128,
+    /// The junior's value still in the pots NOW (already net of earlier draws).
+    pub junior_surplus: u128,
+    /// Drawable backing NOW.
+    pub drawable: u128,
+}
+
+/// One draw step on the CURRENT state: the junior surplus covers first, then senior backing;
+/// `senior_loss` is what C falls by. Returns `(new_state, moved, senior_loss)`, where `moved` is
+/// junior cover + senior draw. Repeating a step on its own output with a deficit that the
+/// previous step already funded draws nothing: the consumed junior surplus is gone from the state.
+pub fn vault_lp_draw_step(s: DrawState, current_deficit: u128) -> (DrawState, u128, u128) {
+    let (junior_cover, senior_draw) =
+        vault_lp_draw_move(current_deficit, s.junior_surplus, s.drawable);
+    let moved = junior_cover + senior_draw;
+    let new_c = match senior_claim_after_draw(s.senior_claim, moved, s.junior_surplus) {
+        Some(v) => v,
+        None => 0,
+    };
+    let senior_loss = s.senior_claim - new_c;
+    (
+        DrawState {
+            senior_claim: new_c,
+            outstanding: s.outstanding.saturating_add(senior_loss),
+            junior_surplus: s.junior_surplus - junior_cover,
+            drawable: s.drawable - moved,
+        },
+        moved,
+        senior_loss,
+    )
+}
+
 /// P3 auto-pin (2026-09-30 decision): the matcher context tag 94 gives every vault LP. These are
 /// PROTOCOL constants (the creator passes none of them); the upgrade authority may later adjust
 /// within protocol bounds via tags 99/95. Values = the relaunch seed's vAMM defaults.
@@ -400,6 +617,40 @@ pub fn pinned_matcher_caps(price_e6: u64) -> Option<PinnedMatcherCaps> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn senior_draw_rule() {
+        // junior surplus covers first; seniors take the rest, bounded by backing
+        assert_eq!(vault_lp_draw_move(1_635_213, 0, 10_000_000), (0, 1_635_213));
+        assert_eq!(vault_lp_draw_move(100, 30, 1_000), (30, 70));
+        assert_eq!(vault_lp_draw_move(100, 30, 50), (30, 20));
+        assert_eq!(vault_lp_draw_move(100, 300, 1_000), (100, 0));
+        assert_eq!(vault_lp_senior_draw_amount(100, 30, 1_000, 70), 0);
+        assert_eq!(senior_claim_after_draw(10_000_000, 1_635_213, 0), Some(8_364_787));
+        assert_eq!(senior_claim_after_draw(10, 100, 0), Some(0));
+        assert_eq!(vault_lp_senior_pricing_claim(10_000_000, 0, 0), 10_000_000);
+        assert_eq!(vault_lp_recovery_split(500, 200), (200, 300));
+        assert!(vault_lp_draw_halts(1, DRAW_OP_JUNIOR_WITHDRAW_97));
+        assert!(!vault_lp_draw_halts(1, DRAW_OP_SENIOR_REDEEM_77));
+        assert!(!vault_lp_draw_halts(0, DRAW_OP_LP_RISK_INCREASING_FILL));
+        assert_eq!(combined_nav(10, 12, 1, 5, 0, 2, 100), Some((3, 6)));
+        assert_eq!(combined_nav(10, 0, 0, 5, 0, 0, 7), Some((7, 7)));
+        let st = DrawState { senior_claim: 10_000_000, outstanding: 0, junior_surplus: 0, drawable: 1_635_213 };
+        let (st2, moved, loss) = vault_lp_draw_step(st, 1_635_213);
+        assert_eq!((moved, loss, st2.senior_claim, st2.outstanding), (1_635_213, 1_635_213, 8_364_787, 1_635_213));
+        let st = DrawState { senior_claim: 100, outstanding: 0, junior_surplus: 30, drawable: 1_000 };
+        let (st2, moved, loss) = vault_lp_draw_step(st, 100);
+        assert_eq!((moved, loss, st2.junior_surplus), (100, 70, 0));
+        let (_, moved2, loss2) = vault_lp_draw_step(st2, 0);
+        assert_eq!((moved2, loss2), (0, 0));
+        assert!(vault_lp_draw_halts(1, DRAW_OP_RECALL_98));
+        let l = DrawLedger { senior_claim: 10_000_000, drawn: 0, outstanding: 0, pending: 1_635_213 };
+        let (l2, loss) = vault_lp_book_pending(l, 0);
+        assert_eq!((l2.senior_claim, l2.outstanding, l2.pending, loss), (8_364_787, 1_635_213, 0, 1_635_213));
+        assert_eq!(vault_lp_book_pending(l2, 0), (l2, 0));
+        let (l3, back) = vault_lp_recover(l2, 2_000_000);
+        assert_eq!((back, l3.senior_claim, l3.outstanding), (1_635_213, 10_000_000, 0));
+    }
 
     #[test]
     fn waterfall_junior_first() {

@@ -405,6 +405,14 @@ pub mod constants {
         ASSET_VAULT_LP_OFF >= PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN + 64
     );
 
+    /// P3 senior draw (loss rule 2026-09-30): per-asset pending-draw record `AssetVaultLpDrawV18`
+    /// (64 B) at [832, 896) of the asset's wrapper slot, directly below `AssetVaultLpV18`. Those
+    /// bytes were zero spare headroom (P1's risk limits end at 672): NO LAYOUT CHANGE.
+    pub const ASSET_VAULT_LP_DRAW_OFF: usize = 832;
+    pub const ASSET_VAULT_LP_DRAW_LEN: usize = 64;
+    const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF + ASSET_VAULT_LP_DRAW_LEN == ASSET_VAULT_LP_OFF);
+    const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF >= 672);
+
     /// P3 vault-LP state account kind (kinds 1-8 are taken; see KIND_CLOSED_MARKET).
     pub const KIND_VAULT_LP_STATE: u8 = 9;
     /// `["vault_lp", market]`.
@@ -1253,7 +1261,15 @@ pub mod error {
         /// another asset has positions or backing, and on a bound market no other asset may
         /// be activated, traded (risk-increasing) or backed. The terminal residual is
         /// market-wide and is credited to the one vault.
-        VaultLpMultiAssetMarket,
+VaultLpMultiAssetMarket,
+        /// P3 senior draw: an engine step would open a bankrupt close on the vault LP (winners
+        /// haircut) while the vault's own pots can still fund the deficit. Crank the vault LP
+        /// (PermissionlessCrank draws senior backing first), then retry.
+        VaultLpSeniorDrawRequired,
+        /// P3 B24: a senior redemption on a LIVE bound vault needs more than the chosen pot
+        /// holds, because part of the senior value sits in the vault LP's capital. Run
+        /// VaultLpRecall (98, permissionless, vault LP flat) first, or redeem fewer shares.
+        VaultLpRedeemNeedsRecall,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -5675,7 +5691,13 @@ pub mod state {
         pub version: u8,                        // 214
         pub bump: u8,                           // 215
         pub _padding: [u8; 8],                  // 216..224
-        pub _reserved: [u8; 32],                // 224..256
+        /// P3 senior draw: cumulative atoms of senior backing moved into the vault LP's capital
+        /// (booked draws, junior cover excluded).
+        pub senior_drawn_atoms: u128,           // 224..240
+        /// P3 senior draw: senior loss still OUTSTANDING (C was cut by it; a later recovery
+        /// restores C first, `vault_lp_recovery_split`). While > 0, the vault LP's risk-increasing
+        /// fills, 97 and 102 are halted (`vault_lp_draw_halts`).
+        pub senior_draw_outstanding_atoms: u128, // 240..256
     }
     const _: () = assert!(core::mem::size_of::<VaultLpStateV18>() == 256);
 
@@ -5693,7 +5715,6 @@ pub mod state {
             || st.junior_floor_bps > crate::constants::VAULT_LP_MAX_JUNIOR_FLOOR_BPS
             || st.senior_fee_share_bps != crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS
             || st._padding != [0u8; 8]
-            || st._reserved != [0u8; 32]
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -5793,6 +5814,45 @@ pub mod state {
         assert!(core::mem::size_of::<AssetVaultLpV18>() == crate::constants::ASSET_VAULT_LP_LEN);
 
     pub const ASSET_VAULT_LP_FLAG_BOUND: u8 = 1;
+
+    /// P3 senior draw: what a crank-time draw moved out of each pot of the bound asset and has
+    /// not yet been booked into the pot ledgers / C (booked by the next P3 instruction carrying
+    /// `vault_lp_state`), plus a mirror of the outstanding senior loss for the fill-time halt.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetVaultLpDrawV18 {
+        /// Unbooked senior-principal WITHDRAWAL from the asset's EVEN (long) domain pot (the
+        /// relabel of the settled loss into a pot is NOT principal and is not recorded).
+        pub pending_out_even_atoms: u128, // 0..16
+        /// Same for the ODD (short) domain pot.
+        pub pending_out_odd_atoms: u128, // 16..32
+        /// Mirror of `VaultLpStateV18::senior_draw_outstanding_atoms` (fill-time halt).
+        pub outstanding_mirror_atoms: u128, // 32..48
+        /// Unbooked atoms moved from the pots into the vault LP (junior cover included).
+        pub pending_moved_atoms: u128, // 48..64
+    }
+    const _: () =
+        assert!(core::mem::size_of::<AssetVaultLpDrawV18>() == crate::constants::ASSET_VAULT_LP_DRAW_LEN);
+
+    pub fn asset_vault_lp_draw_from_wrapper_bytes(wrapper: &[u8]) -> Result<AssetVaultLpDrawV18, ProgramError> {
+        let off = crate::constants::ASSET_VAULT_LP_DRAW_OFF;
+        let bytes = wrapper
+            .get(off..off + crate::constants::ASSET_VAULT_LP_DRAW_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(bytemuck::pod_read_unaligned(bytes))
+    }
+
+    pub fn asset_vault_lp_draw_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        v: &AssetVaultLpDrawV18,
+    ) -> Result<(), ProgramError> {
+        let off = crate::constants::ASSET_VAULT_LP_DRAW_OFF;
+        wrapper
+            .get_mut(off..off + crate::constants::ASSET_VAULT_LP_DRAW_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(v));
+        Ok(())
+    }
 
     pub fn validate_asset_vault_lp(v: &AssetVaultLpV18) -> Result<(), ProgramError> {
         let bound = v.flags & ASSET_VAULT_LP_FLAG_BOUND != 0;
@@ -12840,7 +12900,7 @@ pub mod processor {
     // existing allow on this file's other multi-account trade handlers.
     #[allow(clippy::too_many_arguments)]
     fn handle_trade_nocpi_zero_copy<'a>(
-        _program_id: &Pubkey,
+        program_id: &Pubkey,
         account_a_owner_key: &Pubkey,
         account_b_owner_key: &Pubkey,
         market_ai: &AccountInfo<'a>,
@@ -12991,6 +13051,17 @@ pub mod processor {
             // acceptable on this user-initiated path -- the caller cranks first, then retries.
             collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_a)?;
             collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_b)?;
+            // P3 senior draw: fund an insolvent vault LP from the vault's pots before the fill.
+            let vault_lp_trade = vault_lp_trade_pre_draw(
+                program_id,
+                market_ai.key,
+                &cfg,
+                &mut group,
+                &mut account_a,
+                &mut account_b,
+                account_a_ai.key,
+                account_b_ai.key,
+            )?;
             // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
             // untouched legs before the engine's own trade-application primitive runs, so this
             // trade cannot fill either account's source-domain table and starve a sibling leg's
@@ -13071,6 +13142,19 @@ pub mod processor {
             // after the engine mutates OI on this trade, before any other post-trade
             // check, so an over-cap post-state aborts the instruction.
             ensure_trade_side_oi_cap_view(&group, asset_index as usize)?;
+            if let Some((i, is_a, before, exhausted)) = vault_lp_trade {
+                let lp = if is_a { &account_a } else { &account_b };
+                vault_lp_refuse_new_bankrupt_close(
+                    program_id,
+                    market_ai.key,
+                    &cfg,
+                    &group,
+                    lp,
+                    i,
+                    before,
+                    exhausted,
+                )?;
+            }
             // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
             ensure_protocol_side_oi_cap_view(&group, asset_index as usize, oi_before)?;
             // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
@@ -13430,7 +13514,7 @@ pub mod processor {
 
     #[allow(clippy::too_many_arguments)]
     fn handle_batch_execute_zero_copy<'a>(
-        _program_id: &Pubkey,
+        program_id: &Pubkey,
         account_a_owner_key: &Pubkey,
         account_b_owner_key: &Pubkey,
         market_ai: &AccountInfo<'a>,
@@ -13624,6 +13708,17 @@ pub mod processor {
             // caller cranks first, then retries.
             collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_a)?;
             collect_maintenance_fee_before_trade_view(&cfg, &mut group, &mut account_b)?;
+            // P3 senior draw: fund an insolvent vault LP from the vault's pots before the batch.
+            let vault_lp_trade = vault_lp_trade_pre_draw(
+                program_id,
+                market_ai.key,
+                &cfg,
+                &mut group,
+                &mut account_a,
+                &mut account_b,
+                account_a_ai.key,
+                account_b_ai.key,
+            )?;
             // w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`): reserve latent domains of surviving,
             // untouched legs before the engine's own batch-application primitive runs, using the
             // WHOLE leg request set so a leg that fully closes within this same batch correctly
@@ -13711,6 +13806,19 @@ pub mod processor {
             // whole batch atomically.
             for request in &requests {
                 ensure_trade_side_oi_cap_view(&group, request.asset_index)?;
+            }
+            if let Some((i, is_a, before, exhausted)) = vault_lp_trade {
+                let lp = if is_a { &account_a } else { &account_b };
+                vault_lp_refuse_new_bankrupt_close(
+                    program_id,
+                    market_ai.key,
+                    &cfg,
+                    &group,
+                    lp,
+                    i,
+                    before,
+                    exhausted,
+                )?;
             }
             // P1 items 3 + 5 (batch routes): protocol side-OI cap per leg, and -- on
             // BatchTradeCpi -- the LP exposure cap / floor on account_b per leg. A batch is
@@ -14998,6 +15106,22 @@ pub mod processor {
             }
             rec.lp_net_q = lp_after;
             rec.lp_net_slot = now_slot;
+            // P3 senior draw HALT: while a senior draw is pending or outstanding, the vault LP
+            // may only reduce (it is trading on the seniors' money).
+            {
+                let draw = read_vault_lp_draw_from_view(&group, idx)?;
+                let outstanding = draw
+                    .outstanding_mirror_atoms
+                    .saturating_add(draw.pending_moved_atoms);
+                if lp_after.unsigned_abs() > lp_before.unsigned_abs()
+                    && vault_lp_v18::vault_lp_draw_halts(
+                        outstanding,
+                        vault_lp_v18::DRAW_OP_LP_RISK_INCREASING_FILL,
+                    )
+                {
+                    return Err(PercolatorError::VaultLpExposureCapExceeded.into());
+                }
+            }
             // P3-H2: protocol exposure cap on the vault LP (default 1x its conservative equity,
             // i.e. the junior's capital), stricter than P1's generic LP cap.
             {
@@ -16623,15 +16747,21 @@ pub mod processor {
         // F14-Q1: floor ONCE across both pots (a per-pot floor overstates the combined value
         // when one pot is impaired past its principal), then cap at the backing the vault still
         // owns, so no Live gate (75/77/97/98/102) can price against value that is not there.
-        let principal = p0.checked_add(p1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let impairment = i0.checked_add(i1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let owned = vault_owned_backing_atoms(group, domain)?;
-        let available = principal.saturating_sub(impairment).min(owned);
-        let earnings = e0.checked_add(e1).ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let nav = available
-            .checked_add(earnings)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        Ok((available, nav))
+        // Pure rule: `vault_lp_v18::combined_nav` (Kani-provable). The owned-backing read comes
+        // first; a u128 principal/impairment overflow is unreachable (atoms are u64-bounded).
+        // P3 senior draw / B24 (2026-09-30): per pot, the vault owns `min(principal, held)`
+        // where `held = fresh_unliened + valid_liened` (consumed/impaired backing is gone).
+        // * A pot's physical backing ABOVE its principal is not the seniors': it is the vault
+        //   LP's settled loss that the engine routed into its side's pot (and the senior draw's
+        //   relabel of it), reserved for the winners' claims until they convert.
+        // * A pot's backing BELOW its principal is a real loss (lent out to a winner).
+        // The ledgers' impairment counters are not used: they book EVERY consumed lien, including
+        // consumption of that non-principal backing, which under-priced seniors (B24).
+        // Pure rule: `vault_lp_v18::bound_vault_nav`.
+        let _ = (i0, i1);
+        let (h0, h1) = vault_pot_held_atoms(group, domain)?;
+        vault_lp_v18::bound_vault_nav(p0, h0, p1, h1, e0, e1)
+            .ok_or(PercolatorError::EngineArithmeticOverflow.into())
     }
 
     /// W-GEN-L: a zeroed ledger record for `(market_group, authority, domain)`
@@ -23251,6 +23381,48 @@ pub mod processor {
                 Err(e) => return Err(e),
             }
 
+            // P3 senior draw (loss rule 2026-09-30): when THIS crank targets the bound vault LP and
+            // the (already accrued) engine state makes it liquidatable, refresh it and draw its
+            // realised deficit from the vault's pots BEFORE the engine can liquidate it into a
+            // bankrupt close. Same instruction as the liquidation: no transaction boundary.
+            let vault_lp_asset = match market_bound_vault_asset(&group)? {
+                Some(i)
+                    if read_asset_vault_lp_from_view(&group, i)?.vault_lp_portfolio
+                        == portfolio_ai.key.to_bytes() =>
+                {
+                    Some(i)
+                }
+                _ => None,
+            };
+            let vault_lp_close_before = match vault_lp_asset {
+                Some(_) => Some(vault_lp_close_marker(&portfolio)?),
+                None => None,
+            };
+            let mut vault_lp_backing_exhausted = false;
+            let vault_lp_mode_before = group.header.mode;
+            if let Some(i) = vault_lp_asset {
+                let pre = group
+                    .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
+                    .map_err(map_v16_error)?;
+                if pre.liquidatable && !pre.b_stale {
+                    // A refresh failure here (e.g. lapsed source backing) is left to the engine's
+                    // own plan below; the post-check still refuses a bankrupt close.
+                    let (moved, exhausted) = vault_lp_physical_draw(
+                        program_id,
+                        market_ai.key,
+                        &cfg,
+                        &mut group,
+                        &mut portfolio,
+                        i,
+                        true,
+                    )?;
+                    vault_lp_backing_exhausted = exhausted;
+                    if moved != 0 {
+                        market_accrual_performed = true;
+                    }
+                }
+            }
+
             let summary = group
                 .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
                 .map_err(map_v16_error)?;
@@ -23296,6 +23468,23 @@ pub mod processor {
                 }
                 Err(err) => return Err(map_v16_error(err)),
             };
+            if let (Some(i), Some(before)) = (vault_lp_asset, vault_lp_close_before) {
+                vault_lp_refuse_new_bankrupt_close(
+                    program_id,
+                    market_ai.key,
+                    &cfg,
+                    &group,
+                    &portfolio,
+                    i,
+                    before,
+                    vault_lp_backing_exhausted,
+                )?;
+                // Same rule for the engine's IMMEDIATE-Recovery path (C-7): the vault LP may take
+                // the market Live -> Recovery only once senior backing is exhausted.
+                if vault_lp_mode_before == 0 && group.header.mode == 2 && !vault_lp_backing_exhausted {
+                    return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+                }
+            }
             // Adaptation (5): defer 2f0c809d -- this fork's `CloseResolved` (tag 30) is the only
             // sanctioned closer. Guard against the unified call ever landing a `ResolvedClose`
             // outcome through this general path (upstream carries the identical guard).
@@ -23841,7 +24030,7 @@ pub mod processor {
         // P3: a bound vault prices Earn shares off the SENIOR tranche, so its vault-LP tail
         // accounts are REQUIRED (fail closed: omitting them would price off backing alone).
         // Tail: [11] vault_lp_state (w), [12] vault LP portfolio.
-        let bound_tail = if state::registry_vault_lp_bound(&registry)? {
+        let mut bound_tail = if state::registry_vault_lp_bound(&registry)? {
             let t = load_bound_vault_lp_tail(
                 program_id,
                 accounts,
@@ -23928,6 +24117,23 @@ pub mod processor {
             .checked_mul(BOUND_SCALE)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
 
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST, so the
+        // deposit prices against C after the loss (never the pre-loss C).
+        if let Some((vault_lp_ai, lp_ai, st)) = bound_tail.as_mut() {
+            vault_lp_draw_then_book(
+                program_id,
+                market_ai,
+                &registry,
+                &registry_pda,
+                vault_lp_ai,
+                st,
+                *lp_ai,
+                ledger_ai,
+                sibling_ledger_ai,
+            
+            true,)?;
+        }
+
         // ── Phase 1: NAV (pre-deposit) + shares computation, no mutation. ──
         let shares = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -23991,6 +24197,11 @@ pub mod processor {
                     st.senior_fee_share_bps,
                 )
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                // P3 senior draw (no timing arbitrage): any deficit of the vault LP that is not
+                // drawn and booked yet is read from a CURRENT certificate (stale with inventory
+                // => 85, fail closed). A deposit never prices against it: the draw must run
+                // first (pass the vault LP writable, or crank it).
+                let c_eff = vault_lp_live_pricing_claim(&group, lp_ai, c_eff, nav)?;
                 if nav < c_eff {
                     // Backing alone does not cover the senior: the LP must be valued, and new
                     // money is refused outright if the senior is impaired.
@@ -24393,6 +24604,19 @@ pub mod processor {
         let (to_ledger_pda, to_ledger_bump) =
             state::derive_lp_backing_ledger(program_id, &market_key, to_domain);
         expect_key(to_ledger_ai, &to_ledger_pda)?;
+        // P3 senior draw: the pot ledgers are stale while a draw is pending (booked by the next
+        // P3 instruction carrying vault_lp_state) — refuse rather than move stale principal.
+        if state::registry_vault_lp_bound(&registry)? {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let draw = read_vault_lp_draw_from_view(&group, registry.domain as usize / 2)?;
+            if draw.pending_moved_atoms != 0
+                || draw.pending_out_even_atoms != 0
+                || draw.pending_out_odd_atoms != 0
+            {
+                return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+            }
+        }
 
         let (cfg, mode, configured_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
@@ -24731,7 +24955,7 @@ pub mod processor {
         let redeem_lp_may_be_closed =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
                 == MarketModeV16::Resolved;
-        let bound_tail = if state::registry_vault_lp_bound(&registry)? {
+        let mut bound_tail = if state::registry_vault_lp_bound(&registry)? {
             let t = load_bound_vault_lp_tail(
                 program_id,
                 accounts,
@@ -24775,6 +24999,22 @@ pub mod processor {
         verify_user_token_account(redeemer_dest, &redeemer, &mint)?;
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
 
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST (the
+        // redemption must never price against the pre-loss C).
+        if let Some((vault_lp_ai, lp_ai, st)) = bound_tail.as_mut() {
+            vault_lp_draw_then_book(
+                program_id,
+                market_ai,
+                &registry,
+                &registry_pda,
+                vault_lp_ai,
+                st,
+                *lp_ai,
+                ledger_ai,
+                sibling_ledger_ai,
+            
+            true,)?;
+        }
         // ── NAV (pre-withdraw) → atoms (round DOWN). ──
         //
         // SPLIT: atoms = principal_portion + earnings_portion.
@@ -24872,6 +25112,14 @@ pub mod processor {
                 // F-8: in Resolved mode (terminal-flat, vault LP settled) value the seniors on the
                 // pots' physical idle backing; the vault LP carries no value any more.
                 let resolved = group.header.mode == 1;
+                // P3 senior draw (no early exit): in Live the vault LP's undrawn deficit is ALWAYS
+                // read (current certificate, else 85) even when backing covers C; a redemption
+                // never prices against it (the draw must run first).
+                let senior_claim = if resolved {
+                    senior_claim
+                } else {
+                    vault_lp_live_pricing_claim(&group, lp_ai, senior_claim, nav)?
+                };
                 let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
                 let senior_value = if resolved {
                     vault_lp_v18::tranche_split(physical, senior_claim).senior
@@ -25059,15 +25307,26 @@ pub mod processor {
             // outstanding claim is rejected; a withdrawal against a
             // fully-covered lien is not. backing_num is derived from
             // principal_portion; vault check uses full atoms.
+            // B24: on a bound vault the senior value can sit partly in the vault LP (junior-first
+            // waterfall: V = pots + LP value). A payout the chosen pot cannot fund is NOT lent
+            // out; it needs a recall (98, permissionless, LP flat) first, or a smaller
+            // redemption. Name it instead of a generic 21.
+            let bound_live = bound_tail.is_some() && group.header.mode == 0;
             if bucket.status != BackingBucketStatusV16::Fresh
                 || bucket.fresh_unliened_backing_num < backing_num
                 || source.fresh_reserved_backing_num < backing_num
                 || atoms > group.header.vault.get()
             {
+                if bound_live {
+                    return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
+                }
                 return Err(PercolatorError::EngineLockActive.into());
             }
             // Earnings availability gate: earnings pool must cover the LP's earnings slice.
             if earnings_portion > bucket.utilization_fee_earnings {
+                if bound_live {
+                    return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
+                }
                 return Err(PercolatorError::EngineLockActive.into());
             }
             // OI reservation guard: leave nav_post * threshold/10_000 of
@@ -25659,6 +25918,24 @@ pub mod processor {
         } else {
             None
         };
+        // P3 senior draw: book any pending draw (and restore seniors first) BEFORE the fee
+        // harvest reads C.
+        let mut bound_tail = bound_tail;
+        let mut draw_booked = false;
+        if let Some((vault_lp_ai, _, st)) = bound_tail.as_mut() {
+            draw_booked = vault_lp_draw_then_book(
+                program_id,
+                market_ai,
+                &registry,
+                &registry_pda,
+                vault_lp_ai,
+                st,
+                None,
+                own_ledger_ai,
+                sibling_ledger_ai,
+            
+            true,)?;
+        }
         expect_writable(ledger_ai)?;
         if ledger_ai.data_is_empty() {
             let len = state::backing_domain_ledger_account_len();
@@ -25860,7 +26137,7 @@ pub mod processor {
             // Deadlock fix (frontend-lane review): on a terminal Resolved bound market the
             // crank is also the residual step 77 waits for; if the engine's own recredit cleared
             // the residual (or nothing was pending), succeed as a no-op instead of reverting it.
-            if available == 0 && absorbed == 0 && !resolved_terminal_harvest {
+            if available == 0 && absorbed == 0 && !resolved_terminal_harvest && !draw_booked {
                 return Err(PercolatorError::LpVaultNoFeesToCrank.into());
             }
             if available == 0 {
@@ -26156,6 +26433,753 @@ pub mod processor {
     /// the counterparty's realised loss lands in the same pot as fresh backing the ledger never
     /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
     /// valuation therefore uses the pots, not the ledgers.
+    // ── P3 senior draw (loss rule 2026-09-30: junior first, then Earn seniors pro rata via C;
+    //    winners are never haircut while senior backing remains) ─────────────────────────────
+    //
+    // DRAW (physical, needs only the market + the vault LP): refresh the vault LP on the
+    // engine-clamped price; its realised deficit `D = -certified_equity` is moved from the
+    // vault's own pots (fresh idle backing of the bound asset's two domains, registry-owned)
+    // into the vault LP's capital. `header.vault` nets to 0, no SPL moves. The move is recorded
+    // as PENDING in `AssetVaultLpDrawV18` ([832, 896) of the asset wrapper slot).
+    // BOOK (needs vault_lp_state + both pot ledgers): the pending move is booked into the pot
+    // ledgers (principal withdrawal, not impairment) and C (`senior_claim_after_draw`, junior
+    // pot surplus first), exactly once. Every P3 instruction that reads C or ledger principal
+    // books first.
+
+    #[inline(never)]
+    fn read_vault_lp_draw_from_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<state::AssetVaultLpDrawV18, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_vault_lp_draw_from_wrapper_bytes(&market.wrapper[..])
+    }
+
+    #[inline(never)]
+    fn write_vault_lp_draw_to_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        v: &state::AssetVaultLpDrawV18,
+    ) -> ProgramResult {
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_vault_lp_draw_to_wrapper_bytes(&mut market.wrapper[..], v)
+    }
+
+    /// Atoms of one pot the draw may take: fresh idle backing, while the pot is Fresh and owned
+    /// by this market's LP-vault registry.
+    #[inline(never)]
+    fn vault_pot_drawable_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        cfg: &state::WrapperConfigV16,
+        registry_pda: &[u8; 32],
+        domain: usize,
+    ) -> Result<u128, ProgramError> {
+        let authorities = domain_authorities_from_view(group, cfg, domain)?;
+        if authorities.backing_bucket_authority != *registry_pda {
+            return Ok(0);
+        }
+        let (source, bucket) = backing_domain_parts_view(group, domain)?;
+        if bucket.status != BackingBucketStatusV16::Fresh {
+            return Ok(0);
+        }
+        // Backing reserved against live winner claims on this pot is the winners' (the vault
+        // LP's settled loss routed here), never drawable: only the excess over the claims is.
+        let unreserved = source
+            .fresh_reserved_backing_num
+            .saturating_sub(source.positive_claim_bound_num);
+        let num = bucket.fresh_unliened_backing_num.min(unreserved);
+        Ok(num / BOUND_SCALE)
+    }
+
+    /// Principal-only decrement of one vault pot: MIRRORS tag 77's inline withdraw (principal
+    /// side; no earnings, no SPL). Fails with NO mutation if the pot would be left under-backed
+    /// against its live source-credit claims.
+    #[inline(never)]
+    fn vault_pot_principal_decrement(
+        group: &mut state::MarketViewMutV16<'_>,
+        domain: usize,
+        atoms: u128,
+    ) -> ProgramResult {
+        if atoms == 0 {
+            return Ok(());
+        }
+        let num = atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let vault_before = group.header.vault.get();
+        if atoms > vault_before {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let asset_index = domain / 2;
+        if asset_index >= group.markets.len() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (source_acc, bucket_acc) = if domain % 2 == 0 {
+            (
+                &mut group.markets[asset_index].engine.source_credit_long,
+                &mut group.markets[asset_index].engine.backing_long,
+            )
+        } else {
+            (
+                &mut group.markets[asset_index].engine.source_credit_short,
+                &mut group.markets[asset_index].engine.backing_short,
+            )
+        };
+        let source = source_acc.try_to_runtime().map_err(map_v16_error)?;
+        let mut bucket = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
+        if bucket.status != BackingBucketStatusV16::Fresh
+            || bucket.fresh_unliened_backing_num < num
+            || source.fresh_reserved_backing_num < num
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let mut source_after = source;
+        source_after.fresh_reserved_backing_num -= num;
+        source_after.credit_rate_num =
+            expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
+        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        source_after.credit_epoch = source_after
+            .credit_epoch
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        bucket.fresh_unliened_backing_num -= num;
+        if bucket.fresh_unliened_backing_num == 0 && bucket.valid_liened_backing_num == 0 {
+            if bucket.impaired_liened_backing_num != 0 {
+                bucket.status = BackingBucketStatusV16::Impaired;
+            } else if bucket.consumed_liened_backing_num != 0 {
+                bucket.status = BackingBucketStatusV16::Expired;
+            } else {
+                bucket.status = BackingBucketStatusV16::Empty;
+                bucket.expiry_slot = 0;
+            }
+        }
+        *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source_after);
+        *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+        group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
+            group
+                .header
+                .source_fresh_backing_total_num
+                .get()
+                .checked_sub(num)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?,
+        );
+        group.header.risk_epoch = percolator::V16PodU64::new(
+            group
+                .header
+                .risk_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        group.header.vault = percolator::V16PodU128::new(vault_before - atoms);
+        Ok(())
+    }
+
+    /// Resolved-mode capital credit of the vault LP (the engine's `deposit_not_atomic` is
+    /// Live-only; GH#448 guards a MID-CLOSE deposit, so this refuses while a close is open).
+    /// Same four writes as the engine deposit: capital, c_tot, vault, cert invalidated.
+    #[inline(never)]
+    fn vault_lp_resolved_capital_credit(
+        group: &mut state::MarketViewMutV16<'_>,
+        lp: &mut percolator::PortfolioV16ViewMut<'_>,
+        amount: u128,
+    ) -> ProgramResult {
+        let cp = lp.header.close_progress.try_to_runtime().map_err(map_v16_error)?;
+        if cp.active && !cp.finalized {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        lp.header.capital = percolator::V16PodU128::new(
+            lp.header
+                .capital
+                .get()
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        lp.header.health_cert.valid = 0;
+        group.header.c_tot = percolator::V16PodU128::new(
+            group
+                .header
+                .c_tot
+                .get()
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        group.header.vault = percolator::V16PodU128::new(
+            group
+                .header
+                .vault
+                .get()
+                .checked_add(amount)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        lp.validate_with_market(&group.as_view()).map_err(map_v16_error)?;
+        Ok(())
+    }
+
+    /// The physical senior draw on the bound vault LP (see the section note). Returns the atoms
+    /// moved. `D` is read from a certificate refreshed HERE on the engine's current (clamped)
+    /// state, so a stale certificate alone can never trigger a draw, and a second call in the
+    /// same state sees `D == 0`.
+    #[inline(never)]
+    fn vault_lp_physical_draw(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        cfg: &state::WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        lp: &mut percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        tolerate_refresh_error: bool,
+    ) -> Result<(u128, bool), ProgramError> {
+        let mode = group.header.mode;
+        if mode != 0 && mode != 1 {
+            return Ok((0, false));
+        }
+        // Drawable pot backing is read BEFORE the refresh: the refresh itself settles the LP's
+        // capital against its loss and the engine routes that settled loss into the LP's side
+        // pot for the winners; that backing is not the seniors' and must not be drawn.
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_key);
+        let reg = registry_pda.to_bytes();
+        let even = asset_index * 2;
+        let odd = even + 1;
+        let d_even_pre = vault_pot_drawable_atoms(group, cfg, &reg, even)?;
+        let d_odd_pre = vault_pot_drawable_atoms(group, cfg, &reg, odd)?;
+        // The refresh is the only step allowed to fail softly (nothing is mutated on error, the
+        // engine call is all-or-nothing on its own account view); every later error propagates.
+        let cert = match group.full_account_refresh_not_atomic(lp) {
+            Ok(c) => c,
+            Err(_) if tolerate_refresh_error => return Ok((0, false)),
+            Err(e) => return Err(map_v16_error(e)),
+        };
+        let deficit = if cert.certified_equity < 0 {
+            cert.certified_equity.unsigned_abs()
+        } else {
+            0
+        };
+        if deficit == 0 {
+            return Ok((0, false));
+        }
+        // Never more than a pot holds NOW (the refresh can only have added to the LP's side pot).
+        let d_even = d_even_pre.min(vault_pot_drawable_atoms(group, cfg, &reg, even)?);
+        let d_odd = d_odd_pre.min(vault_pot_drawable_atoms(group, cfg, &reg, odd)?);
+        let drawable = d_even
+            .checked_add(d_odd)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // The junior's share of the pots is netted at booking (it needs C); physically the whole
+        // fundable deficit moves now.
+        let moved = vault_lp_v18::vault_lp_senior_draw_amount(deficit, 0, drawable, 0);
+        if moved == 0 {
+            solana_program::log::sol_log(&alloc::format!("p3_senior_draw deficit={} moved=0 unfunded={}", deficit, deficit));
+            return Ok((0, true));
+        }
+        // Proportional to each pot's drawable backing, so every senior's pro-rata claim stays
+        // redeemable from the pot it sits in (a single redemption draws from ONE pot).
+        // The floor goes to the SMALLER pot's take (the larger pot absorbs the rounding atom), so
+        // a small pot is never left an atom short of its seniors' pro-rata claim.
+        let small_is_odd = d_odd <= d_even;
+        let (d_small, d_large) = if small_is_odd { (d_odd, d_even) } else { (d_even, d_odd) };
+        let take_small = if drawable == 0 {
+            0
+        } else {
+            vault_lp_v18::mul_div_floor(moved, d_small, drawable)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                .min(d_small)
+        };
+        let take_large = moved - take_small;
+        if take_large > d_large {
+            return Err(PercolatorError::EngineCounterUnderflow.into());
+        }
+        let (take_even, take_odd) =
+            if small_is_odd { (take_large, take_small) } else { (take_small, take_large) };
+        vault_pot_principal_decrement(group, even, take_even)?;
+        vault_pot_principal_decrement(group, odd, take_odd)?;
+        let mut relabelled = (0u128, 0u128);
+        if mode == 0 {
+            let lp_pos = signed_position_for_asset_view(group, lp, asset_index)?;
+            group.deposit_not_atomic(lp, moved).map_err(map_v16_error)?;
+            let capital_funded = lp.header.capital.get();
+            // Settle the refilled capital against the LP's loss (engine refresh path).
+            group.full_account_refresh_not_atomic(lp).map_err(map_v16_error)?;
+            let realised = capital_funded.saturating_sub(lp.header.capital.get()).min(moved);
+            // The settled loss is now unowned vault residual. In Live the winners' positive
+            // claims are realisable ONLY against the source backing of the LP's side domain, so
+            // re-label exactly that residual as fresh backing there (no vault change): the
+            // winners convert at full rate instead of being haircut at conversion.
+            if realised != 0 && lp_pos != 0 {
+                let claim_domain = if lp_pos < 0 { odd } else { even };
+                // Same helper Earn deposits use. A pot that is already Fresh keeps its expiry
+                // (the engine may have opened it when it routed the junior's settled loss
+                // there); an empty pot is stamped with the vault-backing expiry.
+                let (_, claim_bucket) = backing_domain_parts_view(group, claim_domain)?;
+                let expiry = if claim_bucket.status == BackingBucketStatusV16::Fresh {
+                    claim_bucket.expiry_slot
+                } else {
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+                };
+                add_fresh_counterparty_backing_view(
+                    group,
+                    claim_domain,
+                    realised
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    expiry,
+                )?;
+                if claim_domain == even {
+                    relabelled.0 = realised;
+                } else {
+                    relabelled.1 = realised;
+                }
+                // Re-certify on the post-draw risk epoch (valuation paths need a current cert).
+                group.full_account_refresh_not_atomic(lp).map_err(map_v16_error)?;
+            }
+        } else {
+            vault_lp_resolved_capital_credit(group, lp, moved)?;
+        }
+        let mut rec = read_vault_lp_draw_from_view(group, asset_index)?;
+        let _ = relabelled;
+        rec.pending_out_even_atoms = rec
+            .pending_out_even_atoms
+            .checked_add(take_even)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        rec.pending_out_odd_atoms = rec
+            .pending_out_odd_atoms
+            .checked_add(take_odd)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        rec.pending_moved_atoms = rec
+            .pending_moved_atoms
+            .checked_add(moved)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        write_vault_lp_draw_to_view(group, asset_index, &rec)?;
+        group.validate_shape().map_err(map_v16_error)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "p3_senior_draw deficit={} moved={} unfunded={} even={} odd={}",
+            deficit,
+            moved,
+            deficit - moved,
+            take_even,
+            take_odd
+        ));
+        Ok((moved, moved < deficit))
+    }
+
+
+    /// FAIL-CLOSED post-check: an engine call on the bound vault LP must not have OPENED a
+    /// bankrupt close while the vault's pots could still have funded the deficit.
+    #[inline(never)]
+    fn vault_lp_refuse_new_bankrupt_close(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        cfg: &state::WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        close_before: (bool, u64),
+        backing_exhausted: bool,
+    ) -> ProgramResult {
+        let _ = (program_id, market_key, cfg, group, asset_index);
+        let cp = lp.header.close_progress.try_to_runtime().map_err(map_v16_error)?;
+        let opened = cp.active
+            && !cp.finalized
+            && (!close_before.0 || cp.close_id != close_before.1);
+        // A bankrupt close may open ONLY when this instruction's own draw found a deficit it could
+        // not fund (senior backing exhausted): everything fundable was already drawn.
+        if opened && !backing_exhausted {
+            return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn vault_lp_close_marker(
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<(bool, u64), ProgramError> {
+        let cp = lp.header.close_progress.try_to_runtime().map_err(map_v16_error)?;
+        Ok((cp.active && !cp.finalized, cp.close_id))
+    }
+
+    /// Recovery, seniors FIRST: any vault value above C (pots + harvestable + current vault-LP
+    /// value) restores C up to the cumulative outstanding senior loss before any of it is junior
+    /// surplus (`vault_lp_recovery_split`). No atoms move; only the claim is restored.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn vault_lp_restore_seniors_first(
+        group: &state::MarketViewMutV16<'_>,
+        cfg: &state::WrapperConfigV16,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        registry: &state::LpVaultRegistryV16,
+        st: &mut state::VaultLpStateV18,
+        own_ledger: &[u8],
+        sib_ledger: &[u8],
+        lp_value: u128,
+    ) -> Result<bool, ProgramError> {
+        if st.senior_draw_outstanding_atoms == 0 {
+            return Ok(false);
+        }
+        let nav = lp_vault_combined_nav_parts_p3(
+            group,
+            market_key,
+            registry_pda,
+            registry.domain,
+            registry.fee_share_bps,
+            own_ledger,
+            sib_ledger,
+        )?
+        .1;
+        let harvestable = lp_vault_harvestable_fee_atoms(cfg, group)?;
+        let c_eff = vault_lp_v18::effective_senior_claim(
+            st.senior_claim_atoms,
+            harvestable,
+            st.senior_fee_share_bps,
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let v = nav
+            .checked_add(harvestable)
+            .and_then(|x| x.checked_add(lp_value))
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let (next, to_seniors) = vault_lp_v18::vault_lp_recover(
+            vault_lp_v18::DrawLedger {
+                senior_claim: st.senior_claim_atoms,
+                drawn: st.senior_drawn_atoms,
+                outstanding: st.senior_draw_outstanding_atoms,
+                pending: 0,
+            },
+            v.saturating_sub(c_eff),
+        );
+        if to_seniors == 0 {
+            return Ok(false);
+        }
+        st.senior_claim_atoms = next.senior_claim;
+        st.senior_draw_outstanding_atoms = next.outstanding;
+        solana_program::log::sol_log(&alloc::format!(
+            "p3_senior_draw_restored to_seniors={} C={} outstanding={}",
+            to_seniors,
+            st.senior_claim_atoms,
+            st.senior_draw_outstanding_atoms
+        ));
+        Ok(true)
+    }
+
+    /// BOOK any pending draw into the pot ledgers and C, exactly once (pending is zeroed).
+    /// `own` is `registry.domain`'s ledger, `sib` the sibling's.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn vault_lp_book_pending_draw(
+        group: &mut state::MarketViewMutV16<'_>,
+        cfg: &state::WrapperConfigV16,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        registry: &state::LpVaultRegistryV16,
+        st: &mut state::VaultLpStateV18,
+        own_ledger: &mut [u8],
+        sib_ledger: &mut [u8],
+        lp_value: u128,
+    ) -> Result<bool, ProgramError> {
+        let a = st.asset_index as usize;
+        let mut rec = read_vault_lp_draw_from_view(group, a)?;
+        let pending = rec.pending_moved_atoms;
+        if pending == 0 && rec.pending_out_even_atoms == 0 && rec.pending_out_odd_atoms == 0 {
+            let restored = vault_lp_restore_seniors_first(
+                group, cfg, market_key, registry_pda, registry, st, own_ledger, sib_ledger, lp_value,
+            )?;
+            if restored || rec.outstanding_mirror_atoms != st.senior_draw_outstanding_atoms {
+                rec.outstanding_mirror_atoms = st.senior_draw_outstanding_atoms;
+                write_vault_lp_draw_to_view(group, a, &rec)?;
+            }
+            return Ok(restored);
+        }
+        for (domain, p) in [
+            ((a * 2) as u16, rec.pending_out_even_atoms),
+            ((a * 2 + 1) as u16, rec.pending_out_odd_atoms),
+        ] {
+            if p == 0 {
+                continue;
+            }
+            let data: &mut [u8] = if domain == registry.domain {
+                &mut *own_ledger
+            } else {
+                &mut *sib_ledger
+            };
+            let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+            let (mut ledger, initialized) =
+                read_or_new_backing_domain_ledger(data, market_key, registry_pda, domain, &bucket)?;
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            // Drawn out of this pot: a principal WITHDRAWAL (never an impairment).
+            ledger.total_principal_atoms = ledger.total_principal_atoms.saturating_sub(p);
+            ledger.total_principal_withdrawn_atoms = ledger
+                .total_principal_withdrawn_atoms
+                .checked_add(p)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            write_or_init_backing_domain_ledger(data, &ledger, initialized)?;
+        }
+        let nav_after = lp_vault_combined_nav_parts_p3(
+            group,
+            market_key,
+            registry_pda,
+            registry.domain,
+            registry.fee_share_bps,
+            own_ledger,
+            sib_ledger,
+        )?
+        .1;
+        let harvestable = lp_vault_harvestable_fee_atoms(cfg, group)?;
+        let c_eff = vault_lp_v18::effective_senior_claim(
+            st.senior_claim_atoms,
+            harvestable,
+            st.senior_fee_share_bps,
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let cover_before = nav_after
+            .checked_add(pending)
+            .and_then(|v| v.checked_add(harvestable))
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // CURRENT junior surplus: the pots' value over C before this move, net of every earlier
+        // (already booked) draw because the ledgers and C already reflect those.
+        let junior_surplus = cover_before.saturating_sub(c_eff);
+        let (next, senior_loss) = vault_lp_v18::vault_lp_book_pending(
+            vault_lp_v18::DrawLedger {
+                senior_claim: st.senior_claim_atoms,
+                drawn: st.senior_drawn_atoms,
+                outstanding: st.senior_draw_outstanding_atoms,
+                pending,
+            },
+            junior_surplus,
+        );
+        let new_c = next.senior_claim;
+        st.senior_claim_atoms = new_c;
+        st.senior_drawn_atoms = next.drawn;
+        st.senior_draw_outstanding_atoms = next.outstanding;
+        rec.pending_out_even_atoms = 0;
+        rec.pending_out_odd_atoms = 0;
+        rec.pending_moved_atoms = 0;
+        rec.outstanding_mirror_atoms = st.senior_draw_outstanding_atoms;
+        write_vault_lp_draw_to_view(group, a, &rec)?;
+        let _ = lp_value;
+        solana_program::log::sol_log(&alloc::format!(
+            "p3_senior_draw_booked moved={} junior_cover={} senior_loss={} C={} outstanding={}",
+            pending,
+            pending - senior_loss.min(pending),
+            senior_loss,
+            new_c,
+            st.senior_draw_outstanding_atoms
+        ));
+        Ok(true)
+    }
+
+    /// Undrawn deficit of the vault LP, READ-ONLY (75/77 may pass the LP read-only): from a
+    /// CURRENT certificate, or from capital + pnl when flat; stale with inventory => 85.
+    #[inline(never)]
+    fn vault_lp_undrawn_deficit_ro(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioAccountV16Account,
+    ) -> Result<u128, ProgramError> {
+        let bitmap = lp.active_bitmap.map(percolator::V16PodU64::get);
+        let cert = lp.health_cert.try_to_runtime().map_err(map_v16_error)?;
+        let cert_current = lp.stale_state == 0
+            && lp.b_stale_state == 0
+            && cert.valid
+            && cert.cert_oracle_epoch == group.header.oracle_epoch.get()
+            && cert.cert_funding_epoch == group.header.funding_epoch.get()
+            && cert.cert_risk_epoch == group.header.risk_epoch.get()
+            && cert.cert_asset_set_epoch == group.header.asset_set_epoch.get()
+            && cert.active_bitmap_at_cert == bitmap;
+        if cert_current {
+            return Ok(if cert.certified_equity < 0 {
+                cert.certified_equity.unsigned_abs()
+            } else {
+                0
+            });
+        }
+        if percolator::active_bitmap_is_empty(bitmap) {
+            let cap = i128::try_from(lp.capital.get())
+                .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+            let pnl = lp.pnl.get().min(0);
+            let fc = lp.fee_credits.get().min(0);
+            let e = cap
+                .checked_add(pnl)
+                .and_then(|v| v.checked_add(fc))
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            return Ok(if e < 0 { e.unsigned_abs() } else { 0 });
+        }
+        Err(PercolatorError::VaultLpValuationStale.into())
+    }
+
+    /// Entry used by every P3 instruction that reads C or ledger principal: (1) when the vault
+    /// LP is passed WRITABLE on a Live market, run the physical draw (fail closed on any refresh
+    /// error); (2) book any pending draw; (3) persist `st`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn vault_lp_draw_then_book<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        vault_lp_ai: &AccountInfo<'a>,
+        st: &mut state::VaultLpStateV18,
+        lp_ai: Option<&AccountInfo<'a>>,
+        own_ledger_ai: &AccountInfo<'a>,
+        sib_ledger_ai: &AccountInfo<'a>,
+        require_booking: bool,
+    ) -> Result<bool, ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let a = st.asset_index as usize;
+        if let Some(lp_ai) = lp_ai {
+            if lp_ai.is_writable && lp_ai.owner == program_id && group.header.mode == 0 {
+                let max_slots = group.header.config.max_market_slots.get() as usize;
+                let mut lp_data = lp_ai.try_borrow_mut_data()?;
+                let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_slots)?;
+                expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                // Only an INSOLVENT vault LP needs the refresh; skip the CU otherwise.
+                let pre = with_portfolio_header_rw_equity_hint(&lp);
+                if pre {
+                    vault_lp_physical_draw(program_id, market_ai.key, &cfg, &mut group, &mut lp, a, false)?;
+                }
+            }
+        }
+        let rec = read_vault_lp_draw_from_view(&group, a)?;
+        let has_pending = rec.pending_moved_atoms != 0
+            || rec.pending_out_even_atoms != 0
+            || rec.pending_out_odd_atoms != 0;
+        let needs_book = has_pending
+            || st.senior_draw_outstanding_atoms != 0
+            || rec.outstanding_mirror_atoms != st.senior_draw_outstanding_atoms;
+        if !needs_book {
+            return Ok(false);
+        }
+        // Current vault-LP value for the seniors-first recovery (0 when not passed/current).
+        let lp_value = match lp_ai {
+            Some(lp_ai) if lp_ai.owner == program_id => {
+                with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h)).unwrap_or(0)
+            }
+            _ => 0,
+        };
+        if has_pending {
+            // Only the ledger of a pot that was actually drawn from is written.
+            let own_is_even = registry.domain as usize == a * 2;
+            let (own_out, sib_out) = if own_is_even {
+                (rec.pending_out_even_atoms, rec.pending_out_odd_atoms)
+            } else {
+                (rec.pending_out_odd_atoms, rec.pending_out_even_atoms)
+            };
+            let writable = (own_out == 0 || own_ledger_ai.is_writable)
+                && (sib_out == 0 || sib_ledger_ai.is_writable);
+            if !writable {
+                if require_booking {
+                    // An instruction that prices off C must book first: fail closed.
+                    expect_writable(if own_out != 0 { own_ledger_ai } else { sib_ledger_ai })?;
+                }
+                // 101 never reads C: the next pricing instruction books it.
+                return Ok(false);
+            }
+        }
+        let booked = {
+            // Borrowed mutably but only WRITTEN when a pending draw is booked (both writable
+            // then, checked above); the recovery-only path just reads them.
+            let mut own = own_ledger_ai.try_borrow_mut_data()?;
+            let mut sib_borrow = sib_ledger_ai.try_borrow_mut_data()?;
+            let sib: &mut [u8] = &mut sib_borrow[..];
+            vault_lp_book_pending_draw(
+                &mut group,
+                &cfg,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry,
+                st,
+                &mut own,
+                sib,
+                lp_value,
+            )?
+        };
+        group.validate_shape().map_err(map_v16_error)?;
+        drop(group);
+        drop(market_data);
+        if booked || st.senior_draw_outstanding_atoms != rec.outstanding_mirror_atoms {
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, st)?;
+        }
+        Ok(booked)
+    }
+
+    /// Trade-path hook (every single and batch executor): if either side is the bound vault LP,
+    /// draw its realised deficit BEFORE the engine trade can realise it into a bankrupt close,
+    /// and return the close marker for the post-check.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn vault_lp_trade_pre_draw(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        cfg: &state::WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        account_a: &mut percolator::PortfolioV16ViewMut<'_>,
+        account_b: &mut percolator::PortfolioV16ViewMut<'_>,
+        key_a: &Pubkey,
+        key_b: &Pubkey,
+    ) -> Result<Option<(usize, bool, (bool, u64), bool)>, ProgramError> {
+        let Some(i) = market_bound_vault_asset(group)? else {
+            return Ok(None);
+        };
+        let lp_key = read_asset_vault_lp_from_view(group, i)?.vault_lp_portfolio;
+        if key_b.to_bytes() == lp_key {
+            let marker = vault_lp_close_marker(account_b)?;
+            let mut exhausted = false;
+            if with_portfolio_header_rw_equity_hint(account_b) {
+                exhausted = vault_lp_physical_draw(program_id, market_key, cfg, group, account_b, i, true)?.1;
+            }
+            return Ok(Some((i, false, marker, exhausted)));
+        }
+        if key_a.to_bytes() == lp_key {
+            let marker = vault_lp_close_marker(account_a)?;
+            let mut exhausted = false;
+            if with_portfolio_header_rw_equity_hint(account_a) {
+                exhausted = vault_lp_physical_draw(program_id, market_key, cfg, group, account_a, i, true)?.1;
+            }
+            return Ok(Some((i, true, marker, exhausted)));
+        }
+        Ok(None)
+    }
+
+    /// 75/77 Live pricing claim (no timing arbitrage): reads the vault LP's undrawn deficit from
+    /// a CURRENT certificate (stale with inventory => 85) and prices through
+    /// `vault_lp_senior_pricing_claim`. A deficit that is not drawn yet refuses the instruction
+    /// (the draw must run first: pass the vault LP writable, or crank it).
+    #[inline(never)]
+    fn vault_lp_live_pricing_claim(
+        group: &state::MarketViewMutV16<'_>,
+        lp_ai: &AccountInfo<'_>,
+        claim: u128,
+        nav: u128,
+    ) -> Result<u128, ProgramError> {
+        let undrawn = with_portfolio_header_ro(lp_ai, |h| vault_lp_undrawn_deficit_ro(group, h))?;
+        if undrawn != 0 {
+            return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+        }
+        Ok(vault_lp_v18::vault_lp_senior_pricing_claim(
+            claim,
+            undrawn,
+            nav.saturating_sub(claim),
+        ))
+    }
+
+    /// Cheap pre-filter: an LP that is flat with non-negative capital+pnl cannot be insolvent;
+    /// otherwise the refresh decides.
+    fn with_portfolio_header_rw_equity_hint(lp: &percolator::PortfolioV16ViewMut<'_>) -> bool {
+        let bitmap = lp.header.active_bitmap.map(percolator::V16PodU64::get);
+        if !percolator::active_bitmap_is_empty(bitmap) {
+            return true;
+        }
+        let cap = lp.header.capital.get() as i128;
+        cap.saturating_add(lp.header.pnl.get().min(0))
+            .saturating_add(lp.header.fee_credits.get().min(0))
+            < 0
+    }
+
     /// F14-Q2: the asset a vault LP is bound to on this market, if any (one vault per market).
     fn market_bound_vault_asset(group: &state::MarketViewMutV16<'_>) -> Result<Option<usize>, ProgramError> {
         let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
@@ -26167,27 +27191,23 @@ pub mod processor {
         Ok(None)
     }
 
-    /// F14-Q1: backing the vault still OWNS across both pots (idle + liened for live claims;
-    /// consumed and impaired backing excluded).
-    fn vault_owned_backing_atoms(
+    /// (own pot, sibling pot) backing still physically held: `fresh_unliened + valid_liened`.
+    #[inline(never)]
+    fn vault_pot_held_atoms(
         group: &state::MarketViewMutV16<'_>,
         domain: u16,
-    ) -> Result<u128, ProgramError> {
-        let mut total = 0u128;
-        for d in [domain, sibling_domain(domain)] {
+    ) -> Result<(u128, u128), ProgramError> {
+        let held = |d: u16| -> Result<u128, ProgramError> {
             let (_, bucket) = backing_domain_parts_view(group, d as usize)?;
-            total = total
-                .checked_add(
-                    bucket
-                        .fresh_unliened_backing_num
-                        .checked_add(bucket.valid_liened_backing_num)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                        / BOUND_SCALE,
-                )
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        }
-        Ok(total)
+            Ok(bucket
+                .fresh_unliened_backing_num
+                .checked_add(bucket.valid_liened_backing_num)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                / BOUND_SCALE)
+        };
+        Ok((held(domain)?, held(sibling_domain(domain))?))
     }
+
 
     /// Claim-free residual (engine `residual()`): vault tokens no header counter owns.
     fn vault_terminal_residual_atoms(group: &state::MarketViewMutV16<'_>) -> Result<u128, ProgramError> {
@@ -26526,7 +27546,8 @@ pub mod processor {
             version: crate::constants::VAULT_LP_STATE_VERSION,
             bump: vault_lp_bump,
             _padding: [0u8; 8],
-            _reserved: [0u8; 32],
+            senior_drawn_atoms: 0,
+            senior_draw_outstanding_atoms: 0,
         };
         state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         state::set_registry_vault_lp_bound(&mut registry);
@@ -26962,6 +27983,22 @@ pub mod processor {
         require_token_balance(vault_balance, amount_u64)?;
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         {
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_WITHDRAW_97) {
+            return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
+        }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
@@ -27111,6 +28148,22 @@ pub mod processor {
             )?;
         }
         expect_owner(target_ledger_ai, program_id)?;
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_RECALL_98) {
+            return Err(PercolatorError::VaultLpRecallRefused.into());
+        }
         let (_, mode, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode != MarketModeV16::Live {
@@ -27261,7 +28314,7 @@ pub mod processor {
         if system_program_ai.key != &system_program::ID || topup > 1 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
         if lp_ai.key.to_bytes() != st.lp_portfolio {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
@@ -27306,6 +28359,19 @@ pub mod processor {
             &cfg0,
             true,
         )?;
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            false,
+        )?;
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         let domain = registry.domain as usize;
         let to_junior = {
@@ -27331,10 +28397,33 @@ pub mod processor {
                     {
                         return Err(PercolatorError::Unauthorized.into());
                     }
+                    // P3 senior draw (Resolved): fund the vault LP's deficit from the vault's
+                    // pots BEFORE the resolved close, so the close never books a bankrupt
+                    // residual against the winners while senior backing remains.
+                    let close_before = vault_lp_close_marker(&lp)?;
+                    let (_, exhausted) = vault_lp_physical_draw(
+                        program_id,
+                        market_ai.key,
+                        &cfg,
+                        &mut group,
+                        &mut lp,
+                        st.asset_index as usize,
+                        true,
+                    )?;
                     let insurance_before = group.header.insurance.get();
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
+                    vault_lp_refuse_new_bankrupt_close(
+                        program_id,
+                        market_ai.key,
+                        &cfg,
+                        &group,
+                        &lp,
+                        st.asset_index as usize,
+                        close_before,
+                        exhausted,
+                    )?;
                     let retained = group
                         .header
                         .insurance
@@ -27515,6 +28604,22 @@ pub mod processor {
             .checked_mul(BOUND_SCALE)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         {
+        // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
+            return Err(PercolatorError::VaultLpReleaseRefused.into());
+        }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
             if resolved {
