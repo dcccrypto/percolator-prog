@@ -3660,6 +3660,7 @@ pub fn send_tx(
     accounts: Vec<AccountMeta>,
     extra_signers: &[&Keypair],
 ) -> Result<u64, String> {
+    let touched: Vec<Pubkey> = accounts.iter().map(|m| m.pubkey).collect();
     let instruction = Instruction {
         program_id,
         accounts,
@@ -3674,9 +3675,13 @@ pub fn send_tx(
         &signer_refs,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx)
+    let r = svm.send_transaction(tx)
         .map(|meta| meta.compute_units_consumed)
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| format!("{e:?}"));
+    if r.is_ok() {
+        gc_zero_lamport_accounts(svm, &touched);
+    }
+    r
 }
 
 pub fn send_raw_tx(
@@ -3685,6 +3690,7 @@ pub fn send_raw_tx(
     instruction: Instruction,
     extra_signers: &[&Keypair],
 ) -> Result<u64, String> {
+    let touched: Vec<Pubkey> = instruction.accounts.iter().map(|m| m.pubkey).collect();
     let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
     signer_refs.push(payer);
     signer_refs.extend_from_slice(extra_signers);
@@ -3694,9 +3700,30 @@ pub fn send_raw_tx(
         &signer_refs,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx)
+    let r = svm.send_transaction(tx)
         .map(|meta| meta.compute_units_consumed)
-        .map_err(|e| format!("{e:?}"))
+        .map_err(|e| format!("{e:?}"));
+    if r.is_ok() {
+        gc_zero_lamport_accounts(svm, &touched);
+    }
+    r
+}
+
+/// Runtime parity (coordinator, C-4b): after a transaction, the real runtime DELETES every
+/// account left with 0 lamports; LiteSVM 0.1 keeps it (data + owner intact). Emulate the
+/// deletion for every account the transaction touched. INDEP_NO_GC=1 disables it (the
+/// LiteSVM-only behaviour, used as a negative control).
+pub fn gc_zero_lamport_accounts(svm: &mut LiteSVM, touched: &[Pubkey]) {
+    if std::env::var("INDEP_NO_GC").map_or(false, |v| v == "1") {
+        return;
+    }
+    for k in touched {
+        if let Some(a) = svm.get_account(k) {
+            if a.lamports == 0 && !a.executable && (!a.data.is_empty() || a.owner != Pubkey::default()) {
+                let _ = svm.set_account(*k, Account::default());
+            }
+        }
+    }
 }
 
 pub fn assert_cu_within(label: &str, cu: u64, limit: u64) {

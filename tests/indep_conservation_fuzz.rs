@@ -1744,7 +1744,10 @@ fn indep_conservation_fuzz_global_invariants() {
                         };
                         let mut rng = XorShiftRng::seed_from_u64(seed);
                         let fee_bps = [0u64, 5, 30][rng.gen_range(0..3)];
-                        let ops: Vec<Op> = (0..len).map(|_| gen_op(&mut rng)).collect();
+                        // FUZZ_RANDLEN=1: resolve at a random point (random sequence length),
+                        // so wind-down (resolve) lands with fees/positions outstanding anywhere.
+                        let n = if std::env::var("FUZZ_RANDLEN").map_or(false, |v| v == "1") { rng.gen_range(1..=len) } else { len };
+                        let ops: Vec<Op> = (0..n).map(|_| gen_op(&mut rng)).collect();
                         let (r, st) = run_seq(fee_bps, &ops, winddown);
                         total.lock().unwrap().merge(&st);
                         if let Err(e) = r {
@@ -3328,7 +3331,8 @@ impl World {
             let (_, g) = self.env.market_state();
             let v = self.token_amount(&self.env.vault);
             let stranded = v as i128 - g.insurance as i128 - c_rem as i128 - g.c_tot as i128;
-            if stranded > 10_000 {
+            let dust: i128 = std::env::var("FUZZ_P3_DUST").ok().and_then(|v| v.parse().ok()).unwrap_or(10_000);
+            if stranded > dust {
                 if std::env::var("FUZZ_DEBUG_P3").is_ok() {
                     for u in 0..self.ports.len() {
                         if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
@@ -3661,4 +3665,29 @@ fn indep_b12_stranger_cannot_close_claim_holding_portfolio_or_redirect_rent() {
     let r2 = w.do_stranger_close_portfolio(2, &stranger, other.pubkey());
     assert!(r2.is_err(), "rent must not be redirectable to an arbitrary account");
     w.check().unwrap();
+}
+
+/// P3 HIGH (coordinator, = F-12): a market that RESOLVES with unharvested LP fees must still let
+/// every senior redeem, and the fee atoms must be conserved (not stranded in the wrapper vault).
+/// No keeper tag 78 before resolve. Run alone: FUZZ_P3=1 --ignored indep_p3_resolve_with_pending
+#[test]
+#[ignore]
+fn indep_p3_resolve_with_pending_fees_seniors_redeem_and_fees_conserved() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    std::env::set_var("FUZZ_P3_PRECRANK", "0");
+    std::env::set_var("FUZZ_P3_DUST", "2000");
+    let mut w = World::new(30);
+    for op in [Op::TradeCpi { u: 128, size_tenths: -300 }, Op::TradeCpi { u: 129, size_tenths: 200 }, Op::TradeCpi { u: 130, size_tenths: 100 }] {
+        let _ = w.apply(&op);
+        w.check().unwrap();
+    }
+    let (cfg, _) = w.env.market_state();
+    let h = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+    assert!(h > 0, "vacuity: LP fees outstanding at resolve");
+    let minted = w.minted;
+    let r = w.wind_down();
+    eprintln!("resolve-with-pending-fees (H={h}): wind_down -> {r:?}");
+    w.check_tokens().unwrap();
+    r.expect("seniors must redeem after a resolve with pending LP fees, and no value may be stranded (dust <= 2000)");
+    assert!(w.minted >= minted);
 }
