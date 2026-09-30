@@ -25009,3 +25009,6 @@ fn v16_attack_withdraw_backing_bucket_live_mode_still_requires_signer() {
     );
     assert_eq!(env.token_amount(beneficiary_dest), 0);
 }
+
+#[path = "v16_cu/boyle_175_ports.rs"]
+mod boyle_175_ports;
