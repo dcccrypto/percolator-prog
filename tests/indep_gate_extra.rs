@@ -1053,7 +1053,9 @@ fn gate_p3_recall_bound_and_unblocks_senior_redemption() {
         // by the draw), so the recall must be refused 76.
         let tpnl = w.env.portfolio_state(tp).pnl.max(0) as u128;
         assert!(b == c || b + 2 >= c + tpnl.min(b.saturating_sub(c)), "backing {b} vs C {c}: neither seniors-isolated nor draw-backed winner (trader pnl {tpnl})");
-        assert_eq!(w.recall(&stranger, 1, 0).err().and_then(|e| custom_code(&e)), Some(76), "no shortfall -> recall refused 76");
+        // 76 (no shortfall) or, from 4b1a5d30, 89 VaultLpPausedForSeniorDraw while a draw is pending.
+        let rc = w.recall(&stranger, 1, 0).err().and_then(|e| custom_code(&e));
+        assert!(rc == Some(76) || rc == Some(89), "no shortfall -> recall refused (76/89), got {rc:?}");
         eprintln!("RECALL-GAP: trading could not create a senior liquidity shortfall (seniors isolated); bound/unblock path not exercised");
         // Liveness after the draw: the h-lock flag must not outlive the winner's conversion.
         let hl0 = w.env.market_state().1.bankruptcy_hlock_active;
