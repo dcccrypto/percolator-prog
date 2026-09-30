@@ -2708,8 +2708,12 @@ impl World {
             Ok(_) => {
                 for &(u, before) in parties {
                     let after = self.pos0(u);
-                    if after.unsigned_abs() > before.unsigned_abs() || (before != 0 && after != 0 && before.signum() != after.signum()) {
+                    // P3 doc row 6 / §113: "unwinding (|pos| not growing) is allowed". A flip that
+                    // SHRINKS |pos| is allowed by that rule; record it (soft) but do not fail.
+                    if after.unsigned_abs() > before.unsigned_abs() {
                         self.pending_violation = Some(format!("P3-g {what} GREW u{u} on a bound asset: {before} -> {after} (must be refused 77)"));
+                    } else if before != 0 && after != 0 && before.signum() != after.signum() {
+                        *self.stats.soft.entry("p3g_nocpi_flip_with_shrinking_abs_pos").or_default() += 1;
                     }
                 }
             }
