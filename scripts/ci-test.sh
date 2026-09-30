@@ -117,14 +117,25 @@ else
 fi
 
 echo "::group::build sibling program BPFs"
+# nft and stake are deployed `--features devnet` (deployments.md build commands); the
+# matcher is deployed plain. Building them otherwise tests bytes that exist on no chain.
 for sib in percolator-match percolator-nft percolator-stake; do
   if [ -d "../$sib" ]; then
-    ( cd "../$sib" && cargo build-sbf ) || { echo "FATAL: $sib BPF build failed"; exit 1; }
-    echo "  built $sib"
+    case "$sib" in
+      percolator-match) feat="" ;;
+      *) feat="--features devnet" ;;
+    esac
+    ( cd "../$sib" && cargo build-sbf -- $feat ) || { echo "FATAL: $sib BPF build failed"; exit 1; }
+    echo "  built $sib $feat"
   else
     echo "FATAL: ../$sib missing — the cross-program suites cannot run without it"; exit 1
   fi
 done
+# P1: the P2 matcher sibling (tests/p1_fee_channel.rs); required when present in CI.
+if [ -d "../percolator-match-p2" ]; then
+  ( cd ../percolator-match-p2 && cargo build-sbf ) || { echo "FATAL: percolator-match-p2 BPF build failed"; exit 1; }
+  echo "  built percolator-match-p2"
+fi
 echo "::endgroup::"
 
 echo "::group::build wrapper BPF"

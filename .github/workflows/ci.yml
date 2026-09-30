@@ -168,6 +168,10 @@ jobs:
           token: '${{ secrets.GITHUB_TOKEN }}'
       # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
       # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
+      # P1: tests/p1_fee_channel.rs drives the P2 matcher (feat/p2-matcher-v2, NOT deployed).
+      - name: checkout P2 matcher (tests only, not deployed)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-match, path: percolator-match-p2, ref: feat/p2-matcher-v2, token: '${{ secrets.GITHUB_TOKEN }}' }
       - name: checkout stake (pinned to the deployed commit)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
