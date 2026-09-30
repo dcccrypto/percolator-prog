@@ -877,7 +877,23 @@ const JUNIOR: u64 = 200_000_000;
 /// Full bind on the CANDIDATE bytes: repairs → Earn seed (75) → 94 → 99 → 95 → 96.
 /// Panics with the failing stage and code (a live market that cannot be bound is a
 /// finding, reported by `p3_fork_bind_survey`).
-fn bind(e: &mut Env, max_lev_bps: u32) -> Bound {
+/// Returns None when the live market is multi-asset: since F14-Q2 a vault LP binds only on a
+/// single-asset market (error 86). The four live markets were created with several configured
+/// asset slots, so on the FINAL head they are refused at tag 94 — asserted here; the drain /
+/// win shapes themselves are covered on single-asset markets by `tests/p3_vault_lp.rs`
+/// (R2/R3 reconstructions, H2, F-14 tests).
+fn bind(e: &mut Env, max_lev_bps: u32) -> Option<Bound> {
+    let (_, g0) = e.market();
+    if g0.config.max_market_slots > 1 {
+        let (_, o) = e.init_vault_lp(2_000);
+        expect_code(&o, 86, &format!("{} tag94 on a multi-asset live market (F14-Q2)", e.label));
+        eprintln!("[{}] multi-asset live market ({} slots): tag 94 refused with 86 (F14-Q2)", e.label, g0.config.max_market_slots);
+        return None;
+    }
+    Some(bind_single(e, max_lev_bps))
+}
+
+fn bind_single(e: &mut Env, max_lev_bps: u32) -> Bound {
     e.apply_live_repairs();
     let o = e.earn_deposit(EARN_SEED, None);
     show(&format!("{} tag75 Earn seed", e.label), &o);
@@ -976,7 +992,7 @@ fn p3_fork_bind_survey() {
         );
         // Candidate: full bind through the marketauth path (simulated PDA signature).
         let mut c = env(&fx, Bytes::Candidate);
-        let b = bind(&mut c, 0);
+        let Some(b) = bind(&mut c, 0) else { return; };
         c.dump(&fx);
         eprintln!("[{}] survey: seed={} junior={}", c.label, b.seed, b.junior);
     }
@@ -1187,7 +1203,7 @@ fn creator_of(e: &Env) -> Pubkey {
 fn p3_fork_ansem_creator_win_is_paid_by_the_junior() {
     let fx = load_fixture("ansem");
     let mut e = env(&fx, Bytes::Candidate);
-    let b = bind(&mut e, 0);
+    let Some(b) = bind(&mut e, 0) else { return; };
     let creator = creator_of(&e);
     assert_eq!(creator, pk("DwgobUX12AvegxPWGerEucV7222TpBFjzPK5FmePspfs"));
     let px0 = e.price();
@@ -1314,7 +1330,7 @@ fn replay_drain(name: &str, live_lp: &str, live_taker: &str) {
     for cap_bps in [0u32, 50_000] {
         let mut e = env(&fx, Bytes::Candidate);
         e.label = format!("{name}/Candidate/cap={cap_bps}");
-        let b = bind(&mut e, cap_bps);
+        let Some(b) = bind(&mut e, cap_bps) else { return; };
         let px0 = e.price();
         let size = units_for(b.junior as u128, px0, 9_000);
         let winner = e.new_trader(Pubkey::new_unique(), 1_000_000_000);
@@ -1406,7 +1422,7 @@ fn p3_fork_textit_both_sides_open_and_close() {
     expect_code(&o, E_INSUFFICIENT_IM, "TEXTIT deployed live-LP short (the live failure)");
 
     let mut e = env(&fx, Bytes::Candidate);
-    let b = bind(&mut e, 0);
+    let Some(b) = bind(&mut e, 0) else { return; };
     let px0 = e.price();
     let s_size = units_for(b.junior as u128, px0, 5_000);
     let l_size = units_for(b.junior as u128, px0, 3_000);

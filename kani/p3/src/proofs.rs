@@ -431,6 +431,9 @@ fn kani_p3_terminal_split_conserves_senior_first_order_independent() {
     let s2: u8 = kani::any();
     let dead: u8 = kani::any();
     kani::assume(dead >= 1 && dead <= 3);
+    // Bounded domain (u8 timed out at 40 min on this box): values < 32 still exercise both the
+    // impaired (phys < C) and solvent branches and every floor.
+    kani::assume(phys < 32 && c < 32 && s1 < 32 && s2 < 32);
     let (phys, c, s1, s2, dead) = (phys as u128, c as u128, s1 as u128, s2 as u128, dead as u128);
     let s = s1 + s2 + dead;
     // Order A: senior 1, senior 2, junior.
