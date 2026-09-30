@@ -372,3 +372,71 @@ fn kani_design_p1_effective_band_total() {
     kani::cover!(stored == 0, "zeroed slot defaults");
     kani::cover!(stored > 0 && stored <= p1::MAX_EXEC_BAND_BPS, "stored band used as-is");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────────────────
+// D-P1-01r / D-P1-01b  Band at full u64 prices, restructured after D-P1-01's NO VERDICT (1 h).
+// Diagnosis: D-P1-01 forms (e−r)·1e4 / (r−e)·1e4 in two branches and a separate r·b product, so
+// the solver must prove multiplier/subtractor equivalence against the implementation's
+// `abs_diff(..) as u128 * BPS_DENOM` and `(ref as u128) * (band as u128)`. Here the spec uses the
+// SAME term shapes as the implementation (d4, rb), so CBMC's structural hashing shares them (the
+// Kani lane's `band_edge_rounding`, same shapes, passed in 33 s); the statements are the
+// independent real-number ones:
+//   (i)   ref == 0  => refused;
+//   (ii)  d4 <= rb  => accepted                      (every fill inside the real band);
+//   (iii) accepted  => d4 < rb + 1e4                 (never more than one atom outside);
+//   (iv)  rb < d4 < rb + 1e4 => accepted             (the documented round-out atom is granted);
+// (ii)–(iv) together are the exact characterization D-P1-01 stated.
+// D-P1-01r: symbolic stored u16 band through the processor's `effective_exec_band_bps` (all
+// bands). D-P1-01b: pre-declared per-band split (constant band; every multiply is by a
+// constant), run ONLY if 01r has no verdict, for the default 500 and the 1 / 9_999 / 10_000 edges.
+// ─────────────────────────────────────────────────────────────────────────────────────────
+#[inline(always)]
+fn band_statements(exec: u64, reference: u64, band: u16) {
+    let accepted = p1::exec_price_within_band(exec, reference, band);
+    let d4 = (exec.abs_diff(reference) as u128) * 10_000;
+    let rb = (reference as u128) * (band as u128);
+    if reference == 0 {
+        assert!(!accepted, "zero reference fails closed");
+        return;
+    }
+    if d4 <= rb {
+        assert!(accepted, "every fill inside the real band is accepted");
+    }
+    if accepted {
+        assert!(d4 < rb + 10_000, "never more than one atom outside the band");
+    }
+    if d4 > rb && d4 < rb + 10_000 {
+        assert!(accepted, "the round-out atom is granted");
+    }
+    kani::cover!(accepted && d4 > rb, "accepted only by the round-out atom");
+    kani::cover!(!accepted && d4 >= rb + 10_000 && d4 < rb + 20_000, "rejected just past the round-out atom");
+    kani::cover!(accepted && exec < reference && reference > u32::MAX as u64, "below-reference fill above the u32 range");
+}
+
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_design_p1_01r_band_full_width_shared_terms() {
+    let exec: u64 = kani::any();
+    let reference: u64 = kani::any();
+    let stored: u16 = kani::any();
+    let band = p1::effective_exec_band_bps(stored);
+    band_statements(exec, reference, band);
+    kani::cover!(stored == 0, "zeroed slot uses the default band");
+    kani::cover!(stored > p1::MAX_EXEC_BAND_BPS, "corrupt slot clamped");
+}
+
+macro_rules! band_per_band {
+    ($name:ident, $b:expr) => {
+        #[kani::proof]
+        #[kani::solver(kissat)]
+        fn $name() {
+            let exec: u64 = kani::any();
+            let reference: u64 = kani::any();
+            band_statements(exec, reference, $b);
+        }
+    };
+}
+band_per_band!(kani_design_p1_01b_band_500_default, 500);
+band_per_band!(kani_design_p1_01b_band_1, 1);
+band_per_band!(kani_design_p1_01b_band_9999, 9_999);
+band_per_band!(kani_design_p1_01b_band_10000_max, 10_000);
