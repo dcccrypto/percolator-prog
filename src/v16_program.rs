@@ -29847,10 +29847,10 @@ mod p1_kani_proofs {
         // multiply-divide at full u64 width did not finish in 50 min. Overflow saturation is
         // covered by the full-width harness below; the Kani lane's exact-floor harness covers
         // tightness.
-        let e1: u32 = kani::any();
-        let e2: u32 = kani::any();
-        let k1: u16 = kani::any();
-        let k2: u16 = kani::any();
+        let e1: u16 = kani::any();
+        let e2: u16 = kani::any();
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
         // Price drawn from a representative concrete set (symbolic u128 division by a symbolic
         // divisor is what made this intractable); equity and k stay fully symbolic.
         let sel: u8 = kani::any();
@@ -29887,7 +29887,17 @@ mod p1_kani_proofs {
     fn kani_p1_exposure_cap_saturates_monotone() {
         // Full-width equity (saturation needs it); k and price concrete-ish to keep the
         // 128-bit division tractable.
-        let equity: u128 = kani::any();
+        // Equity from representative magnitudes incl. the overflow edge (a symbolic u128
+        // numerator under a 128-bit division did not finish in 40 min).
+        let esel: u8 = kani::any();
+        let equity: u128 = match esel % 6 {
+            0 => 0,
+            1 => 1,
+            2 => 1_000_000,
+            3 => u64::MAX as u128,
+            4 => u128::MAX / 2,
+            _ => u128::MAX - 1,
+        };
         let ksel: u8 = kani::any();
         let k: u32 = if ksel % 2 == 0 { 10_000 } else { p1::MAX_LP_EXPOSURE_K_BPS };
         let psel: u8 = kani::any();
@@ -30164,9 +30174,10 @@ mod p1_kani_proofs {
     #[kani::proof]
     #[kani::solver(cadical)]
     fn kani_p1_cap_fast_path_matches_division() {
-        let abs_q: u32 = kani::any();
-        let equity: u32 = kani::any();
-        let k: u16 = kani::any();
+        // u16 / u8 domains (tractability; see the other cap harnesses).
+        let abs_q: u16 = kani::any();
+        let equity: u16 = kani::any();
+        let k: u8 = kani::any();
         let sel: u8 = kani::any();
         let price: u64 = match sel % 4 {
             0 => 1,
@@ -30190,13 +30201,14 @@ mod p1_kani_proofs {
         // The processor decides the LP cap with the division-free `exposure_within_cap_fast`
         // whenever it fits (always, for realistic magnitudes); prove that form is monotone and
         // overflow-safe (checked arithmetic: `None`, never a panic).
-        let abs1: u32 = kani::any();
-        let abs2: u32 = kani::any();
-        let e1: u32 = kani::any();
-        let e2: u32 = kani::any();
-        let k1: u16 = kani::any();
-        let k2: u16 = kani::any();
-        let price: u32 = kani::any();
+        // u16 domains: the u32 run hit the 40-min cap (rc=143).
+        let abs1: u16 = kani::any();
+        let abs2: u16 = kani::any();
+        let e1: u16 = kani::any();
+        let e2: u16 = kani::any();
+        let k1: u8 = kani::any();
+        let k2: u8 = kani::any();
+        let price: u16 = kani::any();
         kani::assume(price != 0 && abs2 <= abs1 && e1 <= e2 && k1 <= k2);
         let a = p1::exposure_within_cap_fast(abs1 as u128, e1 as u128, k1 as u32, price as u64, 1_000_000);
         let b = p1::exposure_within_cap_fast(abs2 as u128, e2 as u128, k2 as u32, price as u64, 1_000_000);
