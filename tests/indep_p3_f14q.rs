@@ -2887,3 +2887,51 @@ fn fnew_backing_lifetime_probe() {
     }
     dump(&w, "end");
 }
+
+/// Cooldown sweep against the live keeper cadence (percolator-oracle-keeper .env: CC_INTERVAL_MS
+/// 1500 = ~4 slots per push cycle at 400 ms; CC_MARK_WINDOW_MS 8000 median = up to ~20 slots of
+/// mark lag). Model: the leaver sees the spot move at slot s and files 76 at once; the keeper
+/// publishes the new mark N slots later and then pushes + cranks every 4 slots; 77 runs at
+/// s + cooldown. The move is the C-7 deficit move (+48.6%, loss beyond the junior ~331k). Prints
+/// leaver vs stayer payouts per (N, cooldown). COOLDOWN_SWEEP="c1,c2,..", KEEPER_LAG="n1,n2,..".
+#[test]
+#[ignore]
+fn cooldown_sweep_leaver_before_keeper_push() {
+    let cds: Vec<u64> = std::env::var("COOLDOWN_SWEEP").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![20, 50, 150, 600]);
+    let lags: Vec<u64> = std::env::var("KEEPER_LAG").ok().map(|s| s.split(',').filter_map(|x| x.parse().ok()).collect()).unwrap_or_else(|| vec![4, 12, 24]);
+    let fair = 5_000_000u128 - RACE_BEYOND / 2;
+    for &lag in &lags {
+        for &cd in &cds {
+            let TimingWorld { mut w, a, a_ata, v, v_ata, tp, lp, .. } = timing_world(cd);
+            let target = PRICE * 14_861 / 10_000;
+            let s0 = w.slot();
+            let sh = w.tok(&a_ata) as u128;
+            let _ = w.request_redeem(&a, a_ata, sh); // leaver files at the spot move
+            let mut pushed = false;
+            let mut a_paid = None;
+            let end = s0 + cd.max(lag) + 6_000;
+            let mut s = s0;
+            while s < end {
+                s += 4; // keeper cycle ~1.5 s
+                w.env.svm.warp_to_slot(s);
+                if s >= s0 + lag {
+                    if !pushed { MARK.with(|c| c.set(target)); pushed = true; }
+                    w.env.push_auth_mark_for_asset_as_admin(0, s, target);
+                    let _ = w.crank(tp); let _ = w.crank(lp);
+                } else {
+                    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
+                }
+                if a_paid.is_none() && s >= s0 + cd {
+                    let _ = w.crank_fees_78();
+                    let (d, r) = w.execute_redeem_domain(&a, 0);
+                    a_paid = Some(if r.is_ok() { w.tok(&d) as u128 } else { eprintln!("SWEEP lag {lag} cd {cd}: 77 -> {:?}", r.as_ref().map_err(|e| code(e))); 0 });
+                }
+            }
+            for _ in 0..3 { let s = w.slot() + 1; w.env.svm.warp_to_slot(s); let _ = w.crank(lp); let _ = w.crank(tp); }
+            let v_paid = timing_redeem(&mut w, &v, v_ata, cd, &mut |_w: &mut P3| {});
+            let a_paid = a_paid.unwrap_or(0);
+            let eff = w.env.market_state().1.assets[0].effective_price;
+            eprintln!("SWEEP keeper lag {lag:>3} slots | cooldown {cd:>4}: leaver {a_paid} stayer {v_paid} (fair {fair}; leaver advantage {}) eff at end {eff}", a_paid as i128 - fair as i128);
+        }
+    }
+}
