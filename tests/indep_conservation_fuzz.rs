@@ -1211,11 +1211,19 @@ impl World {
         // P3-a: senior principal C only drops through senior redemptions.
         if self.p3.is_some() {
             let cnow = self.p3_c();
+            // Senior-draw rule (d119eebd+): C also drops by exactly what the draw books
+            // (VaultLpStateV18.senior_drawn_atoms at [224, 240)).
+            let st = self.p3_state();
+            let drawn = if st.len() >= 240 { u128::from_le_bytes(st[224..240].try_into().unwrap()) } else { 0 };
             let c = self.p3.as_mut().unwrap();
-            if cnow < c.c_last && !c.c_may_drop {
-                return Err(format!("P3-a SENIOR PRINCIPAL DROPPED without a redemption: C {} -> {cnow}", c.c_last));
+            let drop = c.c_last.saturating_sub(cnow);
+            let drawn_delta = drawn.saturating_sub(c.drawn_last);
+            if drop > 0 && !c.c_may_drop && drop > drawn_delta {
+                return Err(format!("P3-a SENIOR PRINCIPAL DROPPED without a redemption: C {} -> {cnow} (draw booked only {drawn_delta})", c.c_last));
             }
+            if drop > 0 && drawn_delta > 0 { *self.stats.soft.entry("p3_c_drop_by_senior_draw").or_default() += 1; }
             c.c_last = cnow;
+            c.drawn_last = drawn;
             c.c_may_drop = false;
         }
         if g.mode == MarketModeV16::Live {
@@ -3058,6 +3066,7 @@ pub struct P3Ctx {
     pub senior_out: u128,
     pub n_redeem: u64,
     pub c_last: u128,
+    pub drawn_last: u128,
     pub c_may_drop: bool,
     pub fees_credited0: u128,
 }
@@ -3202,7 +3211,7 @@ impl World {
         (ctx, delegate) };
         self.p3 = Some(P3Ctx {
             lp, state_pda, junior, upgrade, program_data, ctx, delegate,
-            senior_in: genesis, senior_out: 0, n_redeem: 0, c_last: 0, c_may_drop: false, fees_credited0: 0,
+            senior_in: genesis, senior_out: 0, n_redeem: 0, c_last: 0, drawn_last: 0, c_may_drop: false, fees_credited0: 0,
         });
         // 96 junior deposit (creator first loss).
         self.p3_junior_deposit(3_000_000).unwrap_or_else(|e| panic!("96 junior deposit: {}", &e[..e.len().min(400)]));
@@ -4219,4 +4228,19 @@ fn indep_p3_stranded_pot_backing_after_all_exits_repro() {
         Op::TradeCpi { u: 201, size_tenths: -162 }, Op::Push { delta_bps: -2020 }, Op::LpDeposit { u: 212, amt: 3_862_642 }];
     let (r, _st) = run_seq(0, &ops, true);
     r.expect("nothing stranded after every exit");
+}
+
+/// Shrunk fuzz repro on f0b990e1 (seed 0x7dc9d4dacc52f9, random resolve, no pre-crank, fee 30):
+/// during the resolved wind-down senior principal C drops 10,000,000 -> 9,999,006 with NO senior
+/// redemption and NO draw booked (senior_drawn_atoms unchanged). Passes on ede691b6 and 58e379f1.
+/// Run with FUZZ_P3=1 FUZZ_RANDLEN=1 FUZZ_P3_PRECRANK=0 (FUZZ_DEBUG_P3=1 for the pots).
+#[test]
+#[ignore]
+fn indep_p3_resolved_c_drop_without_redemption_or_draw_repro() {
+    assert!(p3_mode(), "run with FUZZ_P3=1");
+    let ops = vec![Op::Push { delta_bps: 1822 }, Op::TradeCpi { u: 212, size_tenths: 172 }, Op::Push { delta_bps: 1387 }, Op::Warp { n: 27 },
+        Op::Warp { n: 52 }, Op::Push { delta_bps: 1849 }, Op::Push { delta_bps: 1713 }, Op::Push { delta_bps: 1790 }];
+    let (r, st) = run_seq(30, &ops, true);
+    eprintln!("soft {:?}", st.soft);
+    r.expect("C drops only through redemptions or a booked senior draw");
 }
