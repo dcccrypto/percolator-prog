@@ -1615,6 +1615,35 @@ fn p3_draw_halt_then_recovery_restores_seniors_first() {
     conserved(&w, "recovery");
 }
 
+/// D-P3-30: a recall (98) never re-opens a deficit a draw funded. While a draw is pending it is
+/// refused outright (and the refusal books nothing); afterwards it is capped by the vault LP's
+/// certified equity (`vault_lp_recall_limit`), so it can only move the LP's OWN positive equity.
+#[test]
+fn p3_draw_recall_never_reopens_a_funded_deficit() {
+    let (mut w, _s, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 6);
+    let c0 = w.c();
+    let r = recall(&mut w, 1);
+    eprintln!("RECALL while pending -> {:?}; C {} (booking reverted with the refusal)", r.as_ref().map_err(|e| code(e)), w.c());
+    assert!(r.is_err(), "recall while a draw is pending");
+    assert_eq!(w.c(), c0, "the refused recall committed nothing");
+    let _ = w.crank_fees_78();
+    let r = recall(&mut w, 1);
+    assert!(r.is_err(), "recall while a senior draw is outstanding");
+    // Junior re-funds 2M; the next LP-carrying instruction restores C first (outstanding 0).
+    let admin = w.env.admin.insecure_clone();
+    w.junior_deposit(&admin, 2_000_000).unwrap();
+    let late = Keypair::new();
+    w.earn_deposit_domain(&late, 1_000, true, 0).expect("75 restores seniors first");
+    assert_eq!(outstanding(&w), 0);
+    let eq = w.lp_state().capital;
+    // The recall may move LP equity into the pots up to the senior shortfall, never beyond the
+    // LP's own equity.
+    let r_over = recall(&mut w, eq + 1);
+    eprintln!("RECALL over LP equity {eq} -> {:?}", r_over.as_ref().map_err(|e| code(e)));
+    assert!(r_over.is_err(), "recall beyond the vault LP's equity");
+    conserved(&w, "recall");
+}
+
 /// B24: after a junior-covered trader win is converted (consuming the vault LP's settled loss
 /// from the pot), every senior still redeems its FULL pro-rata claim on a LIVE market. On
 /// 58e379f1 the ledger floor under-priced the pots and the redemption failed with a generic 21.
