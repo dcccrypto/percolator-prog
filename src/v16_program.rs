@@ -33340,15 +33340,16 @@ pub mod processor {
             // resolved receipt unfinalised forever, and Resolved 77/102 need terminal-flat, so
             // every senior and the junior were locked. An UNSIGNED terminal payout of an
             // escrowed portfolio is therefore allowed when it PAYS THE PROVEN CURRENT HOLDER:
-            // `accounts[0]` must be the wallet whose token account (NFT trio at
-            // `registry_index`) holds exactly one unit of the bound NFT of THIS portfolio, via
-            // the same Kani-proven verdict as every NFT-holder mutation
+            // `accounts[0]` must be the owner of the token account (NFT trio at
+            // `registry_index`) that holds exactly one unit of the bound NFT of THIS portfolio,
+            // via the same Kani-proven verdict as every NFT-holder mutation
             // (`nft_holder_auth_decision`). The caller already bound `dest_token` to
-            // `accounts[0]` (owner + unencumbered). The holder must be ON-CURVE: a PDA holder
-            // (a marketplace / lending vault) may be unable to move tokens that land in an
-            // account it owns (GH#496), so it keeps the signed (CPI) path. The escrow PDA
-            // itself never holds the NFT, so the GH#496 burn stays impossible.
-            if !pubkey_is_on_curve(owner.key) {
+            // `accounts[0]` (owner + unencumbered). Any holder qualifies, on- or off-curve
+            // (security FIX-FIRST on 65068843: an on-curve requirement let a holder park the NFT
+            // under an off-curve owner and re-lock the market); a holder whose program cannot
+            // move what lands in its own account only harms itself.
+            // GH#496: the escrow PDA itself is never a payee.
+            if owner.key.to_bytes() == escrow_authority.to_bytes() {
                 return Err(PercolatorError::ExpectedSigner.into());
             }
             let nft = optional_nft_holder_accounts(accounts, registry_index);
@@ -33367,29 +33368,6 @@ pub mod processor {
             }
         }
         Ok(())
-    }
-
-    /// Ed25519 on-curve test (a key with a private key, i.e. a wallet that can sign and spend).
-    /// On-chain via the `sol_curve_validate_point` syscall (curve id 0 = Edwards).
-    fn pubkey_is_on_curve(key: &Pubkey) -> bool {
-        #[cfg(target_os = "solana")]
-        {
-            let mut result = 0u8;
-            // SAFETY: the syscall reads 32 bytes at `key` and writes nothing through `result`
-            // for the Edwards validate op; it returns 0 iff the point is valid.
-            let rc = unsafe {
-                solana_program::syscalls::sol_curve_validate_point(
-                    0,
-                    key.as_ref().as_ptr(),
-                    &mut result as *mut u8,
-                )
-            };
-            rc == 0
-        }
-        #[cfg(not(target_os = "solana"))]
-        {
-            key.is_on_curve()
-        }
     }
 
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): `require_unencumbered_dest` folds in what

@@ -4591,15 +4591,19 @@ enum EscrowMode {
     NoSweep,
     /// A stranger names the holder but the holder's token account holds 0 of the NFT.
     SweepUnproven,
-    /// The NFT sits in an off-curve (PDA) account: keeps the signed path only.
+    /// The NFT sits in a token account owned by an OFF-CURVE address (allowOwnerOffCurve): the
+    /// stranger still sweeps it, to that holder's token account.
     SweepOffCurveHolder,
+    /// GH#496: a stranger names the escrow PDA itself as payee (its token account holding the NFT).
+    SweepEscrowPdaAsOwner,
 }
 
 impl World {
     /// Model `MintPositionNft` + a transfer of the NFT to `holder`: tag 72 moves `portfolio.owner`
     /// to the NFT program's mint-authority PDA; the NftRegistry, the PositionNft PDA and the
     /// holder's NFT token account are the on-chain facts the wrapper reads.
-    fn escrow_portfolio(&mut self, u: usize, holder: Pubkey, nft_amount: u64, sweep: bool) {
+    /// `holder == None`: the NFT is (claimed to be) held by the escrow PDA itself. Returns the holder.
+    fn escrow_portfolio(&mut self, u: usize, holder: Option<Pubkey>, nft_amount: u64, sweep: bool) -> Pubkey {
         let pid = self.env.program_id;
         let m = self.env.market;
         let nft_prog = Pubkey::new_unique();
@@ -4618,6 +4622,7 @@ impl World {
         .unwrap();
         self.env.svm.set_account(reg_key, Account { lamports: 1_000_000_000, data: rd, owner: pid, executable: false, rent_epoch: 0 }).unwrap();
         let escrow = state::derive_nft_mint_authority(&nft_prog).0;
+        let holder = holder.unwrap_or(escrow);
         let port = self.ports[u];
         let mut a = self.env.svm.get_account(&port).unwrap();
         let mut pf = state::read_portfolio(&a.data).unwrap();
@@ -4636,6 +4641,7 @@ impl World {
         let holder_nft_ata = Pubkey::new_unique();
         self.env.svm.set_account(holder_nft_ata, Account { lamports: 1_000_000_000, data: make_token_data(nft_mint, holder, nft_amount), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
         self.escrow = Some(EscrowSweep { u, holder, nft_pda, holder_nft_ata, sweep });
+        holder
     }
 }
 
@@ -4657,11 +4663,15 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     assert!(pf.pnl > 0 && pf.legs.iter().all(|l| !l.active), "vacuity: u1 is a flat winner before the wind-down");
     let value = pf.capital + pf.pnl as u128;
     let holder = match mode {
-        EscrowMode::SweepOffCurveHolder => Pubkey::find_program_address(&[b"marketplace-vault"], &Pubkey::new_unique()).0,
-        _ => Keypair::new().pubkey(),
+        EscrowMode::SweepOffCurveHolder => Some(Pubkey::find_program_address(&[b"marketplace-vault"], &Pubkey::new_unique()).0),
+        EscrowMode::SweepEscrowPdaAsOwner => None,
+        _ => Some(Keypair::new().pubkey()),
     };
+    if let Some(h) = holder {
+        assert_eq!(h.is_on_curve(), mode != EscrowMode::SweepOffCurveHolder, "vacuity: holder curve-ness");
+    }
     let amount = if mode == EscrowMode::SweepUnproven { 0 } else { 1 };
-    w.escrow_portfolio(u, holder, amount, mode != EscrowMode::NoSweep);
+    let holder = w.escrow_portfolio(u, holder, amount, mode != EscrowMode::NoSweep);
     let original_owner = w.owners[u].pubkey();
     let owner_before = w.holdings_of(&original_owner);
     let r = w.wind_down();
@@ -4674,14 +4684,18 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
 #[test]
 fn p3_escrowed_dust_winner_swept_by_stranger_pays_holder_and_unlocks_seniors() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-    let (r, value, holder_got, owner_got, senior_out) = escrow_winner_run(EscrowMode::Sweep);
-    eprintln!("escrow sweep: {:?} value {value} holder {holder_got} original owner {owner_got} seniors out {senior_out}", r.as_ref().err());
+    // On-curve wallet holder, and (security FIX-FIRST on 65068843) an NFT parked under an
+    // OFF-CURVE owner: both are swept by a stranger, to the holder's own token account.
+    for mode in [EscrowMode::Sweep, EscrowMode::SweepOffCurveHolder] {
+    let (r, value, holder_got, owner_got, senior_out) = escrow_winner_run(mode);
+    eprintln!("escrow {mode:?}: {:?} value {value} holder {holder_got} original owner {owner_got} seniors out {senior_out}", r.as_ref().err());
     r.expect("seniors and junior exit: the stranger's sweep finalised the escrowed receipt");
     assert!(holder_got + 2 >= value, "the current NFT holder receives the whole terminal payout: {holder_got} of {value}");
     // The pre-wrap owner is also the market's Earn senior in this World: everything it received
     // is its Earn redemption (77), none of the escrowed portfolio's payout.
     assert_eq!(owner_got, senior_out, "the pre-wrap owner of record receives nothing from the escrowed portfolio");
     assert!(senior_out + 2_000 >= 10_000_000, "seniors redeemed: {senior_out}");
+    }
 }
 
 /// Negative controls: without a proven on-curve holder the escrowed receipt stays open and the
@@ -4689,7 +4703,7 @@ fn p3_escrowed_dust_winner_swept_by_stranger_pays_holder_and_unlocks_seniors() {
 #[test]
 fn p3_escrowed_dust_winner_negative_controls() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-    for mode in [EscrowMode::NoSweep, EscrowMode::SweepUnproven, EscrowMode::SweepOffCurveHolder] {
+    for mode in [EscrowMode::NoSweep, EscrowMode::SweepUnproven, EscrowMode::SweepEscrowPdaAsOwner] {
         let (r, _value, holder_got, owner_got, _) = escrow_winner_run(mode);
         eprintln!("{mode:?}: {:?} holder {holder_got} owner {owner_got}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()));
         let e = r.expect_err("control: an unswept escrowed winner must keep the seniors locked");
