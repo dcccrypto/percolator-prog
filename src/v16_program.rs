@@ -23009,6 +23009,7 @@ pub mod processor {
                 accounts,
                 7,
                 owner,
+                portfolio_ai.key,
                 &portfolio_owner,
                 &market_group,
             )?;
@@ -23110,6 +23111,7 @@ pub mod processor {
                 accounts,
                 7,
                 owner,
+                portfolio_ai.key,
                 &portfolio_owner,
                 &market_group,
             )?;
@@ -33308,6 +33310,7 @@ pub mod processor {
         accounts: &[AccountInfo],
         registry_index: usize,
         owner: &AccountInfo,
+        portfolio_key: &Pubkey,
         portfolio_owner: &[u8; 32],
         market_group: &[u8; 32],
     ) -> Result<(), ProgramError> {
@@ -33333,9 +33336,60 @@ pub mod processor {
         let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
         let (escrow_authority, _) = state::derive_nft_mint_authority(&nft_program_id);
         if *portfolio_owner == escrow_authority.to_bytes() {
-            return Err(PercolatorError::ExpectedSigner.into());
+            // Security review of 5e4c15ff (MEDIUM): a wrapped winner who never claims kept its
+            // resolved receipt unfinalised forever, and Resolved 77/102 need terminal-flat, so
+            // every senior and the junior were locked. An UNSIGNED terminal payout of an
+            // escrowed portfolio is therefore allowed when it PAYS THE PROVEN CURRENT HOLDER:
+            // `accounts[0]` must be the wallet whose token account (NFT trio at
+            // `registry_index`) holds exactly one unit of the bound NFT of THIS portfolio, via
+            // the same Kani-proven verdict as every NFT-holder mutation
+            // (`nft_holder_auth_decision`). The caller already bound `dest_token` to
+            // `accounts[0]` (owner + unencumbered). The holder must be ON-CURVE: a PDA holder
+            // (a marketplace / lending vault) may be unable to move tokens that land in an
+            // account it owns (GH#496), so it keeps the signed (CPI) path. The escrow PDA
+            // itself never holds the NFT, so the GH#496 burn stays impossible.
+            if !pubkey_is_on_curve(owner.key) {
+                return Err(PercolatorError::ExpectedSigner.into());
+            }
+            let nft = optional_nft_holder_accounts(accounts, registry_index);
+            if nft.is_none()
+                || authorize_owner_or_nft_holder_raw(
+                    portfolio_owner,
+                    portfolio_key,
+                    market_group,
+                    owner.key,
+                    nft,
+                    program_id,
+                )
+                .is_err()
+            {
+                return Err(PercolatorError::ExpectedSigner.into());
+            }
         }
         Ok(())
+    }
+
+    /// Ed25519 on-curve test (a key with a private key, i.e. a wallet that can sign and spend).
+    /// On-chain via the `sol_curve_validate_point` syscall (curve id 0 = Edwards).
+    fn pubkey_is_on_curve(key: &Pubkey) -> bool {
+        #[cfg(target_os = "solana")]
+        {
+            let mut result = 0u8;
+            // SAFETY: the syscall reads 32 bytes at `key` and writes nothing through `result`
+            // for the Edwards validate op; it returns 0 iff the point is valid.
+            let rc = unsafe {
+                solana_program::syscalls::sol_curve_validate_point(
+                    0,
+                    key.as_ref().as_ptr(),
+                    &mut result as *mut u8,
+                )
+            };
+            rc == 0
+        }
+        #[cfg(not(target_os = "solana"))]
+        {
+            key.is_on_curve()
+        }
     }
 
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): `require_unencumbered_dest` folds in what
