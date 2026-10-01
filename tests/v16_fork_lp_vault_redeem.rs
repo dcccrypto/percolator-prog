@@ -3247,55 +3247,34 @@ fn control_single_domain_lp_can_still_exit_a_resolved_market() {
 #[test]
 fn issue_419_dual_domain_lp_can_exit_a_resolved_market_via_rebalance() {
     let mut env = setup_vault(0);
-    // Sole LP. DEPOSIT atoms of principal land in DOMAIN; the depositor holds MINTED
-    // shares (LP_VAULT_MINIMUM_LIQUIDITY is the dead-share carve-out), so their
-    // proportional claim is very nearly the WHOLE combined principal.
     let d = new_depositor(&mut env, DEPOSIT);
 
-    // PROOF OF LIFE: the split must be a legitimate, reachable state, or the deadlock
-    // this test guards against would be unreachable and a green result would mean nothing.
     try_rebalance_backing(&mut env, DOMAIN, DOMAIN ^ 1, DEPOSIT / 2)
         .expect("PROOF OF LIFE: rebalancing idle backing while Live must succeed");
 
     resolve_market(&mut env).expect("resolve");
+
+    // The Resolved-mode rebalance gate (#419 fix 411d70fc) must stay open: move part of the
+    // sibling pot back. The rest stays split, so the claim still exceeds the home pot.
+    try_rebalance_backing(&mut env, DOMAIN ^ 1, DOMAIN, DEPOSIT / 4).expect(
+        "#419 REGRESSION — RebalanceLpVaultBacking refused on a RESOLVED market.",
+    );
+    env.svm.expire_blockhash();
+
     request(&mut env, &d, MINTED).expect("request");
     env.svm.expire_blockhash();
 
-    // THE DEFECT: with DEPOSIT/2 in each pot and one LP entitled to ~all of it, the
-    // proportional claim exceeds EITHER pot, so both draws fail. This half is expected
-    // and is NOT the bug — the bug was that it had no remedy.
-    let from_home = exec_draw_from(&mut env, &d, DOMAIN);
-    env.svm.expire_blockhash();
-    let from_sibling = exec_draw_from(&mut env, &d, DOMAIN ^ 1);
-    env.svm.expire_blockhash();
-    println!("    [#419] draw from DOMAIN  -> {from_home:?}");
-    println!("    [#419] draw from SIBLING -> {from_sibling:?}");
-
-    // THE FIX: consolidating the pots is a bounded, permissionless continuation, and it
-    // must be available in Resolved — the mode in which an LP most needs to get out.
-    try_rebalance_backing(&mut env, DOMAIN ^ 1, DOMAIN, DEPOSIT / 2).expect(
-        "#419 REGRESSION — RebalanceLpVaultBacking refused on a RESOLVED market. That is \
-         the deadlock: redemption is priced on COMBINED principal but drawn from a SINGLE \
-         pot, so once an LP's claim exceeds either pot, consolidating is the ONLY remedy. \
-         Refusing it here strands the capital permanently.",
-    );
-    env.svm.expire_blockhash();
-
-    // AND THE EXIT MUST ACTUALLY PAY. An open instruction is not an exit; the DoS is only
-    // closed when the LP's tokens move.
+    // Live 2026-10-01b: the payout spans both pots in ONE 77 (the chosen pot is topped up from
+    // its sibling), so the LP no longer needs an off-chain consolidation first. Before that fix
+    // this draw failed Custom(25) on both pots.
     let before = tok(&env.svm, d.dest);
     exec_draw_from(&mut env, &d, DOMAIN)
-        .expect("#419 REGRESSION — redemption still fails after consolidating the pots");
+        .expect("#419 REGRESSION — a redemption larger than one pot must pay in one instruction");
     let paid = tok(&env.svm, d.dest) - before;
-    println!("    [#419] atoms paid after consolidation -> {paid}");
-
-    assert!(
-        paid > 0,
-        "#419 REGRESSION — redemption reported success but paid nothing"
-    );
+    println!("    [#419] atoms paid across both pots -> {paid}");
     assert_eq!(
         paid, MINTED as u64,
-        "the LP must be paid its full pro-rata claim once the pots are consolidated"
+        "the LP must be paid its full pro-rata claim across both pots"
     );
 }
 

@@ -24951,7 +24951,13 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             // Only PRINCIPAL moves; earnings stay with the domain that earned them.
-            if amount > from_ledger.total_principal_atoms {
+            // Live 2026-10-01b (SI `8WC8…`): only AVAILABLE principal (principal net of the
+            // pot's booked impairment) may move. Moving the full 1,000 out of a pot carrying a
+            // 0.032976 loss left `principal 0 < loss`, after which every pricing of that pot
+            // underflowed (77 -> 25), and a floored NAV would instead hide the loss from the
+            // remaining holders. The impairment stays with the pot that took it. Same code (25)
+            // as the old principal-only bound.
+            if amount > backing_ledger_available_principal_atoms(&from_ledger) {
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
 
@@ -25492,19 +25498,34 @@ pub mod processor {
             {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
-            // rehearsal-23: fund the pooled payout across both pots (bound vaults only).
-            if bound_tail.is_some() {
-                let other_ledger_ai = if source_domain == registry.domain {
-                    sibling_ledger_ai
-                } else {
-                    ledger_ai
-                };
-                vault_pot_top_up_from_sibling(
+            // rehearsal-23: fund the pooled payout across both pots. #419 / live 2026-10-01b:
+            // a NON-bound vault is priced on the combined pots too (NAV, available principal and
+            // LP earnings all span both ledgers), so it gets the same top-up — non-bound rules:
+            // ledger-principal shortfall covered, sibling clamped to its available principal —
+            // plus the earnings-leg relabel. No-op whenever the chosen pot already suffices, so
+            // every single-pot redemption is byte-for-byte the old path.
+            let other_ledger_ai = if source_domain == registry.domain {
+                sibling_ledger_ai
+            } else {
+                ledger_ai
+            };
+            vault_pot_top_up_from_sibling(
+                &mut group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                domain,
+                backing_num,
+                source_ledger_ai,
+                other_ledger_ai,
+                if bound_tail.is_some() { None } else { Some(principal_portion) },
+            )?;
+            if bound_tail.is_none() {
+                vault_pot_earnings_top_up_from_sibling(
                     &mut group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
                     domain,
-                    backing_num,
+                    gross_consumed,
                     source_ledger_ai,
                     other_ledger_ai,
                 )?;
@@ -27885,6 +27906,23 @@ pub mod processor {
     /// backing (never backing reserved for live winner claims) moves to the chosen pot, ledger
     /// principal moves with it, `header.vault` nets to 0, no SPL. No-op when the pot suffices or
     /// either ledger is not writable.
+    ///
+    /// #419 / live 2026-10-01b (SI `8WC8…`): a NON-bound vault has the same shape — 77 prices on
+    /// the combined pots and pays from one, so every wizard market (1,000 seeded per pot) failed
+    /// 25 for any redemption above one pot. `nonbound_need_ledger = Some(principal_portion)`
+    /// selects the non-bound rules:
+    ///   * the move also covers the chosen pot's LEDGER-principal shortfall (77's ledger gate);
+    ///   * it never moves more than the sibling ledger's AVAILABLE principal (principal minus
+    ///     net impairment): moving the impairment would leave `principal < loss` there and every
+    ///     later pricing of that pot underflows (25) — the tag-91 trap the live fork hit;
+    ///   * a lapsed sibling bucket is not a source (W-21: its principal is tag 89's to forfeit).
+    ///
+    /// Bound (`None`): unchanged rules — the pots' physical backing is the truth there (F-14).
+    ///
+    /// Both modes: "free" backing is the pot's fresh idle backing net of what its live winner
+    /// claims reserve (`available - positive_claim_bound`, the exact stay-fully-backed gate 77
+    /// applies), on BOTH sides — so the chosen pot keeps its own winners' reservation and the
+    /// shortfall comes from the sibling instead of failing 21.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn vault_pot_top_up_from_sibling<'a>(
@@ -27895,30 +27933,57 @@ pub mod processor {
         need_num: u128,
         to_ledger_ai: &AccountInfo<'a>,
         from_ledger_ai: &AccountInfo<'a>,
+        nonbound_need_ledger: Option<u128>,
     ) -> ProgramResult {
-        let (_, to_bucket) = backing_domain_parts_view(group, to_domain)?;
-        let have = if to_bucket.status == BackingBucketStatusV16::Fresh {
-            to_bucket.fresh_unliened_backing_num
-        } else {
-            0
-        };
-        if have >= need_num || !to_ledger_ai.is_writable || !from_ledger_ai.is_writable {
+        if !to_ledger_ai.is_writable || !from_ledger_ai.is_writable {
             return Ok(());
         }
         let from_domain = sibling_domain(to_domain as u16) as usize;
-        let (from_source, from_bucket) = backing_domain_parts_view(group, from_domain)?;
-        if from_bucket.status != BackingBucketStatusV16::Fresh {
+        let (to_source, to_bucket) = backing_domain_parts_view(group, to_domain)?;
+        let have = vault_pot_free_backing_num(&to_source, &to_bucket);
+        let fresh_short = need_num.saturating_sub(have).div_ceil(BOUND_SCALE);
+        if fresh_short == 0 && nonbound_need_ledger.is_none() {
             return Ok(());
         }
-        let from_free = from_bucket
-            .fresh_unliened_backing_num
-            .min(
-                from_source
-                    .fresh_reserved_backing_num
-                    .saturating_sub(from_source.positive_claim_bound_num),
-            )
-            / BOUND_SCALE;
-        let short = (need_num - have).div_ceil(BOUND_SCALE);
+        let (from_source, from_bucket) = backing_domain_parts_view(group, from_domain)?;
+        // Both ledgers, synced against the PRE-move buckets (#413: syncing the destination
+        // after the refill would read the receivable pay-down as a phantom recovery).
+        let (mut to_l, to_init) = read_or_new_backing_domain_ledger(
+            &to_ledger_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            to_domain as u16,
+            &to_bucket,
+        )?;
+        sync_backing_domain_ledger(&mut to_l, &to_bucket)?;
+        let (mut from_l, from_init) = read_or_new_backing_domain_ledger(
+            &from_ledger_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            from_domain as u16,
+            &from_bucket,
+        )?;
+        sync_backing_domain_ledger(&mut from_l, &from_bucket)?;
+
+        let ledger_short = nonbound_need_ledger
+            .map(|need| need.saturating_sub(to_l.total_principal_atoms))
+            .unwrap_or(0);
+        let short = fresh_short.max(ledger_short);
+        if short == 0 {
+            return Ok(());
+        }
+        let mut from_free = vault_pot_free_backing_num(&from_source, &from_bucket) / BOUND_SCALE;
+        if nonbound_need_ledger.is_some() {
+            if !from_init
+                || !policy_v16::backing_principal_withdrawal_is_fresh(
+                    from_bucket.expiry_slot,
+                    authenticated_market_slot_or_fallback_view(group),
+                )
+            {
+                return Ok(());
+            }
+            from_free = from_free.min(backing_ledger_available_principal_atoms(&from_l));
+        }
         let x = short.min(from_free);
         if x == 0 {
             return Ok(());
@@ -27944,27 +28009,171 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?,
             expiry,
         )?;
-        // Ledger principal moves in lockstep (from -x, to +x), re-baselined like a rebalance.
-        for (ai, d, add) in [(from_ledger_ai, from_domain, false), (to_ledger_ai, to_domain, true)] {
-            let mut data = ai.try_borrow_mut_data()?;
+        // Ledger principal moves in lockstep (from -x, to +x); watermarks pinned to the
+        // post-move buckets so the next sync books no phantom loss or recovery.
+        from_l.total_principal_atoms = if nonbound_need_ledger.is_some() {
+            // x <= available principal <= principal: exact.
+            from_l
+                .total_principal_atoms
+                .checked_sub(x)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?
+        } else {
+            from_l.total_principal_atoms.saturating_sub(x)
+        };
+        to_l.total_principal_atoms = to_l
+            .total_principal_atoms
+            .checked_add(x)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        for (ai, d, l, init) in [
+            (from_ledger_ai, from_domain, &mut from_l, from_init),
+            (to_ledger_ai, to_domain, &mut to_l, to_init),
+        ] {
             let (_, b) = backing_domain_parts_view(group, d)?;
-            let (mut l, init) =
-                read_or_new_backing_domain_ledger(&data, market_key, registry_pda, d as u16, &b)?;
-            sync_backing_domain_ledger(&mut l, &b)?;
-            l.total_principal_atoms = if add {
-                l.total_principal_atoms
-                    .checked_add(x)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-            } else {
-                l.total_principal_atoms.saturating_sub(x)
-            };
             l.last_observed_unavailable_principal_atoms = backing_unavailable_principal_atoms(&b)?;
-            write_or_init_backing_domain_ledger(&mut data, &l, init)?;
+            l.last_observed_bucket_earnings_atoms = b.utilization_fee_earnings;
+            write_or_init_backing_domain_ledger(&mut ai.try_borrow_mut_data()?, l, init)?;
         }
         group.validate_shape().map_err(map_v16_error)?;
         solana_program::log::sol_log(&alloc::format!(
             "p3_redeem_pot_top_up from={} to={} atoms={}",
             from_domain, to_domain, x
+        ));
+        Ok(())
+    }
+
+    /// A pot's fresh idle backing that its live winner claims do NOT reserve, in num: what can
+    /// leave the pot while it stays fully backed (`expected_source_credit_rate_num == SCALE`,
+    /// i.e. `available - x >= positive_claim_bound`). Never more than the older
+    /// `fresh_reserved - positive_claim_bound` reading. 0 for a non-Fresh pot or an
+    /// inconsistent source (the gates downstream then refuse, as before).
+    fn vault_pot_free_backing_num(
+        source: &SourceCreditStateV16,
+        bucket: &percolator::BackingBucketV16,
+    ) -> u128 {
+        if bucket.status != BackingBucketStatusV16::Fresh {
+            return 0;
+        }
+        let available = match source_credit_available_backing_num(*source) {
+            Ok(a) => a,
+            Err(_) => return 0,
+        };
+        bucket
+            .fresh_unliened_backing_num
+            .min(
+                source
+                    .fresh_reserved_backing_num
+                    .saturating_sub(source.positive_claim_bound_num),
+            )
+            .min(available.saturating_sub(source.positive_claim_bound_num))
+    }
+
+    /// A synced ledger's available principal (principal net of impairment), floored at 0.
+    fn backing_ledger_available_principal_atoms(l: &state::BackingDomainLedgerAccountV16) -> u128 {
+        l.total_principal_atoms.saturating_sub(
+            l.cumulative_loss_atoms
+                .saturating_sub(l.cumulative_recovery_atoms),
+        )
+    }
+
+    /// #419 earnings leg (non-bound vault): 77 prices LP earnings on BOTH pots' ledgers but
+    /// consumes the gross earnings (`gross_consumed`) from the chosen pot's bucket only, so a
+    /// redeemer whose earnings share exceeds that pot failed (21 at the earnings gate / 25 at
+    /// the gross decrement). Relabel the shortfall of the sibling's gross utilization-fee
+    /// earnings onto the chosen pot: bucket -> bucket and ledger -> ledger, in lockstep.
+    /// `header.backing_provider_earnings_total` and `header.vault` are unchanged (the atoms
+    /// never leave the vault; only which pot books them). Never more than the sibling ledger's
+    /// own unwithdrawn earnings, so the sibling ledger cannot go `withdrawn > earned`.
+    #[inline(never)]
+    fn vault_pot_earnings_top_up_from_sibling<'a>(
+        group: &mut state::MarketViewMutV16<'_>,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        to_domain: usize,
+        need_gross: u128,
+        to_ledger_ai: &AccountInfo<'a>,
+        from_ledger_ai: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        if need_gross == 0 || !to_ledger_ai.is_writable || !from_ledger_ai.is_writable {
+            return Ok(());
+        }
+        let from_domain = sibling_domain(to_domain as u16) as usize;
+        let (_, to_bucket) = backing_domain_parts_view(group, to_domain)?;
+        if to_bucket.utilization_fee_earnings >= need_gross {
+            return Ok(());
+        }
+        let (_, from_bucket) = backing_domain_parts_view(group, from_domain)?;
+        let (mut from_l, from_init) = read_or_new_backing_domain_ledger(
+            &from_ledger_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            from_domain as u16,
+            &from_bucket,
+        )?;
+        if !from_init {
+            return Ok(());
+        }
+        sync_backing_domain_ledger(&mut from_l, &from_bucket)?;
+        let (mut to_l, to_init) = read_or_new_backing_domain_ledger(
+            &to_ledger_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            to_domain as u16,
+            &to_bucket,
+        )?;
+        sync_backing_domain_ledger(&mut to_l, &to_bucket)?;
+        let g = (need_gross - to_bucket.utilization_fee_earnings)
+            .min(from_bucket.utilization_fee_earnings)
+            .min(
+                from_l
+                    .total_earnings_atoms
+                    .saturating_sub(from_l.total_earnings_withdrawn_atoms),
+            );
+        if g == 0 {
+            return Ok(());
+        }
+        let asset_index = to_domain / 2;
+        if asset_index >= group.markets.len() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        for (d, add) in [(from_domain, false), (to_domain, true)] {
+            let slot = &mut group.markets[asset_index].engine;
+            let bucket_acc = if d.is_multiple_of(2) {
+                &mut slot.backing_long
+            } else {
+                &mut slot.backing_short
+            };
+            let mut b = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
+            b.utilization_fee_earnings = if add {
+                b.utilization_fee_earnings
+                    .checked_add(g)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            } else {
+                b.utilization_fee_earnings
+                    .checked_sub(g)
+                    .ok_or(PercolatorError::EngineCounterUnderflow)?
+            };
+            *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&b);
+        }
+        from_l.total_earnings_atoms = from_l
+            .total_earnings_atoms
+            .checked_sub(g)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        to_l.total_earnings_atoms = to_l
+            .total_earnings_atoms
+            .checked_add(g)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        for (ai, d, l, init) in [
+            (from_ledger_ai, from_domain, &mut from_l, from_init),
+            (to_ledger_ai, to_domain, &mut to_l, to_init),
+        ] {
+            let (_, b) = backing_domain_parts_view(group, d)?;
+            l.last_observed_bucket_earnings_atoms = b.utilization_fee_earnings;
+            write_or_init_backing_domain_ledger(&mut ai.try_borrow_mut_data()?, l, init)?;
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "lp_redeem_earnings_top_up from={} to={} atoms={}",
+            from_domain, to_domain, g
         ));
         Ok(())
     }
