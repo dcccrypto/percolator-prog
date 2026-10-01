@@ -918,3 +918,48 @@ fn top_up_into_a_pot_with_a_receivable_books_no_phantom_recovery() {
     assert_eq!(ledger_available(&sib), fresh(SIBLING_DOMAIN));
     assert_eq!(ledger_available(&own) + ledger_available(&sib), nav - owed, "remaining NAV exact");
 }
+
+/// ADVERSARIAL (code review M-1): any wallet can send tag 91. On bd4fe5f8 a stranger moving the
+/// full principal off an impaired pot locked the vault: every later 75 and 77 failed 25 for ALL
+/// depositors. The bad 91 must be refused, and deposits and withdrawals keep working.
+#[test]
+fn stranger_cannot_lock_the_vault_with_tag_91() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, SI_D0_PRINCIPAL, DOMAIN);
+    deposit(&mut env, &v, SI_D1_PRINCIPAL, SIBLING_DOMAIN);
+    consume_pot_backing(&mut env, SIBLING_DOMAIN, SI_D1_CONSUMED);
+
+    // `rebalance` signs with a brand-new funded keypair that holds no shares: a stranger.
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let err = rebalance(&mut env, &v, SIBLING_DOMAIN, DOMAIN, SI_D1_PRINCIPAL)
+        .expect_err("a stranger's full-principal 91 off an impaired pot must be refused");
+    assert!(err.contains("Custom(25)"), "got {err}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before, "nothing moved");
+
+    // A second depositor can still enter (75 prices both ledgers) ...
+    let (registry, mint) = (v.registry, v.mint);
+    let other = Keypair::new();
+    env.svm.airdrop(&other.pubkey(), 10_000_000_000).unwrap();
+    let (src2, ata2) = (Pubkey::new_unique(), Pubkey::new_unique());
+    let cm = env.collateral_mint;
+    set_token(&mut env.svm, src2, cm, other.pubkey(), 50_000_000);
+    set_token(&mut env.svm, ata2, mint, other.pubkey(), 0);
+    let payer = env.payer.insecure_clone();
+    send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::DepositToLpVault { amount: 50_000_000, domain: DOMAIN },
+        deposit_accounts(env.market, env.vault_token, registry, mint, ata2, src2, v.ledger, other.pubkey()),
+        &[&other],
+    )
+    .expect("75 still prices after the refused 91");
+    assert!(token_amount(&env.svm, ata2) > 0);
+
+    // ... and the creator still exits in full through one 77.
+    let shares = token_amount(&env.svm, v.lp_ata) as u128;
+    request(&mut env, &v, shares);
+    execute(&mut env, &v, DOMAIN).expect("77 still pays after the refused 91");
+    assert!(token_amount(&env.svm, v.dest) > 0);
+}
