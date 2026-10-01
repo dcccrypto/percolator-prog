@@ -177,6 +177,8 @@ pub struct EscrowSweep {
     pub nft_pda: Pubkey,
     pub holder_nft_ata: Pubkey,
     pub sweep: bool,
+    /// Sweep calls allowed (None = unlimited): models a holder who claims once and walks away.
+    pub budget: Option<u32>,
 }
 
 impl World {
@@ -1007,14 +1009,29 @@ impl World {
     }
 
     /// (payee key in `accounts[0]`, extra NFT-trio metas) for a permissionless terminal payout.
-    fn terminal_payee(&self, u: usize) -> (Pubkey, Vec<AccountMeta>) {
-        match &self.escrow {
-            Some(e) if e.u == u && e.sweep => (
-                e.holder,
-                vec![AccountMeta::new_readonly(e.nft_pda, false), AccountMeta::new_readonly(e.holder_nft_ata, false)],
-            ),
+    fn terminal_payee(&mut self, u: usize) -> (Pubkey, Vec<AccountMeta>) {
+        match &mut self.escrow {
+            Some(e) if e.u == u && e.sweep && e.budget != Some(0) => {
+                if let Some(b) = e.budget.as_mut() {
+                    *b -= 1;
+                }
+                (
+                    e.holder,
+                    vec![AccountMeta::new_readonly(e.nft_pda, false), AccountMeta::new_readonly(e.holder_nft_ata, false)],
+                )
+            }
             _ => (self.owners[u].pubkey(), vec![]),
         }
+    }
+
+    /// vault - c_tot - insurance - provider earnings - fresh backing (the engine's residual).
+    pub fn claim_free_residual(&self) -> u128 {
+        let (_, g) = self.env.market_state();
+        g.vault
+            .saturating_sub(g.c_tot)
+            .saturating_sub(g.insurance)
+            .saturating_sub(g.backing_provider_earnings_total)
+            .saturating_sub(g.source_fresh_backing_total_num / BOUND_SCALE)
     }
 
     pub fn do_close_resolved(&mut self, u: usize) -> Result<u64, String> {
@@ -1551,9 +1568,10 @@ impl World {
                 if let Some(pf) = self.env.svm.get_account(&self.ports[u]).and_then(|a| state::read_portfolio(&a.data).ok()) {
                     let rc = pf.resolved_payout_receipt;
                     if rc.present && !rc.finalized {
+                        // Still owed. P3 option (b): an open receipt is a haircut only if the value
+                        // reserved for it is gone (checked after the Earn exits, below).
                         let owed = rc.terminal_positive_claim_face.saturating_sub(rc.paid_effective);
-                        *self.stats.soft.entry("close_resolved_haircut_events").or_default() += 1;
-                        *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += owed.min(u64::MAX as u128) as u64;
+                        *self.stats.soft.entry("open_receipt_owed_atoms").or_default() += owed.min(u64::MAX as u128) as u64;
                     }
                 }
             }
@@ -1570,6 +1588,16 @@ impl World {
                 *self.stats.ok.entry("winddown_lp_redeem").or_default() += 1;
             }
             self.check()?;
+        }
+        // P3 option (b): every open receipt's remainder must still be RESERVED (claim-free
+        // residual >= what is owed) after the Earn exits; whatever is not is a winner haircut.
+        let owed = *self.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0) as u128;
+        if owed != 0 {
+            let resid = self.claim_free_residual();
+            if resid < owed {
+                *self.stats.soft.entry("close_resolved_haircut_events").or_default() += 1;
+                *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += (owed - resid).min(u64::MAX as u128) as u64;
+            }
         }
         if self.p3.is_some() {
             self.p3_terminal_checks()?;
@@ -4555,24 +4583,32 @@ fn p3_diluted_receipts_finalise_after_vault_lp_settles() {
     }
 }
 
-/// Negative control: without the post-101 tag-46 sweep (the gate's ordering) the eedb case locks
-/// the seniors (P3-f, materialized 1, 77 -> 21) with its winner 1,340 short. The other three cases
-/// discriminate in the gate harness (deedd0fc World: `anvil_probe_{e968,cacb,1369}`), not in this
-/// @1827c83a World copy, where they pass with or without the sweep.
+/// Without the post-101 tag-46 sweep (the gate's ordering) the eedb winner's receipt stays open,
+/// 1,340 short. On 5e4c15ff that locked the seniors (P3-f, materialized 1, 77 -> 21). With P3
+/// option (b) the seniors and junior exit anyway and the remainder stays RESERVED (residual >=
+/// owed after every Earn exit, so no haircut is counted); the holder can claim it later.
 #[test]
-fn p3_diluted_receipts_negative_control_without_post_101_topup() {
+fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
     std::env::set_var("ANVIL_NO_KEEPER_TOPUP", "1");
-    let mut failed = Vec::new();
-    for (label, fee, plain, ops) in diluted_receipt_cases() {
-        let (r, haircut, _) = diluted_receipt_run(fee, plain, &ops);
-        eprintln!("{label} (no sweep): {:?} haircut {haircut}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()));
-        if r.is_err() || haircut > 2 {
-            failed.push(label);
-        }
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::remove_var("FUZZ_LP_DOMAINS");
+    std::env::set_var("FUZZ_P3_PRECRANK", "1");
+    let (label, fee, _, ops) = diluted_receipt_cases().into_iter().next().unwrap();
+    let mut w = World::new(fee);
+    for op in &ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants");
     }
+    let r = w.wind_down();
     std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
-    assert!(failed.contains(&"eedb std fee30"), "control: eedb must fail without the sweep, failed {failed:?}");
+    let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0) as u128;
+    let haircut = *w.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0);
+    eprintln!("{label} (no sweep): {:?} open receipt owed {owed} haircut {haircut} residual {}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()), w.claim_free_residual());
+    r.expect("seniors and junior exit beside the open receipt");
+    assert!(owed > 0, "vacuity: the receipt is still open without the sweep");
+    assert_eq!(haircut, 0, "the open remainder stays reserved (not a haircut)");
+    assert!(w.claim_free_residual() >= owed, "reserved: residual {} >= owed {owed}", w.claim_free_residual());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4594,8 +4630,12 @@ enum EscrowMode {
     /// The NFT sits in a token account owned by an OFF-CURVE address (allowOwnerOffCurve): the
     /// stranger still sweeps it, to that holder's token account.
     SweepOffCurveHolder,
-    /// GH#496: a stranger names the escrow PDA itself as payee (its token account holding the NFT).
-    SweepEscrowPdaAsOwner,
+    /// The NFT was parked PRE-CLOSE in a token account owned by the escrow PDA itself: the
+    /// proven holder is the escrow PDA, and the stranger's sweep pays it (holder's own choice).
+    SweepEscrowPdaParked,
+    /// The holder claims ONCE (the diluted first close leaves an open receipt) and walks away:
+    /// option (b) lets the seniors and junior exit while that remainder stays reserved.
+    SweepOnceThenIdle,
 }
 
 impl World {
@@ -4640,7 +4680,7 @@ impl World {
         self.env.svm.set_account(nft_pda, Account { lamports: 1_000_000_000, data: nd, owner: nft_prog, executable: false, rent_epoch: 0 }).unwrap();
         let holder_nft_ata = Pubkey::new_unique();
         self.env.svm.set_account(holder_nft_ata, Account { lamports: 1_000_000_000, data: make_token_data(nft_mint, holder, nft_amount), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
-        self.escrow = Some(EscrowSweep { u, holder, nft_pda, holder_nft_ata, sweep });
+        self.escrow = Some(EscrowSweep { u, holder, nft_pda, holder_nft_ata, sweep, budget: None });
         holder
     }
 }
@@ -4664,7 +4704,7 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     let value = pf.capital + pf.pnl as u128;
     let holder = match mode {
         EscrowMode::SweepOffCurveHolder => Some(Pubkey::find_program_address(&[b"marketplace-vault"], &Pubkey::new_unique()).0),
-        EscrowMode::SweepEscrowPdaAsOwner => None,
+        EscrowMode::SweepEscrowPdaParked => None,
         _ => Some(Keypair::new().pubkey()),
     };
     if let Some(h) = holder {
@@ -4672,41 +4712,112 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     }
     let amount = if mode == EscrowMode::SweepUnproven { 0 } else { 1 };
     let holder = w.escrow_portfolio(u, holder, amount, mode != EscrowMode::NoSweep);
+    if mode == EscrowMode::SweepOnceThenIdle {
+        w.escrow.as_mut().unwrap().budget = Some(1);
+    }
     let original_owner = w.owners[u].pubkey();
     let owner_before = w.holdings_of(&original_owner);
     let r = w.wind_down();
     let holder_got = w.holdings_of(&holder);
     let owner_got = w.holdings_of(&original_owner).saturating_sub(owner_before);
     let c = w.p3.as_ref().unwrap();
-    (r, value, holder_got, owner_got, c.senior_out)
+    let out = (r, value, holder_got, owner_got, c.senior_out);
+    LAST_ESCROW_WORLD.with(|x| *x.borrow_mut() = Some(w));
+    out
+}
+
+thread_local! {
+    static LAST_ESCROW_WORLD: std::cell::RefCell<Option<World>> = const { std::cell::RefCell::new(None) };
 }
 
 #[test]
 fn p3_escrowed_dust_winner_swept_by_stranger_pays_holder_and_unlocks_seniors() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-    // On-curve wallet holder, and (security FIX-FIRST on 65068843) an NFT parked under an
-    // OFF-CURVE owner: both are swept by a stranger, to the holder's own token account.
-    for mode in [EscrowMode::Sweep, EscrowMode::SweepOffCurveHolder] {
-    let (r, value, holder_got, owner_got, senior_out) = escrow_winner_run(mode);
-    eprintln!("escrow {mode:?}: {:?} value {value} holder {holder_got} original owner {owner_got} seniors out {senior_out}", r.as_ref().err());
-    r.expect("seniors and junior exit: the stranger's sweep finalised the escrowed receipt");
-    assert!(holder_got + 2 >= value, "the current NFT holder receives the whole terminal payout: {holder_got} of {value}");
-    // The pre-wrap owner is also the market's Earn senior in this World: everything it received
-    // is its Earn redemption (77), none of the escrowed portfolio's payout.
-    assert_eq!(owner_got, senior_out, "the pre-wrap owner of record receives nothing from the escrowed portfolio");
-    assert!(senior_out + 2_000 >= 10_000_000, "seniors redeemed: {senior_out}");
+    // A wallet holder, an OFF-CURVE-owned holder token account, and an NFT parked PRE-CLOSE in a
+    // token account owned by the escrow PDA itself: a stranger sweeps each, paying the proven
+    // holder, and the seniors redeem.
+    for mode in [EscrowMode::Sweep, EscrowMode::SweepOffCurveHolder, EscrowMode::SweepEscrowPdaParked] {
+        let (r, value, holder_got, owner_got, senior_out) = escrow_winner_run(mode);
+        eprintln!("escrow {mode:?}: {:?} value {value} holder {holder_got} original owner {owner_got} seniors out {senior_out}", r.as_ref().err());
+        r.unwrap_or_else(|e| panic!("{mode:?}: seniors and junior exit after the stranger's sweep: {e}"));
+        assert!(holder_got + 2 >= value, "{mode:?}: the proven holder receives the whole terminal payout: {holder_got} of {value}");
+        // The pre-wrap owner is also the market's Earn senior in this World: everything it
+        // received is its Earn redemption (77), none of the escrowed portfolio's payout.
+        assert_eq!(owner_got, senior_out, "{mode:?}: the owner of record receives nothing from the escrowed portfolio");
+        assert!(senior_out + 2_000 >= 10_000_000, "{mode:?}: seniors redeemed: {senior_out}");
     }
 }
 
-/// Negative controls: without a proven on-curve holder the escrowed receipt stays open and the
-/// seniors stay locked (P3-f), and no tokens reach anyone but through the holder path.
+/// P3 option (b): the holder claims once (a partial receipt, diluted by the vault LP's claim) and
+/// never comes back. The seniors and the junior still exit (the gate ignores a receipt-only
+/// portfolio); the receipt's remainder stays RESERVED in the claim-free residual (vault >= it,
+/// asserted after every Earn exit), and the holder claims it in full later.
+#[test]
+fn p3_open_receipt_reserved_while_seniors_exit_and_claimable_later() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    let (r, value, holder_got, _, senior_out) = escrow_winner_run(EscrowMode::SweepOnceThenIdle);
+    eprintln!("once-then-idle: {:?} value {value} holder so far {holder_got} seniors out {senior_out}", r.as_ref().err());
+    r.expect("seniors and junior exit beside an open receipt");
+    assert!(senior_out + 2_000 >= 10_000_000, "seniors redeemed: {senior_out}");
+    LAST_ESCROW_WORLD.with(|x| {
+        let mut b = x.borrow_mut();
+        let w = b.as_mut().unwrap();
+        let u = w.escrow.as_ref().unwrap().u;
+        let holder = w.escrow.as_ref().unwrap().holder;
+        let pf = w.env.portfolio_state(w.ports[u]);
+        let rc = pf.resolved_payout_receipt;
+        assert!(rc.present && !rc.finalized, "vacuity: the receipt is still open after the Earn exits");
+        let owed = rc.terminal_positive_claim_face - rc.paid_effective;
+        assert!(owed > 0 && holder_got + owed + 2 >= value, "vacuity: a real remainder is owed ({owed})");
+        let (_, g) = w.env.market_state();
+        let resid = w.claim_free_residual();
+        eprintln!("open receipt owed {owed}; vault {} residual {resid} fresh {}", g.vault, g.source_fresh_backing_total_num / BOUND_SCALE);
+        assert!(g.vault >= owed && resid >= owed, "the receipt's remainder stays reserved: vault {} residual {resid} owed {owed}", g.vault);
+        // Hardening: a payout destination equal to the vault token account is refused.
+        {
+            let e = w.escrow.clone().unwrap();
+            let (m, v, va, p) = (w.env.market, w.env.vault, w.env.vault_authority, w.ports[u]);
+            let r = w.send(
+                ProgInstruction::ClaimResolvedPayoutTopup,
+                vec![
+                    AccountMeta::new_readonly(e.holder, false),
+                    AccountMeta::new(m, false),
+                    AccountMeta::new(p, false),
+                    AccountMeta::new(v, false),
+                    AccountMeta::new(v, false),
+                    AccountMeta::new_readonly(va, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(nft_registry_pda(&m), false),
+                    AccountMeta::new_readonly(e.nft_pda, false),
+                    AccountMeta::new_readonly(e.holder_nft_ata, false),
+                ],
+                &[],
+            );
+            assert_eq!(r.as_ref().err().and_then(|x| custom_code(x)), Some(11), "dest == vault is refused (InvalidTokenAccount): {:?}", r.as_ref().err().map(|x| x.chars().take(200).collect::<String>()));
+        }
+        // Later: the holder (any stranger on its behalf) claims; it is paid in full.
+        w.escrow.as_mut().unwrap().budget = None;
+        let before = w.holdings_of(&holder);
+        let _ = w.do_claim_topup(u);
+        let _ = w.do_close_resolved(u);
+        let got = w.holdings_of(&holder) - before;
+        let rc = w.env.portfolio_state(w.ports[u]).resolved_payout_receipt;
+        eprintln!("late claim paid {got}, receipt finalized {}", rc.finalized || !rc.present);
+        assert!(got + 2 >= owed, "the holder claims the whole remainder later: {got} of {owed}");
+        assert!(rc.finalized || !rc.present, "the receipt is finalised by the late claim");
+    });
+}
+
+/// Negative controls: the gate ignores ONLY receipt-only portfolios. An escrowed winner that
+/// was never closed still holds capital (nobody idle, or an unproven holder), so the seniors stay
+/// locked (P3-f) and nothing is paid.
 #[test]
 fn p3_escrowed_dust_winner_negative_controls() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
-    for mode in [EscrowMode::NoSweep, EscrowMode::SweepUnproven, EscrowMode::SweepEscrowPdaAsOwner] {
+    for mode in [EscrowMode::NoSweep, EscrowMode::SweepUnproven] {
         let (r, _value, holder_got, owner_got, _) = escrow_winner_run(mode);
         eprintln!("{mode:?}: {:?} holder {holder_got} owner {owner_got}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()));
-        let e = r.expect_err("control: an unswept escrowed winner must keep the seniors locked");
+        let e = r.expect_err("control: an escrowed winner that still holds capital keeps the seniors locked");
         assert!(e.contains("SENIORS LOCKED"), "{mode:?}: expected P3-f, got {e}");
         assert_eq!(holder_got, 0, "{mode:?}: nothing reaches the holder without a proven sweep");
         assert_eq!(owner_got, 0, "{mode:?}: the owner of record is never paid for an escrowed portfolio");

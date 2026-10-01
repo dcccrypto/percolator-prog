@@ -418,6 +418,17 @@ pub mod constants {
     /// vault-owned atoms (C-7 exhausted / single-pot race: winners were short 8,511 / 8,699).
     pub const ASSET_VAULT_POT_OWNED_OFF: usize = 800;
     pub const ASSET_VAULT_POT_OWNED_LEN: usize = 32;
+    /// P3 option (b) (security review of d1fb6023): MARKET-WIDE count (u64, kept in asset slot
+    /// 0's wrapper bytes [792, 800), below the pot-owned counters — zero spare headroom above P1's
+    /// risk limits: NO LAYOUT CHANGE) of registered portfolios whose ONLY remaining state is an
+    /// unfinalised resolved payout receipt. Zero (deployed / fresh) = none known, i.e. today's
+    /// strict terminal-flat gate.
+    pub const MARKET_RESOLVED_RECEIPT_ONLY_OFF: usize = 792;
+    pub const MARKET_RESOLVED_RECEIPT_ONLY_LEN: usize = 8;
+    const _: () = assert!(
+        MARKET_RESOLVED_RECEIPT_ONLY_OFF + MARKET_RESOLVED_RECEIPT_ONLY_LEN == ASSET_VAULT_POT_OWNED_OFF
+    );
+    const _: () = assert!(MARKET_RESOLVED_RECEIPT_ONLY_OFF >= 672);
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF + ASSET_VAULT_POT_OWNED_LEN == 832);
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF >= 672);
     pub const ASSET_VAULT_LP_DRAW_LEN: usize = 64;
@@ -11725,6 +11736,26 @@ pub mod processor {
         instruction_data: &[u8],
     ) -> ProgramResult {
         restamp_vault_pots_in_writable_markets(program_id, accounts)?;
+        // P3 option (b): the Earn exits (77, 102) and the terminal harvest/absorption (78) may
+        // run beside open resolved receipts; they must never lower the claim-free residual that
+        // is reserved for those receipts. Fail closed if they do.
+        let reserve = match instruction_data.first() {
+            Some(77) | Some(78) | Some(102) => Some(resolved_receipt_reserve_snapshot(program_id, accounts)?),
+            _ => None,
+        };
+        process_instruction_dispatch(program_id, accounts, instruction_data)?;
+        if let Some(before) = reserve {
+            resolved_receipt_reserve_check(program_id, accounts, &before)?;
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn process_instruction_dispatch<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
         match Instruction::decode(instruction_data)? {
             Instruction::InitMarket {
                 max_portfolio_assets,
@@ -22955,10 +22986,19 @@ pub mod processor {
             // backing in the SIBLING pot covers a winner's claim pot before the engine realises
             // it at a sub-unit credit rate (the Resolved twin of the Live relabel / top-up).
             vault_cover_resolved_claim_shortfall(program_id, market_ai.key, &cfg, &mut group, &mut portfolio)?;
+            let receipt_only_before = portfolio_is_receipt_only(&portfolio)?;
+            let reserved_residual = receipt_reserve_bound(&group)?;
             let insurance_before = group.header.insurance.get();
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
+            let receipt_only_after = portfolio_is_receipt_only(&portfolio)?;
+            resolved_receipt_only_transition(&mut group, receipt_only_before, receipt_only_after)?;
+            if let (Some(bound), percolator::ResolvedCloseOutcomeV16::Closed { payout }) = (reserved_residual, outcome) {
+                if payout > bound {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+            }
             // close_resolved can charge an accrued maintenance fee into header.insurance.
             // Domain-credit it (mirroring SyncMaintenanceFee) so it stays withdrawable via
             // a per-domain budget; otherwise it strands in aggregate insurance — withdrawable
@@ -23076,9 +23116,18 @@ pub mod processor {
             group
                 .advance_resolved_slot_not_atomic(authenticated_slot)
                 .map_err(map_v16_error)?;
+            let receipt_only_before = portfolio_is_receipt_only(&portfolio)?;
+            let reserved_residual = receipt_reserve_bound(&group)?;
             let payout = group
                 .claim_resolved_payout_topup_not_atomic(&mut portfolio)
                 .map_err(map_v16_error)?;
+            let receipt_only_after = portfolio_is_receipt_only(&portfolio)?;
+            resolved_receipt_only_transition(&mut group, receipt_only_before, receipt_only_after)?;
+            if let Some(bound) = reserved_residual {
+                if payout > bound {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+            }
             (
                 cfg,
                 payout,
@@ -25263,10 +25312,11 @@ pub mod processor {
                 }
                 // F-14: on a terminal-flat Resolved market any claim-free residual belongs in
                 // the pots before seniors are priced; tag 78 absorbs it. Bundle 78 first.
-                if group.header.mode == 1
-                    && group.header.materialized_portfolio_count.get() == 0
-                    && group.header.c_tot.get() == 0
-                    && (vault_terminal_residual_atoms(&group)? != 0
+                // P3 option (b): with receipts open the residual is THEIRS (reserved), so only the
+                // stray must have been absorbed first.
+                let (flat, receipts_open) = resolved_terminal_flat(&group)?;
+                if flat
+                    && ((!receipts_open && vault_terminal_residual_atoms(&group)? != 0)
                         || vault_terminal_stray_atoms(&group, asset_index)?.iter().any(|x| *x != 0))
                 {
                     return Err(PercolatorError::VaultLpHarvestPending.into());
@@ -25429,8 +25479,7 @@ pub mod processor {
             // own backing); mode 2 = Recovery and any non-terminal Resolved stay blocked.
             match group.header.mode {
                 0 => {}
-                1 if group.header.materialized_portfolio_count.get() == 0
-                    && group.header.c_tot.get() == 0 => {}
+                1 if resolved_terminal_flat(&group)?.0 => {}
                 _ => return Err(PercolatorError::EngineLockActive.into()),
             }
             // Registry must be the backing authority for this domain.
@@ -26255,10 +26304,8 @@ pub mod processor {
             // terminal-flat no trader payout can still draw on insurance, so the Finding-1
             // hazard (converting insurance that still backs traders) cannot arise; the clamp in
             // `lp_vault_harvestable_fee_atoms` keeps reserved/budgeted insurance untouched.
-            let resolved_terminal_harvest = bound_tail.is_some()
-                && group.header.mode == 1
-                && group.header.materialized_portfolio_count.get() == 0
-                && group.header.c_tot.get() == 0;
+            let (terminal_flat, receipts_open) = resolved_terminal_flat(&group)?;
+            let resolved_terminal_harvest = bound_tail.is_some() && terminal_flat;
             if group.header.mode != 0 && !resolved_terminal_harvest {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -26305,7 +26352,22 @@ pub mod processor {
             // counter owns, created when outside winners were paid from these pots and the
             // loss side refilled them) into the vault's OWN pot. Seniors then take it first
             // through min(physical, C); the junior only what is left over C (tag 102).
-            let absorbed = if resolved_terminal_harvest {
+            let absorbed = if resolved_terminal_harvest && receipts_open {
+                // P3 option (b): receipts are open, so the residual is reserved for them (no
+                // engine recredit, no residual absorption); only the stray (claim-free POT
+                // backing, never receipt value) becomes the vault's.
+                let stray = vault_absorb_terminal_stray(&mut group, domain)?;
+                if stray != 0 {
+                    let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                    ledger.last_observed_unavailable_principal_atoms =
+                        backing_unavailable_principal_atoms(&bucket_after)?;
+                    ledger.total_principal_atoms = ledger
+                        .total_principal_atoms
+                        .checked_add(stray)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                }
+                stray
+            } else if resolved_terminal_harvest {
                 match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(domain / 2) {
                     Ok(_) => {
                         let residual = vault_terminal_residual_atoms(&group)?;
@@ -27410,10 +27472,7 @@ pub mod processor {
         // loser's settled loss made redundant) is vault value the ledger NAV does not see; it
         // absorbs the move before any senior loss (junior first), and tag 78 then makes it the
         // vault's own. senior_loss = max(0, C_eff - nav - harvestable - stray).
-        let stray = if group.header.mode == 1
-            && group.header.materialized_portfolio_count.get() == 0
-            && group.header.c_tot.get() == 0
-        {
+        let stray = if resolved_terminal_flat(group)?.0 {
             let x = vault_terminal_stray_atoms(group, a)?;
             x[0].checked_add(x[1]).ok_or(PercolatorError::EngineArithmeticOverflow)?
         } else {
@@ -27554,10 +27613,7 @@ pub mod processor {
         // at TERMINAL-FLAT (no materialized portfolio, c_tot == 0): every loss is realised, every
         // winner is paid, and whatever backing is left beyond vault-owned principal (the stray)
         // is counted as vault value in the booking (`vault_lp_book_pending_draw`).
-        if has_pending
-            && group.header.mode == 1
-            && !(group.header.materialized_portfolio_count.get() == 0 && group.header.c_tot.get() == 0)
-        {
+        if has_pending && group.header.mode == 1 && !resolved_terminal_flat(&group)?.0 {
             return Ok(false);
         }
         // Current vault-LP value for the seniors-first recovery (0 when not passed/current).
@@ -27965,6 +28021,165 @@ pub mod processor {
 
 
     /// Claim-free residual (engine `residual()`): vault tokens no header counter owns.
+    /// P3 option (b): a portfolio whose ONLY remaining state is an unfinalised resolved payout
+    /// receipt — exactly the engine's `is_empty_for_dematerialization` with the receipt clause
+    /// inverted (a canceled-inert close ledger is conservatively NOT receipt-only: under-counting
+    /// keeps the strict gate, never opens it).
+    fn portfolio_is_receipt_only(
+        p: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<bool, ProgramError> {
+        let h = &p.header;
+        let receipt = h.resolved_payout_receipt.try_to_runtime().map_err(map_v16_error)?;
+        if !receipt.present || receipt.finalized {
+            return Ok(false);
+        }
+        if !percolator::active_bitmap_is_empty(h.active_bitmap.map(percolator::V16PodU64::get))
+            || h.capital.get() != 0
+            || h.pnl.get() != 0
+            || h.reserved_pnl.get() != 0
+            || h.fee_credits.get() != 0
+            || h.cancel_deposit_escrow.get() != 0
+            || h.stale_state != 0
+            || h.b_stale_state != 0
+            || h.rebalance_lock != 0
+            || h.liquidation_lock != 0
+            || h.source_domains.iter().any(|d| d.is_occupied())
+        {
+            return Ok(false);
+        }
+        let cp = h.close_progress.try_to_runtime().map_err(map_v16_error)?;
+        let finalized_inert = cp.active && cp.finalized && !cp.canceled && cp.residual_remaining == 0;
+        Ok(cp == percolator::CloseProgressLedgerV16::EMPTY || finalized_inert)
+    }
+
+    fn resolved_receipt_only_count(group: &state::MarketViewMutV16<'_>) -> Result<u64, ProgramError> {
+        let off = crate::constants::MARKET_RESOLVED_RECEIPT_ONLY_OFF;
+        let w = &group.markets.first().ok_or(PercolatorError::InvalidInstruction)?.wrapper;
+        let b: [u8; 8] = w
+            .get(off..off + 8)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .try_into()
+            .map_err(|_| PercolatorError::InvalidAccountLen)?;
+        Ok(u64::from_le_bytes(b))
+    }
+
+    /// Account for one portfolio's receipt-only transition inside a 45/46 instruction.
+    fn resolved_receipt_only_transition(
+        group: &mut state::MarketViewMutV16<'_>,
+        was: bool,
+        is: bool,
+    ) -> ProgramResult {
+        if was == is {
+            return Ok(());
+        }
+        let n = resolved_receipt_only_count(group)?;
+        let n = if is {
+            n.checked_add(1).ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            // A portfolio that turned receipt-only before this counter existed is not counted;
+            // never underflow (that only keeps the strict gate).
+            n.saturating_sub(1)
+        };
+        let off = crate::constants::MARKET_RESOLVED_RECEIPT_ONLY_OFF;
+        let m = group.markets.first_mut().ok_or(PercolatorError::InvalidInstruction)?;
+        m.wrapper
+            .get_mut(off..off + 8)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&n.to_le_bytes());
+        Ok(())
+    }
+
+    /// Resolved terminal-flat for the vault's Earn exits (77/102), the terminal fee harvest and
+    /// the stray absorption (78), and the terminal booking. Returns `(flat, receipts_open)`:
+    /// - strict: mode Resolved, c_tot == 0 and no materialized portfolio; or
+    /// - P3 option (b): every materialized portfolio is a counted receipt-only portfolio, with
+    ///   the engine's own claim-free aggregates all zero (no capital, positive pnl, claim bound,
+    ///   blocker, stale certificate or negative-pnl account anywhere). Then `receipts_open` is
+    ///   true and the whole claim-free RESIDUAL (`vault - c_tot - insurance - earnings - fresh
+    ///   backing`) is reserved for those receipts: they are paid from it (rate-bounded by the
+    ///   payout ledger) and never from pot backing, so 77/102 (which move only pot backing) cannot
+    ///   reach it, 78 does not absorb it, and `process_instruction` fails 77/78/102 closed if the
+    ///   residual drops.
+    fn resolved_terminal_flat(group: &state::MarketViewMutV16<'_>) -> Result<(bool, bool), ProgramError> {
+        let h = &group.header;
+        if h.mode != 1 || h.c_tot.get() != 0 {
+            return Ok((false, false));
+        }
+        let materialized = h.materialized_portfolio_count.get();
+        if materialized == 0 {
+            return Ok((true, false));
+        }
+        let receipt_only = resolved_receipt_only_count(group)?;
+        let flat = receipt_only == materialized
+            && h.pnl_pos_tot.get() == 0
+            && h.pnl_matured_pos_tot.get() == 0
+            && h.pnl_pos_bound_tot.get() == 0
+            && h.pnl_pos_bound_tot_num.get() == 0
+            && h.source_claim_bound_total_num.get() == 0
+            && h.resolved_payout_blocker_count.get() == 0
+            && h.stale_certificate_count.get() == 0
+            && h.b_stale_account_count.get() == 0
+            && h.negative_pnl_account_count.get() == 0;
+        Ok((flat, flat))
+    }
+
+    /// P3 option (b), the other half of the reservation: once the market is terminal-flat with
+    /// receipts open (Earn may already have exited), a receipt payment (45/46) is paid from the
+    /// reserved claim-free residual ONLY — never from pot backing. `Some(residual)` is that bound.
+    fn receipt_reserve_bound(group: &state::MarketViewMutV16<'_>) -> Result<Option<u128>, ProgramError> {
+        if resolved_terminal_flat(group)?.1 {
+            Ok(Some(vault_terminal_residual_atoms(group)?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// (market key, residual) of every writable market account in `accounts` that is Resolved
+    /// terminal-flat with open receipts (P3 option (b)); checked again after 77/78/102.
+    fn resolved_receipt_reserve_snapshot(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+    ) -> Result<alloc::vec::Vec<(Pubkey, u128)>, ProgramError> {
+        let mut out = alloc::vec::Vec::new();
+        for ai in accounts.iter() {
+            if !ai.is_writable || ai.owner != program_id {
+                continue;
+            }
+            let Ok(mut data) = ai.try_borrow_mut_data() else {
+                continue;
+            };
+            if data.len() < crate::constants::MIN_MARKET_ACCOUNT_LEN {
+                continue;
+            }
+            let Ok((_, group)) = state::market_view_mut(&mut data) else {
+                continue;
+            };
+            if resolved_terminal_flat(&group)?.1 {
+                out.push((*ai.key, vault_terminal_residual_atoms(&group)?));
+            }
+        }
+        Ok(out)
+    }
+
+    fn resolved_receipt_reserve_check(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        before: &[(Pubkey, u128)],
+    ) -> ProgramResult {
+        for (key, residual_before) in before {
+            let Some(ai) = accounts.iter().find(|a| a.key == key && a.owner == program_id) else {
+                continue;
+            };
+            let mut data = ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut data)?;
+            if vault_terminal_residual_atoms(&group)? < *residual_before {
+                solana_program::log::sol_log("p3_resolved_receipt_reserve_breached");
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+        }
+        Ok(())
+    }
+
     fn vault_terminal_residual_atoms(group: &state::MarketViewMutV16<'_>) -> Result<u128, ProgramError> {
         let owned = group
             .header
@@ -29582,10 +29797,7 @@ pub mod processor {
             if resolved {
                 // Terminal-flat only: no portfolio (and so no pending resolved payout) can still
                 // draw on the pots after the junior takes the surplus.
-                if group.header.mode != 1
-                    || group.header.c_tot.get() != 0
-                    || group.header.materialized_portfolio_count.get() != 0
-                {
+                if !resolved_terminal_flat(&group)?.0 {
                     return Err(PercolatorError::EngineLockActive.into());
                 }
             } else {
@@ -33347,11 +33559,11 @@ pub mod processor {
             // `accounts[0]` (owner + unencumbered). Any holder qualifies, on- or off-curve
             // (security FIX-FIRST on 65068843: an on-curve requirement let a holder park the NFT
             // under an off-curve owner and re-lock the market); a holder whose program cannot
-            // move what lands in its own account only harms itself.
-            // GH#496: the escrow PDA itself is never a payee.
-            if owner.key.to_bytes() == escrow_authority.to_bytes() {
-                return Err(PercolatorError::ExpectedSigner.into());
-            }
+            // move what lands in its own account only harms itself. That includes the escrow
+            // PDA itself when it TRULY holds the NFT (the holder gave it away): GH#496 was an
+            // unproven payee; here an escrow-PDA payee needs its own token account to hold the
+            // bound NFT, which no third party can arrange (security, d1fb6023 review: a blanket
+            // escrow-PDA refusal re-locked a portfolio whose NFT was parked there pre-close).
             let nft = optional_nft_holder_accounts(accounts, registry_index);
             if nft.is_none()
                 || authorize_owner_or_nft_holder_raw(
@@ -33389,6 +33601,10 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
     ) -> Result<u64, ProgramError> {
+        // Hardening (security review of d1fb6023): a payout never lands back in the vault.
+        if dest_token_ai.key == vault_token_ai.key {
+            return Err(PercolatorError::InvalidTokenAccount.into());
+        }
         let dest = unpack_token_account(dest_token_ai)?;
         let vault = unpack_token_account(vault_token_ai)?;
         if dest.mint != vault.mint || !is_withdrawable_collateral_mint(cfg, &dest.mint) {
