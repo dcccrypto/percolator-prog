@@ -25530,6 +25530,7 @@ pub mod processor {
                     other_ledger_ai,
                 )?;
             }
+            let source_check_slot = authenticated_market_slot_or_fallback_view(&group);
             let (source_acc, bucket_acc) = if domain % 2 == 0 {
                 (
                     &mut group.markets[asset_index].engine.source_credit_long,
@@ -25560,7 +25561,12 @@ pub mod processor {
             // engine's resolved close can return backing to the pot without a wrapper ledger
             // write), so it is not a gate there and is decremented saturating.
             let ledger_gate = !(bound_tail.is_some() && group.header.mode == 1);
-            if ledger_gate && principal_portion > ledger.total_principal_atoms {
+            let ledger_cap = if bound_tail.is_some() {
+                ledger.total_principal_atoms
+            } else {
+                backing_ledger_available_principal_atoms(&ledger)
+            };
+            if ledger_gate && principal_portion > ledger_cap {
                 // B24 / gate-100: on a LIVE bound vault the chosen pot cannot fund this payout —
                 // name it (recall or redeem less), before any generic counter error.
                 if bound_tail.is_some() && group.header.mode == 0 {
@@ -25587,7 +25593,17 @@ pub mod processor {
             // out; it needs a recall (98, permissionless, LP flat) first, or a smaller
             // redemption. Name it instead of a generic 21.
             let bound_live = bound_tail.is_some() && group.header.mode == 0;
+            // Security INFO (PR #522): on a NON-bound vault a lapsed source pot is not payable
+            // either (W-21, the same predicate tag 50 / 91 / the sibling top-up use): its
+            // principal is tag 89's to forfeit, and which instruction lands first must not
+            // decide where it goes. Bound pots keep their sentinel-expiry handling (F-14).
+            let source_lapsed = bound_tail.is_none()
+                && !policy_v16::backing_principal_withdrawal_is_fresh(
+                    bucket.expiry_slot,
+                    source_check_slot,
+                );
             if bucket.status != BackingBucketStatusV16::Fresh
+                || source_lapsed
                 || bucket.fresh_unliened_backing_num < backing_num
                 || source.fresh_reserved_backing_num < backing_num
                 || atoms > group.header.vault.get()
@@ -27966,7 +27982,7 @@ pub mod processor {
         sync_backing_domain_ledger(&mut from_l, &from_bucket)?;
 
         let ledger_short = nonbound_need_ledger
-            .map(|need| need.saturating_sub(to_l.total_principal_atoms))
+            .map(|need| need.saturating_sub(backing_ledger_available_principal_atoms(&to_l)))
             .unwrap_or(0);
         let short = fresh_short.max(ledger_short);
         if short == 0 {

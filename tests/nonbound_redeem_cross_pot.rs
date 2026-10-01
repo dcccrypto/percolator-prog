@@ -159,7 +159,7 @@ fn send(
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
-        .map(|_| ())
+        .map(|m| { if std::env::var_os("SEC_CU").is_some() { eprintln!("SEC_CU {}", m.compute_units_consumed); } })
         .map_err(|e| format!("{e:?}"))
 }
 
@@ -962,4 +962,121 @@ fn stranger_cannot_lock_the_vault_with_tag_91() {
     request(&mut env, &v, shares);
     execute(&mut env, &v, DOMAIN).expect("77 still pays after the refused 91");
     assert!(token_amount(&env.svm, v.dest) > 0);
+}
+
+// ─── Security review of PR #522 (adversarial; MEDIUM re-lock via a 77 from the impaired pot) ───────────────────────────────────────────────────────
+/// A THIRD-PARTY cranker executes a holder's matured partial redemption with source = the
+/// IMPAIRED pot (live SI shape: consumed lien, fresh untouched). The non-bound top-up covers only
+/// the LEDGER-principal shortfall, so the impaired pot can end at principal < loss, and every later
+/// pricing of the vault (75 / 77) would underflow 25.
+#[test]
+fn sec_partial_exit_from_impaired_pot_must_not_lock_the_vault() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, SI_D0_PRINCIPAL, DOMAIN);
+    deposit(&mut env, &v, SI_D1_PRINCIPAL, SIBLING_DOMAIN);
+    consume_pot_backing(&mut env, SIBLING_DOMAIN, SI_D1_CONSUMED);
+    let held = token_amount(&env.svm, v.lp_ata) as u128;
+    let shares = held * 6 / 10; // partial: holders remain
+    request(&mut env, &v, shares);
+    let r = execute(&mut env, &v, SIBLING_DOMAIN);
+    eprintln!("SEC 77 from impaired pot: {:?}", r.as_ref().map(|_| ()).map_err(|e| e.chars().take(200).collect::<String>()));
+    let sib = ledger_of(&env.svm, v.sibling_ledger);
+    let own = ledger_of(&env.svm, v.ledger);
+    eprintln!(
+        "SEC impaired pot: principal={} net_loss={}  other pot principal={}",
+        sib.total_principal_atoms,
+        sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms,
+        own.total_principal_atoms
+    );
+    eprintln!("SEC locked-shape={}", r.is_ok() && sib.total_principal_atoms < sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms);
+    // Vault pricing must still work for everyone else.
+    let lp = v.lp.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let r75 = send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::DepositToLpVault { amount: 1_000_000, domain: DOMAIN },
+        deposit_accounts(env.market, env.vault_token, v.registry, v.mint, v.lp_ata, v.source, v.ledger, lp.pubkey()),
+        &[&lp],
+    );
+    eprintln!("SEC 75 after: {:?}", r75.as_ref().map(|_| ()).map_err(|e| e.chars().take(160).collect::<String>()));
+    // Can a permissionless 91 un-stick it?
+    let r91 = rebalance(&mut env, &v, DOMAIN, SIBLING_DOMAIN, SI_D1_CONSUMED);
+    eprintln!("SEC 91 repair: {:?}", r91.as_ref().map(|_| ()).map_err(|e| e.chars().take(160).collect::<String>()));
+    env.svm.expire_blockhash();
+    let r75b = send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::DepositToLpVault { amount: 1_000_000, domain: DOMAIN },
+        deposit_accounts(env.market, env.vault_token, v.registry, v.mint, v.lp_ata, v.source, v.ledger, lp.pubkey()),
+        &[&lp],
+    );
+    eprintln!("SEC 75 after repair: {:?}", r75b.as_ref().map(|_| ()).map_err(|e| e.chars().take(160).collect::<String>()));
+    assert!(r75.is_ok(), "LOCK: 75 after the 77 failed");
+    assert!(
+        sib.total_principal_atoms >= sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms,
+        "a 77 from the impaired pot must never leave it at principal < loss"
+    );
+}
+
+#[test]
+fn sec_cu_single_pot_77() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, SI_D0_PRINCIPAL, DOMAIN);
+    deposit(&mut env, &v, SI_D1_PRINCIPAL, SIBLING_DOMAIN);
+    let held = token_amount(&env.svm, v.lp_ata) as u128;
+    request(&mut env, &v, held / 10);
+    execute(&mut env, &v, DOMAIN).expect("77");
+}
+
+/// Same, real consumption shape (fresh paid out): expected safe.
+#[test]
+fn sec_partial_exit_from_paid_out_impaired_pot_keeps_pricing() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 1_000_000_000, DOMAIN);
+    deposit(&mut env, &v, 1_000_000_000, SIBLING_DOMAIN);
+    consume_pot_backing_paid_out(&mut env, SIBLING_DOMAIN, 100_000_000);
+    let held = token_amount(&env.svm, v.lp_ata) as u128;
+    request(&mut env, &v, held * 6 / 10);
+    execute(&mut env, &v, SIBLING_DOMAIN).expect("77");
+    let sib = ledger_of(&env.svm, v.sibling_ledger);
+    assert!(sib.total_principal_atoms >= sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms);
+    deposit(&mut env, &v, 1_000_000, DOMAIN);
+}
+
+/// CU of a cross-pot non-bound 77 (both legs: principal + earnings top-up).
+#[test]
+fn sec_cu_cross_pot_77() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, SI_D0_PRINCIPAL, DOMAIN);
+    deposit(&mut env, &v, SI_D1_PRINCIPAL, SIBLING_DOMAIN);
+    add_pot_earnings(&mut env, SIBLING_DOMAIN, 10_000_000);
+    let held = token_amount(&env.svm, v.lp_ata) as u128;
+    request(&mut env, &v, held * 9 / 10);
+    execute(&mut env, &v, DOMAIN).expect("77");
+}
+
+/// Security INFO (PR #522): 77's OWN source pot gets the same lapse test as tag 50 / 91 and the
+/// sibling top-up (W-21). A lapsed pot's principal is tag 89's to forfeit, so a non-bound 77 from
+/// it is refused (21, as for any non-Fresh pot) and nothing moves.
+#[test]
+fn nonbound_77_refuses_a_lapsed_source_pot() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 1_000_000_000, DOMAIN);
+    let shares = token_amount(&env.svm, v.lp_ata) as u128 / 10;
+    request(&mut env, &v, shares);
+    let now = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    with_market(&mut env, |g| g.source_backing_buckets[DOMAIN as usize].expiry_slot = now);
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    let err = execute(&mut env, &v, DOMAIN).expect_err("a lapsed pot is not payable");
+    assert!(err.contains("Custom(21)"), "got {err}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, before, "atomic");
+    assert_eq!(token_amount(&env.svm, v.dest), 0);
 }
