@@ -154,6 +154,8 @@ pub struct World {
     pub trader_deficit: std::collections::BTreeMap<usize, u128>,
     /// Provisional resolved-close shortfall per user; reduced by later 46 top-ups (net = real haircut).
     pub provisional_burn: std::collections::BTreeMap<usize, u128>,
+    /// FUZZ_P3_SKIP_ONE_RECEIPT=1: the winner whose open receipt is deliberately left unpaid.
+    pub skip_receipt: Option<usize>,
     pub p3: Option<P3Ctx>,
     pub minted_by: std::collections::BTreeMap<Pubkey, u128>,
 }
@@ -241,6 +243,7 @@ impl World {
             pending_violation: None,
             trader_deficit: Default::default(),
             provisional_burn: Default::default(),
+            skip_receipt: None,
             p3: None,
             minted_by: Default::default(),
         };
@@ -1035,6 +1038,13 @@ impl World {
                     }
                     *self.stats.soft.entry("close_resolved_haircut_atoms").or_default() += burned.min(u64::MAX as u128) as u64;
                     *self.provisional_burn.entry(u).or_insert(0) += burned;
+                    if self.skip_receipt.is_none() && std::env::var("FUZZ_P3_SKIP_ONE_RECEIPT").map_or(false, |v| v == "1") && self.port_alive(u) {
+                        let x = self.env.portfolio_state(p);
+                        if x.resolved_payout_receipt.present && !x.resolved_payout_receipt.finalized {
+                            self.skip_receipt = Some(u);
+                            *self.stats.soft.entry("skip_receipt_armed").or_default() += 1;
+                        }
+                    }
                     if std::env::var("FUZZ_RT_TRACE").is_ok() {
                         let rc = if self.port_alive(u) { let a = self.env.portfolio_state(p); format!("receipt present {} fin {} face {} paid {}", a.resolved_payout_receipt.present, a.resolved_payout_receipt.finalized, a.resolved_payout_receipt.terminal_positive_claim_face, a.resolved_payout_receipt.paid_effective) } else { "portfolio GONE after close".into() };
                         let g = self.env.market_state().1;
@@ -3483,7 +3493,7 @@ impl World {
         }
         for round in 0..8 {
             for u in 0..=N_USERS {
-                if self.closed[u] {
+                if self.closed[u] || self.skip_receipt == Some(u) {
                     continue;
                 }
                 let _ = self.do_close_resolved(u);
@@ -3518,9 +3528,16 @@ impl World {
                 self.check()?;
             }
             if std::env::var("FUZZ_RT_TRACE").is_ok() { eprintln!("  SWEEP: vault LP closed {}", self.env.svm.get_account(&lp).map_or(true, |x| x.lamports == 0)); }
+            // Escrow-branch variant: leave ONE open receipt unpaid on purpose (no final sweep for it).
+            if std::env::var("FUZZ_P3_SKIP_ONE_RECEIPT").map_or(false, |v| v == "1") {
+                if self.skip_receipt.is_none() { self.skip_receipt = (0..=N_USERS).find(|&u| self.port_alive(u) && self.provisional_burn.get(&u).map_or(false, |b| *b > 0)
+                    && { let x = self.env.portfolio_state(self.ports[u]); x.resolved_payout_receipt.present && !x.resolved_payout_receipt.finalized });
+                if self.skip_receipt.is_some() { *self.stats.soft.entry("skip_receipt_armed").or_default() += 1; } }
+            }
             for _ in 0..3 {
                 for u in 0..=N_USERS {
                     if !self.port_alive(u) { continue; }
+                    if self.skip_receipt == Some(u) { continue; }
                     let _ = self.do_claim_topup(u);
                     let _ = self.do_close_resolved(u);
                     self.check()?;
@@ -3669,6 +3686,22 @@ impl World {
         // Refined (coordinator's G-1 rule): a haircut up to the bankrupt-TRADER deficits is the
         // engine credit rate (EXPECTED). Only a haircut BEYOND that, with the junior or seniors
         // receiving value, is a violation (backing owed to winners went to Earn).
+        // Escrow-branch variant: seniors and junior have exited with one receipt still open. The
+        // vault must still hold at least its unpaid remainder; then a late 46 (+ close) pays it.
+        if let Some(u) = self.skip_receipt {
+            let unpaid = *self.provisional_burn.get(&u).unwrap_or(&0);
+            let v = self.token_amount(&self.env.vault) as u128;
+            if v + 2 < unpaid {
+                return Err(format!("ESCROW: vault {v} < unpaid open-receipt remainder {unpaid} after Earn exited"));
+            }
+            *self.stats.soft.entry("skip_receipt_earn_exited_first").or_default() += 1;
+            for _ in 0..3 { let _ = self.do_claim_topup(u); let _ = self.do_close_resolved(u); }
+            let left = *self.provisional_burn.get(&u).unwrap_or(&0);
+            if left > 2 {
+                return Err(format!("ESCROW: late 46 did not pay the parked receipt: {left} of {unpaid} still unpaid (vault {v})"));
+            }
+            *self.stats.soft.entry("skip_receipt_paid_late").or_default() += 1;
+        }
         // Net haircut: provisional resolved-close shortfalls minus later 46 top-ups.
         let haircut_atoms: u128 = self.provisional_burn.values().sum();
         *self.stats.soft.entry("net_winner_haircut_atoms").or_default() += haircut_atoms.min(u64::MAX as u128) as u64;
