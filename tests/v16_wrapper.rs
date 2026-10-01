@@ -25897,6 +25897,14 @@ fn cw02_basis_clamp_site_enumeration_is_reads_only() {
     for (line, text) in &hits {
         println!("(cw02) v16_program.rs:{line}: {text}");
     }
+    // P3 (ede691b6, Earn exit/entry worse-of pricing): `vault_lp_equity_lag_bounds_ro` reads the
+    // raw basis as a conservative upper bound on the ADL-effective quantity when it re-values the
+    // vault LP at the pending target. It is a pricing READ, not a size clamp; it is allowed only
+    // inside that function, exactly once.
+    let lag_fn_start = src.lines().position(|l| l.contains("fn vault_lp_equity_lag_bounds_ro(")).expect("lag bounds fn") + 1;
+    let lag_fn_end = src.lines().enumerate().skip(lag_fn_start).find(|(_, l)| l.starts_with("    fn ") || l.starts_with("    pub fn ")).map(|(i, _)| i + 1).unwrap();
+    let (pricing, hits): (Vec<_>, Vec<_>) = hits.into_iter().partition(|(line, _)| *line > lag_fn_start && *line < lag_fn_end);
+    assert_eq!(pricing.len(), 1, "exactly one raw-basis read inside vault_lp_equity_lag_bounds_ro");
     assert_eq!(
         hits.len(),
         2,
