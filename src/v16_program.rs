@@ -1307,6 +1307,14 @@ VaultLpMultiAssetMarket,
         /// at market creation (relaunch seeds and the wizard do), before any trade. Custom(90),
         /// appended at the END (no existing code shifts). SDK: add to the client error map.
         VaultLpBindRequiresFlatAsset,
+        /// NON-BOUND Earn deposit (75) routed INTO a pot whose booked net impairment exceeds its
+        /// principal. Pricing floors that pot at zero, so atoms deposited into it would first
+        /// be absorbed by the excess impairment while minting shares as if they were fully
+        /// backed; refused rather than silently charge the depositor. Deposit to the sibling
+        /// pot (its NAV is priced on its own). Custom(91), appended at the END (no existing
+        /// code shifts). SDK: add to the client error map and route Earn deposits to the pot
+        /// with `principal >= net impairment`.
+        LpVaultTargetPotImpaired,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -16697,7 +16705,7 @@ pub mod processor {
             &bucket,
         )?;
         sync_backing_domain_ledger(&mut ledger, &bucket)?;
-        percolator::lp_vault::lp_vault_nav_atoms(
+        lp_vault_nav_atoms_floored(
             ledger.total_principal_atoms,
             ledger.total_earnings_atoms,
             ledger.total_earnings_withdrawn_atoms,
@@ -16705,7 +16713,48 @@ pub mod processor {
             ledger.cumulative_recovery_atoms,
             fee_share_bps,
         )
-        .map_err(map_v16_error)
+    }
+
+    /// NON-BOUND vault: one pot's NAV with its net impairment FLOORED at its principal.
+    ///
+    /// `percolator::lp_vault::lp_vault_nav_atoms` fails closed (`CounterUnderflow`, Custom 25)
+    /// when `cumulative_loss - cumulative_recovery > total_principal`. That state is reachable
+    /// on a live Earn vault (a pot's booked loss outgrows the principal the ledger still
+    /// carries for it: live OTC `6Y4bf...` 2026-10-02, SI `8WC8...` 2026-10-01) and it froze
+    /// every pricing call (75, 77) until the pot recovered. An over-impaired pot is worth ZERO
+    /// to the vault, never negative: the vault's liability is limited to what it put in. So it
+    /// contributes 0 and the sibling pot is priced on its own. The floor is CONTINUOUS with the
+    /// unfloored value at `impairment == principal` (which already priced to 0 without error),
+    /// so it opens no pricing state that was not already legal one atom earlier.
+    ///
+    /// Everything else is identical to the engine fn: the fee-share bound, the fail-closed
+    /// `earnings - withdrawn` subtraction, the floor-rounded LP earnings share. `loss <
+    /// recovery` (impossible by ledger construction) is treated as zero impairment, the same
+    /// reading `backing_ledger_available_principal_atoms` and the P3 floor already use.
+    fn lp_vault_nav_atoms_floored(
+        total_principal_atoms: u128,
+        total_earnings_atoms: u128,
+        total_earnings_withdrawn_atoms: u128,
+        cumulative_loss_atoms: u128,
+        cumulative_recovery_atoms: u128,
+        fee_share_bps: u16,
+    ) -> Result<u128, ProgramError> {
+        if fee_share_bps as u64 > percolator::MAX_MARGIN_BPS {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        let available_principal = total_principal_atoms
+            .saturating_sub(cumulative_loss_atoms.saturating_sub(cumulative_recovery_atoms));
+        let net_earnings = total_earnings_atoms
+            .checked_sub(total_earnings_withdrawn_atoms)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        let lp_earnings = percolator::wide_math::wide_mul_div_floor_u128(
+            net_earnings,
+            fee_share_bps as u128,
+            percolator::MAX_MARGIN_BPS as u128,
+        );
+        available_principal
+            .checked_add(lp_earnings)
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
     }
 
     /// One domain's AVAILABLE principal (principal net of impairment). Mirrors
@@ -16726,14 +16775,10 @@ pub mod processor {
             &bucket,
         )?;
         sync_backing_domain_ledger(&mut ledger, &bucket)?;
-        let net_impairment = ledger
-            .cumulative_loss_atoms
-            .checked_sub(ledger.cumulative_recovery_atoms)
-            .ok_or(PercolatorError::EngineCounterUnderflow)?;
-        ledger
-            .total_principal_atoms
-            .checked_sub(net_impairment)
-            .ok_or_else(|| PercolatorError::EngineCounterUnderflow.into())
+        // Floored at 0 exactly like `lp_vault_nav_atoms_floored` (an over-impaired pot has no
+        // available principal; it does not make the whole vault unpriceable). This is the SAME
+        // quantity tag 77's per-pot cap and the sibling top-up already use.
+        Ok(backing_ledger_available_principal_atoms(&ledger))
     }
 
     /// AVAILABLE principal across BOTH domains. Must be summed alongside NAV: the
@@ -24329,6 +24374,33 @@ pub mod processor {
             let (_, bucket) = backing_domain_parts_view(&group, domain)?;
             let ledger_data = ledger_ai.try_borrow_data()?;
             let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+            if !state::registry_vault_lp_bound(&registry)? {
+                // NON-BOUND: pricing floors an over-impaired pot at 0 (see
+                // `lp_vault_nav_atoms_floored`), so the first `impairment - principal` atoms
+                // deposited INTO such a pot would be absorbed by the excess while shares were
+                // minted against a fully-backed deposit. Refuse that routing; the sibling pot
+                // is priced on its own and accepts the deposit at full value.
+                let target_data: &[u8] = if target_is_sibling {
+                    &sibling_ledger_data
+                } else {
+                    &ledger_data
+                };
+                let (mut target_l, _) = read_or_new_backing_domain_ledger(
+                    target_data,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    target_domain,
+                    &bucket,
+                )?;
+                sync_backing_domain_ledger(&mut target_l, &bucket)?;
+                if target_l
+                    .cumulative_loss_atoms
+                    .saturating_sub(target_l.cumulative_recovery_atoms)
+                    > target_l.total_principal_atoms
+                {
+                    return Err(PercolatorError::LpVaultTargetPotImpaired.into());
+                }
+            }
             let nav = if state::registry_vault_lp_bound(&registry)? {
                 // P3 (F-14): floored NAV on a bound vault (never bricks on lent-out backing).
                 lp_vault_combined_nav_parts_p3(
@@ -25660,15 +25732,14 @@ pub mod processor {
                     .total_earnings_withdrawn_atoms
                     .checked_add(gross_consumed)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let nav_post_atoms = percolator::lp_vault::lp_vault_nav_atoms(
+                let nav_post_atoms = lp_vault_nav_atoms_floored(
                     post_principal,
                     ledger.total_earnings_atoms,
                     post_earnings_withdrawn,
                     ledger.cumulative_loss_atoms,
                     ledger.cumulative_recovery_atoms,
                     registry.fee_share_bps,
-                )
-                .map_err(map_v16_error)?;
+                )?;
                 let nav_post_num = nav_post_atoms
                     .checked_mul(BOUND_SCALE)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?;
