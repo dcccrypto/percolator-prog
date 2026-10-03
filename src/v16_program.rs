@@ -10193,6 +10193,58 @@ pub mod risk_limits_v17 {
         b
     }
 
+    /// Matcher-inventory-sync (2026-10-03): `ext_version = 2`, 40 bytes = the 24-byte block
+    /// `encode_matcher_call_ext` builds (all-zero fields and flags under mode 0) followed by the
+    /// LP's REAL signed engine position on this leg's asset (i128 LE, bytes 24..40; for a batch,
+    /// the PRE-batch position -- the matcher carries earlier same-asset legs itself). The
+    /// matcher prices and caps against this instead of its own `inventory_base` counter, which
+    /// liquidations, ADL scaling, side resets, RebalanceReduce, force-close and no-CPI trades
+    /// leave stale (devnet drift 2026-10-03; upstream percolator-prog#406,
+    /// percolator-match#8). Sent ONLY to the canonical matcher program, which understands v2
+    /// (`matcher_takes_lp_position`); every other matcher still gets the 24-byte block.
+    /// Matcher-inventory-sync: port of the engine's `kernel_adl_effective_quantity_ceil`
+    /// (engine 35ddd692 src/v16.rs:1677): `ceil(raw_abs * current_a / a_basis)`, `None` (the
+    /// engine's InvalidLeg) unless `raw_abs <= MAX_POSITION_ABS_Q`, `a_basis` in
+    /// `[MIN_A_SIDE, ADL_ONE]` and `current_a` in `[1, a_basis]`. Exact in u128: the product is
+    /// at most 1e14 * 1e15 = 1e29 < u128::MAX (boundary test
+    /// `tests/matcher_inventory_sync.rs::adl_effective_abs_q_matches_engine_contract`).
+    pub fn adl_effective_abs_q(raw_abs: u128, a_basis: u128, current_a: u128) -> Option<u128> {
+        if raw_abs > percolator::MAX_POSITION_ABS_Q
+            || !(percolator::MIN_A_SIDE..=percolator::ADL_ONE).contains(&a_basis)
+            || !(1..=a_basis).contains(&current_a)
+        {
+            return None;
+        }
+        Some(raw_abs.checked_mul(current_a)?.div_ceil(a_basis))
+    }
+
+    pub const CALL_EXT_V2_VERSION: u8 = 2;
+    pub const CALL_EXT_V2_LEN: usize = 40;
+
+    pub fn encode_matcher_call_ext_v2(
+        mode: u8,
+        mark_slot: u64,
+        lp_headroom_q: u128,
+        exec_band_bps: u16,
+        taker_reducing: bool,
+        accepts_fee_request: bool,
+        lp_position_q: i128,
+    ) -> [u8; CALL_EXT_V2_LEN] {
+        let v1 = encode_matcher_call_ext(
+            mode,
+            mark_slot,
+            lp_headroom_q,
+            exec_band_bps,
+            taker_reducing,
+            accepts_fee_request,
+        );
+        let mut b = [0u8; CALL_EXT_V2_LEN];
+        b[..24].copy_from_slice(&v1);
+        b[0] = CALL_EXT_V2_VERSION;
+        b[24..CALL_EXT_V2_LEN].copy_from_slice(&lp_position_q.to_le_bytes());
+        b
+    }
+
     /// F4: every outstanding fee leg the market still owes someone. `None` on overflow or on a
     /// corrupt `withdrawn > accrued` pair (callers fail closed on `None`).
     pub fn outstanding_fee_legs(
@@ -15022,12 +15074,14 @@ pub mod processor {
         // ZERO fill instead of reverting in the engine with Custom(49). By default the headroom
         // travels as the request size itself (matcher 12bd671 rejects non-zero call bytes
         // 43..67); `matcher_ext_mode = 1` also sends it in the P2 call extension.
+        let lp_position_sync = matcher_takes_lp_position(matcher_prog.key);
         let p1_pre = p1_cpi_preflight_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
             max_market_slots_pre,
             &[(asset_index, size_q)],
+            lp_position_sync,
         )?;
         let lp_headroom_q = p1_pre[0].headroom_q;
         let size_q = if size_q.unsigned_abs() > lp_headroom_q {
@@ -15049,14 +15103,29 @@ pub mod processor {
         // maximum for this asset.
         let accepts_fee_request =
             p1_pre[0].matcher_ext_mode == state::MATCHER_EXT_MODE_V1 && p1_pre[0].max_requested_fee_bps != 0;
-        let call_ext = risk_limits_v17::encode_matcher_call_ext(
-            p1_pre[0].matcher_ext_mode,
-            oracle_profile_pre.last_good_oracle_slot,
-            lp_headroom_q,
-            p1_pre[0].band_bps,
-            p1_pre[0].taker_reducing,
-            accepts_fee_request,
-        );
+        // Matcher-inventory-sync: the canonical matcher gets the 40-byte v2 block carrying the
+        // LP's real engine position; any other matcher the unchanged 24-byte block.
+        let call_ext: Vec<u8> = match p1_pre[0].lp_position_q {
+            Some(lp_position_q) => risk_limits_v17::encode_matcher_call_ext_v2(
+                p1_pre[0].matcher_ext_mode,
+                oracle_profile_pre.last_good_oracle_slot,
+                lp_headroom_q,
+                p1_pre[0].band_bps,
+                p1_pre[0].taker_reducing,
+                accepts_fee_request,
+                lp_position_q,
+            )
+            .to_vec(),
+            None => risk_limits_v17::encode_matcher_call_ext(
+                p1_pre[0].matcher_ext_mode,
+                oracle_profile_pre.last_good_oracle_slot,
+                lp_headroom_q,
+                p1_pre[0].band_bps,
+                p1_pre[0].taker_reducing,
+                accepts_fee_request,
+            )
+            .to_vec(),
+        };
 
         invoke_matcher(
             matcher_prog,
@@ -15715,7 +15784,7 @@ pub mod processor {
         legs: &[(u16, u64, i128)],
         // F-10: one 24-byte P1/P2 call extension per leg (18+26n+24n wire), or `None` for the
         // legacy 18+26n call. Same bytes the single TradeCpi route sends.
-        exts: Option<&[[u8; 24]]>,
+        exts: Option<&[Vec<u8>]>,
         seeds: &[&[u8]],
     ) -> ProgramResult {
         let mut data = Vec::with_capacity(18 + legs.len() * 50);
@@ -15730,6 +15799,11 @@ pub mod processor {
         }
         if let Some(exts) = exts {
             if exts.len() != legs.len() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            // Uniform width: all 24-byte (v0/v1) or all 40-byte (v2) blocks.
+            let w = exts.first().map(|e| e.len()).unwrap_or(0);
+            if (w != 24 && w != risk_limits_v17::CALL_EXT_V2_LEN) || exts.iter().any(|e| e.len() != w) {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             for e in exts {
@@ -15977,12 +16051,14 @@ pub mod processor {
         // asset_admin, item 5 floor halt per leg -> the NAMED `LpFloorHalt` rather than the
         // engine's Custom(49) from inside the batch execute, band width per leg). No clip -- a
         // batch is atomic; the post-fill cap check still runs.
+        let lp_position_sync = matcher_takes_lp_position(matcher_prog.key);
         let p1_pre = p1_cpi_preflight_before_matcher(
             market_ai,
             account_a_ai,
             account_b_ai,
             max_market_slots_pre,
             &cpi_requests,
+            lp_position_sync,
         )?;
         // F-10: behavioural parity with TradeCpi. When ANY leg's asset has the P2 call
         // extension on, every leg carries its 24-byte extension (a mode-0 leg gets the all-zero
@@ -15990,8 +16066,29 @@ pub mod processor {
         // legs), EXEC_BAND and TAKER_REDUCING per leg exactly as on the single route. HEADROOM
         // is the leg's own |size|: a batch is atomic (no clip) and the wrapper's post-fill cap
         // check still names 68. The fee-request channel is not offered on the batch route.
-        let batch_exts: Option<Vec<[u8; 24]>> =
-            if p1_pre.iter().any(|l| l.matcher_ext_mode == state::MATCHER_EXT_MODE_V1) {
+        // Matcher-inventory-sync: the canonical matcher gets a 40-byte v2 block on EVERY leg
+        // (each carrying the LP's PRE-batch real position on that leg's asset; the matcher
+        // carries earlier same-asset legs itself), regardless of the ext mode.
+        let batch_exts: Option<Vec<Vec<u8>>> = if lp_position_sync {
+            let mut v = Vec::with_capacity(legs.len());
+            for (i, leg) in legs.iter().enumerate() {
+                v.push(
+                    risk_limits_v17::encode_matcher_call_ext_v2(
+                        p1_pre[i].matcher_ext_mode,
+                        leg_mark_slots[i],
+                        leg.size_q.unsigned_abs(),
+                        p1_pre[i].band_bps,
+                        p1_pre[i].taker_reducing,
+                        false,
+                        p1_pre[i]
+                            .lp_position_q
+                            .ok_or(PercolatorError::InvalidInstruction)?,
+                    )
+                    .to_vec(),
+                );
+            }
+            Some(v)
+        } else if p1_pre.iter().any(|l| l.matcher_ext_mode == state::MATCHER_EXT_MODE_V1) {
                 Some(
                     legs.iter()
                         .enumerate()
@@ -16004,6 +16101,7 @@ pub mod processor {
                                 p1_pre[i].taker_reducing,
                                 false,
                             )
+                            .to_vec()
                         })
                         .collect(),
                 )
@@ -31395,6 +31493,78 @@ pub mod processor {
         Ok(())
     }
 
+    /// Matcher-inventory-sync: the portfolio's ECONOMIC position on `asset_index`, exactly as the
+    /// engine counts it (`V16Core::effective_abs_quantity_for_leg`, engine 35ddd692
+    /// src/v16.rs:1695, with `kernel_adl_effective_quantity_ceil` :1677): a current-epoch leg
+    /// is its raw basis scaled by the side's ADL index, `ceil(|basis| * current_a / a_basis)`;
+    /// a prior-reset obligation (side `ResetPending`, `epoch_snap + 1 == epoch`) owns 0;
+    /// anything else is `InvalidLeg`. `signed_position_for_asset_view` returns the raw BASIS,
+    /// which an ADL or side reset of the OPPOSITE side shrinks/zeroes without touching this
+    /// portfolio, so it cannot be used to tell the matcher where the LP really is.
+    fn effective_signed_position_for_asset_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+    ) -> Result<i128, ProgramError> {
+        if asset_index >= group.markets.len() {
+            return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        let asset = group.markets[asset_index]
+            .engine
+            .asset
+            .try_to_runtime()
+            .map_err(map_v16_error)?;
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            if leg.active && leg.asset_index as usize == asset_index && leg.market_id == asset.market_id
+            {
+                let (current_a, epoch, mode) = match leg.side {
+                    SideV16::Long => (asset.a_long, asset.epoch_long, asset.mode_long),
+                    SideV16::Short => (asset.a_short, asset.epoch_short, asset.mode_short),
+                };
+                let abs: u128 = if leg.epoch_snap == epoch {
+                    risk_limits_v17::adl_effective_abs_q(
+                        leg.basis_pos_q.unsigned_abs(),
+                        leg.a_basis,
+                        current_a,
+                    )
+                    .ok_or(PercolatorError::EngineInvalidLeg)?
+                } else if mode == percolator::SideModeV16::ResetPending
+                    && leg.epoch_snap.checked_add(1) == Some(epoch)
+                {
+                    0
+                } else {
+                    return Err(PercolatorError::EngineInvalidLeg.into());
+                };
+                let abs = i128::try_from(abs).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                return Ok(match leg.side {
+                    SideV16::Long => abs,
+                    SideV16::Short => -abs,
+                });
+            }
+            slot += 1;
+        }
+        Ok(0)
+    }
+
+    /// Matcher-inventory-sync: the matcher programs that understand the 40-byte `ext_version = 2`
+    /// call extension (LP engine position). Only the canonical (devnet: EDKKgRaV, upgraded to
+    /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
+    fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
+        #[cfg(feature = "devnet")]
+        {
+            *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
+        }
+        #[cfg(not(feature = "devnet"))]
+        {
+            let _ = matcher_prog;
+            false
+        }
+    }
+
     // FIX W2 (upstream #147 + #160): a CPI trade route (TradeCpi/BatchTradeCpi) previously
     // invoked the untrusted external matcher with no per-asset lifecycle check at all. The
     // engine's own `require_asset_risk_change_allowed` gate (v16.rs) still rejects a
@@ -31829,6 +31999,10 @@ pub mod processor {
         matcher_ext_mode: u8,
         /// This leg's asset `max_requested_fee_bps` (P2 fee channel; 0 = off).
         max_requested_fee_bps: u16,
+        /// Matcher-inventory-sync: the LP's (account_b) real ADL-effective signed position on
+        /// this leg's asset BEFORE the trade. `Some` only when the caller asked for it (the
+        /// configured matcher takes the v2 extension).
+        lp_position_q: Option<i128>,
     }
 
     /// TradeCpi / BatchTradeCpi pre-matcher: the existing portfolio-currency preflight
@@ -31846,6 +32020,7 @@ pub mod processor {
         account_b_ai: &AccountInfo<'_>,
         max_market_slots: usize,
         cpi_requests: &[(u16, i128)],
+        want_lp_position: bool,
     ) -> Result<Vec<P1CpiLegPreflight>, ProgramError> {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
@@ -31926,7 +32101,13 @@ pub mod processor {
             } else {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
             };
+            let lp_position_q = if want_lp_position {
+                Some(effective_signed_position_for_asset_view(&group, &account_b, asset_index)?)
+            } else {
+                None
+            };
             out.push(P1CpiLegPreflight {
+                lp_position_q,
                 taker_reducing,
                 headroom_q,
                 band_bps: risk_limits_v17::effective_exec_band_bps(limits.exec_band_bps),
@@ -33485,10 +33666,14 @@ pub mod processor {
         lp_account_id: u64,
         oracle_price_e6: u64,
         req_size: i128,
-        call_ext: &[u8; 24],
+        call_ext: &[u8],
         seeds: &[&[u8]],
     ) -> ProgramResult {
-        let mut data = [0u8; 67];
+        // 24-byte v0/v1 block (67-byte call) or 40-byte v2 block (83-byte call).
+        if call_ext.len() != 24 && call_ext.len() != risk_limits_v17::CALL_EXT_V2_LEN {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut data = alloc::vec![0u8; 43 + call_ext.len()];
         data[0] = 0;
         data[1..9].copy_from_slice(&req_id.to_le_bytes());
         data[9..11].copy_from_slice(&(asset_index as u16).to_le_bytes());
@@ -33497,7 +33682,7 @@ pub mod processor {
         data[27..43].copy_from_slice(&req_size.to_le_bytes());
         // P1: bytes 43..67 -- all-zero (legacy) unless the protocol enabled the P2 call
         // extension for this asset (`AssetRiskLimitsV17::matcher_ext_mode`).
-        data[43..67].copy_from_slice(call_ext);
+        data[43..].copy_from_slice(call_ext);
 
         let mut metas = Vec::with_capacity(2 + tail.len());
         metas.push(AccountMeta::new_readonly(*matcher_delegate.key, true));
@@ -33513,7 +33698,7 @@ pub mod processor {
         let ix = SolInstruction {
             program_id: *matcher_prog.key,
             accounts: metas,
-            data: data.to_vec(),
+            data,
         };
         let mut infos = Vec::with_capacity(3 + tail.len());
         infos.push(matcher_delegate.clone());
@@ -35965,6 +36150,31 @@ mod p1_kani_proofs {
         kani::cover!(lp == 0 && ba + bb < owed as u128, "shortfall: everything goes to the base");
     }
 
+
+    /// Matcher-inventory-sync: the 40-byte v2 call extension is the v1 block with version 2,
+    /// followed by the LP position, for every input.
+    #[kani::proof]
+    fn kani_sync_call_ext_v2_layout() {
+        let mode: u8 = kani::any();
+        kani::assume(mode <= 1);
+        let mark_slot: u64 = kani::any();
+        let headroom: u128 = kani::any();
+        let band: u16 = kani::any();
+        let taker_reducing: bool = kani::any();
+        let accepts_fee: bool = kani::any();
+        let pos: i128 = kani::any();
+        let v1 = p1::encode_matcher_call_ext(mode, mark_slot, headroom, band, taker_reducing, accepts_fee);
+        let v2 = p1::encode_matcher_call_ext_v2(mode, mark_slot, headroom, band, taker_reducing, accepts_fee, pos);
+        assert_eq!(v2[0], p1::CALL_EXT_V2_VERSION);
+        assert_eq!(&v2[1..24], &v1[1..24]);
+        assert_eq!(i128::from_le_bytes(v2[24..40].try_into().unwrap()), pos);
+        // mode 0 carries no v1 field: flags and fields all zero, only version + position.
+        if mode == 0 {
+            assert!(v2[1..24].iter().all(|b| *b == 0));
+        }
+        kani::cover!(mode == 1 && taker_reducing, "mode 1 with reducing flag");
+        kani::cover!(mode == 0 && pos < 0, "mode 0 with a short LP");
+    }
 
     #[kani::proof]
     #[kani::solver(cadical)]
