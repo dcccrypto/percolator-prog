@@ -43,6 +43,10 @@ fn code(e: PercolatorError) -> String {
 }
 
 fn program_path() -> PathBuf {
+    // Negative controls: run the same test against another wrapper binary.
+    if let Some(p) = std::env::var_os("P1_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.push("target/deploy/percolator_prog.so");
     assert!(p.exists(), "wrapper BPF missing — cargo build-sbf --features devnet");
@@ -50,6 +54,9 @@ fn program_path() -> PathBuf {
 }
 
 fn matcher_program_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("SYNC_MATCHER_SO") {
+        return PathBuf::from(p);
+    }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
     p.push("percolator-match/target/deploy/percolator_match.so");
@@ -1252,6 +1259,77 @@ fn p3_vault_lp_set_matcher_then_real_trade_cpi_fill() {
 }
 
 const POS: i128 = percolator::POS_SCALE as i128;
+
+/// Security review S-2 (matcher-inventory-sync build, 2026-10-03): the skew-funding snapshot
+/// `lp_net_q` must be the vault LP's ADL-EFFECTIVE position, the same measure as its denominator
+/// `max(oi_eff_long_q, oi_eff_short_q)` (`vault_lp_skew_funding_rate`). The vault LP is the only
+/// short; the long's tag-44 partial close ADL-scales the short side (A_short < 1), so the LP's
+/// raw basis stays -10 while its real position is -7. Both writers are checked against the
+/// ENGINE's own `oi_eff_short_q`: the crank refresh (`vault_lp_refresh_snapshot`) and the
+/// post-fill snapshot (`vault_lp_post_fill`). Before the fix both stored the raw basis.
+#[test]
+fn p3_s2_skew_snapshot_is_the_adl_effective_position() {
+    let mut env = Env::new(Params::default());
+    let lp_key = env.init_vault_lp(1_000);
+    env.approve_matcher();
+    let admin = env.admin.insecure_clone();
+    let lp = env.vault_lp_set_matcher_as(&admin, lp_key).expect("set matcher");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let t = env.new_trader(5_000_000);
+    env.trade(&t, &lp, 10 * POS).expect("open long against the vault lp");
+    assert_eq!(env.asset_rec().lp_net_q, -10 * POS);
+
+    // The long exits 3 units unilaterally (tag 44): the short side (the vault LP) is ADL-scaled.
+    let (pid, _, pep) = env.identity(t.portfolio);
+    let kp = t.kp.insecure_clone();
+    let m = env.market;
+    env.send(
+        ProgInstruction::RebalanceReduce {
+            portfolio_id: pid,
+            position_epoch: pep,
+            asset_index: 0,
+            reduce_q: (3 * POS) as u128,
+        },
+        vec![
+            AccountMeta::new(kp.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(t.portfolio, false),
+        ],
+        &[&kp],
+    )
+    .expect("tag 44 partial close");
+    let (_, g) = env.market_state();
+    assert!(g.assets[0].a_short < percolator::ADL_ONE, "short side ADL-scaled");
+    let oi_short = g.assets[0].oi_eff_short_q as i128;
+    assert_eq!(oi_short, 7 * POS, "engine: the LP's effective short is 7");
+    assert_eq!(env.position(lp.portfolio), -10 * POS, "raw basis is untouched by the ADL");
+
+    // (a) crank refresh of the vault LP. A crank needs progress (else EngineNonProgress 22):
+    // move the price one step, cranking only the trader, then crank the vault LP.
+    let tp = t.portfolio;
+    env.move_price(1_010_000, &[tp]);
+    env.svm.expire_blockhash();
+    env.crank(lp.portfolio).expect("crank the vault lp");
+    let (_, g) = env.market_state();
+    assert_eq!(g.assets[0].oi_eff_short_q as i128, oi_short, "no fill or ADL since");
+    assert_eq!(
+        env.asset_rec().lp_net_q,
+        -oi_short,
+        "refresh: lp_net_q is the engine's effective short, not the raw basis (-10)"
+    );
+
+    // (b) a reducing fill (long sells 1, LP buys 1 back): post-fill snapshot.
+    env.trade(&t, &lp, -POS).expect("reducing fill");
+    let (_, g) = env.market_state();
+    let oi_short = g.assets[0].oi_eff_short_q as i128;
+    assert!(env.position(lp.portfolio) < -oi_short, "raw basis still overstates |LP|");
+    assert_eq!(
+        env.asset_rec().lp_net_q,
+        -oi_short,
+        "post-fill: lp_net_q is the engine's effective short"
+    );
+    env.assert_conserved("after S-2 sequence");
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
 // 4. Junior tranche (tags 95/96)

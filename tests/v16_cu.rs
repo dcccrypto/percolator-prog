@@ -113,6 +113,11 @@ fn has_active_leg_for_asset(account: &PortfolioAccountV16, asset_index: usize) -
 }
 
 fn program_path() -> PathBuf {
+    // Negative controls (matcher-inventory-sync R-1): run the same test against another wrapper
+    // binary without touching target/deploy.
+    if let Some(p) = std::env::var_os("P1_WRAPPER_SO") {
+        return PathBuf::from(p);
+    }
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target/deploy/percolator_prog.so");
     assert!(
@@ -124,6 +129,9 @@ fn program_path() -> PathBuf {
 }
 
 fn matcher_program_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("SYNC_MATCHER_SO") {
+        return PathBuf::from(p);
+    }
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop();
     path.push("percolator-match/target/deploy/percolator_match.so");
@@ -18050,6 +18058,44 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
 // 56 -- and only the multiplicative cap can tell them apart.
 #[test]
 fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
+    // A fresh (non-canonical) matcher id: the LEGACY 24-byte call extension.
+    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(Pubkey::new_unique());
+    eprintln!("(#436) 11 legs, non-canonical matcher (v1 wire): {allowed_cu} CU");
+    // v1: the matcher's own counter sums all 11 single-unit LP sells.
+    assert_eq!(counter, -11 * POS_SCALE as i128, "legacy wire: counter is the running sum");
+}
+
+/// Security review R-1 (matcher-inventory-sync, 2026-10-03): the SAME 11-leg bound on the
+/// CANONICAL matcher id, which is the only id the wrapper sends the 40-byte v2 extension (the
+/// LP's ADL-effective position per leg) to. f01b490a computed that position with a full
+/// `AssetStateV16::try_to_runtime` plus a third leg walk per leg and exceeded 1.4M CU at 11
+/// legs (`ComputationalBudgetExceeded`; 10 legs = 1,301,298). The #436 test above never took
+/// the v2 path because it uses a fresh matcher id. The fix folds the effective computation into
+/// the preflight's existing LP leg walk and reads only the side's A/epoch/mode fields.
+#[cfg(feature = "devnet")]
+#[test]
+fn v16_bpf_batch_trade_cpi_canonical_matcher_v2_11_legs_fit_budget() {
+    let canonical = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
+    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(canonical);
+    eprintln!("(R-1) 11 legs, canonical matcher (v2 wire): {allowed_cu} CU");
+    // Non-vacuity: v2 really ran. Under v2 the matcher carries each asset's pre-batch position
+    // separately and stores the LAST leg's asset (0 - 1 unit); v1 would store -11 units.
+    assert_eq!(counter, -(POS_SCALE as i128), "v2 wire: counter is the last leg's own asset");
+    // Margin. Measured 10x per binary pair on this test (CU steps by 1,500 with the random
+    // keypairs' PDA bump search):
+    //   deployed 553d76f0 + 4a0f696 (v1 on this id): min 1,374,684, max 1,380,684
+    //   f01b490a + b5b419d (v2, before R-1):         ComputationalBudgetExceeded 10/10
+    //   R-1 fix + b5b419d (v2):                       min 1,380,641, max 1,383,641
+    // i.e. v2 costs ~6k CU over 11 legs (~540/leg, matcher's v2 handling included). Require at
+    // least 10,000 CU of headroom under the 1.4M ceiling (six more bump steps than observed).
+    assert!(
+        allowed_cu <= 1_390_000,
+        "11 canonical legs consumed {allowed_cu} CU; less than 10k CU headroom under 1.4M"
+    );
+}
+
+/// Shared body of the #436 / R-1 tests. Returns (11-leg CU, matcher ctx `inventory_base`).
+fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i128) {
     // REWRITTEN 2026-08-29 for the #436 fix. This test used to assert that a 14-leg x 4-tail
     // batch (product 56 <= budget 64) MUST EXECUTE. It never could: measurement showed a leg
     // costs ~120,000 CU, so 12+ legs exhaust the 1.4M ceiling regardless of tail size, and the
@@ -18119,7 +18165,6 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     for asset_index in 0..LEGS as u16 {
         env.configure_auth_mark_for_asset_as_admin(asset_index, LEGS as u64 + 1, PRICE);
     }
-    let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
     env.svm.add_program(matcher_program, &matcher_bytes);
     let taker = Keypair::new();
@@ -18266,6 +18311,10 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
         MAX_LEGS as u32,
         "all 11 legs must have actually filled"
     );
+    let ctx_data = env.svm.get_account(&ctx).unwrap().data;
+    // 64-byte return slot + MatcherCtx.inventory_base at +96.
+    let counter = i128::from_le_bytes(ctx_data[64 + 96..64 + 112].try_into().unwrap());
+    (allowed_cu, counter)
 }
 
 // ══════════════════════════════════════════════════════════════════════════════

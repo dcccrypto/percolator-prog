@@ -904,3 +904,61 @@ fn adl_effective_abs_q_matches_engine_contract() {
         "current_a above a_basis"
     );
 }
+
+// ---- Security review (percolator-security, 2026-10-03) engine-anchored checks ----
+fn sec_oi(env: &Env) -> (u128, u128, u128, u128) {
+    let mut md = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut md).unwrap();
+    let a = group.markets[0].engine.asset.try_to_runtime().unwrap();
+    (a.oi_eff_long_q, a.oi_eff_short_q, a.a_long, a.a_short)
+}
+
+/// Anchor the v2 value to the ENGINE's own OI, not the test's re-implemented formula. The LP is
+/// the only short; after an uneven tag-44 ADL the LP's real position == engine oi_eff_short.
+/// A reducing fill of size Q then must leave counter == -(oi_eff_short after).
+#[test]
+fn sec_v2_value_matches_engine_oi_after_adl() {
+    for frac in [3i128, 7, 13] {
+        let mut env = canonical_env();
+        let lp = env.lp(CAP);
+        let long = env.trader();
+        env.trade_cpi(&long.0, long.1, &lp, CAP).expect("long opens");
+        env.rebalance_reduce(&long.0, long.1, (CAP / frac + 12_345) as u128)
+            .expect("tag 44 partial");
+        let (ol, os, al, ash) = sec_oi(&env);
+        eprintln!("frac {frac}: oi_long {ol} oi_short {os} a_long {al} a_short {ash} eff_lp {} counter {}", env.eff(lp.account), env.counter(&lp));
+        assert!(ash < percolator::ADL_ONE, "short side ADL'd");
+        env.trade_cpi(&long.0, long.1, &lp, -Q).expect("reducing fill");
+        let (_, os2, _, _) = sec_oi(&env);
+        eprintln!("  after reduce: oi_short {os2} counter {} eff_lp {}", env.counter(&lp), env.eff(lp.account));
+        assert_eq!(env.counter(&lp), -(os2 as i128), "matcher counter == engine OI (LP sole short)");
+    }
+}
+
+/// ResetPending window (LP leg = prior-reset obligation, before crank/finalize): the wrapper's
+/// effective view must take the obligation branch (0), not fail with InvalidLeg. Print the error
+/// so the same test can be compared on the deployed wrapper.
+#[test]
+fn sec_trade_during_reset_pending_window() {
+    let mut env = canonical_env();
+    let lp = env.lp(CAP);
+    let long = env.trader();
+    env.trade_cpi(&long.0, long.1, &lp, CAP).expect("long opens");
+    env.rebalance_reduce(&long.0, long.1, CAP as u128).expect("tag 44 full exit");
+    let (ol, os, al, ash) = sec_oi(&env);
+    eprintln!("after full exit: oi {ol}/{os} a {al}/{ash} eff_lp {} counter {}", env.eff(lp.account), env.counter(&lp));
+    let t = env.trader();
+    let r1 = env.trade_cpi(&t.0, t.1, &lp, Q);
+    let r2 = env.trade_cpi(&t.0, t.1, &lp, -Q);
+    let short_err = |r: &Result<u64, String>| match r { Ok(_) => "OK".to_string(), Err(e) => e.split("err: ").nth(1).unwrap_or(e).chars().take(60).collect() };
+    eprintln!("RESULT buy: {}", short_err(&r1));
+    eprintln!("RESULT sell: {}", short_err(&r2));
+    eprintln!("counter after {}", env.counter(&lp));
+    // While the short side is ResetPending the engine refuses every risk-increasing fill with
+    // LockActive (21). The v2 effective view must take the prior-reset-obligation branch (0)
+    // and let the engine refuse; an `InvalidLeg` from the wrapper would brick the market.
+    for (dir, r) in [("buy", &r1), ("sell", &r2)] {
+        let e = r.as_ref().expect_err("a fill during ResetPending must be refused");
+        assert!(e.contains("Custom(21)"), "{dir}: expected LockActive (21), got {e}");
+    }
+}

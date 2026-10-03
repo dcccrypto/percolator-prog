@@ -25905,15 +25905,16 @@ fn cw02_basis_clamp_site_enumeration_is_reads_only() {
     let lag_fn_end = src.lines().enumerate().skip(lag_fn_start).find(|(_, l)| l.starts_with("    fn ") || l.starts_with("    pub fn ")).map(|(i, _)| i + 1).unwrap();
     let (pricing, hits): (Vec<_>, Vec<_>) = hits.into_iter().partition(|(line, _)| *line > lag_fn_start && *line < lag_fn_end);
     assert_eq!(pricing.len(), 1, "exactly one raw-basis read inside vault_lp_equity_lag_bounds_ro");
-    // Matcher-inventory-sync (2026-10-03): `effective_signed_position_for_asset_view` reads the raw
-    // basis once as the INPUT to the engine's ADL-effective conversion
-    // (`adl_effective_abs_q(raw, a_basis, current_a)`), so the matcher is told the LP's real
+    // Matcher-inventory-sync (2026-10-03): `raw_and_effective_signed_position_for_asset_view` reads
+    // the raw basis once as the INPUT to the engine's ADL-effective conversion
+    // (`adl_effective_abs_q(raw_abs, a_basis, current_a)`), so the matcher is told the LP's real
     // position. A conversion read, not a size clamp; allowed only inside that function, once.
-    let eff_fn_start = src.lines().position(|l| l.contains("fn effective_signed_position_for_asset_view(")).expect("effective position fn") + 1;
+    let eff_fn_start = src.lines().position(|l| l.contains("fn raw_and_effective_signed_position_for_asset_view(")).expect("effective position fn") + 1;
     let eff_fn_end = src.lines().enumerate().skip(eff_fn_start).find(|(_, l)| l.starts_with("    fn ") || l.starts_with("    pub fn ")).map(|(i, _)| i + 1).unwrap();
     let (effective, hits): (Vec<_>, Vec<_>) = hits.into_iter().partition(|(line, _)| *line > eff_fn_start && *line < eff_fn_end);
-    assert_eq!(effective.len(), 1, "exactly one raw-basis read inside effective_signed_position_for_asset_view");
-    assert!(effective[0].1.contains("leg.basis_pos_q.unsigned_abs(),"), "it feeds adl_effective_abs_q");
+    assert_eq!(effective.len(), 1, "exactly one raw-basis read inside raw_and_effective_signed_position_for_asset_view");
+    assert!(effective[0].1.contains("let raw_abs = leg.basis_pos_q.unsigned_abs();"), "it feeds adl_effective_abs_q");
+    assert!(src.contains("risk_limits_v17::adl_effective_abs_q(raw_abs, leg.a_basis, current_a)"), "raw_abs is the conversion input");
     assert_eq!(
         hits.len(),
         2,

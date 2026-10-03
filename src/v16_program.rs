@@ -10215,6 +10215,11 @@ pub mod risk_limits_v17 {
         {
             return None;
         }
+        // Unscaled leg (the common case, A unchanged since the leg's snapshot):
+        // ceil(raw * a / a) == raw exactly, so skip the u128 mul/div (CU, review R-1).
+        if current_a == a_basis {
+            return Some(raw_abs);
+        }
         Some(raw_abs.checked_mul(current_a)?.div_ceil(a_basis))
     }
 
@@ -15332,7 +15337,11 @@ pub mod processor {
                 }
                 continue;
             }
-            rec.lp_net_q = lp_after;
+            // S-2 (security review 2026-10-03): the skew-funding numerator must be the vault LP's
+            // ADL-EFFECTIVE position, the same measure as its denominator
+            // `max(oi_eff_long_q, oi_eff_short_q)`; the raw basis overstates |LP| while A < 1.
+            // `lp_after` stays raw for the raw-vs-raw `joins_crowd` / draw-halt checks (S-3).
+            rec.lp_net_q = effective_signed_position_for_asset_view(&group, &b, idx)?;
             rec.lp_net_slot = now_slot;
             // P3 senior draw HALT: while a senior draw is pending or outstanding, the vault LP
             // may only reduce (it is trading on the seniors' money).
@@ -23935,7 +23944,8 @@ pub mod processor {
             if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || rec.vault_lp_portfolio != key {
                 continue;
             }
-            let q = signed_position_for_asset_view(&group, &portfolio, idx)?;
+            // S-2: effective, consistent with the effective-OI denominator (see vault_lp_post_fill).
+            let q = effective_signed_position_for_asset_view(&group, &portfolio, idx)?;
             if q != rec.lp_net_q {
                 rec.lp_net_q = q;
                 rec.lp_net_slot = now_slot;
@@ -31493,61 +31503,81 @@ pub mod processor {
         Ok(())
     }
 
-    /// Matcher-inventory-sync: the portfolio's ECONOMIC position on `asset_index`, exactly as the
-    /// engine counts it (`V16Core::effective_abs_quantity_for_leg`, engine 35ddd692
-    /// src/v16.rs:1695, with `kernel_adl_effective_quantity_ceil` :1677): a current-epoch leg
-    /// is its raw basis scaled by the side's ADL index, `ceil(|basis| * current_a / a_basis)`;
-    /// a prior-reset obligation (side `ResetPending`, `epoch_snap + 1 == epoch`) owns 0;
-    /// anything else is `InvalidLeg`. `signed_position_for_asset_view` returns the raw BASIS,
-    /// which an ADL or side reset of the OPPOSITE side shrinks/zeroes without touching this
-    /// portfolio, so it cannot be used to tell the matcher where the LP really is.
-    fn effective_signed_position_for_asset_view(
+    /// Matcher-inventory-sync: the portfolio's signed position on `asset_index` as BOTH the raw
+    /// basis (`.0`, identical to `signed_position_for_asset_view`) and the ECONOMIC position
+    /// (`.1`), exactly as the engine counts it (`V16Core::effective_abs_quantity_for_leg`,
+    /// engine 35ddd692 src/v16.rs:1695, with `kernel_adl_effective_quantity_ceil` :1677): a
+    /// current-epoch leg is its raw basis scaled by the side's ADL index,
+    /// `ceil(|basis| * current_a / a_basis)`; a prior-reset obligation (side `ResetPending`,
+    /// `epoch_snap + 1 == epoch`) owns 0; anything else is `InvalidLeg`. The raw basis is what an
+    /// ADL or side reset of the OPPOSITE side shrinks/zeroes without touching this portfolio, so
+    /// it cannot be used to tell the matcher (or P3 skew funding) where the LP really is.
+    ///
+    /// CU (security review R-1, 2026-10-03): ONE leg walk serves both values, and only the
+    /// leg's side `a_*` / `epoch_*` / `mode_*` fields are read from the asset pod (a full
+    /// `AssetStateV16::try_to_runtime` decodes ~40 fields), so the 11-leg canonical
+    /// BatchTradeCpi stays inside 1.4M CU. Leg validation is unchanged (`try_to_runtime` on each
+    /// walked slot, as in `signed_position_for_asset_view`); the side-mode byte is decoded with
+    /// the engine's encoding (0 Normal, 1 DrainOnly, 2 ResetPending) and anything else fails
+    /// closed with the engine's `InvalidConfig`.
+    fn raw_and_effective_signed_position_for_asset_view(
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         asset_index: usize,
-    ) -> Result<i128, ProgramError> {
+    ) -> Result<(i128, i128), ProgramError> {
         if asset_index >= group.markets.len() {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let asset = group.markets[asset_index]
-            .engine
-            .asset
-            .try_to_runtime()
-            .map_err(map_v16_error)?;
+        let asset = &group.markets[asset_index].engine.asset;
+        let market_id = asset.market_id.get();
         let mut slot = 0usize;
         while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = portfolio.header.legs[slot]
                 .try_to_runtime()
                 .map_err(map_v16_error)?;
-            if leg.active && leg.asset_index as usize == asset_index && leg.market_id == asset.market_id
-            {
-                let (current_a, epoch, mode) = match leg.side {
-                    SideV16::Long => (asset.a_long, asset.epoch_long, asset.mode_long),
-                    SideV16::Short => (asset.a_short, asset.epoch_short, asset.mode_short),
+            if leg.active && leg.asset_index as usize == asset_index && leg.market_id == market_id {
+                let raw_abs = leg.basis_pos_q.unsigned_abs();
+                let (current_a, epoch, mode_byte) = match leg.side {
+                    SideV16::Long => (asset.a_long.get(), asset.epoch_long.get(), asset.mode_long),
+                    SideV16::Short => {
+                        (asset.a_short.get(), asset.epoch_short.get(), asset.mode_short)
+                    }
                 };
-                let abs: u128 = if leg.epoch_snap == epoch {
-                    risk_limits_v17::adl_effective_abs_q(
-                        leg.basis_pos_q.unsigned_abs(),
-                        leg.a_basis,
-                        current_a,
-                    )
-                    .ok_or(PercolatorError::EngineInvalidLeg)?
-                } else if mode == percolator::SideModeV16::ResetPending
-                    && leg.epoch_snap.checked_add(1) == Some(epoch)
-                {
+                let reset_pending = match mode_byte {
+                    0 | 1 => false,
+                    2 => true,
+                    _ => return Err(PercolatorError::EngineInvalidConfig.into()),
+                };
+                let eff_abs: u128 = if leg.epoch_snap == epoch {
+                    risk_limits_v17::adl_effective_abs_q(raw_abs, leg.a_basis, current_a)
+                        .ok_or(PercolatorError::EngineInvalidLeg)?
+                } else if reset_pending && leg.epoch_snap.checked_add(1) == Some(epoch) {
                     0
                 } else {
                     return Err(PercolatorError::EngineInvalidLeg.into());
                 };
-                let abs = i128::try_from(abs).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                let raw = i128::try_from(raw_abs)
+                    .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                let eff = i128::try_from(eff_abs)
+                    .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
                 return Ok(match leg.side {
-                    SideV16::Long => abs,
-                    SideV16::Short => -abs,
+                    SideV16::Long => (raw, eff),
+                    SideV16::Short => (-raw, -eff),
                 });
             }
             slot += 1;
         }
-        Ok(0)
+        Ok((0, 0))
+    }
+
+    /// The ADL-effective signed position only (`.1` of
+    /// `raw_and_effective_signed_position_for_asset_view`).
+    fn effective_signed_position_for_asset_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+    ) -> Result<i128, ProgramError> {
+        Ok(raw_and_effective_signed_position_for_asset_view(group, portfolio, asset_index)?.1)
     }
 
     /// Matcher-inventory-sync: the matcher programs that understand the 40-byte `ext_version = 2`
@@ -32080,7 +32110,15 @@ pub mod processor {
                 return Err(PercolatorError::SameOwnerTrade.into());
             }
             let limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
-            let before = signed_position_for_asset_view(&group, &account_b, asset_index)?;
+            // R-1: on the v2 path ONE walk gives the raw basis (P1 headroom, unchanged) and the
+            // effective position the matcher is told; the legacy path keeps the raw-only read.
+            let (before, lp_position_q) = if want_lp_position {
+                let (raw, eff) =
+                    raw_and_effective_signed_position_for_asset_view(&group, &account_b, asset_index)?;
+                (raw, Some(eff))
+            } else {
+                (signed_position_for_asset_view(&group, &account_b, asset_index)?, None)
+            };
             let lp_delta_sign: i8 = if size_q > 0 { -1 } else { 1 };
             let lp_after_full = before
                 .checked_sub(size_q)
@@ -32100,11 +32138,6 @@ pub mod processor {
                 room
             } else {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
-            };
-            let lp_position_q = if want_lp_position {
-                Some(effective_signed_position_for_asset_view(&group, &account_b, asset_index)?)
-            } else {
-                None
             };
             out.push(P1CpiLegPreflight {
                 lp_position_q,
