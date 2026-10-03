@@ -3442,8 +3442,11 @@ fn available_principal(env: &Env) -> u128 {
 
 #[test]
 fn issue_413_a_refill_is_not_counted_as_both_principal_and_recovery() {
-    const CONSUMED: u128 = 400_000;
-    const REFILL: u128 = 300_000;
+    // 10% of DEPOSIT: the largest impairment a non-bound 75 (the touches and the refill below)
+    // still accepts since security R-1 (LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS). Was 400,000 /
+    // 300,000; the double-count this pins is proportional, so the smaller shape detects it too.
+    const CONSUMED: u128 = 100_000;
+    const REFILL: u128 = 75_000;
     let mut env = setup_vault(0);
     let _genesis = new_depositor(&mut env, DEPOSIT);
 

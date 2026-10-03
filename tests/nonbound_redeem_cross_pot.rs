@@ -651,7 +651,7 @@ fn si_shape_full_creator_exit_spans_both_pots() {
     );
 
     // Pricing over both ledgers still works (no principal < loss underflow anywhere).
-    deposit(&mut env, &v, 1_000_000, DOMAIN);
+    pricing_sound_or_r1_paused(&mut env, &v, 1_000_000, DOMAIN);
 }
 
 /// REGRESSION (#419 earnings leg): LP earnings are priced on both pots' ledgers but the gross
@@ -862,7 +862,44 @@ fn top_up_never_moves_more_than_sibling_available_principal() {
         execute(&mut env, &v, DOMAIN).expect("within own free + sibling available");
         let sib = ledger_of(&env.svm, v.sibling_ledger);
         assert!(sib.total_principal_atoms >= sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms);
-        deposit(&mut env, &v, 1_000_000, DOMAIN); // pricing still sound
+        pricing_sound_or_r1_paused(&mut env, &v, 1_000_000, DOMAIN); // pricing still sound
+    }
+}
+
+/// After an exit the vault must still PRICE (no principal < loss underflow, never Custom 25).
+/// An exit leaves the pot's impairment behind while principal leaves, so the vault's impairment
+/// ratio rises; above `LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS` (10%, security R-1) the deposit is
+/// paused with the named Custom 91, otherwise it succeeds. The expectation is computed from the
+/// two (synced) ledgers, so it pins which of the two must happen.
+fn pricing_sound_or_r1_paused(env: &mut Env, v: &Vault, amount: u128, domain: u16) {
+    let (mut imp, mut p) = (0u128, 0u128);
+    for l in [v.ledger, v.sibling_ledger] {
+        if let Some(a) = env.svm.get_account(&l) {
+            let led = state::read_backing_domain_ledger(&a.data).expect("ledger");
+            imp += led
+                .cumulative_loss_atoms
+                .saturating_sub(led.cumulative_recovery_atoms)
+                .min(led.total_principal_atoms);
+            p += led.total_principal_atoms;
+        }
+    }
+    let lp = v.lp.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    env.svm.expire_blockhash();
+    let r = send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::DepositToLpVault { amount, domain },
+        deposit_accounts(env.market, env.vault_token, v.registry, v.mint, v.lp_ata, v.source, v.ledger, lp.pubkey()),
+        &[&lp],
+    );
+    eprintln!("post-exit vault impairment {imp} / principal {p}: deposit {:?}", r.as_ref().map(|_| ()).map_err(|e| e.contains("Custom(91)")));
+    if imp * 10_000 > 1_000 * p {
+        let e = r.expect_err("R-1: vault impairment > 10% pauses 75");
+        assert!(e.contains("Custom(91)"), "named pause, never 25: {e}");
+    } else {
+        r.expect("pricing still sound");
     }
 }
 
@@ -1046,7 +1083,7 @@ fn sec_partial_exit_from_paid_out_impaired_pot_keeps_pricing() {
     execute(&mut env, &v, SIBLING_DOMAIN).expect("77");
     let sib = ledger_of(&env.svm, v.sibling_ledger);
     assert!(sib.total_principal_atoms >= sib.cumulative_loss_atoms - sib.cumulative_recovery_atoms);
-    deposit(&mut env, &v, 1_000_000, DOMAIN);
+    pricing_sound_or_r1_paused(&mut env, &v, 1_000_000, DOMAIN);
 }
 
 /// CU of a cross-pot non-bound 77 (both legs: principal + earnings top-up).

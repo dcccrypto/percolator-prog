@@ -713,6 +713,31 @@ pub mod constants {
     /// Redemptions (77) are never gated by it.
     pub const LP_VAULT_MAX_PRICE_COLLAPSE: u128 = 1_000;
 
+    /// R-1 (security review of bc228e1b, 2026-10-03): a NON-bound Earn deposit (tag 75) is
+    /// refused (Custom 91) when the vault's total net impairment exceeds this fraction (in bps)
+    /// of its total principal:
+    ///
+    /// ```text
+    /// refuse  iff  Σ_pot min(loss − recovery, principal) * 10_000  >  BPS * Σ_pot principal
+    /// ```
+    ///
+    /// over the two pot ledgers tag 75 already reads, each synced against its own bucket (the
+    /// same synced quantities the "either pot over-impaired" rule and the NAV floor use).
+    ///
+    /// Why: NAV prices a pot's consumed backing (the provider receivable) at zero, but
+    /// receivables recover. A deposit at impairment ratio `r` buys its pro-rata slice of every
+    /// later recovery at a discount, a windfall of up to `r / (1 − r)` per token deposited,
+    /// paid by the incumbent holders. The 1000x collapse factor alone bounded only the ticket
+    /// price, not that pool (reviewer: 2 tokens bought +998 tokens at the collapse threshold).
+    /// At 10% the windfall is at most 1/9 ≈ 0.11x per token, and it shrinks as `r` falls.
+    ///
+    /// Vault-total (not per pot) by design: NAV and shares are vault-wide, so the transfer a
+    /// newcomer can capture is set by the vault's ratio, whichever pot holds the receivable.
+    /// Exact integer comparison, no rounding: exactly `BPS / 10_000` of principal impaired is
+    /// accepted, one atom more is refused. Redemptions (77) are never gated by it. The
+    /// either-pot rule and `LP_VAULT_MAX_PRICE_COLLAPSE` stay as backstops.
+    pub const LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS: u128 = 1_000;
+
     /// #440: upper bound on `CreateLpVault`'s `redemption_cooldown_slots`.
     ///
     /// ~1 year at ~2.5 slots/sec. DELIBERATELY THE SAME NUMBER as
@@ -1334,7 +1359,9 @@ VaultLpMultiAssetMarket,
         /// Vault impaired, deposits paused. NON-BOUND Earn deposit (75) refused because EITHER
         /// pot's booked net impairment exceeds its principal (pricing floors that pot at zero,
         /// so a deposit would buy the holders' recoverable receivable for nothing, or be
-        /// absorbed by the excess), or because the vault's share price has collapsed
+        /// absorbed by the excess), or because the vault's total net impairment exceeds
+        /// `LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS` (10%) of its total principal, or because the
+        /// vault's share price has collapsed
         /// (`nav * LP_VAULT_MAX_PRICE_COLLAPSE < total shares`). Also returned by
         /// RebalanceLpVaultBacking (91) when the DESTINATION pot is over-impaired. Redemptions
         /// (77) are not affected. Custom(91), appended at the END (no existing code shifts).
@@ -16863,6 +16890,11 @@ pub mod processor {
     /// `earnings - withdrawn` subtraction, the floor-rounded LP earnings share. `loss <
     /// recovery` (impossible by ledger construction) is treated as zero impairment, the same
     /// reading `backing_ledger_available_principal_atoms` and the P3 floor already use.
+    ///
+    /// `#[inline(never)]` (security review N-1, 2026-10-03): inlined into tag 77's
+    /// `handle_execute_redemption`, it pushed that frame past the SBF limit ("overwrites values
+    /// in the frame", 55 warnings). Out of line the build has 0 such warnings.
+    #[inline(never)]
     fn lp_vault_nav_atoms_floored(
         total_principal_atoms: u128,
         total_earnings_atoms: u128,
@@ -16913,17 +16945,20 @@ pub mod processor {
         Ok(backing_ledger_available_principal_atoms(&ledger))
     }
 
-    /// True when one pot's SYNCED net impairment (`loss - recovery`) exceeds its principal:
-    /// the state the per-pot NAV floor prices at zero. Used by the non-bound tag 75 (either
-    /// pot over-impaired pauses deposits) and by tag 91 (never move holders' backing INTO
-    /// such a pot). Read-only: the sync runs on a local copy, nothing is written.
-    fn lp_vault_pot_over_impaired(
+    /// One pot's SYNCED `(principal, min(loss − recovery, principal), over_impaired)` for the
+    /// non-bound tag 75 guards (either-pot rule + `LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS`). The
+    /// sync runs on a local copy of the ledger; nothing is written. `over_impaired` is
+    /// `backing_ledger_over_impaired` (the per-pot NAV floor state; tag 91 checks the same
+    /// predicate on its synced destination ledger).
+    /// `#[inline(never)]` keeps the synced ledger copy out of tag 75's frame.
+    #[inline(never)]
+    fn lp_vault_pot_impairment_parts(
         group: &state::MarketViewMutV16<'_>,
         market_group: [u8; 32],
         authority: [u8; 32],
         domain: u16,
         ledger_data: &[u8],
-    ) -> Result<bool, ProgramError> {
+    ) -> Result<(u128, u128, bool), ProgramError> {
         let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
         let (mut ledger, _) = read_or_new_backing_domain_ledger(
             ledger_data,
@@ -16933,7 +16968,20 @@ pub mod processor {
             &bucket,
         )?;
         sync_backing_domain_ledger(&mut ledger, &bucket)?;
-        Ok(backing_ledger_over_impaired(&ledger))
+        let principal = ledger.total_principal_atoms;
+        let impairment = ledger
+            .cumulative_loss_atoms
+            .saturating_sub(ledger.cumulative_recovery_atoms)
+            .min(principal);
+        Ok((principal, impairment, backing_ledger_over_impaired(&ledger)))
+    }
+
+    /// `impairment * 10_000 > max_bps * principal`, exactly, without overflow: for integers
+    /// `x > b*P/10_000 (real)` iff `x > floor(b*P/10_000)`, and the floor is ≤ `principal` when
+    /// `max_bps ≤ 10_000`, so it fits. `principal == 0` (no backing yet) is never impaired.
+    pub fn lp_vault_impairment_exceeds(impairment: u128, principal: u128, max_bps: u128) -> bool {
+        impairment
+            > percolator::wide_math::wide_mul_div_floor_u128(principal, max_bps, 10_000)
     }
 
     /// `loss - recovery > principal` on an already-synced ledger (`loss < recovery` reads as
@@ -24552,19 +24600,41 @@ pub mod processor {
                 //    redemptions (77) stay open.
                 // Both ledgers are pinned by address above; each is synced against its OWN
                 // pot's bucket (`registry.domain` and its sibling cover both pots).
+                //
+                // R-1 (security review of bc228e1b): also pause while the VAULT's total net
+                // impairment exceeds `LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS` of its total
+                // principal. Below the either-pot floor, NAV still prices every receivable at
+                // zero, so a newcomer buys a discounted slice of its recovery; this caps that
+                // windfall (see the constant). Same synced ledgers, read-only.
+                let mut vault_principal: u128 = 0;
+                let mut vault_impairment: u128 = 0;
                 for (pot_domain, pot_data) in [
                     (registry.domain, &ledger_data[..]),
                     (sibling_domain(registry.domain), &sibling_ledger_data[..]),
                 ] {
-                    if lp_vault_pot_over_impaired(
+                    let (principal, impairment, over_impaired) = lp_vault_pot_impairment_parts(
                         &group,
                         market_ai.key.to_bytes(),
                         registry_pda.to_bytes(),
                         pot_domain,
                         pot_data,
-                    )? {
+                    )?;
+                    if over_impaired {
                         return Err(PercolatorError::LpVaultTargetPotImpaired.into());
                     }
+                    vault_principal = vault_principal
+                        .checked_add(principal)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    vault_impairment = vault_impairment
+                        .checked_add(impairment)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                }
+                if lp_vault_impairment_exceeds(
+                    vault_impairment,
+                    vault_principal,
+                    crate::constants::LP_VAULT_MAX_DEPOSIT_IMPAIRMENT_BPS,
+                ) {
+                    return Err(PercolatorError::LpVaultTargetPotImpaired.into());
                 }
             }
             let nav = if state::registry_vault_lp_bound(&registry)? {

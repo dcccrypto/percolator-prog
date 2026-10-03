@@ -9,6 +9,8 @@
 //! reviewer's PoC (`sec_final_low_nav_entry`) minted a 1,000,000-atom depositor 99.9997% of the
 //! supply. Fix: refuse (Custom 91) when EITHER pot is over-impaired, and when
 //! `nav * LP_VAULT_MAX_PRICE_COLLAPSE (1,000) < total shares` on the final pricing NAV.
+//! R-1 (review of bc228e1b) adds a vault impairment-ratio pause (> 10% of total principal);
+//! see tests/sec_r1_impairment_pause.rs. Tests here that priced deposits above 10% now pin it.
 //!
 //! B-2 (MEDIUM): permissionless tag 91 into an over-impaired pot moved Earn holders' backing into
 //! a pot priced at 0, lowering NAV. Fix: refuse an over-impaired DESTINATION (Custom 91).
@@ -807,8 +809,9 @@ fn sec_otc_live_shape_low_nav_entry_is_refused_91() {
 }
 
 /// The PRE-EXISTING half of H-1 (present on deployed f2fbf36d): no pot is over-impaired
-/// (sibling impairment == principal exactly), but NAV = 3 atoms against 2e9 shares. Only the
-/// share-price-collapse guard refuses this one.
+/// (sibling impairment == principal exactly), but NAV = 3 atoms against 2e9 shares. The
+/// share-price-collapse guard refuses it, and since R-1 so does the vault impairment-ratio
+/// pause (~100% > 10%), which now runs first.
 #[test]
 fn sec_collapsed_price_with_no_over_impaired_pot_is_refused_91() {
     let (mut env, v, atk, r) = low_nav_entry(P);
@@ -827,37 +830,48 @@ fn sec_collapsed_price_with_no_over_impaired_pot_is_refused_91() {
     assert_refused_91_without_side_effects(&mut env, &v, &atk, 1_000_000, SIBLING_DOMAIN);
 }
 
-/// Threshold boundary. Total shares T = 2e9; sibling at the boundary (contributes 0); the registry
-/// pot keeps `avail` atoms. nav * 1000 == T (avail = 2,000,000) is accepted and priced exactly;
-/// one atom less is refused.
+/// Inflate the registry's outstanding share count (no impairment anywhere). Since R-1 an
+/// impairment-driven collapse is refused by the ratio pause long before `nav * 1000 < shares`,
+/// so the collapse BACKSTOP is pinned on a synthetic share supply instead.
+fn set_registry_shares(env: &mut Env, v: &Vault, total: u128) {
+    let mut acct = env.svm.get_account(&v.registry).expect("registry");
+    let mut r = state::read_lp_vault_registry(&acct.data).expect("registry decode");
+    r.total_lp_shares_outstanding = total;
+    state::write_lp_vault_registry(&mut acct.data, &r).expect("registry encode");
+    env.svm.set_account(v.registry, acct).unwrap();
+}
+
+/// Collapse-backstop boundary (`LP_VAULT_MAX_PRICE_COLLAPSE`), on an UNIMPAIRED vault (NAV = 2P,
+/// so R-1 does not fire): total shares T = nav * 1000 is accepted and priced exactly; one share
+/// more is refused 91.
 #[test]
 fn sec_price_collapse_threshold_is_exact() {
-    let at = |avail: u128| {
-        let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
-        consume_pot_backing(&mut env, DOMAIN, P - avail);
+    let at = |t: u128| {
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, 0);
+        set_registry_shares(&mut env, &v, t);
         let atk = new_actor(&mut env, &v);
-        let t = registry_shares(&env, &v);
-        assert_eq!(t, 2 * P);
         let r = try_deposit(&mut env, &atk, 1_000_000, DOMAIN);
-        (r, shares_of(&env, atk.lp_ata), t)
+        (r, shares_of(&env, atk.lp_ata))
     };
-    let (r, s, t) = at(2_000_000);
+    let t = 2 * P * 1_000;
+    let (r, s) = at(t);
     r.expect("nav * 1000 == shares is NOT collapsed");
-    assert_eq!(s, floor_mul_div(1_000_000, t, 2_000_000));
-    let (r, s, _) = at(1_999_999);
+    assert_eq!(s, floor_mul_div(1_000_000, t, 2 * P));
+    let (r, s) = at(t + 1);
     let e = r.expect_err("nav * 1000 < shares is collapsed");
     assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
     assert_eq!(s, 0);
 }
 
-/// The collapse test uses the FINAL pricing NAV: harvestable LP fees (#411) count. NAV before
-/// fees = 1,000,000 (refused); with 1,000,000 harvestable it is 2,000,000 == T / 1000 (accepted,
-/// priced on the fee-inclusive NAV).
+/// The collapse test uses the FINAL pricing NAV: harvestable LP fees (#411) count. Unimpaired
+/// vault, T = 1000 * (2P + 1,000,000): NAV before fees = 2P (refused); with 1,000,000
+/// harvestable it is exactly T / 1000 (accepted, priced on the fee-inclusive NAV).
 #[test]
 fn sec_harvestable_fees_count_toward_the_collapse_threshold() {
+    let t = 1_000 * (2 * P + 1_000_000);
     let setup_at = |fees: u128| {
-        let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
-        consume_pot_backing(&mut env, DOMAIN, P - 1_000_000);
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, 0);
+        set_registry_shares(&mut env, &v, t);
         if fees != 0 {
             let mut acct = env.svm.get_account(&env.market).expect("market");
             let (mut cfg, mut g) = state::read_market(&acct.data).expect("read market");
@@ -871,31 +885,33 @@ fn sec_harvestable_fees_count_toward_the_collapse_threshold() {
             set_token(&mut env.svm, env.vault_token, mint, va, bal + fees as u64);
         }
         let atk = new_actor(&mut env, &v);
-        let t = registry_shares(&env, &v);
         let r = try_deposit(&mut env, &atk, 1_000_000, DOMAIN);
-        (r, shares_of(&env, atk.lp_ata), t)
+        (r, shares_of(&env, atk.lp_ata))
     };
-    let (r, _, _) = setup_at(0);
-    assert!(has_code(&r.expect_err("1e6 * 1000 < 2e9"), TARGET_IMPAIRED));
-    let (r, s, t) = setup_at(1_000_000);
+    let (r, _) = setup_at(0);
+    assert!(has_code(&r.expect_err("2P * 1000 < T"), TARGET_IMPAIRED));
+    let (r, s) = setup_at(1_000_000);
     r.expect("fees lift NAV to the threshold");
     assert_eq!(
         s,
-        floor_mul_div(1_000_000, t, 2_000_000),
+        floor_mul_div(1_000_000, t, 2 * P + 1_000_000),
         "priced on the fee-inclusive NAV"
     );
 }
 
 /// Reviewer's third row: registry pot nearly empty but the sibling is healthy (NAV = P + 3).
-/// Not collapsed, no pot over-impaired: the deposit is accepted at the ordinary price
-/// (0.0999% of supply, as on deployed bytes).
+/// Not collapsed and no pot over-impaired, but the vault is ~50% impaired: since R-1 the
+/// deposit is refused 91 with no side effects, into either pot (bc228e1b accepted it at the
+/// ordinary price, buying half of the registry pot's later recovery at a discount).
 #[test]
-fn sec_low_registry_pot_with_healthy_sibling_still_accepts() {
-    let (env, v, atk, r) = low_nav_entry(0);
-    r.expect("healthy vault accepts");
-    let s = shares_of(&env, atk.lp_ata);
-    assert_eq!(s, floor_mul_div(1_000_000, 2 * P, P + 3));
-    assert_eq!(registry_shares(&env, &v), 2 * P + s);
+fn sec_low_registry_pot_with_healthy_sibling_is_paused_by_r1() {
+    let (mut env, v, atk, r) = low_nav_entry(0);
+    let e = r.expect_err("R-1: vault impairment ~50% > 10%");
+    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
+    assert_eq!(shares_of(&env, atk.lp_ata), 0);
+    for d in [DOMAIN, SIBLING_DOMAIN] {
+        assert_refused_91_without_side_effects(&mut env, &v, &atk, 1_000_000, d);
+    }
 }
 
 /// A fully healthy vault: deposits into either pot accepted, priced 1:1 on NAV.
@@ -992,10 +1008,12 @@ fn sec_91_refuses_an_over_impaired_destination() {
 }
 
 /// Tag 91 still works into a healthy, a merely-impaired (impairment < principal) and a boundary
-/// (impairment == principal) destination; principal moves 1:1 and NAV is unchanged.
+/// (impairment == principal) destination; principal moves 1:1 and NAV is unchanged. Up to the
+/// R-1 limit (10% of total principal = 200,000,000) a deposit after the move prices exactly on
+/// 2P - impairment; above it the deposit is paused (91) while 91 itself is unaffected.
 #[test]
 fn sec_91_still_moves_into_a_non_over_impaired_destination() {
-    for dest_impairment in [0u128, 400_000_000, P] {
+    for dest_impairment in [0u128, 200_000_000, 400_000_000, P] {
         let (mut env, v) = otc_env(SIBLING_DOMAIN, dest_impairment);
         let amt = 100_000_000u128;
         let src_p = ledger_of(&env.svm, v.ledger).total_principal_atoms;
@@ -1016,6 +1034,10 @@ fn sec_91_still_moves_into_a_non_over_impaired_destination() {
         // NAV unchanged: a deposit after the move prices exactly as on 2P - impairment.
         let atk = new_actor(&mut env, &v);
         let t = registry_shares(&env, &v);
+        if dest_impairment * 10 > 2 * P {
+            assert_refused_91_without_side_effects(&mut env, &v, &atk, 100_000_000, DOMAIN);
+            continue;
+        }
         try_deposit(&mut env, &atk, 100_000_000, DOMAIN).expect("deposit after the move");
         assert_eq!(
             shares_of(&env, atk.lp_ata),

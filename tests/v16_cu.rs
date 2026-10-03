@@ -18086,11 +18086,23 @@ fn v16_bpf_batch_trade_cpi_canonical_matcher_v2_11_legs_fit_budget() {
     //   deployed 553d76f0 + 4a0f696 (v1 on this id): min 1,374,684, max 1,380,684
     //   f01b490a + b5b419d (v2, before R-1):         ComputationalBudgetExceeded 10/10
     //   R-1 fix + b5b419d (v2):                       min 1,380,641, max 1,383,641
-    // i.e. v2 costs ~6k CU over 11 legs (~540/leg, matcher's v2 handling included). Require at
-    // least 10,000 CU of headroom under the 1.4M ceiling (six more bump steps than observed).
+    // i.e. v2 costs ~6k CU over 11 legs (~540/leg, matcher's v2 handling included).
+    //
+    // Re-measured 2026-10-04 (security review of bc228e1b, I-6), 60 runs on the H-1/R-1 build:
+    //   1,380,641 x26 | 1,382,141 x9 | 1,383,641 x17 | 1,385,141 x3 | 1,386,641 x3 |
+    //   1,388,141 x1 | 1,389,641 x1   (reviewer, 3 runs on 45e24eb3: max 1,388,141)
+    // The floor (1,380,641) is deterministic; the tail is the random keypairs' PDA bump search,
+    // +1,500 CU per extra bump step. The old `<= 1,390,000` sat 359 CU above the observed max, so
+    // one more bump step failed the test while the transaction itself still fit: a flake, not a
+    // budget signal. The real gate is the 1,400,000 limit the tx is sent with (exceeding it is
+    // ComputationalBudgetExceeded, which this test reports as an error). Assert that limit minus
+    // a 3,000 CU safety margin (two bump steps), so a real regression of ~10k CU on the floor
+    // (or any per-leg growth) still fails here before it can fail on chain.
+    const CU_LIMIT: u64 = 1_400_000;
+    const SAFETY_MARGIN: u64 = 3_000;
     assert!(
-        allowed_cu <= 1_390_000,
-        "11 canonical legs consumed {allowed_cu} CU; less than 10k CU headroom under 1.4M"
+        allowed_cu <= CU_LIMIT - SAFETY_MARGIN,
+        "11 canonical legs consumed {allowed_cu} CU; less than {SAFETY_MARGIN} CU under 1.4M"
     );
 }
 
