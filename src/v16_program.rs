@@ -689,6 +689,30 @@ pub mod constants {
     /// see percolator/src/v16.rs lp_vault module doc).
     pub const LP_VAULT_MINIMUM_LIQUIDITY: u128 = 1_000;
 
+    /// H-1 (security review 2026-10-03): a NON-bound Earn deposit (tag 75) is refused
+    /// (Custom 91) when `nav * LP_VAULT_MAX_PRICE_COLLAPSE < total_lp_shares_outstanding`,
+    /// with `nav` the final pricing NAV (floored pots + harvestable fees).
+    ///
+    /// Why a floor on the share price is needed: NAV counts consumed backing (a provider
+    /// receivable) as a loss, but receivables recover. A vault whose NAV has collapsed
+    /// toward zero while its receivable is still outstanding sells its ENTIRE future
+    /// recovery for dust: `shares = amount * total / nav` hands a 1-token depositor
+    /// ~100% of the supply (live OTC 2026-10-03: nav 3 atoms vs 2e9 shares — 1,000,000
+    /// atoms bought 99.9997%).
+    ///
+    /// Why 1,000: genesis mints 1 share per atom (`lp_shares_for_deposit`, total == 0),
+    /// and earnings only raise the price, so `nav * 1000 < shares` means the price per
+    /// share is below 0.1% of genesis: the vault has written off more than 99.9% of
+    /// what its holders put in. At or above that price a 1-atom deposit mints at most
+    /// 1,000 shares and the depositor's capture of a later recovery is bounded by the
+    /// ordinary pro-rata rule that already applies to any impaired vault (a
+    /// pre-existing, documented property of NAV pricing). Below it, pricing is
+    /// degenerate. The bound is deliberately loose so a heavily-but-not-totally
+    /// impaired vault keeps taking the deposits that refill its receivable; the
+    /// "either pot over-impaired" refusal handles the per-pot floor case on its own.
+    /// Redemptions (77) are never gated by it.
+    pub const LP_VAULT_MAX_PRICE_COLLAPSE: u128 = 1_000;
+
     /// #440: upper bound on `CreateLpVault`'s `redemption_cooldown_slots`.
     ///
     /// ~1 year at ~2.5 slots/sec. DELIBERATELY THE SAME NUMBER as
@@ -1307,13 +1331,14 @@ VaultLpMultiAssetMarket,
         /// at market creation (relaunch seeds and the wizard do), before any trade. Custom(90),
         /// appended at the END (no existing code shifts). SDK: add to the client error map.
         VaultLpBindRequiresFlatAsset,
-        /// NON-BOUND Earn deposit (75) routed INTO a pot whose booked net impairment exceeds its
-        /// principal. Pricing floors that pot at zero, so atoms deposited into it would first
-        /// be absorbed by the excess impairment while minting shares as if they were fully
-        /// backed; refused rather than silently charge the depositor. Deposit to the sibling
-        /// pot (its NAV is priced on its own). Custom(91), appended at the END (no existing
-        /// code shifts). SDK: add to the client error map and route Earn deposits to the pot
-        /// with `principal >= net impairment`.
+        /// Vault impaired, deposits paused. NON-BOUND Earn deposit (75) refused because EITHER
+        /// pot's booked net impairment exceeds its principal (pricing floors that pot at zero,
+        /// so a deposit would buy the holders' recoverable receivable for nothing, or be
+        /// absorbed by the excess), or because the vault's share price has collapsed
+        /// (`nav * LP_VAULT_MAX_PRICE_COLLAPSE < total shares`). Also returned by
+        /// RebalanceLpVaultBacking (91) when the DESTINATION pot is over-impaired. Redemptions
+        /// (77) are not affected. Custom(91), appended at the END (no existing code shifts).
+        /// SDK/app: map to "Earn deposits paused while this vault settles".
         LpVaultTargetPotImpaired,
     }
 
@@ -16888,6 +16913,37 @@ pub mod processor {
         Ok(backing_ledger_available_principal_atoms(&ledger))
     }
 
+    /// True when one pot's SYNCED net impairment (`loss - recovery`) exceeds its principal:
+    /// the state the per-pot NAV floor prices at zero. Used by the non-bound tag 75 (either
+    /// pot over-impaired pauses deposits) and by tag 91 (never move holders' backing INTO
+    /// such a pot). Read-only: the sync runs on a local copy, nothing is written.
+    fn lp_vault_pot_over_impaired(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        ledger_data: &[u8],
+    ) -> Result<bool, ProgramError> {
+        let (_, bucket) = backing_domain_parts_view(group, domain as usize)?;
+        let (mut ledger, _) = read_or_new_backing_domain_ledger(
+            ledger_data,
+            market_group,
+            authority,
+            domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        Ok(backing_ledger_over_impaired(&ledger))
+    }
+
+    /// `loss - recovery > principal` on an already-synced ledger (`loss < recovery` reads as
+    /// zero impairment, the same convention as `backing_ledger_available_principal_atoms`).
+    fn backing_ledger_over_impaired(l: &state::BackingDomainLedgerAccountV16) -> bool {
+        l.cumulative_loss_atoms
+            .saturating_sub(l.cumulative_recovery_atoms)
+            > l.total_principal_atoms
+    }
+
     /// AVAILABLE principal across BOTH domains. Must be summed alongside NAV: the
     /// redemption split is `principal_out = shares * available_principal / total_shares`
     /// and `earnings_out = atoms_out - principal_out`. Pairing a COMBINED nav with a
@@ -24479,34 +24535,36 @@ pub mod processor {
         let shares = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
-            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            // Validates the routed domain against the group (the per-pot reads below sync
+            // each pot against its own bucket).
+            let (_, _target_bucket) = backing_domain_parts_view(&group, domain)?;
             let ledger_data = ledger_ai.try_borrow_data()?;
             let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
             if !state::registry_vault_lp_bound(&registry)? {
                 // NON-BOUND: pricing floors an over-impaired pot at 0 (see
-                // `lp_vault_nav_atoms_floored`), so the first `impairment - principal` atoms
-                // deposited INTO such a pot would be absorbed by the excess while shares were
-                // minted against a fully-backed deposit. Refuse that routing; the sibling pot
-                // is priced on its own and accepts the deposit at full value.
-                let target_data: &[u8] = if target_is_sibling {
-                    &sibling_ledger_data
-                } else {
-                    &ledger_data
-                };
-                let (mut target_l, _) = read_or_new_backing_domain_ledger(
-                    target_data,
-                    market_ai.key.to_bytes(),
-                    registry_pda.to_bytes(),
-                    target_domain,
-                    &bucket,
-                )?;
-                sync_backing_domain_ledger(&mut target_l, &bucket)?;
-                if target_l
-                    .cumulative_loss_atoms
-                    .saturating_sub(target_l.cumulative_recovery_atoms)
-                    > target_l.total_principal_atoms
-                {
-                    return Err(PercolatorError::LpVaultTargetPotImpaired.into());
+                // `lp_vault_nav_atoms_floored`). Two consequences, both refused (91):
+                //  - INTO such a pot: the first `impairment - principal` atoms would be
+                //    absorbed by the excess while shares were minted as fully backed.
+                //  - H-1 (security review 2026-10-03): into the OTHER pot. The floored pot
+                //    still carries a recoverable receivable that belongs to the existing
+                //    holders; NAV prices it at 0, so a newcomer buys a slice of that
+                //    recovery at no cost. Deposits pause until no pot is over-impaired;
+                //    redemptions (77) stay open.
+                // Both ledgers are pinned by address above; each is synced against its OWN
+                // pot's bucket (`registry.domain` and its sibling cover both pots).
+                for (pot_domain, pot_data) in [
+                    (registry.domain, &ledger_data[..]),
+                    (sibling_domain(registry.domain), &sibling_ledger_data[..]),
+                ] {
+                    if lp_vault_pot_over_impaired(
+                        &group,
+                        market_ai.key.to_bytes(),
+                        registry_pda.to_bytes(),
+                        pot_domain,
+                        pot_data,
+                    )? {
+                        return Err(PercolatorError::LpVaultTargetPotImpaired.into());
+                    }
                 }
             }
             let nav = if state::registry_vault_lp_bound(&registry)? {
@@ -24550,6 +24608,19 @@ pub mod processor {
             let nav = nav
                 .checked_add(harvestable)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // H-1 (security review 2026-10-03): NON-bound share-price collapse. Evaluated on
+            // the FINAL pricing NAV (floored pots + harvestable fees), so fees that would be
+            // cranked into NAV in the same slot count toward keeping the vault open. See
+            // `LP_VAULT_MAX_PRICE_COLLAPSE` for the threshold. `saturating_mul` is the safe
+            // direction: a NAV so large it saturates is not collapsed. Genesis
+            // (`total == 0`) prices 1:1 and is never collapsed.
+            if bound_tail.is_none()
+                && registry.total_lp_shares_outstanding != 0
+                && nav.saturating_mul(crate::constants::LP_VAULT_MAX_PRICE_COLLAPSE)
+                    < registry.total_lp_shares_outstanding
+            {
+                return Err(PercolatorError::LpVaultTargetPotImpaired.into());
+            }
             if let Some((_, Some(lp_ai), st)) = bound_tail.as_ref() {
                 // P3-L1: the genesis senior deposit mints 1:1, so it must not be able to buy a
                 // pre-existing fee backlog (on a bound vault with no senior shares, tag 78 now
@@ -24936,8 +25007,11 @@ pub mod processor {
     /// so the registry PDA is already authorised for both domains.
     ///
     /// Permissionless: moving idle backing between two pots owned by the same
-    /// vault cannot extract value, and the source-side gate below refuses any
-    /// move that would leave the source domain under-backed.
+    /// vault cannot extract value, because the source-side gate below refuses any
+    /// move that would leave the source domain under-backed, only AVAILABLE
+    /// principal leaves the source, and (B-2, 2026-10-03) the DESTINATION may not
+    /// be over-impaired (`loss - recovery > principal`; Custom 91). Under the
+    /// per-pot NAV floor, backing booked into such a pot lowers vault NAV.
     #[inline(never)]
     fn handle_rebalance_lp_vault_backing<'a>(
         program_id: &Pubkey,
@@ -25218,6 +25292,19 @@ pub mod processor {
                 &to_bucket_pre,
             )?;
             sync_backing_domain_ledger(&mut to_ledger, &to_bucket_pre)?;
+            // B-2 (security review 2026-10-03): never move backing INTO an over-impaired pot.
+            // The per-pot NAV floor prices such a pot at 0, so booking `amount` there (with
+            // the watermark pinned below) leaves its impairment unchanged and lowers vault
+            // NAV by `min(amount, impairment - principal)`: the moved backing refills that
+            // pot's receivable and backs its winners with the Earn holders' money. The
+            // instruction is permissionless, so the refusal has to live here. Checked on the
+            // SYNCED ledger (losses since the last observation count). A pot whose impairment
+            // equals its principal is not over-impaired and still accepts (NAV-neutral).
+            // Fail closed before any destination write; the source-side writes above are
+            // discarded with the transaction.
+            if backing_ledger_over_impaired(&to_ledger) {
+                return Err(PercolatorError::LpVaultTargetPotImpaired.into());
+            }
             add_fresh_counterparty_backing_view(
                 &mut group,
                 to_domain as usize,

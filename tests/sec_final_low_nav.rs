@@ -1,22 +1,22 @@
 // Skip this integration-test binary when Kani builds the test suite.
 #![cfg(not(kani))]
 #![allow(dead_code)]
-//! NON-bound (non-P3) Earn vault: NAV pricing with an OVER-IMPAIRED pot (impairment > principal).
+//! Security review 2026-10-03 (wrapper 7a3ac04c), regression tests for H-1 and B-2.
 //!
-//! Live bug (devnet wrapper ETDLAdi @ 553d76f0, 2026-10-02): on a NON-bound Earn vault, when ONE
-//! pot's booked net impairment (cumulative_loss - cumulative_recovery) exceeds its principal,
-//! `lp_vault_combined_nav_atoms` failed closed (Custom 25 EngineCounterUnderflow) and EVERY tag
-//! 75 reverted until the pot recovered (OTC market 6Y4bf...; same class froze SI 8WC8...).
+//! H-1 (HIGH): on a NON-bound Earn vault a tag 75 priced at a collapsed NAV bought the existing
+//! holders' recoverable receivable for dust. Live OTC (6Y4bfYLW, slot 507,133,571): registry pot
+//! available principal 3 atoms, sibling pot over-impaired (floored to 0), 2e9 shares. The
+//! reviewer's PoC (`sec_final_low_nav_entry`) minted a 1,000,000-atom depositor 99.9997% of the
+//! supply. Fix: refuse (Custom 91) when EITHER pot is over-impaired, and when
+//! `nav * LP_VAULT_MAX_PRICE_COLLAPSE (1,000) < total shares` on the final pricing NAV.
 //!
-//! Fix: price an over-impaired pot at ZERO (floored), never negative; refuse a deposit routed INTO
-//! such a pot (Custom 91) so it is not silently absorbed.
+//! B-2 (MEDIUM): permissionless tag 91 into an over-impaired pot moved Earn holders' backing into
+//! a pot priced at 0, lowering NAV. Fix: refuse an over-impaired DESTINATION (Custom 91).
 //!
-//! H-1 (security review 2026-10-03): a deposit into the HEALTHY pot while the other is
-//! over-impaired is ALSO refused (91): the floored pot's recoverable receivable belongs to the
-//! existing holders and a newcomer priced on the floored NAV would capture it. Deposits pause;
-//! redemptions (77) stay open. The tests below that previously asserted the 75 succeeded in the
-//! over-impaired state now assert the refusal (see tests/sec_final_low_nav.rs for the rest).
+//! Tag 77 (redemption) is never gated by either guard.
 //!
+//! Harness copied verbatim from tests/nonbound_nav_floor.rs. `PERC_PROG_SO` overrides the
+//! program bytes, so the same tests run as negative controls against other builds.
 //! Harness copied from tests/nonbound_redeem_cross_pot.rs. `PERC_PROG_SO` overrides the program
 //! bytes, so the same tests run as a negative control against the pre-fix build.
 
@@ -168,7 +168,11 @@ fn send(
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
-        .map(|m| { if std::env::var_os("SEC_CU").is_some() { eprintln!("SEC_CU {}", m.compute_units_consumed); } })
+        .map(|m| {
+            if std::env::var_os("SEC_CU").is_some() {
+                eprintln!("SEC_CU {}", m.compute_units_consumed);
+            }
+        })
         .map_err(|e| format!("{e:?}"))
 }
 
@@ -203,7 +207,8 @@ fn init_market_ix() -> ProgInstruction {
 /// authority. admin is the cfg.asset_authority (init default) so the append is
 /// fee-free. configured_slots grows 1 → 2, enabling domain 2.
 fn activate_asset_ix(backing_authority: Pubkey, admin: Pubkey) -> ProgInstruction {
-    ProgInstruction::UpdateAssetLifecycle { market_id: 2,
+    ProgInstruction::UpdateAssetLifecycle {
+        market_id: 2,
         action: ASSET_ACTION_ACTIVATE,
         asset_index: APPEND_ASSET_INDEX,
         // W3A-2: this file's only `UpdateAssetAuthority` mention is a doc
@@ -400,7 +405,6 @@ fn token_amount(svm: &LiteSVM, key: Pubkey) -> u64 {
         .amount
 }
 
-
 fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     let ata_program: Pubkey = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
         .parse()
@@ -493,11 +497,21 @@ struct Vault {
 
 fn vault(env: &mut Env) -> Vault {
     let (registry, mint, ledger, lp, lp_ata, source) = ready_vault(env);
-    let (sibling_ledger, _) = derive_lp_backing_ledger(&env.program_id, &env.market, SIBLING_DOMAIN);
+    let (sibling_ledger, _) =
+        derive_lp_backing_ledger(&env.program_id, &env.market, SIBLING_DOMAIN);
     let dest = Pubkey::new_unique();
     let (cm, owner) = (env.collateral_mint, lp.pubkey());
     set_token(&mut env.svm, dest, cm, owner, 0);
-    Vault { registry, mint, ledger, sibling_ledger, lp, lp_ata, source, dest }
+    Vault {
+        registry,
+        mint,
+        ledger,
+        sibling_ledger,
+        lp,
+        lp_ata,
+        source,
+        dest,
+    }
 }
 
 fn deposit(env: &mut Env, v: &Vault, amount: u128, domain: u16) {
@@ -508,14 +522,27 @@ fn deposit(env: &mut Env, v: &Vault, amount: u128, domain: u16) {
         env.program_id,
         &payer,
         ProgInstruction::DepositToLpVault { amount, domain },
-        deposit_accounts(env.market, env.vault_token, v.registry, v.mint, v.lp_ata, v.source, v.ledger, lp.pubkey()),
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            v.registry,
+            v.mint,
+            v.lp_ata,
+            v.source,
+            v.ledger,
+            lp.pubkey(),
+        ),
         &[&lp],
     )
     .expect("deposit");
 }
 
 fn rebalance(env: &mut Env, v: &Vault, from: u16, to: u16, amount: u128) -> Result<(), String> {
-    let (fl, tl) = if from == DOMAIN { (v.ledger, v.sibling_ledger) } else { (v.sibling_ledger, v.ledger) };
+    let (fl, tl) = if from == DOMAIN {
+        (v.ledger, v.sibling_ledger)
+    } else {
+        (v.sibling_ledger, v.ledger)
+    };
     let cranker = Keypair::new();
     env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
     let payer = env.payer.insecure_clone();
@@ -523,7 +550,11 @@ fn rebalance(env: &mut Env, v: &Vault, from: u16, to: u16, amount: u128) -> Resu
         &mut env.svm,
         env.program_id,
         &payer,
-        ProgInstruction::RebalanceLpVaultBacking { from_domain: from, to_domain: to, amount },
+        ProgInstruction::RebalanceLpVaultBacking {
+            from_domain: from,
+            to_domain: to,
+            amount,
+        },
         vec![
             AccountMeta::new(cranker.pubkey(), true),
             AccountMeta::new(env.market, false),
@@ -604,7 +635,6 @@ fn floor_mul_div(a: u128, b: u128, c: u128) -> u128 {
     a.checked_mul(b).expect("test values fit u128") / c
 }
 
-
 // ─────────────────────────────── helpers specific to this file ───────────────────────────────
 
 const P: u128 = 1_000_000_000; // 1,000 tokens seeded into EACH pot (the launch wizard shape)
@@ -656,7 +686,16 @@ fn try_deposit(env: &mut Env, v: &Vault, amount: u128, domain: u16) -> Result<()
         env.program_id,
         &payer,
         ProgInstruction::DepositToLpVault { amount, domain },
-        deposit_accounts(env.market, env.vault_token, v.registry, v.mint, v.lp_ata, v.source, v.ledger, lp.pubkey()),
+        deposit_accounts(
+            env.market,
+            env.vault_token,
+            v.registry,
+            v.mint,
+            v.lp_ata,
+            v.source,
+            v.ledger,
+            lp.pubkey(),
+        ),
         &[&lp],
     )
 }
@@ -702,246 +741,286 @@ fn net_impairment(l: &state::BackingDomainLedgerAccountV16) -> u128 {
     l.cumulative_loss_atoms - l.cumulative_recovery_atoms
 }
 
-// ───────────────────────────────────────── tests ─────────────────────────────────────────────
+// ─────────────────────────────── H-1 / B-2 regression tests ──────────────────────────────────
 
-/// THE LIVE BUG. OTC shape: the registry pot is healthy, the SIBLING pot's impairment exceeds
-/// its principal. The app's own builder deposits into the registry pot. Before the floor this
-/// reverted Custom(25) (combined NAV underflowed on the sibling). fdf07759 made it succeed priced
-/// on the floored NAV; H-1 (2026-10-03) refuses it with the NAMED code 91 instead (the newcomer
-/// would buy the sibling's recoverable receivable at 0). No tokens move, nothing is minted, and
-/// neither pot nor ledger is touched.
-#[test]
-fn otc_shape_75_into_the_healthy_pot_is_refused_91_while_the_sibling_is_over_impaired() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    let t_before = registry_shares(&env, &v);
-    assert_eq!(t_before, 2 * P);
-    let held = shares_of(&env, v.lp_ata);
-    let (src, vault_tok) = (token_amount(&env.svm, v.source), token_amount(&env.svm, env.vault_token));
+/// Live OTC shape: sibling pot impairment `sib`, registry pot impairment `P - 3` (3 atoms of
+/// available principal). A NEW actor deposits 1,000,000 atoms into the registry pot. Returns
+/// (env, vault, attacker, deposit result).
+fn low_nav_entry(sib: u128) -> (Env, Vault, Vault, Result<(), String>) {
+    let (mut env, v) = otc_env(SIBLING_DOMAIN, sib);
+    consume_pot_backing(&mut env, DOMAIN, P - 3);
+    let atk = new_actor(&mut env, &v);
+    let r = try_deposit(&mut env, &atk, 1_000_000, DOMAIN);
+    (env, v, atk, r)
+}
+
+fn assert_refused_91_without_side_effects(
+    env: &mut Env,
+    v: &Vault,
+    who: &Vault,
+    amount: u128,
+    domain: u16,
+) {
+    let t = registry_shares(env, v);
+    let held = shares_of(env, who.lp_ata);
+    let src = token_amount(&env.svm, who.source);
+    let vault_tok = token_amount(&env.svm, env.vault_token);
     let market_before = env.svm.get_account(&env.market).unwrap().data;
-    let led_before = env.svm.get_account(&v.ledger).unwrap().data;
-    let sib_ledger_before = env.svm.get_account(&v.sibling_ledger).unwrap().data;
-
-    let e = try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect_err("H-1: deposits pause");
-    assert!(has_code(&e, TARGET_IMPAIRED), "named refusal, got {}", code_of(&e));
-    assert_eq!(shares_of(&env, v.lp_ata), held);
-    assert_eq!(registry_shares(&env, &v), t_before);
-    assert_eq!(token_amount(&env.svm, v.source), src);
-    assert_eq!(token_amount(&env.svm, env.vault_token), vault_tok);
-    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
-    assert_eq!(env.svm.get_account(&v.ledger).unwrap().data, led_before);
-    assert_eq!(env.svm.get_account(&v.sibling_ledger).unwrap().data, sib_ledger_before);
-}
-
-/// Same state, mirrored: the REGISTRY pot is the over-impaired one, the sibling is healthy. H-1:
-/// the deposit into the healthy sibling is refused 91 too (either pot over-impaired pauses 75).
-#[test]
-fn otc_shape_mirrored_75_into_the_healthy_sibling_is_refused_91() {
-    let (mut env, v) = otc_env(DOMAIN, OVER);
-    let t_before = registry_shares(&env, &v);
-    let held = shares_of(&env, v.lp_ata);
-    let e = try_deposit(&mut env, &v, 250_000_000, SIBLING_DOMAIN).expect_err("H-1: deposits pause");
-    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
-    assert_eq!(shares_of(&env, v.lp_ata), held);
-    assert_eq!(registry_shares(&env, &v), t_before);
-    assert_eq!(ledger_of(&env.svm, v.sibling_ledger).total_principal_atoms, P);
-}
-
-/// A deposit routed INTO the over-impaired pot is refused with the named code (91), moves no
-/// tokens and mints nothing. (Before the fix: Custom 25 for every deposit, either pot.)
-#[test]
-fn deposit_routed_into_the_over_impaired_pot_is_refused_without_side_effects() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    let (t, held, src, vault_tok) = (
-        registry_shares(&env, &v),
-        shares_of(&env, v.lp_ata),
-        token_amount(&env.svm, v.source),
-        token_amount(&env.svm, env.vault_token),
+    let l_before = env.svm.get_account(&v.ledger).map(|a| a.data);
+    let s_before = env.svm.get_account(&v.sibling_ledger).map(|a| a.data);
+    let e = try_deposit(env, who, amount, domain).expect_err("deposit must be refused");
+    assert!(
+        has_code(&e, TARGET_IMPAIRED),
+        "want Custom(91), got {}",
+        code_of(&e)
     );
-    let sib_before = env.svm.get_account(&v.sibling_ledger).unwrap().data;
-    let e = try_deposit(&mut env, &v, 100_000_000, SIBLING_DOMAIN).expect_err("must refuse");
-    assert!(has_code(&e, TARGET_IMPAIRED), "named refusal, got {}", code_of(&e));
-    assert_eq!(registry_shares(&env, &v), t);
-    assert_eq!(shares_of(&env, v.lp_ata), held);
-    assert_eq!(token_amount(&env.svm, v.source), src);
+    assert_eq!(registry_shares(env, v), t, "no shares minted");
+    assert_eq!(shares_of(env, who.lp_ata), held);
+    assert_eq!(token_amount(&env.svm, who.source), src, "no tokens moved");
     assert_eq!(token_amount(&env.svm, env.vault_token), vault_tok);
-    assert_eq!(env.svm.get_account(&v.sibling_ledger).unwrap().data, sib_before);
-    // ... and (H-1) the healthy pot refuses the same deposit while the sibling is over-impaired.
-    let e = try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect_err("H-1: deposits pause");
-    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        market_before
+    );
+    assert_eq!(env.svm.get_account(&v.ledger).map(|a| a.data), l_before);
+    assert_eq!(
+        env.svm.get_account(&v.sibling_ledger).map(|a| a.data),
+        s_before
+    );
 }
 
-/// BOUNDARY (impairment == principal exactly): this priced to 0 without error on the old code
-/// and must keep doing so — the floor is continuous with it — and the deposit target rule does
-/// NOT refuse it (nothing would be absorbed).
+/// THE REVIEWER'S EXPLOIT (sec_final_low_nav_entry, OTC row): refused 91. Both guards fire here
+/// (sibling over-impaired, and NAV 3 * 1000 < 2e9); each is pinned on its own below.
 #[test]
-fn boundary_impairment_equal_to_principal_is_unchanged_and_deposits_into_it_work() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
-    let t = registry_shares(&env, &v);
-    let held = shares_of(&env, v.lp_ata);
-    try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect("healthy pot");
-    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, P));
-    try_deposit(&mut env, &v, 100_000_000, SIBLING_DOMAIN).expect("deposit into the pot AT the boundary");
-}
-
-/// ADVERSARIAL: deposit-then-recovery capture. At the boundary (impairment == principal, NAV
-/// halved, price 0.5 — not collapsed) an attacker can still buy in and ride a full recovery: the
-/// pre-existing, documented property of NAV pricing (receivables are priced as losses). In the
-/// OVER-impaired state H-1 now refuses the entry outright (I-4 of the 2026-10-03 review), so the
-/// floor opens no capture window beyond the boundary state.
-fn attacker_profit_after_full_recovery(consumed: u128) -> (u128, u128) {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, consumed);
-    let atk = new_actor(&mut env, &v);
-    let amt = 100_000_000u128;
-    try_deposit(&mut env, &atk, amt, DOMAIN).expect("attacker deposit");
-    // A live write synced the loss into the ledger before the recovery.
-    book_synced_impairment(&mut env, v.sibling_ledger, consumed);
-    recover_pot_backing(&mut env, SIBLING_DOMAIN, consumed);
-    let shares = shares_of(&env, atk.lp_ata);
-    request(&mut env, &atk, shares);
-    execute(&mut env, &atk, DOMAIN).expect("attacker redeems after the recovery");
-    let got = token_amount(&env.svm, atk.dest) as u128;
-    (got, amt)
-}
-
-#[test]
-fn deposit_then_recovery_captures_no_more_than_the_boundary_state() {
-    let (got_boundary, amt) = attacker_profit_after_full_recovery(P);
-    // Boundary: the attacker's pro-rata slice of the recovered vault: NAV 2,100 over 2,200
-    // shares, attacker holds 200 shares.
-    assert_eq!(got_boundary, floor_mul_div(200_000_000, 2_100_000_000, 2_200_000_000));
-    assert!(got_boundary > amt, "documented pre-existing property at the boundary");
-    // Over-impaired: H-1 refuses the entry, so no capture at all.
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    let atk = new_actor(&mut env, &v);
-    let e = try_deposit(&mut env, &atk, amt, DOMAIN).expect_err("H-1: no entry while over-impaired");
+fn sec_otc_live_shape_low_nav_entry_is_refused_91() {
+    let (mut env, v, atk, r) = low_nav_entry(OVER);
+    let e = r.expect_err("7a3ac04c minted 99.9997% here; must refuse");
     assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
     assert_eq!(shares_of(&env, atk.lp_ata), 0);
-}
-
-/// ADVERSARIAL: a recovery that stays INSIDE the over-impaired segment (net impairment still above
-/// principal) leaves the pot over-impaired, so deposits stay paused (H-1) and an existing holder's
-/// exit through the healthy pot is still priced on the floored NAV (the recovery moved no value).
-#[test]
-fn recovery_inside_the_over_impaired_segment_moves_no_value() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    book_synced_impairment(&mut env, v.sibling_ledger, OVER);
-    recover_pot_backing(&mut env, SIBLING_DOMAIN, 300_000_000); // 1,500 -> 1,200 (> principal 1,000)
-    let atk = new_actor(&mut env, &v);
-    let e = try_deposit(&mut env, &atk, 100_000_000, DOMAIN).expect_err("still over-impaired");
-    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
-    let t = registry_shares(&env, &v);
-    let shares = shares_of(&env, v.lp_ata) / 2;
-    request(&mut env, &v, shares);
-    execute(&mut env, &v, DOMAIN).expect("redeem");
-    assert_eq!(token_amount(&env.svm, v.dest) as u128, floor_mul_div(shares, P, t), "floored NAV");
-}
-
-/// REDEEM AFTER THE FLOOR: a holder exits (all but the 1,000 dead shares) through the healthy
-/// pot. Paid exactly shares * floored-NAV / total (the healthy pot's value), never a token from
-/// the over-impaired pot, and nobody can take more than the healthy pot backs.
-#[test]
-fn redeem_through_the_healthy_pot_pays_the_floored_nav_and_leaves_the_sibling_alone() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    let t = registry_shares(&env, &v);
-    let shares = shares_of(&env, v.lp_ata);
-    let owed = floor_mul_div(shares, P, t);
-    assert!(owed <= P, "never more than the healthy pot backs");
-    let sib_bucket = market_group(&env).source_backing_buckets[SIBLING_DOMAIN as usize];
-    request(&mut env, &v, shares);
-    execute(&mut env, &v, DOMAIN).expect("77 through the healthy pot");
-    assert_eq!(token_amount(&env.svm, v.dest) as u128, owed);
-    let g = market_group(&env);
-    let sb = g.source_backing_buckets[SIBLING_DOMAIN as usize];
-    assert_eq!(sb.fresh_unliened_backing_num, sib_bucket.fresh_unliened_backing_num);
-    assert_eq!(sb.consumed_liened_backing_num, sib_bucket.consumed_liened_backing_num);
-    let sl = ledger_of(&env.svm, v.sibling_ledger);
-    assert_eq!(sl.total_principal_atoms, P, "sibling principal untouched");
-}
-
-/// A redeemer who names the OVER-IMPAIRED pot as the source cannot pull value out of it or
-/// strand the vault: the per-pot available principal of that pot is 0, so the payout is refused
-/// (fail closed, no tokens move). Pre-existing guard; asserted so the floor cannot loosen it.
-#[test]
-fn redeem_naming_the_over_impaired_pot_as_source_is_refused() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    let shares = shares_of(&env, v.lp_ata) / 2;
-    request(&mut env, &v, shares);
-    let vault_tok = token_amount(&env.svm, env.vault_token);
-    let r = execute(&mut env, &v, SIBLING_DOMAIN);
-    eprintln!("77 from the over-impaired pot: {:?}", r.as_ref().map_err(|e| code_of(e)));
-    if r.is_ok() {
-        // If a future change makes this succeed it must still be exactly the floored claim and
-        // may never leave the pot with principal below its impairment.
-        let sl = ledger_of(&env.svm, v.sibling_ledger);
-        assert!(sl.total_principal_atoms >= net_impairment(&sl) || sl.total_principal_atoms == P);
-    } else {
-        assert_eq!(token_amount(&env.svm, env.vault_token), vault_tok, "no tokens moved");
-    }
-    // Either way the vault stays priceable for exits: the remaining shares redeem through the
-    // healthy pot (H-1 keeps 75 paused, refused with the named 91, never 25).
-    let e = try_deposit(&mut env, &v, 1_000_000, DOMAIN).expect_err("H-1: deposits pause");
-    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
-}
-
-/// SIBLING UNAFFECTED / earnings: LP earnings collected in a pot are still part of NAV (they are
-/// not principal and the loss did not touch them): NAV = 1,000 + 50% of 20. Measured at the
-/// boundary (impairment == principal, floor-equivalent, still open for 75); in the OVER state the
-/// same deposit is refused 91 (H-1).
-#[test]
-fn earnings_in_the_over_impaired_pot_still_count_toward_nav() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
-    add_pot_earnings(&mut env, SIBLING_DOMAIN, 20_000_000);
-    // seed the ledger earnings the same way a crank/sync would: next sync reads the bucket.
-    let t = registry_shares(&env, &v);
-    let held = shares_of(&env, v.lp_ata);
-    let amt = 100_000_000u128;
-    try_deposit(&mut env, &v, amt, DOMAIN).expect("deposit");
-    let nav = P + 10_000_000; // fee_share_bps 5_000 -> LP gets half of the 20
-    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(amt, t, nav));
-
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    add_pot_earnings(&mut env, SIBLING_DOMAIN, 20_000_000);
-    let e = try_deposit(&mut env, &v, amt, DOMAIN).expect_err("H-1: deposits pause");
-    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
-}
-
-/// BOTH pots over-impaired: NAV floors to 0 and a deposit must fail closed (a zero NAV with
-/// outstanding shares never mints), whichever pot it targets.
-#[test]
-fn both_pots_over_impaired_deposits_fail_closed() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
-    consume_pot_backing(&mut env, DOMAIN, OVER);
-    let (t, held) = (registry_shares(&env, &v), shares_of(&env, v.lp_ata));
+    assert_eq!(registry_shares(&env, &v), 2 * P);
+    // Either pot, any size.
     for d in [DOMAIN, SIBLING_DOMAIN] {
-        let e = try_deposit(&mut env, &v, 100_000_000, d).expect_err("must refuse");
-        assert!(has_code(&e, TARGET_IMPAIRED), "deposit to pot {d}: {}", code_of(&e));
+        for amt in [1u128, 1_000_000, 10 * P] {
+            assert_refused_91_without_side_effects(&mut env, &v, &atk, amt, d);
+        }
     }
-    assert_eq!(registry_shares(&env, &v), t);
-    assert_eq!(shares_of(&env, v.lp_ata), held);
 }
 
-/// The healthy-vault path is byte-for-byte what it was: no impairment anywhere, the NAV equals the
-/// principal sum and deposits price 1:1.
+/// The PRE-EXISTING half of H-1 (present on deployed f2fbf36d): no pot is over-impaired
+/// (sibling impairment == principal exactly), but NAV = 3 atoms against 2e9 shares. Only the
+/// share-price-collapse guard refuses this one.
 #[test]
-fn control_healthy_vault_prices_unchanged() {
+fn sec_collapsed_price_with_no_over_impaired_pot_is_refused_91() {
+    let (mut env, v, atk, r) = low_nav_entry(P);
+    for l in [v.ledger, v.sibling_ledger] {
+        if let Some(a) = env.svm.get_account(&l) {
+            let led = state::read_backing_domain_ledger(&a.data).expect("ledger");
+            assert!(
+                net_impairment(&led) <= led.total_principal_atoms,
+                "no pot over-impaired"
+            );
+        }
+    }
+    let e = r.expect_err("collapsed NAV must refuse");
+    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
+    assert_eq!(shares_of(&env, atk.lp_ata), 0);
+    assert_refused_91_without_side_effects(&mut env, &v, &atk, 1_000_000, SIBLING_DOMAIN);
+}
+
+/// Threshold boundary. Total shares T = 2e9; sibling at the boundary (contributes 0); the registry
+/// pot keeps `avail` atoms. nav * 1000 == T (avail = 2,000,000) is accepted and priced exactly;
+/// one atom less is refused.
+#[test]
+fn sec_price_collapse_threshold_is_exact() {
+    let at = |avail: u128| {
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
+        consume_pot_backing(&mut env, DOMAIN, P - avail);
+        let atk = new_actor(&mut env, &v);
+        let t = registry_shares(&env, &v);
+        assert_eq!(t, 2 * P);
+        let r = try_deposit(&mut env, &atk, 1_000_000, DOMAIN);
+        (r, shares_of(&env, atk.lp_ata), t)
+    };
+    let (r, s, t) = at(2_000_000);
+    r.expect("nav * 1000 == shares is NOT collapsed");
+    assert_eq!(s, floor_mul_div(1_000_000, t, 2_000_000));
+    let (r, s, _) = at(1_999_999);
+    let e = r.expect_err("nav * 1000 < shares is collapsed");
+    assert!(has_code(&e, TARGET_IMPAIRED), "got {}", code_of(&e));
+    assert_eq!(s, 0);
+}
+
+/// The collapse test uses the FINAL pricing NAV: harvestable LP fees (#411) count. NAV before
+/// fees = 1,000,000 (refused); with 1,000,000 harvestable it is 2,000,000 == T / 1000 (accepted,
+/// priced on the fee-inclusive NAV).
+#[test]
+fn sec_harvestable_fees_count_toward_the_collapse_threshold() {
+    let setup_at = |fees: u128| {
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, P);
+        consume_pot_backing(&mut env, DOMAIN, P - 1_000_000);
+        if fees != 0 {
+            let mut acct = env.svm.get_account(&env.market).expect("market");
+            let (mut cfg, mut g) = state::read_market(&acct.data).expect("read market");
+            cfg.lp_fee_accrued_atoms += fees;
+            g.insurance += fees;
+            g.vault += fees;
+            state::write_market(&mut acct.data, &cfg, &g).expect("write market");
+            env.svm.set_account(env.market, acct).unwrap();
+            let bal = token_amount(&env.svm, env.vault_token);
+            let (mint, va) = (env.collateral_mint, vault_authority(&env));
+            set_token(&mut env.svm, env.vault_token, mint, va, bal + fees as u64);
+        }
+        let atk = new_actor(&mut env, &v);
+        let t = registry_shares(&env, &v);
+        let r = try_deposit(&mut env, &atk, 1_000_000, DOMAIN);
+        (r, shares_of(&env, atk.lp_ata), t)
+    };
+    let (r, _, _) = setup_at(0);
+    assert!(has_code(&r.expect_err("1e6 * 1000 < 2e9"), TARGET_IMPAIRED));
+    let (r, s, t) = setup_at(1_000_000);
+    r.expect("fees lift NAV to the threshold");
+    assert_eq!(
+        s,
+        floor_mul_div(1_000_000, t, 2_000_000),
+        "priced on the fee-inclusive NAV"
+    );
+}
+
+/// Reviewer's third row: registry pot nearly empty but the sibling is healthy (NAV = P + 3).
+/// Not collapsed, no pot over-impaired: the deposit is accepted at the ordinary price
+/// (0.0999% of supply, as on deployed bytes).
+#[test]
+fn sec_low_registry_pot_with_healthy_sibling_still_accepts() {
+    let (env, v, atk, r) = low_nav_entry(0);
+    r.expect("healthy vault accepts");
+    let s = shares_of(&env, atk.lp_ata);
+    assert_eq!(s, floor_mul_div(1_000_000, 2 * P, P + 3));
+    assert_eq!(registry_shares(&env, &v), 2 * P + s);
+}
+
+/// A fully healthy vault: deposits into either pot accepted, priced 1:1 on NAV.
+#[test]
+fn sec_healthy_vault_accepts_deposits_into_both_pots() {
     let mut env = setup();
     let v = vault(&mut env);
     deposit(&mut env, &v, P, DOMAIN);
     deposit(&mut env, &v, P, SIBLING_DOMAIN);
-    let t = registry_shares(&env, &v);
-    let held = shares_of(&env, v.lp_ata);
-    try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect("deposit");
-    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, 2 * P));
+    let atk = new_actor(&mut env, &v);
+    try_deposit(&mut env, &atk, 100_000_000, DOMAIN).expect("registry pot");
+    try_deposit(&mut env, &atk, 100_000_000, SIBLING_DOMAIN).expect("sibling pot");
+    assert_eq!(shares_of(&env, atk.lp_ata), 200_000_000);
 }
 
-/// Moderate impairment (below principal) is priced exactly as before: unfloored.
+/// Tag 77 stays open while deposits are paused: in the over-impaired state a holder exits through
+/// the healthy pot and is paid exactly the floored NAV share; the paused deposit is still refused
+/// afterwards.
 #[test]
-fn control_impairment_below_principal_is_priced_unfloored() {
-    let (mut env, v) = otc_env(SIBLING_DOMAIN, 400_000_000);
+fn sec_77_redeems_while_deposits_are_paused() {
+    let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
+    let probe = new_actor(&mut env, &v);
+    assert_refused_91_without_side_effects(&mut env, &v, &probe, 1_000_000, DOMAIN);
     let t = registry_shares(&env, &v);
-    let held = shares_of(&env, v.lp_ata);
-    try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect("deposit");
-    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, 2 * P - 400_000_000));
-    // and a deposit into the (merely) impaired pot is allowed.
-    try_deposit(&mut env, &v, 100_000_000, SIBLING_DOMAIN).expect("impairment < principal is a normal pot");
+    let shares = shares_of(&env, v.lp_ata);
+    let owed = floor_mul_div(shares, P, t);
+    request(&mut env, &v, shares);
+    execute(&mut env, &v, DOMAIN).expect("77 through the healthy pot must work while 75 is paused");
+    assert_eq!(token_amount(&env.svm, v.dest) as u128, owed);
+    assert_eq!(registry_shares(&env, &v), t - shares);
+    assert_refused_91_without_side_effects(&mut env, &v, &probe, 1_000_000, DOMAIN);
+}
+
+/// Same, in the exact live OTC shape (3 atoms in the registry pot): 77 is not refused by any
+/// 91 guard (whatever it pays, it never fails with Custom 91).
+#[test]
+fn sec_77_is_never_refused_91_in_the_live_otc_shape() {
+    let (mut env, v, _atk, _) = low_nav_entry(OVER);
+    let shares = shares_of(&env, v.lp_ata);
+    request(&mut env, &v, shares);
+    let r = execute(&mut env, &v, DOMAIN);
+    eprintln!(
+        "77 in the live OTC shape: {:?}",
+        r.as_ref().map_err(|e| code_of(e))
+    );
+    match r {
+        Ok(()) => assert_eq!(
+            token_amount(&env.svm, v.dest) as u128,
+            floor_mul_div(shares, 3, 2 * P)
+        ),
+        Err(e) => assert!(
+            !has_code(&e, TARGET_IMPAIRED),
+            "77 must never be gated by 91: {}",
+            code_of(&e)
+        ),
+    }
+}
+
+/// B-2: tag 91 INTO an over-impaired pot is refused 91 with no state change, both when the loss
+/// is only visible after the in-instruction sync (lazy ledger) and when it is already booked.
+/// Amounts: a small move and the SI-style "deficit + 0.1%" repair the app used to prepend.
+#[test]
+fn sec_91_refuses_an_over_impaired_destination() {
+    for booked in [false, true] {
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
+        if booked {
+            book_synced_impairment(&mut env, v.sibling_ledger, OVER);
+        }
+        for amt in [1_000_000u128, (OVER - P) + (OVER - P) / 1000] {
+            let market_before = env.svm.get_account(&env.market).unwrap().data;
+            let l_before = env.svm.get_account(&v.ledger).unwrap().data;
+            let s_before = env.svm.get_account(&v.sibling_ledger).unwrap().data;
+            let e = rebalance(&mut env, &v, DOMAIN, SIBLING_DOMAIN, amt).expect_err("must refuse");
+            assert!(
+                has_code(&e, TARGET_IMPAIRED),
+                "booked={booked} amt={amt}: {}",
+                code_of(&e)
+            );
+            assert_eq!(
+                env.svm.get_account(&env.market).unwrap().data,
+                market_before
+            );
+            assert_eq!(env.svm.get_account(&v.ledger).unwrap().data, l_before);
+            assert_eq!(
+                env.svm.get_account(&v.sibling_ledger).unwrap().data,
+                s_before
+            );
+        }
+    }
+    // Mirrored: registry pot over-impaired, move from the sibling into it.
+    let (mut env, v) = otc_env(DOMAIN, OVER);
+    let e = rebalance(&mut env, &v, SIBLING_DOMAIN, DOMAIN, 1_000_000).expect_err("must refuse");
+    assert!(has_code(&e, TARGET_IMPAIRED), "mirrored: {}", code_of(&e));
+}
+
+/// Tag 91 still works into a healthy, a merely-impaired (impairment < principal) and a boundary
+/// (impairment == principal) destination; principal moves 1:1 and NAV is unchanged.
+#[test]
+fn sec_91_still_moves_into_a_non_over_impaired_destination() {
+    for dest_impairment in [0u128, 400_000_000, P] {
+        let (mut env, v) = otc_env(SIBLING_DOMAIN, dest_impairment);
+        let amt = 100_000_000u128;
+        let src_p = ledger_of(&env.svm, v.ledger).total_principal_atoms;
+        let dst_p = ledger_of(&env.svm, v.sibling_ledger).total_principal_atoms;
+        rebalance(&mut env, &v, DOMAIN, SIBLING_DOMAIN, amt)
+            .unwrap_or_else(|e| panic!("dest impairment {dest_impairment}: {}", code_of(&e)));
+        assert_eq!(
+            ledger_of(&env.svm, v.ledger).total_principal_atoms,
+            src_p - amt
+        );
+        let sl = ledger_of(&env.svm, v.sibling_ledger);
+        assert_eq!(sl.total_principal_atoms, dst_p + amt);
+        assert_eq!(
+            net_impairment(&sl),
+            dest_impairment,
+            "impairment stays with the pot"
+        );
+        // NAV unchanged: a deposit after the move prices exactly as on 2P - impairment.
+        let atk = new_actor(&mut env, &v);
+        let t = registry_shares(&env, &v);
+        try_deposit(&mut env, &atk, 100_000_000, DOMAIN).expect("deposit after the move");
+        assert_eq!(
+            shares_of(&env, atk.lp_ata),
+            floor_mul_div(100_000_000, t, 2 * P - dest_impairment),
+            "dest impairment {dest_impairment}"
+        );
+    }
 }
