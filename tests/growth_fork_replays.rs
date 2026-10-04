@@ -1,0 +1,620 @@
+// Skip this integration-test binary when Kani builds the test suite.
+#![cfg(not(kani))]
+//! growth-v19 fork replays (plan §2.1 worked examples): OTC, Jimothy and STONK, the three
+//! listed markets whose over-levered creator LP took the crowd fills that drained it. Shows
+//! that the growth gate would have CLOSED the crowd side while leaving the thin side open.
+//!
+//! # Method (key-free, read-only)
+//! * `tests/fixtures/growth_fork/<market>.json`: READ-ONLY dumps (one `getMultipleAccounts`,
+//!   one context slot) of the slab, every wrapper-owned portfolio whose `market_group_id`
+//!   (offset 16) is the slab, the LP's matcher context, and the Clock sysvar. Fetcher:
+//!   `tests/fixtures/growth_fork/fetch.py` (devnet relaunch wrapper `ETDLAdi…`, matcher
+//!   `EDKKgRaV…`; no keys, no sends).
+//! * Part 1 (pure, on the live bytes): decode the LP with the program's own decoders, compute
+//!   `C_m`, the ADL-effective LP net, `N_cap = 1x * C_m / P` and `u`, and run the program's own
+//!   `growth_v19::growth_gate` for a crowd-side and a thin-side open.
+//! * Part 2 (LiteSVM fork): mount THIS build's wrapper at the live id and THIS build's matcher
+//!   at the canonical id, load every account, and send a crowd-side TradeCpi from the market's
+//!   largest non-LP portfolio (owner listed as signer, `with_sigverify(false)`; no account data
+//!   rewritten to fit a signer). Run twice: growth OFF (the slab as fetched: the NEGATIVE
+//!   CONTROL) and growth ON (the one opt-in rewrite: asset 0's `AssetGrowthV19` at [672, 792)
+//!   with `l_launch = tier`, lambda 1x, kink 50%). The live engine may refuse first (h-lock,
+//!   loss-stale, ADL); every outcome is printed and the assertions are exactly what the
+//!   bytes support.
+use litesvm::LiteSVM;
+use percolator::{SideV16, POS_SCALE};
+use percolator_prog::{
+    constants::KIND_PORTFOLIO, growth_v19, ix::Instruction as ProgInstruction, risk_limits_v17,
+    state,
+};
+use solana_program::pubkey;
+use solana_sdk::{
+    account::Account,
+    clock::Clock,
+    instruction::{AccountMeta, Instruction, InstructionError},
+    message::Message,
+    pubkey::Pubkey,
+    signature::{Keypair, Signature, Signer},
+    transaction::{Transaction, TransactionError},
+};
+use std::path::PathBuf;
+
+const WRAPPER_ID: Pubkey = pubkey!("ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
+const MATCHER_ID: Pubkey = pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
+const GROWTH_CAPACITY_FULL: u32 = 93;
+
+fn so(path: &str) -> Vec<u8> {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push(path);
+    std::fs::read(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+}
+
+fn b64(s: &str) -> Vec<u8> {
+    fn val(c: u8) -> u32 {
+        match c {
+            b'A'..=b'Z' => (c - b'A') as u32,
+            b'a'..=b'z' => (c - b'a' + 26) as u32,
+            b'0'..=b'9' => (c - b'0' + 52) as u32,
+            b'+' => 62,
+            b'/' => 63,
+            _ => panic!("bad base64 byte {c}"),
+        }
+    }
+    let bytes: Vec<u8> = s.bytes().filter(|c| *c != b'=' && *c != b'\n').collect();
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let mut acc = 0u32;
+        for (i, c) in chunk.iter().enumerate() {
+            acc |= val(*c) << (18 - 6 * i);
+        }
+        out.push((acc >> 16) as u8);
+        if chunk.len() > 2 {
+            out.push((acc >> 8) as u8);
+        }
+        if chunk.len() > 3 {
+            out.push(acc as u8);
+        }
+    }
+    out
+}
+
+struct Fixture {
+    name: String,
+    slab: Pubkey,
+    clock: Clock,
+    accounts: Vec<(Pubkey, Account)>,
+}
+
+fn load(name: &str) -> Fixture {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push(format!("tests/fixtures/growth_fork/{name}.json"));
+    let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{}: {e}", p.display()));
+    let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+    assert_eq!(
+        v["wrapper_program"].as_str().unwrap(),
+        WRAPPER_ID.to_string()
+    );
+    let clock: Clock = bincode::deserialize(&b64(v["clock_sysvar_b64"].as_str().unwrap())).unwrap();
+    let accounts = v["accounts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a["pubkey"].as_str().unwrap().parse().unwrap(),
+                Account {
+                    lamports: a["lamports"].as_u64().unwrap(),
+                    data: b64(a["data_b64"].as_str().unwrap()),
+                    owner: a["owner"].as_str().unwrap().parse().unwrap(),
+                    executable: a["executable"].as_bool().unwrap(),
+                    rent_epoch: 0,
+                },
+            )
+        })
+        .collect();
+    Fixture {
+        name: name.to_string(),
+        slab: v["slab"].as_str().unwrap().parse().unwrap(),
+        clock,
+        accounts,
+    }
+}
+
+fn data<'a>(fx: &'a Fixture, k: &Pubkey) -> &'a [u8] {
+    &fx.accounts.iter().find(|(kk, _)| kk == k).unwrap().1.data
+}
+
+fn portfolios(fx: &Fixture) -> Vec<Pubkey> {
+    fx.accounts
+        .iter()
+        .filter(|(_, a)| a.owner == WRAPPER_ID && a.data.len() > 10 && a.data[10] == KIND_PORTFOLIO)
+        .map(|(k, _)| *k)
+        .collect()
+}
+
+/// The LP: the portfolio with an ENABLED matcher config.
+fn lp_of(fx: &Fixture) -> Pubkey {
+    let lps: Vec<Pubkey> = portfolios(fx)
+        .into_iter()
+        .filter(|k| {
+            state::read_portfolio_matcher_config(data(fx, k))
+                .unwrap()
+                .enabled()
+                == 1
+        })
+        .collect();
+    assert_eq!(lps.len(), 1, "{}: exactly one matcher LP", fx.name);
+    lps[0]
+}
+
+/// (raw signed, ADL-effective signed) position on asset 0, via the program's own port of the
+/// engine's `kernel_adl_effective_quantity_ceil`.
+fn positions(fx: &Fixture, portfolio: &Pubkey) -> (i128, i128) {
+    let (_, g) = state::read_market(data(fx, &fx.slab)).unwrap();
+    let p = state::read_portfolio(data(fx, portfolio)).unwrap();
+    for l in p.legs.iter().filter(|l| l.active && l.asset_index == 0) {
+        let raw = l.basis_pos_q.unsigned_abs();
+        let (a, epoch) = match l.side {
+            SideV16::Long => (g.assets[0].a_long, g.assets[0].epoch_long),
+            SideV16::Short => (g.assets[0].a_short, g.assets[0].epoch_short),
+        };
+        let eff = if l.epoch_snap == epoch {
+            risk_limits_v17::adl_effective_abs_q(raw, l.a_basis, a).unwrap()
+        } else {
+            0
+        };
+        let s = if l.side == SideV16::Long { 1 } else { -1 };
+        if std::env::var_os("GROWTH_FORK_DEBUG").is_some() {
+            eprintln!(
+                "  leg {:?} raw {raw} eff {eff} snap {} epoch {epoch} a_basis {} a {a}",
+                l.side, l.epoch_snap, l.a_basis
+            );
+        }
+        return (s * raw as i128, s * eff as i128);
+    }
+    (0, 0)
+}
+
+fn conservative_equity(fx: &Fixture, portfolio: &Pubkey) -> u128 {
+    let p = state::read_portfolio(data(fx, portfolio)).unwrap();
+    percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap()
+}
+
+struct Live {
+    lp: Pubkey,
+    lp_eff: i128,
+    c_m: u128,
+    price: u64,
+    imr: u64,
+    n_cap: u128,
+    hlock: bool,
+}
+
+fn live(fx: &Fixture) -> Live {
+    let (_, g) = state::read_market(data(fx, &fx.slab)).unwrap();
+    let lp = lp_of(fx);
+    let (_, lp_eff) = positions(fx, &lp);
+    let c_m = conservative_equity(fx, &lp);
+    let price = g.assets[0].effective_price;
+    let n_cap = growth_v19::n_cap_q(c_m, growth_v19::DEFAULT_LAMBDA_BPS, price, POS_SCALE).unwrap();
+    Live {
+        lp,
+        lp_eff,
+        c_m,
+        price,
+        imr: g.config.initial_margin_bps,
+        n_cap,
+        hlock: g.bankruptcy_hlock_active,
+    }
+}
+
+/// The program's own gate for a 1,000-unit crowd-side and thin-side open against an LP with
+/// conservative equity `c_m` and ADL-effective net `lp_eff`, at the engine IMR tier (10x here).
+fn gate_verdicts(
+    c_m: u128,
+    lp_eff: i128,
+    price: u64,
+    imr: u64,
+) -> (growth_v19::GrowthVerdict, growth_v19::GrowthVerdict) {
+    let crowd_dir: i128 = if lp_eff < 0 { 1 } else { -1 };
+    let size = 1_000 * POS_SCALE as i128;
+    let ceil =
+        growth_v19::ceiling_imr_bps(imr, growth_v19::leverage_x100_for_imr_bps(imr).unwrap())
+            .unwrap();
+    let gate = |taker_size: i128| {
+        let lp_after = lp_eff - taker_size;
+        growth_v19::growth_gate(&growth_v19::GrowthGateIn {
+            taker_before_q: 0,
+            taker_after_q: taker_size,
+            taker_eff_after_abs_q: taker_size.unsigned_abs(),
+            taker_equity: u128::MAX / 4, // ANY equity: the crowd refusal is capacity, not margin
+            taker_cert_initial_req: None,
+            lp: Some(growth_v19::GrowthLpIn {
+                before_q: lp_eff,
+                after_q: lp_after,
+                eff_after_abs_q: lp_after.unsigned_abs(),
+                equity: c_m,
+            }),
+            price_e6: price,
+            pos_scale: POS_SCALE,
+            engine_imr_bps: imr,
+            min_nonzero_im_req: 0,
+            ceil_imr_bps: ceil,
+            lambda_bps: growth_v19::DEFAULT_LAMBDA_BPS,
+            kink_bps: growth_v19::DEFAULT_KINK_BPS,
+            crowd_blocked: false, // capacity alone; the h-lock is not needed for the verdict
+        })
+    };
+    (gate(crowd_dir * size), gate(-crowd_dir * size))
+}
+
+fn u_display(c_m: u128, lp_eff: i128, price: u64) -> (u128, String) {
+    let n = growth_v19::n_cap_q(c_m, growth_v19::DEFAULT_LAMBDA_BPS, price, POS_SCALE).unwrap();
+    let u_bps = if n == 0 {
+        u128::MAX
+    } else {
+        lp_eff.unsigned_abs() * 10_000 / n
+    };
+    (n, format!("{}.{:02}%", u_bps / 100, u_bps % 100))
+}
+
+/// Part 1a: the 10-04 audit snapshot (slot 507,235,567), when all three LPs still held the
+/// crowd's inventory. Inputs are the audit's recorded live fields (fixture provenance in the
+/// JSON); C_m = capital + min(pnl, 0) (all three had positive PnL, which gets no credit).
+#[test]
+fn growth_fork_replay_audit_snapshot_closes_all_three_crowds() {
+    let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    p.push("tests/fixtures/growth_fork/audit_snapshot_507235567.json");
+    let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
+    let num = |x: &serde_json::Value| -> i128 { x.as_str().unwrap().parse().unwrap() };
+    let mut seen = 0;
+    for name in ["otc", "jimothy", "stonk"] {
+        let m = &v["markets"][name];
+        let pnl = num(&m["lp_pnl"]);
+        let c_m = percolator_prog::vault_lp_v18::conservative_equity(
+            num(&m["lp_capital"]) as u128,
+            pnl,
+            0,
+        )
+        .unwrap();
+        let lp_eff = num(&m["lp_eff_q"]);
+        let price = num(&m["price_e6"]) as u64;
+        let imr = num(&m["initial_margin_bps"]) as u64;
+        let (n, u) = u_display(c_m, lp_eff, price);
+        let (crowd, thin) = gate_verdicts(c_m, lp_eff, price, imr);
+        eprintln!("[audit {name}] C_m {c_m} LP eff {lp_eff} @ {price} -> N_cap {n}, u = {u}: crowd {crowd:?}, thin {thin:?}");
+        assert!(lp_eff.unsigned_abs() >= n, "{name}: u >= 1");
+        assert_eq!(
+            crowd,
+            growth_v19::GrowthVerdict::CapacityFull,
+            "{name}: the crowd side would have been closed"
+        );
+        assert_eq!(
+            thin,
+            growth_v19::GrowthVerdict::Allow,
+            "{name}: the thin side stays open"
+        );
+        // NEGATIVE CONTROL: the same LP with 20x the capital is within capacity.
+        let (crowd_rich, _) = gate_verdicts(c_m * 20, lp_eff, price, imr);
+        assert_ne!(
+            crowd_rich,
+            growth_v19::GrowthVerdict::CapacityFull,
+            "{name}: capital opens the crowd side"
+        );
+        seen += 1;
+    }
+    assert_eq!(seen, 3);
+}
+
+// ── Part 2: LiteSVM fork ────────────────────────────────────────────────────
+
+fn fork(fx: &Fixture, growth_on: bool) -> LiteSVM {
+    let mut svm = LiteSVM::new().with_sigverify(false);
+    svm.add_program(WRAPPER_ID, &so("target/deploy/percolator_prog.so"));
+    svm.add_program(
+        MATCHER_ID,
+        &so("../percolator-match/target/deploy/percolator_match.so"),
+    );
+    for (k, a) in &fx.accounts {
+        let mut a = a.clone();
+        if growth_on && *k == fx.slab {
+            let (_, g) = state::read_market(&a.data).unwrap();
+            let imr = g.config.initial_margin_bps;
+            let tier = growth_v19::leverage_x100_for_imr_bps(imr).unwrap();
+            let rec = state::AssetGrowthV19 {
+                lambda_bps: growth_v19::DEFAULT_LAMBDA_BPS,
+                l_launch_x100: tier,
+                l_tier_x100: tier,
+                ceil_x100: tier,
+                kink_bps: growth_v19::DEFAULT_KINK_BPS,
+                r_gap_bps: 400,
+                version: growth_v19::GROWTH_VERSION,
+                ..Default::default()
+            };
+            let r = state::asset_growth_range(&a.data, 0).unwrap();
+            let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+            let slot_end = slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN;
+            state::asset_growth_to_wrapper_bytes(&mut a.data[slot0..slot_end], &rec, imr).unwrap();
+        }
+        svm.set_account(*k, a).unwrap();
+    }
+    svm.set_sysvar(&fx.clock);
+    svm
+}
+
+fn trade_cpi(
+    svm: &mut LiteSVM,
+    fx: &Fixture,
+    taker: &Pubkey,
+    lp: &Pubkey,
+    size_q: i128,
+) -> Result<(), TransactionError> {
+    let md = svm.get_account(&fx.slab).unwrap().data;
+    let (cfg, _, _, market_id, _, _) = state::read_market_trade_preflight(&md, 0).unwrap();
+    let td = svm.get_account(taker).unwrap().data;
+    let ld = svm.get_account(lp).unwrap().data;
+    let owner = Pubkey::new_from_array(state::read_portfolio_owner_preflight(&td).unwrap().1);
+    let mcfg = state::read_portfolio_matcher_config(&ld).unwrap();
+    let ix = Instruction {
+        program_id: WRAPPER_ID,
+        accounts: vec![
+            AccountMeta::new(owner, true),
+            AccountMeta::new(fx.slab, false),
+            AccountMeta::new(*taker, false),
+            AccountMeta::new(*lp, false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(mcfg.matcher_program), false),
+            AccountMeta::new(Pubkey::new_from_array(mcfg.matcher_context), false),
+            AccountMeta::new_readonly(Pubkey::new_from_array(mcfg.matcher_delegate), false),
+        ],
+        data: ProgInstruction::TradeCpi {
+            account_a_portfolio_id: state::read_portfolio_id(&td).unwrap(),
+            account_a_position_epoch: state::read_portfolio_position_epoch(&td).unwrap(),
+            account_b_portfolio_id: state::read_portfolio_id(&ld).unwrap(),
+            account_b_position_epoch: state::read_portfolio_position_epoch(&ld).unwrap(),
+            market_id,
+            account_b_matcher_sequence: state::read_portfolio_matcher_sequence(&ld).unwrap(),
+            asset_index: 0,
+            size_q,
+            fee_bps: cfg.trade_fee_base_bps,
+            limit_price: 0,
+            backing_fee_cap_bps: 10_000,
+        }
+        .encode(),
+    };
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.expire_blockhash();
+    let msg = Message::new(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ix,
+        ],
+        Some(&payer.pubkey()),
+    );
+    let mut tx = Transaction::new_unsigned(msg);
+    tx.signatures = vec![Signature::default(); tx.message.header.num_required_signatures as usize];
+    tx.partial_sign(&[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).map(|_| ()).map_err(|f| f.err)
+}
+
+/// The largest-capital non-LP portfolio (the taker for the fork trades).
+fn taker_of(fx: &Fixture, lp: &Pubkey) -> Pubkey {
+    portfolios(fx)
+        .into_iter()
+        .filter(|k| k != lp)
+        .max_by_key(|k| state::read_portfolio(data(fx, k)).unwrap().capital)
+        .unwrap()
+}
+
+fn custom(r: &Result<(), TransactionError>) -> Option<u32> {
+    match r {
+        Err(TransactionError::InstructionError(2, InstructionError::Custom(c))) => Some(*c),
+        _ => None,
+    }
+}
+
+fn raw_pos(svm: &LiteSVM, k: &Pubkey) -> i128 {
+    let p = state::read_portfolio(&svm.get_account(k).unwrap().data).unwrap();
+    p.legs
+        .iter()
+        .find(|l| l.active && l.asset_index == 0)
+        .map(|l| match l.side {
+            SideV16::Long => l.basis_pos_q.unsigned_abs() as i128,
+            SideV16::Short => -(l.basis_pos_q.unsigned_abs() as i128),
+        })
+        .unwrap_or(0)
+}
+
+/// TradeNoCpi (no clip): taker vs the LP portfolio, both owners as (fake) signers.
+fn trade_nocpi(
+    svm: &mut LiteSVM,
+    fx: &Fixture,
+    taker: &Pubkey,
+    lp: &Pubkey,
+    size_q: i128,
+) -> Result<(), TransactionError> {
+    let md = svm.get_account(&fx.slab).unwrap().data;
+    let (cfg, _, _, market_id, _, _) = state::read_market_trade_preflight(&md, 0).unwrap();
+    let (_, g) = state::read_market(&md).unwrap();
+    let td = svm.get_account(taker).unwrap().data;
+    let ld = svm.get_account(lp).unwrap().data;
+    let owner_a = Pubkey::new_from_array(state::read_portfolio_owner_preflight(&td).unwrap().1);
+    let owner_b = Pubkey::new_from_array(state::read_portfolio_owner_preflight(&ld).unwrap().1);
+    let ix = Instruction {
+        program_id: WRAPPER_ID,
+        accounts: vec![
+            AccountMeta::new(owner_a, true),
+            AccountMeta::new(owner_b, true),
+            AccountMeta::new(fx.slab, false),
+            AccountMeta::new(*taker, false),
+            AccountMeta::new(*lp, false),
+        ],
+        data: ProgInstruction::TradeNoCpi {
+            account_a_portfolio_id: state::read_portfolio_id(&td).unwrap(),
+            account_a_position_epoch: state::read_portfolio_position_epoch(&td).unwrap(),
+            account_b_portfolio_id: state::read_portfolio_id(&ld).unwrap(),
+            account_b_position_epoch: state::read_portfolio_position_epoch(&ld).unwrap(),
+            market_id,
+            asset_index: 0,
+            size_q,
+            exec_price: g.assets[0].effective_price,
+            fee_bps: cfg.trade_fee_base_bps,
+            backing_fee_cap_bps: 10_000,
+        }
+        .encode(),
+    };
+    let payer = Keypair::new();
+    svm.airdrop(&payer.pubkey(), 10_000_000_000).unwrap();
+    svm.expire_blockhash();
+    let msg = Message::new(
+        &[
+            solana_sdk::compute_budget::ComputeBudgetInstruction::request_heap_frame(256 * 1024),
+            solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            ix,
+        ],
+        Some(&payer.pubkey()),
+    );
+    let mut tx = Transaction::new_unsigned(msg);
+    tx.signatures = vec![Signature::default(); tx.message.header.num_required_signatures as usize];
+    tx.partial_sign(&[&payer], svm.latest_blockhash());
+    svm.send_transaction(tx).map(|_| ()).map_err(|f| f.err)
+}
+
+/// One open on a fresh fork; returns (outcome, taker fill).
+fn open(
+    fx: &Fixture,
+    growth_on: bool,
+    nocpi: bool,
+    taker: &Pubkey,
+    lp: &Pubkey,
+    size: i128,
+) -> (Result<(), TransactionError>, i128) {
+    let mut svm = fork(fx, growth_on);
+    let before = raw_pos(&svm, taker);
+    let r = if nocpi {
+        trade_nocpi(&mut svm, fx, taker, lp, size)
+    } else {
+        trade_cpi(&mut svm, fx, taker, lp, size)
+    };
+    (r, raw_pos(&svm, taker) - before)
+}
+
+/// Part 2 (live bytes at the fetch slot). Growth is NEVER looser than the live market, and
+/// with LP inventory above capacity the crowd side is closed: zero fill on TradeCpi (the LP
+/// headroom IS N_cap), GrowthCapacityFull on the unclipped TradeNoCpi.
+fn replay(name: &str) {
+    let fx = load(name);
+    let l = live(&fx);
+    let taker = taker_of(&fx, &l.lp);
+    let (n, u) = u_display(l.c_m, l.lp_eff, l.price);
+    eprintln!(
+        "[{}] live: LP {} C_m {} LP eff {} @ {} -> N_cap {n}, u = {u}, hlock {}",
+        fx.name, l.lp, l.c_m, l.lp_eff, l.price, l.hlock
+    );
+    let crowd_dir: i128 = if l.lp_eff < 0 { 1 } else { -1 };
+    let size = 100 * POS_SCALE as i128;
+    for (dir, side) in [(crowd_dir, "crowd/long-if-LP-flat"), (-crowd_dir, "thin")] {
+        for nocpi in [false, true] {
+            let (r_off, f_off) = open(&fx, false, nocpi, &taker, &l.lp, dir * size);
+            let (r_on, f_on) = open(&fx, true, nocpi, &taker, &l.lp, dir * size);
+            eprintln!(
+                "[{}] {side} {}: growth OFF -> {:?} fill {f_off}; growth ON -> {:?} fill {f_on}",
+                fx.name,
+                if nocpi { "TradeNoCpi" } else { "TradeCpi" },
+                r_off,
+                r_on
+            );
+            // never looser than the live market
+            if r_on.is_ok() {
+                assert!(
+                    r_off.is_ok(),
+                    "{}: growth accepted what the live market refused",
+                    fx.name
+                );
+                assert!(
+                    f_on.unsigned_abs() <= f_off.unsigned_abs(),
+                    "{}: growth filled more than live",
+                    fx.name
+                );
+            }
+        }
+    }
+    if l.lp_eff.unsigned_abs() >= n && l.lp_eff != 0 {
+        // u >= 1 on the live bytes: the crowd side gets no fill under growth...
+        let (r_cpi, f_cpi) = open(&fx, true, false, &taker, &l.lp, crowd_dir * size);
+        assert!(
+            r_cpi.is_err() || f_cpi == 0,
+            "{}: crowd TradeCpi gets no fill",
+            fx.name
+        );
+        // ...and where the live engine would still ACCEPT the unclipped NoCpi fill, growth names
+        // the refusal (where the live engine already refuses first -- h-lock / ADL / loss-stale
+        // -- the "never looser" check above covers it).
+        let (r_live, _) = open(&fx, false, true, &taker, &l.lp, crowd_dir * size);
+        let (r_nocpi, _) = open(&fx, true, true, &taker, &l.lp, crowd_dir * size);
+        if r_live.is_ok() {
+            assert_eq!(
+                custom(&r_nocpi),
+                Some(GROWTH_CAPACITY_FULL),
+                "{}: crowd TradeNoCpi named refusal",
+                fx.name
+            );
+        }
+    }
+    if l.lp_eff == 0 && l.hlock {
+        // Flat LP + latched market h-lock: every open grows |LP| (joins the "crowd"), and the
+        // plan's rule closes LP growth while the h-lock is on -> growth closes BOTH sides.
+        let (r, f) = open(&fx, true, true, &taker, &l.lp, size);
+        let (r2, f2) = open(&fx, true, true, &taker, &l.lp, -size);
+        assert!(
+            r.is_err() && r2.is_err() && f == 0 && f2 == 0,
+            "{}: h-lock closes LP growth",
+            fx.name
+        );
+    }
+}
+
+#[test]
+fn growth_fork_replay_otc() {
+    replay("otc");
+}
+
+#[test]
+fn growth_fork_replay_jimothy() {
+    replay("jimothy");
+}
+
+#[test]
+fn growth_fork_replay_stonk() {
+    replay("stonk");
+}
+
+#[test]
+#[ignore = "diagnostic: GROWTH_FORK_DEBUG=1 cargo test -- --ignored growth_fork_dump"]
+fn growth_fork_dump() {
+    for n in ["otc", "stonk", "jimothy"] {
+        let fx = load(n);
+        let (_, g) = state::read_market(data(&fx, &fx.slab)).unwrap();
+        eprintln!(
+            "== {n}: price {} oi L {} S {} hlock {} epoch L {} S {}",
+            g.assets[0].effective_price,
+            g.assets[0].oi_eff_long_q,
+            g.assets[0].oi_eff_short_q,
+            g.bankruptcy_hlock_active,
+            g.assets[0].epoch_long,
+            g.assets[0].epoch_short
+        );
+        for k in portfolios(&fx) {
+            let p = state::read_portfolio(data(&fx, &k)).unwrap();
+            let en = state::read_portfolio_matcher_config(data(&fx, &k))
+                .unwrap()
+                .enabled();
+            let (raw, eff) = positions(&fx, &k);
+            eprintln!(
+                "  {k} lp_enabled {en} cap {} pnl {} fee {} raw {raw} eff {eff}",
+                p.capital, p.pnl, p.fee_credits
+            );
+        }
+    }
+}

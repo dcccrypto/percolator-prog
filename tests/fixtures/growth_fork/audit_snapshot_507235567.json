@@ -1,0 +1,39 @@
+{
+ "source": "~/percolator-ops/ledger/audit-2026-10-04/markets-evidence/scan.json (read-only devnet scan, 10-04 audit)",
+ "scan_slot": 507235567,
+ "markets": {
+  "stonk": {
+   "slab": "4EGvEGdLY2i9JeApJ8cEjkFehuSXpzfo11BBJarB7MTw",
+   "lp": "9mpgfUsAacsFQdTVA56psgSZZYyeoDenQKpHMyHH35Aw",
+   "lp_capital": "154739610",
+   "lp_pnl": "61271332",
+   "lp_eff_q": "-1878156349",
+   "lp_basis_q": "-9724439576",
+   "price_e6": "184015",
+   "initial_margin_bps": "1000",
+   "hlock": 1
+  },
+  "otc": {
+   "slab": "6Y4bfYLWrhabgzU4p3onx9CeW1jCKjGjjSCaoCHf2Q9R",
+   "lp": "4rEz9NbcPPB6cKgsG2A5WhPD4R1CLxRLYfUYjVXuJHmj",
+   "lp_capital": "63948002",
+   "lp_pnl": "8987689",
+   "lp_eff_q": "-125469956399",
+   "lp_basis_q": "-125469956399",
+   "price_e6": "6151",
+   "initial_margin_bps": "1000",
+   "hlock": 1
+  },
+  "jimothy": {
+   "slab": "CzKxVxPm9gpt7eyQ3xJKh57EMT6i5bep5Swu9NRcpzCh",
+   "lp": "3xPkQq1gzUr5KhzX63jrCUWvPqfTPdCjnVydYzKhwcfz",
+   "lp_capital": "76660142",
+   "lp_pnl": "6778374",
+   "lp_eff_q": "-322779776999",
+   "lp_basis_q": "-488367481868",
+   "price_e6": "3876",
+   "initial_margin_bps": "1000",
+   "hlock": 1
+  }
+ }
+}
