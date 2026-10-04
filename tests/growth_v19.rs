@@ -56,6 +56,12 @@ const GROWTH_CAPACITY_FULL: &str = "Custom(93)";
 const GROWTH_INVALID_CONFIG: &str = "Custom(94)";
 const GROWTH_NEEDS_LP_COUNTERPARTY: &str = "Custom(95)";
 const GROWTH_REQUIRES_BOUND_VAULT_LP: &str = "Custom(97)";
+const GROWTH_UTIL_FEE_REQUIRES_TRADE_CPI: &str = "Custom(99)";
+const GROWTH_UTIL_FEE_NOT_COVERED: &str = "Custom(98)";
+/// The taker's signed fee maximum on TradeCpi. N-2: opens above the kink pay the utilisation
+/// fee (base fee 0 here, no matcher request on the kind-0 LP), so the charged fee is exactly
+/// the utilisation fee and margin boundaries below add it (`util_fee_atoms`).
+const TAKER_MAX_FEE_BPS: u64 = 10_000;
 /// P3 F-14: on a bound asset a NoCpi fill may not grow anyone (the vault LP never signs).
 const VAULT_LP_EXCLUSIVE_COUNTERPARTY: &str = "Custom(77)";
 
@@ -214,6 +220,10 @@ struct MarketCfg {
     slots: usize,
     /// `Some((r_gap, l_launch_x100))` => InitMarket carries the growth block.
     growth: Option<(u16, u16)>,
+    /// Engine `max_trading_fee_bps` (N-2: a growth market needs >= base + 100 + 500).
+    max_fee: u64,
+    /// Wrapper `trade_fee_base_bps` (0 in most tests: margin boundaries stay exact).
+    base_fee: u64,
 }
 
 impl MarketCfg {
@@ -225,6 +235,8 @@ impl MarketCfg {
             funding: 1,
             slots: 1,
             growth: Some((R_GAP, l_launch_x100)),
+            max_fee: 10_000,
+            base_fee: 0,
         }
     }
     fn legacy() -> Self {
@@ -245,8 +257,8 @@ fn init_market_ix(c: &MarketCfg) -> ProgInstruction {
         min_nonzero_im_req: 20,
         maintenance_margin_bps: c.mmr,
         initial_margin_bps: c.imr,
-        max_trading_fee_bps: 10_000,
-        trade_fee_base_bps: 0,
+        max_trading_fee_bps: c.max_fee,
+        trade_fee_base_bps: c.base_fee,
         liquidation_fee_bps: c.liq_fee,
         liquidation_fee_cap: 1_000_000_000_000_000,
         min_liquidation_abs: 0,
@@ -668,6 +680,18 @@ impl Env {
         lp: &Lp,
         size_q: i128,
     ) -> Result<u64, String> {
+        self.trade_cpi_signing(taker, taker_account, lp, size_q, TAKER_MAX_FEE_BPS)
+    }
+
+    /// TradeCpi with an explicit signed `fee_bps` (the taker's maximum).
+    fn trade_cpi_signing(
+        &mut self,
+        taker: &Keypair,
+        taker_account: Pubkey,
+        lp: &Lp,
+        size_q: i128,
+        signed_fee_bps: u64,
+    ) -> Result<u64, String> {
         let (a_id, _, a_epoch) = self.identity(taker_account);
         let (b_id, b_seq, b_epoch) = self.identity(lp.account);
         let market_id = self.market_id();
@@ -682,7 +706,7 @@ impl Env {
                 account_b_matcher_sequence: b_seq,
                 asset_index: 0,
                 size_q,
-                fee_bps: 0,
+                fee_bps: signed_fee_bps,
                 limit_price: 0,
                 backing_fee_cap_bps: 10_000,
             },
@@ -805,6 +829,17 @@ impl Env {
         lambda_bps: u32,
         kink_bps: u16,
     ) -> Result<u64, String> {
+        self.set_growth_dials_util(signer, lambda_bps, kink_bps, 0)
+    }
+
+    /// Tag 93 V19 with the N-2 8-byte trailer (`util == 0` -> the 6-byte form).
+    fn set_growth_dials_util(
+        &mut self,
+        signer: &Keypair,
+        lambda_bps: u32,
+        kink_bps: u16,
+        util: u16,
+    ) -> Result<u64, String> {
         let (pd, market) = (self.program_data, self.market);
         self.send(
             ProgInstruction::SetAssetRiskLimitsV19 {
@@ -819,6 +854,7 @@ impl Env {
                 }),
                 growth_lambda_bps: lambda_bps,
                 growth_kink_bps: kink_bps,
+                growth_util_fee_max_bps: util,
             },
             vec![
                 AccountMeta::new(signer.pubkey(), true),
@@ -880,6 +916,41 @@ fn seeded_keypair(tag: u8) -> Keypair {
 
 fn units(n: i128) -> i128 {
     n * Q
+}
+
+/// The vault LP's N_cap (Q) at its CURRENT conservative equity (lambda 1x, $1). N-2: the
+/// utilisation fee is credited to the LP, so C_m and N_cap grow with every fee-paying open.
+fn n_cap_now(env: &Env, lp: Pubkey) -> i128 {
+    let p = env.portfolio_state(lp);
+    let c_m = percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits)
+        .unwrap();
+    percolator_prog::growth_v19::n_cap_q(c_m, 10_000, PRICE, POS_SCALE).unwrap() as i128
+}
+
+/// N-2: the engine fee (atoms) of an open of `open_q` that leaves its side's users OI at
+/// `side_after_q`, at the current N_cap: `ceil(ceil(notional) * util_bps / 1e4)` (base fee 0
+/// and no matcher request in this env, so this is the whole fee).
+fn util_fee_atoms(env: &Env, lp: Pubkey, side_after_q: i128, open_q: i128) -> u128 {
+    let n = n_cap_now(env, lp) as u128;
+    let bps = percolator_prog::growth_v19::utilisation_fee_bps(
+        side_after_q.unsigned_abs(),
+        n,
+        5_000,
+        percolator_prog::growth_v19::GROWTH_UTIL_FEE_DEFAULT_BPS,
+    )
+    .unwrap() as u128;
+    let notional = (open_q.unsigned_abs() * PRICE as u128).div_ceil(POS_SCALE);
+    (notional * bps).div_ceil(10_000)
+}
+
+/// Deposit a fresh crowd taker needs to open `open_q` that leaves the crowd's users OI at
+/// `side_after_q`: the IMR_dyn leg (base 1000, kink 50%) plus the utilisation fee.
+fn crowd_open_cost(env: &Env, lp: Pubkey, side_after_q: i128, open_q: i128) -> u128 {
+    use percolator_prog::growth_v19 as gv;
+    let n = n_cap_now(env, lp) as u128;
+    let imr = gv::dyn_imr_bps(side_after_q.unsigned_abs(), n, 1_000, 5_000).unwrap();
+    let notional = gv::risk_notional_ceil(open_q.unsigned_abs(), PRICE, POS_SCALE).unwrap();
+    gv::leg_im_req(notional, imr, 20).unwrap() + util_fee_atoms(env, lp, side_after_q, open_q)
 }
 
 /// Asset 0's growth record straight from the market account bytes.
@@ -1041,7 +1112,8 @@ fn growth_slab_layout_diff_is_confined_to_672_792() {
 fn crowd_book(env: &mut Env) -> Lp {
     let lp = env.lp(1_000 * USD);
     let (x, xp) = env.trader(200 * USD);
-    // u 0 -> 60%: IMR_dyn at 60% = 2800 -> 168 USD on 600 units.
+    // u 0 -> 60%: IMR_dyn at 60% = 2800 -> 168 USD on 600 units, + the N-2 utilisation fee
+    // (100 bps at u = 60%: 6 USD, credited to the LP).
     assert_ok(
         &env.trade_cpi(&x, xp, &lp, units(600)),
         "X opens the crowd to u = 60%",
@@ -1062,17 +1134,20 @@ fn growth_thin_side_full_leverage_while_crowd_is_stepped() {
         "crowd at 5x",
     );
     assert_eq!(env.pos(ap), 0);
-    // exactly the stepped requirement passes, one atom less does not
-    let (a1, a1p) = env.trader(46 * USD - 1);
+    // exactly the stepped requirement passes, one atom less does not. N-2: plus the utilisation
+    // fee at u -> 70% (200 bps), paid to the LP (46 USD + 2 USD at C_m $1,000 + X's fee).
+    let need = crowd_open_cost(&env, lp.account, units(700), units(100));
+    assert!(need > 46 * USD && need < 49 * USD, "need {need}");
+    let (a1, a1p) = env.trader(need - 1);
     assert_err(
         &env.trade_cpi(&a1, a1p, &lp, units(100)),
         GROWTH_LEVERAGE_EXCEEDED,
         "crowd 1 atom short",
     );
-    let (a2, a2p) = env.trader(46 * USD);
+    let (a2, a2p) = env.trader(need);
     assert_ok(
         &env.trade_cpi(&a2, a2p, &lp, units(100)),
-        "crowd at exactly IMR_dyn 46%",
+        "crowd at exactly IMR_dyn + the utilisation fee",
     );
     // Thin (short) side at the full launch leverage 10x: 10 USD for 100 units.
     let (b, bp) = env.trader(10 * USD);
@@ -1129,10 +1204,10 @@ fn growth_launch_ceiling_and_whole_position_add() {
 fn growth_over_imr_dyn_position_is_not_liquidated_and_can_close() {
     let mut env = Env::new(MarketCfg::growth(1_000));
     let lp = env.lp(1_000 * USD);
-    let (x, xp) = env.trader(170 * USD);
+    let (x, xp) = env.trader(180 * USD);
     assert_ok(
         &env.trade_cpi(&x, xp, &lp, units(600)),
-        "X at u = 60% (needs 168)",
+        "X at u = 60% (needs 168 + the 6 USD utilisation fee)",
     );
     // A whale pushes u to 90%: X's position now sits far above IMR_dyn (8200 bps -> 492 USD).
     let (w, wp) = env.trader(10_000 * USD);
@@ -1215,29 +1290,33 @@ fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
         GROWTH_LEVERAGE_EXCEEDED,
         "u == 1 at 2x",
     );
-    // A larger request is clipped to exactly N_cap and ADMITTED (u == 1 at 1x).
+    // A larger request is clipped to exactly N_cap and ADMITTED (u == 1 at 1x). N-2: the
+    // whale's 900 paid the utilisation fee to the LP, so N_cap is the CURRENT (pre-fill) one.
+    let n_cap = n_cap_now(&env, lp.account);
+    assert!(n_cap > units(1_000), "the utilisation fee grew C_m");
     assert_ok(
         &env.trade_cpi(&w, wp, &lp, units(5_000)),
         "clipped to u == 1",
     );
     assert_eq!(env.pos(wp), n_cap, "filled exactly to capacity");
     assert_eq!(env.pos(lp.account), -n_cap, "|LP| == N_cap, never above");
-    // Any further crowd growth: TradeCpi is clipped to a zero fill; the unclipped NoCpi route
-    // names the refusal (u > 1).
+    // Any further crowd growth: TradeCpi is clipped to the room the last fill's own fee added
+    // (never past N_cap); the unclipped NoCpi route names the refusal (u > 1).
     assert_ok(
-        &env.trade_cpi(&w, wp, &lp, units(1)),
-        "zero fill at capacity",
+        &env.trade_cpi(&w, wp, &lp, units(100)),
+        "clipped at capacity",
     );
-    assert_eq!(env.pos(lp.account), -n_cap);
+    assert!(env.pos(lp.account).unsigned_abs() <= n_cap_now(&env, lp.account).unsigned_abs());
+    assert!(env.pos(wp) - n_cap < units(10), "only the fee-funded room");
     let lp_owner = lp.owner.insecure_clone();
     assert_err(
-        &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1)),
+        &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(100)),
         GROWTH_CAPACITY_FULL,
         "u > 1 (NoCpi)",
     );
     let (c, cp) = env.trader(1_000 * USD);
     assert_err(
-        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(1)),
+        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(100)),
         GROWTH_CAPACITY_FULL,
         "a new crowd trader too",
     );
@@ -1261,7 +1340,8 @@ fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
         &env.trade_cpi(&t2, t2p, &lp, -units(100)),
         "thin side still open",
     );
-    assert_ok(&env.trade_cpi(&w, wp, &lp, -n_cap), "the whale closes");
+    let whale = env.pos(wp);
+    assert_ok(&env.trade_cpi(&w, wp, &lp, -whale), "the whale closes");
     // NEGATIVE CONTROL: legacy accepts 5,000 units (default k = 10x, no growth gate).
     let mut legacy = Env::new(MarketCfg::legacy());
     let llp = legacy.lp(1_000 * USD);
@@ -1277,11 +1357,27 @@ fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
 fn growth_batch_cpi_is_gated() {
     let mut env = Env::new(MarketCfg::growth(1_000));
     let lp = crowd_book(&mut env);
+    // N-2: above the utilisation kink an open owes the utilisation fee, which only TradeCpi can
+    // credit to the LP -> the batch route refuses it up front (99), whatever the margin.
     let (a, ap) = env.trader(20 * USD);
     assert_err(
         &env.batch_trade_cpi(&a, ap, &lp, units(100)),
+        GROWTH_UTIL_FEE_REQUIRES_TRADE_CPI,
+        "batch crowd above the kink",
+    );
+    // below the kink the batch route is gated as before: a 5x launch ceiling refuses 6x (92)
+    let mut low = Env::new(MarketCfg::growth(500));
+    let llp_low = low.lp(1_000 * USD);
+    let (y, yp) = low.trader(16_666_667);
+    assert_err(
+        &low.batch_trade_cpi(&y, yp, &llp_low, units(100)),
         GROWTH_LEVERAGE_EXCEEDED,
-        "batch crowd at 5x",
+        "batch 6x over the 5x ceiling (u = 10%)",
+    );
+    let (y2, y2p) = low.trader(20 * USD);
+    assert_ok(
+        &low.batch_trade_cpi(&y2, y2p, &llp_low, units(100)),
+        "batch at 5x",
     );
     let (b, bp) = env.trader(10 * USD);
     assert_ok(
@@ -1346,9 +1442,12 @@ fn growth_nocpi_is_gated() {
         VAULT_LP_EXCLUSIVE_COUNTERPARTY,
         "NoCpi crowd at IMR_dyn passes the gate; P3 refuses the NoCpi route",
     );
+    // via TradeCpi the same open also pays the N-2 utilisation fee (u -> 70%: 200 bps)
+    let fee = util_fee_atoms(&env, lp.account, units(700), units(100));
+    let (a3, a3p) = env.trader(52 * USD + fee);
     assert_ok(
-        &env.trade_cpi(&a2, a2p, &lp, units(100)),
-        "the same open at IMR_dyn via TradeCpi",
+        &env.trade_cpi(&a3, a3p, &lp, units(100)),
+        "the same open at IMR_dyn + the utilisation fee via TradeCpi",
     );
     // NEGATIVE CONTROL: legacy (engine 10x) accepts the 6.7x pair.
     let mut legacy = Env::new(MarketCfg::legacy());
@@ -1481,7 +1580,8 @@ fn growth_gate100_rows_new_refusals_are_state_attributable() {
     {
         let mut env = Env::new(MarketCfg::growth(1_000));
         let lp = crowd_book(&mut env);
-        let (a, ap) = env.trader(46 * USD - 1);
+        let need = crowd_open_cost(&env, lp.account, units(700), units(100));
+        let (a, ap) = env.trader(need - 1);
         assert_err(
             &env.trade_cpi(&a, ap, &lp, units(100)),
             GROWTH_LEVERAGE_EXCEEDED,
@@ -1531,15 +1631,25 @@ fn growth_gate100_rows_new_refusals_are_state_attributable() {
         let mut env = Env::new(MarketCfg::growth(1_000));
         let lp = env.lp(1_000 * USD);
         let (w, wp) = env.trader(100_000 * USD);
+        // NoCpi is the unclipped route that reaches the gate (the batch route answers 99 first
+        // above the kink, N-2); on a bound asset the gate answers before P3's NoCpi rule.
+        let lp_owner = lp.owner.insecure_clone();
         assert_err(
-            &env.batch_trade_cpi(&w, wp, &lp, units(1_001)),
+            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
             GROWTH_CAPACITY_FULL,
-            "row 93 refused (u > 1, batch: no clip)",
+            "row 93 refused (u > 1)",
         );
         env.force_capital(lp.account, 2_000 * USD); // capacity doubles (harness seed of LP capital)
+                                                    // same signers, same request: the GROWTH gate now admits it; the next layer (P3 F-14:
+                                                    // a vault LP never takes a NoCpi fill that grows it) answers instead of 93.
+        assert_err(
+            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
+            VAULT_LP_EXCLUSIVE_COUNTERPARTY,
+            "row 93 cleared (same signers)",
+        );
         assert_ok(
-            &env.batch_trade_cpi(&w, wp, &lp, units(1_001)),
-            "row 93 accepted (same signer)",
+            &env.trade_cpi(&w, wp, &lp, units(1_001)),
+            "and it fills via TradeCpi",
         );
         assert_eq!(env.pos(wp), units(1_001));
     }
@@ -1577,6 +1687,7 @@ fn growth_ua_dials_tighten_only_and_take_effect() {
         }),
         growth_lambda_bps: 5_000,
         growth_kink_bps: 3_000,
+        growth_util_fee_max_bps: 0,
     };
     let bytes = ix.encode();
     assert_eq!(bytes.len(), 50);
@@ -1635,6 +1746,7 @@ fn growth_ua_dials_tighten_only_and_take_effect() {
         }),
         growth_lambda_bps: 9_000,
         growth_kink_bps: 4_000,
+        growth_util_fee_max_bps: 0,
     };
     assert_err(
         &env.send(
@@ -1693,13 +1805,15 @@ fn m1_book(env: &mut Env) -> (Lp, (Keypair, Pubkey), (Keypair, Pubkey)) {
     let (t, tp) = env.trader(100 * USD);
     assert_ok(&env.trade_cpi(&w, wp, &lp, units(900)), "W crowd 900");
     assert_ok(&env.trade_cpi(&t, tp, &lp, -units(100)), "T thin short 100");
+    // N-2: W's 900 paid the utilisation fee to the LP, so N_cap is the CURRENT one (> 1,000).
+    let n = n_cap_now(env, lp.account);
     assert_ok(
         &env.trade_cpi(&w, wp, &lp, units(5_000)),
         "W clipped to capacity",
     );
-    // N-1: capacity is the crowd's users OI (W long 1,000 == N_cap); the LP nets T's short.
-    assert_eq!(env.pos(wp), units(1_000), "crowd OI at N_cap");
-    assert_eq!(env.pos(lp.account), -units(900));
+    // N-1: capacity is the crowd's users OI (W long == N_cap); the LP nets T's short.
+    assert_eq!(env.pos(wp), n, "crowd OI at N_cap");
+    assert_eq!(env.pos(lp.account), -(n - units(100)));
     (lp, (w, wp), (t, tp))
 }
 
@@ -1707,21 +1821,22 @@ fn m1_book(env: &mut Env) -> (Lp, (Keypair, Pubkey), (Keypair, Pubkey)) {
 fn growth_m1_closes_are_never_trapped() {
     // 1. TradeCpi close at capacity: filled in full (was a silent ZERO fill).
     let mut env = Env::new(MarketCfg::growth(1_000));
-    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    let (lp, (_wk, wp), (t, tp)) = m1_book(&mut env);
     assert_ok(&env.trade_cpi(&t, tp, &lp, units(100)), "T closes via CPI");
     assert_eq!(env.pos(tp), 0, "close filled in full");
     assert_eq!(
         env.pos(lp.account),
-        -units(1_000),
+        -env.pos(wp),
         "the LP absorbs the close and still holds at most N_cap (N-1)"
     );
+    assert!(env.pos(lp.account).abs() <= n_cap_now(&env, lp.account));
     // ...and the crowd stays closed for NEW growth.
     let (c, cp) = env.trader(1_000 * USD);
     let lp_owner = lp.owner.insecure_clone();
     assert_err(
-        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(1)),
+        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(100)),
         GROWTH_CAPACITY_FULL,
-        "crowd still closed",
+        "crowd still closed (beyond the fee-funded room)",
     );
 
     // 2. NoCpi close: on a bound asset the vault LP never signs NoCpi (P3 F-14), so the NoCpi
@@ -1729,12 +1844,13 @@ fn growth_m1_closes_are_never_trapped() {
     //    against an LP at capacity).
     let mut env = Env::new(MarketCfg::growth(1_000));
     let (_lp, (w, wp), (t, tp)) = m1_book(&mut env);
+    let w0 = env.pos(wp);
     assert_ok(
         &env.trade_nocpi(&t, tp, &w, wp, units(100)),
         "T closes via NoCpi into W who reduces",
     );
     assert_eq!(env.pos(tp), 0);
-    assert_eq!(env.pos(wp), units(900));
+    assert_eq!(env.pos(wp), w0 - units(100));
 
     // 3. Partial reduce after a capital loss (N_cap 500 < |LP|), then a close with the LP
     //    deep under capacity (capital 150: N_cap 150 vs |LP| 1,060).
@@ -1859,11 +1975,14 @@ fn growth_l2_r_gap_floor() {
 fn growth_n1_thin_open_crowd_refill_thin_close_cannot_pass_ncap() {
     let mut env = Env::new(MarketCfg::growth(1_000));
     let lp = env.lp(1_000 * USD);
-    let n_cap = units(1_000).unsigned_abs();
+    // N-2: every open above the kink pays the utilisation fee to the LP, so C_m and N_cap grow
+    // a little each cycle; the bound is N_cap at its CURRENT value, never k x the original.
     let (t, tp) = env.trader(5_000 * USD);
-    let mut crowd = Vec::new();
+    let mut crowd: Vec<Pubkey> = Vec::new();
     for cycle in 0..4 {
         let (c, cp) = env.trader(100_000 * USD);
+        let room_before =
+            n_cap_now(&env, lp.account) - crowd.iter().map(|p| env.pos(*p).max(0)).sum::<i128>();
         assert_ok(
             &env.trade_cpi(&c, cp, &lp, units(5_000)),
             "crowd request (clipped)",
@@ -1872,15 +1991,16 @@ fn growth_n1_thin_open_crowd_refill_thin_close_cannot_pass_ncap() {
         if cycle == 0 {
             assert_eq!(filled, units(1_000), "cycle 0: the crowd fills to N_cap");
         } else {
-            assert_eq!(
-                filled, 0,
-                "cycle {cycle}: no crowd room -- the thin side frees none"
+            assert!(
+                filled <= room_before && filled < units(100),
+                "cycle {cycle}: only the fee-funded room ({filled} vs {room_before}) -- the thin side frees none"
             );
             // the unclipped route names the refusal
+            let lp_owner = lp.owner.insecure_clone();
             assert_err(
-                &env.batch_trade_cpi(&c, cp, &lp, units(1)),
+                &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(500)),
                 GROWTH_CAPACITY_FULL,
-                "refill via batch",
+                "refill via NoCpi",
             );
         }
         crowd.push(cp);
@@ -1890,7 +2010,7 @@ fn growth_n1_thin_open_crowd_refill_thin_close_cannot_pass_ncap() {
             assert_eq!(env.pos(tp), 0, "M-1: the close fills in full");
         }
         assert!(
-            env.pos(lp.account).unsigned_abs() <= n_cap,
+            env.pos(lp.account).unsigned_abs() <= n_cap_now(&env, lp.account).unsigned_abs(),
             "cycle {cycle}: |LP| <= N_cap after the close"
         );
         let lp_now = env.pos(lp.account);
@@ -1898,19 +2018,17 @@ fn growth_n1_thin_open_crowd_refill_thin_close_cannot_pass_ncap() {
             assert_ok(&env.trade_cpi(&t, tp, &lp, lp_now), "thin open to LP flat");
         }
         let users_long: i128 = crowd.iter().map(|p| env.pos(*p).max(0)).sum();
-        assert!(
-            users_long.unsigned_abs() <= n_cap,
-            "crowd users OI <= N_cap"
-        );
-        assert!(env.pos(lp.account).unsigned_abs() <= n_cap);
+        let n_cap = n_cap_now(&env, lp.account);
+        assert!(users_long <= n_cap, "crowd users OI <= N_cap");
+        assert!(env.pos(lp.account).abs() <= n_cap);
     }
     let close = -env.pos(tp);
     assert_ok(&env.trade_cpi(&t, tp, &lp, close), "final thin close");
     assert_eq!(env.pos(tp), 0);
-    assert_eq!(
-        env.pos(lp.account).unsigned_abs(),
-        n_cap,
-        "|LP| ends at N_cap, not 4 x N_cap"
+    let lp_abs = env.pos(lp.account).abs();
+    assert!(
+        lp_abs <= n_cap_now(&env, lp.account) && lp_abs < units(1_300),
+        "|LP| ends <= N_cap (grown only by the fees), not 4 x N_cap: {lp_abs}"
     );
 }
 
@@ -1978,4 +2096,188 @@ fn growth_n1_opens_only_on_a_bound_vault_lp() {
     let llp = legacy.lp(1_000 * USD);
     let (z, zp) = legacy.trader(1_000 * USD);
     assert_ok(&legacy.trade_cpi(&z, zp, &llp, units(10)), "legacy opens");
+}
+
+/// N-2 (security round 3): the utilisation fee. Opens above the 50% kink pay
+/// `500 bps * (u_after - 0.5) / 0.5` of their opening notional to the vault LP through the P2
+/// LP-credit channel; the taker must sign for it (98 otherwise); closes never pay it; the UA
+/// dial may only RAISE it (500..2000 bps) and only within the market's engine fee cap; a growth
+/// InitMarket needs `max_trading_fee_bps >= base + 100 + 500`.
+#[test]
+fn growth_n2_utilisation_fee_consent_close_dial_and_init_rule() {
+    // InitMarket rule (base fee 0 here): 599 refused, 600 accepted
+    let mut bad = MarketCfg::growth(1_000);
+    bad.max_fee = 599;
+    let r = Env::try_new_with(&program_path(), bad).map(|_| 0u64);
+    assert_err(&r, GROWTH_INVALID_CONFIG, "fee cap below base + 100 + 500");
+    let mut ok = MarketCfg::growth(1_000);
+    ok.max_fee = 600;
+    assert!(Env::try_new_with(&program_path(), ok).is_ok());
+
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let lp = crowd_book(&mut env); // X long 600 (u 60%), paid 100 bps
+                                   // u -> 700 / 1,006 (X's fee grew C_m): 196 bps. Signed 195 -> 98; 196 -> admitted, and the
+                                   // LP earns exactly the fee.
+    let n = n_cap_now(&env, lp.account) as u128;
+    let bps = percolator_prog::growth_v19::utilisation_fee_bps(units(700) as u128, n, 5_000, 500)
+        .unwrap() as u64;
+    assert_eq!(bps, 196);
+    let (a, ap) = env.trader(100 * USD);
+    assert_err(
+        &env.trade_cpi_signing(&a, ap, &lp, units(100), bps - 1),
+        GROWTH_UTIL_FEE_NOT_COVERED,
+        "under-signed",
+    );
+    let fee = util_fee_atoms(&env, lp.account, units(700), units(100));
+    assert_eq!(fee, 1_960_000, "196 bps on $100");
+    let lp0 = env.portfolio_state(lp.account).capital;
+    let a0 = env.portfolio_state(ap).capital;
+    assert_ok(
+        &env.trade_cpi_signing(&a, ap, &lp, units(100), bps),
+        "signed exactly",
+    );
+    assert_eq!(
+        env.portfolio_state(ap).capital,
+        a0 - fee,
+        "taker paid exactly the fee"
+    );
+    assert_eq!(
+        env.portfolio_state(lp.account).capital,
+        lp0 + fee,
+        "LP earned it"
+    );
+    // a close pays nothing (base fee 0, no util): signed 0 is enough
+    let a1 = env.portfolio_state(ap).capital;
+    assert_ok(
+        &env.trade_cpi_signing(&a, ap, &lp, -units(100), 0),
+        "close signed 0",
+    );
+    assert_eq!(env.pos(ap), 0);
+    assert_eq!(
+        env.portfolio_state(ap).capital,
+        a1,
+        "closes never pay the utilisation fee"
+    );
+    // thin side below its kink: no fee either
+    let (b, bp) = env.trader(10 * USD);
+    assert_ok(
+        &env.trade_cpi_signing(&b, bp, &lp, -units(100), 0),
+        "thin at u 10%",
+    );
+
+    // UA dial: raise to 1000 bps -> the same open now pays 400 bps; cheaper / above max refused
+    let ua = env.upgrade_authority.insecure_clone();
+    assert_err(
+        &env.set_growth_dials_util(&ua, 10_000, 5_000, 499),
+        GROWTH_INVALID_CONFIG,
+        "below default",
+    );
+    assert_err(
+        &env.set_growth_dials_util(&ua, 10_000, 5_000, 2_001),
+        GROWTH_INVALID_CONFIG,
+        "above hard max",
+    );
+    assert_ok(
+        &env.set_growth_dials_util(&ua, 10_000, 5_000, 1_000),
+        "raise to 1000",
+    );
+    assert_eq!(growth_of(&env).unwrap().util_fee_max_bps, 1_000);
+    assert_ok(
+        &env.set_growth_dials(&ua, 10_000, 5_000),
+        "6-byte form leaves it",
+    );
+    assert_eq!(growth_of(&env).unwrap().util_fee_max_bps, 1_000);
+    let n = n_cap_now(&env, lp.account) as u128;
+    let bps2 = percolator_prog::growth_v19::utilisation_fee_bps(units(700) as u128, n, 5_000, 1_000)
+        .unwrap() as u64;
+    assert!(
+        bps2 > 2 * bps - 10,
+        "doubling the dial doubles the fee ({bps2})"
+    );
+    let (c, cp) = env.trader(100 * USD);
+    assert_err(
+        &env.trade_cpi_signing(&c, cp, &lp, units(100), bps2 - 1),
+        GROWTH_UTIL_FEE_NOT_COVERED,
+        "raised",
+    );
+    assert_ok(
+        &env.trade_cpi_signing(&c, cp, &lp, units(100), bps2),
+        "signed the raised fee",
+    );
+    // the dial must fit the market's engine fee cap
+    let mut tight = MarketCfg::growth(1_000);
+    tight.max_fee = 600;
+    let mut t = Env::new(tight);
+    let ua = t.upgrade_authority.insecure_clone();
+    assert_err(
+        &t.set_growth_dials_util(&ua, 10_000, 5_000, 1_000),
+        GROWTH_INVALID_CONFIG,
+        "over the fee cap",
+    );
+}
+
+/// F-1 (security round 3) behavioural tripwire: the GOLDEN fee accrual of one single-route
+/// TradeCpi. The frame overflow found in round 2 (one extra 32-byte local in
+/// `handle_trade_nocpi_zero_copy`) surfaced as Custom(15) / corrupted accruals on exactly this
+/// path. The taker pays `ceil(notional * 30 / 1e4)`; cfg protocol / LP / insurance accrue and
+/// the asset's creator counter receive exactly `split_trade_fee` of it, conservatively. Legacy
+/// and growth markets (growth below the kink: no utilisation fee) must agree to the atom.
+#[test]
+fn growth_f1_single_route_fee_accrual_is_golden() {
+    for growth in [false, true] {
+        let mut c = if growth {
+            MarketCfg::growth(1_000)
+        } else {
+            MarketCfg::legacy()
+        };
+        c.base_fee = 30;
+        let mut env = Env::new(c);
+        let lp = env.lp(1_000 * USD);
+        let (x, xp) = env.trader(100 * USD);
+        let (cfg0, _) = state::read_market(&env.market_bytes()).unwrap();
+        let p0 = state::read_asset_oracle_profile(&env.market_bytes(), 0).unwrap();
+        let cap0 = env.portfolio_state(xp).capital;
+        assert_ok(&env.trade_cpi(&x, xp, &lp, units(333)), "open 333 units");
+        let fee = (333u128 * USD * 30).div_ceil(10_000);
+        assert_eq!(
+            cap0 - env.portfolio_state(xp).capital,
+            fee,
+            "taker paid the base fee only"
+        );
+        let parts = percolator_prog::policy_v16::split_trade_fee(
+            fee,
+            percolator_prog::constants::PROTOCOL_FEE_BPS,
+            cfg0.creator_share_bps,
+            cfg0.lp_share_bps,
+            cfg0.insurance_share_bps,
+        )
+        .unwrap();
+        let (cfg1, _) = state::read_market(&env.market_bytes()).unwrap();
+        let p1 = state::read_asset_oracle_profile(&env.market_bytes(), 0).unwrap();
+        assert_eq!(
+            cfg1.protocol_fee_accrued_atoms - cfg0.protocol_fee_accrued_atoms,
+            parts.protocol
+        );
+        assert_eq!(
+            cfg1.lp_fee_accrued_atoms - cfg0.lp_fee_accrued_atoms,
+            parts.lp
+        );
+        assert_eq!(
+            cfg1.insurance_reserve_accrued_atoms - cfg0.insurance_reserve_accrued_atoms,
+            parts.insurance
+        );
+        assert_eq!(
+            (p1.creator_fee_claimable_atoms - p0.creator_fee_claimable_atoms) as u128,
+            parts.creator
+        );
+        assert_eq!(
+            parts.protocol + parts.lp + parts.insurance + parts.creator,
+            fee,
+            "conservative"
+        );
+        assert!(
+            parts.protocol > 0 && parts.lp > 0,
+            "non-trivial split (growth {growth})"
+        );
+    }
 }

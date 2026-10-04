@@ -755,3 +755,65 @@ fn growth_fork_q2_reduce_bit_is_effective_jimothy() {
         eff_pos_svm(&off, &fx.slab, &taker)
     );
 }
+
+/// Kani rev 5 (b), the R11 modelling assumption: the engine's aggregate effective OI per side
+/// equals the sum of the per-leg ADL-effective positions (up to per-leg rounding dust), so
+/// `users_side_oi_q(oi_eff_side, vault_lp_eff)` is the users' summed effective legs. Checked on
+/// a REAL post-ADL state (Jimothy: A_long ~ 0.53, A_short ~ 0.66 on the live fixture) loaded in
+/// LiteSVM, before and after an engine-applied fill on the fork.
+#[test]
+fn growth_fork_oi_eff_equals_sum_of_effective_legs_after_adl() {
+    let fx = load("jimothy");
+    let l = live(&fx);
+    let check = |svm: &LiteSVM, what: &str| {
+        let (_, g) = state::read_market(&svm.get_account(&fx.slab).unwrap().data).unwrap();
+        let a = &g.assets[0];
+        assert!(
+            a.a_long < 1_000_000_000_000_000 && a.a_short < 1_000_000_000_000_000,
+            "{what}: the fixture is post-ADL (A < 1)"
+        );
+        let (mut long, mut short, mut legs) = (0u128, 0u128, 0u128);
+        let mut users_long = 0u128;
+        let mut users_short = 0u128;
+        for k in portfolios(&fx) {
+            let e = eff_pos_svm(svm, &fx.slab, &k);
+            if e != 0 {
+                legs += 1;
+            }
+            if e > 0 {
+                long += e.unsigned_abs();
+            } else {
+                short += e.unsigned_abs();
+            }
+            if k != l.lp {
+                if e > 0 {
+                    users_long += e.unsigned_abs();
+                } else {
+                    users_short += e.unsigned_abs();
+                }
+            }
+        }
+        let lp_eff = eff_pos_svm(svm, &fx.slab, &l.lp);
+        let ul = growth_v19::users_side_oi_q(a.oi_eff_long_q, lp_eff, true);
+        let us = growth_v19::users_side_oi_q(a.oi_eff_short_q, lp_eff, false);
+        eprintln!(
+            "[jimothy OI {what}] oi_eff L {} S {} | sum eff legs L {long} S {short} ({legs} legs) | users L {ul} vs {users_long}, S {us} vs {users_short}",
+            a.oi_eff_long_q, a.oi_eff_short_q
+        );
+        assert!(long.abs_diff(a.oi_eff_long_q) <= legs, "{what}: long side");
+        assert!(
+            short.abs_diff(a.oi_eff_short_q) <= legs,
+            "{what}: short side"
+        );
+        assert!(
+            ul.abs_diff(users_long) <= legs && us.abs_diff(users_short) <= legs,
+            "{what}: users OI"
+        );
+    };
+    let mut svm = fork(&fx, Growth::Bound);
+    check(&svm, "fixture");
+    let taker = taker_of(&fx, &l.lp);
+    let r = trade_cpi(&mut svm, &fx, &taker, &l.lp, -10 * POS_SCALE as i128);
+    assert!(r.is_ok(), "a reduce fills: {r:?}");
+    check(&svm, "after a fill");
+}

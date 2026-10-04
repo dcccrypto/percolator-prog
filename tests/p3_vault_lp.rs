@@ -3466,6 +3466,10 @@ fn ctx_u64(env: &Env, ctx: Pubkey, off: usize) -> u64 {
     u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
 }
 
+/// N-2: a growth taker signs room for base + the matcher request + the utilisation fee (the
+/// charge is what the wrapper computes, never more than this signed maximum).
+const GROWTH_FEE: u64 = 10_000;
+
 fn growth_params() -> Params {
     Params {
         funding: 1,
@@ -3533,7 +3537,7 @@ fn growth_v19_bound_quote_depth_scales_with_capital() {
         let t = env.new_trader(1_000_000_000);
         // G4: a growth bind turns the fee channel on (50 bps cap), so the taker signs a fee
         // that covers base + the matcher's requested fee.
-        env.trade_signing_fee(&t, &lp, 100 * 1_000_000, 100).expect("fill 100 units");
+        env.trade_signing_fee(&t, &lp, 100 * 1_000_000, GROWTH_FEE).expect("fill 100 units");
         assert_eq!(env.position(t.portfolio), 100 * 1_000_000, "filled in full");
         ctx_u64(&env, lp.ctx, CTX_LAST_EXEC_OFF)
     }
@@ -3566,14 +3570,14 @@ fn growth_v19_bound_capacity_full_and_thin_side_open() {
     };
     let cap_before = n_cap(&env);
     assert_eq!(cap_before, 1_000 * 1_000_000);
-    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("clipped to u == 1");
+    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("clipped to u == 1");
     assert_eq!(env.position(lp.portfolio).unsigned_abs(), cap_before, "|LP| == N_cap (pre-fill C_m) exactly");
     for _ in 0..3 {
-        env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("crowd at capacity");
+        env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd at capacity");
         assert!(env.position(lp.portfolio).unsigned_abs() <= n_cap(&env), "never above N_cap(C_m)");
     }
     let thin = env.new_trader(20_000_000);
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin side open");
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin side open");
     assert_eq!(env.position(thin.portfolio), -(100 * 1_000_000));
 }
 
@@ -3681,11 +3685,11 @@ fn growth_v19_m1_bound_close_at_capacity_and_in_closed_mode() {
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
     let whale = env.new_trader(100_000_000_000);
     let thin = env.new_trader(100_000_000);
-    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, 100).expect("crowd 900");
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin short 100");
-    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("crowd to capacity");
+    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, GROWTH_FEE).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin short 100");
+    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd to capacity");
     // close at capacity
-    env.trade_signing_fee(&thin, &lp, 40 * 1_000_000, 100).expect("partial close at capacity");
+    env.trade_signing_fee(&thin, &lp, 40 * 1_000_000, GROWTH_FEE).expect("partial close at capacity");
     assert_eq!(env.position(thin.portfolio), -(60 * 1_000_000), "filled in full");
     // closed mode
     let mut m = env.svm.get_account(&env.market).unwrap();
@@ -3693,7 +3697,7 @@ fn growth_v19_m1_bound_close_at_capacity_and_in_closed_mode() {
     group.bankruptcy_hlock_active = true;
     state::write_market(&mut m.data, &cfg, &group).unwrap();
     env.svm.set_account(env.market, m).unwrap();
-    env.trade_signing_fee(&thin, &lp, 60 * 1_000_000, 100).expect("close in closed mode");
+    env.trade_signing_fee(&thin, &lp, 60 * 1_000_000, GROWTH_FEE).expect("close in closed mode");
     assert_eq!(env.position(thin.portfolio), 0, "never trapped");
 }
 
@@ -3708,8 +3712,8 @@ fn growth_v19_m1_bound_close_in_closed_mode_with_ext_mode_0() {
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
     let whale = env.new_trader(100_000_000_000);
     let thin = env.new_trader(100_000_000);
-    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, 100).expect("crowd 900");
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin short 100");
+    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, GROWTH_FEE).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin short 100");
     env.set_fee_channel(0, 0).expect("UA: ext mode 0, fee channel off");
     let mut m = env.svm.get_account(&env.market).unwrap();
     let (cfg, mut group) = state::read_market(&m.data).unwrap();
@@ -3740,34 +3744,123 @@ fn growth_v19_n1_bound_thin_cycles_cannot_push_lp_past_ncap() {
     let mut crowd: Vec<Pubkey> = Vec::new();
     for cycle in 0..4 {
         let c = env.new_trader(100_000_000_000);
-        env.trade_signing_fee(&c, &lp, 5_000 * 1_000_000, 100).expect("crowd request (clipped)");
+        let users_before: u128 = crowd.iter().map(|p| env.position(*p).max(0).unsigned_abs()).sum();
+        let room = n_cap(&env).saturating_sub(users_before);
+        env.trade_signing_fee(&c, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd request (clipped)");
         if cycle > 0 {
-            // C_m grows with the fee channel, so a sliver of new room may open; never the
-            // N_cap a thin open used to free.
+            // C_m grows with the fee channel (the N-2 utilisation fee the thin open paid at
+            // u = 1 included), so the fee-funded room opens; never the N_cap a thin open used
+            // to free.
+            let filled = env.position(c.portfolio).unsigned_abs();
             assert!(
-                env.position(c.portfolio) < 50 * 1_000_000,
-                "cycle {cycle}: the thin side frees no crowd room (filled {})",
-                env.position(c.portfolio)
+                filled <= room && filled < 200 * 1_000_000,
+                "cycle {cycle}: the thin side frees no crowd room (filled {filled}, fee room {room})"
             );
         }
         crowd.push(c.portfolio);
         let close = -env.position(t.portfolio);
         if close != 0 {
-            env.trade_signing_fee(&t, &lp, close, 100).expect("thin close (exempt)");
+            env.trade_signing_fee(&t, &lp, close, GROWTH_FEE).expect("thin close (exempt)");
             assert_eq!(env.position(t.portfolio), 0, "M-1: the close fills in full");
         }
         assert!(env.position(lp.portfolio).unsigned_abs() <= n_cap(&env), "cycle {cycle}: |LP| <= N_cap");
         let lp_now = env.position(lp.portfolio);
         if lp_now != 0 {
-            env.trade_signing_fee(&t, &lp, lp_now, 100).expect("thin open");
+            env.trade_signing_fee(&t, &lp, lp_now, GROWTH_FEE).expect("thin open");
         }
         let users_long: u128 = crowd.iter().map(|p| env.position(*p).max(0).unsigned_abs()).sum();
         assert!(users_long <= n_cap(&env), "crowd users OI <= N_cap");
     }
     let close = -env.position(t.portfolio);
-    env.trade_signing_fee(&t, &lp, close, 100).expect("final thin close");
+    env.trade_signing_fee(&t, &lp, close, GROWTH_FEE).expect("final thin close");
     assert_eq!(env.position(t.portfolio), 0);
     let lp_abs = env.position(lp.portfolio).unsigned_abs();
     eprintln!("N-1 bound: final |LP| {lp_abs} vs N_cap {}", n_cap(&env));
     assert!(lp_abs <= n_cap(&env), "|LP| ends <= N_cap, not 4 x N_cap");
+}
+
+// N-2 (security round 3): the reviewer's hedged lock-out, with assertions.
+/// N-2 (security round 3, reviewer `sec3_hedged_lockout_of_both_sides`, now asserting): one
+/// actor fills BOTH sides' users OI to N_cap delta-neutrally (10 Sybil longs of 100 units, one
+/// 1,000-unit short), so fresh users cannot open either side. The lock-out itself is the price
+/// of the N-1 invariant; the utilisation fee makes it COST: every open above the 50% kink pays
+/// `500 bps * (u - 0.5) / 0.5` of its notional to the vault LP, so building this lock-out pays
+/// the LP ~$65 on a $1k C_m (before: only base + matcher fees). Closes never pay it.
+/// NEGATIVE CONTROL: mutant `n2-nofee` (utilisation fee 0) fails the cost assertions.
+#[test]
+fn sec3_hedged_lockout_of_both_sides() {
+    use percolator_prog::growth_v19 as gv;
+    const FEE: u64 = 10_000; // the taker's signed maximum; the charge is base + requested + util
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    let n = 1_000 * POS;
+    let c_m = |env: &Env| -> u128 {
+        let p = env.portfolio(lp.portfolio);
+        percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap()
+    };
+    let lp_cap0 = env.portfolio(lp.portfolio).capital;
+    // expected utilisation fee, leg by leg, from the pure functions at the pre-fill C_m
+    let mut expected_util: u128 = 0;
+    let mut users_long: u128 = 0;
+    let mut actor_deposits: u128 = 0;
+    let mut actors: Vec<Pubkey> = Vec::new();
+    for i in 0..10 {
+        let n_cap = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap();
+        let bps = gv::utilisation_fee_bps(users_long + (n / 10) as u128, n_cap, 5_000, 500).unwrap();
+        expected_util += (n as u128 / 10) * bps as u128 / 10_000; // notional at $1 = units
+        let mut dep: u64 = 10_000_000;
+        loop {
+            let c = env.new_trader(dep);
+            let r = env.trade_signing_fee(&c, &lp, n / 10, FEE);
+            if r.is_ok() && env.position(c.portfolio) == n / 10 {
+                actor_deposits += dep as u128;
+                actors.push(c.portfolio);
+                break;
+            }
+            dep += 5_000_000;
+            assert!(dep < 400_000_000, "leg {i}: {r:?}");
+        }
+        users_long += (n / 10) as u128;
+    }
+    let n_cap = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap();
+    let bps = gv::utilisation_fee_bps(n as u128, n_cap, 5_000, 500).unwrap();
+    expected_util += n as u128 * bps as u128 / 10_000;
+    let mut sdep: u64 = 100_000_000;
+    let s = loop {
+        let s = env.new_trader(sdep);
+        let r = env.trade_signing_fee(&s, &lp, -n, FEE);
+        if r.is_ok() && env.position(s.portfolio) == -n {
+            break s;
+        }
+        sdep += 10_000_000;
+        assert!(sdep < 2_000_000_000, "short: {r:?}");
+    };
+    actor_deposits += sdep as u128;
+    actors.push(s.portfolio);
+    let actor_cap: u128 = actors.iter().map(|k| env.portfolio(*k).capital).sum();
+    let actor_fees = actor_deposits - actor_cap;
+    let lp_gain = env.portfolio(lp.portfolio).capital - lp_cap0;
+    eprintln!(
+        "SEC3 lockout: actor locked {actor_deposits}, paid fees {actor_fees}, LP capital +{lp_gain}; expected utilisation fee {expected_util} (u_short {bps} bps)"
+    );
+    // the lock-out costs real money, and the LP earns it
+    assert!(expected_util >= 60_000_000, "the model prices the lock-out at >= $60 ({expected_util})");
+    assert!(actor_fees >= expected_util, "actor paid {actor_fees} < utilisation fee {expected_util}");
+    assert!(lp_gain >= expected_util, "LP earned {lp_gain} < utilisation fee {expected_util}");
+    // fresh users still cannot open (the lock-out exists; it is now paid for)
+    // ...except for the room the lock-out's OWN fees added to C_m (they fund the LP)
+    let room = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap() - n as u128;
+    let u = env.new_trader(1_000_000_000);
+    let r1 = env.trade_signing_fee(&u, &lp, 100 * POS, FEE);
+    eprintln!("SEC3 fresh long 100 -> filled {} (fee-funded room {room})", env.position(u.portfolio));
+    assert!(r1.is_ok() && env.position(u.portfolio) as u128 <= room, "crowd full: {r1:?}");
+    // a close never pays the utilisation fee: base + matcher request only (<= 2% here)
+    let cap_before = env.portfolio(s.portfolio).capital;
+    env.trade_signing_fee(&s, &lp, n, FEE).expect("actor short closes");
+    assert_eq!(env.position(s.portfolio), 0);
+    let close_fee = cap_before.saturating_sub(env.portfolio(s.portfolio).capital);
+    eprintln!("SEC3 close of 1,000 units paid {close_fee}");
+    assert!(close_fee <= 20_000_000, "a close pays no utilisation fee ({close_fee})");
 }
