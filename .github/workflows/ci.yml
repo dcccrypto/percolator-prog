@@ -67,9 +67,12 @@ jobs:
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
       - uses: dtolnay/rust-toolchain@stable
-      - name: install solana toolchain (cargo build-sbf)
+      # R4-1 (security round 4): the DEPLOY toolchain, not the test job's 4.2.2 -- frame sizes
+      # depend on it. cargo-build-sbf 3.1.15 + platform-tools v1.52 (deployments.md); the gate
+      # script refuses any other cargo-build-sbf and passes --tools-version v1.52.
+      - name: install the deploy solana toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52)
         env:
-          SOLANA_CLI_VERSION: "4.2.2"
+          SOLANA_CLI_VERSION: "3.1.15"
         run: |
           sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
           echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
