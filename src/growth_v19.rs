@@ -47,6 +47,11 @@ pub const GRADUATION_ENABLED: bool = false;
 pub const RATCHET_EPOCH_SLOTS: u64 = 9_000;
 /// One ratchet step: +1x.
 pub const RATCHET_STEP_X100: u16 = 100;
+/// Security review L-6: the largest BatchTradeCpi that carries a growth leg (ext v3 on every
+/// leg). 11 v3 legs measured 1,392,150-1,396,650 CU, inside the 3k safety margin under 1.4M;
+/// the legacy bound (11) stays for batches with no growth leg. A batch against a growth vault
+/// LP (kind-2 context, single-slot market) has 1 leg anyway: a kind-2 context binds one asset.
+pub const GROWTH_BATCH_MAX_LEGS: usize = 10;
 
 /// `ceil(1_000_000 / l_x100)`: the IMR (bps) of a leverage cap. `None` below 1x (an IMR above
 /// 100% is not a leverage cap).
@@ -297,6 +302,10 @@ pub struct GrowthLpIn {
     /// Raw signed positions before / after (crowd detection, raw-vs-raw like S-3).
     pub before_q: i128,
     pub after_q: i128,
+    /// M-1 (security review 2026-10-04): the LP's raw position after the taker's REDUCING part
+    /// of the fill (`lp_mid_q`). The crowd test is on the OPENING part only:
+    /// `joins_crowd(mid_q, after_q)`. Equal to `before_q` when the taker does not reduce.
+    pub mid_q: i128,
     /// ADL-effective |position| after the fill (the numerator of `u`).
     pub eff_after_abs_q: u128,
     /// Conservative equity `C_m`.
@@ -333,6 +342,11 @@ pub enum GrowthVerdict {
     Allow,
     LeverageExceeded,
     CapacityFull,
+    /// A risk-increasing fill with no single LP counterparty (NoCpi between two non-LPs or two
+    /// LPs). On a growth asset every OPEN must face an LP and pay IMR_dyn; otherwise a pair
+    /// opened trader-vs-trader at the launch ceiling could later be "closed" into an LP past
+    /// its capacity through the M-1 close exemption (the P1 F-7 dump).
+    NoLpCounterparty,
 }
 
 /// The IMR the gate applies to a risk-increasing taker fill, or `Err(CapacityFull)`.
@@ -342,7 +356,7 @@ pub fn growth_required_imr_bps(g: &GrowthGateIn) -> Result<u64, GrowthVerdict> {
         return Err(GrowthVerdict::LeverageExceeded);
     }
     match g.lp {
-        Some(lp) if joins_crowd(lp.before_q, lp.after_q) => {
+        Some(lp) if joins_crowd(lp.mid_q, lp.after_q) => {
             if g.crowd_blocked {
                 return Err(GrowthVerdict::CapacityFull);
             }
@@ -359,6 +373,9 @@ pub fn growth_required_imr_bps(g: &GrowthGateIn) -> Result<u64, GrowthVerdict> {
 pub fn growth_gate(g: &GrowthGateIn) -> GrowthVerdict {
     if !taker_risk_increasing(g.taker_before_q, g.taker_after_q) {
         return GrowthVerdict::Allow;
+    }
+    if g.lp.is_none() {
+        return GrowthVerdict::NoLpCounterparty;
     }
     if g.price_e6 == 0 {
         return GrowthVerdict::LeverageExceeded;
@@ -383,16 +400,87 @@ pub fn growth_gate(g: &GrowthGateIn) -> GrowthVerdict {
     }
 }
 
+/// L-2 (security review 2026-10-04): the protocol floor on the creator-declared `r_gap`. A
+/// position can only be liquidated when a keeper cranks, so the worst move between two
+/// liquidation opportunities is at least the engine's per-slot price limit times the
+/// liquidation latency in slots:
+/// `r_gap >= max_price_move_bps_per_slot * R_GAP_MIN_LIQUIDATION_SLOTS`.
+/// 50 slots = the devnet keeper cycle (~20 s at ~2.5 slots/s; `percolator-launch`
+/// `app/lib/market-params.ts` ACCRUAL_DT_SLOTS rationale). At the wizard's 10x setting
+/// (4 bps/slot) the floor is 200 bps, so MMR 500 = r_gap 400 + fee 100 still fits; a creator
+/// can no longer declare `r_gap = 1` and reduce the rule to `MMR > fee`.
+pub const R_GAP_MIN_LIQUIDATION_SLOTS: u64 = 50;
+
+/// The `r_gap` floor for a market's engine price limit. `None` on overflow (fails closed).
+pub fn r_gap_floor_bps(max_price_move_bps_per_slot: u64) -> Option<u64> {
+    max_price_move_bps_per_slot.checked_mul(R_GAP_MIN_LIQUIDATION_SLOTS)
+}
+
 /// InitMarket rule (plan §2.1, bankruptcy safety): a position crosses maintenance before it can
 /// go bankrupt, so it survives the worst gap between liquidation opportunities only if
-/// `MMR >= r_gap + liquidation fee`. Also `r_gap > 0` (measured, never defaulted).
-pub fn init_margin_rule_ok(maintenance_bps: u64, r_gap_bps: u16, liquidation_fee_bps: u64) -> bool {
+/// `MMR >= r_gap + liquidation fee`, with `r_gap > 0` and `r_gap >= r_gap_floor_bps(price
+/// limit)` (L-2: never below what the engine's own price limit allows in one keeper cycle).
+pub fn init_margin_rule_ok(
+    maintenance_bps: u64,
+    r_gap_bps: u16,
+    liquidation_fee_bps: u64,
+    max_price_move_bps_per_slot: u64,
+) -> bool {
     if r_gap_bps == 0 {
         return false;
+    }
+    match r_gap_floor_bps(max_price_move_bps_per_slot) {
+        Some(floor) if (r_gap_bps as u64) >= floor => {}
+        _ => return false,
     }
     match (r_gap_bps as u64).checked_add(liquidation_fee_bps) {
         Some(need) => maintenance_bps >= need,
         None => false,
+    }
+}
+
+/// M-1: the taker's change STRICTLY reduces it: ends flat, or keeps the side with a smaller
+/// magnitude (no flip, no growth). Same predicate as P1's `position_change_reduce_only`.
+pub fn taker_strictly_reduces(before_q: i128, after_q: i128) -> bool {
+    after_q == 0
+        || (before_q != 0
+            && (before_q > 0) == (after_q > 0)
+            && after_q.unsigned_abs() <= before_q.unsigned_abs())
+}
+
+/// M-1: the taker's change FLIPS it (crosses zero to a non-zero opposite position).
+pub fn taker_flips(before_q: i128, after_q: i128) -> bool {
+    before_q != 0 && after_q != 0 && (before_q > 0) != (after_q > 0)
+}
+
+/// M-1: the LP's position after the taker's REDUCING part of a two-party fill (the LP moves by
+/// the negation of the taker's change).
+/// * strict reduction: the whole fill is the reducing part -> `lp_after`
+///   (= `lp_before + taker_before - taker_after`);
+/// * flip: the reducing part closes the taker to flat -> `lp_before + taker_before`;
+/// * otherwise (open / grow): no reducing part -> `lp_before`.
+///
+/// Every LP-capacity check on a growth asset measures LP growth from this point, so a taker's
+/// close is never refused or clipped for capacity while its opening part is. `None` on overflow.
+pub fn lp_mid_q(lp_before_q: i128, taker_before_q: i128, taker_after_q: i128) -> Option<i128> {
+    if taker_strictly_reduces(taker_before_q, taker_after_q) {
+        lp_before_q
+            .checked_add(taker_before_q)?
+            .checked_sub(taker_after_q)
+    } else if taker_flips(taker_before_q, taker_after_q) {
+        lp_before_q.checked_add(taker_before_q)
+    } else {
+        Some(lp_before_q)
+    }
+}
+
+/// L-4 (security review): G4 protocol defaults are applied FIELD BY FIELD at the tag-94 bind:
+/// a field the upgrade authority preset (non-zero) is kept, a zero field gets its default.
+pub fn g4_default_if_zero(current: u128, default: u128) -> u128 {
+    if current == 0 {
+        default
+    } else {
+        current
     }
 }
 
@@ -495,6 +583,23 @@ pub fn encode_ext_v3_from_v2(
     b
 }
 
+/// The P2 call-extension flag "this request only reduces the taker" (bit 3 of byte 1; same
+/// value as `risk_limits_v17::EXT_FLAG_TAKER_REDUCING` and the matcher's).
+pub const EXT_FLAG_TAKER_REDUCING: u8 = 1 << 3;
+
+/// M-1: mark a growth leg's v3 block TAKER_REDUCING when the wrapper verified the leg only
+/// reduces the taker (strict, or a flip already clipped to its close). The matcher then never
+/// clips it for LP capacity (v3 cap, closed mode, kind-2 size budget).
+pub fn ext_v3_mark_taker_reducing(
+    mut b: [u8; CALL_EXT_V3_LEN],
+    taker_reducing: bool,
+) -> [u8; CALL_EXT_V3_LEN] {
+    if taker_reducing {
+        b[1] |= EXT_FLAG_TAKER_REDUCING;
+    }
+    b
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -573,6 +678,7 @@ mod tests {
             taker_cert_initial_req: None,
             lp: Some(GrowthLpIn {
                 before_q: 0,
+                mid_q: 0,
                 after_q: -(100 * PS as i128),
                 eff_after_abs_q: 100 * PS,
                 equity: 1_000_000_000,
@@ -600,6 +706,7 @@ mod tests {
         let mut c = g;
         c.lp = Some(GrowthLpIn {
             before_q: -(800 * PS as i128),
+            mid_q: -(800 * PS as i128),
             after_q: -(900 * PS as i128),
             eff_after_abs_q: 900 * PS,
             equity: 1_000_000_000,
@@ -612,6 +719,7 @@ mod tests {
         let mut t = c;
         t.lp = Some(GrowthLpIn {
             before_q: -(900 * PS as i128),
+            mid_q: -(900 * PS as i128),
             after_q: -(800 * PS as i128),
             eff_after_abs_q: 800 * PS,
             equity: 1_000_000_000,
@@ -622,6 +730,7 @@ mod tests {
         let mut e = c;
         e.lp = Some(GrowthLpIn {
             before_q: -(900 * PS as i128),
+            mid_q: -(900 * PS as i128),
             after_q: -(1_000 * PS as i128),
             eff_after_abs_q: 1_000 * PS,
             equity: 1_000_000_000,
@@ -633,6 +742,7 @@ mod tests {
         let mut f = c;
         f.lp = Some(GrowthLpIn {
             before_q: -(900 * PS as i128),
+            mid_q: -(900 * PS as i128),
             after_q: -(1_000 * PS as i128 + 1),
             eff_after_abs_q: 1_000 * PS + 1,
             equity: 1_000_000_000,
@@ -702,6 +812,56 @@ mod tests {
     }
 
     #[test]
+    fn m1_mid_and_counterparty() {
+        // strict close of a short 100: the LP goes from -900 to -1000 (the close grows |LP|)
+        assert_eq!(lp_mid_q(-900, -100, 0), Some(-1_000));
+        assert_eq!(lp_mid_q(-900, -100, -40), Some(-960));
+        // flip short 100 -> long 50: the reducing part takes the LP to -1000
+        assert_eq!(lp_mid_q(-900, -100, 50), Some(-1_000));
+        // open / grow: no reducing part
+        assert_eq!(lp_mid_q(-900, 0, 50), Some(-900));
+        assert_eq!(lp_mid_q(-900, 50, 80), Some(-900));
+        assert!(taker_strictly_reduces(-100, 0) && taker_strictly_reduces(-100, -1));
+        assert!(!taker_strictly_reduces(-100, 1) && !taker_strictly_reduces(0, 1));
+        assert!(taker_flips(-100, 1) && !taker_flips(-100, 0) && !taker_flips(0, 5));
+        // the gate measures crowd growth from mid: the flip's opening long grows a short LP
+        let mut g = GrowthGateIn {
+            taker_before_q: -100,
+            taker_after_q: 50,
+            taker_eff_after_abs_q: 50,
+            taker_equity: u128::MAX / 4,
+            taker_cert_initial_req: None,
+            lp: Some(GrowthLpIn {
+                before_q: -900,
+                mid_q: -1_000,
+                after_q: -1_050,
+                eff_after_abs_q: 1_050,
+                equity: 1_000,
+            }),
+            price_e6: 1_000_000,
+            pos_scale: 1_000_000,
+            engine_imr_bps: 1_000,
+            min_nonzero_im_req: 0,
+            ceil_imr_bps: 1_000,
+            lambda_bps: 10_000,
+            kink_bps: 5_000,
+            crowd_blocked: false,
+        };
+        assert_eq!(
+            growth_gate(&g),
+            GrowthVerdict::CapacityFull,
+            "opening part past N_cap gated"
+        );
+        // no LP counterparty: a risk-increasing side is refused, a close is not
+        g.lp = None;
+        assert_eq!(growth_gate(&g), GrowthVerdict::NoLpCounterparty);
+        g.taker_after_q = 0;
+        assert_eq!(growth_gate(&g), GrowthVerdict::Allow);
+        assert_eq!(g4_default_if_zero(0, 100), 100);
+        assert_eq!(g4_default_if_zero(7, 100), 7);
+    }
+
+    #[test]
     fn sides_and_dials() {
         // CPI: a always checked (even if it is itself an LP), b is the LP
         assert_eq!(growth_sides(true, false, true), (true, false, Some(true)));
@@ -726,13 +886,27 @@ mod tests {
 
     #[test]
     fn init_rule() {
-        assert!(init_margin_rule_ok(500, 400, 100));
-        assert!(!init_margin_rule_ok(500, 401, 100));
+        assert!(init_margin_rule_ok(500, 400, 100, 4));
+        assert!(!init_margin_rule_ok(500, 401, 100, 4));
         assert!(
-            !init_margin_rule_ok(500, 0, 100),
+            !init_margin_rule_ok(500, 0, 100, 0),
             "r_gap must be measured (> 0)"
         );
-        assert!(!init_margin_rule_ok(u64::MAX, 1, u64::MAX));
+        assert!(!init_margin_rule_ok(u64::MAX, 1, u64::MAX, 0));
+        // L-2 floor: 4 bps/slot x 50 slots = 200 bps
+        assert!(init_margin_rule_ok(500, 200, 100, 4));
+        assert!(
+            !init_margin_rule_ok(500, 199, 100, 4),
+            "below price-limit x latency"
+        );
+        assert!(
+            !init_margin_rule_ok(10_000, 1, 100, 4),
+            "r_gap = 1 bps refused"
+        );
+        assert!(
+            !init_margin_rule_ok(10_000, 400, 0, u64::MAX),
+            "floor overflow fails closed"
+        );
     }
 
     #[test]
