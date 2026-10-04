@@ -2680,6 +2680,20 @@ pub mod state {
         Ok(limits)
     }
 
+    /// Encode into an asset's wrapper-slot bytes (the view-level twin of
+    /// `write_asset_risk_limits`); validates first.
+    pub fn asset_risk_limits_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        limits: &AssetRiskLimitsV17,
+    ) -> Result<(), ProgramError> {
+        validate_asset_risk_limits(limits)?;
+        wrapper
+            .get_mut(ASSET_RISK_LIMITS_OFF..ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(limits));
+        Ok(())
+    }
+
     #[inline]
     fn asset_risk_limits_range(
         data: &[u8],
@@ -7278,6 +7292,16 @@ pub mod ix {
             junior_floor_bps: u16,
             l_launch_x100: u16,
         },
+        /// growth-v19: tag 93 (upgrade authority) with the FULL legacy body (ext mode + max
+        /// requested fee always present) and a 6-byte trailer `[lambda_bps u32][kink_bps u16]`:
+        /// the growth dials of a growth asset. Until the epoch clamp exists they may only
+        /// tighten / stay within the growth-1 defaults (`growth_v19::growth_dials_ok`).
+        /// `limits` is always a `SetAssetRiskLimits`.
+        SetAssetRiskLimitsV19 {
+            limits: alloc::boxed::Box<Instruction>,
+            growth_lambda_bps: u32,
+            growth_kink_bps: u16,
+        },
         /// Tag 95, UPGRADE-AUTHORITY-gated (P3-H2). SetMatcherConfig + InitMatcherCtx for the
         /// vault LP (whose owner, a PDA, cannot sign either), with the protocol-approved matcher.
         VaultLpSetMatcher {
@@ -7791,23 +7815,36 @@ pub mod ix {
                 85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
                 },
-                crate::constants::TAG_SET_ASSET_RISK_LIMITS => Self::SetAssetRiskLimits {
-                    asset_index: read_u16(&mut rest)?,
-                    exec_band_bps: read_u16(&mut rest)?,
-                    lp_exposure_k_bps: read_u32(&mut rest)?,
-                    lp_floor_atoms: read_u128(&mut rest)?,
-                    side_oi_cap_q: read_u128(&mut rest)?,
-                    matcher_ext_mode: if rest.is_empty() {
-                        0
+                crate::constants::TAG_SET_ASSET_RISK_LIMITS => {
+                    let base = Self::SetAssetRiskLimits {
+                        asset_index: read_u16(&mut rest)?,
+                        exec_band_bps: read_u16(&mut rest)?,
+                        lp_exposure_k_bps: read_u32(&mut rest)?,
+                        lp_floor_atoms: read_u128(&mut rest)?,
+                        side_oi_cap_q: read_u128(&mut rest)?,
+                        matcher_ext_mode: if rest.is_empty() {
+                            0
+                        } else {
+                            read_u8(&mut rest)?
+                        },
+                        max_requested_fee_bps: if rest.is_empty() {
+                            0
+                        } else {
+                            read_u16(&mut rest)?
+                        },
+                    };
+                    if rest.len() == 6 {
+                        let growth_lambda_bps = read_u32(&mut rest)?;
+                        let growth_kink_bps = read_u16(&mut rest)?;
+                        Self::SetAssetRiskLimitsV19 {
+                            limits: alloc::boxed::Box::new(base),
+                            growth_lambda_bps,
+                            growth_kink_bps,
+                        }
                     } else {
-                        read_u8(&mut rest)?
-                    },
-                    max_requested_fee_bps: if rest.is_empty() {
-                        0
-                    } else {
-                        read_u16(&mut rest)?
-                    },
-                },
+                        base
+                    }
+                }
                 86 => Self::UpdateFeeSplit {
                     creator_share_bps: read_u16(&mut rest)?,
                     lp_share_bps: read_u16(&mut rest)?,
@@ -8686,6 +8723,34 @@ pub mod ix {
                 Self::InitVaultLp { junior_floor_bps } => {
                     out.push(94);
                     push_u16(&mut out, junior_floor_bps);
+                }
+                Self::SetAssetRiskLimitsV19 {
+                    ref limits,
+                    growth_lambda_bps,
+                    growth_kink_bps,
+                } => {
+                    if let Self::SetAssetRiskLimits {
+                        asset_index,
+                        exec_band_bps,
+                        lp_exposure_k_bps,
+                        lp_floor_atoms,
+                        side_oi_cap_q,
+                        matcher_ext_mode,
+                        max_requested_fee_bps,
+                    } = **limits
+                    {
+                        out.push(crate::constants::TAG_SET_ASSET_RISK_LIMITS);
+                        push_u16(&mut out, asset_index);
+                        push_u16(&mut out, exec_band_bps);
+                        push_u32(&mut out, lp_exposure_k_bps);
+                        push_u128(&mut out, lp_floor_atoms);
+                        push_u128(&mut out, side_oi_cap_q);
+                        // the full legacy body is mandatory under the growth trailer
+                        out.push(matcher_ext_mode);
+                        push_u16(&mut out, max_requested_fee_bps);
+                        push_u32(&mut out, growth_lambda_bps);
+                        push_u16(&mut out, growth_kink_bps);
+                    }
                 }
                 Self::InitVaultLpV19 {
                     junior_floor_bps,
@@ -12114,6 +12179,42 @@ pub mod processor {
         Ok(())
     }
 
+    /// Tag 93 (both encodings): destructure once, then `handle_set_asset_risk_limits`.
+    fn dispatch_set_asset_risk_limits<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        ix: &Instruction,
+        growth: Option<(u32, u16)>,
+    ) -> ProgramResult {
+        match *ix {
+            Instruction::SetAssetRiskLimits {
+                asset_index,
+                exec_band_bps,
+                lp_exposure_k_bps,
+                lp_floor_atoms,
+                side_oi_cap_q,
+                matcher_ext_mode,
+                max_requested_fee_bps,
+            } => handle_set_asset_risk_limits(
+                program_id,
+                accounts,
+                asset_index,
+                state::AssetRiskLimitsV17 {
+                    side_oi_cap_q,
+                    lp_floor_atoms,
+                    lp_exposure_k_bps,
+                    exec_band_bps,
+                    matcher_ext_mode,
+                    _reserved0: 0,
+                    max_requested_fee_bps,
+                    _reserved: [0u8; 22],
+                },
+                growth,
+            ),
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+
     /// Tag 0 (both encodings): destructure once, then `handle_init_market`.
     fn dispatch_init_market<'a>(
         program_id: &Pubkey,
@@ -12850,28 +12951,18 @@ pub mod processor {
                 amount,
                 authority_epoch,
             } => handle_withdraw_protocol_fee(program_id, accounts, amount, authority_epoch),
-            Instruction::SetAssetRiskLimits {
-                asset_index,
-                exec_band_bps,
-                lp_exposure_k_bps,
-                lp_floor_atoms,
-                side_oi_cap_q,
-                matcher_ext_mode,
-                max_requested_fee_bps,
-            } => handle_set_asset_risk_limits(
+            ix @ Instruction::SetAssetRiskLimits { .. } => {
+                dispatch_set_asset_risk_limits(program_id, accounts, &ix, None)
+            }
+            Instruction::SetAssetRiskLimitsV19 {
+                limits,
+                growth_lambda_bps,
+                growth_kink_bps,
+            } => dispatch_set_asset_risk_limits(
                 program_id,
                 accounts,
-                asset_index,
-                state::AssetRiskLimitsV17 {
-                    side_oi_cap_q,
-                    lp_floor_atoms,
-                    lp_exposure_k_bps,
-                    exec_band_bps,
-                    matcher_ext_mode,
-                    _reserved0: 0,
-                    max_requested_fee_bps,
-                    _reserved: [0u8; 22],
-                },
+                &limits,
+                Some((growth_lambda_bps, growth_kink_bps)),
             ),
             Instruction::SetProtocolFeeAuthority { new_authority } => {
                 handle_set_protocol_fee_authority(program_id, accounts, new_authority)
@@ -19365,6 +19456,8 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
         limits: state::AssetRiskLimitsV17,
+        // growth-v19: `(lambda_bps, kink_bps)` from the optional trailer.
+        growth: Option<(u32, u16)>,
     ) -> ProgramResult {
         let upgrade_authority = account(accounts, 0)?;
         let program_data_ai = account(accounts, 1)?;
@@ -19387,7 +19480,27 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let mut market_data = market_ai.try_borrow_mut_data()?;
-        state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)
+        state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)?;
+        if let Some((lambda_bps, kink_bps)) = growth {
+            // growth-v19 dials: growth assets only; tighten-only / within bounds until the epoch
+            // clamp is enforced (plan §2.9 L3).
+            if !growth_v19::growth_dials_ok(growth_v19::EPOCH_CLAMP_ENFORCED, lambda_bps, kink_bps)
+            {
+                return Err(PercolatorError::GrowthInvalidConfig.into());
+            }
+            let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let market = group
+                .markets
+                .get_mut(asset_index as usize)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            let mut g = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
+                .ok_or(PercolatorError::GrowthInvalidConfig)?;
+            g.lambda_bps = lambda_bps;
+            g.kink_bps = kink_bps;
+            state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -29527,7 +29640,7 @@ pub mod processor {
                     .ok_or(PercolatorError::InvalidInstruction)?;
                 let growth =
                     state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?;
-                match (growth, l_launch_x100) {
+                let on = match (growth, l_launch_x100) {
                     (None, None) => false,
                     (None, Some(_)) => return Err(PercolatorError::GrowthInvalidConfig.into()),
                     (Some(_), None) => true,
@@ -29545,7 +29658,29 @@ pub mod processor {
                         )?;
                         true
                     }
+                };
+                // G4 (plan §2.3 step 5): a growth asset's protocol risk defaults -- the P2
+                // call extension on, the fee channel on (100 bps cap = pinned max_total), an LP floor > 0 -- are
+                // written here, at the existing creator bind, so a new creator market needs no
+                // upgrade-authority send. Only into an ALL-ZERO record: an upgrade-authority
+                // tag-93 value set before the bind is never overwritten. Legacy (growth OFF)
+                // binds are unchanged.
+                if on {
+                    let limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
+                    if limits == state::AssetRiskLimitsV17::default() {
+                        let pinned = state::AssetRiskLimitsV17 {
+                            matcher_ext_mode: growth_v19::GROWTH_PIN_MATCHER_EXT_MODE,
+                            max_requested_fee_bps: growth_v19::GROWTH_PIN_MAX_REQUESTED_FEE_BPS,
+                            lp_floor_atoms: growth_v19::GROWTH_PIN_LP_FLOOR_ATOMS,
+                            ..Default::default()
+                        };
+                        state::asset_risk_limits_to_wrapper_bytes(
+                            &mut market.wrapper[..],
+                            &pinned,
+                        )?;
+                    }
                 }
+                on
             };
             rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
@@ -29562,9 +29697,9 @@ pub mod processor {
                 vault_lp_v18::pinned_matcher_caps(price)
                     .ok_or(PercolatorError::InvalidInstruction)?
             };
-            (senior_claim, caps)
+            (senior_claim, caps, growth_on)
         };
-        let (senior_claim, pinned_caps) = senior_claim;
+        let (senior_claim, pinned_caps, growth_on) = senior_claim;
 
         let market_bytes = market_ai.key.to_bytes();
         let bump_bytes = [vault_lp_bump];
@@ -29622,7 +29757,12 @@ pub mod processor {
                 asset_generation_frontier,
                 trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
                 expiry_slot: u64::MAX,
-                kind: vault_lp_v18::PIN_MATCHER_KIND,
+                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
+                kind: if growth_on {
+                    growth_v19::GROWTH_PIN_MATCHER_KIND
+                } else {
+                    vault_lp_v18::PIN_MATCHER_KIND
+                },
                 trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
                 base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
                 max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
@@ -29943,6 +30083,29 @@ pub mod processor {
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
             group.deposit_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+            // growth-v19: record the launch risk capital `c_launch` ONCE, at the first junior
+            // deposit into a growth asset: the vault LP's conservative equity right after it
+            // (the graduation reference, plan §2.1; graduation itself is compiled off).
+            let idx = st.asset_index as usize;
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let c_m = vault_lp_v18::conservative_equity(
+                lp.header.capital.get(),
+                lp.header.pnl.get(),
+                lp.header.fee_credits.get(),
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let market = group
+                .markets
+                .get_mut(idx)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            if let Some(mut g) =
+                state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
+            {
+                if g.c_launch_atoms == 0 && c_m > 0 {
+                    g.c_launch_atoms = u64::try_from(c_m).unwrap_or(u64::MAX);
+                    state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+                }
+            }
         }
         transfer_tokens(token_program, source_token, vault_token, owner, amount_u64)?;
         st.junior_deposited_atoms = st
@@ -32639,16 +32802,9 @@ pub mod processor {
             raw_and_effective_signed_position_for_asset_view(group, account_a, asset_index)?;
         let (b_after, b_eff) =
             raw_and_effective_signed_position_for_asset_view(group, account_b, asset_index)?;
-        // Some(true) = account_b is the LP counterparty, Some(false) = account_a.
-        let lp_is_b = if roles.cpi {
-            Some(true)
-        } else {
-            match (roles.a_is_lp, roles.b_is_lp) {
-                (false, true) => Some(true),
-                (true, false) => Some(false),
-                _ => None,
-            }
-        };
+        // Side selection is the pure (Kani-target) `growth_v19::growth_sides`.
+        let (a_is_taker, b_is_taker, lp_is_b) =
+            growth_v19::growth_sides(roles.cpi, roles.a_is_lp, roles.b_is_lp);
         let equity_of = |p: &percolator::PortfolioV16ViewMut<'_>| -> Result<u128, ProgramError> {
             vault_lp_v18::conservative_equity(
                 p.header.capital.get(),
@@ -32673,20 +32829,8 @@ pub mod processor {
             None => None,
         };
         let sides: [(bool, &percolator::PortfolioV16ViewMut<'_>, i128, i128, i128); 2] = [
-            (
-                lp_is_b != Some(false),
-                account_a,
-                position_a_before,
-                a_after,
-                a_eff,
-            ),
-            (
-                lp_is_b != Some(true),
-                account_b,
-                position_b_before,
-                b_after,
-                b_eff,
-            ),
+            (a_is_taker, account_a, position_a_before, a_after, a_eff),
+            (b_is_taker, account_b, position_b_before, b_after, b_eff),
         ];
         for (is_taker, taker, before, after, eff) in sides {
             if !is_taker || !growth_v19::taker_risk_increasing(before, after) {

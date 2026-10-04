@@ -16,8 +16,9 @@
 //! base    = max(engine IMR, ceil(1_000_000 / L_ceil_x100))                 (never looser than engine)
 //! crowd fill (LP |inventory| grows) AND taker risk-increasing:
 //!   u <= u_k       : IMR_dyn = base
-//!   u_k < u < 1    : IMR_dyn = base + ceil((u - u_k) / (1 - u_k) * (10_000 - base))
-//!   u >= 1         : refuse (GrowthCapacityFull)
+//!   u_k < u <= 1   : IMR_dyn = base + ceil((u - u_k) / (1 - u_k) * (10_000 - base))
+//!                    (= 100% at u == 1: a fill may take the LP exactly TO capacity)
+//!   u > 1          : refuse (GrowthCapacityFull)
 //! thin side, reductions, closes: base (reductions / closes are never checked at all)
 //! require taker conservative equity >= cert IM (whole portfolio, engine IMR)
 //!                                       - this leg at engine IMR + this leg at IMR_dyn
@@ -167,18 +168,38 @@ pub fn n_cap_q(c_m: u128, lambda_bps: u32, price_e6: u64, pos_scale: u128) -> Op
     Some(num / den)
 }
 
-/// `liquidity_notional_e6` the wrapper hands the matcher (ext v3): `floor(c_m * lambda / 1e4)`.
-/// `None` on overflow.
+/// Depth multiple kappa: the ext-v3 depth is `kappa * lambda * C_m`, i.e. kappa times the
+/// capacity notional. The pinned kind-2 matcher prices constant-product impact
+/// `k * n / (D - n)`, which is INFINITE at `D == n`: with kappa = 1 the vAMM could never fill
+/// to capacity and the matcher (not N_cap) would be the binding limit. With kappa = 4 the
+/// impact at full capacity is `k / 3` (~17 bps at the pinned 50), well inside the pinned
+/// 100 bps max-total, so N_cap stays the ONE binding number and depth only shapes the price
+/// (less capital => deeper impact for the same order).
+pub const DEPTH_MULT: u128 = 4;
+
+/// `liquidity_notional_e6` the wrapper hands the matcher (ext v3):
+/// `floor(c_m * lambda * DEPTH_MULT / 1e4)`. `None` on overflow.
 pub fn liquidity_notional_e6(c_m: u128, lambda_bps: u32) -> Option<u128> {
-    Some(c_m.checked_mul(lambda_bps as u128)? / BPS)
+    Some(
+        c_m.checked_mul(lambda_bps as u128)?
+            .checked_mul(DEPTH_MULT)?
+            / BPS,
+    )
 }
 
 /// Kinked dynamic IMR for a crowd-joining fill. `None` == refuse (GrowthCapacityFull): `n_cap`
-/// is 0, `u >= 1`, a corrupt input or an overflow.
+/// is 0, `u > 1` (`lp_abs_after > n_cap`), a corrupt input or an overflow.
+///
+/// Q3 (2026-10-04): `u == 1` exactly is ADMITTED at 100% IMR. The TradeCpi headroom clip
+/// (`N_cap - |LP|`, P1 with `k = lambda`) and the matcher's ext-v3 inventory check (`<= cap`)
+/// both let a fill land exactly ON `N_cap`; refusing only `u > 1` makes the clip, the matcher
+/// and this gate agree, and keeps the provable invariant "no crowd fill ever leaves
+/// `|LP_eff| > N_cap`" (Kani target 5). The curve is continuous: `IMR_dyn -> 10_000` as
+/// `u -> 1`. (With `kink == 10_000` there is no step at all and `u == 1` costs only `base`.)
 ///
 /// `u <= u_k` (exactly: `lp * 1e4 <= kink * n`) -> `base`; otherwise
 /// `base + ceil((10_000 - base) * (lp*1e4 - kink*n) / (n * (10_000 - kink)))`, which is
-/// `< 10_000 - base + 1` because `lp < n`. Monotone non-decreasing in `lp_abs_after`,
+/// `<= 10_000 - base` because `lp <= n`. Monotone non-decreasing in `lp_abs_after`,
 /// non-increasing in `n_cap`.
 pub fn dyn_imr_bps(
     lp_abs_after: u128,
@@ -189,7 +210,7 @@ pub fn dyn_imr_bps(
     if base_imr_bps > MAX_IMR_BPS || kink_bps as u128 > BPS {
         return None;
     }
-    if n_cap == 0 || lp_abs_after >= n_cap {
+    if n_cap == 0 || lp_abs_after > n_cap {
         return None;
     }
     let lhs = lp_abs_after.checked_mul(BPS)?;
@@ -197,7 +218,7 @@ pub fn dyn_imr_bps(
     if lhs <= rhs {
         return Some(base_imr_bps);
     }
-    // Here kink < 10_000 (else lhs <= rhs because lp < n).
+    // Here kink < 10_000 (else lhs <= rhs because lp <= n).
     let span = (MAX_IMR_BPS - base_imr_bps) as u128;
     let num = span.checked_mul(lhs - rhs)?;
     let den = n_cap.checked_mul(BPS - kink_bps as u128)?;
@@ -375,12 +396,71 @@ pub fn init_margin_rule_ok(maintenance_bps: u64, r_gap_bps: u16, liquidation_fee
     }
 }
 
+/// Which sides of a fill the growth gate checks, from the P1 roles. Returns
+/// `(a_is_taker, b_is_taker, lp_is_b)` where `lp_is_b` is `Some(true)` when account_b is the
+/// fill's LP counterparty, `Some(false)` when account_a is, `None` when there is no single LP
+/// (NoCpi between two non-LPs or two LPs: no crowd step, both sides face the ceiling).
+///
+/// * CPI routes: account_b is the matcher LP; account_a is ALWAYS checked, even if it has its
+///   own enabled matcher config (registering a matcher cannot escape the ceiling).
+/// * NoCpi: every side that is not THE single LP is checked.
+pub fn growth_sides(cpi: bool, a_is_lp: bool, b_is_lp: bool) -> (bool, bool, Option<bool>) {
+    let lp_is_b = if cpi {
+        Some(true)
+    } else {
+        match (a_is_lp, b_is_lp) {
+            (false, true) => Some(true),
+            (true, false) => Some(false),
+            _ => None,
+        }
+    };
+    (lp_is_b != Some(false), lp_is_b != Some(true), lp_is_b)
+}
+
+// ── Upgrade-authority dials (tag 93 growth trailer) ─────────────────────────────────────────
+
+/// Plan §2.9 L3: until the epoch return clamp makes `r_gap` program-enforced, the dials may
+/// only TIGHTEN (or stay at) the growth-1 defaults: `lambda <= 1x`, `kink <= 50%`.
+pub const EPOCH_CLAMP_ENFORCED: bool = false;
+
+/// Bounds for the UA setters. Without the epoch clamp: `lambda in [1, DEFAULT_LAMBDA_BPS]`
+/// (never more LP leverage than 1x) and `kink in [0, DEFAULT_KINK_BPS]` (the step never starts
+/// later than u = 50%). With it: `lambda in [1, MAX_LAMBDA_BPS]`, `kink in [0, 10_000]`.
+pub fn growth_dials_ok(epoch_clamp_enforced: bool, lambda_bps: u32, kink_bps: u16) -> bool {
+    let (lambda_max, kink_max) = if epoch_clamp_enforced {
+        (MAX_LAMBDA_BPS, BPS as u16)
+    } else {
+        (DEFAULT_LAMBDA_BPS, DEFAULT_KINK_BPS)
+    };
+    lambda_bps >= 1 && lambda_bps <= lambda_max && kink_bps <= kink_max
+}
+
 // ── Auto-pin on a growth asset (tag 94) ─────────────────────────────────────────────────────
 
 /// Matcher-context liquidity ceiling pinned at bind on a growth asset: 1e16 atoms ($10B at 6
 /// decimals, the engine's `MAX_VAULT_TVL` scale). It only bounds the `min(ctx, ext)` the
 /// matcher takes; the binding depth is the wrapper's ext-v3 `liquidity_notional_e6`.
 pub const GROWTH_PIN_LIQUIDITY_E6: u128 = 10_000_000_000_000_000;
+
+/// G4 (plan §2.3 step 5 / §2.5): the protocol defaults tag 94 writes into a growth asset's
+/// `AssetRiskLimitsV17` when the record is still all-zero (an upgrade-authority tag-93 value
+/// set before the bind is never overwritten):
+/// * `matcher_ext_mode = 1`: the P2 call extension (mark slot, headroom, band) is on;
+pub const GROWTH_PIN_MATCHER_EXT_MODE: u8 = 1;
+/// * the fee channel ON (the spread now pays the LP instead of nobody), capped at the pinned
+///   matcher's own `max_total_bps` (100 bps, inside the plan's 50-100 range). The matcher's
+///   requested fee is `|exec - oracle| / oracle <= max_total`, so a cap BELOW max_total would
+///   refuse every large fill the matcher legitimately prices at its clamp (found by
+///   `growth_v19_bound_capacity_full_and_thin_side_open` with a 50 bps cap: Custom(9)).
+pub const GROWTH_PIN_MAX_REQUESTED_FEE_BPS: u16 = 100;
+const _: () =
+    assert!(GROWTH_PIN_MAX_REQUESTED_FEE_BPS as u32 >= crate::vault_lp_v18::PIN_MAX_TOTAL_BPS);
+/// * an LP floor > 0 (plan §2.9 L4): the vault LP halts risk-increasing fills before its equity
+///   reaches 0 instead of at 0. 1e6 atoms = $1 for a 6-decimal collateral mint.
+pub const GROWTH_PIN_LP_FLOOR_ATOMS: u128 = 1_000_000;
+/// * and the matcher context kind 2 (v2 adaptive fee, size impact, skew surcharge / thin
+///   rebate, stale-mark guard) instead of the kind-1 vAMM.
+pub const GROWTH_PIN_MATCHER_KIND: u8 = 2;
 
 /// The finite, NON-BINDING caps tag 94 pins on a growth asset (`N_cap` replaces the fixed
 /// $5k fill / $25k inventory of `vault_lp_v18::pinned_matcher_caps`): the binding cap is the
@@ -451,6 +531,11 @@ mod tests {
         assert_eq!(dyn_imr_bps(999_999, n, 1_000, 5_000), Some(10_000));
         assert_eq!(
             dyn_imr_bps(1_000_000, n, 1_000, 5_000),
+            Some(10_000),
+            "u == 1 admitted at 100%"
+        );
+        assert_eq!(
+            dyn_imr_bps(1_000_001, n, 1_000, 5_000),
             None,
             "u == 1 refuses"
         );
@@ -471,6 +556,12 @@ mod tests {
         );
         assert_eq!(n_cap_q(1, 10_000, 0, PS), None);
         assert_eq!(n_cap_q(u128::MAX, 10_000, 1, PS), None);
+        // depth = kappa (4) x the capacity notional
+        assert_eq!(
+            liquidity_notional_e6(1_000_000_000, 10_000),
+            Some(4_000_000_000)
+        );
+        assert_eq!(liquidity_notional_e6(u128::MAX, 10_000), None);
     }
 
     fn base_in() -> GrowthGateIn {
@@ -527,12 +618,23 @@ mod tests {
         });
         t.taker_equity = 10_000_000;
         assert_eq!(growth_gate(&t), GrowthVerdict::Allow);
-        // u >= 1 refuses the crowd, reductions still pass.
-        let mut f = c;
-        f.lp = Some(GrowthLpIn {
+        // u == 1 exactly is admitted at 100% IMR (Q3); u > 1 refuses the crowd; reductions pass.
+        let mut e = c;
+        e.lp = Some(GrowthLpIn {
             before_q: -(900 * PS as i128),
             after_q: -(1_000 * PS as i128),
             eff_after_abs_q: 1_000 * PS,
+            equity: 1_000_000_000,
+        });
+        e.taker_equity = 100_000_000; // 100% of the 100-unit notional
+        assert_eq!(growth_gate(&e), GrowthVerdict::Allow, "u == 1 at 1x");
+        e.taker_equity = 99_999_999;
+        assert_eq!(growth_gate(&e), GrowthVerdict::LeverageExceeded);
+        let mut f = c;
+        f.lp = Some(GrowthLpIn {
+            before_q: -(900 * PS as i128),
+            after_q: -(1_000 * PS as i128 + 1),
+            eff_after_abs_q: 1_000 * PS + 1,
             equity: 1_000_000_000,
         });
         f.taker_equity = u128::MAX;
@@ -597,6 +699,29 @@ mod tests {
         );
         assert_eq!(ratchet_ceiling_x100(800, 0, 600, 500, false, 1), (600, 1));
         assert_eq!(ratchet_ceiling_x100(800, 0, 900, 500, true, 1), (500, 1));
+    }
+
+    #[test]
+    fn sides_and_dials() {
+        // CPI: a always checked (even if it is itself an LP), b is the LP
+        assert_eq!(growth_sides(true, false, true), (true, false, Some(true)));
+        assert_eq!(growth_sides(true, true, true), (true, false, Some(true)));
+        // NoCpi
+        assert_eq!(growth_sides(false, false, true), (true, false, Some(true)));
+        assert_eq!(growth_sides(false, true, false), (false, true, Some(false)));
+        assert_eq!(growth_sides(false, false, false), (true, true, None));
+        assert_eq!(growth_sides(false, true, true), (true, true, None));
+        // dials: tighten-only without the epoch clamp
+        assert!(growth_dials_ok(false, 10_000, 5_000));
+        assert!(growth_dials_ok(false, 1, 0));
+        assert!(!growth_dials_ok(false, 10_001, 5_000), "lambda above 1x");
+        assert!(
+            !growth_dials_ok(false, 10_000, 5_001),
+            "kink later than 50%"
+        );
+        assert!(!growth_dials_ok(false, 0, 0), "lambda 0");
+        assert!(growth_dials_ok(true, MAX_LAMBDA_BPS, 10_000));
+        assert!(!growth_dials_ok(true, MAX_LAMBDA_BPS + 1, 0));
     }
 
     #[test]
