@@ -40,6 +40,10 @@ declare_id!("Perco1ator111111111111111111111111111111111");
 /// leverage step-down. See `~/percolator-ops/ledger/p3-vault-owned-lp-2026-09-29.md`.
 pub mod vault_lp_v18;
 
+/// growth-v19 (2026-10-04): pure math for dynamic leverage and capital-derived capacity. See
+/// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
+pub mod growth_v19;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -433,6 +437,17 @@ pub mod constants {
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF >= 672);
     pub const ASSET_VAULT_LP_DRAW_LEN: usize = 64;
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF + ASSET_VAULT_LP_DRAW_LEN == ASSET_VAULT_LP_OFF);
+
+    /// growth-v19 (2026-10-04): per-asset `state::AssetGrowthV19` (120 B) at [672, 792) of EACH
+    /// asset's 1024-byte wrapper slot: the zero spare headroom between P1's risk limits (end 672)
+    /// and asset-0's market-wide resolved-receipt counter (792). NO LAYOUT CHANGE: every other
+    /// offset is unchanged and a deployed / fresh slot reads all-zero == growth OFF (today's
+    /// behaviour, byte for byte). The range is pinned at compile time on BOTH sides.
+    pub const ASSET_GROWTH_OFF: usize = 672;
+    pub const ASSET_GROWTH_LEN: usize = 120;
+    const _: () = assert!(ASSET_GROWTH_OFF == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
+    const _: () = assert!(ASSET_GROWTH_OFF + ASSET_GROWTH_LEN == MARKET_RESOLVED_RECEIPT_ONLY_OFF);
+    const _: () = assert!(ASSET_GROWTH_OFF + ASSET_GROWTH_LEN <= ASSET_VAULT_POT_OWNED_OFF);
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF >= 672);
 
     /// P3 vault-LP state account kind (kinds 1-8 are taken; see KIND_CLOSED_MARKET).
@@ -1367,6 +1382,24 @@ VaultLpMultiAssetMarket,
         /// (77) are not affected. Custom(91), appended at the END (no existing code shifts).
         /// SDK/app: map to "Earn deposits paused while this vault settles".
         LpVaultTargetPotImpaired,
+        /// growth-v19: a risk-increasing fill on a growth-enabled asset leaves the taker's
+        /// conservative equity (no credit for positive PnL) below the dynamic initial margin:
+        /// the launch ceiling `IMR(L_ceil)`, stepped up on the crowded side as the LP's
+        /// capacity fills. Reductions and closes are never refused. Custom(92), appended at
+        /// the END. SDK/app: "Max N.Nx on new <side>: this market's liquidity is U% used."
+        GrowthLeverageExceeded,
+        /// growth-v19: a crowd-side risk-increasing fill when the LP counterparty's capacity
+        /// `N_cap = lambda * C_m / P` is full (u >= 1), its capital is 0, the price is 0 /
+        /// the cap overflows (fail closed), or the market's bankruptcy h-lock is latched. The
+        /// thin side, reductions and closes stay open. Custom(93), appended at the END.
+        /// SDK/app: "New <side> paused: this side is full. Closes and <other side> are open."
+        GrowthCapacityFull,
+        /// growth-v19: an invalid growth configuration. InitMarket with a growth block:
+        /// `MMR < r_gap + liquidation fee`, `r_gap == 0`, `l_launch` outside [1x, tier max],
+        /// or `max_abs_funding_e9_per_slot == 0` on a single-slot market. InitVaultLp (94)
+        /// with an `l_launch` on an asset whose growth block is off or outside the tier.
+        /// Custom(94), appended at the END.
+        GrowthInvalidConfig,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2672,6 +2705,38 @@ pub mod state {
         let limits: AssetRiskLimitsV17 = bytemuck::pod_read_unaligned(bytes);
         validate_asset_risk_limits(&limits)?;
         Ok(limits)
+    }
+
+    /// growth-v19: absolute byte range of asset `asset_index`'s `AssetGrowthV19` in a market
+    /// account (`dynamic_slot_offset(asset) + [672, 792)`).
+    pub fn asset_growth_range(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<core::ops::Range<usize>, ProgramError> {
+        let capacity = market_slot_capacity(data)?;
+        if asset_index >= capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(asset_index)?
+            .checked_add(crate::constants::ASSET_GROWTH_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(start..start + crate::constants::ASSET_GROWTH_LEN)
+    }
+
+    /// growth-v19: decode asset `asset_index`'s growth record from a market account (`None` ==
+    /// off). `engine_imr_bps` is the market's engine IMR (validation of the tier).
+    pub fn read_asset_growth(
+        data: &[u8],
+        asset_index: usize,
+        engine_imr_bps: u64,
+    ) -> Result<Option<AssetGrowthV19>, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_growth_range(data, asset_index)?;
+        let start = range.start - crate::constants::ASSET_GROWTH_OFF;
+        let wrapper = data
+            .get(start..range.end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        asset_growth_from_wrapper_bytes(wrapper, engine_imr_bps)
     }
 
     pub fn write_asset_risk_limits(
@@ -5951,6 +6016,128 @@ pub mod state {
         Ok(())
     }
 
+    /// growth-v19 per-asset dynamic-leverage / capacity record at `constants::ASSET_GROWTH_OFF`
+    /// (672) of each asset's wrapper slot. ALL-ZERO == OFF (today's behaviour); `version == 1`
+    /// == on. Written by InitMarket's optional growth block (asset 0, creator, at creation:
+    /// the only place the MMR >= r_gap + fee rule can be checked) and re-set by InitVaultLp's
+    /// optional `l_launch` (creator, at bind, asset flat). No other writer in growth-1.
+    ///
+    /// No u128 field (a 16-aligned field would pad 120 B to 128 and break `Pod`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetGrowthV19 {
+        /// Junior risk capital at launch (atoms), the graduation reference. 0 = not recorded.
+        pub c_launch_atoms: u64, // 0..8
+        /// Slot of the last ceiling change (ratchet).
+        pub ceil_slot: u64, // 8..16
+        /// LP leverage on capital: `N_cap = lambda * C_m / P`. Default 10_000 (1x).
+        pub lambda_bps: u32, // 16..20
+        /// Creator's starting leverage cap, x100 (bounded by the tier).
+        pub l_launch_x100: u16, // 20..22
+        /// Protocol tier maximum, x100 == floor(1e6 / engine IMR) at enable time.
+        pub l_tier_x100: u16, // 22..24
+        /// Current graduated ceiling, x100 (== l_launch while graduation is off).
+        pub ceil_x100: u16, // 24..26
+        /// Utilisation kink u_k (bps). Default 5_000.
+        pub kink_bps: u16, // 26..28
+        /// Worst move between liquidation opportunities (bps), validated at InitMarket.
+        pub r_gap_bps: u16, // 28..30
+        /// Phase-2 dials (Earn allocation, fee cushion); must be 0 in growth-1.
+        pub alloc_alpha_bps: u16, // 30..32
+        pub alloc_buffer_bps: u16,   // 32..34
+        pub cushion_target_bps: u16, // 34..36
+        pub cushion_share_bps: u16,  // 36..38
+        /// 0 = off, 1 = on.
+        pub version: u8, // 38
+        pub flags: u8,               // 39
+        pub _reserved0: [u8; 32],    // 40..72
+        pub _reserved1: [u8; 32],    // 72..104
+        pub _reserved2: [u8; 16],    // 104..120
+    }
+    const _: () =
+        assert!(core::mem::size_of::<AssetGrowthV19>() == crate::constants::ASSET_GROWTH_LEN);
+    /// Offset of `version` inside the record: the one-byte OFF fast path (CU) reads only this.
+    pub const ASSET_GROWTH_VERSION_FIELD_OFF: usize = 38;
+    const _: () =
+        assert!(core::mem::offset_of!(AssetGrowthV19, version) == ASSET_GROWTH_VERSION_FIELD_OFF);
+
+    /// Structural validation (`engine_imr_bps` is the market's engine IMR). All-zero is valid
+    /// (off). `version == 0` with ANY other non-zero byte is corrupt (fail closed), as is an
+    /// unknown version, a non-zero reserved / phase-2 byte, `l_launch` outside [1x, l_tier],
+    /// a tier looser than the engine IMR, `lambda` outside [1, MAX], or a kink above 100%.
+    pub fn validate_asset_growth(
+        g: &AssetGrowthV19,
+        engine_imr_bps: u64,
+    ) -> Result<(), ProgramError> {
+        if g.version == 0 {
+            if *g != AssetGrowthV19::default() {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            return Ok(());
+        }
+        let tier_max = crate::growth_v19::leverage_x100_for_imr_bps(engine_imr_bps)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        if g.version != crate::growth_v19::GROWTH_VERSION
+            || g.flags != 0
+            || g._reserved0 != [0u8; 32]
+            || g._reserved1 != [0u8; 32]
+            || g._reserved2 != [0u8; 16]
+            || g.alloc_alpha_bps != 0
+            || g.alloc_buffer_bps != 0
+            || g.cushion_target_bps != 0
+            || g.cushion_share_bps != 0
+            || g.l_launch_x100 < crate::growth_v19::LEVERAGE_X100_ONE
+            || g.l_launch_x100 > g.l_tier_x100
+            || g.l_tier_x100 > tier_max
+            || g.ceil_x100 < crate::growth_v19::LEVERAGE_X100_ONE
+            || g.ceil_x100 > g.l_tier_x100
+            || g.lambda_bps == 0
+            || g.lambda_bps > crate::growth_v19::MAX_LAMBDA_BPS
+            || g.kink_bps as u128 > crate::growth_v19::BPS
+            || g.r_gap_bps == 0
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// `None` when growth is OFF on this asset (one-byte read), else the validated record.
+    pub fn asset_growth_from_wrapper_bytes(
+        wrapper: &[u8],
+        engine_imr_bps: u64,
+    ) -> Result<Option<AssetGrowthV19>, ProgramError> {
+        let off = crate::constants::ASSET_GROWTH_OFF;
+        let version = *wrapper
+            .get(off + ASSET_GROWTH_VERSION_FIELD_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        if version == 0 {
+            // OFF: exactly the deployed behaviour, which never reads these bytes. Only the
+            // version byte is read on this path (CU: it runs per leg on every trade route);
+            // the writers (`asset_growth_to_wrapper_bytes`) validate the whole record.
+            return Ok(None);
+        }
+        let bytes = wrapper
+            .get(off..off + crate::constants::ASSET_GROWTH_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let g: AssetGrowthV19 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_growth(&g, engine_imr_bps)?;
+        Ok(Some(g))
+    }
+
+    pub fn asset_growth_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        g: &AssetGrowthV19,
+        engine_imr_bps: u64,
+    ) -> Result<(), ProgramError> {
+        validate_asset_growth(g, engine_imr_bps)?;
+        let off = crate::constants::ASSET_GROWTH_OFF;
+        wrapper
+            .get_mut(off..off + crate::constants::ASSET_GROWTH_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(g));
+        Ok(())
+    }
+
     /// Vault-owned atoms of pot `parity` (0 = even/long, 1 = odd/short) of this asset.
     pub fn vault_pot_owned_from_wrapper_bytes(wrapper: &[u8], parity: usize) -> Result<u128, ProgramError> {
         let off = crate::constants::ASSET_VAULT_POT_OWNED_OFF + 16 * (parity & 1);
@@ -7076,6 +7263,21 @@ pub mod ix {
         /// a portfolio OWNED BY THE LP-VAULT REGISTRY PDA, binds it as the asset's exclusive
         /// matcher LP and seeds the senior claim at the vault's current backing NAV.
         InitVaultLp { junior_floor_bps: u16 },
+        /// growth-v19: tag 0 with a 4-byte trailing growth block `[r_gap_bps u16][l_launch_x100
+        /// u16]` (both non-zero). `market` is always an `InitMarket`. Enables growth on asset 0
+        /// and validates `MMR >= r_gap + liquidation fee` and, on a single-slot market,
+        /// `max_abs_funding_e9_per_slot > 0`. Without the block tag 0 is byte-for-byte legacy.
+        InitMarketV19 {
+            market: alloc::boxed::Box<Instruction>,
+            growth_r_gap_bps: u16,
+            growth_l_launch_x100: u16,
+        },
+        /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
+        /// starting leverage cap, written at bind on an asset whose growth block is on.
+        InitVaultLpV19 {
+            junior_floor_bps: u16,
+            l_launch_x100: u16,
+        },
         /// Tag 95, UPGRADE-AUTHORITY-gated (P3-H2). SetMatcherConfig + InitMatcherCtx for the
         /// vault LP (whose owner, a PDA, cannot sign either), with the protocol-approved matcher.
         VaultLpSetMatcher {
@@ -7133,30 +7335,46 @@ pub mod ix {
                 .split_first()
                 .ok_or(ProgramError::InvalidInstructionData)?;
             let ix = match tag {
-                0 => Self::InitMarket {
-                    max_portfolio_assets: read_u16(&mut rest)?,
-                    h_min: read_u64(&mut rest)?,
-                    h_max: read_u64(&mut rest)?,
-                    initial_price: read_u64(&mut rest)?,
-                    min_nonzero_mm_req: read_u128(&mut rest)?,
-                    min_nonzero_im_req: read_u128(&mut rest)?,
-                    maintenance_margin_bps: read_u64(&mut rest)?,
-                    initial_margin_bps: read_u64(&mut rest)?,
-                    max_trading_fee_bps: read_u64(&mut rest)?,
-                    trade_fee_base_bps: read_u64(&mut rest)?,
-                    liquidation_fee_bps: read_u64(&mut rest)?,
-                    liquidation_fee_cap: read_u128(&mut rest)?,
-                    min_liquidation_abs: read_u128(&mut rest)?,
-                    max_price_move_bps_per_slot: read_u64(&mut rest)?,
-                    max_accrual_dt_slots: read_u64(&mut rest)?,
-                    max_abs_funding_e9_per_slot: read_u64(&mut rest)?,
-                    min_funding_lifetime_slots: read_u64(&mut rest)?,
-                    max_account_b_settlement_chunks: read_u64(&mut rest)?,
-                    max_bankrupt_close_chunks: read_u64(&mut rest)?,
-                    max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
-                    public_b_chunk_atoms: read_u128(&mut rest)?,
-                    maintenance_fee_per_slot: read_u128(&mut rest)?,
-                },
+                0 => {
+                    let base = Self::InitMarket {
+                        max_portfolio_assets: read_u16(&mut rest)?,
+                        h_min: read_u64(&mut rest)?,
+                        h_max: read_u64(&mut rest)?,
+                        initial_price: read_u64(&mut rest)?,
+                        min_nonzero_mm_req: read_u128(&mut rest)?,
+                        min_nonzero_im_req: read_u128(&mut rest)?,
+                        maintenance_margin_bps: read_u64(&mut rest)?,
+                        initial_margin_bps: read_u64(&mut rest)?,
+                        max_trading_fee_bps: read_u64(&mut rest)?,
+                        trade_fee_base_bps: read_u64(&mut rest)?,
+                        liquidation_fee_bps: read_u64(&mut rest)?,
+                        liquidation_fee_cap: read_u128(&mut rest)?,
+                        min_liquidation_abs: read_u128(&mut rest)?,
+                        max_price_move_bps_per_slot: read_u64(&mut rest)?,
+                        max_accrual_dt_slots: read_u64(&mut rest)?,
+                        max_abs_funding_e9_per_slot: read_u64(&mut rest)?,
+                        min_funding_lifetime_slots: read_u64(&mut rest)?,
+                        max_account_b_settlement_chunks: read_u64(&mut rest)?,
+                        max_bankrupt_close_chunks: read_u64(&mut rest)?,
+                        max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
+                        public_b_chunk_atoms: read_u128(&mut rest)?,
+                        maintenance_fee_per_slot: read_u128(&mut rest)?,
+                    };
+                    if rest.is_empty() {
+                        base
+                    } else {
+                        let growth_r_gap_bps = read_u16(&mut rest)?;
+                        let growth_l_launch_x100 = read_u16(&mut rest)?;
+                        if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::InitMarketV19 {
+                            market: alloc::boxed::Box::new(base),
+                            growth_r_gap_bps,
+                            growth_l_launch_x100,
+                        }
+                    }
+                }
                 1 => Self::InitPortfolio,
                 3 => Self::Deposit {
                     portfolio_id: read_u64(&mut rest)?,
@@ -7608,9 +7826,21 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
-                94 => Self::InitVaultLp {
-                    junior_floor_bps: read_u16(&mut rest)?,
-                },
+                94 => {
+                    let junior_floor_bps = read_u16(&mut rest)?;
+                    if rest.is_empty() {
+                        Self::InitVaultLp { junior_floor_bps }
+                    } else {
+                        let l_launch_x100 = read_u16(&mut rest)?;
+                        if l_launch_x100 == 0 {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::InitVaultLpV19 {
+                            junior_floor_bps,
+                            l_launch_x100,
+                        }
+                    }
+                }
                 95 => Self::VaultLpSetMatcher {
                     expected_sequence: read_u64(&mut rest)?,
                     asset_generation_frontier: read_u64(&mut rest)?,
@@ -8456,6 +8686,23 @@ pub mod ix {
                 Self::InitVaultLp { junior_floor_bps } => {
                     out.push(94);
                     push_u16(&mut out, junior_floor_bps);
+                }
+                Self::InitVaultLpV19 {
+                    junior_floor_bps,
+                    l_launch_x100,
+                } => {
+                    out.push(94);
+                    push_u16(&mut out, junior_floor_bps);
+                    push_u16(&mut out, l_launch_x100);
+                }
+                Self::InitMarketV19 {
+                    ref market,
+                    growth_r_gap_bps,
+                    growth_l_launch_x100,
+                } => {
+                    out = market.encode();
+                    push_u16(&mut out, growth_r_gap_bps);
+                    push_u16(&mut out, growth_l_launch_x100);
                 }
                 Self::VaultLpSetMatcher {
                     expected_sequence,
@@ -11867,13 +12114,14 @@ pub mod processor {
         Ok(())
     }
 
-    #[inline(never)]
-    fn process_instruction_dispatch<'a>(
+    /// Tag 0 (both encodings): destructure once, then `handle_init_market`.
+    fn dispatch_init_market<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        instruction_data: &[u8],
+        ix: &Instruction,
+        growth: Option<(u16, u16)>,
     ) -> ProgramResult {
-        match Instruction::decode(instruction_data)? {
+        match *ix {
             Instruction::InitMarket {
                 max_portfolio_assets,
                 h_min,
@@ -11922,6 +12170,31 @@ pub mod processor {
                 max_bankrupt_close_lifetime_slots,
                 public_b_chunk_atoms,
                 maintenance_fee_per_slot,
+                growth,
+            ),
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+
+    #[inline(never)]
+    fn process_instruction_dispatch<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        match Instruction::decode(instruction_data)? {
+            ix @ Instruction::InitMarket { .. } => {
+                dispatch_init_market(program_id, accounts, &ix, None)
+            }
+            Instruction::InitMarketV19 {
+                market,
+                growth_r_gap_bps,
+                growth_l_launch_x100,
+            } => dispatch_init_market(
+                program_id,
+                accounts,
+                &market,
+                Some((growth_r_gap_bps, growth_l_launch_x100)),
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -12635,8 +12908,12 @@ pub mod processor {
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
             Instruction::InitVaultLp { junior_floor_bps } => {
-                handle_init_vault_lp(program_id, accounts, junior_floor_bps)
+                handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)
             }
+            Instruction::InitVaultLpV19 {
+                junior_floor_bps,
+                l_launch_x100,
+            } => handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100)),
             Instruction::VaultLpSetMatcher {
                 expected_sequence,
                 asset_generation_frontier,
@@ -12742,6 +13019,8 @@ pub mod processor {
         max_bankrupt_close_lifetime_slots: u64,
         public_b_chunk_atoms: u128,
         maintenance_fee_per_slot: u128,
+        // growth-v19: `(r_gap_bps, l_launch_x100)` from the optional trailing block.
+        growth: Option<(u16, u16)>,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -12869,7 +13148,74 @@ pub mod processor {
             market_ai.key.to_bytes(),
             initial_price,
             init_slot,
-        )
+        )?;
+        if let Some((r_gap_bps, l_launch_x100)) = growth {
+            init_market_growth_block(
+                market_ai,
+                r_gap_bps,
+                l_launch_x100,
+                maintenance_margin_bps,
+                initial_margin_bps,
+                liquidation_fee_bps,
+                max_abs_funding_e9_per_slot,
+                init_slot,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// growth-v19: InitMarket's optional growth block (creator == InitMarket admin, at
+    /// creation; the engine MMR is immutable afterwards, so this is the only place the
+    /// bankruptcy-safety rule can be enforced). Enables growth on asset 0:
+    /// * `MMR >= r_gap + liquidation_fee_bps`, `r_gap > 0` (plan §2.1 "bankruptcy safety");
+    /// * `l_launch` in [1x, L_tier], `L_tier = floor(1e6 / engine IMR)` (the engine IMR is
+    ///   the protocol ceiling; the creator's choice is stored separately);
+    /// * a single-slot market (the P3 shape) must have `max_abs_funding_e9_per_slot > 0`
+    ///   (funding has no setter; plan §2.3 step 1 / §2.4).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn init_market_growth_block(
+        market_ai: &AccountInfo<'_>,
+        r_gap_bps: u16,
+        l_launch_x100: u16,
+        maintenance_margin_bps: u64,
+        initial_margin_bps: u64,
+        liquidation_fee_bps: u64,
+        max_abs_funding_e9_per_slot: u64,
+        init_slot: u64,
+    ) -> ProgramResult {
+        if !growth_v19::init_margin_rule_ok(maintenance_margin_bps, r_gap_bps, liquidation_fee_bps)
+        {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let l_tier_x100 = growth_v19::leverage_x100_for_imr_bps(initial_margin_bps)
+            .ok_or(PercolatorError::GrowthInvalidConfig)?;
+        if l_launch_x100 < growth_v19::LEVERAGE_X100_ONE || l_launch_x100 > l_tier_x100 {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if max_market_slots == 1 && max_abs_funding_e9_per_slot == 0 {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let g = state::AssetGrowthV19 {
+            ceil_slot: init_slot,
+            lambda_bps: growth_v19::DEFAULT_LAMBDA_BPS,
+            l_launch_x100,
+            l_tier_x100,
+            ceil_x100: l_launch_x100,
+            kink_bps: growth_v19::DEFAULT_KINK_BPS,
+            r_gap_bps,
+            version: growth_v19::GROWTH_VERSION,
+            ..Default::default()
+        };
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let market = group
+            .markets
+            .get_mut(0)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, initial_margin_bps)
     }
 
     #[inline(never)]
@@ -13433,6 +13779,17 @@ pub mod processor {
             }
             // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
             ensure_protocol_side_oi_cap_view(&group, asset_index as usize, oi_before)?;
+            // growth-v19 (plan §2.1): dynamic leverage / capacity gate, every route. Before the
+            // P1 LP checks so a full crowd side answers GrowthCapacityFull.
+            growth_post_fill_view(
+                &group,
+                &account_a,
+                &account_b,
+                asset_index as usize,
+                account_a_position,
+                account_b_position,
+                roles,
+            )?;
             // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
             // and the same-owner rule (reduce-only exemption).
             p1_post_fill_checks_view(
@@ -14104,6 +14461,9 @@ pub mod processor {
                 ensure_protocol_side_oi_cap_view(&group, request.asset_index, oi_before_legs[i])?;
             }
             for ctx in &leg_ctx {
+                // growth-v19: per leg on the FINAL batch state against the PRE-batch positions
+                // (one leg per asset), the same frame as the engine's final-portfolio IM check.
+                growth_post_fill_view(&group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles)?;
                 p1_post_fill_checks_view(
                     &group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles,
                 )?;
@@ -15171,16 +15531,23 @@ pub mod processor {
         // Matcher-inventory-sync: the canonical matcher gets the 40-byte v2 block carrying the
         // LP's real engine position; any other matcher the unchanged 24-byte block.
         let call_ext: Vec<u8> = match p1_pre[0].lp_position_q {
-            Some(lp_position_q) => risk_limits_v17::encode_matcher_call_ext_v2(
-                p1_pre[0].matcher_ext_mode,
-                oracle_profile_pre.last_good_oracle_slot,
-                lp_headroom_q,
-                p1_pre[0].band_bps,
-                p1_pre[0].taker_reducing,
-                accepts_fee_request,
-                lp_position_q,
-            )
-            .to_vec(),
+            Some(lp_position_q) => {
+                let v2 = risk_limits_v17::encode_matcher_call_ext_v2(
+                    p1_pre[0].matcher_ext_mode,
+                    oracle_profile_pre.last_good_oracle_slot,
+                    lp_headroom_q,
+                    p1_pre[0].band_bps,
+                    p1_pre[0].taker_reducing,
+                    accepts_fee_request,
+                    lp_position_q,
+                );
+                // growth-v19: the canonical matcher gets ext v3 on a growth asset (the same
+                // N_cap that clips the headroom and gates the fill post-trade).
+                match p1_pre[0].growth_ext {
+                    Some((cap, liq)) => growth_v19::encode_ext_v3_from_v2(&v2, cap, liq).to_vec(),
+                    None => v2.to_vec(),
+                }
+            }
             None => risk_limits_v17::encode_matcher_call_ext(
                 p1_pre[0].matcher_ext_mode,
                 oracle_profile_pre.last_good_oracle_slot,
@@ -15429,10 +15796,12 @@ pub mod processor {
                     b.header.fee_credits.get(),
                 )
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let lev = if rec.vault_lp_max_lev_bps == 0 {
-                    crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS
-                } else {
-                    rec.vault_lp_max_lev_bps
+                // growth-v19: one number -- on a growth asset the default vault-LP leverage is
+                // the growth `lambda_bps` (N_cap); an explicit tag-99 value stays an override.
+                let lev = match (rec.vault_lp_max_lev_bps, asset_growth_view(&group, idx)?) {
+                    (0, Some(g)) => g.lambda_bps,
+                    (0, None) => crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS,
+                    (v, _) => v,
                 };
                 if !vault_lp_v18::vault_lp_exposure_allowed(
                     lp_before,
@@ -15872,7 +16241,11 @@ pub mod processor {
             }
             // Uniform width: all 24-byte (v0/v1) or all 40-byte (v2) blocks.
             let w = exts.first().map(|e| e.len()).unwrap_or(0);
-            if (w != 24 && w != risk_limits_v17::CALL_EXT_V2_LEN) || exts.iter().any(|e| e.len() != w) {
+            if (w != 24
+                && w != risk_limits_v17::CALL_EXT_V2_LEN
+                && w != growth_v19::CALL_EXT_V3_LEN)
+                || exts.iter().any(|e| e.len() != w)
+            {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             for e in exts {
@@ -16139,22 +16512,31 @@ pub mod processor {
         // (each carrying the LP's PRE-batch real position on that leg's asset; the matcher
         // carries earlier same-asset legs itself), regardless of the ext mode.
         let batch_exts: Option<Vec<Vec<u8>>> = if lp_position_sync {
+            // growth-v19: a batch's extensions are one width (the matcher never mixes). If ANY
+            // leg is on a growth asset every leg is v3; a non-growth leg gets the neutral pair
+            // (MAX_POSITION_ABS_Q, u128::MAX), under which `min(ctx, ext)` is the ctx value.
+            let any_growth = p1_pre.iter().any(|l| l.growth_ext.is_some());
             let mut v = Vec::with_capacity(legs.len());
             for (i, leg) in legs.iter().enumerate() {
-                v.push(
-                    risk_limits_v17::encode_matcher_call_ext_v2(
-                        p1_pre[i].matcher_ext_mode,
-                        leg_mark_slots[i],
-                        leg.size_q.unsigned_abs(),
-                        p1_pre[i].band_bps,
-                        p1_pre[i].taker_reducing,
-                        false,
-                        p1_pre[i]
-                            .lp_position_q
-                            .ok_or(PercolatorError::InvalidInstruction)?,
-                    )
-                    .to_vec(),
+                let v2 = risk_limits_v17::encode_matcher_call_ext_v2(
+                    p1_pre[i].matcher_ext_mode,
+                    leg_mark_slots[i],
+                    leg.size_q.unsigned_abs(),
+                    p1_pre[i].band_bps,
+                    p1_pre[i].taker_reducing,
+                    false,
+                    p1_pre[i]
+                        .lp_position_q
+                        .ok_or(PercolatorError::InvalidInstruction)?,
                 );
+                v.push(if any_growth {
+                    let (cap, liq) = p1_pre[i]
+                        .growth_ext
+                        .unwrap_or((percolator::MAX_POSITION_ABS_Q, u128::MAX));
+                    growth_v19::encode_ext_v3_from_v2(&v2, cap, liq).to_vec()
+                } else {
+                    v2.to_vec()
+                });
             }
             Some(v)
         } else if p1_pre.iter().any(|l| l.matcher_ext_mode == state::MATCHER_EXT_MODE_V1) {
@@ -28958,6 +29340,8 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         junior_floor_bps: u16,
+        // growth-v19: optional creator starting leverage cap (x100).
+        l_launch_x100: Option<u16>,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -29131,6 +29515,38 @@ pub mod processor {
             profile0.next_portfolio_id = next_portfolio_id;
             write_oracle_profile_to_view(&mut group, 0, &profile0)?;
 
+            // growth-v19: the creator's starting leverage cap (optional trailing field) may only
+            // be set on an asset whose growth block is on (InitMarket validated its MMR rule),
+            // within [1x, L_tier]. A growth asset pins NON-BINDING matcher caps: N_cap (ext v3)
+            // replaces the fixed $5k / $25k auto-pin caps.
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let growth_on = {
+                let market = group
+                    .markets
+                    .get_mut(asset_index)
+                    .ok_or(PercolatorError::InvalidInstruction)?;
+                let growth =
+                    state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?;
+                match (growth, l_launch_x100) {
+                    (None, None) => false,
+                    (None, Some(_)) => return Err(PercolatorError::GrowthInvalidConfig.into()),
+                    (Some(_), None) => true,
+                    (Some(mut g), Some(l)) => {
+                        if l < growth_v19::LEVERAGE_X100_ONE || l > g.l_tier_x100 {
+                            return Err(PercolatorError::GrowthInvalidConfig.into());
+                        }
+                        g.l_launch_x100 = l;
+                        g.ceil_x100 = l;
+                        g.ceil_slot = last_fee_slot;
+                        state::asset_growth_to_wrapper_bytes(
+                            &mut market.wrapper[..],
+                            &g,
+                            engine_imr,
+                        )?;
+                        true
+                    }
+                }
+            };
             rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
             rec.lp_net_q = 0;
@@ -29140,8 +29556,12 @@ pub mod processor {
             rec.vault_lp_max_lev_bps = 0;
             write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
             let price = group.markets[asset_index].engine.asset.effective_price.get();
-            let caps = vault_lp_v18::pinned_matcher_caps(price)
-                .ok_or(PercolatorError::InvalidInstruction)?;
+            let caps = if growth_on {
+                growth_v19::growth_pinned_matcher_caps()
+            } else {
+                vault_lp_v18::pinned_matcher_caps(price)
+                    .ok_or(PercolatorError::InvalidInstruction)?
+            };
             (senior_claim, caps)
         };
         let (senior_claim, pinned_caps) = senior_claim;
@@ -32117,6 +32537,197 @@ pub mod processor {
         Ok(())
     }
 
+    /// growth-v19 record of `asset_index` (`None` == growth OFF: a one-byte read).
+    fn asset_growth_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<Option<state::AssetGrowthV19>, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_growth_from_wrapper_bytes(
+            &market.wrapper[..],
+            group.header.config.initial_margin_bps.get(),
+        )
+    }
+
+    /// growth-v19: the leverage ceiling (x100) in force. Graduation is OFF in growth-1, so this
+    /// is `min(L_launch, L_tier)`; once it is on, the stored ratcheted `ceil_x100`.
+    fn growth_ceiling_x100(g: &state::AssetGrowthV19) -> u16 {
+        if growth_v19::GRADUATION_ENABLED {
+            g.ceil_x100
+        } else {
+            growth_v19::graduated_ceiling_x100(false, g.l_launch_x100, g.l_tier_x100, 0, 0)
+        }
+    }
+
+    /// growth-v19 `(inventory_cap_q, liquidity_notional_e6)` for the matcher's ext v3, from the
+    /// LP's conservative equity `C_m`. Fails CLOSED to `(0, 0)` (0 = closed to LP growth) on a
+    /// zero price / overflow, and while the market's bankruptcy h-lock is latched (the same
+    /// crowd-side refusal the post-fill gate applies, so the quote and the gate agree).
+    fn growth_matcher_caps_view(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        g: &state::AssetGrowthV19,
+    ) -> Result<(u128, u128), ProgramError> {
+        if group.header.bankruptcy_hlock_active != 0 {
+            return Ok((0, 0));
+        }
+        let price = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let c_m = vault_lp_v18::conservative_equity(
+            lp.header.capital.get(),
+            lp.header.pnl.get(),
+            lp.header.fee_credits.get(),
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let cap = growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE).unwrap_or(0);
+        let cap = core::cmp::min(cap, percolator::MAX_POSITION_ABS_Q);
+        let liq = if cap == 0 {
+            0
+        } else {
+            growth_v19::liquidity_notional_e6(c_m, g.lambda_bps).unwrap_or(0)
+        };
+        Ok((cap, liq))
+    }
+
+    /// growth-v19 post-fill gate (plan §2.1), every route: called from BOTH shared executors
+    /// (`handle_trade_nocpi_zero_copy` single, `handle_batch_execute_zero_copy` per leg) after
+    /// the engine applied the fill and BEFORE the P1 LP checks (so a full crowd side answers
+    /// with the named `GrowthCapacityFull`). No new accounts: the market and both portfolios
+    /// are already borrowed. Growth OFF (all-zero slot) costs one byte read and returns.
+    ///
+    /// Who is checked: every side that is NOT the fill's LP counterparty. The LP is account_b
+    /// on the CPI routes; on NoCpi it is the single side with an enabled matcher config (if
+    /// both or neither are LPs there is no crowd step and both sides face the ceiling).
+    /// Maintenance is untouched: this only refuses risk-increasing fills.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn growth_post_fill_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_a_before: i128,
+        position_b_before: i128,
+        roles: P1TradeRoles,
+    ) -> ProgramResult {
+        let g = match asset_growth_view(group, asset_index)? {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let ceil_imr_bps = growth_v19::ceiling_imr_bps(engine_imr, growth_ceiling_x100(&g))
+            .ok_or(PercolatorError::GrowthLeverageExceeded)?;
+        let price = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let (a_after, a_eff) =
+            raw_and_effective_signed_position_for_asset_view(group, account_a, asset_index)?;
+        let (b_after, b_eff) =
+            raw_and_effective_signed_position_for_asset_view(group, account_b, asset_index)?;
+        // Some(true) = account_b is the LP counterparty, Some(false) = account_a.
+        let lp_is_b = if roles.cpi {
+            Some(true)
+        } else {
+            match (roles.a_is_lp, roles.b_is_lp) {
+                (false, true) => Some(true),
+                (true, false) => Some(false),
+                _ => None,
+            }
+        };
+        let equity_of = |p: &percolator::PortfolioV16ViewMut<'_>| -> Result<u128, ProgramError> {
+            vault_lp_v18::conservative_equity(
+                p.header.capital.get(),
+                p.header.pnl.get(),
+                p.header.fee_credits.get(),
+            )
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        };
+        let lp_in = match lp_is_b {
+            Some(true) => Some(growth_v19::GrowthLpIn {
+                before_q: position_b_before,
+                after_q: b_after,
+                eff_after_abs_q: b_eff.unsigned_abs(),
+                equity: equity_of(account_b)?,
+            }),
+            Some(false) => Some(growth_v19::GrowthLpIn {
+                before_q: position_a_before,
+                after_q: a_after,
+                eff_after_abs_q: a_eff.unsigned_abs(),
+                equity: equity_of(account_a)?,
+            }),
+            None => None,
+        };
+        let sides: [(bool, &percolator::PortfolioV16ViewMut<'_>, i128, i128, i128); 2] = [
+            (
+                lp_is_b != Some(false),
+                account_a,
+                position_a_before,
+                a_after,
+                a_eff,
+            ),
+            (
+                lp_is_b != Some(true),
+                account_b,
+                position_b_before,
+                b_after,
+                b_eff,
+            ),
+        ];
+        for (is_taker, taker, before, after, eff) in sides {
+            if !is_taker || !growth_v19::taker_risk_increasing(before, after) {
+                continue;
+            }
+            let cert = taker
+                .header
+                .health_cert
+                .try_to_runtime()
+                .ok()
+                .filter(|c| c.valid)
+                .map(|c| c.certified_initial_req);
+            let input = growth_v19::GrowthGateIn {
+                taker_before_q: before,
+                taker_after_q: after,
+                taker_eff_after_abs_q: eff.unsigned_abs(),
+                taker_equity: equity_of(taker)?,
+                taker_cert_initial_req: cert,
+                lp: lp_in,
+                price_e6: price,
+                pos_scale: percolator::POS_SCALE,
+                engine_imr_bps: engine_imr,
+                min_nonzero_im_req: group.header.config.min_nonzero_im_req.get(),
+                ceil_imr_bps,
+                lambda_bps: g.lambda_bps,
+                kink_bps: g.kink_bps,
+                crowd_blocked: group.header.bankruptcy_hlock_active != 0,
+            };
+            match growth_v19::growth_gate(&input) {
+                growth_v19::GrowthVerdict::Allow => {}
+                growth_v19::GrowthVerdict::LeverageExceeded => {
+                    return Err(PercolatorError::GrowthLeverageExceeded.into())
+                }
+                growth_v19::GrowthVerdict::CapacityFull => {
+                    return Err(PercolatorError::GrowthCapacityFull.into())
+                }
+            }
+        }
+        Ok(())
+    }
+
     fn side_oi_snapshot_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -32214,10 +32825,20 @@ pub mod processor {
         if risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true) {
             return Ok((true, 0));
         }
-        let k = risk_limits_v17::effective_lp_exposure_k_bps(
+        // growth-v19: on a growth asset the DEFAULT multiplier is the growth `lambda_bps`
+        // (`N_cap = lambda * C_m / P` replaces `k = 1e8 / IMR`), so the headroom the matcher is
+        // clipped to and the post-fill LP cap are the same number as the growth gate's N_cap.
+        // An explicit tag-93 `lp_exposure_k_bps` stays an upgrade-authority override.
+        let k = match (
             limits.lp_exposure_k_bps,
-            group.header.config.initial_margin_bps.get(),
-        );
+            asset_growth_view(group, asset_index)?,
+        ) {
+            (0, Some(g)) => g.lambda_bps,
+            (stored, _) => risk_limits_v17::effective_lp_exposure_k_bps(
+                stored,
+                group.header.config.initial_margin_bps.get(),
+            ),
+        };
         let price = group
             .markets
             .get(asset_index)
@@ -32261,6 +32882,10 @@ pub mod processor {
         /// this leg's asset BEFORE the trade. `Some` only when the caller asked for it (the
         /// configured matcher takes the v2 extension).
         lp_position_q: Option<i128>,
+        /// growth-v19: `(inventory_cap_q, liquidity_notional_e6)` for the ext-v3 block. `Some`
+        /// only on a growth asset AND when the matcher takes the LP position (canonical
+        /// matcher, which understands v3 from the growth-1 matcher build on).
+        growth_ext: Option<(u128, u128)>,
     }
 
     /// TradeCpi / BatchTradeCpi pre-matcher: the existing portfolio-currency preflight
@@ -32367,7 +32992,21 @@ pub mod processor {
             } else {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
             };
+            let growth_ext = if want_lp_position {
+                match asset_growth_view(&group, asset_index)? {
+                    Some(g) => Some(growth_matcher_caps_view(
+                        &group,
+                        &account_b,
+                        asset_index,
+                        &g,
+                    )?),
+                    None => None,
+                }
+            } else {
+                None
+            };
             out.push(P1CpiLegPreflight {
+                growth_ext,
                 lp_position_q,
                 taker_reducing,
                 headroom_q,
@@ -33931,7 +34570,10 @@ pub mod processor {
         seeds: &[&[u8]],
     ) -> ProgramResult {
         // 24-byte v0/v1 block (67-byte call) or 40-byte v2 block (83-byte call).
-        if call_ext.len() != 24 && call_ext.len() != risk_limits_v17::CALL_EXT_V2_LEN {
+        if call_ext.len() != 24
+            && call_ext.len() != risk_limits_v17::CALL_EXT_V2_LEN
+            && call_ext.len() != growth_v19::CALL_EXT_V3_LEN
+        {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let mut data = alloc::vec![0u8; 43 + call_ext.len()];
