@@ -140,6 +140,10 @@ struct Params {
     assets: u16,
     /// Maintenance fee per slot (0 = off).
     maint_fee: u128,
+    /// growth-v19: engine funding cap (a single-slot growth market needs > 0).
+    funding: u64,
+    /// growth-v19: `Some((r_gap_bps, l_launch_x100))` => InitMarket carries the growth block.
+    growth: Option<(u16, u16)>,
 }
 
 impl Default for Params {
@@ -151,6 +155,8 @@ impl Default for Params {
             fee_bps: 0,
             assets: 1,
             maint_fee: 0,
+            funding: 0,
+            growth: None,
         }
     }
 }
@@ -281,8 +287,7 @@ impl Env {
         };
         env.svm.warp_to_slot(1);
         let admin = env.admin.insecure_clone();
-        env.send(
-            ProgInstruction::InitMarket {
+        let init = ProgInstruction::InitMarket {
                 max_portfolio_assets: p.assets,
                 h_min: 0,
                 h_max: 10,
@@ -298,14 +303,24 @@ impl Env {
                 min_liquidation_abs: 0,
                 max_price_move_bps_per_slot: p.move_bps,
                 max_accrual_dt_slots: 1,
-                max_abs_funding_e9_per_slot: 0,
+                max_abs_funding_e9_per_slot: p.funding,
                 min_funding_lifetime_slots: 1,
                 max_account_b_settlement_chunks: 1,
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 100,
                 public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
                 maintenance_fee_per_slot: p.maint_fee,
+            };
+        let init = match p.growth {
+            None => init,
+            Some((r, l)) => ProgInstruction::InitMarketV19 {
+                market: Box::new(init),
+                growth_r_gap_bps: r,
+                growth_l_launch_x100: l,
             },
+        };
+        env.send(
+            init,
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(market, false),
@@ -498,6 +513,18 @@ impl Env {
         matcher_prog: Pubkey,
         extra: &[AccountMeta],
     ) -> Result<Lp, String> {
+        self.init_vault_lp_full_launch(signer, floor_bps, matcher_prog, extra, None)
+    }
+
+    /// Tag 94 with an optional growth-v19 `l_launch_x100` trailer (`InitVaultLpV19`).
+    fn init_vault_lp_full_launch(
+        &mut self,
+        signer: &Keypair,
+        floor_bps: u16,
+        matcher_prog: Pubkey,
+        extra: &[AccountMeta],
+        l_launch_x100: Option<u16>,
+    ) -> Result<Lp, String> {
         let lp = self.new_program_account(self.plen);
         let ctx = Pubkey::new_unique();
         self.svm
@@ -539,13 +566,16 @@ impl Env {
         ];
         accts.extend_from_slice(extra);
         self.svm.expire_blockhash();
-        self.send(
-            ProgInstruction::InitVaultLp {
+        let ix = match l_launch_x100 {
+            None => ProgInstruction::InitVaultLp {
                 junior_floor_bps: floor_bps,
             },
-            accts,
-            &[signer],
-        )
+            Some(l) => ProgInstruction::InitVaultLpV19 {
+                junior_floor_bps: floor_bps,
+                l_launch_x100: l,
+            },
+        };
+        self.send(ix, accts, &[signer])
         .map(|_| Lp {
             portfolio: lp,
             owner_key: self.registry,
@@ -3413,4 +3443,118 @@ fn p3_recall_cap_is_post_maintenance_fee() {
     assert!(r2.is_ok(), "the post-fee equity is recallable");
     assert!(after_equity >= 0);
     env.assert_conserved("recall post-fee");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// growth-v19 on a BOUND (P3) market: tag 94 `l_launch`, the non-binding auto-pin and the
+// ext-v3 capital-derived depth (plan §2.1 / §2.2). Each test pairs with a legacy control.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Matcher context account bytes (context at offset 64; see percolator-match vamm.rs layout).
+const CTX_LIQUIDITY_OFF: usize = 64 + 64;
+const CTX_MAX_FILL_OFF: usize = 64 + 80;
+const CTX_LAST_EXEC_OFF: usize = 64 + 120;
+const CTX_MAX_INVENTORY_OFF: usize = 64 + 128;
+
+fn gctx_u128(env: &Env, ctx: Pubkey, off: usize) -> u128 {
+    let d = env.svm.get_account(&ctx).unwrap().data;
+    u128::from_le_bytes(d[off..off + 16].try_into().unwrap())
+}
+
+fn ctx_u64(env: &Env, ctx: Pubkey, off: usize) -> u64 {
+    let d = env.svm.get_account(&ctx).unwrap().data;
+    u64::from_le_bytes(d[off..off + 8].try_into().unwrap())
+}
+
+fn growth_params() -> Params {
+    Params {
+        funding: 1,
+        growth: Some((400, 1_000)),
+        ..Params::default()
+    }
+}
+
+fn growth_rec(env: &Env) -> Option<state::AssetGrowthV19> {
+    state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).unwrap()
+}
+
+#[test]
+fn growth_v19_tag94_l_launch_rules_and_non_binding_pin() {
+    let gerr = "Custom(94)";
+    // growth OFF: an l_launch trailer is refused (no growth block to set it on)
+    let mut legacy = Env::new(Params::default());
+    let admin = legacy.admin.insecure_clone();
+    let m = legacy.matcher;
+    let r = legacy.init_vault_lp_full_launch(&admin, 2_000, m, &[], Some(500));
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(gerr)), "growth off: {r:?}", r = r.as_ref().map(|_| ()));
+    // legacy bind (no trailer) pins the fixed $25k inventory / $5k fill caps
+    let llp = legacy.init_vault_lp_full_launch(&admin, 2_000, m, &[], None).expect("legacy bind");
+    let legacy_inv = gctx_u128(&legacy, llp.ctx, CTX_MAX_INVENTORY_OFF);
+    assert_eq!(legacy_inv, 25_000 * 1_000_000, "$25k at $1");
+    assert_eq!(gctx_u128(&legacy, llp.ctx, CTX_MAX_FILL_OFF), 5_000 * 1_000_000);
+
+    // growth ON: above the tier (10x) refused; within it, written
+    let mut env = Env::new(growth_params());
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    let r = env.init_vault_lp_full_launch(&admin, 2_000, m, &[], Some(1_001));
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(gerr)), "above tier");
+    let lp = env.init_vault_lp_full_launch(&admin, 2_000, m, &[], Some(550)).expect("growth bind");
+    let g = growth_rec(&env).expect("growth on");
+    assert_eq!((g.l_launch_x100, g.ceil_x100, g.l_tier_x100), (550, 550, 1_000));
+    // N_cap replaces the fixed caps: the pinned context caps are finite but non-binding
+    let engine_max = percolator_prog::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q;
+    assert_eq!(gctx_u128(&env, lp.ctx, CTX_MAX_INVENTORY_OFF), engine_max);
+    assert_eq!(gctx_u128(&env, lp.ctx, CTX_MAX_FILL_OFF), engine_max);
+    assert_eq!(
+        gctx_u128(&env, lp.ctx, CTX_LIQUIDITY_OFF),
+        percolator_prog::growth_v19::GROWTH_PIN_LIQUIDITY_E6
+    );
+    // a growth bind without the trailer keeps the InitMarket l_launch (10x)
+    let mut env2 = Env::new(growth_params());
+    let admin2 = env2.admin.insecure_clone();
+    let m2 = env2.matcher;
+    env2.init_vault_lp_full_launch(&admin2, 2_000, m2, &[], None).expect("bind");
+    assert_eq!(growth_rec(&env2).unwrap().l_launch_x100, 1_000);
+}
+
+/// The ext-v3 depth is `lambda * C_m`: the same fill moves the vAMM quote more on a market with
+/// less junior capital. NEGATIVE CONTROL: on the legacy pin (fixed $250k depth, no v3) junior
+/// capital does not change the quote.
+#[test]
+fn growth_v19_bound_quote_depth_scales_with_capital() {
+    fn last_exec_after_fill(p: Params, junior: u64) -> u64 {
+        let mut env = Env::new(p);
+        let lp = env.bind(2_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, junior).expect("junior");
+        let t = env.new_trader(1_000_000_000);
+        env.trade(&t, &lp, 100 * 1_000_000).expect("fill 100 units");
+        assert_eq!(env.position(t.portfolio), 100 * 1_000_000, "filled in full");
+        ctx_u64(&env, lp.ctx, CTX_LAST_EXEC_OFF)
+    }
+    let thin = last_exec_after_fill(growth_params(), 1_000_000_000); // $1k junior
+    let deep = last_exec_after_fill(growth_params(), 50_000_000_000); // $50k junior
+    assert!(thin > deep, "growth: thin {thin} must quote worse than deep {deep}");
+    // legacy pin: the junior size does not move the quote
+    let l_thin = last_exec_after_fill(Params::default(), 1_000_000_000);
+    let l_deep = last_exec_after_fill(Params::default(), 50_000_000_000);
+    assert_eq!(l_thin, l_deep, "legacy: depth is the fixed pinned value");
+    eprintln!("growth thin {thin} deep {deep}; legacy {l_thin} / {l_deep}");
+}
+
+/// The bound vault LP's capacity is `lambda * C_m` with the growth lambda (1x): a crowd fill to
+/// u == 1 is refused GrowthCapacityFull, the thin side stays open.
+#[test]
+fn growth_v19_bound_capacity_full_and_thin_side_open() {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    let whale = env.new_trader(100_000_000_000);
+    let r = env.trade(&whale, &lp, 1_000 * 1_000_000);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(93)")), "u == 1: {r:?}");
+    env.trade(&whale, &lp, 900 * 1_000_000).expect("u = 90%");
+    let thin = env.new_trader(10_000_000);
+    env.trade(&thin, &lp, -(100 * 1_000_000)).expect("thin side at 10x");
 }
