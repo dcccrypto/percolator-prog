@@ -16,9 +16,11 @@
 //! * Part 2 (LiteSVM fork): mount THIS build's wrapper at the live id and THIS build's matcher
 //!   at the canonical id, load every account, and send a crowd-side TradeCpi from the market's
 //!   largest non-LP portfolio (owner listed as signer, `with_sigverify(false)`; no account data
-//!   rewritten to fit a signer). Run twice: growth OFF (the slab as fetched: the NEGATIVE
-//!   CONTROL) and growth ON (the one opt-in rewrite: asset 0's `AssetGrowthV19` at [672, 792)
-//!   with `l_launch = tier`, lambda 1x, kink 50%). The live engine may refuse first (h-lock,
+//!   rewritten to fit a signer). Run three ways: growth OFF (the slab as fetched: the NEGATIVE
+//!   CONTROL), growth ON + BOUND (the opt-in rewrites: asset 0's `AssetGrowthV19` at
+//!   [672, 792) with `l_launch = tier`, lambda 1x, kink 50%, AND the market's LP recorded as
+//!   asset 0's bound vault LP -- the growth-1 shape since N-1) and growth ON + UNBOUND (the
+//!   growth record only: every open is refused, 97). The live engine may refuse first (h-lock,
 //!   loss-stale, ADL); every outcome is printed and the assertions are exactly what the
 //!   bytes support.
 use litesvm::LiteSVM;
@@ -42,6 +44,7 @@ use std::path::PathBuf;
 const WRAPPER_ID: Pubkey = pubkey!("ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
 const MATCHER_ID: Pubkey = pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
 const GROWTH_CAPACITY_FULL: u32 = 93;
+const GROWTH_REQUIRES_BOUND_VAULT_LP: u32 = 97;
 
 fn so(path: &str) -> Vec<u8> {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -217,7 +220,10 @@ fn gate_verdicts(
     imr: u64,
 ) -> (growth_v19::GrowthVerdict, growth_v19::GrowthVerdict) {
     let crowd_dir: i128 = if lp_eff < 0 { 1 } else { -1 };
-    let size = 1_000 * POS_SCALE as i128;
+    // N-1: the thin side is capacity-bounded too (its users OI <= N_cap), so the probe open is
+    // 1,000 units or a tenth of N_cap, whichever is smaller.
+    let n = growth_v19::n_cap_q(c_m, growth_v19::DEFAULT_LAMBDA_BPS, price, POS_SCALE).unwrap();
+    let size = core::cmp::min(1_000 * POS_SCALE, n / 10) as i128;
     let ceil =
         growth_v19::ceiling_imr_bps(imr, growth_v19::leverage_x100_for_imr_bps(imr).unwrap())
             .unwrap();
@@ -234,6 +240,15 @@ fn gate_verdicts(
                 mid_q: lp_eff, // an open from flat has no reducing part
                 after_q: lp_after,
                 eff_after_abs_q: lp_after.unsigned_abs(),
+                // N-1: users OI on the taker's side. The snapshot has no per-side OI, so the
+                // crowd side uses |LP_after| (a LOWER bound of the crowd's users OI: the
+                // CapacityFull verdict is therefore sound) and the thin side the taker's own
+                // open (the thin side's prior OI is not recorded; Part 2 uses the slab's real OI).
+                users_oi_side_after_q: if (taker_size > 0) == (lp_eff < 0) {
+                    lp_after.unsigned_abs()
+                } else {
+                    taker_size.unsigned_abs()
+                },
                 equity: c_m,
             }),
             price_e6: price,
@@ -244,6 +259,7 @@ fn gate_verdicts(
             lambda_bps: growth_v19::DEFAULT_LAMBDA_BPS,
             kink_bps: growth_v19::DEFAULT_KINK_BPS,
             crowd_blocked: false, // capacity alone; the h-lock is not needed for the verdict
+            asset_bound: true,    // as if bound (growth-1 admits opens only there)
         })
     };
     (gate(crowd_dir * size), gate(-crowd_dir * size))
@@ -309,7 +325,18 @@ fn growth_fork_replay_audit_snapshot_closes_all_three_crowds() {
 
 // ── Part 2: LiteSVM fork ────────────────────────────────────────────────────
 
-fn fork(fx: &Fixture, growth_on: bool) -> LiteSVM {
+/// Growth rewrites on the fetched slab: `Off` (as fetched, the NEGATIVE CONTROL), `Bound`
+/// (growth record + the market's LP recorded as asset 0's BOUND vault LP: the growth-1 shape,
+/// opens are admitted only there since N-1) and `Unbound` (growth record only).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Growth {
+    Off,
+    Bound,
+    Unbound,
+}
+
+fn fork(fx: &Fixture, growth: Growth) -> LiteSVM {
+    let growth_on = growth != Growth::Off;
     let mut svm = LiteSVM::new().with_sigverify(false);
     svm.add_program(WRAPPER_ID, &so("target/deploy/percolator_prog.so"));
     svm.add_program(
@@ -336,6 +363,12 @@ fn fork(fx: &Fixture, growth_on: bool) -> LiteSVM {
             let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
             let slot_end = slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN;
             state::asset_growth_to_wrapper_bytes(&mut a.data[slot0..slot_end], &rec, imr).unwrap();
+            if growth == Growth::Bound {
+                let mut v = state::read_asset_vault_lp(&a.data, 0).unwrap();
+                v.vault_lp_portfolio = lp_of(fx).to_bytes();
+                v.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
+                state::asset_vault_lp_to_wrapper_bytes(&mut a.data[slot0..slot_end], &v).unwrap();
+            }
         }
         svm.set_account(*k, a).unwrap();
     }
@@ -485,13 +518,13 @@ fn trade_nocpi(
 /// One open on a fresh fork; returns (outcome, taker fill).
 fn open(
     fx: &Fixture,
-    growth_on: bool,
+    growth: Growth,
     nocpi: bool,
     taker: &Pubkey,
     lp: &Pubkey,
     size: i128,
 ) -> (Result<(), TransactionError>, i128) {
-    let mut svm = fork(fx, growth_on);
+    let mut svm = fork(fx, growth);
     let before = raw_pos(&svm, taker);
     let r = if nocpi {
         trade_nocpi(&mut svm, fx, taker, lp, size)
@@ -517,8 +550,8 @@ fn replay(name: &str) {
     let size = 100 * POS_SCALE as i128;
     for (dir, side) in [(crowd_dir, "crowd/long-if-LP-flat"), (-crowd_dir, "thin")] {
         for nocpi in [false, true] {
-            let (r_off, f_off) = open(&fx, false, nocpi, &taker, &l.lp, dir * size);
-            let (r_on, f_on) = open(&fx, true, nocpi, &taker, &l.lp, dir * size);
+            let (r_off, f_off) = open(&fx, Growth::Off, nocpi, &taker, &l.lp, dir * size);
+            let (r_on, f_on) = open(&fx, Growth::Bound, nocpi, &taker, &l.lp, dir * size);
             eprintln!(
                 "[{}] {side} {}: growth OFF -> {:?} fill {f_off}; growth ON -> {:?} fill {f_on}",
                 fx.name,
@@ -526,6 +559,48 @@ fn replay(name: &str) {
                 r_off,
                 r_on
             );
+            // N-1: growth-1 admits opens only against a BOUND vault LP. On the same slab with
+            // the growth record but no bind, every open the live market would fill is refused
+            // with GrowthRequiresBoundVaultLp.
+            let (r_unb, f_unb) = open(&fx, Growth::Unbound, nocpi, &taker, &l.lp, dir * size);
+            eprintln!(
+                "[{}] {side} {}: growth ON, UNBOUND -> {:?} fill {f_unb}",
+                fx.name,
+                if nocpi { "TradeNoCpi" } else { "TradeCpi" },
+                r_unb
+            );
+            // The probe is an OPEN for the taker unless it reduces the taker's own position
+            // (the fixture's largest portfolio may already sit on the crowd side).
+            let taker_eff = positions(&fx, &taker).1;
+            let opens = growth_v19::taker_risk_increasing(taker_eff, taker_eff + dir * size);
+            if opens {
+                assert_eq!(f_unb, 0, "{}: unbound growth fills no open", fx.name);
+                // TradeCpi may answer a zero fill first (the matcher's closed mode under the
+                // h-lock, or the N_cap headroom clip); the unclipped NoCpi route names the
+                // refusal wherever the live engine would have filled it.
+                if nocpi && r_off.is_ok() && f_off != 0 {
+                    assert_eq!(
+                        custom(&r_unb),
+                        Some(GROWTH_REQUIRES_BOUND_VAULT_LP),
+                        "{}: unbound",
+                        fx.name
+                    );
+                }
+            } else {
+                // reductions are never refused by growth (M-1), bound or not
+                assert_eq!(
+                    (r_unb.is_ok(), f_unb),
+                    (r_off.is_ok(), f_off),
+                    "{}: unbound reduce",
+                    fx.name
+                );
+                assert_eq!(
+                    (r_on.is_ok(), f_on),
+                    (r_off.is_ok(), f_off),
+                    "{}: bound reduce",
+                    fx.name
+                );
+            }
             // never looser than the live market
             if r_on.is_ok() {
                 assert!(
@@ -543,7 +618,7 @@ fn replay(name: &str) {
     }
     if l.lp_eff.unsigned_abs() >= n && l.lp_eff != 0 {
         // u >= 1 on the live bytes: the crowd side gets no fill under growth...
-        let (r_cpi, f_cpi) = open(&fx, true, false, &taker, &l.lp, crowd_dir * size);
+        let (r_cpi, f_cpi) = open(&fx, Growth::Bound, false, &taker, &l.lp, crowd_dir * size);
         assert!(
             r_cpi.is_err() || f_cpi == 0,
             "{}: crowd TradeCpi gets no fill",
@@ -552,8 +627,8 @@ fn replay(name: &str) {
         // ...and where the live engine would still ACCEPT the unclipped NoCpi fill, growth names
         // the refusal (where the live engine already refuses first -- h-lock / ADL / loss-stale
         // -- the "never looser" check above covers it).
-        let (r_live, _) = open(&fx, false, true, &taker, &l.lp, crowd_dir * size);
-        let (r_nocpi, _) = open(&fx, true, true, &taker, &l.lp, crowd_dir * size);
+        let (r_live, _) = open(&fx, Growth::Off, true, &taker, &l.lp, crowd_dir * size);
+        let (r_nocpi, _) = open(&fx, Growth::Bound, true, &taker, &l.lp, crowd_dir * size);
         if r_live.is_ok() {
             assert_eq!(
                 custom(&r_nocpi),
@@ -566,8 +641,8 @@ fn replay(name: &str) {
     if l.lp_eff == 0 && l.hlock {
         // Flat LP + latched market h-lock: every open grows |LP| (joins the "crowd"), and the
         // plan's rule closes LP growth while the h-lock is on -> growth closes BOTH sides.
-        let (r, f) = open(&fx, true, true, &taker, &l.lp, size);
-        let (r2, f2) = open(&fx, true, true, &taker, &l.lp, -size);
+        let (r, f) = open(&fx, Growth::Bound, true, &taker, &l.lp, size);
+        let (r2, f2) = open(&fx, Growth::Bound, true, &taker, &l.lp, -size);
         assert!(
             r.is_err() && r2.is_err() && f == 0 && f2 == 0,
             "{}: h-lock closes LP growth",
@@ -618,4 +693,65 @@ fn growth_fork_dump() {
             );
         }
     }
+}
+
+/// ADL-effective signed position of `k` on asset 0, read from the fork's CURRENT state.
+fn eff_pos_svm(svm: &LiteSVM, slab: &Pubkey, k: &Pubkey) -> i128 {
+    let (_, g) = state::read_market(&svm.get_account(slab).unwrap().data).unwrap();
+    let p = state::read_portfolio(&svm.get_account(k).unwrap().data).unwrap();
+    for l in p.legs.iter().filter(|l| l.active && l.asset_index == 0) {
+        let (a, epoch) = match l.side {
+            SideV16::Long => (g.assets[0].a_long, g.assets[0].epoch_long),
+            SideV16::Short => (g.assets[0].a_short, g.assets[0].epoch_short),
+        };
+        let eff = if l.epoch_snap == epoch {
+            risk_limits_v17::adl_effective_abs_q(l.basis_pos_q.unsigned_abs(), l.a_basis, a)
+                .unwrap()
+        } else {
+            0
+        };
+        return if l.side == SideV16::Long {
+            eff as i128
+        } else {
+            -(eff as i128)
+        };
+    }
+    0
+}
+
+/// Q2 (re-verification): the TAKER_REDUCING classification of a growth leg is made on the
+/// ADL-EFFECTIVE position. Jimothy's largest portfolio is long with A ~ 0.53 (raw 203,125 /
+/// effective 107,980 units). A sell of `eff + 10` units over-closes the effective position
+/// although it only "reduces" the raw basis: on the growth (bound) fork the single route
+/// clips it to exactly the close (the taker ends FLAT); it is not marked reducing and passed
+/// through as a close that turns into an unmarked 10-unit short. NEGATIVE CONTROL: mutant
+/// `q2-raw` (classify on the raw basis) -- the taker ends short and this test fails.
+#[test]
+fn growth_fork_q2_reduce_bit_is_effective_jimothy() {
+    let fx = load("jimothy");
+    let l = live(&fx);
+    let taker = taker_of(&fx, &l.lp);
+    let (raw, eff) = positions(&fx, &taker);
+    assert!(
+        eff > 0 && raw > eff,
+        "fixture carries an ADL haircut: raw {raw} eff {eff}"
+    );
+    let over = eff + 10 * POS_SCALE as i128;
+    assert!(over < raw, "the probe sits inside the haircut");
+    let mut svm = fork(&fx, Growth::Bound);
+    let r = trade_cpi(&mut svm, &fx, &taker, &l.lp, -over);
+    let after = eff_pos_svm(&svm, &fx.slab, &taker);
+    eprintln!("[jimothy Q2] sell eff+10 ({over}) on growth: {r:?} -> taker eff {eff} -> {after}");
+    assert!(r.is_ok(), "the close fills");
+    assert_eq!(
+        after, 0,
+        "clipped to exactly the effective close, never an unmarked flip"
+    );
+    // the legacy market (growth OFF) is unchanged by growth-v19: report what it does
+    let mut off = fork(&fx, Growth::Off);
+    let r0 = trade_cpi(&mut off, &fx, &taker, &l.lp, -over);
+    eprintln!(
+        "[jimothy Q2] growth OFF: {r0:?} -> taker eff {}",
+        eff_pos_svm(&off, &fx.slab, &taker)
+    );
 }

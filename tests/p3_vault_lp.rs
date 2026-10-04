@@ -3719,3 +3719,55 @@ fn growth_v19_m1_bound_close_in_closed_mode_with_ext_mode_0() {
     env.trade_signing_fee(&thin, &lp, 100 * 1_000_000, 0).expect("close in closed mode, mode 0");
     assert_eq!(env.position(thin.portfolio), 0, "never trapped");
 }
+
+/// N-1 on a REAL bound growth market (tag-94 bind, registry-owned vault LP, kind-2 canonical
+/// matcher, junior-funded capital): the reviewer's thin-open / crowd-refill / thin-close cycle
+/// (`sec2_thin_open_crowd_fill_thin_close_cycles_past_ncap`). Before the fix 4 cycles took the
+/// LP to 4 x N_cap; now the refill finds no room (capacity = the crowd's users OI), the thin
+/// close still fills in full, and |LP| <= N_cap(C_m) after every fill.
+#[test]
+fn growth_v19_n1_bound_thin_cycles_cannot_push_lp_past_ncap() {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    let n_cap = |env: &Env| -> u128 {
+        let p = env.portfolio(lp.portfolio);
+        let c_m = percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap();
+        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, PRICE, POS as u128).unwrap()
+    };
+    let t = env.new_trader(5_000_000_000);
+    let mut crowd: Vec<Pubkey> = Vec::new();
+    for cycle in 0..4 {
+        let c = env.new_trader(100_000_000_000);
+        env.trade_signing_fee(&c, &lp, 5_000 * 1_000_000, 100).expect("crowd request (clipped)");
+        if cycle > 0 {
+            // C_m grows with the fee channel, so a sliver of new room may open; never the
+            // N_cap a thin open used to free.
+            assert!(
+                env.position(c.portfolio) < 50 * 1_000_000,
+                "cycle {cycle}: the thin side frees no crowd room (filled {})",
+                env.position(c.portfolio)
+            );
+        }
+        crowd.push(c.portfolio);
+        let close = -env.position(t.portfolio);
+        if close != 0 {
+            env.trade_signing_fee(&t, &lp, close, 100).expect("thin close (exempt)");
+            assert_eq!(env.position(t.portfolio), 0, "M-1: the close fills in full");
+        }
+        assert!(env.position(lp.portfolio).unsigned_abs() <= n_cap(&env), "cycle {cycle}: |LP| <= N_cap");
+        let lp_now = env.position(lp.portfolio);
+        if lp_now != 0 {
+            env.trade_signing_fee(&t, &lp, lp_now, 100).expect("thin open");
+        }
+        let users_long: u128 = crowd.iter().map(|p| env.position(*p).max(0).unsigned_abs()).sum();
+        assert!(users_long <= n_cap(&env), "crowd users OI <= N_cap");
+    }
+    let close = -env.position(t.portfolio);
+    env.trade_signing_fee(&t, &lp, close, 100).expect("final thin close");
+    assert_eq!(env.position(t.portfolio), 0);
+    let lp_abs = env.position(lp.portfolio).unsigned_abs();
+    eprintln!("N-1 bound: final |LP| {lp_abs} vs N_cap {}", n_cap(&env));
+    assert!(lp_abs <= n_cap(&env), "|LP| ends <= N_cap, not 4 x N_cap");
+}

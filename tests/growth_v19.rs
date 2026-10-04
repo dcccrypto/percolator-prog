@@ -55,6 +55,9 @@ const GROWTH_LEVERAGE_EXCEEDED: &str = "Custom(92)";
 const GROWTH_CAPACITY_FULL: &str = "Custom(93)";
 const GROWTH_INVALID_CONFIG: &str = "Custom(94)";
 const GROWTH_NEEDS_LP_COUNTERPARTY: &str = "Custom(95)";
+const GROWTH_REQUIRES_BOUND_VAULT_LP: &str = "Custom(97)";
+/// P3 F-14: on a bound asset a NoCpi fill may not grow anyone (the vault LP never signs).
+const VAULT_LP_EXCLUSIVE_COUNTERPARTY: &str = "Custom(77)";
 
 fn program_path() -> PathBuf {
     if let Some(p) = std::env::var_os("GROWTH_WRAPPER_SO") {
@@ -289,6 +292,9 @@ struct Env {
     /// Mocked ProgramData upgrade authority (tag 93).
     upgrade_authority: Keypair,
     program_data: Pubkey,
+    /// N-1: `lp()` binds the LP as asset 0's vault LP (STATE POKE, see `bind_vault_lp_poke`) on
+    /// a single-slot growth market, the growth-1 shape (new markets are P3-bound by default).
+    bind_growth_lp: bool,
 }
 
 impl Env {
@@ -347,6 +353,7 @@ impl Env {
             portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
                 .unwrap(),
             next_key: 0x40,
+            bind_growth_lp: cfg.growth.is_some() && cfg.slots == 1,
             upgrade_authority: seeded_keypair(3),
             program_data: Pubkey::find_program_address(
                 &[program_id.as_ref()],
@@ -610,12 +617,48 @@ impl Env {
             &[&owner],
         )
         .expect("init matcher ctx");
+        if self.bind_growth_lp {
+            self.bind_vault_lp_poke(account);
+        }
         Lp {
             owner,
             account,
             ctx,
             delegate,
         }
+    }
+
+    /// An LP that is NOT the asset's vault LP (no bind poke).
+    fn lp_unbound(&mut self, deposit: u128) -> Lp {
+        let b = self.bind_growth_lp;
+        self.bind_growth_lp = false;
+        let lp = self.lp(deposit);
+        self.bind_growth_lp = b;
+        lp
+    }
+
+    /// STATE POKE (harness seed): record `lp` as asset 0's BOUND P3 vault LP
+    /// (`AssetVaultLpV18 { vault_lp_portfolio, flags: BOUND }`, everything else 0 = defaults).
+    /// Growth-1 admits opens only against a bound vault LP (N-1). A real tag-94 bind also makes
+    /// the LP registry-owned, pins the kind-2 matcher and funds it through the junior tranche;
+    /// that full path, including the reviewer's N-1 cycle, is exercised in
+    /// `tests/p3_vault_lp.rs` (`growth_v19_*`). Here the gate's arithmetic is pinned against
+    /// the plain kind-0 LP whose exact fills make the boundaries exact.
+    fn bind_vault_lp_poke(&mut self, lp: Pubkey) {
+        let mut m = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&m.data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        let rec = state::AssetVaultLpV18 {
+            vault_lp_portfolio: lp.to_bytes(),
+            flags: state::ASSET_VAULT_LP_FLAG_BOUND,
+            ..Default::default()
+        };
+        state::asset_vault_lp_to_wrapper_bytes(
+            &mut m.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &rec,
+        )
+        .unwrap();
+        self.svm.set_account(self.market, m).unwrap();
     }
 
     fn trade_cpi(
@@ -1259,8 +1302,15 @@ fn growth_nocpi_is_gated() {
     // Two non-LP portfolios: on a growth asset every OPEN must face an LP (M-1 / P1 F-7), so a
     // trader-vs-trader NoCpi open is refused on BOTH sides, whatever the margin.
     let mut env = Env::new(MarketCfg::growth(500));
+    // N-1: before any vault LP is bound, every open is refused (growth-1 = bound only).
     let (p, pp) = env.trader(15 * USD);
     let (q, qp) = env.trader(100 * USD);
+    assert_err(
+        &env.trade_nocpi(&p, pp, &q, qp, units(100)),
+        GROWTH_REQUIRES_BOUND_VAULT_LP,
+        "no bound vault LP yet",
+    );
+    let lp = env.lp(1_000 * USD);
     assert_err(
         &env.trade_nocpi(&p, pp, &q, qp, units(100)),
         GROWTH_NEEDS_LP_COUNTERPARTY,
@@ -1277,8 +1327,9 @@ fn growth_nocpi_is_gated() {
         GROWTH_NEEDS_LP_COUNTERPARTY,
         "even at 1x",
     );
-    // NoCpi against an LP portfolio (enabled matcher): the crowd step applies.
-    let lp = env.lp(1_000 * USD);
+    // NoCpi against the vault LP: the crowd step applies (the gate answers before P3's own
+    // NoCpi rule); the admitted size is then refused by P3 F-14 -- a vault LP never takes a
+    // NoCpi fill that grows it -- and fills through TradeCpi.
     let (x, xp) = env.trader(1_000 * USD);
     assert_ok(&env.trade_cpi(&x, xp, &lp, units(600)), "u = 60%");
     // base 2000 (5x); u -> 70%: 2000 + 0.4 * 8000 = 5200 -> 52 USD for 100 units
@@ -1290,9 +1341,14 @@ fn growth_nocpi_is_gated() {
         "NoCpi crowd",
     );
     let (a2, a2p) = env.trader(52 * USD);
-    assert_ok(
+    assert_err(
         &env.trade_nocpi(&a2, a2p, &lp_owner, lp.account, units(100)),
-        "NoCpi crowd at IMR_dyn",
+        VAULT_LP_EXCLUSIVE_COUNTERPARTY,
+        "NoCpi crowd at IMR_dyn passes the gate; P3 refuses the NoCpi route",
+    );
+    assert_ok(
+        &env.trade_cpi(&a2, a2p, &lp, units(100)),
+        "the same open at IMR_dyn via TradeCpi",
     );
     // NEGATIVE CONTROL: legacy (engine 10x) accepts the 6.7x pair.
     let mut legacy = Env::new(MarketCfg::legacy());
@@ -1475,17 +1531,17 @@ fn growth_gate100_rows_new_refusals_are_state_attributable() {
         let mut env = Env::new(MarketCfg::growth(1_000));
         let lp = env.lp(1_000 * USD);
         let (w, wp) = env.trader(100_000 * USD);
-        let lp_owner = lp.owner.insecure_clone();
         assert_err(
-            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
+            &env.batch_trade_cpi(&w, wp, &lp, units(1_001)),
             GROWTH_CAPACITY_FULL,
-            "row 93 refused (u > 1)",
+            "row 93 refused (u > 1, batch: no clip)",
         );
         env.force_capital(lp.account, 2_000 * USD); // capacity doubles (harness seed of LP capital)
         assert_ok(
-            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
-            "row 93 accepted (same signers)",
+            &env.batch_trade_cpi(&w, wp, &lp, units(1_001)),
+            "row 93 accepted (same signer)",
         );
+        assert_eq!(env.pos(wp), units(1_001));
     }
     // Custom(94) GrowthInvalidConfig: same admin signer, MMR rule violated vs satisfied.
     {
@@ -1631,7 +1687,7 @@ fn growth_ua_dials_tighten_only_and_take_effect() {
 
 /// Book: N_cap 1,000 units. W crowds long to 900, T opens a THIN short 100 (LP -800), W fills
 /// the crowd to capacity (LP -1,000). T's close (a buy) GROWS |LP| past N_cap.
-fn m1_book(env: &mut Env) -> (Lp, Pubkey, (Keypair, Pubkey)) {
+fn m1_book(env: &mut Env) -> (Lp, (Keypair, Pubkey), (Keypair, Pubkey)) {
     let lp = env.lp(1_000 * USD);
     let (w, wp) = env.trader(100_000 * USD);
     let (t, tp) = env.trader(100 * USD);
@@ -1641,8 +1697,10 @@ fn m1_book(env: &mut Env) -> (Lp, Pubkey, (Keypair, Pubkey)) {
         &env.trade_cpi(&w, wp, &lp, units(5_000)),
         "W clipped to capacity",
     );
-    assert_eq!(env.pos(lp.account), -units(1_000), "LP at N_cap");
-    (lp, wp, (t, tp))
+    // N-1: capacity is the crowd's users OI (W long 1,000 == N_cap); the LP nets T's short.
+    assert_eq!(env.pos(wp), units(1_000), "crowd OI at N_cap");
+    assert_eq!(env.pos(lp.account), -units(900));
+    (lp, (w, wp), (t, tp))
 }
 
 #[test]
@@ -1654,8 +1712,8 @@ fn growth_m1_closes_are_never_trapped() {
     assert_eq!(env.pos(tp), 0, "close filled in full");
     assert_eq!(
         env.pos(lp.account),
-        -units(1_100),
-        "the LP absorbs the close past N_cap"
+        -units(1_000),
+        "the LP absorbs the close and still holds at most N_cap (N-1)"
     );
     // ...and the crowd stays closed for NEW growth.
     let (c, cp) = env.trader(1_000 * USD);
@@ -1666,15 +1724,17 @@ fn growth_m1_closes_are_never_trapped() {
         "crowd still closed",
     );
 
-    // 2. NoCpi close (LP co-signs): was Custom(68).
+    // 2. NoCpi close: on a bound asset the vault LP never signs NoCpi (P3 F-14), so the NoCpi
+    //    exit is closing INTO another closer -- both reduce, nothing is gated (was Custom(68)
+    //    against an LP at capacity).
     let mut env = Env::new(MarketCfg::growth(1_000));
-    let (lp, _w, (t, tp)) = m1_book(&mut env);
-    let lp_owner = lp.owner.insecure_clone();
+    let (_lp, (w, wp), (t, tp)) = m1_book(&mut env);
     assert_ok(
-        &env.trade_nocpi(&t, tp, &lp_owner, lp.account, units(100)),
-        "T closes via NoCpi",
+        &env.trade_nocpi(&t, tp, &w, wp, units(100)),
+        "T closes via NoCpi into W who reduces",
     );
     assert_eq!(env.pos(tp), 0);
+    assert_eq!(env.pos(wp), units(900));
 
     // 3. Partial reduce after a capital loss (N_cap 500 < |LP|), then a close with the LP
     //    deep under capacity (capital 150: N_cap 150 vs |LP| 1,060).
@@ -1745,10 +1805,7 @@ fn growth_m1_closes_are_never_trapped() {
         "opening part gated",
     );
     assert_eq!(env.pos(tp), -units(100));
-    assert_ok(
-        &env.trade_nocpi(&t, tp, &lp_owner, lp.account, units(100)),
-        "close-only passes",
-    );
+    assert_ok(&env.trade_cpi(&t, tp, &lp, units(100)), "close-only passes");
 
     // NEGATIVE CONTROL (scope): the legacy class is unchanged by this PR -- a legacy LP over
     // its own 10x cap still zero-fills a thin close (reviewer `sec_..._over_its_10x_cap`).
@@ -1789,4 +1846,136 @@ fn growth_l2_r_gap_floor() {
     );
     assert!(try_init(200).is_ok(), "at the floor");
     assert!(try_init(400).is_ok());
+}
+
+/// N-1 (security re-verification 2026-10-04): the reviewer's repro
+/// `sec2_thin_open_crowd_fill_thin_close_cycles_past_ncap`, with assertions. Before the fix a
+/// thin open emptied the LP, a fresh crowd portfolio refilled it to N_cap, and the exempt thin
+/// close pushed it past: 4 cycles took the LP to 4 x N_cap. Capacity is now the crowd's users
+/// OI, so the refill finds no room and |LP| <= OI_crowd <= N_cap after every fill, while the
+/// thin close still fills in full (M-1 kept). NEGATIVE CONTROL: mutant `n1-lpnet` (u measured
+/// on the LP's net again, OI clip off) -- this test fails (PR description).
+#[test]
+fn growth_n1_thin_open_crowd_refill_thin_close_cannot_pass_ncap() {
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let lp = env.lp(1_000 * USD);
+    let n_cap = units(1_000).unsigned_abs();
+    let (t, tp) = env.trader(5_000 * USD);
+    let mut crowd = Vec::new();
+    for cycle in 0..4 {
+        let (c, cp) = env.trader(100_000 * USD);
+        assert_ok(
+            &env.trade_cpi(&c, cp, &lp, units(5_000)),
+            "crowd request (clipped)",
+        );
+        let filled = env.pos(cp);
+        if cycle == 0 {
+            assert_eq!(filled, units(1_000), "cycle 0: the crowd fills to N_cap");
+        } else {
+            assert_eq!(
+                filled, 0,
+                "cycle {cycle}: no crowd room -- the thin side frees none"
+            );
+            // the unclipped route names the refusal
+            assert_err(
+                &env.batch_trade_cpi(&c, cp, &lp, units(1)),
+                GROWTH_CAPACITY_FULL,
+                "refill via batch",
+            );
+        }
+        crowd.push(cp);
+        let close = -env.pos(tp);
+        if close != 0 {
+            assert_ok(&env.trade_cpi(&t, tp, &lp, close), "thin close (exempt)");
+            assert_eq!(env.pos(tp), 0, "M-1: the close fills in full");
+        }
+        assert!(
+            env.pos(lp.account).unsigned_abs() <= n_cap,
+            "cycle {cycle}: |LP| <= N_cap after the close"
+        );
+        let lp_now = env.pos(lp.account);
+        if lp_now != 0 {
+            assert_ok(&env.trade_cpi(&t, tp, &lp, lp_now), "thin open to LP flat");
+        }
+        let users_long: i128 = crowd.iter().map(|p| env.pos(*p).max(0)).sum();
+        assert!(
+            users_long.unsigned_abs() <= n_cap,
+            "crowd users OI <= N_cap"
+        );
+        assert!(env.pos(lp.account).unsigned_abs() <= n_cap);
+    }
+    let close = -env.pos(tp);
+    assert_ok(&env.trade_cpi(&t, tp, &lp, close), "final thin close");
+    assert_eq!(env.pos(tp), 0);
+    assert_eq!(
+        env.pos(lp.account).unsigned_abs(),
+        n_cap,
+        "|LP| ends at N_cap, not 4 x N_cap"
+    );
+}
+
+/// N-1: growth-1 admits opens only against a BOUND vault LP. An unbound growth LP, a growth
+/// asset on a multi-slot market (P3 binds single-asset markets only) and an asset whose
+/// vault LP was unbound all refuse opens with GrowthRequiresBoundVaultLp (97) and keep every
+/// close open. NEGATIVE CONTROL: the same open against the bound LP is admitted.
+#[test]
+fn growth_n1_opens_only_on_a_bound_vault_lp() {
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let free = env.lp_unbound(1_000 * USD);
+    let (x, xp) = env.trader(1_000 * USD);
+    assert_err(
+        &env.trade_cpi(&x, xp, &free, units(10)),
+        GROWTH_REQUIRES_BOUND_VAULT_LP,
+        "unbound LP",
+    );
+    assert_eq!(env.pos(xp), 0);
+    let bound = env.lp(1_000 * USD);
+    assert_err(
+        &env.trade_cpi(&x, xp, &free, units(10)),
+        GROWTH_NEEDS_LP_COUNTERPARTY,
+        "another LP while a vault LP is bound",
+    );
+    assert_ok(
+        &env.trade_cpi(&x, xp, &bound, units(10)),
+        "bound vault LP: admitted",
+    );
+    assert_eq!(env.pos(xp), units(10));
+    // the vault LP is unbound again (STATE POKE: zero record): opens refused, the close fills
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let r = state::asset_growth_range(&m.data, 0).unwrap();
+    let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+    state::asset_vault_lp_to_wrapper_bytes(
+        &mut m.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+        &state::AssetVaultLpV18::default(),
+    )
+    .unwrap();
+    env.svm.set_account(env.market, m).unwrap();
+    assert_err(
+        &env.trade_cpi(&x, xp, &bound, units(10)),
+        GROWTH_REQUIRES_BOUND_VAULT_LP,
+        "unbound: add",
+    );
+    assert_ok(
+        &env.trade_cpi(&x, xp, &bound, -units(10)),
+        "unbound: the close fills",
+    );
+    assert_eq!(env.pos(xp), 0);
+    // multi-slot growth market: no bind is possible, every open is refused
+    let mut c2 = MarketCfg::growth(1_000);
+    c2.slots = 2;
+    let mut env2 = Env::new(c2);
+    let lp2 = env2.lp(1_000 * USD);
+    let (y, yp) = env2.trader(1_000 * USD);
+    assert_err(
+        &env2.trade_cpi(&y, yp, &lp2, units(10)),
+        GROWTH_REQUIRES_BOUND_VAULT_LP,
+        "multi-slot",
+    );
+    // NEGATIVE CONTROL: legacy multi-slot market opens
+    let mut l2 = MarketCfg::legacy();
+    l2.slots = 2;
+    let mut legacy = Env::new(l2);
+    let llp = legacy.lp(1_000 * USD);
+    let (z, zp) = legacy.trader(1_000 * USD);
+    assert_ok(&legacy.trade_cpi(&z, zp, &llp, units(10)), "legacy opens");
 }

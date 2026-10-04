@@ -18227,8 +18227,26 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: b
             1_000,
         )
         .unwrap();
+        // N-1: growth-1 admits opens only against a BOUND vault LP, and P3 binds single-asset
+        // markets only, so a real growth batch carries at most ONE opening growth leg. This is
+        // an UPPER BOUND measurement on an unreachable state: asset 0 of a 12-slot market bound
+        // to this LP (STATE POKE), so asset 0's leg runs the FULL gate (users OI, N_cap,
+        // IMR_dyn) and the P3 post-fill, plus ext v3 on all legs.
+        let rec = state::AssetVaultLpV18 {
+            vault_lp_portfolio: lp_account.to_bytes(),
+            flags: state::ASSET_VAULT_LP_FLAG_BOUND,
+            ..Default::default()
+        };
+        state::asset_vault_lp_to_wrapper_bytes(
+            &mut m.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &rec,
+        )
+        .unwrap();
         env.svm.set_account(env.market, m).unwrap();
     }
+    // L-6: with a growth leg, any batch over GROWTH_BATCH_MAX_LEGS answers the named
+    // GrowthBatchTooManyLegs (96) before the generic bounds.
+    let too_many = if growth_v3 { "Custom(96)" } else { "Custom(9)" };
     let mk_legs = |n: usize| -> Vec<percolator_prog::ix::BatchTradeCpiLeg> {
         (0..n as u16)
             .map(|asset_index| percolator_prog::ix::BatchTradeCpiLeg {
@@ -18316,8 +18334,8 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: b
         )
         .expect_err("11-leg x 6-tail (product 66 > budget 64) must reject on the fanout budget");
     assert!(
-        rejected.contains("Custom(9)"),
-        "expected InvalidInstruction, got {rejected}"
+        rejected.contains(too_many),
+        "expected {too_many}, got {rejected}"
     );
 
     // ── 3. THE BOUND ITSELF IS REACHABLE. Without this the two rejections above would be
@@ -18355,8 +18373,8 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: b
             &[&taker],
         );
         assert!(
-            r.as_ref().err().is_some_and(|e| e.contains("Custom(9)")),
-            "11 legs with a growth leg must be refused up front: {r:?}"
+            r.as_ref().err().is_some_and(|e| e.contains("Custom(96)")),
+            "11 legs with a growth leg must be refused up front (GrowthBatchTooManyLegs): {r:?}"
         );
         assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
         percolator_prog::growth_v19::GROWTH_BATCH_MAX_LEGS
