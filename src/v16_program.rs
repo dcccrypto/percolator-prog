@@ -4707,9 +4707,17 @@ pub mod state {
             // P2b L1: the engine byte now carries domain attribution (0, 1, or 1|mask<<1);
             // this host-only runtime mirror keeps only "active". Re-encoding collapses an
             // attributed byte to 1 (unattributed), which is the fail-closed direction.
-            bankruptcy_hlock_active: percolator::bankruptcy_hlock_is_active(
-                wire.bankruptcy_hlock_active,
-            ),
+            bankruptcy_hlock_active: {
+                percolator::validate_bankruptcy_hlock_wire(
+                    wire.bankruptcy_hlock_active,
+                    percolator::v16_domain_count_for_market_slots(
+                        wire.config.max_market_slots.get(),
+                    )
+                    .map_err(map_account_wire_error)?,
+                )
+                .map_err(map_account_wire_error)?;
+                percolator::bankruptcy_hlock_is_active(wire.bankruptcy_hlock_active)
+            },
             threshold_stress_active: decode_bool(wire.threshold_stress_active)?,
             loss_stale_active: decode_bool(wire.loss_stale_active)?,
             recovery_reason: wire

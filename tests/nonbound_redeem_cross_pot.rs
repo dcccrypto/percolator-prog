@@ -708,7 +708,8 @@ fn winner_claim_reserves_backing_full_exit_refused_partial_pays() {
         request(&mut env, &v, shares);
         let before = env.svm.get_account(&env.market).unwrap().data;
         let err = execute(&mut env, &v, DOMAIN).expect_err("full exit must keep the winner backed");
-        assert!(err.contains("Custom(21)"), "EngineLockActive (stay-fully-backed), got {err}");
+        // P2b E7: the tag-77 stay-fully-backed gate has its own code (was Custom(21)).
+        assert!(err.contains("Custom(122)"), "EarnExitWouldUnderBackClaims (stay-fully-backed), got {err}");
         assert_eq!(env.svm.get_account(&env.market).unwrap().data, before, "atomic: no state moved");
         assert_eq!(token_amount(&env.svm, v.dest), 0);
     }
@@ -849,7 +850,8 @@ fn top_up_never_moves_more_than_sibling_available_principal() {
         request(&mut env, &v, shares);
         let before = env.svm.get_account(&env.market).unwrap().data;
         let err = execute(&mut env, &v, DOMAIN).expect_err("needs the sibling's impaired principal");
-        assert!(err.contains("Custom(21)"), "got {err}");
+        // P2b E7: tag-77 stay-fully-backed gate (was Custom(21)).
+        assert!(err.contains("Custom(122)"), "got {err}");
         assert_eq!(env.svm.get_account(&env.market).unwrap().data, before, "atomic");
         let sib = ledger_of(&env.svm, v.sibling_ledger);
         assert_eq!(sib.total_principal_atoms, 1_000_000_000, "sibling ledger untouched");
