@@ -26677,8 +26677,15 @@ pub mod processor {
             // terminal-flat no trader payout can still draw on insurance, so the Finding-1
             // hazard (converting insurance that still backs traders) cannot arise; the clamp in
             // `lp_vault_harvestable_fee_atoms` keeps reserved/budgeted insurance untouched.
+            // Earn-drain §5 (2026-10-04): NON-bound vaults get the same terminal-flat harvest. On
+            // a non-bound market the stranded value (claim-free engine Residual, and pot backing
+            // the ledger books as loss although it is physically there) otherwise stays in the
+            // vault forever: 77 prices from the ledger and nothing else can reach it. At
+            // terminal-flat no trader can draw on insurance or on the pots, so the Finding-1
+            // hazard does not arise here either; open receipts keep their reserved residual
+            // (`nonbound_terminal_absorb` only reconciles pot backing then).
             let (terminal_flat, receipts_open) = resolved_terminal_flat(&group)?;
-            let resolved_terminal_harvest = bound_tail.is_some() && terminal_flat;
+            let resolved_terminal_harvest = terminal_flat;
             if group.header.mode != 0 && !resolved_terminal_harvest {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -26725,7 +26732,9 @@ pub mod processor {
             // counter owns, created when outside winners were paid from these pots and the
             // loss side refilled them) into the vault's OWN pot. Seniors then take it first
             // through min(physical, C); the junior only what is left over C (tag 102).
-            let absorbed = if resolved_terminal_harvest && receipts_open {
+            let absorbed = if resolved_terminal_harvest && bound_tail.is_none() {
+                nonbound_terminal_absorb(&mut group, domain, &mut ledger, receipts_open)?
+            } else if resolved_terminal_harvest && receipts_open {
                 // P3 option (b): receipts are open, so the residual is reserved for them (no
                 // engine recredit, no residual absorption); only the stray (claim-free POT
                 // backing, never receipt value) becomes the vault's.
@@ -28826,6 +28835,90 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
         }
         Ok(credited)
+    }
+
+    /// NON-bound terminal-flat Resolved harvest (tag 78; earn-drain-replay-2026-10-04 §5). The
+    /// caller has already synced `ledger` (the target pot's) against the pre-harvest bucket.
+    ///
+    /// 1. Unless receipts are open (their claim-free residual is reserved for them, P3 option
+    ///    (b)), let the engine run its own claim-free recredit (insurance's entitled overlap),
+    ///    then add whatever claim-free RESIDUAL is left (`vault - c_tot - insurance - provider
+    ///    earnings - fresh backing`: tokens no account owns) to the target pot as sentinel fresh
+    ///    backing. The engine add pays the pot's outstanding receivable first.
+    /// 2. Re-sync the ledger, so that receivable pay-down is booked as RECOVERY.
+    /// 3. If the pot is Fresh and claim-free, its whole physical backing belongs to the vault (the
+    ///    registry is the domain's only backing authority, checked by the caller, and no
+    ///    portfolio is left to claim it). Raise the ledger's available principal to it: first as
+    ///    recovery of booked impairment, the rest as principal. Never lowers anything.
+    ///
+    /// Value-neutral: no token moves and `header.vault` is unchanged; atoms only move from
+    /// "owned by nobody" (Residual / uncredited pot backing) to the Earn holders' NAV.
+    /// Returns the atoms newly credited to the ledger's available principal.
+    #[inline(never)]
+    fn nonbound_terminal_absorb(
+        group: &mut state::MarketViewMutV16<'_>,
+        domain: usize,
+        ledger: &mut state::BackingDomainLedgerAccountV16,
+        receipts_open: bool,
+    ) -> Result<u128, ProgramError> {
+        let available_before = backing_ledger_available_principal_atoms(ledger);
+        if !receipts_open {
+            match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(domain / 2) {
+                Ok(_) => {
+                    let residual = vault_terminal_residual_atoms(group)?;
+                    if residual != 0 {
+                        add_fresh_counterparty_backing_view(
+                            group,
+                            domain,
+                            residual
+                                .checked_mul(BOUND_SCALE)
+                                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                            crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                        )?;
+                        group.validate_shape().map_err(map_v16_error)?;
+                        solana_program::log::sol_log(&alloc::format!(
+                            "nonbound_terminal_residual_absorbed to={} atoms={}",
+                            domain, residual
+                        ));
+                    }
+                }
+                // Same as the bound path: the engine is not terminal-ready for its recredit, so
+                // the residual is left alone. The pot reconciliation below is independent of it.
+                Err(percolator::V16Error::LockActive) => {}
+                Err(e) => return Err(map_v16_error(e)),
+            }
+        }
+        let (source, bucket) = backing_domain_parts_view(group, domain)?;
+        sync_backing_domain_ledger(ledger, &bucket)?;
+        if bucket.status == BackingBucketStatusV16::Fresh
+            && source.positive_claim_bound_num == 0
+            && bucket.valid_liened_backing_num == 0
+        {
+            let physical = bucket.fresh_unliened_backing_num / BOUND_SCALE;
+            let available = backing_ledger_available_principal_atoms(ledger);
+            if physical > available {
+                let gap = physical - available;
+                let net_impairment = ledger
+                    .cumulative_loss_atoms
+                    .saturating_sub(ledger.cumulative_recovery_atoms);
+                let recovery = gap.min(net_impairment);
+                ledger.cumulative_recovery_atoms = ledger
+                    .cumulative_recovery_atoms
+                    .checked_add(recovery)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                ledger.total_principal_atoms = ledger
+                    .total_principal_atoms
+                    .checked_add(gap - recovery)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                solana_program::log::sol_log(&alloc::format!(
+                    "nonbound_terminal_pot_reconciled domain={} recovery={} principal={}",
+                    domain,
+                    recovery,
+                    gap - recovery
+                ));
+            }
+        }
+        Ok(backing_ledger_available_principal_atoms(ledger).saturating_sub(available_before))
     }
 
     /// Σ over the bound asset's two pots of Fresh backing that is NOT vault-owned (atoms).

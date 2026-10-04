@@ -548,22 +548,23 @@ impl Replay {
 
     fn snap(&self) -> Snap {
         let (_, g) = self.env.market_state();
-        let lp = self.env.portfolio_state(self.lp);
-        let (tc, tpnl) = self
-            .traders
-            .first()
-            .map(|(_, p)| {
-                let s = self.env.portfolio_state(*p);
-                (s.capital, s.pnl)
-            })
-            .unwrap_or((0, 0));
+        let pf = |k: Pubkey| {
+            self.env
+                .svm
+                .get_account(&k)
+                .and_then(|a| state::read_portfolio(&a.data).ok())
+                .map(|s| (s.capital, s.pnl))
+                .unwrap_or((0, 0))
+        };
+        let (lp_capital, lp_pnl) = pf(self.lp);
+        let (tc, tpnl) = self.traders.first().map(|(_, p)| pf(*p)).unwrap_or((0, 0));
         let (earn_principal, earn_nav) = self.earn_nav(&g);
         let mut s = Snap {
             slot: self.env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot + self.offset,
             trader_cap: tc,
             trader_pnl: tpnl,
-            lp_cap: lp.capital,
-            lp_pnl: lp.pnl,
+            lp_cap: lp_capital,
+            lp_pnl,
             vault: g.vault,
             c_tot: g.c_tot,
             ppt: g.pnl_pos_tot,
@@ -1058,6 +1059,12 @@ impl Replay {
     /// Hold the mark for `slots` (warmup), settling `who`.
     fn hold(&mut self, slots: u64, who: &[Pubkey]) {
         let (_, g) = self.env.market_state();
+        if g.mode != percolator::MarketModeV16::Live {
+            // Resolved: no marks to push; only the clock moves.
+            let s = self.now() + slots;
+            self.env.svm.warp_to_slot(s);
+            return;
+        }
         let px = g.assets[0].effective_price;
         for _ in 0..slots {
             let s = self.now() + 1;
@@ -1418,5 +1425,229 @@ fn deposit_refilling_a_receivable_is_booked_as_recovery() {
         s.earn_nav, phys,
         "NAV {} vs physical {}: the depositor's principal paid the receivable (consumed {:?}) and no recovery was booked",
         s.earn_nav, phys, s.consumed
+    );
+}
+
+// ---------------------------------------------------------------------------------------------
+// Resolved terminal harvest for NON-bound Earn vaults (§5 of earn-drain-replay-2026-10-04.md).
+// On a resolved, terminal-flat market, value that no account owns must reach the Earn holders:
+//   (a) engine Residual `V - (C + I + E + F)` (on the deployed engine, #175 round-trip support);
+//   (b) pot backing the non-bound ledger does not credit (I-2: a receivable refilled by another
+//       actor's loss, booked as Earn loss).
+// Before the fix tag 78 refuses every non-bound Resolved call (EngineLockActive) and 77 prices
+// from the ledger, so both stay in the vault forever.
+// ---------------------------------------------------------------------------------------------
+
+impl Replay {
+    fn crank_fees_78(&mut self, target_domain: u16) -> Result<u64, String> {
+        let payer = self.env.payer.pubkey();
+        self.env.svm.expire_blockhash();
+        self.env.send(
+            ProgInstruction::LpVaultCrankFees {
+                domain: target_domain,
+            },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(self.env.market, false),
+                AccountMeta::new(self.registry, false),
+                AccountMeta::new(self.ledgers[0], false),
+                AccountMeta::new(self.ledgers[1], false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[],
+        )
+    }
+    fn close_resolved_any(&mut self, owner: Pubkey, p: Pubkey) -> Result<u64, String> {
+        let dest = self.env.token_account_for_mint(self.env.mint, owner, 0);
+        self.env.svm.expire_blockhash();
+        self.env.send(
+            ProgInstruction::CloseResolved {
+                fee_rate_per_slot: 0,
+            },
+            vec![
+                AccountMeta::new_readonly(owner, false),
+                AccountMeta::new(self.env.market, false),
+                AccountMeta::new(p, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(self.env.vault, false),
+                AccountMeta::new_readonly(self.env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(nft_registry_pda(&self.env.market), false),
+            ],
+            &[],
+        )
+    }
+}
+
+#[derive(Debug)]
+struct HarvestOutcome {
+    stranded_before: i128,
+    engine_residual_before: i128,
+    r78: [Result<u64, Option<u32>>; 2],
+    unowned_after_78: i128,
+    engine_residual_after_78: i128,
+    incumbent_paid: u64,
+    vault_left: u64,
+}
+
+fn run_resolved_harvest() -> HarvestOutcome {
+    let mut r = Replay::new(r2_market());
+    // The incumbent is the only Earn holder: re-deposit as a known key so it can redeem.
+    let h = Keypair::new();
+    let (h_ata0, _) = r.deposit_shares(&h, 1_000_000_000, 0).expect("H 75 d0");
+    let (h_ata1, _) = r.deposit_shares(&h, 1_000_000_000, 1).expect("H 75 d1");
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(1_000_000_000);
+    let (a2k, a2) = r.new_trader(1_000_000_000);
+    let (tk, t) = r.new_trader(1_000_000_000);
+    let all = [a1, a2, t, r.lp];
+    // (b) I-2: the pair's conversion is booked as Earn loss although A2's loss refilled the pot.
+    r.trade(&a1k, a1, q).expect("A1 long");
+    r.trade(&a2k, a2, -q).expect("A2 short");
+    // (a) a single trader's round trip: its gain is netted against the reversal's loss.
+    r.trade(&tk, t, q).expect("T long");
+    r.walk(1_100_000, &all);
+    r.hold(r.lm.params.h_max + 2, &all);
+    r.trade(&a1k, a1, -q).expect("A1 close");
+    r.trade(&a2k, a2, q).expect("A2 close");
+    r.hold(r.lm.params.h_max + 2, &all);
+    r.convert_all(&a1k, a1).expect("A1 convert");
+    r.walk(1_000_000, &all);
+    r.hold(r.lm.params.h_max + 2, &all);
+    r.trade(&tk, t, -q).expect("T close");
+    r.hold(r.lm.params.h_max + 2, &all);
+    let s = r.snap();
+    s.print("pre-resolve");
+    let stranded_before = s.unowned();
+    let engine_residual_before = s.engine_residual();
+    // Resolve and close every portfolio (terminal-flat).
+    r.env.resolve();
+    let owners = [
+        (a1k.pubkey(), a1),
+        (a2k.pubkey(), a2),
+        (tk.pubkey(), t),
+        (r.lp_owner.pubkey(), r.lp),
+    ];
+    for round in 0..6 {
+        for (k, p) in owners {
+            if r.env
+                .svm
+                .get_account(&p)
+                .is_none_or(|a| a.data.iter().all(|b| *b == 0) || a.lamports == 0)
+            {
+                continue;
+            }
+            let res = r.close_resolved_any(k, p);
+            if std::env::var("R2_DEBUG").is_ok() {
+                eprintln!(
+                    "round {round} close {p}: {:?}",
+                    res.as_ref().map_err(|e| custom_code(e))
+                );
+            }
+        }
+        // Permissionless tag 8 on each emptied portfolio (rent to its owner), as the keeper does.
+        for (k, p) in owners {
+            let closer = Keypair::new();
+            r.env.ensure_signer_account(closer.pubkey());
+            let Ok((pid, seq, ep)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                r.env.portfolio_identity(p)
+            })) else {
+                continue;
+            };
+            r.env.svm.expire_blockhash();
+            let res = r.env.send(
+                ProgInstruction::ClosePortfolio {
+                    portfolio_id: pid,
+                    expected_sequence: seq,
+                    position_epoch: ep,
+                },
+                vec![
+                    AccountMeta::new(closer.pubkey(), true),
+                    AccountMeta::new(r.env.market, false),
+                    AccountMeta::new(p, false),
+                    AccountMeta::new(k, false),
+                ],
+                &[&closer],
+            );
+            if std::env::var("R2_DEBUG").is_ok() {
+                eprintln!(
+                    "round {round} tag8 {p}: {:?}",
+                    res.as_ref().map_err(|e| custom_code(e))
+                );
+            }
+        }
+        let (_, g) = r.env.market_state();
+        if g.materialized_portfolio_count == 0 {
+            break;
+        }
+    }
+    let (_, g) = r.env.market_state();
+    assert_eq!(
+        (g.c_tot, g.materialized_portfolio_count, g.pnl_pos_tot),
+        (0, 0, 0),
+        "terminal-flat (vault {}, mode {:?})",
+        g.vault,
+        g.mode
+    );
+    // Harvest both pots, then the incumbent redeems everything it holds.
+    let r78 = [
+        r.crank_fees_78(0).map_err(|e| custom_code(&e)),
+        r.crank_fees_78(1).map_err(|e| custom_code(&e)),
+    ];
+    let after78 = r.snap();
+    after78.print("after 78");
+    let mut incumbent_paid = 0u64;
+    for ata in [h_ata0, h_ata1] {
+        incumbent_paid += r
+            .redeem_all(&h, ata)
+            .unwrap_or_else(|e| panic!("H 77: {e}"));
+    }
+    // The creator's Replay::new deposits (1,000 + 1,000) also hold shares; redeem them too so the
+    // vault can empty (they are part of the same incumbent class).
+    let vault_left = r.env.token_amount(r.env.vault);
+    HarvestOutcome {
+        stranded_before,
+        engine_residual_before,
+        r78,
+        unowned_after_78: after78.unowned(),
+        engine_residual_after_78: after78.engine_residual(),
+        incumbent_paid,
+        vault_left,
+    }
+}
+
+/// Fix acceptance: after Resolve, a non-bound vault's holders recover the stranded value.
+/// The incumbent H holds half the shares of a 4,000 vault (the replay creator holds the other
+/// half); every trade is zero-sum (pair + round trip, fee 0), so H's half of the pots is exactly
+/// 2,000 plus half of everything stranded.
+#[test]
+fn nonbound_resolved_terminal_harvest_returns_stranded_value() {
+    let o = run_resolved_harvest();
+    eprintln!("harvest outcome: {o:#?}");
+    assert!(
+        o.stranded_before > 0,
+        "the scenario must strand value (vacuity guard)"
+    );
+    assert!(
+        o.r78.iter().all(|r| r.is_ok()),
+        "tag 78 must run on a non-bound terminal-flat market: {:?}",
+        o.r78
+    );
+    assert!(
+        o.unowned_after_78.abs() <= 2,
+        "after 78 nothing may stay unowned: {}",
+        o.unowned_after_78
+    );
+    assert!(
+        o.engine_residual_after_78.abs() <= 2,
+        "after 78 Residual must be dust: {}",
+        o.engine_residual_after_78
+    );
+    assert!(
+        (o.incumbent_paid as i128 - 2_000_000_000).abs() <= 2,
+        "H paid {} for 2,000 deposited; {} was stranded (engine residual {})",
+        o.incumbent_paid,
+        o.stranded_before,
+        o.engine_residual_before
     );
 }
