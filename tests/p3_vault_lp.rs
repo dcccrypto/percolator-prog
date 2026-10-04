@@ -3529,7 +3529,9 @@ fn growth_v19_bound_quote_depth_scales_with_capital() {
         let admin = env.admin.insecure_clone();
         env.junior_deposit_as(&admin, lp.portfolio, junior).expect("junior");
         let t = env.new_trader(1_000_000_000);
-        env.trade(&t, &lp, 100 * 1_000_000).expect("fill 100 units");
+        // G4: a growth bind turns the fee channel on (50 bps cap), so the taker signs a fee
+        // that covers base + the matcher's requested fee.
+        env.trade_signing_fee(&t, &lp, 100 * 1_000_000, 100).expect("fill 100 units");
         assert_eq!(env.position(t.portfolio), 100 * 1_000_000, "filled in full");
         ctx_u64(&env, lp.ctx, CTX_LAST_EXEC_OFF)
     }
@@ -3543,8 +3545,9 @@ fn growth_v19_bound_quote_depth_scales_with_capital() {
     eprintln!("growth thin {thin} deep {deep}; legacy {l_thin} / {l_deep}");
 }
 
-/// The bound vault LP's capacity is `lambda * C_m` with the growth lambda (1x): a crowd fill to
-/// u == 1 is refused GrowthCapacityFull, the thin side stays open.
+/// The bound vault LP's capacity is `lambda * C_m` with the growth lambda (1x). Q3: a crowd fill
+/// may take the LP exactly TO capacity (u == 1), never beyond (the CPI clip lands on N_cap and
+/// the next crowd request zero-fills); the thin side stays open.
 #[test]
 fn growth_v19_bound_capacity_full_and_thin_side_open() {
     let mut env = Env::new(growth_params());
@@ -3552,9 +3555,113 @@ fn growth_v19_bound_capacity_full_and_thin_side_open() {
     let admin = env.admin.insecure_clone();
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
     let whale = env.new_trader(100_000_000_000);
-    let r = env.trade(&whale, &lp, 1_000 * 1_000_000);
-    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(93)")), "u == 1: {r:?}");
-    env.trade(&whale, &lp, 900 * 1_000_000).expect("u = 90%");
-    let thin = env.new_trader(10_000_000);
-    env.trade(&thin, &lp, -(100 * 1_000_000)).expect("thin side at 10x");
+    // N_cap from the LP's CURRENT conservative equity (the fee channel credits the LP, so C_m
+    // and N_cap grow after each fill).
+    let n_cap = |env: &Env| -> u128 {
+        let p = env.portfolio(lp.portfolio);
+        let c_m = percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap();
+        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, PRICE, POS as u128).unwrap()
+    };
+    let cap_before = n_cap(&env);
+    assert_eq!(cap_before, 1_000 * 1_000_000);
+    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("clipped to u == 1");
+    assert_eq!(env.position(lp.portfolio).unsigned_abs(), cap_before, "|LP| == N_cap (pre-fill C_m) exactly");
+    for _ in 0..3 {
+        env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("crowd at capacity");
+        assert!(env.position(lp.portfolio).unsigned_abs() <= n_cap(&env), "never above N_cap(C_m)");
+    }
+    let thin = env.new_trader(20_000_000);
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin side open");
+    assert_eq!(env.position(thin.portfolio), -(100 * 1_000_000));
+}
+
+const CTX_KIND_OFF: usize = 64 + 12;
+
+fn risk_limits(env: &Env) -> state::AssetRiskLimitsV17 {
+    state::read_asset_risk_limits(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap()
+}
+
+/// G4: a growth bind writes the protocol risk defaults (ext mode 1, fee channel 100 bps, LP floor
+/// $1) and pins the kind-2 adaptive matcher; a legacy bind does neither; an upgrade-authority
+/// tag-93 record set before the bind is never overwritten.
+#[test]
+fn growth_v19_tag94_g4_defaults() {
+    use percolator_prog::growth_v19 as g;
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let r = risk_limits(&env);
+    assert_eq!(r.matcher_ext_mode, g::GROWTH_PIN_MATCHER_EXT_MODE);
+    assert_eq!(r.max_requested_fee_bps, g::GROWTH_PIN_MAX_REQUESTED_FEE_BPS);
+    assert_eq!(r.lp_floor_atoms, g::GROWTH_PIN_LP_FLOOR_ATOMS);
+    assert_eq!((r.side_oi_cap_q, r.lp_exposure_k_bps, r.exec_band_bps), (0, 0, 0));
+    let d = env.svm.get_account(&lp.ctx).unwrap().data;
+    assert_eq!(d[CTX_KIND_OFF], g::GROWTH_PIN_MATCHER_KIND, "kind-2 adaptive matcher");
+    // NEGATIVE CONTROL: legacy bind
+    let mut legacy = Env::new(Params::default());
+    let llp = legacy.bind(2_000);
+    assert_eq!(risk_limits(&legacy), state::AssetRiskLimitsV17::default());
+    assert_eq!(legacy.svm.get_account(&llp.ctx).unwrap().data[CTX_KIND_OFF], 1, "kind-1 vAMM");
+    // UA preset before the bind is kept
+    let mut pre = Env::new(growth_params());
+    let a = pre.admin.pubkey();
+    pre.set_program_data_authority(&a);
+    pre.set_fee_channel(1, 7).expect("UA tag 93 before bind");
+    pre.bind(2_000);
+    let r = risk_limits(&pre);
+    assert_eq!((r.matcher_ext_mode, r.max_requested_fee_bps, r.lp_floor_atoms), (1, 7, 0), "not overwritten");
+}
+
+/// G4 LP floor: a growth vault LP halts risk-increasing fills while its equity is at or below
+/// the $1 floor (legacy: only at 0).
+#[test]
+fn growth_v19_lp_floor_default_halts_before_zero() {
+    let run = |p: Params, fee: u64| {
+        let mut env = Env::new(p);
+        let lp = env.bind(2_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, 500_000).expect("junior $0.50");
+        let t = env.new_trader(10_000_000);
+        env.trade_signing_fee(&t, &lp, 100_000, fee)
+    };
+    let r = run(growth_params(), 100);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(69)")), "growth: LpFloorHalt, got {r:?}");
+    let l = run(Params::default(), 0);
+    assert!(l.is_ok(), "legacy: an LP with $0.50 still quotes: {l:?}");
+}
+
+/// G4 fee channel: on a growth market the matcher's requested fee needs the taker's consent
+/// (signed fee_bps covering it); on a legacy market (channel off) a zero signed fee fills.
+#[test]
+fn growth_v19_fee_channel_on_requires_taker_consent() {
+    let run = |p: Params, fee: u64| {
+        let mut env = Env::new(p);
+        let lp = env.bind(2_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior");
+        let t = env.new_trader(100_000_000);
+        env.trade_signing_fee(&t, &lp, 10 * 1_000_000, fee)
+    };
+    let r = run(growth_params(), 0);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(9)")), "requested fee refused without consent: {r:?}");
+    assert!(run(growth_params(), 100).is_ok(), "with consent");
+    assert!(run(Params::default(), 0).is_ok(), "legacy: channel off");
+}
+
+/// c_launch is recorded ONCE, at the first junior deposit into a growth asset.
+#[test]
+fn growth_v19_c_launch_recorded_once() {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 0);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 1_000_000_000);
+    env.junior_deposit_as(&admin, lp.portfolio, 500_000_000).expect("junior +$500");
+    assert_eq!(growth_rec(&env).unwrap().c_launch_atoms, 1_000_000_000, "never overwritten");
+    // NEGATIVE CONTROL: no growth record on a legacy market
+    let mut legacy = Env::new(Params::default());
+    let llp = legacy.bind(2_000);
+    let la = legacy.admin.insecure_clone();
+    legacy.junior_deposit_as(&la, llp.portfolio, 1_000_000_000).expect("junior");
+    assert!(state::read_asset_growth(&legacy.svm.get_account(&legacy.market).unwrap().data, 0, 1_000).unwrap().is_none());
 }

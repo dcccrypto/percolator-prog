@@ -284,6 +284,9 @@ struct Env {
     portfolio_account_len: usize,
     /// Deterministic key source (byte-parity runs need identical keys on both programs).
     next_key: u8,
+    /// Mocked ProgramData upgrade authority (tag 93).
+    upgrade_authority: Keypair,
+    program_data: Pubkey,
 }
 
 impl Env {
@@ -342,7 +345,36 @@ impl Env {
             portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
                 .unwrap(),
             next_key: 0x40,
+            upgrade_authority: seeded_keypair(3),
+            program_data: Pubkey::find_program_address(
+                &[program_id.as_ref()],
+                &solana_sdk::bpf_loader_upgradeable::id(),
+            )
+            .0,
         };
+        // ProgramData mock for the tag-93 upgrade-authority gate (45-byte layout, as in
+        // p1_lp_limits.rs).
+        {
+            let ua = env.upgrade_authority.pubkey();
+            env.svm.airdrop(&ua, 1_000_000_000).unwrap();
+            let mut pd = vec![0u8; 45];
+            pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+            pd[12] = 1;
+            pd[13..45].copy_from_slice(ua.as_ref());
+            let pdk = env.program_data;
+            env.svm
+                .set_account(
+                    pdk,
+                    Account {
+                        lamports: 1_000_000_000,
+                        data: pd,
+                        owner: solana_sdk::bpf_loader_upgradeable::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
         env.send(
             init_market_ix(&cfg),
             vec![
@@ -721,6 +753,37 @@ impl Env {
         )
     }
 
+    /// Tag 93 with the growth-v19 dial trailer, signed by `signer`.
+    fn set_growth_dials(
+        &mut self,
+        signer: &Keypair,
+        lambda_bps: u32,
+        kink_bps: u16,
+    ) -> Result<u64, String> {
+        let (pd, market) = (self.program_data, self.market);
+        self.send(
+            ProgInstruction::SetAssetRiskLimitsV19 {
+                limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+                    asset_index: 0,
+                    exec_band_bps: 0,
+                    lp_exposure_k_bps: 0,
+                    lp_floor_atoms: 0,
+                    side_oi_cap_q: 0,
+                    matcher_ext_mode: 0,
+                    max_requested_fee_bps: 0,
+                }),
+                growth_lambda_bps: lambda_bps,
+                growth_kink_bps: kink_bps,
+            },
+            vec![
+                AccountMeta::new(signer.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[signer],
+        )
+    }
+
     fn portfolio_state(&self, portfolio: Pubkey) -> PortfolioAccountV16 {
         state::read_portfolio(&self.svm.get_account(&portfolio).unwrap().data).unwrap()
     }
@@ -1048,8 +1111,14 @@ fn growth_over_imr_dyn_position_is_not_liquidated_and_can_close() {
     let (x2, x2p) = env.trader(170 * USD);
     assert_err(
         &env.trade_cpi(&x2, x2p, &lp, units(800)),
+        GROWTH_LEVERAGE_EXCEEDED,
+        "clipped to u == 1: 100% IMR",
+    );
+    let lp_owner_x = lp.owner.insecure_clone();
+    assert_err(
+        &env.trade_nocpi(&x2, x2p, &lp_owner_x, lp.account, units(800)),
         GROWTH_CAPACITY_FULL,
-        "u would reach 1",
+        "u would exceed 1 (NoCpi, unclipped)",
     );
     assert_err(
         &env.trade_cpi(&x2, x2p, &lp, units(600)),
@@ -1086,31 +1155,44 @@ fn growth_over_imr_dyn_position_is_not_liquidated_and_can_close() {
 
 #[test]
 fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
+    // Q3: a fill may take the LP exactly TO capacity (u == 1, IMR_dyn = 100%); only u > 1 is
+    // refused. The TradeCpi headroom clip (= N_cap) lands exactly there, so clip and gate agree
+    // and |LP| never exceeds N_cap.
     let mut env = Env::new(MarketCfg::growth(1_000));
     let lp = env.lp(1_000 * USD);
+    let n_cap = units(1_000);
+    // u == 1 needs 100% margin: 50 USD for 100 units at the edge is refused (92), not 93.
+    let (m, mp) = env.trader(50 * USD);
     let (w, wp) = env.trader(100_000 * USD);
-    // Exactly N_cap (u == 1) is refused (P1 headroom == N_cap, so a larger request is clipped
-    // to exactly this).
+    assert_ok(&env.trade_cpi(&w, wp, &lp, units(900)), "u = 90%");
     assert_err(
-        &env.trade_cpi(&w, wp, &lp, units(1_000)),
-        GROWTH_CAPACITY_FULL,
-        "u == 1",
+        &env.trade_cpi(&m, mp, &lp, units(100)),
+        GROWTH_LEVERAGE_EXCEEDED,
+        "u == 1 at 2x",
     );
-    assert_err(
+    // A larger request is clipped to exactly N_cap and ADMITTED (u == 1 at 1x).
+    assert_ok(
         &env.trade_cpi(&w, wp, &lp, units(5_000)),
-        GROWTH_CAPACITY_FULL,
         "clipped to u == 1",
     );
-    // u = 99.9% passes (IMR 9982 bps, the whale has the margin)
-    assert_ok(&env.trade_cpi(&w, wp, &lp, units(999)), "u = 99.9%");
-    assert_err(
+    assert_eq!(env.pos(wp), n_cap, "filled exactly to capacity");
+    assert_eq!(env.pos(lp.account), -n_cap, "|LP| == N_cap, never above");
+    // Any further crowd growth: TradeCpi is clipped to a zero fill; the unclipped NoCpi route
+    // names the refusal (u > 1).
+    assert_ok(
         &env.trade_cpi(&w, wp, &lp, units(1)),
+        "zero fill at capacity",
+    );
+    assert_eq!(env.pos(lp.account), -n_cap);
+    let lp_owner = lp.owner.insecure_clone();
+    assert_err(
+        &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1)),
         GROWTH_CAPACITY_FULL,
-        "any further crowd growth",
+        "u > 1 (NoCpi)",
     );
     let (c, cp) = env.trader(1_000 * USD);
     assert_err(
-        &env.trade_cpi(&c, cp, &lp, units(1)),
+        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(1)),
         GROWTH_CAPACITY_FULL,
         "a new crowd trader too",
     );
@@ -1118,15 +1200,12 @@ fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
     let (t, tp) = env.trader(10 * USD);
     assert_ok(
         &env.trade_cpi(&t, tp, &lp, -units(100)),
-        "thin side at u ~ 1",
+        "thin side at u = 1",
     );
-    // LP capital falls to 500 USD (N_cap 500 < |LP| 899): crowd closed, thin + closes open
+    // LP capital falls to 500 USD (N_cap 500 < |LP| 900): crowd closed, thin + closes open
     env.force_capital(lp.account, 500 * USD);
-    // TradeCpi: the P1 headroom IS N_cap (lambda default), so the matcher request is clipped to
-    // a ZERO fill (Ok, no position). The named refusal shows on the unclipped NoCpi route.
     assert_ok(&env.trade_cpi(&c, cp, &lp, units(1)), "zero fill");
     assert_eq!(env.pos(cp), 0, "crowd closed: clipped to zero");
-    let lp_owner = lp.owner.insecure_clone();
     assert_err(
         &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(1)),
         GROWTH_CAPACITY_FULL,
@@ -1137,15 +1216,16 @@ fn growth_refuses_crowd_at_u_ge_1_and_keeps_thin_and_closes_open() {
         &env.trade_cpi(&t2, t2p, &lp, -units(100)),
         "thin side still open",
     );
-    assert_ok(&env.trade_cpi(&w, wp, &lp, -units(999)), "the whale closes");
-    // NEGATIVE CONTROL: legacy accepts 1,000 units (default k = 10x).
+    assert_ok(&env.trade_cpi(&w, wp, &lp, -n_cap), "the whale closes");
+    // NEGATIVE CONTROL: legacy accepts 5,000 units (default k = 10x, no growth gate).
     let mut legacy = Env::new(MarketCfg::legacy());
     let llp = legacy.lp(1_000 * USD);
     let (lw, lwp) = legacy.trader(100_000 * USD);
     assert_ok(
-        &legacy.trade_cpi(&lw, lwp, &llp, units(1_000)),
+        &legacy.trade_cpi(&lw, lwp, &llp, units(5_000)),
         "legacy u > 1 accepted",
     );
+    assert_eq!(legacy.pos(lwp), units(5_000));
 }
 
 #[test]
@@ -1391,15 +1471,16 @@ fn growth_gate100_rows_new_refusals_are_state_attributable() {
         let mut env = Env::new(MarketCfg::growth(1_000));
         let lp = env.lp(1_000 * USD);
         let (w, wp) = env.trader(100_000 * USD);
+        let lp_owner = lp.owner.insecure_clone();
         assert_err(
-            &env.trade_cpi(&w, wp, &lp, units(1_000)),
+            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
             GROWTH_CAPACITY_FULL,
-            "row 93 refused",
+            "row 93 refused (u > 1)",
         );
         env.force_capital(lp.account, 2_000 * USD); // capacity doubles (harness seed of LP capital)
         assert_ok(
-            &env.trade_cpi(&w, wp, &lp, units(1_000)),
-            "row 93 accepted (same signer)",
+            &env.trade_nocpi(&w, wp, &lp_owner, lp.account, units(1_001)),
+            "row 93 accepted (same signers)",
         );
     }
     // Custom(94) GrowthInvalidConfig: same admin signer, MMR rule violated vs satisfied.
@@ -1413,4 +1494,92 @@ fn growth_gate100_rows_new_refusals_are_state_attributable() {
             "row 94 accepted"
         );
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Upgrade-authority growth dials (tag 93 trailer): tighten-only until the epoch clamp
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[test]
+fn growth_ua_dials_tighten_only_and_take_effect() {
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let ua = env.upgrade_authority.insecure_clone();
+    // wire: the full legacy body + 6 bytes
+    let ix = ProgInstruction::SetAssetRiskLimitsV19 {
+        limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+            asset_index: 0,
+            exec_band_bps: 0,
+            lp_exposure_k_bps: 0,
+            lp_floor_atoms: 0,
+            side_oi_cap_q: 0,
+            matcher_ext_mode: 0,
+            max_requested_fee_bps: 0,
+        }),
+        growth_lambda_bps: 5_000,
+        growth_kink_bps: 3_000,
+    };
+    let bytes = ix.encode();
+    assert_eq!(bytes.len(), 50);
+    assert_eq!(ProgInstruction::decode(&bytes).unwrap(), ix);
+    // bounds without the epoch clamp: lambda <= 1x, kink <= 50%
+    assert_err(
+        &env.set_growth_dials(&ua, 10_001, 5_000),
+        GROWTH_INVALID_CONFIG,
+        "lambda above 1x",
+    );
+    assert_err(
+        &env.set_growth_dials(&ua, 10_000, 5_001),
+        GROWTH_INVALID_CONFIG,
+        "kink later than 50%",
+    );
+    assert_err(
+        &env.set_growth_dials(&ua, 0, 5_000),
+        GROWTH_INVALID_CONFIG,
+        "lambda 0",
+    );
+    // not the upgrade authority
+    let stranger = env.signer();
+    env.svm.airdrop(&stranger.pubkey(), 1_000_000_000).unwrap();
+    assert_err(
+        &env.set_growth_dials(&stranger, 5_000, 3_000),
+        "Custom(8)",
+        "non-UA signer",
+    );
+    // tighten: lambda 0.5x, kink 30%
+    assert_ok(&env.set_growth_dials(&ua, 5_000, 3_000), "tighten");
+    let g = growth_of(&env).unwrap();
+    assert_eq!((g.lambda_bps, g.kink_bps), (5_000, 3_000));
+    // effect: N_cap halves -> the CPI clip lands at 500 units (u == 1) on a $1,000 LP
+    let lp = env.lp(1_000 * USD);
+    let (w, wp) = env.trader(100_000 * USD);
+    assert_ok(&env.trade_cpi(&w, wp, &lp, units(800)), "clipped");
+    assert_eq!(env.pos(wp), units(500), "N_cap = 0.5 * C_m / P");
+    // back to the default bound is within bounds
+    assert_ok(
+        &env.set_growth_dials(&ua, 10_000, 5_000),
+        "back to defaults",
+    );
+    // growth OFF market: the dial trailer is refused
+    let mut legacy = Env::new(MarketCfg::legacy());
+    let lua = legacy.upgrade_authority.insecure_clone();
+    assert_err(
+        &legacy.set_growth_dials(&lua, 5_000, 3_000),
+        GROWTH_INVALID_CONFIG,
+        "growth off",
+    );
+    // NEGATIVE CONTROL (wire): the legacy tag-93 form still decodes as the legacy variant.
+    let legacy_bytes = ProgInstruction::SetAssetRiskLimits {
+        asset_index: 0,
+        exec_band_bps: 0,
+        lp_exposure_k_bps: 0,
+        lp_floor_atoms: 0,
+        side_oi_cap_q: 0,
+        matcher_ext_mode: 1,
+        max_requested_fee_bps: 7,
+    }
+    .encode();
+    assert!(matches!(
+        ProgInstruction::decode(&legacy_bytes).unwrap(),
+        ProgInstruction::SetAssetRiskLimits { .. }
+    ));
 }
