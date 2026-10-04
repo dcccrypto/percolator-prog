@@ -1427,6 +1427,25 @@ VaultLpMultiAssetMarket,
         /// the batch route carries no LP fee credit, so such opens must use TradeCpi. Closes and
         /// opens at or below the kink are unaffected. Custom(99), appended at the END.
         GrowthUtilisationFeeRequiresTradeCpi,
+        // ── P2b E7: distinct lock codes (engine percolator feat/p2b-lock-exits). ───────────
+        // EXPLICIT discriminants in a reserved block (120..=122) so that appends by other
+        // in-flight branches (growth/Earn builders take 100+) cannot shift them or be shifted
+        // by them: a duplicate value is a compile error, not a silent ABI drift. Everything
+        // below keeps its old meaning; these split what used to be Custom(21).
+        /// The asset is in ADL reduce-only: a side's A factor is below ADL_ONE, or a side is
+        /// DrainOnly / still resetting after ADL. Closing and reducing work; opening or adding
+        /// does not. Was Custom(21). SDK/app: "Close-only (auto-deleverage) until the market
+        /// resets". Engine: `V16Error::AdlReduceOnly`.
+        EngineAdlReduceOnly = 120,
+        /// A risk-increasing trade on a loss-stale asset (positions are being refreshed after
+        /// an accrual). Was Custom(21). SDK/app: "Refreshing positions, retry shortly".
+        /// Engine: `V16Error::LossStale`.
+        EngineLossStale = 121,
+        /// An Earn exit (tag 77 ExecuteRedemption) would leave the pot's source domain
+        /// under-backed (credit rate below full). Was Custom(21) (the "stay fully backed" gate).
+        /// Internal pot moves that share the check keep Custom(21).
+        /// SDK/app: "Withdrawal would under-back open claims; try a smaller amount or later".
+        EarnExitWouldUnderBackClaims = 122,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -1460,6 +1479,9 @@ VaultLpMultiAssetMarket,
             // the only thing coupling the two repos at compile time. The engine's own CI
             // was green with this variant added and the wrapper unbuildable.
             V16Error::LpVaultZeroSharesMinted => PercolatorError::LpVaultZeroSharesMinted,
+            // P2b E7 (engine feat/p2b-lock-exits).
+            V16Error::AdlReduceOnly => PercolatorError::EngineAdlReduceOnly,
+            V16Error::LossStale => PercolatorError::EngineLossStale,
         };
         mapped.into()
     }
@@ -4682,7 +4704,12 @@ pub mod state {
             slot_last: wire.slot_last.get(),
             current_slot: wire.current_slot.get(),
             assets: Vec::with_capacity(slot_count),
-            bankruptcy_hlock_active: decode_bool(wire.bankruptcy_hlock_active)?,
+            // P2b L1: the engine byte now carries domain attribution (0, 1, or 1|mask<<1);
+            // this host-only runtime mirror keeps only "active". Re-encoding collapses an
+            // attributed byte to 1 (unattributed), which is the fail-closed direction.
+            bankruptcy_hlock_active: percolator::bankruptcy_hlock_is_active(
+                wire.bankruptcy_hlock_active,
+            ),
             threshold_stress_active: decode_bool(wire.threshold_stress_active)?,
             loss_stale_active: decode_bool(wire.loss_stale_active)?,
             recovery_reason: wire
@@ -26742,7 +26769,7 @@ pub mod processor {
             source_after.credit_rate_num =
                 expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
             if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
-                return Err(PercolatorError::EngineLockActive.into());
+                return Err(PercolatorError::EarnExitWouldUnderBackClaims.into());
             }
             source = source_after;
             source.credit_epoch = source
@@ -36699,6 +36726,23 @@ pub mod processor {
             assert_eq!(
                 custom_code(PercolatorError::LpVaultDepositBelowMinimumLiquidity),
                 50
+            );
+            // P2b E7: reserved explicit block 120..=122; the lock that used to be 21.
+            assert_eq!(custom_code(PercolatorError::EngineAdlReduceOnly), 120);
+            assert_eq!(custom_code(PercolatorError::EngineLossStale), 121);
+            assert_eq!(custom_code(PercolatorError::EarnExitWouldUnderBackClaims), 122);
+            assert_eq!(custom_code(PercolatorError::EngineLockActive), 21);
+            assert_eq!(
+                crate::error::map_v16_error(percolator::V16Error::AdlReduceOnly),
+                ProgramError::Custom(120)
+            );
+            assert_eq!(
+                crate::error::map_v16_error(percolator::V16Error::LossStale),
+                ProgramError::Custom(121)
+            );
+            assert_eq!(
+                crate::error::map_v16_error(percolator::V16Error::LockActive),
+                ProgramError::Custom(21)
             );
         }
 
