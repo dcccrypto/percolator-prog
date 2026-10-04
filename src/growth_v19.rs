@@ -12,14 +12,18 @@
 //! ```text
 //! C_m     = conservative equity of the LP counterparty (no credit for positive PnL)
 //! N_cap_q = floor(C_m * lambda_bps * POS_SCALE / (10_000 * price_e6))     (None -> refuse growth)
-//! u       = |LP_eff_after| / N_cap_q
+//! u       = OI_users(taker side, after) / N_cap_q        (N-1: users OI, NOT the LP's net)
+//!           OI_users(side) = oi_eff_side - the vault LP's own effective leg on that side
 //! base    = max(engine IMR, ceil(1_000_000 / L_ceil_x100))                 (never looser than engine)
+//! opens only on a BOUND P3 asset, against ITS vault LP (else 97 / 95)
 //! crowd fill (LP |inventory| grows) AND taker risk-increasing:
 //!   u <= u_k       : IMR_dyn = base
 //!   u_k < u <= 1   : IMR_dyn = base + ceil((u - u_k) / (1 - u_k) * (10_000 - base))
-//!                    (= 100% at u == 1: a fill may take the LP exactly TO capacity)
+//!                    (= 100% at u == 1: a fill may take its side exactly TO capacity)
 //!   u > 1          : refuse (GrowthCapacityFull)
-//! thin side, reductions, closes: base (reductions / closes are never checked at all)
+//! thin-side open: base, and u > 1 refused too (each side's users OI <= N_cap)
+//! reductions, closes: never checked at all (M-1)
+//! => |LP| = |OI_long_users - OI_short_users| <= max(both) <= N_cap after ANY fill sequence
 //! require taker conservative equity >= cert IM (whole portfolio, engine IMR)
 //!                                       - this leg at engine IMR + this leg at IMR_dyn
 //! ```
@@ -306,8 +310,18 @@ pub struct GrowthLpIn {
     /// of the fill (`lp_mid_q`). The crowd test is on the OPENING part only:
     /// `joins_crowd(mid_q, after_q)`. Equal to `before_q` when the taker does not reduce.
     pub mid_q: i128,
-    /// ADL-effective |position| after the fill (the numerator of `u`).
+    /// ADL-effective |position| after the fill (diagnostic; NOT the numerator of `u` since
+    /// N-1).
     pub eff_after_abs_q: u128,
+    /// N-1 (security re-verification 2026-10-04): the USERS' ADL-effective open interest on the
+    /// TAKER's side after the fill -- the asset's `oi_eff_{long,short}_q` minus the vault LP's
+    /// own effective position when it sits on that side (`users_side_oi_q`). This is the
+    /// numerator of `u` for every open, crowd or thin. Since every user position on a bound
+    /// asset faces the vault LP, `|LP| = |OI_long_users - OI_short_users| <= max(both)`, so
+    /// capping each side's users OI at `N_cap` bounds `|LP|` after ANY sequence of fills
+    /// (closes only lower OI). Measuring the LP's own net instead (the pre-N-1 rule) let a thin
+    /// open empty the LP, a crowd refill it, and the exempt thin close push it past `N_cap`.
+    pub users_oi_side_after_q: u128,
     /// Conservative equity `C_m`.
     pub equity: u128,
 }
@@ -335,6 +349,10 @@ pub struct GrowthGateIn {
     pub kink_bps: u16,
     /// Crowd side closed regardless of `u` (the market's bankruptcy h-lock is latched).
     pub crowd_blocked: bool,
+    /// N-1: the asset has a BOUND P3 vault LP (`ASSET_VAULT_LP_FLAG_BOUND`). Growth-1 admits
+    /// opens only there: users OI can be apportioned to one LP only when that LP is every
+    /// user's exclusive counterparty (this also removes the multi-LP overshoot).
+    pub asset_bound: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -345,8 +363,11 @@ pub enum GrowthVerdict {
     /// A risk-increasing fill with no single LP counterparty (NoCpi between two non-LPs or two
     /// LPs). On a growth asset every OPEN must face an LP and pay IMR_dyn; otherwise a pair
     /// opened trader-vs-trader at the launch ceiling could later be "closed" into an LP past
-    /// its capacity through the M-1 close exemption (the P1 F-7 dump).
+    /// its capacity through the M-1 close exemption (the P1 F-7 dump). Since N-1 the LP must
+    /// be the asset's bound vault LP.
     NoLpCounterparty,
+    /// N-1: a risk-increasing fill on a growth asset that has no bound P3 vault LP.
+    NotBound,
 }
 
 /// The IMR the gate applies to a risk-increasing taker fill, or `Err(CapacityFull)`.
@@ -356,15 +377,27 @@ pub fn growth_required_imr_bps(g: &GrowthGateIn) -> Result<u64, GrowthVerdict> {
         return Err(GrowthVerdict::LeverageExceeded);
     }
     match g.lp {
-        Some(lp) if joins_crowd(lp.mid_q, lp.after_q) => {
-            if g.crowd_blocked {
+        Some(lp) => {
+            let crowd = joins_crowd(lp.mid_q, lp.after_q);
+            if crowd && g.crowd_blocked {
                 return Err(GrowthVerdict::CapacityFull);
             }
             let n = n_cap_q(lp.equity, g.lambda_bps, g.price_e6, g.pos_scale)
                 .ok_or(GrowthVerdict::CapacityFull)?;
-            dyn_imr_bps(lp.eff_after_abs_q, n, base, g.kink_bps).ok_or(GrowthVerdict::CapacityFull)
+            // N-1: `u = OI_users(taker side after) / N_cap` for EVERY open. A crowd-joining
+            // open pays the kinked IMR_dyn at that u; a thin open pays only the ceiling but
+            // may not take its own side past N_cap either (otherwise the thin side can become
+            // the crowd and a later exempt close of the old crowd pushes |LP| past N_cap).
+            if crowd {
+                dyn_imr_bps(lp.users_oi_side_after_q, n, base, g.kink_bps)
+                    .ok_or(GrowthVerdict::CapacityFull)
+            } else if lp.users_oi_side_after_q > n {
+                Err(GrowthVerdict::CapacityFull)
+            } else {
+                Ok(base)
+            }
         }
-        _ => Ok(base),
+        None => Ok(base),
     }
 }
 
@@ -373,6 +406,9 @@ pub fn growth_required_imr_bps(g: &GrowthGateIn) -> Result<u64, GrowthVerdict> {
 pub fn growth_gate(g: &GrowthGateIn) -> GrowthVerdict {
     if !taker_risk_increasing(g.taker_before_q, g.taker_after_q) {
         return GrowthVerdict::Allow;
+    }
+    if !g.asset_bound {
+        return GrowthVerdict::NotBound;
     }
     if g.lp.is_none() {
         return GrowthVerdict::NoLpCounterparty;
@@ -472,6 +508,82 @@ pub fn lp_mid_q(lp_before_q: i128, taker_before_q: i128, taker_after_q: i128) ->
     } else {
         Some(lp_before_q)
     }
+}
+
+/// N-1: the users' (everyone but the asset's vault LP) ADL-effective open interest on one side:
+/// the engine's `oi_eff_{long,short}_q` minus the vault LP's own effective position when it is
+/// on that side. Saturating (an engine OI below the LP's own leg would be an engine invariant
+/// break; 0 users OI is the conservative reading for the LP-on-side subtraction only).
+pub fn users_side_oi_q(oi_eff_side_q: u128, vault_lp_eff_q: i128, long_side: bool) -> u128 {
+    let lp_on_side = if long_side {
+        vault_lp_eff_q > 0
+    } else {
+        vault_lp_eff_q < 0
+    };
+    if lp_on_side {
+        oi_eff_side_q.saturating_sub(vault_lp_eff_q.unsigned_abs())
+    } else {
+        oi_eff_side_q
+    }
+}
+
+/// N-1: the most a taker may OPEN on one side before that side's users OI reaches `N_cap`
+/// (the TradeCpi clip, so the clip and the post-fill gate agree; Q3: landing exactly on
+/// `N_cap` is admitted).
+pub fn growth_open_room_q(n_cap: u128, users_oi_side_before_q: u128) -> u128 {
+    n_cap.saturating_sub(users_oi_side_before_q)
+}
+
+/// How the wrapper treats one growth taker leg before the matcher, from the taker's
+/// ADL-EFFECTIVE position (Q2 of the re-verification: the raw basis overstates the position
+/// while A < 1, so a "reduce" of |raw| could over-close into an unmarked opening remainder).
+/// Returns `(taker_reducing, close_room)`:
+/// * a strict reduction: `(true, Some(|size|))` -- never clipped for capacity (M-1);
+/// * a flip on the single route (`clip_flips_to_close`): `(true, Some(|eff_before|))` -- the
+///   request is clipped to exactly its close, which is then a strict close;
+/// * otherwise `(false, None)`: an open / grow (or a batch flip), which faces every cap.
+///
+/// `None` on overflow (fails closed).
+pub fn growth_leg_reduce_class(
+    taker_eff_before_q: i128,
+    size_q: i128,
+    clip_flips_to_close: bool,
+) -> Option<(bool, Option<u128>)> {
+    let after = taker_eff_before_q.checked_add(size_q)?;
+    if size_q != 0 && taker_strictly_reduces(taker_eff_before_q, after) {
+        Some((true, Some(size_q.unsigned_abs())))
+    } else if clip_flips_to_close && taker_flips(taker_eff_before_q, after) {
+        Some((true, Some(taker_eff_before_q.unsigned_abs())))
+    } else {
+        Some((false, None))
+    }
+}
+
+/// The ext-v3 `(inventory_cap_q, liquidity_notional_e6)` for a growth leg (R8 extraction of
+/// `growth_matcher_caps_view`): `(0, 0)` = CLOSED while the market's h-lock is latched, and on
+/// a zero price / zero `C_m` / overflow (fails closed); otherwise `N_cap` (bounded by the
+/// engine's position limit) and the `DEPTH_MULT * lambda * C_m` depth.
+pub fn growth_matcher_caps(
+    hlock_active: bool,
+    c_m: u128,
+    lambda_bps: u32,
+    price_e6: u64,
+    pos_scale: u128,
+    max_position_abs_q: u128,
+) -> (u128, u128) {
+    if hlock_active {
+        return (0, 0);
+    }
+    let cap = n_cap_q(c_m, lambda_bps, price_e6, pos_scale).unwrap_or(0);
+    let cap = if cap > max_position_abs_q {
+        max_position_abs_q
+    } else {
+        cap
+    };
+    if cap == 0 {
+        return (0, 0);
+    }
+    (cap, liquidity_notional_e6(c_m, lambda_bps).unwrap_or(0))
 }
 
 /// L-4 (security review): G4 protocol defaults are applied FIELD BY FIELD at the tag-94 bind:
@@ -681,6 +793,7 @@ mod tests {
                 mid_q: 0,
                 after_q: -(100 * PS as i128),
                 eff_after_abs_q: 100 * PS,
+                users_oi_side_after_q: 100 * PS,
                 equity: 1_000_000_000,
             }),
             price_e6: 1_000_000,
@@ -691,6 +804,7 @@ mod tests {
             lambda_bps: 10_000,
             kink_bps: 5_000,
             crowd_blocked: false,
+            asset_bound: true,
         }
     }
 
@@ -709,6 +823,7 @@ mod tests {
             mid_q: -(800 * PS as i128),
             after_q: -(900 * PS as i128),
             eff_after_abs_q: 900 * PS,
+            users_oi_side_after_q: 900 * PS,
             equity: 1_000_000_000,
         });
         c.taker_equity = 81_999_999;
@@ -722,6 +837,7 @@ mod tests {
             mid_q: -(900 * PS as i128),
             after_q: -(800 * PS as i128),
             eff_after_abs_q: 800 * PS,
+            users_oi_side_after_q: 800 * PS,
             equity: 1_000_000_000,
         });
         t.taker_equity = 10_000_000;
@@ -733,6 +849,7 @@ mod tests {
             mid_q: -(900 * PS as i128),
             after_q: -(1_000 * PS as i128),
             eff_after_abs_q: 1_000 * PS,
+            users_oi_side_after_q: 1_000 * PS,
             equity: 1_000_000_000,
         });
         e.taker_equity = 100_000_000; // 100% of the 100-unit notional
@@ -745,6 +862,7 @@ mod tests {
             mid_q: -(900 * PS as i128),
             after_q: -(1_000 * PS as i128 + 1),
             eff_after_abs_q: 1_000 * PS + 1,
+            users_oi_side_after_q: 1_000 * PS + 1,
             equity: 1_000_000_000,
         });
         f.taker_equity = u128::MAX;
@@ -836,6 +954,7 @@ mod tests {
                 mid_q: -1_000,
                 after_q: -1_050,
                 eff_after_abs_q: 1_050,
+                users_oi_side_after_q: 1_050,
                 equity: 1_000,
             }),
             price_e6: 1_000_000,
@@ -846,6 +965,7 @@ mod tests {
             lambda_bps: 10_000,
             kink_bps: 5_000,
             crowd_blocked: false,
+            asset_bound: true,
         };
         assert_eq!(
             growth_gate(&g),
@@ -919,5 +1039,295 @@ mod tests {
         assert_eq!(&b[24..40], &(-5i128).to_le_bytes());
         assert_eq!(u128::from_le_bytes(b[40..56].try_into().unwrap()), 7);
         assert_eq!(u128::from_le_bytes(b[56..72].try_into().unwrap()), 9);
+    }
+    #[test]
+    fn n1_pure_pieces() {
+        // users OI: the vault LP's own leg is removed only from ITS side
+        assert_eq!(users_side_oi_q(1_000, -400, true), 1_000);
+        assert_eq!(users_side_oi_q(1_000, 400, true), 600);
+        assert_eq!(users_side_oi_q(1_000, -400, false), 600);
+        assert_eq!(users_side_oi_q(300, 400, true), 0, "saturates");
+        assert_eq!(growth_open_room_q(1_000, 600), 400);
+        assert_eq!(growth_open_room_q(1_000, 1_200), 0);
+        // reduce class from the EFFECTIVE position (Q2)
+        assert_eq!(
+            growth_leg_reduce_class(-100, 40, true),
+            Some((true, Some(40)))
+        );
+        assert_eq!(
+            growth_leg_reduce_class(-100, 100, false),
+            Some((true, Some(100)))
+        );
+        assert_eq!(
+            growth_leg_reduce_class(-100, 150, true),
+            Some((true, Some(100))),
+            "single-route flip -> its close"
+        );
+        assert_eq!(
+            growth_leg_reduce_class(-100, 150, false),
+            Some((false, None)),
+            "batch flip is an open"
+        );
+        assert_eq!(
+            growth_leg_reduce_class(-80, 100, false),
+            Some((false, None)),
+            "|raw| 100 over-closes |eff| 80: NOT marked reducing"
+        );
+        assert_eq!(growth_leg_reduce_class(0, 5, true), Some((false, None)));
+        assert_eq!(growth_leg_reduce_class(10, 5, true), Some((false, None)));
+        assert_eq!(growth_leg_reduce_class(i128::MAX, 1, true), None);
+        // ext v3 caps (R8): closed under the h-lock, on C_m 0 and on price 0
+        assert_eq!(
+            growth_matcher_caps(true, 1_000_000_000, 10_000, 1_000_000, PS, u128::MAX),
+            (0, 0)
+        );
+        assert_eq!(
+            growth_matcher_caps(false, 0, 10_000, 1_000_000, PS, u128::MAX),
+            (0, 0)
+        );
+        assert_eq!(
+            growth_matcher_caps(false, 1_000_000_000, 10_000, 0, PS, u128::MAX),
+            (0, 0)
+        );
+        assert_eq!(
+            growth_matcher_caps(false, 1_000_000_000, 10_000, 1_000_000, PS, u128::MAX),
+            (1_000_000_000, 4_000_000_000)
+        );
+        assert_eq!(
+            growth_matcher_caps(false, 1_000_000_000, 10_000, 1_000_000, PS, 7).0,
+            7
+        );
+    }
+
+    #[test]
+    fn n1_thin_open_counts_against_its_side_and_unbound_refuses_opens() {
+        // thin open (the LP shrinks) whose own side would pass N_cap: refused
+        let mut t = base_in();
+        t.lp = Some(GrowthLpIn {
+            before_q: -(900 * PS as i128),
+            mid_q: -(900 * PS as i128),
+            after_q: -(800 * PS as i128),
+            eff_after_abs_q: 800 * PS,
+            users_oi_side_after_q: 1_000 * PS + 1,
+            equity: 1_000_000_000,
+        });
+        t.taker_after_q = -(100 * PS as i128);
+        assert_eq!(growth_gate(&t), GrowthVerdict::CapacityFull);
+        if let Some(l) = t.lp.as_mut() {
+            l.users_oi_side_after_q = 1_000 * PS;
+        }
+        assert_eq!(
+            growth_gate(&t),
+            GrowthVerdict::Allow,
+            "landing on N_cap is admitted"
+        );
+        // crowd u is measured on users OI, not on the LP's net: LP -500 but crowd OI 1,001
+        let mut c = base_in();
+        c.lp = Some(GrowthLpIn {
+            before_q: -(400 * PS as i128),
+            mid_q: -(400 * PS as i128),
+            after_q: -(500 * PS as i128),
+            eff_after_abs_q: 500 * PS,
+            users_oi_side_after_q: 1_000 * PS + 1,
+            equity: 1_000_000_000,
+        });
+        c.taker_equity = u128::MAX;
+        assert_eq!(growth_gate(&c), GrowthVerdict::CapacityFull);
+        // unbound growth asset: opens refused, closes never
+        let mut u = base_in();
+        u.asset_bound = false;
+        assert_eq!(growth_gate(&u), GrowthVerdict::NotBound);
+        u.taker_before_q = 100 * PS as i128;
+        u.taker_after_q = 0;
+        assert_eq!(growth_gate(&u), GrowthVerdict::Allow);
+    }
+
+    /// The N-1 capacity model: `users` hold effective positions against ONE vault LP
+    /// (`LP = -sum(users)`), every fill is a user vs the LP, and admission is the PRODUCTION
+    /// `growth_gate` fed exactly as `growth_post_fill_view` feeds it (`users_oi` = the users OI
+    /// on the taker's side after; `measure_lp_net` = the pre-N-1 measure, the mutant).
+    fn n1_admits(users: &[i128], i: usize, d: i128, n_cap: u128, measure_lp_net: bool) -> bool {
+        let lp: i128 = -users.iter().sum::<i128>();
+        let before = users[i];
+        let after = before + d;
+        let mut next = users.to_vec();
+        next[i] = after;
+        let lp_after = lp - d;
+        let side_oi = |v: &[i128], long: bool| -> u128 {
+            v.iter()
+                .map(|p| {
+                    if (long && *p > 0) || (!long && *p < 0) {
+                        p.unsigned_abs()
+                    } else {
+                        0
+                    }
+                })
+                .sum()
+        };
+        let users_oi = if measure_lp_net {
+            lp_after.unsigned_abs()
+        } else {
+            side_oi(&next, after > 0)
+        };
+        let g = GrowthGateIn {
+            taker_before_q: before,
+            taker_after_q: after,
+            taker_eff_after_abs_q: after.unsigned_abs(),
+            taker_equity: u128::MAX / 4,
+            taker_cert_initial_req: None,
+            lp: Some(GrowthLpIn {
+                before_q: lp,
+                mid_q: lp_mid_q(lp, before, after).unwrap(),
+                after_q: lp_after,
+                eff_after_abs_q: lp_after.unsigned_abs(),
+                users_oi_side_after_q: users_oi,
+                // lambda 1x, $1 (1e6), POS_SCALE 1: N_cap = C_m / 1e6
+                equity: n_cap * 1_000_000,
+            }),
+            price_e6: 1_000_000,
+            pos_scale: 1,
+            engine_imr_bps: 1_000,
+            min_nonzero_im_req: 0,
+            ceil_imr_bps: 1_000,
+            lambda_bps: 10_000,
+            kink_bps: 5_000,
+            crowd_blocked: false,
+            asset_bound: true,
+        };
+        growth_gate(&g) == GrowthVerdict::Allow
+    }
+
+    fn n1_inv(users: &[i128], n_cap: u128) -> bool {
+        let long: u128 = users
+            .iter()
+            .filter(|p| **p > 0)
+            .map(|p| p.unsigned_abs())
+            .sum();
+        let short: u128 = users
+            .iter()
+            .filter(|p| **p < 0)
+            .map(|p| p.unsigned_abs())
+            .sum();
+        let lp = users.iter().sum::<i128>().unsigned_abs();
+        long <= n_cap && short <= n_cap && lp <= core::cmp::max(long, short)
+    }
+
+    /// N-1 inductive step, exhaustive on a small domain (the Kani harness of note rev 4 is this
+    /// statement for symbolic values): from EVERY state satisfying
+    /// `OI_long_users <= N_cap ∧ OI_short_users <= N_cap ∧ |LP| <= max(both)`, every fill the
+    /// gate admits -- open, grow, reduce, close, flip -- lands in a state satisfying it again.
+    /// Hence `|LP| <= N_cap` after ANY admitted sequence.
+    #[test]
+    fn n1_capacity_invariant_is_inductive() {
+        const N: u128 = 4;
+        const R: i128 = 6;
+        let mut states = 0u64;
+        let mut fills = 0u64;
+        let mut closes_admitted = 0u64;
+        for a in -R..=R {
+            for b in -R..=R {
+                for c in -R..=R {
+                    let users = [a, b, c];
+                    if !n1_inv(&users, N) {
+                        continue;
+                    }
+                    states += 1;
+                    for i in 0..3 {
+                        for d in -2 * R..=2 * R {
+                            if d == 0 || !n1_admits(&users, i, d, N, false) {
+                                continue;
+                            }
+                            fills += 1;
+                            let mut next = users;
+                            next[i] += d;
+                            if taker_strictly_reduces(users[i], next[i]) {
+                                closes_admitted += 1;
+                            }
+                            assert!(n1_inv(&next, N), "{users:?} user {i} {d:+} -> {next:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // covers: non-vacuous (opens ARE admitted up to N_cap and refused past it), and every
+        // strict reduction is admitted (M-1 liveness kept)
+        assert!(
+            states > 100 && fills > 1_000,
+            "states {states} fills {fills}"
+        );
+        assert!(
+            n1_admits(&[0, 0, 0], 0, N as i128, N, false),
+            "open to exactly N_cap"
+        );
+        assert!(
+            !n1_admits(&[0, 0, 0], 0, N as i128 + 1, N, false),
+            "N_cap + 1 refused"
+        );
+        assert!(
+            n1_admits(&[3, 0, 0], 1, -4, N, false),
+            "thin side opens to N_cap"
+        );
+        assert!(
+            n1_admits(&[3, -4, 0], 2, 1, N, false),
+            "crowd lands on N_cap"
+        );
+        assert!(
+            !n1_admits(&[4, -4, 0], 2, 1, N, false),
+            "crowd past N_cap refused"
+        );
+        let mut reductions = 0u64;
+        for a in -R..=R {
+            for b in -R..=R {
+                let users = [a, b, -(a + b).clamp(-R, R)];
+                if !n1_inv(&users, N) {
+                    continue;
+                }
+                for i in 0..3 {
+                    let p = users[i];
+                    for d in 1..=p.unsigned_abs() as i128 {
+                        let d = if p > 0 { -d } else { d };
+                        assert!(n1_admits(&users, i, d, N, false), "close {users:?} {i} {d}");
+                        reductions += 1;
+                    }
+                }
+            }
+        }
+        assert!(reductions > 0 && closes_admitted > 0);
+    }
+
+    /// NEGATIVE CONTROL (mutant `n1-lpnet`): the pre-N-1 measure (u on |LP| net) is NOT
+    /// inductive, and the reviewer's thin-open / crowd-refill / thin-close cycle reaches
+    /// `|LP| > N_cap` from flat.
+    #[test]
+    fn n1_mutant_lp_net_measure_breaks_the_invariant() {
+        const N: u128 = 4;
+        // replay the reviewer's cycle: users [T, C1, C2]
+        let mut u = [0i128, 0, 0];
+        let step = |u: &mut [i128; 3], i: usize, d: i128, mutant: bool| -> bool {
+            let ok = n1_admits(&u[..], i, d, N, mutant);
+            if ok {
+                u[i] += d;
+            }
+            ok
+        };
+        assert!(step(&mut u, 1, 4, true), "crowd C1 to N_cap");
+        assert!(step(&mut u, 0, -4, true), "thin T opens: LP back to 0");
+        assert!(
+            step(&mut u, 2, 4, true),
+            "crowd C2 refills (LP net 0 frees room)"
+        );
+        assert!(step(&mut u, 0, 4, true), "thin close is exempt");
+        let lp = u.iter().sum::<i128>().unsigned_abs();
+        assert_eq!(lp, 8, "mutant: |LP| = 2 x N_cap");
+        // the real rule refuses the refill: C2's open would put users long OI at 8 > N_cap
+        let mut r = [0i128, 0, 0];
+        assert!(step(&mut r, 1, 4, false));
+        assert!(
+            step(&mut r, 0, -4, false),
+            "thin T: short side OI 4 <= N_cap"
+        );
+        assert!(!step(&mut r, 2, 4, false), "N-1: refill refused");
+        assert!(step(&mut r, 0, 4, false), "thin close still exempt");
+        assert!(r.iter().sum::<i128>().unsigned_abs() <= N);
     }
 }

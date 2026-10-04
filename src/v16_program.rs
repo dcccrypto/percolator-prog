@@ -1406,7 +1406,17 @@ VaultLpMultiAssetMarket,
         /// close. Without this, a pair opened trader-vs-trader at the launch ceiling could be
         /// "closed" into an LP past its capacity through the close exemption. Custom(95),
         /// appended at the END. SDK/app: "Open against the market maker (trade via the book)".
+        /// Since N-1 the counterparty must be the asset's BOUND vault LP.
         GrowthNeedsLpCounterparty,
+        /// growth-v19 L-6 (security re-verification): a BatchTradeCpi carrying a growth leg
+        /// has more than `growth_v19::GROWTH_BATCH_MAX_LEGS` (10) legs. Custom(96), appended
+        /// at the END. SDK/app: "Split this order into batches of at most 10 markets".
+        GrowthBatchTooManyLegs,
+        /// growth-v19 N-1 (security re-verification): growth-1 admits OPENS only on assets with
+        /// a BOUND P3 vault LP, where every user position faces that one LP and capacity is
+        /// measured on users open interest. Reductions / closes are never refused by this.
+        /// Custom(97), appended at the END. SDK/app: "This market is not open for new positions".
+        GrowthRequiresBoundVaultLp,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -13898,9 +13908,9 @@ pub mod processor {
                 &group,
                 &account_a,
                 &account_b,
+                (account_a_ai.key, account_b_ai.key),
                 asset_index as usize,
-                account_a_position,
-                account_b_position,
+                size_q,
                 roles,
             )?;
             // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
@@ -14573,10 +14583,18 @@ pub mod processor {
             for (i, request) in requests.iter().enumerate() {
                 ensure_protocol_side_oi_cap_view(&group, request.asset_index, oi_before_legs[i])?;
             }
-            for ctx in &leg_ctx {
+            for (ctx, request) in leg_ctx.iter().zip(requests.iter()) {
                 // growth-v19: per leg on the FINAL batch state against the PRE-batch positions
                 // (one leg per asset), the same frame as the engine's final-portfolio IM check.
-                growth_post_fill_view(&group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles)?;
+                growth_post_fill_view(
+                    &group,
+                    &account_a,
+                    &account_b,
+                    (account_a_ai.key, account_b_ai.key),
+                    ctx.0,
+                    request.size_q,
+                    roles,
+                )?;
                 p1_post_fill_checks_view(
                     &group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles,
                 )?;
@@ -14895,8 +14913,18 @@ pub mod processor {
         let b = state::portfolio_view_mut_for_market_slots(&mut b_data, max_market_slots)?;
         for &(asset, b_before, a_before) in pre.iter() {
             let idx = asset as usize;
-            let a_after = signed_position_for_asset_view(&group, &a, idx)?;
-            let b_after = signed_position_for_asset_view(&group, &b, idx)?;
+            // growth-v19: `pre` is ADL-effective on a growth asset (see the capture).
+            let (a_after, b_after) = if asset_growth_view(&group, idx)?.is_some() {
+                (
+                    effective_signed_position_for_asset_view(&group, &a, idx)?,
+                    effective_signed_position_for_asset_view(&group, &b, idx)?,
+                )
+            } else {
+                (
+                    signed_position_for_asset_view(&group, &a, idx)?,
+                    signed_position_for_asset_view(&group, &b, idx)?,
+                )
+            };
             if vault_lp_v18::joins_crowd(a_before, a_after)
                 || vault_lp_v18::joins_crowd(b_before, b_after)
             {
@@ -15847,11 +15875,22 @@ pub mod processor {
             if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 {
                 continue;
             }
-            out.push((
-                asset,
-                signed_position_for_asset_view(&group, &b, asset as usize)?,
-                signed_position_for_asset_view(&group, &a, asset as usize)?,
-            ));
+            // growth-v19 (N-1 / Q2): on a growth asset the M-1 `lp_mid_q` below compares with
+            // the post-fill (re-based, effective) positions, so capture the ADL-EFFECTIVE
+            // pre-fill positions; legacy assets keep the raw basis (S-3).
+            if asset_growth_view(&group, asset as usize)?.is_some() {
+                out.push((
+                    asset,
+                    effective_signed_position_for_asset_view(&group, &b, asset as usize)?,
+                    effective_signed_position_for_asset_view(&group, &a, asset as usize)?,
+                ));
+            } else {
+                out.push((
+                    asset,
+                    signed_position_for_asset_view(&group, &b, asset as usize)?,
+                    signed_position_for_asset_view(&group, &a, asset as usize)?,
+                ));
+            }
         }
         Ok(out)
     }
@@ -15877,7 +15916,15 @@ pub mod processor {
         for &(asset, lp_before, taker_before) in pre.iter() {
             let idx = asset as usize;
             let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
-            let lp_after = signed_position_for_asset_view(&group, &b, idx)?;
+            // growth-v19 (N-1 / Q2): on a growth asset `pre` holds the ADL-EFFECTIVE pre-fill
+            // positions, so compare with the effective post-fill ones (the raw basis is not
+            // re-based by a fill and overstates |pos| while A < 1).
+            let growth_asset = asset_growth_view(&group, idx)?.is_some();
+            let lp_after = if growth_asset {
+                effective_signed_position_for_asset_view(&group, &b, idx)?
+            } else {
+                signed_position_for_asset_view(&group, &b, idx)?
+            };
             if account_b_ai.key.to_bytes() != rec.vault_lp_portfolio {
                 if vault_lp_v18::joins_crowd(lp_before, lp_after) {
                     return Err(PercolatorError::VaultLpExclusiveCounterparty.into());
@@ -15887,8 +15934,8 @@ pub mod processor {
             // M-1 (security review 2026-10-04): on a growth asset the vault LP's draw halt, H2
             // exposure cap and step-down measure its growth from the position AFTER the
             // taker's reducing part, so a taker close is never refused by them.
-            let lp_before = if asset_growth_view(&group, idx)?.is_some() {
-                let taker_after_now = signed_position_for_asset_view(&group, &a, idx)?;
+            let lp_before = if growth_asset {
+                let taker_after_now = effective_signed_position_for_asset_view(&group, &a, idx)?;
                 growth_v19::lp_mid_q(lp_before, taker_before, taker_after_now)
                     .ok_or(PercolatorError::EngineArithmeticOverflow)?
             } else {
@@ -15945,7 +15992,11 @@ pub mod processor {
                 }
             }
             if rec.lev_cap_q != 0 && vault_lp_v18::joins_crowd(lp_before, lp_after) {
-                let taker_after = signed_position_for_asset_view(&group, &a, idx)?;
+                let taker_after = if growth_asset {
+                    effective_signed_position_for_asset_view(&group, &a, idx)?
+                } else {
+                    signed_position_for_asset_view(&group, &a, idx)?
+                };
                 if taker_after.unsigned_abs() > taker_before.unsigned_abs() {
                     let imr = vault_lp_v18::step_imr_bps(
                         lp_after.unsigned_abs(),
@@ -16469,7 +16520,7 @@ pub mod processor {
             let data = market_ai.try_borrow_data()?;
             for leg in legs {
                 if state::asset_growth_version(&data, leg.asset_index as usize)? != 0 {
-                    return Err(PercolatorError::InvalidInstruction.into());
+                    return Err(PercolatorError::GrowthBatchTooManyLegs.into());
                 }
             }
         }
@@ -32731,13 +32782,51 @@ pub mod processor {
         position_b_before: i128,
         roles: P1TradeRoles,
     ) -> ProgramResult {
+        // growth-v19 (N-1 / Q2): on a growth asset these checks run INSIDE
+        // `growth_post_fill_view`, on the ADL-effective pre-fill positions (the M-1 `lp_mid_q`
+        // must compare like with like). Kept out of the executors so their call arity and
+        // frames are unchanged (the single executor's frame is at the SBF limit: one extra
+        // 32-byte local there corrupted the fee accrual with no build warning).
+        if asset_growth_view(group, asset_index)?.is_some() {
+            return Ok(());
+        }
+        p1_post_fill_checks_inner(
+            group,
+            account_a,
+            account_b,
+            asset_index,
+            position_a_before,
+            position_b_before,
+            roles,
+            None,
+        )
+    }
+
+    /// `effective_after`: `Some((a, b))` = the ADL-effective post-fill positions (growth path,
+    /// with ADL-effective `position_*_before`); `None` = read the raw basis (legacy, S-3).
+    #[allow(clippy::too_many_arguments)]
+    fn p1_post_fill_checks_inner(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_a_before: i128,
+        position_b_before: i128,
+        roles: P1TradeRoles,
+        effective_after: Option<(i128, i128)>,
+    ) -> ProgramResult {
         let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
         if !lp_involved {
             return Ok(());
         }
         // One position read per side (each walks the leg table -- CU).
-        let a_after = signed_position_for_asset_view(group, account_a, asset_index)?;
-        let b_after = signed_position_for_asset_view(group, account_b, asset_index)?;
+        let (a_after, b_after) = match effective_after {
+            Some(e) => e,
+            None => (
+                signed_position_for_asset_view(group, account_a, asset_index)?,
+                signed_position_for_asset_view(group, account_b, asset_index)?,
+            ),
+        };
         if roles.b_is_lp {
             ensure_lp_limits_after_fill_view(
                 group,
@@ -32815,9 +32904,6 @@ pub mod processor {
         asset_index: usize,
         g: &state::AssetGrowthV19,
     ) -> Result<(u128, u128), ProgramError> {
-        if group.header.bankruptcy_hlock_active != 0 {
-            return Ok((0, 0));
-        }
         let price = group
             .markets
             .get(asset_index)
@@ -32832,14 +32918,15 @@ pub mod processor {
             lp.header.fee_credits.get(),
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let cap = growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE).unwrap_or(0);
-        let cap = core::cmp::min(cap, percolator::MAX_POSITION_ABS_Q);
-        let liq = if cap == 0 {
-            0
-        } else {
-            growth_v19::liquidity_notional_e6(c_m, g.lambda_bps).unwrap_or(0)
-        };
-        Ok((cap, liq))
+        // R8: the pure extraction (Kani target) is the whole decision.
+        Ok(growth_v19::growth_matcher_caps(
+            group.header.bankruptcy_hlock_active != 0,
+            c_m,
+            g.lambda_bps,
+            price,
+            percolator::POS_SCALE,
+            percolator::MAX_POSITION_ABS_Q,
+        ))
     }
 
     /// growth-v19 post-fill gate (plan §2.1), every route: called from BOTH shared executors
@@ -32858,9 +32945,10 @@ pub mod processor {
         group: &state::MarketViewMutV16<'_>,
         account_a: &percolator::PortfolioV16ViewMut<'_>,
         account_b: &percolator::PortfolioV16ViewMut<'_>,
+        keys: (&Pubkey, &Pubkey),
         asset_index: usize,
-        position_a_before: i128,
-        position_b_before: i128,
+        // The fill: account_a moved by `+size_q`, account_b by `-size_q` (executor convention).
+        size_q: i128,
         roles: P1TradeRoles,
     ) -> ProgramResult {
         let g = match asset_growth_view(group, asset_index)? {
@@ -32878,13 +32966,38 @@ pub mod processor {
             .asset
             .effective_price
             .get();
-        let (a_after, a_eff) =
+        // N-1 / Q2: the gate compares ADL-effective positions (before: the executors' pre-trade
+        // effective read; after: the effective read here).
+        let (_, a_eff) =
             raw_and_effective_signed_position_for_asset_view(group, account_a, asset_index)?;
-        let (b_after, b_eff) =
+        let (_, b_eff) =
             raw_and_effective_signed_position_for_asset_view(group, account_b, asset_index)?;
+        // N-1 / Q2: the ADL-effective positions BEFORE this fill. The engine re-bases each
+        // touched leg to its effective size and then applies the fill, so `eff_after - delta`
+        // is the effective pre-fill position (no extra pre-trade walk, and no new locals in the
+        // executors' frames). A raw-basis "before" would read a grow inside the ADL haircut
+        // (`raw - eff`) as a reduction and skip the gate.
+        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        let position_a_before = a_eff.checked_sub(size_q).ok_or_else(overflow)?;
+        let position_b_before = b_eff.checked_add(size_q).ok_or_else(overflow)?;
         // Side selection is the pure (Kani-target) `growth_v19::growth_sides`.
         let (a_is_taker, b_is_taker, lp_is_b) =
             growth_v19::growth_sides(roles.cpi, roles.a_is_lp, roles.b_is_lp);
+        // N-1: growth-1 admits opens only on a BOUND P3 asset, and only against ITS vault LP
+        // (every user position faces that LP, so users OI is that LP's book). Another LP
+        // counterparty is treated as no LP (GrowthNeedsLpCounterparty on an open).
+        let vault = read_asset_vault_lp_from_view(group, asset_index)?;
+        let asset_bound = vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0;
+        let lp_is_b = match lp_is_b {
+            Some(true) if asset_bound && keys.1.to_bytes() == vault.vault_lp_portfolio => {
+                Some(true)
+            }
+            Some(false) if asset_bound && keys.0.to_bytes() == vault.vault_lp_portfolio => {
+                Some(false)
+            }
+            _ => None,
+        };
+        let (oi_long, oi_short) = side_oi_snapshot_view(group, asset_index)?;
         let equity_of = |p: &percolator::PortfolioV16ViewMut<'_>| -> Result<u128, ProgramError> {
             vault_lp_v18::conservative_equity(
                 p.header.capital.get(),
@@ -32895,29 +33008,38 @@ pub mod processor {
         };
         // M-1: LP growth is measured from the LP's position after the taker's REDUCING part
         // (`growth_v19::lp_mid_q`), so only a flip's OPENING part joins the crowd.
-        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        // The taker's opening side is the sign of its position after the fill.
+        let users_oi = |taker_after: i128, lp_eff: i128| -> u128 {
+            if taker_after > 0 {
+                growth_v19::users_side_oi_q(oi_long, lp_eff, true)
+            } else {
+                growth_v19::users_side_oi_q(oi_short, lp_eff, false)
+            }
+        };
         let lp_in = match lp_is_b {
             Some(true) => Some(growth_v19::GrowthLpIn {
                 before_q: position_b_before,
-                mid_q: growth_v19::lp_mid_q(position_b_before, position_a_before, a_after)
+                mid_q: growth_v19::lp_mid_q(position_b_before, position_a_before, a_eff)
                     .ok_or_else(overflow)?,
-                after_q: b_after,
+                after_q: b_eff,
                 eff_after_abs_q: b_eff.unsigned_abs(),
+                users_oi_side_after_q: users_oi(a_eff, b_eff),
                 equity: equity_of(account_b)?,
             }),
             Some(false) => Some(growth_v19::GrowthLpIn {
                 before_q: position_a_before,
-                mid_q: growth_v19::lp_mid_q(position_a_before, position_b_before, b_after)
+                mid_q: growth_v19::lp_mid_q(position_a_before, position_b_before, b_eff)
                     .ok_or_else(overflow)?,
-                after_q: a_after,
+                after_q: a_eff,
                 eff_after_abs_q: a_eff.unsigned_abs(),
+                users_oi_side_after_q: users_oi(b_eff, a_eff),
                 equity: equity_of(account_a)?,
             }),
             None => None,
         };
         let sides: [(bool, &percolator::PortfolioV16ViewMut<'_>, i128, i128, i128); 2] = [
-            (a_is_taker, account_a, position_a_before, a_after, a_eff),
-            (b_is_taker, account_b, position_b_before, b_after, b_eff),
+            (a_is_taker, account_a, position_a_before, a_eff, a_eff),
+            (b_is_taker, account_b, position_b_before, b_eff, b_eff),
         ];
         for (is_taker, taker, before, after, eff) in sides {
             if !is_taker || !growth_v19::taker_risk_increasing(before, after) {
@@ -32945,6 +33067,7 @@ pub mod processor {
                 lambda_bps: g.lambda_bps,
                 kink_bps: g.kink_bps,
                 crowd_blocked: group.header.bankruptcy_hlock_active != 0,
+                asset_bound,
             };
             match growth_v19::growth_gate(&input) {
                 growth_v19::GrowthVerdict::Allow => {}
@@ -32957,9 +33080,24 @@ pub mod processor {
                 growth_v19::GrowthVerdict::NoLpCounterparty => {
                     return Err(PercolatorError::GrowthNeedsLpCounterparty.into())
                 }
+                growth_v19::GrowthVerdict::NotBound => {
+                    return Err(PercolatorError::GrowthRequiresBoundVaultLp.into())
+                }
             }
         }
-        Ok(())
+        // P1 items 2, 3, 5 post-fill on the ADL-effective pre-fill positions (see
+        // `p1_post_fill_checks_view`): AFTER the gate, so a full crowd side still answers the
+        // named GrowthCapacityFull first.
+        p1_post_fill_checks_inner(
+            group,
+            account_a,
+            account_b,
+            asset_index,
+            position_a_before,
+            position_b_before,
+            roles,
+            Some((a_eff, b_eff)),
+        )
     }
 
     fn side_oi_snapshot_view(
@@ -33236,15 +33374,29 @@ pub mod processor {
             // reduces is never clipped or halted for LP capacity / floor: headroom = its own
             // |size| (bounded by the taker's position). A flip on the single route is clipped to
             // exactly its closing part, which is then a strict close.
-            let (taker_reducing, close_room) = match growth_rec {
-                Some(_) if taker_reducing => (true, Some(size_q.unsigned_abs())),
-                Some(_)
-                    if clip_flips_to_close
-                        && growth_v19::taker_flips(taker_before, taker_after) =>
-                {
-                    (true, Some(taker_before.unsigned_abs()))
+            // Q2 (re-verification): classified from the taker's ADL-EFFECTIVE position, so the
+            // TAKER_REDUCING bit is never set on a request that over-closes |eff| < |raw| into
+            // an opening remainder. `growth_open` carries, for an open / grow / batch flip, the
+            // taker's ADL-effective position before (N-1 OI room below).
+            let (taker_reducing, close_room, growth_open) = match growth_rec {
+                Some(_) => {
+                    let (_, taker_eff) = raw_and_effective_signed_position_for_asset_view(
+                        &group,
+                        &account_a,
+                        asset_index,
+                    )?;
+                    match growth_v19::growth_leg_reduce_class(
+                        taker_eff,
+                        size_q,
+                        clip_flips_to_close,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                    {
+                        (true, room) => (true, room, None),
+                        (false, _) => (false, None, Some(taker_eff)),
+                    }
                 }
-                _ => (taker_reducing, None),
+                None => (taker_reducing, None, None),
             };
             let headroom_q = if let Some(room) = close_room {
                 room
@@ -33256,6 +33408,56 @@ pub mod processor {
                 room
             } else {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
+            };
+            // N-1: an opening growth leg is also clipped to its side's users-OI room under
+            // N_cap (+ the closing part of a batch flip), so the TradeCpi clip and the post-fill
+            // gate agree (the gate refuses `OI_users(side) > N_cap`; landing on it is admitted).
+            // Only on a bound asset against its vault LP: anywhere else the gate refuses the
+            // open outright (GrowthRequiresBoundVaultLp / GrowthNeedsLpCounterparty).
+            let headroom_q = match (growth_rec, growth_open) {
+                (Some(g), Some(taker_eff)) => {
+                    let vault = read_asset_vault_lp_from_view(&group, asset_index)?;
+                    if vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0
+                        && account_b_ai.key.to_bytes() == vault.vault_lp_portfolio
+                    {
+                        let (_, lp_eff) = raw_and_effective_signed_position_for_asset_view(
+                            &group,
+                            &account_b,
+                            asset_index,
+                        )?;
+                        let price = market.engine.asset.effective_price.get();
+                        let c_m = vault_lp_v18::conservative_equity(
+                            account_b.header.capital.get(),
+                            account_b.header.pnl.get(),
+                            account_b.header.fee_credits.get(),
+                        )
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        let n_cap =
+                            growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE)
+                                .unwrap_or(0);
+                        let long_side = size_q > 0;
+                        let oi_side = if long_side {
+                            market.engine.asset.oi_eff_long_q.get()
+                        } else {
+                            market.engine.asset.oi_eff_short_q.get()
+                        };
+                        let users = growth_v19::users_side_oi_q(oi_side, lp_eff, long_side);
+                        // A batch flip first closes |taker_eff| (that part is not on this side).
+                        let closing =
+                            if growth_v19::taker_flips(taker_eff, taker_eff.saturating_add(size_q))
+                            {
+                                taker_eff.unsigned_abs()
+                            } else {
+                                0
+                            };
+                        let room =
+                            closing.saturating_add(growth_v19::growth_open_room_q(n_cap, users));
+                        core::cmp::min(headroom_q, room)
+                    } else {
+                        headroom_q
+                    }
+                }
+                _ => headroom_q,
             };
             let growth_ext = if want_lp_position {
                 match growth_rec {
