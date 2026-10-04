@@ -7,7 +7,7 @@ LIMIT=${LIMIT:-1500}
 P=/Users/khubair/wt-growth-v19/percolator-prog
 M=/Users/khubair/wt-growth-v19/percolator-match
 L=$P/kani/growth/logs/$tag
-mkdir -p $L; : > $L/SUMMARY
+mkdir -p $L; touch $L/SUMMARY
 jobs_list=()
 for h in $(grep -o "fn kani_growth_[a-z_0-9]*" $P/kani/growth/src/proofs.rs | sed 's/fn //'); do
   jobs_list+=("growth|$h|$P/kani/growth|cargo kani -Z stubbing --harness proofs::$h --exact")
@@ -38,10 +38,20 @@ run_one() {
   local c=$(grep -E "cover properties satisfied|of [0-9]+ cover properties" $L/$h.log | tail -1)
   echo "$crate | $h | ${v:-NO VERDICT} | ${c:-no cover line} | ${secs}s" >> $L/SUMMARY
 }
-for j in "${jobs_list[@]}"; do
-  IFS='|' read crate h dir cmd <<< "$j"
-  while [ $(jobs -r | wc -l) -ge 3 ]; do sleep 3; done
-  run_one "$crate" "$h" "$dir" "$cmd" &
-done
+# One queue PER CRATE, run sequentially inside the crate (concurrent cargo-kani processes in
+# the same crate share build artifacts and were observed to cross-contaminate harness results:
+# the first attempt is kept, discarded, under logs/aborted-concurrent-INVALID). The three crate
+# queues (growth proofs crate, wrapper tests, matcher) run in parallel: at most 3 harnesses.
+run_queue() {
+  local want=$1
+  for j in "${jobs_list[@]}"; do
+    IFS='|' read crate h dir cmd <<< "$j"
+    [ "$crate" = "$want" ] || continue
+    run_one "$crate" "$h" "$dir" "$cmd"
+  done
+}
+run_queue growth &
+run_queue wrapper-tests &
+run_queue matcher &
 wait
 echo DONE >> $L/SUMMARY
