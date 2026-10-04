@@ -1386,3 +1386,37 @@ fn backpack_winner_keeps_k_gain_and_no_unowned_residual() {
         end.engine_residual()
     );
 }
+
+/// lp-earn §8's "second leak path": a 75 deposit into a pot that carries a provider receivable
+/// pays the receivable down with the NEW depositor's principal, and the non-bound ledger never
+/// books that as recovery. Step 1 of the R-2 world (pots physically whole, 180 booked as loss),
+/// then a deposit into d1. Safety property: after the deposit, NAV equals the pots' physical
+/// backing net of open claims. RED on deployed and E1 (needs E3: the add-path refill).
+#[test]
+#[ignore = "attribution PoC: red until E3 lands; run with --ignored"]
+fn deposit_refilling_a_receivable_is_booked_as_recovery() {
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(1_000_000_000);
+    let (a2k, a2) = r.new_trader(1_000_000_000);
+    let pair = [a1, a2, r.lp];
+    r.trade(&a1k, a1, q).expect("A1 long");
+    r.trade(&a2k, a2, -q).expect("A2 short");
+    r.walk(1_180_000, &pair);
+    r.trade(&a1k, a1, -q).expect("A1 close");
+    r.trade(&a2k, a2, q).expect("A2 close");
+    r.hold(r.lm.params.h_max + 2, &pair);
+    r.convert_all(&a1k, a1).expect("A1 convert");
+    let before = r.snap();
+    assert_eq!(before.consumed[1], 180_000_000, "d1 carries the receivable");
+    let e = Keypair::new();
+    r.deposit_shares(&e, 1_800_000_000, 1).expect("75 into d1");
+    let s = r.snap();
+    s.print("after 75 into the receivable pot");
+    let phys: u128 = (0..2).map(|d| s.fresh[d] + s.valid[d] - s.claim[d]).sum();
+    assert_eq!(
+        s.earn_nav, phys,
+        "NAV {} vs physical {}: the depositor's principal paid the receivable (consumed {:?}) and no recovery was booked",
+        s.earn_nav, phys, s.consumed
+    );
+}
