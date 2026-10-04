@@ -586,6 +586,105 @@ pub fn growth_matcher_caps(
     (cap, liquidity_notional_e6(c_m, lambda_bps).unwrap_or(0))
 }
 
+// ── N-2: per-side utilisation fee (security round 3) ────────────────────────────────────────
+
+/// N-2 default: the utilisation fee at `u = 1` (bps of the opening notional), paid to the vault
+/// LP through the P2 fee channel. 0 at or below the kink, linear to this at `u = 1`.
+pub const GROWTH_UTIL_FEE_DEFAULT_BPS: u16 = 500;
+/// N-2 hard ceiling on the per-asset utilisation-fee dial.
+pub const GROWTH_UTIL_FEE_HARD_MAX_BPS: u16 = 2_000;
+
+/// The utilisation-fee maximum in force: the stored dial, or the protocol default when 0.
+pub fn util_fee_max_effective_bps(stored_bps: u16) -> u16 {
+    if stored_bps == 0 {
+        GROWTH_UTIL_FEE_DEFAULT_BPS
+    } else {
+        stored_bps
+    }
+}
+
+/// N-2: the utilisation fee (bps) for an open that leaves its side's users OI at
+/// `users_oi_side_after_q`: 0 while `u <= kink`, else
+/// `ceil(max * (u - u_k) / (1 - u_k))`, capped at `max` (same kinked shape as `dyn_imr_bps`).
+/// `None` when `n_cap == 0` or on overflow (the gate refuses such an open anyway).
+pub fn utilisation_fee_bps(
+    users_oi_side_after_q: u128,
+    n_cap: u128,
+    kink_bps: u16,
+    max_fee_bps: u16,
+) -> Option<u16> {
+    if n_cap == 0 || kink_bps as u128 > BPS {
+        return None;
+    }
+    let lhs = users_oi_side_after_q.checked_mul(BPS)?;
+    let rhs = (kink_bps as u128).checked_mul(n_cap)?;
+    if lhs <= rhs || max_fee_bps == 0 {
+        return Some(0);
+    }
+    let num = (max_fee_bps as u128).checked_mul(lhs - rhs)?;
+    let den = n_cap.checked_mul(BPS - kink_bps as u128)?;
+    let fee = num.div_ceil(den);
+    Some(if fee > max_fee_bps as u128 {
+        max_fee_bps
+    } else {
+        fee as u16
+    })
+}
+
+/// N-2: the OPENING part of a taker fill (`|after|` for a flip, `|size|` for an open / grow, 0
+/// for a strict reduction or close). Only this part ever pays the utilisation fee.
+pub fn opening_part_q(taker_before_q: i128, taker_after_q: i128) -> u128 {
+    if taker_strictly_reduces(taker_before_q, taker_after_q) {
+        0
+    } else if taker_flips(taker_before_q, taker_after_q) {
+        taker_after_q.unsigned_abs()
+    } else {
+        taker_after_q.abs_diff(taker_before_q)
+    }
+}
+
+/// N-2: the utilisation fee as a rate on the WHOLE fill (the fee channel charges bps on the
+/// executed notional): `floor(fee_bps * opening / |fill|)`, so the closing part of a flip is
+/// never charged (it rounds in the taker's favour by < 1 bps of the opening part).
+pub fn util_fee_on_fill_bps(fee_bps: u16, opening_q: u128, fill_abs_q: u128) -> u16 {
+    if fill_abs_q == 0 || opening_q == 0 || fee_bps == 0 {
+        return 0;
+    }
+    let o = if opening_q > fill_abs_q {
+        fill_abs_q
+    } else {
+        opening_q
+    };
+    ((fee_bps as u128 * o) / fill_abs_q) as u16
+}
+
+/// N-2: the market's engine `max_trading_fee_bps` must leave room for the base fee, the pinned
+/// matcher request and the utilisation fee at its maximum (InitMarket and the dial setter).
+pub fn util_fee_fits_trading_cap(
+    max_trading_fee_bps: u64,
+    base_fee_bps: u64,
+    util_max_bps: u16,
+) -> bool {
+    match base_fee_bps
+        .checked_add(GROWTH_PIN_MAX_REQUESTED_FEE_BPS as u64)
+        .and_then(|v| v.checked_add(util_max_bps as u64))
+    {
+        Some(need) => max_trading_fee_bps >= need,
+        None => false,
+    }
+}
+
+/// N-2 dial bounds: without the epoch clamp the utilisation fee may only be RAISED from the
+/// default (tighten-only: a cheaper lock-out is never allowed); always `<= HARD_MAX`.
+pub fn util_fee_dial_ok(epoch_clamp_enforced: bool, util_max_bps: u16) -> bool {
+    let lo = if epoch_clamp_enforced {
+        0
+    } else {
+        GROWTH_UTIL_FEE_DEFAULT_BPS
+    };
+    util_max_bps >= lo && util_max_bps <= GROWTH_UTIL_FEE_HARD_MAX_BPS
+}
+
 /// L-4 (security review): G4 protocol defaults are applied FIELD BY FIELD at the tag-94 bind:
 /// a field the upgrade authority preset (non-zero) is kept, a zero field gets its default.
 pub fn g4_default_if_zero(current: u128, default: u128) -> u128 {
@@ -1329,5 +1428,52 @@ mod tests {
         assert!(!step(&mut r, 2, 4, false), "N-1: refill refused");
         assert!(step(&mut r, 0, 4, false), "thin close still exempt");
         assert!(r.iter().sum::<i128>().unsigned_abs() <= N);
+    }
+
+    #[test]
+    fn n2_utilisation_fee_shape() {
+        let n = 1_000u128;
+        // 0 at and below the kink, linear to max at u = 1, capped above
+        assert_eq!(utilisation_fee_bps(500, n, 5_000, 500), Some(0));
+        assert_eq!(utilisation_fee_bps(501, n, 5_000, 500), Some(1)); // ceil
+        assert_eq!(utilisation_fee_bps(600, n, 5_000, 500), Some(100));
+        assert_eq!(utilisation_fee_bps(1_000, n, 5_000, 500), Some(500));
+        assert_eq!(utilisation_fee_bps(5_000, n, 5_000, 500), Some(500));
+        assert_eq!(utilisation_fee_bps(1, 0, 5_000, 500), None);
+        assert_eq!(utilisation_fee_bps(900, n, 5_000, 0), Some(0));
+        // monotone in u and in max
+        let mut prev = 0;
+        for oi in 0..=1_200u128 {
+            let f = utilisation_fee_bps(oi, n, 5_000, 500).unwrap();
+            assert!(f >= prev && f <= 500);
+            prev = f;
+        }
+        // only the OPENING part pays: closes / reduces 0, flips |after|, grows the delta
+        assert_eq!(opening_part_q(-100, 0), 0);
+        assert_eq!(opening_part_q(-100, -40), 0);
+        assert_eq!(opening_part_q(-100, 50), 50);
+        assert_eq!(opening_part_q(0, 70), 70);
+        assert_eq!(opening_part_q(20, 70), 50);
+        assert_eq!(util_fee_on_fill_bps(500, 50, 150), 166); // flip: 1/3 of the fill opens
+        assert_eq!(util_fee_on_fill_bps(500, 0, 150), 0);
+        assert_eq!(util_fee_on_fill_bps(500, 150, 150), 500);
+        // the closing part of a flip is never charged: rate * fill <= fee * opening
+        for (o, f) in [(1u128, 3u128), (7, 9), (50, 150), (99, 100)] {
+            let r = util_fee_on_fill_bps(333, o, f) as u128;
+            assert!(r * f <= 333 * o);
+        }
+        // defaults, dial bounds (tighten-only) and the trading-cap rule
+        assert_eq!(util_fee_max_effective_bps(0), GROWTH_UTIL_FEE_DEFAULT_BPS);
+        assert_eq!(util_fee_max_effective_bps(900), 900);
+        assert!(util_fee_dial_ok(false, GROWTH_UTIL_FEE_DEFAULT_BPS));
+        assert!(
+            !util_fee_dial_ok(false, GROWTH_UTIL_FEE_DEFAULT_BPS - 1),
+            "cheaper lock-out refused"
+        );
+        assert!(!util_fee_dial_ok(false, GROWTH_UTIL_FEE_HARD_MAX_BPS + 1));
+        assert!(util_fee_dial_ok(true, 0));
+        assert!(util_fee_fits_trading_cap(630, 30, 500));
+        assert!(!util_fee_fits_trading_cap(629, 30, 500));
+        assert!(!util_fee_fits_trading_cap(u64::MAX, u64::MAX, 500));
     }
 }
