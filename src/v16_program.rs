@@ -25405,6 +25405,154 @@ pub mod processor {
         Ok(())
     }
 
+    /// Tag 77 OI-reservation guard, moved out of `handle_execute_redemption` unchanged so that
+    /// handler keeps SBF frame margin (it sits at 4,032 of 4,096 bytes; `cargo build-sbf` gives no
+    /// diagnostic at the limit). Pure check: reads only its arguments, mutates nothing.
+    #[inline(never)]
+    fn execute_redemption_oi_reservation_check(
+        ledger: &state::BackingDomainLedgerAccountV16,
+        principal_portion: u128,
+        gross_consumed: u128,
+        outstanding_post: u128,
+        oi_reservation_threshold_bps: u16,
+        fee_share_bps: u16,
+    ) -> ProgramResult {
+        // Post-redeem NAV: recompute with post-withdrawal counters.
+        let post_principal = ledger
+            .total_principal_atoms
+            .checked_sub(principal_portion)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        // Use gross_consumed (not earnings_portion) so nav_post reflects
+        // the correct remaining net_earnings for the fee_share split.
+        let post_earnings_withdrawn = ledger
+            .total_earnings_withdrawn_atoms
+            .checked_add(gross_consumed)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let nav_post_atoms = lp_vault_nav_atoms_floored(
+            post_principal,
+            ledger.total_earnings_atoms,
+            post_earnings_withdrawn,
+            ledger.cumulative_loss_atoms,
+            ledger.cumulative_recovery_atoms,
+            fee_share_bps,
+        )?;
+        let nav_post_num = nav_post_atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let covered = nav_post_num
+            .checked_mul(oi_reservation_threshold_bps as u128)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            / 10_000u128;
+        if covered < outstanding_post {
+            return Err(PercolatorError::LpVaultOiReservationViolated.into());
+        }
+        Ok(())
+    }
+
+    /// Tag 77 bound-vault (P3) payout pricing, moved out of `handle_execute_redemption` unchanged
+    /// so that handler keeps SBF frame margin (it sits at 4,032 of 4,096 bytes; `cargo build-sbf`
+    /// gives no diagnostic at the limit). Read-only: prices `(atoms, principal)`, mutates nothing.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_redemption_bound_pricing(
+        cfg_nav: &state::WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        lp_ai: &AccountInfo<'_>,
+        st: &state::VaultLpStateV18,
+        registry: &state::LpVaultRegistryV16,
+        shares: u128,
+        asset_index: usize,
+        nav: u128,
+        available_principal: u128,
+    ) -> Result<(u128, u128), ProgramError> {
+        // P3-K1: pending (harvestable) LP fees belong to every current holder, so a
+        // redeemer must not leave without its share — and paying it before the crank
+        // would pay out atoms that are not yet in backing. Require the harvest first
+        // (bundle tag 78 before 77 in the same transaction).
+        if lp_vault_harvestable_fee_atoms(cfg_nav, group)? != 0 {
+            return Err(PercolatorError::VaultLpHarvestPending.into());
+        }
+        // F-14: on a terminal-flat Resolved market any claim-free residual belongs in
+        // the pots before seniors are priced; tag 78 absorbs it. Bundle 78 first.
+        // P3 option (b): with receipts open the residual is THEIRS (reserved), so only the
+        // stray must have been absorbed first.
+        let (flat, receipts_open) = resolved_terminal_flat(group)?;
+        if flat
+            && ((!receipts_open && vault_terminal_residual_atoms(group)? != 0)
+                || vault_terminal_stray_atoms(group, asset_index)?
+                    .iter()
+                    .any(|x| *x != 0))
+        {
+            return Err(PercolatorError::VaultLpHarvestPending.into());
+        }
+        // P3: payout = floor(shares * senior / S), senior = min(V, C). The LP is valued
+        // only when backing alone does not cover C.
+        let senior_claim = st.senior_claim_atoms;
+        // F-8: in Resolved mode (terminal-flat, vault LP settled) value the seniors on the
+        // pots' physical idle backing; the vault LP carries no value any more.
+        let resolved = group.header.mode == 1;
+        // P3 senior draw (no early exit): in Live the vault LP's undrawn deficit is ALWAYS
+        // read (current certificate, else 85) even when backing covers C; a redemption
+        // never prices against it (the draw must run first).
+        let senior_claim = if resolved {
+            senior_claim
+        } else {
+            vault_lp_live_pricing_claim(group, lp_ai, senior_claim, nav)?
+        };
+        // P3 fairness: an EXIT is priced as if the pending oracle target were already the
+        // effective price whenever that is worse for the vault LP: the deficit it would
+        // realise (beyond the junior's pot surplus) comes off the claim now, exactly as the
+        // draw would book it (`vault_lp_senior_pricing_claim`, the booking rule).
+        let lp_equity_worse = if resolved {
+            0
+        } else {
+            with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(group, h))?.0
+        };
+        let physical = vault_physical_idle_backing_atoms(group, registry.domain)?;
+        let senior_value = if resolved {
+            vault_lp_v18::tranche_split(physical, senior_claim).senior
+        } else {
+            // P3 fairness (E-1, security delta dfa4559b..3245e861): value the vault at the
+            // price worse for it, ALWAYS (no `nav >= C` shortcut); a deficit at that price
+            // is drawn out of the pots (`vault_lp_v18::live_exit_senior_value`).
+            let lp_value_at_eff = if lp_equity_worse >= 0 {
+                with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(group, h))?
+            } else {
+                0
+            };
+            vault_lp_v18::live_exit_senior_value(
+                senior_claim,
+                nav,
+                lp_value_at_eff,
+                lp_equity_worse,
+            )
+        };
+        let atoms = vault_lp_v18::senior_atoms_for_redemption(
+            shares,
+            registry.total_lp_shares_outstanding,
+            senior_value,
+        )
+        .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        // Principal first, never more than the payout: part of the pots' principal can
+        // belong to the junior (e.g. a recall that over-covered after a later loss).
+        // F-8: in Resolved mode the payout is priced on the pots' PHYSICAL idle backing,
+        // and the ledger's impairment can be stale there (see
+        // `vault_physical_idle_backing_atoms`), so the whole payout is drawn as principal;
+        // the bucket gates below still enforce that it physically exists.
+        let principal = if resolved {
+            atoms
+        } else {
+            vault_lp_v18::senior_principal_portion(
+                shares,
+                available_principal,
+                registry.total_lp_shares_outstanding,
+                atoms,
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+        };
+        Ok((atoms, principal))
+    }
+
     fn handle_execute_redemption<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -25662,85 +25810,18 @@ pub mod processor {
             let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) =
                 bound_tail.as_ref()
             {
-                // P3-K1: pending (harvestable) LP fees belong to every current holder, so a
-                // redeemer must not leave without its share — and paying it before the crank
-                // would pay out atoms that are not yet in backing. Require the harvest first
-                // (bundle tag 78 before 77 in the same transaction).
-                if lp_vault_harvestable_fee_atoms(&cfg_nav, &group)? != 0 {
-                    return Err(PercolatorError::VaultLpHarvestPending.into());
-                }
-                // F-14: on a terminal-flat Resolved market any claim-free residual belongs in
-                // the pots before seniors are priced; tag 78 absorbs it. Bundle 78 first.
-                // P3 option (b): with receipts open the residual is THEIRS (reserved), so only the
-                // stray must have been absorbed first.
-                let (flat, receipts_open) = resolved_terminal_flat(&group)?;
-                if flat
-                    && ((!receipts_open && vault_terminal_residual_atoms(&group)? != 0)
-                        || vault_terminal_stray_atoms(&group, asset_index)?.iter().any(|x| *x != 0))
-                {
-                    return Err(PercolatorError::VaultLpHarvestPending.into());
-                }
-                // P3: payout = floor(shares * senior / S), senior = min(V, C). The LP is valued
-                // only when backing alone does not cover C.
-                let senior_claim = st.senior_claim_atoms;
-                // F-8: in Resolved mode (terminal-flat, vault LP settled) value the seniors on the
-                // pots' physical idle backing; the vault LP carries no value any more.
-                let resolved = group.header.mode == 1;
-                // P3 senior draw (no early exit): in Live the vault LP's undrawn deficit is ALWAYS
-                // read (current certificate, else 85) even when backing covers C; a redemption
-                // never prices against it (the draw must run first).
-                let senior_claim = if resolved {
-                    senior_claim
-                } else {
-                    vault_lp_live_pricing_claim(&group, lp_ai, senior_claim, nav)?
-                };
-                // P3 fairness: an EXIT is priced as if the pending oracle target were already the
-                // effective price whenever that is worse for the vault LP: the deficit it would
-                // realise (beyond the junior's pot surplus) comes off the claim now, exactly as the
-                // draw would book it (`vault_lp_senior_pricing_claim`, the booking rule).
-                let lp_equity_worse = if resolved {
-                    0
-                } else {
-                    with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(&group, h))?.0
-                };
-                let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
-                let senior_value = if resolved {
-                    vault_lp_v18::tranche_split(physical, senior_claim).senior
-                } else {
-                    // P3 fairness (E-1, security delta dfa4559b..3245e861): value the vault at the
-                    // price worse for it, ALWAYS (no `nav >= C` shortcut); a deficit at that price
-                    // is drawn out of the pots (`vault_lp_v18::live_exit_senior_value`).
-                    let lp_value_at_eff = if lp_equity_worse >= 0 {
-                        with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?
-                    } else {
-                        0
-                    };
-                    vault_lp_v18::live_exit_senior_value(senior_claim, nav, lp_value_at_eff, lp_equity_worse)
-                };
-                let atoms = vault_lp_v18::senior_atoms_for_redemption(
+                // Out of line (SBF frame): tag 77 sits at the 4,096-byte frame edge.
+                execute_redemption_bound_pricing(
+                    &cfg_nav,
+                    &group,
+                    lp_ai,
+                    st,
+                    &registry,
                     redemption.shares,
-                    registry.total_lp_shares_outstanding,
-                    senior_value,
-                )
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                // Principal first, never more than the payout: part of the pots' principal can
-                // belong to the junior (e.g. a recall that over-covered after a later loss).
-                // F-8: in Resolved mode the payout is priced on the pots' PHYSICAL idle backing,
-                // and the ledger's impairment can be stale there (see
-                // `vault_physical_idle_backing_atoms`), so the whole payout is drawn as principal;
-                // the bucket gates below still enforce that it physically exists.
-                let principal = if resolved {
-                    atoms
-                } else {
-                    vault_lp_v18::senior_principal_portion(
-                        redemption.shares,
-                        available_principal,
-                        registry.total_lp_shares_outstanding,
-                        atoms,
-                    )
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                };
-                (atoms, principal)
+                    asset_index,
+                    nav,
+                    available_principal,
+                )?
             } else {
                 let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
                     redemption.shares,
@@ -26001,36 +26082,15 @@ pub mod processor {
             // tests/v16_fork_lp_vault_redeem.rs.
             let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
             if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
-                let outstanding_post = bucket.valid_liened_backing_num;
-                // Post-redeem NAV: recompute with post-withdrawal counters.
-                let post_principal = ledger
-                    .total_principal_atoms
-                    .checked_sub(principal_portion)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                // Use gross_consumed (not earnings_portion) so nav_post reflects
-                // the correct remaining net_earnings for the fee_share split.
-                let post_earnings_withdrawn = ledger
-                    .total_earnings_withdrawn_atoms
-                    .checked_add(gross_consumed)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let nav_post_atoms = lp_vault_nav_atoms_floored(
-                    post_principal,
-                    ledger.total_earnings_atoms,
-                    post_earnings_withdrawn,
-                    ledger.cumulative_loss_atoms,
-                    ledger.cumulative_recovery_atoms,
+                // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
+                execute_redemption_oi_reservation_check(
+                    &ledger,
+                    principal_portion,
+                    gross_consumed,
+                    bucket.valid_liened_backing_num,
+                    registry.oi_reservation_threshold_bps,
                     registry.fee_share_bps,
                 )?;
-                let nav_post_num = nav_post_atoms
-                    .checked_mul(BOUND_SCALE)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let covered = nav_post_num
-                    .checked_mul(registry.oi_reservation_threshold_bps as u128)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                    / 10_000u128;
-                if covered < outstanding_post {
-                    return Err(PercolatorError::LpVaultOiReservationViolated.into());
-                }
             }
             // ── Principal-side bucket mutation. ──
             bucket.fresh_unliened_backing_num = bucket
