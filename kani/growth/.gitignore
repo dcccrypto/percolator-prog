@@ -1,0 +1,4 @@
+target/
+logs/
+mutants/growth_v19_mutant.rs
+__pycache__/
