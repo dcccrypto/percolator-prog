@@ -25571,6 +25571,22 @@ pub mod processor {
             
             true,)?;
         }
+        // F-3 (security review of E1, 2026-10-04): on a Resolved NON-bound market the harvest runs
+        // INLINE before the redemption is priced, so a holder who redeems before anyone cranks 78
+        // cannot leave their share of the stranded value to later redeemers. 78 stays the
+        // permissionless way to do the same without redeeming. Chosen over refusing (a new error
+        // code would collide with growth-v19's 92-94 in this sequential enum, and refusing would
+        // make every app/keeper bundle 78 x2 before 77). No-op unless terminal-flat.
+        if bound_tail.is_none() && mode == MarketModeV16::Resolved {
+            nonbound_terminal_absorb_both_pots(
+                program_id,
+                market_ai,
+                &registry_pda,
+                registry.domain,
+                ledger_ai,
+                sibling_ledger_ai,
+            )?;
+        }
         // ── NAV (pre-withdraw) → atoms (round DOWN). ──
         //
         // SPLIT: atoms = principal_portion + earnings_portion.
@@ -26750,7 +26766,11 @@ pub mod processor {
                 }
                 stray
             } else if resolved_terminal_harvest {
-                match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(domain / 2) {
+                // F-1: every configured asset's insurance recredit runs before the slab-global
+                // residual is absorbed (`terminal_recredit_all_assets`).
+                match terminal_recredit_all_assets(&mut group, domain / 2).map(|ready| {
+                    if ready { Ok(()) } else { Err(percolator::V16Error::LockActive) }
+                })? {
                     Ok(_) => {
                         let residual = vault_terminal_residual_atoms(&group)?;
                         if residual != 0 {
@@ -28837,6 +28857,44 @@ pub mod processor {
         Ok(credited)
     }
 
+    /// F-1 (security review of E1, 2026-10-04): before ANY slab-global Residual is absorbed into
+    /// one asset's pot, run the engine's claim-free insurance recredit (insurance's entitled
+    /// overlap of receivable × paired insurance spend × residual, upstream 76a86f48) for EVERY
+    /// configured asset that has one pending, not just the target's. Otherwise a second traded
+    /// asset's entitlement would be paid to the target asset's vault.
+    ///
+    /// The target asset is always called. That keeps the engine's `require_terminal_claim_free_state`
+    /// gate on the path, exactly as the single-asset call did. Other assets are called only when the
+    /// read-only overlap pre-check (receivable on a side × the paired side's insurance spend) is
+    /// non-zero, so the cost stays bounded by the configured slots (≤ 14) and by what is pending.
+    /// Returns `Ok(false)` when the engine is not terminal-ready (LockActive): the caller absorbs
+    /// no Residual.
+    #[inline(never)]
+    fn terminal_recredit_all_assets(
+        group: &mut state::MarketViewMutV16<'_>,
+        target_asset: usize,
+    ) -> Result<bool, ProgramError> {
+        let configured = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        for a in core::iter::once(target_asset).chain((0..configured).filter(|a| *a != target_asset)) {
+            if a != target_asset {
+                let slot = &group.markets[a].engine;
+                let long_recv = slot.source_credit_long.provider_receivable_num.get() / BOUND_SCALE;
+                let short_recv = slot.source_credit_short.provider_receivable_num.get() / BOUND_SCALE;
+                let pending = long_recv.min(slot.insurance_domain_spent_short.get()) != 0
+                    || short_recv.min(slot.insurance_domain_spent_long.get()) != 0;
+                if !pending {
+                    continue;
+                }
+            }
+            match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(a) {
+                Ok(_) => {}
+                Err(percolator::V16Error::LockActive) => return Ok(false),
+                Err(e) => return Err(map_v16_error(e)),
+            }
+        }
+        Ok(true)
+    }
+
     /// NON-bound terminal-flat Resolved harvest (tag 78; earn-drain-replay-2026-10-04 §5). The
     /// caller has already synced `ledger` (the target pot's) against the pre-harvest bucket.
     ///
@@ -28862,35 +28920,34 @@ pub mod processor {
         receipts_open: bool,
     ) -> Result<u128, ProgramError> {
         let available_before = backing_ledger_available_principal_atoms(ledger);
-        if !receipts_open {
-            match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(domain / 2) {
-                Ok(_) => {
-                    let residual = vault_terminal_residual_atoms(group)?;
-                    if residual != 0 {
-                        add_fresh_counterparty_backing_view(
-                            group,
-                            domain,
-                            residual
-                                .checked_mul(BOUND_SCALE)
-                                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
-                            crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
-                        )?;
-                        group.validate_shape().map_err(map_v16_error)?;
-                        solana_program::log::sol_log(&alloc::format!(
-                            "nonbound_terminal_residual_absorbed to={} atoms={}",
-                            domain, residual
-                        ));
-                    }
-                }
-                // Same as the bound path: the engine is not terminal-ready for its recredit, so
-                // the residual is left alone. The pot reconciliation below is independent of it.
-                Err(percolator::V16Error::LockActive) => {}
-                Err(e) => return Err(map_v16_error(e)),
+        // (Ok(false) = the engine is not terminal-ready for its recredit (LockActive): the
+        // residual is left alone, as on the bound path.)
+        if !receipts_open && terminal_recredit_all_assets(group, domain / 2)? {
+            let residual = vault_terminal_residual_atoms(group)?;
+            if residual != 0 {
+                add_fresh_counterparty_backing_view(
+                    group,
+                    domain,
+                    residual
+                        .checked_mul(BOUND_SCALE)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                )?;
+                group.validate_shape().map_err(map_v16_error)?;
+                solana_program::log::sol_log(&alloc::format!(
+                    "nonbound_terminal_residual_absorbed to={} atoms={}",
+                    domain, residual
+                ));
             }
         }
         let (source, bucket) = backing_domain_parts_view(group, domain)?;
         sync_backing_domain_ledger(ledger, &bucket)?;
-        if bucket.status == BackingBucketStatusV16::Fresh
+        // F-2: while receipts are open, pot stray stays where it is (P3 option (b) reserves the
+        // claim-free value for them; upstream c3988149 keeps each bucket's junior need pledged).
+        // It is credited by the 78/77 that runs once the receipts finalise and nothing is
+        // materialised.
+        if !receipts_open
+            && bucket.status == BackingBucketStatusV16::Fresh
             && source.positive_claim_bound_num == 0
             && bucket.valid_liened_backing_num == 0
         {
@@ -28919,6 +28976,58 @@ pub mod processor {
             }
         }
         Ok(backing_ledger_available_principal_atoms(ledger).saturating_sub(available_before))
+    }
+
+    /// F-3: the non-bound terminal-flat harvest of BOTH pots, run inline by a Resolved tag 77
+    /// (and identical to tag 78 on each pot: same helper, same gates). A pot whose ledger account
+    /// is uninitialised or not writable is skipped (77 cannot create ledger PDAs; 78 can). The
+    /// residual is absorbed into the registry's own pot first; the sibling then only reconciles.
+    /// Returns Ok with no effect unless the market is Resolved and terminal-flat, and the registry
+    /// is still the backing authority (PROG-1) of the pot.
+    #[inline(never)]
+    fn nonbound_terminal_absorb_both_pots<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        registry_pda: &Pubkey,
+        registry_domain: u16,
+        ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let (terminal_flat, receipts_open) = resolved_terminal_flat(&group)?;
+        if !terminal_flat {
+            return Ok(());
+        }
+        for (pot_domain, pot_ai) in [
+            (registry_domain, ledger_ai),
+            (sibling_domain(registry_domain), sibling_ledger_ai),
+        ] {
+            if pot_ai.data_is_empty() || !pot_ai.is_writable || pot_ai.owner != program_id {
+                continue;
+            }
+            let domain = pot_domain as usize;
+            let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                continue;
+            }
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let mut data = pot_ai.try_borrow_mut_data()?;
+            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+                &data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                pot_domain,
+                &bucket,
+            )?;
+            if !initialized {
+                continue;
+            }
+            sync_backing_domain_ledger(&mut ledger, &bucket)?;
+            nonbound_terminal_absorb(&mut group, domain, &mut ledger, receipts_open)?;
+            write_or_init_backing_domain_ledger(&mut data, &ledger, initialized)?;
+        }
+        Ok(())
     }
 
     /// Σ over the bound asset's two pots of Fresh backing that is NOT vault-owned (atoms).

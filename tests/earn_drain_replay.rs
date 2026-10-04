@@ -262,6 +262,9 @@ struct Replay {
     crank_err: usize,
     crank_codes: std::collections::BTreeMap<u32, usize>,
     user_err: Vec<String>,
+    /// (count, sum, max) CU of successful keeper cranks / pushes.
+    crank_cu: (u64, u64, u64),
+    push_cu: (u64, u64, u64),
     peak_consumed: u128,
     peak_earn_loss: u128,
 }
@@ -316,6 +319,8 @@ impl Replay {
             crank_err: 0,
             crank_codes: Default::default(),
             user_err: Vec::new(),
+            crank_cu: (0, 0, 0),
+            push_cu: (0, 0, 0),
             peak_consumed: 0,
             peak_earn_loss: 0,
         };
@@ -473,8 +478,15 @@ impl Replay {
             ],
             &[&admin],
         );
-        if r.is_err() {
-            self.push_err += 1;
+        match r {
+            Ok(cu) => {
+                self.push_cu = (
+                    self.push_cu.0 + 1,
+                    self.push_cu.1 + cu,
+                    self.push_cu.2.max(cu),
+                )
+            }
+            Err(_) => self.push_err += 1,
         }
     }
 
@@ -501,12 +513,21 @@ impl Replay {
             ],
             &[],
         );
-        if let Err(e) = r {
-            self.crank_err += 1;
-            *self
-                .crank_codes
-                .entry(custom_code(&e).unwrap_or(u32::MAX))
-                .or_default() += 1;
+        match r {
+            Ok(cu) => {
+                self.crank_cu = (
+                    self.crank_cu.0 + 1,
+                    self.crank_cu.1 + cu,
+                    self.crank_cu.2.max(cu),
+                )
+            }
+            Err(e) => {
+                self.crank_err += 1;
+                *self
+                    .crank_codes
+                    .entry(custom_code(&e).unwrap_or(u32::MAX))
+                    .or_default() += 1;
+            }
         }
     }
 
@@ -852,6 +873,15 @@ fn swordcat_replay_report() {
     t0.print("after trade");
     a.print("audit slot 507240948");
     e.print("end (507250189)");
+    eprintln!(
+        "CU keeper cranks n={} mean={} max={} | pushes n={} mean={} max={}",
+        r.crank_cu.0,
+        r.crank_cu.1 / r.crank_cu.0.max(1),
+        r.crank_cu.2,
+        r.push_cu.0,
+        r.push_cu.1 / r.push_cu.0.max(1),
+        r.push_cu.2
+    );
     eprintln!(
         "push errors {} / crank errors {} {:?} | peak consumed {:.6} | peak Earn loss {:.6}",
         r.push_err,
@@ -1340,6 +1370,15 @@ fn backpack_replay_report() {
         s.print(&format!("backpack <= {cp}"));
     }
     eprintln!(
+        "CU keeper cranks n={} mean={} max={} | pushes n={} mean={} max={}",
+        r.crank_cu.0,
+        r.crank_cu.1 / r.crank_cu.0.max(1),
+        r.crank_cu.2,
+        r.push_cu.0,
+        r.push_cu.1 / r.push_cu.0.max(1),
+        r.push_cu.2
+    );
+    eprintln!(
         "push errors {} / crank errors {} {:?} / user errors {:?} | peak consumed {:.6} | peak Earn loss {:.6}",
         r.push_err,
         r.crank_err,
@@ -1490,7 +1529,31 @@ struct HarvestOutcome {
     vault_left: u64,
 }
 
-fn run_resolved_harvest() -> HarvestOutcome {
+/// The harvest world up to terminal-flat (Resolved, every portfolio closed), before any 78.
+struct TerminalWorld {
+    r: Replay,
+    h: Keypair,
+    h_atas: [Pubkey; 2],
+    stranded_before: i128,
+    engine_residual_before: i128,
+}
+
+/// (InitMarket with 14 slots configures all 14 assets, as on every live slab; asset 0 trades.)
+fn terminal_flat_world() -> TerminalWorld {
+    resolved_world(Closing::All)
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Closing {
+    /// CloseResolved + tag 8 on everyone: terminal-flat, nothing materialized.
+    All,
+    /// Same, but A2 (emptied by CloseResolved) is NOT tag-8 closed: one materialized portfolio.
+    KeepA2Materialized,
+    /// Nobody is closed: Resolved with trader capital still in portfolios.
+    None,
+}
+
+fn resolved_world(closing: Closing) -> TerminalWorld {
     let mut r = Replay::new(r2_market());
     // The incumbent is the only Earn holder: re-deposit as a known key so it can redeem.
     let h = Keypair::new();
@@ -1528,8 +1591,58 @@ fn run_resolved_harvest() -> HarvestOutcome {
         (tk.pubkey(), t),
         (r.lp_owner.pubkey(), r.lp),
     ];
+    match closing {
+        Closing::None => {
+            return TerminalWorld {
+                r,
+                h,
+                h_atas: [h_ata0, h_ata1],
+                stranded_before,
+                engine_residual_before,
+            };
+        }
+        Closing::KeepA2Materialized => {
+            r.close_resolved_any(a2k.pubkey(), a2)
+                .expect("A2 CloseResolved");
+            let rest = [owners[0], owners[2], owners[3]];
+            close_all_resolved(&mut r, &rest);
+            let (_, g) = r.env.market_state();
+            assert_eq!(
+                (g.c_tot, g.materialized_portfolio_count),
+                (0, 1),
+                "only A2 stays materialized"
+            );
+            return TerminalWorld {
+                r,
+                h,
+                h_atas: [h_ata0, h_ata1],
+                stranded_before,
+                engine_residual_before,
+            };
+        }
+        Closing::All => close_all_resolved(&mut r, &owners),
+    }
+    let (_, g) = r.env.market_state();
+    assert_eq!(
+        (g.c_tot, g.materialized_portfolio_count, g.pnl_pos_tot),
+        (0, 0, 0),
+        "terminal-flat (vault {}, mode {:?})",
+        g.vault,
+        g.mode
+    );
+    TerminalWorld {
+        r,
+        h,
+        h_atas: [h_ata0, h_ata1],
+        stranded_before,
+        engine_residual_before,
+    }
+}
+
+/// CloseResolved then permissionless tag 8 on each portfolio, until nothing is materialized.
+fn close_all_resolved(r: &mut Replay, owners: &[(Pubkey, Pubkey)]) {
     for round in 0..6 {
-        for (k, p) in owners {
+        for &(k, p) in owners {
             if r.env
                 .svm
                 .get_account(&p)
@@ -1546,7 +1659,7 @@ fn run_resolved_harvest() -> HarvestOutcome {
             }
         }
         // Permissionless tag 8 on each emptied portfolio (rent to its owner), as the keeper does.
-        for (k, p) in owners {
+        for &(k, p) in owners {
             let closer = Keypair::new();
             r.env.ensure_signer_account(closer.pubkey());
             let Ok((pid, seq, ep)) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1555,7 +1668,7 @@ fn run_resolved_harvest() -> HarvestOutcome {
                 continue;
             };
             r.env.svm.expire_blockhash();
-            let res = r.env.send(
+            let _ = r.env.send(
                 ProgInstruction::ClosePortfolio {
                     portfolio_id: pid,
                     expected_sequence: seq,
@@ -1569,26 +1682,41 @@ fn run_resolved_harvest() -> HarvestOutcome {
                 ],
                 &[&closer],
             );
-            if std::env::var("R2_DEBUG").is_ok() {
-                eprintln!(
-                    "round {round} tag8 {p}: {:?}",
-                    res.as_ref().map_err(|e| custom_code(e))
-                );
-            }
         }
         let (_, g) = r.env.market_state();
         if g.materialized_portfolio_count == 0 {
             break;
         }
     }
-    let (_, g) = r.env.market_state();
-    assert_eq!(
-        (g.c_tot, g.materialized_portfolio_count, g.pnl_pos_tot),
-        (0, 0, 0),
-        "terminal-flat (vault {}, mode {:?})",
-        g.vault,
-        g.mode
-    );
+}
+
+/// Write only the bytes of the fields `f` changes (read_market/write_market is not byte-neutral
+/// on these slabs: it rewrites wrapper bytes it does not model).
+fn mutate_market_surgical(r: &mut Replay, f: impl FnOnce(&mut state::MarketGroupV16)) {
+    let original = r.env.svm.get_account(&r.env.market).expect("market");
+    let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+    let mut noop = original.data.clone();
+    state::write_market(&mut noop, &cfg, &g).unwrap();
+    f(&mut g);
+    let mut mutated = original.data.clone();
+    state::write_market(&mut mutated, &cfg, &g).unwrap();
+    let mut acct = original;
+    for i in 0..acct.data.len() {
+        if mutated[i] != noop[i] {
+            acct.data[i] = mutated[i];
+        }
+    }
+    r.env.svm.set_account(r.env.market, acct).unwrap();
+}
+
+fn run_resolved_harvest() -> HarvestOutcome {
+    let TerminalWorld {
+        mut r,
+        h,
+        h_atas,
+        stranded_before,
+        engine_residual_before,
+    } = terminal_flat_world();
     // Harvest both pots, then the incumbent redeems everything it holds.
     let r78 = [
         r.crank_fees_78(0).map_err(|e| custom_code(&e)),
@@ -1597,13 +1725,11 @@ fn run_resolved_harvest() -> HarvestOutcome {
     let after78 = r.snap();
     after78.print("after 78");
     let mut incumbent_paid = 0u64;
-    for ata in [h_ata0, h_ata1] {
+    for ata in h_atas {
         incumbent_paid += r
             .redeem_all(&h, ata)
             .unwrap_or_else(|e| panic!("H 77: {e}"));
     }
-    // The creator's Replay::new deposits (1,000 + 1,000) also hold shares; redeem them too so the
-    // vault can empty (they are part of the same incumbent class).
     let vault_left = r.env.token_amount(r.env.vault);
     HarvestOutcome {
         stranded_before,
@@ -1649,5 +1775,146 @@ fn nonbound_resolved_terminal_harvest_returns_stranded_value() {
         o.incumbent_paid,
         o.stranded_before,
         o.engine_residual_before
+    );
+}
+
+/// F-1 (security review of E1): 2-asset slab. Asset 1 carries a pending terminal insurance
+/// recredit (receivable on its long source × insurance spent on its short domain), and the slab
+/// carries extra claim-free Residual. The harvest on ASSET 0's vault must run asset 1's recredit
+/// before absorbing the slab-global Residual. Without that, insurance's 40 goes to asset 0's Earn
+/// holders. RED on 54825149 (single-asset recredit), GREEN on the F-1 build.
+#[test]
+fn f1_harvest_runs_every_assets_insurance_recredit_before_absorbing_residual() {
+    const R: u128 = 40_000_000; // receivable on asset 1's long source
+    const X: u128 = 40_000_000; // insurance spent on asset 1's short domain
+    const Y: u128 = 100_000_000; // extra claim-free Residual
+    let TerminalWorld { mut r, .. } = terminal_flat_world();
+    let bs = BOUND_SCALE;
+    mutate_market_surgical(&mut r, |g| {
+        g.source_credit[2].provider_receivable_num = R * bs;
+        g.source_credit[2].spent_backing_num = R * bs;
+        g.source_backing_buckets[2].consumed_liened_backing_num = R * bs;
+        g.source_backing_buckets[2].status = percolator::BackingBucketStatusV16::Expired;
+        g.insurance_domain_budget[3] = X; // a domain that spent X had a budget of at least X
+        g.insurance_domain_spent[3] = X;
+        g.vault += Y;
+    });
+    let vault_tokens = r.env.token_amount(r.env.vault) as u128;
+    let (mint, va) = (r.env.mint, r.env.vault_authority);
+    r.env
+        .set_token_account_amount(r.env.vault, mint, va, (vault_tokens + Y) as u64);
+    let before = r.snap();
+    before.print("F-1 before 78");
+    let r78 = r.crank_fees_78(0);
+    let after = r.snap();
+    after.print("F-1 after 78");
+    r78.unwrap_or_else(|e| panic!("78 on asset 0's vault: {e}"));
+    assert!(
+        before.engine_residual() >= (R as i128),
+        "vacuity: residual covers the entitlement"
+    );
+    assert_eq!(
+        after.insurance - before.insurance,
+        R.min(X),
+        "asset 1's insurance recredit ran before the residual was absorbed into asset 0's pot"
+    );
+    assert_eq!(
+        after.engine_residual(),
+        0,
+        "the rest of the Residual is absorbed"
+    );
+}
+
+/// Raw offset of asset 0's wrapper receipt-only counter (`MARKET_RESOLVED_RECEIPT_ONLY_OFF` within
+/// the asset slot, whose wrapper bytes come first).
+fn receipt_only_counter_offset() -> usize {
+    use percolator_prog::constants::{
+        HEADER_LEN, MARKET_GROUP_LEN, MARKET_RESOLVED_RECEIPT_ONLY_OFF, WRAPPER_CONFIG_LEN,
+    };
+    HEADER_LEN + WRAPPER_CONFIG_LEN + MARKET_GROUP_LEN + MARKET_RESOLVED_RECEIPT_ONLY_OFF
+}
+
+/// F-2: with receipts OPEN, the non-bound harvest must not credit pot stray to Earn (it stays
+/// reserved, P3 option (b) / upstream c3988149's per-bucket junior need). The open receipt here
+/// is the WRAPPER's own state, set directly: one materialized, emptied portfolio counted
+/// receipt-only (the counter `resolved_terminal_flat` reads), so `receipts_open` is true. An
+/// E1-native receipt needs a legacy unbacked claim (see p3_resolved_lock's legacy fixture).
+/// RED on 54825149 (the stray was credited), GREEN on the F-2 build.
+#[test]
+fn f2_receipts_open_harvest_does_not_credit_pot_stray() {
+    let TerminalWorld { mut r, .. } = resolved_world(Closing::KeepA2Materialized);
+    let off = receipt_only_counter_offset();
+    let mut acct = r.env.svm.get_account(&r.env.market).unwrap();
+    acct.data[off..off + 8].copy_from_slice(&1u64.to_le_bytes());
+    r.env.svm.set_account(r.env.market, acct).unwrap();
+    let before = r.snap();
+    before.print("F-2 before 78 (receipts open)");
+    let r78 = r.crank_fees_78(0);
+    let after = r.snap();
+    after.print("F-2 after 78");
+    r78.unwrap_or_else(|e| panic!("78 with receipts open: {e}"));
+    assert!(
+        before.fresh[0] > before.earn_nav.min(before.fresh[0]) || before.unowned() > 0,
+        "vacuity: there is pot stray to protect"
+    );
+    assert_eq!(
+        after.earn_nav, before.earn_nav,
+        "no pot stray credited to Earn while receipts are open"
+    );
+    assert_eq!(
+        after.engine_residual(),
+        before.engine_residual(),
+        "the receipts' residual is untouched"
+    );
+}
+
+/// F-3: a Resolved non-bound 77 runs the harvest inline, so the first redeemer cannot leave its
+/// share of the stranded value to later redeemers, and nobody has to crank 78 first. No 78 is
+/// sent. RED on 54825149 (H paid 1,850), GREEN on the F-3 build (H paid 2,000).
+#[test]
+fn f3_resolved_77_harvests_inline_without_78() {
+    let TerminalWorld {
+        mut r,
+        h,
+        h_atas,
+        stranded_before,
+        ..
+    } = terminal_flat_world();
+    assert!(stranded_before > 0, "vacuity: value is stranded");
+    let mut paid = 0u64;
+    for ata in h_atas {
+        paid += r
+            .redeem_all(&h, ata)
+            .unwrap_or_else(|e| panic!("H 77: {e}"));
+    }
+    eprintln!("F-3: H paid {paid} without any 78 (stranded before resolve {stranded_before})");
+    assert!(
+        (paid as i128 - 2_000_000_000).abs() <= 2,
+        "H paid {paid}, owed 2,000"
+    );
+}
+
+/// F-6b: tag 78 stays refused (21) on a Resolved market that still has an OPEN portfolio with
+/// trader capital (a real one, not a synthetic c_tot byte): converting insurance or absorbing
+/// residual there would take value traders can still claim.
+#[test]
+fn f6_resolved_78_refused_while_a_real_portfolio_is_open() {
+    let TerminalWorld { mut r, .. } = resolved_world(Closing::None);
+    let (_, g) = r.env.market_state();
+    assert!(
+        g.c_tot > 0 && g.materialized_portfolio_count > 0,
+        "vacuity: traders still hold capital"
+    );
+    let before = r.snap();
+    for d in 0..2u16 {
+        let e = r
+            .crank_fees_78(d)
+            .expect_err("78 must refuse while a portfolio is open");
+        assert_eq!(custom_code(&e), Some(21), "EngineLockActive, got {e}");
+    }
+    let after = r.snap();
+    assert_eq!(
+        (after.vault, after.insurance, after.fresh_total),
+        (before.vault, before.insurance, before.fresh_total)
     );
 }
