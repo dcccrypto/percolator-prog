@@ -4570,6 +4570,60 @@ fn diluted_receipt_run(fee: u64, plain: bool, ops: &[Op]) -> (Result<(), String>
     (r, st.soft.get("close_resolved_haircut_atoms").copied().unwrap_or(0), w.shortfall)
 }
 
+/// LEGACY-MARKET fixture for the #175 source reclass (engine `release/v18.3-engine-175`).
+///
+/// The eedb shape only opens a diluted receipt because of #175: the winner u1's +4,873 claim
+/// sits on d1, and on the deployed engine (35ddd692) the support netted earlier was orphaned into
+/// Residual (4,875), leaving d1 Empty at credit rate 0, so the claim is UNBACKED and its Resolved
+/// close is paid from the diluted junior snapshot (1,340 short). The E1 engine books that support
+/// into d1 (fresh 4,875, rate 1), so the claim is paid in full and no receipt opens (measured
+/// 2026-10-04: owed 0, residual 0).
+///
+/// Markets that ran on the pre-E1 engine already carry such orphaned claims when E1 is deployed in
+/// place, so the receipt-reservation path these tests protect stays live. This helper rebuilds
+/// that legacy state on an E1 engine. It moves d1's fresh backing back into the claim-free
+/// Residual exactly as 35ddd692 left it. A full state diff of both runs confirmed every differing
+/// field: d1 bucket Fresh/4,875 vs Empty/0, d1 fresh_reserved 4,875 vs 0, d1 credit rate 1 vs 0,
+/// the header fresh total ±4,875, plus epoch counters and u1's cert, which the wind-down
+/// re-certifies. It is a no-op on the deployed engine, where d1 is already Empty. Returns the
+/// atoms moved.
+fn inject_legacy_175_orphan(w: &mut World) -> u128 {
+    let bs = percolator::BOUND_SCALE;
+    let original = w.env.svm.get_account(&w.env.market).expect("market");
+    let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+    let b = &mut g.source_backing_buckets[1];
+    if !(b.status == percolator::BackingBucketStatusV16::Fresh
+        && b.valid_liened_backing_num == 0
+        && b.consumed_liened_backing_num == 0
+        && b.impaired_liened_backing_num == 0
+        && b.fresh_unliened_backing_num > 0)
+    {
+        return 0;
+    }
+    // `read_market`/`write_market` is not byte-neutral on this slab (it rewrites 35 wrapper bytes it
+    // does not model), so write ONLY the bytes of the fields changed here: serialise a no-op round
+    // trip and the mutated one, and copy onto the original exactly the positions where they differ.
+    let mut noop = original.data.clone();
+    state::write_market(&mut noop, &cfg, &state::read_market(&original.data).unwrap().1).unwrap();
+    let moved = b.fresh_unliened_backing_num;
+    b.fresh_unliened_backing_num = 0;
+    b.expiry_slot = 0;
+    b.status = percolator::BackingBucketStatusV16::Empty;
+    g.source_credit[1].fresh_reserved_backing_num -= moved;
+    g.source_credit[1].credit_rate_num = 0;
+    g.source_fresh_backing_total_num -= moved;
+    let mut mutated = original.data.clone();
+    state::write_market(&mut mutated, &cfg, &g).unwrap();
+    let mut acct = original;
+    for i in 0..acct.data.len() {
+        if mutated[i] != noop[i] {
+            acct.data[i] = mutated[i];
+        }
+    }
+    w.env.svm.set_account(w.env.market, acct).unwrap();
+    moved / bs
+}
+
 #[test]
 fn p3_diluted_receipts_finalise_after_vault_lp_settles() {
     let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
@@ -4600,6 +4654,8 @@ fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
         let _ = w.apply(op);
         w.check().expect("invariants");
     }
+    let moved = inject_legacy_175_orphan(&mut w);
+    assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
     let r = w.wind_down();
     std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
     let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0) as u128;
@@ -4609,6 +4665,32 @@ fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
     assert!(owed > 0, "vacuity: the receipt is still open without the sweep");
     assert_eq!(haircut, 0, "the open remainder stays reserved (not a haircut)");
     assert!(w.claim_free_residual() >= owed, "reserved: residual {} >= owed {owed}", w.claim_free_residual());
+}
+
+/// E1 acceptance (#175 source reclass): on a market that never ran the pre-E1 engine, the eedb
+/// winner's +4,873 d1 claim is BACKED (the netted support is booked into d1), so its Resolved close
+/// pays it in full and no receipt opens, even without the post-101 sweep. RED on 35ddd692 bytes
+/// (owed 1,340, Residual 4,875 at resolve), GREEN on E1.
+#[test]
+fn p3_eedb_winner_backed_under_source_reclass_needs_no_receipt() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("ANVIL_NO_KEEPER_TOPUP", "1");
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::remove_var("FUZZ_LP_DOMAINS");
+    std::env::set_var("FUZZ_P3_PRECRANK", "1");
+    let (label, fee, _, ops) = diluted_receipt_cases().into_iter().next().unwrap();
+    let mut w = World::new(fee);
+    for op in &ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants");
+    }
+    let r = w.wind_down();
+    std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
+    let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0);
+    eprintln!("{label} (fresh market, no sweep): {:?} owed {owed} residual {}", r.as_ref().err().map(|e| e.chars().take(120).collect::<String>()), w.claim_free_residual());
+    r.expect("seniors and junior exit");
+    assert_eq!(owed, 0, "the backed winner is paid in full at its first close");
+    assert_eq!(w.claim_free_residual(), 0, "nothing is left owned by nobody");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -4697,6 +4779,10 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     for op in &ops {
         let _ = w.apply(op);
         w.check().expect("invariants");
+    }
+    if mode == EscrowMode::SweepOnceThenIdle {
+        let moved = inject_legacy_175_orphan(&mut w);
+        assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
     }
     let u = 1usize;
     let pf = w.env.portfolio_state(w.ports[u]);
