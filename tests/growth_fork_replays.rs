@@ -231,6 +231,7 @@ fn gate_verdicts(
             taker_cert_initial_req: None,
             lp: Some(growth_v19::GrowthLpIn {
                 before_q: lp_eff,
+                mid_q: lp_eff, // an open from flat has no reducing part
                 after_q: lp_after,
                 eff_after_abs_q: lp_after.unsigned_abs(),
                 equity: c_m,

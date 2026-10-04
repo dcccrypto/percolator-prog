@@ -3470,6 +3470,8 @@ fn growth_params() -> Params {
     Params {
         funding: 1,
         growth: Some((400, 1_000)),
+        // L-2: r_gap 400 must clear max_price_move x 50 slots (4 x 50 = 200).
+        move_bps: 4,
         ..Params::default()
     }
 }
@@ -3608,7 +3610,7 @@ fn growth_v19_tag94_g4_defaults() {
     pre.set_fee_channel(1, 7).expect("UA tag 93 before bind");
     pre.bind(2_000);
     let r = risk_limits(&pre);
-    assert_eq!((r.matcher_ext_mode, r.max_requested_fee_bps, r.lp_floor_atoms), (1, 7, 0), "not overwritten");
+    assert_eq!((r.matcher_ext_mode, r.max_requested_fee_bps, r.lp_floor_atoms), (1, 7, percolator_prog::growth_v19::GROWTH_PIN_LP_FLOOR_ATOMS), "L-4: preset fields kept, zero fields defaulted");
 }
 
 /// G4 LP floor: a growth vault LP halts risk-increasing fills while its equity is at or below
@@ -3664,4 +3666,56 @@ fn growth_v19_c_launch_recorded_once() {
     let la = legacy.admin.insecure_clone();
     legacy.junior_deposit_as(&la, llp.portfolio, 1_000_000_000).expect("junior");
     assert!(state::read_asset_growth(&legacy.svm.get_account(&legacy.market).unwrap().data, 0, 1_000).unwrap().is_none());
+}
+
+/// M-1 on a BOUND growth market with the canonical kind-2 matcher: a thin-side close at
+/// capacity, and in matcher CLOSED mode (the wrapper sends inventory cap 0 while the market's
+/// h-lock reads latched), fills in full. STATE POKE: `bankruptcy_hlock_active` (a real latched
+/// h-lock needs a bankruptcy with an unconverted winner; the engine clears this stale flag only
+/// later, inside the trade, so the pre-matcher read still sends the closed cap).
+#[test]
+fn growth_v19_m1_bound_close_at_capacity_and_in_closed_mode() {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    let whale = env.new_trader(100_000_000_000);
+    let thin = env.new_trader(100_000_000);
+    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, 100).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin short 100");
+    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, 100).expect("crowd to capacity");
+    // close at capacity
+    env.trade_signing_fee(&thin, &lp, 40 * 1_000_000, 100).expect("partial close at capacity");
+    assert_eq!(env.position(thin.portfolio), -(60 * 1_000_000), "filled in full");
+    // closed mode
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let (cfg, mut group) = state::read_market(&m.data).unwrap();
+    group.bankruptcy_hlock_active = true;
+    state::write_market(&mut m.data, &cfg, &group).unwrap();
+    env.svm.set_account(env.market, m).unwrap();
+    env.trade_signing_fee(&thin, &lp, 60 * 1_000_000, 100).expect("close in closed mode");
+    assert_eq!(env.position(thin.portfolio), 0, "never trapped");
+}
+
+/// M-1 with the P2 extension switched OFF afterwards by the upgrade authority (tag 93, mode 0):
+/// the v1 block then carries no flags, so the wrapper must mark the v3 block TAKER_REDUCING
+/// itself or the matcher's closed mode would zero-fill the close.
+#[test]
+fn growth_v19_m1_bound_close_in_closed_mode_with_ext_mode_0() {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
+    let whale = env.new_trader(100_000_000_000);
+    let thin = env.new_trader(100_000_000);
+    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, 100).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), 100).expect("thin short 100");
+    env.set_fee_channel(0, 0).expect("UA: ext mode 0, fee channel off");
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let (cfg, mut group) = state::read_market(&m.data).unwrap();
+    group.bankruptcy_hlock_active = true;
+    state::write_market(&mut m.data, &cfg, &group).unwrap();
+    env.svm.set_account(env.market, m).unwrap();
+    env.trade_signing_fee(&thin, &lp, 100 * 1_000_000, 0).expect("close in closed mode, mode 0");
+    assert_eq!(env.position(thin.portfolio), 0, "never trapped");
 }

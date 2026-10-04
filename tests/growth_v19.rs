@@ -54,6 +54,7 @@ const R_GAP: u16 = 400;
 const GROWTH_LEVERAGE_EXCEEDED: &str = "Custom(92)";
 const GROWTH_CAPACITY_FULL: &str = "Custom(93)";
 const GROWTH_INVALID_CONFIG: &str = "Custom(94)";
+const GROWTH_NEEDS_LP_COUNTERPARTY: &str = "Custom(95)";
 
 fn program_path() -> PathBuf {
     if let Some(p) = std::env::var_os("GROWTH_WRAPPER_SO") {
@@ -246,7 +247,8 @@ fn init_market_ix(c: &MarketCfg) -> ProgInstruction {
         liquidation_fee_bps: c.liq_fee,
         liquidation_fee_cap: 1_000_000_000_000_000,
         min_liquidation_abs: 0,
-        max_price_move_bps_per_slot: 100,
+        // 4 bps/slot = the wizard's 10x setting; the L-2 r_gap floor is then 4 x 50 = 200 bps.
+        max_price_move_bps_per_slot: 4,
         max_accrual_dt_slots: 1,
         max_abs_funding_e9_per_slot: c.funding,
         min_funding_lifetime_slots: 1,
@@ -1254,24 +1256,26 @@ fn growth_batch_cpi_is_gated() {
 
 #[test]
 fn growth_nocpi_is_gated() {
-    // Two non-LP portfolios (no crowd step): BOTH sides face the 5x launch ceiling.
+    // Two non-LP portfolios: on a growth asset every OPEN must face an LP (M-1 / P1 F-7), so a
+    // trader-vs-trader NoCpi open is refused on BOTH sides, whatever the margin.
     let mut env = Env::new(MarketCfg::growth(500));
     let (p, pp) = env.trader(15 * USD);
     let (q, qp) = env.trader(100 * USD);
     assert_err(
         &env.trade_nocpi(&p, pp, &q, qp, units(100)),
-        GROWTH_LEVERAGE_EXCEEDED,
-        "a side at 6.7x",
+        GROWTH_NEEDS_LP_COUNTERPARTY,
+        "trader-vs-trader open (a side)",
     );
     assert_err(
         &env.trade_nocpi(&q, qp, &p, pp, units(100)),
-        GROWTH_LEVERAGE_EXCEEDED,
-        "b side at 6.7x",
+        GROWTH_NEEDS_LP_COUNTERPARTY,
+        "trader-vs-trader open (b side)",
     );
-    let (r, rp) = env.trader(20 * USD);
-    assert_ok(
-        &env.trade_nocpi(&r, rp, &q, qp, units(100)),
-        "both sides within 5x",
+    let (r, rp) = env.trader(1_000 * USD);
+    assert_err(
+        &env.trade_nocpi(&r, rp, &q, qp, units(10)),
+        GROWTH_NEEDS_LP_COUNTERPARTY,
+        "even at 1x",
     );
     // NoCpi against an LP portfolio (enabled matcher): the crowd step applies.
     let lp = env.lp(1_000 * USD);
@@ -1559,6 +1563,42 @@ fn growth_ua_dials_tighten_only_and_take_effect() {
         &env.set_growth_dials(&ua, 10_000, 5_000),
         "back to defaults",
     );
+    // L-4: the dial form touches ONLY the dial bytes -- a non-zero legacy body is refused and a
+    // dial change leaves the risk-limits record byte-identical.
+    let limits_before = state::read_asset_risk_limits(&env.market_bytes(), 0).unwrap();
+    let (pd, market) = (env.program_data, env.market);
+    let with_body = ProgInstruction::SetAssetRiskLimitsV19 {
+        limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+            asset_index: 0,
+            exec_band_bps: 0,
+            lp_exposure_k_bps: 0,
+            lp_floor_atoms: 0,
+            side_oi_cap_q: 0,
+            matcher_ext_mode: 1,
+            max_requested_fee_bps: 0,
+        }),
+        growth_lambda_bps: 9_000,
+        growth_kink_bps: 4_000,
+    };
+    assert_err(
+        &env.send(
+            with_body,
+            vec![
+                AccountMeta::new(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&ua],
+        ),
+        "Custom(9)",
+        "dial form with a non-zero legacy body",
+    );
+    assert_ok(&env.set_growth_dials(&ua, 9_000, 4_000), "dials only");
+    assert_eq!(
+        state::read_asset_risk_limits(&env.market_bytes(), 0).unwrap(),
+        limits_before
+    );
+
     // growth OFF market: the dial trailer is refused
     let mut legacy = Env::new(MarketCfg::legacy());
     let lua = legacy.upgrade_authority.insecure_clone();
@@ -1582,4 +1622,171 @@ fn growth_ua_dials_tighten_only_and_take_effect() {
         ProgInstruction::decode(&legacy_bytes).unwrap(),
         ProgInstruction::SetAssetRiskLimits { .. }
     ));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Security review 2026-10-04, M-1: a reducing / closing taker is never refused or zero-filled
+// (reviewer repro `sec_thin_side_close_when_lp_at_capacity`, now asserted)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Book: N_cap 1,000 units. W crowds long to 900, T opens a THIN short 100 (LP -800), W fills
+/// the crowd to capacity (LP -1,000). T's close (a buy) GROWS |LP| past N_cap.
+fn m1_book(env: &mut Env) -> (Lp, Pubkey, (Keypair, Pubkey)) {
+    let lp = env.lp(1_000 * USD);
+    let (w, wp) = env.trader(100_000 * USD);
+    let (t, tp) = env.trader(100 * USD);
+    assert_ok(&env.trade_cpi(&w, wp, &lp, units(900)), "W crowd 900");
+    assert_ok(&env.trade_cpi(&t, tp, &lp, -units(100)), "T thin short 100");
+    assert_ok(
+        &env.trade_cpi(&w, wp, &lp, units(5_000)),
+        "W clipped to capacity",
+    );
+    assert_eq!(env.pos(lp.account), -units(1_000), "LP at N_cap");
+    (lp, wp, (t, tp))
+}
+
+#[test]
+fn growth_m1_closes_are_never_trapped() {
+    // 1. TradeCpi close at capacity: filled in full (was a silent ZERO fill).
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    assert_ok(&env.trade_cpi(&t, tp, &lp, units(100)), "T closes via CPI");
+    assert_eq!(env.pos(tp), 0, "close filled in full");
+    assert_eq!(
+        env.pos(lp.account),
+        -units(1_100),
+        "the LP absorbs the close past N_cap"
+    );
+    // ...and the crowd stays closed for NEW growth.
+    let (c, cp) = env.trader(1_000 * USD);
+    let lp_owner = lp.owner.insecure_clone();
+    assert_err(
+        &env.trade_nocpi(&c, cp, &lp_owner, lp.account, units(1)),
+        GROWTH_CAPACITY_FULL,
+        "crowd still closed",
+    );
+
+    // 2. NoCpi close (LP co-signs): was Custom(68).
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    let lp_owner = lp.owner.insecure_clone();
+    assert_ok(
+        &env.trade_nocpi(&t, tp, &lp_owner, lp.account, units(100)),
+        "T closes via NoCpi",
+    );
+    assert_eq!(env.pos(tp), 0);
+
+    // 3. Partial reduce after a capital loss (N_cap 500 < |LP|), then a close with the LP
+    //    deep under capacity (capital 150: N_cap 150 vs |LP| 1,060).
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    env.force_capital(lp.account, 500 * USD);
+    assert_ok(
+        &env.trade_cpi(&t, tp, &lp, units(40)),
+        "partial reduce after capital loss",
+    );
+    assert_eq!(env.pos(tp), -units(60));
+    env.force_capital(lp.account, 150 * USD);
+    assert_ok(
+        &env.trade_cpi(&t, tp, &lp, units(60)),
+        "close far past capacity",
+    );
+    assert_eq!(env.pos(tp), 0);
+    // SCOPE: an LP with ZERO capital fails the ENGINE's own initial margin on any LP growth
+    // (Custom 49). That is an engine invariant, identical on legacy (control below), not a
+    // growth clip; on bound P3 markets the senior-draw pre-fill refills the vault LP first.
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    env.force_capital(lp.account, 0);
+    assert_err(
+        &env.trade_cpi(&t, tp, &lp, units(100)),
+        "Custom(49)",
+        "engine IM (growth)",
+    );
+    let mut l0 = Env::new(MarketCfg::legacy());
+    let l0lp = l0.lp(1_000 * USD);
+    let (l0w, l0wp) = l0.trader(100_000 * USD);
+    let (l0t, l0tp) = l0.trader(100 * USD);
+    assert_ok(&l0.trade_cpi(&l0w, l0wp, &l0lp, units(900)), "L0 W 900");
+    assert_ok(
+        &l0.trade_cpi(&l0t, l0tp, &l0lp, -units(100)),
+        "L0 T thin 100",
+    );
+    assert_ok(
+        &l0.trade_cpi(&l0w, l0wp, &l0lp, units(100)),
+        "L0 W to 900 net",
+    );
+    l0.force_capital(l0lp.account, 0);
+    let r = l0.trade_cpi(&l0t, l0tp, &l0lp, units(100));
+    assert!(
+        r.is_err() || l0.pos(l0tp) == -units(100),
+        "legacy refuses / does not fill it either: {r:?}"
+    );
+
+    // 4. FLIP on TradeCpi at capacity: split -- the closing part fills, the opening part (a new
+    //    crowd long past N_cap) does not.
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    assert_ok(&env.trade_cpi(&t, tp, &lp, units(150)), "flip request");
+    assert_eq!(
+        env.pos(tp),
+        0,
+        "the close part filled; the opening part did not"
+    );
+
+    // 5. FLIP on NoCpi (cannot clip): the opening part is gated -> refused; a close-only
+    //    request passes.
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let (lp, _w, (t, tp)) = m1_book(&mut env);
+    let lp_owner = lp.owner.insecure_clone();
+    assert_err(
+        &env.trade_nocpi(&t, tp, &lp_owner, lp.account, units(150)),
+        GROWTH_CAPACITY_FULL,
+        "opening part gated",
+    );
+    assert_eq!(env.pos(tp), -units(100));
+    assert_ok(
+        &env.trade_nocpi(&t, tp, &lp_owner, lp.account, units(100)),
+        "close-only passes",
+    );
+
+    // NEGATIVE CONTROL (scope): the legacy class is unchanged by this PR -- a legacy LP over
+    // its own 10x cap still zero-fills a thin close (reviewer `sec_..._over_its_10x_cap`).
+    let mut l2 = Env::new(MarketCfg::legacy());
+    let l2lp = l2.lp(1_000 * USD);
+    let (l2w, l2wp) = l2.trader(100_000 * USD);
+    let (l2t, l2tp) = l2.trader(100 * USD);
+    assert_ok(&l2.trade_cpi(&l2w, l2wp, &l2lp, units(900)), "L2 W 900");
+    assert_ok(
+        &l2.trade_cpi(&l2t, l2tp, &l2lp, -units(100)),
+        "L2 T thin 100",
+    );
+    l2.force_capital(l2lp.account, 50 * USD);
+    assert_ok(
+        &l2.trade_cpi(&l2t, l2tp, &l2lp, units(100)),
+        "legacy zero fill",
+    );
+    assert_eq!(
+        l2.pos(l2tp),
+        -units(100),
+        "legacy over-cap class unchanged (growth OFF is byte-for-byte legacy)"
+    );
+}
+
+/// L-2: the r_gap floor (reviewer `sec_r_gap_is_creator_declared_and_unbounded_below`, inverted).
+#[test]
+fn growth_l2_r_gap_floor() {
+    let try_init = |r_gap: u16| {
+        let mut c = MarketCfg::growth(1_000);
+        c.growth = Some((r_gap, 1_000));
+        Env::try_new_with(&program_path(), c).map(|_| 0u64)
+    };
+    assert_err(&try_init(1), GROWTH_INVALID_CONFIG, "r_gap = 1 bps refused");
+    assert_err(
+        &try_init(199),
+        GROWTH_INVALID_CONFIG,
+        "below 4 bps/slot x 50 slots",
+    );
+    assert!(try_init(200).is_ok(), "at the floor");
+    assert!(try_init(400).is_ok());
 }

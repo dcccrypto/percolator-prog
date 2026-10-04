@@ -18059,7 +18059,7 @@ fn v16_fix_w2_drain_only_risk_increase_cpi_trade_rejects_before_matcher() {
 #[test]
 fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
     // A fresh (non-canonical) matcher id: the LEGACY 24-byte call extension.
-    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(Pubkey::new_unique());
+    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(Pubkey::new_unique(), false);
     eprintln!("(#436) 11 legs, non-canonical matcher (v1 wire): {allowed_cu} CU");
     // v1: the matcher's own counter sums all 11 single-unit LP sells.
     assert_eq!(counter, -11 * POS_SCALE as i128, "legacy wire: counter is the running sum");
@@ -18076,7 +18076,7 @@ fn v16_bpf_batch_trade_cpi_tail_fanout_budget_rejects_oversized_product() {
 #[test]
 fn v16_bpf_batch_trade_cpi_canonical_matcher_v2_11_legs_fit_budget() {
     let canonical = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
-    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(canonical);
+    let (allowed_cu, counter) = batch_trade_cpi_tail_fanout_budget_case(canonical, false);
     eprintln!("(R-1) 11 legs, canonical matcher (v2 wire): {allowed_cu} CU");
     // Non-vacuity: v2 really ran. Under v2 the matcher carries each asset's pre-batch position
     // separately and stores the LAST leg's asset (0 - 1 unit); v1 would store -11 units.
@@ -18106,8 +18106,27 @@ fn v16_bpf_batch_trade_cpi_canonical_matcher_v2_11_legs_fit_budget() {
     );
 }
 
+/// growth-v19 security review L-6: the worst-case growth batch. A KIND-2 matcher context binds
+/// to ONE asset (matcher ERR_ASSET_MISMATCH 8004 on a second asset; measured), so a batch
+/// against a growth vault LP (kind 2, single-slot market) has at most ONE leg by construction.
+/// The largest growth batch is therefore 11 legs on a kind-0/1 canonical context of a
+/// multi-asset market with asset 0 growth-enabled: ext v3 (72 B) on every leg, the growth gate
+/// on asset 0's leg. It must still fit the 1.4M budget with the legacy case's safety margin.
+#[test]
+fn v16_bpf_batch_trade_cpi_canonical_growth_v3_11_legs_fit_budget() {
+    let canonical = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
+    let (allowed_cu, _counter) = batch_trade_cpi_tail_fanout_budget_case(canonical, true);
+    eprintln!("(L-6) 10 legs (growth cap), canonical matcher, growth asset 0 (v3 wire on all legs): {allowed_cu} CU");
+    const CU_LIMIT: u64 = 1_400_000;
+    const SAFETY_MARGIN: u64 = 3_000;
+    assert!(
+        allowed_cu <= CU_LIMIT - SAFETY_MARGIN,
+        "10 growth (v3) legs consumed {allowed_cu} CU; less than {SAFETY_MARGIN} CU under 1.4M"
+    );
+}
+
 /// Shared body of the #436 / R-1 tests. Returns (11-leg CU, matcher ctx `inventory_base`).
-fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i128) {
+fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: bool) -> (u64, i128) {
     // REWRITTEN 2026-08-29 for the #436 fix. This test used to assert that a 14-leg x 4-tail
     // batch (product 56 <= budget 64) MUST EXECUTE. It never could: measurement showed a leg
     // costs ~120,000 CU, so 12+ legs exhaust the 1.4M ceiling regardless of tail size, and the
@@ -18186,6 +18205,30 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i12
     env.deposit(&taker, taker_account, 100_000_000);
     env.deposit(&lp, lp_account, 100_000_000);
     let (ctx, delegate, _) = env.init_matcher_context(&lp, matcher_program, lp_account);
+    if growth_v3 {
+        // HARNESS SEED: growth ON for asset 0 (only asset 0 can be a growth asset), so the
+        // batch carries ext v3 on all 11 legs and asset 0's leg runs the growth gate.
+        let mut m = env.svm.get_account(&env.market).unwrap();
+        let r = state::asset_growth_range(&m.data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        let g = state::AssetGrowthV19 {
+            lambda_bps: 10_000,
+            l_launch_x100: 1_000,
+            l_tier_x100: 1_000,
+            ceil_x100: 1_000,
+            kink_bps: 5_000,
+            r_gap_bps: 400,
+            version: 1,
+            ..Default::default()
+        };
+        state::asset_growth_to_wrapper_bytes(
+            &mut m.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &g,
+            1_000,
+        )
+        .unwrap();
+        env.svm.set_account(env.market, m).unwrap();
+    }
     let mk_legs = |n: usize| -> Vec<percolator_prog::ix::BatchTradeCpiLeg> {
         (0..n as u16)
             .map(|asset_index| percolator_prog::ix::BatchTradeCpiLeg {
@@ -18285,6 +18328,41 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i12
     // honest shape of this bound: NECESSARY, NOT SUFFICIENT. Per-leg cost varies with market
     // state, so callers must still handle compute exhaustion at or below 11; the fix only
     // removes 12..=16, which could never work anywhere.
+    // growth-v19 L-6: a batch with a growth leg is capped at GROWTH_BATCH_MAX_LEGS (10); 11
+    // growth legs are refused up front (before the matcher CPI), 10 must execute.
+    let allowed_legs = if growth_v3 {
+        let refuse_tail = add_benign_tail_accounts(&mut env, ALLOW_TAIL);
+        let market_before = env.svm.get_account(&env.market).unwrap();
+        env.svm.expire_blockhash();
+        let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
+        let (lp_portfolio_id, lp_matcher_sequence, lp_position_epoch) =
+            env.portfolio_identity(lp_account);
+        let r = env.send(
+            ProgInstruction::BatchTradeCpi {
+                account_a_portfolio_id: taker_portfolio_id,
+                account_a_position_epoch: taker_position_epoch,
+                account_b_portfolio_id: lp_portfolio_id,
+                account_b_position_epoch: lp_position_epoch,
+                account_b_matcher_sequence: lp_matcher_sequence,
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs: mk_legs(MAX_LEGS),
+            },
+            matcher_accounts(
+                taker.pubkey(), env.market, taker_account, lp_account,
+                matcher_program, ctx, delegate, &refuse_tail,
+            ),
+            &[&taker],
+        );
+        assert!(
+            r.as_ref().err().is_some_and(|e| e.contains("Custom(9)")),
+            "11 legs with a growth leg must be refused up front: {r:?}"
+        );
+        assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+        percolator_prog::growth_v19::GROWTH_BATCH_MAX_LEGS
+    } else {
+        MAX_LEGS
+    };
     let allow_tail = add_benign_tail_accounts(&mut env, ALLOW_TAIL);
     env.svm.expire_blockhash();
     let (taker_portfolio_id, _, taker_position_epoch) = env.portfolio_identity(taker_account);
@@ -18299,7 +18377,7 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i12
                 account_b_matcher_sequence: lp_matcher_sequence,
                 max_slippage_atoms: u128::MAX,
                 max_fee_atoms: u128::MAX,
-                legs: mk_legs(MAX_LEGS),
+                legs: mk_legs(allowed_legs),
             },
             matcher_accounts(
                 taker.pubkey(),
@@ -18320,8 +18398,8 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey) -> (u64, i12
     );
     assert_eq!(
         percolator::active_bitmap_count_ones(env.portfolio_state(taker_account).active_bitmap),
-        MAX_LEGS as u32,
-        "all 11 legs must have actually filled"
+        allowed_legs as u32,
+        "all allowed legs must have actually filled"
     );
     let ctx_data = env.svm.get_account(&ctx).unwrap().data;
     // 64-byte return slot + MatcherCtx.inventory_base at +96.
