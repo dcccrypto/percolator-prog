@@ -5552,6 +5552,9 @@ pub mod state {
             asset.effective_price = initial_price;
             asset.fund_px_last = initial_price;
             asset.slot_last = init_slot;
+            // v2.2 band: arm the per-epoch band at genesis exactly as the engine's own
+            // activation does (epoch 1, anchored at the genesis price).
+            percolator::band_initialize_asset(&mut asset, engine_config.band_bps, initial_price, init_slot);
             let mut slot = EngineAssetSlotV16Account::empty_for_market(market_id);
             slot.asset = percolator::AssetStateV16Account::from_runtime(&asset);
             slot.insurance_domain_budget_long = percolator::V16PodU128::new(0);
@@ -14553,19 +14556,24 @@ pub mod processor {
                 reduces_existing,
             )
             .map_err(map_v16_error)?;
-            // v2.2 band: no favourable-side close at a pinned price (Custom 104).
+            // v2.2 band: no favourable-side close at a pinned price (Custom 104). The rule binds
+            // the side that CHOSE the fill: the taker on the matcher route, both signers on
+            // NoCpi. The passive LP of a CPI fill is the party the rule protects (a user closing
+            // at a stale price is favourable to the LP), so it is never refused for it.
             reject_band_favourable_close_view(
                 &group,
                 asset_index as usize,
                 account_a_position,
                 size_q,
             )?;
-            reject_band_favourable_close_view(
-                &group,
-                asset_index as usize,
-                account_b_position,
-                size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
-            )?;
+            if !roles.cpi {
+                reject_band_favourable_close_view(
+                    &group,
+                    asset_index as usize,
+                    account_b_position,
+                    size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
+                )?;
+            }
             // F-TRADENOCPI-FEE: the position enters/settles at the asset mark (effective_price), NOT at
             // the caller-supplied exec_price. The engine uses request.exec_price ONLY as the fee notional
             // basis (fee = size_q*exec_price/POS_SCALE * fee_bps), so without pinning it two cooperating
@@ -15118,19 +15126,22 @@ pub mod processor {
                     reduces_existing,
                 )
                 .map_err(map_v16_error)?;
-                // v2.2 band: no favourable-side close at a pinned price (Custom 104).
+                // v2.2 band: no favourable-side close at a pinned price (Custom 104); the taker
+                // on the matcher route, both signers on NoCpi (see the single executor).
                 reject_band_favourable_close_view(
                     &group,
                     asset_index,
                     account_a_position_for_accrual,
                     leg.size_q,
                 )?;
-                reject_band_favourable_close_view(
-                    &group,
-                    asset_index,
-                    account_b_position_for_accrual,
-                    leg.size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
-                )?;
+                if !roles.cpi {
+                    reject_band_favourable_close_view(
+                        &group,
+                        asset_index,
+                        account_b_position_for_accrual,
+                        leg.size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
+                    )?;
+                }
                 let fee_basis_price = group.markets[asset_index]
                     .engine
                     .asset
@@ -25159,6 +25170,8 @@ pub mod processor {
             let receipt_only_before = portfolio_is_receipt_only(&portfolio)?;
             let reserved_residual = receipt_reserve_bound(&group)?;
             let insurance_before = group.header.insurance.get();
+            // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+            let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
@@ -25177,7 +25190,13 @@ pub mod processor {
                 .header
                 .insurance
                 .get()
-                .saturating_sub(insurance_before);
+                .saturating_sub(insurance_before)
+                .saturating_sub(
+                    group
+                        .rent_unrouted_total()
+                        .map_err(map_v16_error)?
+                        .saturating_sub(rent_unrouted_before),
+                );
             credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, retained)?;
             group.validate_shape().map_err(map_v16_error)?;
             let payout = match outcome {
@@ -25817,6 +25836,8 @@ pub mod processor {
             // after that collection so the reward calculation below sees liquidation proceeds,
             // never the old maintenance obligation.
             let insurance_before = group.header.insurance.get();
+            // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+            let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             let result = match group.permissionless_auto_crank_not_atomic(
                 &mut portfolio,
                 AutoCrankWorkV16 {
@@ -25920,7 +25941,13 @@ pub mod processor {
                     .header
                     .insurance
                     .get()
-                    .saturating_sub(insurance_before);
+                    .saturating_sub(insurance_before)
+                    .saturating_sub(
+                        group
+                            .rent_unrouted_total()
+                            .map_err(map_v16_error)?
+                            .saturating_sub(rent_unrouted_before),
+                    );
                 // FIX (ADOPT upstream 01ec6161, PRESERVED): a liquidation whose penalty is not
                 // reclaimable pays NO cranker reward at all. The full `retained_fee` still flows
                 // to `credit_market_fee_split_across_domains_view` below unchanged (matches this
@@ -25971,7 +25998,13 @@ pub mod processor {
                     .header
                     .insurance
                     .get()
-                    .saturating_sub(insurance_before);
+                    .saturating_sub(insurance_before)
+                    .saturating_sub(
+                        group
+                            .rent_unrouted_total()
+                            .map_err(map_v16_error)?
+                            .saturating_sub(rent_unrouted_before),
+                    );
                 credit_market_fee_split_across_domains_view(
                     &cfg,
                     &mut group,
@@ -33145,6 +33178,8 @@ pub mod processor {
                         true,
                     )?;
                     let insurance_before = group.header.insurance.get();
+                    // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+                    let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
@@ -33183,7 +33218,13 @@ pub mod processor {
                         .header
                         .insurance
                         .get()
-                        .saturating_sub(insurance_before);
+                        .saturating_sub(insurance_before)
+                        .saturating_sub(
+                            group
+                                .rent_unrouted_total()
+                                .map_err(map_v16_error)?
+                                .saturating_sub(rent_unrouted_before),
+                        );
                     credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, retained)?;
                     match outcome {
                         percolator::ResolvedCloseOutcomeV16::ProgressOnly => 0,
