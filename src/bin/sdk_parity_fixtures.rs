@@ -150,10 +150,12 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::DepositJuniorTranche { .. } => "DepositJuniorTranche",
         Instruction::WithdrawJuniorTranche { .. } => "WithdrawJuniorTranche",
         Instruction::VaultLpRecall { .. } => "VaultLpRecall",
-        Instruction::SetVaultLpRisk { .. } => "SetVaultLpRisk",
+        Instruction::SetVaultLpRisk { .. } | Instruction::SetVaultLpRiskV19 { .. } => "SetVaultLpRisk",
         Instruction::VaultLpConvertPnl { .. } => "VaultLpConvertPnl",
         Instruction::VaultLpSettleResolved { .. } => "VaultLpSettleResolved",
         Instruction::VaultLpReleaseSurplus { .. } => "VaultLpReleaseSurplus",
+        // Phase 2b (2026-10-05), tag 103.
+        Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
     }
 }
 
