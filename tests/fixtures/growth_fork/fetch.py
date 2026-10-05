@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Read-only devnet fetch of the growth-v19 fork-replay fixtures (no keys used, no sends).
-Markets: OTC, Jimothy, STONK (devnet relaunch wrapper ETDLAdi.. / matcher EDKKgRaV..).
+Markets: OTC, Jimothy, STONK, Percolator (devnet relaunch wrapper ETDLAdi.. / matcher EDKKgRaV..).
 Usage: fetch.py <out_dir> [rpc]"""
 import requests, base64, json, sys, os, base58
 OUT = sys.argv[1]
@@ -14,9 +14,16 @@ def rpc(m, p):
     return r['result']
 mk = {"otc": "6Y4bfYLWrhabgzU4p3onx9CeW1jCKjGjjSCaoCHf2Q9R",
       "jimothy": "CzKxVxPm9gpt7eyQ3xJKh57EMT6i5bep5Swu9NRcpzCh",
-      "stonk": sys.argv[3] if len(sys.argv) > 3 else None}
+      "stonk": sys.argv[3] if len(sys.argv) > 3 else None,
+      # Phase 2b (2026-10-05): the flagship, for the "Earn raises N_cap" replay. Its Earn
+      # registry and backing ledgers are wrapper PDAs with market_group at offset 16, so the
+      # same getProgramAccounts filter returns them alongside the portfolios.
+      "percolator": "9EPm8nB8Fs7WcEZgE1WGFPTGc6rAzD6GhFJyMm4dEFHn"}
+# FETCH_ONLY=name[,name] restricts the run (re-fetching one market must not move the others).
+ONLY = set(filter(None, os.environ.get("FETCH_ONLY", "").split(",")))
 for name, a in mk.items():
     if a is None: continue
+    if ONLY and name not in ONLY: continue
     res = rpc("getProgramAccounts", [W, {"encoding": "base64", "dataSlice": {"offset": 0, "length": 0},
           "filters": [{"memcmp": {"offset": 16, "bytes": a}}]}])
     keys = [a] + sorted(r['pubkey'] for r in res)
