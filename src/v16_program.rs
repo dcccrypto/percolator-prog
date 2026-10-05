@@ -33304,7 +33304,7 @@ pub mod processor {
             let outstanding = st.backstop_outstanding_atoms as u128;
             let moved = if mode == 0 {
                 // A CURRENT certificate (the draw above refreshed the LP) or a flat LP.
-                let deficit = vault_lp_undrawn_deficit_ro(&group, &lp.header)?;
+                let deficit = vault_lp_undrawn_deficit_ro(&group, lp.header)?;
                 let reg = registry_pda.to_bytes();
                 let drawable = vault_pot_drawable_atoms(&group, &cfg, &reg, 0)?
                     .saturating_add(vault_pot_drawable_atoms(&group, &cfg, &reg, 1)?);
@@ -33539,6 +33539,7 @@ pub mod processor {
     /// Tag 112 phases 4-5: mint the rescue shares (registry PDA signs) and bump the registry's
     /// outstanding count. Kept out of the handler's frame.
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
     fn rescue_mint_shares<'a>(
         token_program: &AccountInfo<'a>,
         mint_ai: &AccountInfo<'a>,
