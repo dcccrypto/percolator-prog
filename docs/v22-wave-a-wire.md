@@ -26,11 +26,10 @@ l_launch_x100 u16`) forms. NEW lot form: growth block + `lot_exp u8` (+5 bytes),
 `1..=15` (0 in the 5-byte form is refused; send the 4-byte form). Wave B's band trailer, when it
 lands, follows `lot_exp`.
 
-**Precision floor.** Every growth market must open at `initial_price >= 10_000_000` (=$10 per lot);
-the same floor binds a ConfigureAuthMark (tag 62) made BEFORE launch (no portfolio ever created on
-the market). Security review A2: after launch, a re-anchor (ConfigureAuthMark of a used market,
-RestartAssetOracle, lifecycle reset) is not floored, so an asset whose mark fell below $10 per lot
-can be revived at its true price. Choose
+**Precision floor.** Every growth market must open at `initial_price >= 10_000_000` (=$10 per lot),
+and EVERY ConfigureAuthMark (tag 62) on a growth asset is floored too (security review R2-1).
+RestartAssetOracle -- the exit from asset Recovery -- is the one exemption (A2), so an asset whose
+mark fell below $10 per lot by ordinary pushes can be revived at its true price. Choose
 `lot_exp` so the per-lot price at launch is in [$10, $10,000]:
 `lot_exp = clamp(ceil(log10(10 / P_token_usd)), 0, 15)`.
 
@@ -96,3 +95,26 @@ with the floor) then 77 (v2.2 form with the refresh accounts and the floor).
 
 **Keeper:** after a full sweep (book loss-current), execute pending `keeper_ok` requests with an
 unsigned 77 (n_refresh 0, wire min 1). Keep the par − E3 gap monitor as telemetry.
+
+## SDK requirements for tag 77 (security review round 2, before mainnet)
+
+1. **Simulate first, always.** Build the 77 with the refresh accounts, `simulateTransaction` it, read
+   the payout from the simulated token balance change (or the 117/118 error), and only then send.
+   A CU overrun aborts the whole transaction (`ComputationalBudgetExceeded`, not a program error):
+   never surface it as 118.
+2. **Explicit compute budget.** Prepend `SetComputeUnitLimit(1_300_000)` (the measured worst case
+   under the leg budget is 1,199,659 CU for 2 x 14-leg refreshes; 2 x 14-leg LIQUIDATING refreshes
+   1,199,215; 8 single-leg 1,016,434; 8 single-leg on a Hybrid vault asset with a Pyth tail
+   1,018,782). The default 200k limit always fails a refreshing 77.
+3. **Default floor = quote - at most 5 bps.** `min_payout = floor(simulated_payout * (10_000 - 5)
+   / 10_000)` (both on the 76 v2.2 trailer and on the 77 wire). On a book that is not loss-current
+   the program allows a signed exit down to 25 bps below par (`EXIT_DIP_BPS`); the 5 bps floor
+   removes that tolerance for an honest redeemer, at the cost of a retry when the book is moving.
+   App copy: "You'll receive at least $X" and, on the dip path, "may pay up to 0.25% below par while
+   positions refresh".
+4. **Refresh selection.** Pass every positioned portfolio on the vault's asset that is stale, up to
+   8 and to the leg budget `Σ(3 + legs) <= 34`. Portfolios with legs on OTHER assets that moved in
+   the same slot cannot be refreshed inline (the 77 hints only the vault asset): crank them with a
+   full tag 5 (one hint per leg asset) earlier in the same transaction.
+5. **Keeper (`keeper_ok`) execution** needs EVERY configured asset loss-current (round 2), so run it
+   right after a full same-slot sweep of the whole market.

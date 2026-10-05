@@ -19,22 +19,12 @@ pub fn lot_exp_ok(lot_exp: u8) -> bool {
     lot_exp <= LOT_EXP_MAX
 }
 
-/// Item 7 precision floor: a GROWTH market's LAUNCH mark below `10^7` e6 per lot is refused.
+/// Item 7 precision floor: a GROWTH market's anchor below `10^7` e6 per lot is refused
+/// (InitMarket and every ConfigureAuthMark; RestartAssetOracle is exempt, A2 / R2-1).
 /// Non-growth markets keep the legacy rule (any valid engine price).
 #[inline]
 pub fn lot_price_below_floor(growth: bool, mark_e6: u64) -> bool {
     growth && mark_e6 < LOT_PRICE_FLOOR_E6
-}
-
-/// Item 7 / security review A2: where the floor binds. Only at LAUNCH -- InitMarket, and a
-/// ConfigureAuthMark before any portfolio was ever created on the market (asset 0's
-/// `next_portfolio_id == 0`). A later re-anchor (ConfigureAuthMark of a live market,
-/// RestartAssetOracle, lifecycle reset) is NOT floored, so an asset whose mark fell below the
-/// floor by ordinary pushes can be revived at its TRUE price (the floor only exists so a creator
-/// cannot launch an untrackable market).
-#[inline]
-pub fn reanchor_floor_applies(growth: bool, market_ever_used: bool) -> bool {
-    growth && !market_ever_used
 }
 
 /// Item 8 rule 1: the floor a redemption must clear is the larger of the floor the redeemer
@@ -70,6 +60,16 @@ pub struct LossCounters {
     /// `oi_eff != 0 && loss_weight_sum == 0`), so gating on it would refuse every exit on any
     /// market with open interest.
     pub b_stale_accounts: u64,
+    /// Round 2 (A5): accounts whose loss exceeds their capital and is not yet absorbed (market
+    /// header `negative_pnl_account_count`). A touched loser settles its loss from principal at
+    /// once, so a negative PnL persists only for an underwater account: its unabsorbed deficit
+    /// will still be socialized onto winners (moving the claims E3 reads). Included.
+    pub negative_pnl_accounts: u64,
+    /// Round 2 (A5): portfolios with an invalidated health certificate (header
+    /// `stale_certificate_count`). At engine 1c053113 no path sets `stale_state = true` (only
+    /// `clear_account_stale` decrements), so this is always 0 today; included fail-closed so a
+    /// future engine that uses it cannot silently bypass the gate.
+    pub stale_certificates: u64,
 }
 
 /// No pending GENUINE loss on the asset: no domain loss barrier, no retained socialized-loss
@@ -81,6 +81,8 @@ pub fn no_pending_genuine_loss(c: &LossCounters) -> bool {
         && c.obligation_long == 0
         && c.obligation_short == 0
         && c.b_stale_accounts == 0
+        && c.negative_pnl_accounts == 0
+        && c.stale_certificates == 0
 }
 
 /// Item 8 rule 3: the vault's asset is loss-current: every positioned leg was refreshed at the
@@ -235,7 +237,6 @@ mod tests {
         assert_eq!(effective_min_payout(5, 9), 9);
         assert!(payout_meets_min(9, 9) && !payout_meets_min(8, 9));
         assert!(lot_exp_ok(15) && !lot_exp_ok(16));
-        assert!(reanchor_floor_applies(true, false) && !reanchor_floor_applies(true, true));
         assert!(dip_floor_ok(9_975, 10_000) && !dip_floor_ok(9_974, 10_000));
         assert_eq!(cross_pot_netting(2_000, 2_026, 1_000, 973), (26, false));
         assert_eq!(cross_pot_netting(1_000, 973, 2_000, 2_026), (26, true));

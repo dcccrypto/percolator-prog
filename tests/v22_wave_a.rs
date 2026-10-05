@@ -132,7 +132,7 @@ proptest! {
     #[test]
     fn loss_current_and_gate_full_width(
         sl in any::<u64>(), ss in any::<u64>(), bl in any::<u64>(), bs in any::<u64>(),
-        ol in any::<u64>(), os in any::<u64>(), bst in any::<u64>(),
+        ol in any::<u64>(), os in any::<u64>(), bst in any::<u64>(), neg in any::<u64>(), sc in any::<u64>(),
         zero_mask in any::<u8>(), signed in any::<bool>(), require in any::<bool>(),
     ) {
         // zero a random subset so the all-zero corners are reached often
@@ -142,9 +142,12 @@ proptest! {
             barrier_long: z(2, bl as u128) as u64, barrier_short: z(3, bs as u128) as u64,
             obligation_long: z(4, ol as u128) as u64, obligation_short: z(5, os as u128) as u64,
             b_stale_accounts: z(6, bst as u128) as u64,
+            negative_pnl_accounts: if zero_mask & 0x80 != 0 { 0 } else { neg },
+            stale_certificates: if sc % 3 == 0 { sc } else { 0 },
         };
         let genuine = c.barrier_long == 0 && c.barrier_short == 0 && c.obligation_long == 0
-            && c.obligation_short == 0 && c.b_stale_accounts == 0;
+            && c.obligation_short == 0 && c.b_stale_accounts == 0
+            && c.negative_pnl_accounts == 0 && c.stale_certificates == 0;
         let lc = c.stale_long == 0 && c.stale_short == 0 && genuine;
         prop_assert_eq!(wave_a_v22::loss_current(&c), lc);
         let expect = if !require || lc { LossGate::Pass } else if signed && genuine { LossGate::DipFloor } else { LossGate::Refuse };
@@ -455,32 +458,38 @@ fn sec_s9_restart_after_a_dip_below_the_floor_is_allowed() {
     assert_eq!(state::profile_lot_exp(&profile0(&env)), 3, "lot kept by the restart");
 }
 
-/// A2: the floor binds only the LAUNCH anchor. Once the market was used (a portfolio exists),
-/// ConfigureAuthMark may re-anchor below the floor. NEGATIVE CONTROL (same test): before any
-/// portfolio, the same re-anchor is refused with 119.
+/// Security review R2-1 regression: ConfigureAuthMark is floored ALWAYS. The round-2 "launch
+/// only" proxy (asset 0 `next_portfolio_id == 0`) was bypassed by creating one portfolio; now a
+/// re-anchor below the floor is refused before AND after a portfolio exists. CONTROL (same test):
+/// RestartAssetOracle stays exempt (`sec_s9_restart_after_a_dip_below_the_floor_is_allowed`) and
+/// a re-anchor at the floor is accepted.
 #[test]
-fn a2_configure_auth_mark_below_floor_only_refused_before_launch() {
+fn r2_1_configure_auth_mark_below_floor_refused_even_after_a_portfolio_exists() {
     let mut env = V16CuEnv::new();
     init_on_fresh(&mut env, growth_init(LOT_PRICE_FLOOR_E6, Some(3))).expect("lot 3");
     env.svm.warp_to_slot(2);
-    let seq = env.control_sequences(0).oracle_observation + 1;
     let admin = env.admin.insecure_clone();
     let market = env.market;
-    let ix = |seq: u64| ProgInstruction::ConfigureAuthMark {
+    let ix = |seq: u64, mark: u64| ProgInstruction::ConfigureAuthMark {
         asset_index: 0,
         market_id: 1,
         now_slot: 2,
-        initial_mark_e6: 5_000_000,
+        initial_mark_e6: mark,
         observation_sequence: seq,
     };
-    let pre = env.send(ix(seq), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
-    assert_eq!(code(&pre), Some(ERR_LOT), "pre-launch re-anchor below the floor: {pre:?}");
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    let pre = env.send(ix(seq, 5_000_000), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
+    assert_eq!(code(&pre), Some(ERR_LOT), "before any portfolio: {pre:?}");
     let owner = solana_sdk::signature::Keypair::new();
     env.create_portfolio(&owner);
     let seq = env.control_sequences(0).oracle_observation + 1;
     env.svm.expire_blockhash();
-    let post = env.send(ix(seq), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
-    assert!(post.is_ok(), "A2: re-anchor of a used market below the floor: {post:?}");
+    let post = env.send(ix(seq, 5_000_000), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
+    assert_eq!(code(&post), Some(ERR_LOT), "R2-1: after a portfolio exists: {post:?}");
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    env.svm.expire_blockhash();
+    env.send(ix(seq, LOT_PRICE_FLOOR_E6), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin])
+        .expect("control: a re-anchor at the floor");
 }
 
 /// Reviewer S5 (sec_v22a_replay.rs): wire hygiene of the v2.2 trailers, adopted as a regression.

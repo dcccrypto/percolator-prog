@@ -2818,6 +2818,8 @@ impl Replay {
             && a.pending_obligation_count_long == 0
             && a.pending_obligation_count_short == 0
             && g.b_stale_account_count == 0
+            && g.negative_pnl_account_count == 0
+            && g.stale_certificate_count == 0
     }
     /// H's exact claim on the CURRENT state under the program's own non-bound rule
     /// (floor(shares x E3 NAV / S)), computed by the test's independent E3 model.
@@ -3420,4 +3422,342 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
         assert_eq!(code(&res), Some(ERR_NOT_LOSS_CURRENT), "{res:?}");
         assert!(!r.no_genuine_loss_now() || r.stale_total() > 0);
     }
+}
+
+/// Market whose bankruptcy residuals and per-account B settlement move in 1-USDC chunks, so a
+/// real bust leaves pending socialized-loss settlement across several touches.
+fn chunked_b_market() -> LiveMarket {
+    let mut lm = r2_market();
+    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    lm
+}
+
+impl Replay {
+    fn loss_snapshot(&self) -> String {
+        let (_, g) = self.env.market_state();
+        let a = &g.assets[0];
+        format!(
+            "stale {}/{} obl {}/{} b_stale {} barriers {:?} b_num {}/{} neg_pnl {} stale_certs {}",
+            a.stale_account_count_long, a.stale_account_count_short,
+            a.pending_obligation_count_long, a.pending_obligation_count_short,
+            g.b_stale_account_count, &g.pending_domain_loss_barriers[..2],
+            a.b_long_num, a.b_short_num, g.negative_pnl_account_count, g.stale_certificate_count
+        )
+    }
+}
+
+#[test]
+#[ignore = "exploration: prints the counters through a real chunked bankruptcy"]
+fn a5_explore_real_chunked_bankruptcy() {
+    let mut r = Replay::new(chunked_b_market());
+    let h = Keypair::new();
+    let (_h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut shorts = vec![];
+    for _ in 0..3 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, -q).expect("short");
+        shorts.push(p);
+    }
+    let lp = r.lp;
+    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
+    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(20_000_000);
+    r.trade(&bk, bp, qb).expect("levered long");
+    eprintln!("A5X open: {}", r.loss_snapshot());
+    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
+    eprintln!("A5X after walk: {}", r.loss_snapshot());
+    for i in 0..12 {
+        r.crank_pf(bp);
+        eprintln!("A5X bust crank {i}: {}", r.loss_snapshot());
+    }
+    for i in 0..6 {
+        r.crank_pf(lp);
+        eprintln!("A5X lp crank {i}: {}", r.loss_snapshot());
+        for p in shorts.iter() {
+            r.crank_pf(*p);
+        }
+        eprintln!("A5X shorts crank {i}: {}", r.loss_snapshot());
+    }
+}
+
+/// A6 round 2: two 14-leg portfolios that are LIQUIDATABLE after an asset-0 drop (a 100-token
+/// asset-0 long + 13 x 10-token legs on $25 capital, asset 0 down 15%). One inline refresh is
+/// one bounded crank, so each refresh liquidates (at most one leg) on top of re-certifying 14
+/// legs: the heaviest refresh the budget admits (2 x 17 = 34 units).
+#[test]
+fn a6_two_liquidating_fourteen_leg_refreshes_cu() {
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let assets: u16 = 14;
+    let px = 1_000_000u64;
+    let cp_owner = Keypair::new();
+    r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();
+    let cp = r.env.create_portfolio(&cp_owner);
+    r.env.deposit(&cp_owner, cp, 100_000_000_000);
+    let crank_all = |r: &mut Replay| {
+        let payer = r.env.payer.pubkey();
+        let market = r.env.market;
+        r.env.svm.expire_blockhash();
+        r.env
+            .send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations: (0..assets)
+                        .map(|a| CrankObservationHint { asset_index: a, oracle_accounts: 0 })
+                        .collect(),
+                },
+                vec![AccountMeta::new(payer, true), AccountMeta::new(market, false), AccountMeta::new(cp, false)],
+                &[],
+            )
+            .ok();
+    };
+    let q10: i128 = 10 * percolator::POS_SCALE as i128;
+    let q100: i128 = 100 * percolator::POS_SCALE as i128;
+    let mut tr = vec![];
+    for _ in 0..2 {
+        let (k, p) = r.new_trader(25_000_000);
+        crank_all(&mut r);
+        r.trade(&k, p, q100).expect("asset 0 long 100 vs LP");
+        for a in 1..assets {
+            r.env.svm.expire_blockhash();
+            r.env
+                .try_trade_asset_with_cu(a, &k, p, &cp_owner, cp, q10, px, 0)
+                .unwrap_or_else(|e| panic!("asset {a} leg: {e}"));
+        }
+        tr.push(p);
+    }
+    let lp = r.lp;
+    walk_only(&mut r, 850_000, &[lp]);
+    r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    crank_all(&mut r);
+    let before: Vec<i128> = tr.iter().map(|p| r.env.portfolio_state(*p).capital as i128).collect();
+    let res = r.execute_77(&h, Some((1, tr.clone())), false);
+    let after: Vec<i128> = tr.iter().map(|p| r.env.portfolio_state(*p).capital as i128).collect();
+    eprintln!("A6-LIQ 2 x 14-leg liquidating refreshes: {:?} (capital {before:?} -> {after:?})", res.as_ref().map(|x| x.1).map_err(|e| custom_code(e)));
+    let (_, cu) = res.expect("2 x 14-leg liquidating refreshes + 77");
+    assert!(cu <= 1_260_000, "A6: {cu} CU leaves < 10% headroom under 1.4M");
+}
+
+/// A6 round 2: oracle-tail refreshes on a NON-AuthMark vault asset. Asset 0 is reconfigured to
+/// Hybrid with one Pyth leg; every inline refresh then parses the oracle tail. 8 single-leg
+/// stale traders (8 x 4 = 32 units) on the strict keeper path.
+#[test]
+fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
+    use solana_sdk::clock::Clock;
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let feed = [7u8; 32];
+    // LiteSVM starts at unix_timestamp 0; Pyth needs a real (positive, fresh) publish time.
+    let mut clock = r.env.svm.get_sysvar::<Clock>();
+    clock.unix_timestamp = 1_700_000_000;
+    r.env.svm.set_sysvar(&clock);
+    let ts = clock.unix_timestamp;
+    let pyth = r.env.set_pyth_price(&feed, 1_000_000, -6, ts);
+    let slot = r.now();
+    r.env
+        .try_configure_hybrid_with_cu(1, 0, [feed, [0u8; 32], [0u8; 32]], &[pyth], slot, ts, 0, 0, 10_000)
+        .expect("asset 0 -> Hybrid (1 Pyth leg)");
+    let crank_o = |r: &mut Replay, p: Pubkey, oracle: Pubkey| -> Result<u64, String> {
+        let payer = r.env.payer.pubkey();
+        let market = r.env.market;
+        r.env.svm.expire_blockhash();
+        r.env.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 0,
+                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 1 }],
+            },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(market, false),
+                AccountMeta::new(p, false),
+                AccountMeta::new_readonly(oracle, false),
+            ],
+            &[],
+        )
+    };
+    let lp = r.lp;
+    crank_o(&mut r, lp, pyth).ok();
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut tr = vec![];
+    for i in 0..8 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, if i % 2 == 0 { q } else { -q }).unwrap_or_else(|e| panic!("open {i}: {e}"));
+        tr.push(p);
+    }
+    // walk the external price +2% over a few slots, cranking only the LP (traders go stale)
+    let mut px = 1_000_000i64;
+    let mut oracle = pyth;
+    let mut t = ts;
+    let mut tick = |r: &mut Replay, t: &mut i64| {
+        let s = r.now() + 1;
+        r.env.svm.warp_to_slot(s);
+        *t += 1;
+        let mut c = r.env.svm.get_sysvar::<Clock>();
+        c.unix_timestamp = *t;
+        r.env.svm.set_sysvar(&c);
+    };
+    for _ in 0..8 {
+        tick(&mut r, &mut t);
+        px += 2_500;
+        oracle = r.env.set_pyth_price(&feed, px, -6, t);
+        crank_o(&mut r, lp, oracle).unwrap_or_else(|e| panic!("lp crank: {e}"));
+    }
+    r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
+    tick(&mut r, &mut t);
+    tick(&mut r, &mut t);
+    oracle = r.env.set_pyth_price(&feed, px, -6, t);
+    // the 77's oracle tail follows the 8 refresh accounts
+    let pid = r.env.program_id;
+    let escrow = state::derive_lp_escrow(&pid, &r.env.market).0;
+    let red = r.redemption_pda(&h.pubkey());
+    let dest = r.env.token_account_for_mint(r.env.mint, h.pubkey(), 0);
+    let payer = r.env.payer.pubkey();
+    let mut metas = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(r.env.market, false),
+        AccountMeta::new(r.registry, false),
+        AccountMeta::new(red, false),
+        AccountMeta::new(r.lp_mint, false),
+        AccountMeta::new(escrow, false),
+        AccountMeta::new(r.env.vault, false),
+        AccountMeta::new_readonly(r.env.vault_authority, false),
+        AccountMeta::new(r.ledgers[0], false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(r.ledgers[1], false),
+        AccountMeta::new(h.pubkey(), false),
+    ];
+    for p in tr.iter() {
+        metas.push(AccountMeta::new(*p, false));
+    }
+    metas.push(AccountMeta::new_readonly(oracle, false));
+    r.env.svm.expire_blockhash();
+    let res = r.env.send(
+        ProgInstruction::ExecuteRedemptionV22 { domain: 0, min_payout_atoms: 1, n_refresh: 8 },
+        metas,
+        &[],
+    );
+    eprintln!("A6-HYB 8 oracle-tail refreshes + 77: {:?}", res.as_ref().map_err(|e| custom_code(e)));
+    let cu = res.expect("8 hybrid refreshes + 77");
+    assert!(cu <= 1_260_000, "A6 hybrid: {cu} CU leaves < 10% headroom under 1.4M");
+}
+
+/// A5 round 2, REAL repro (no state poke): a 9.5x-levered long busts on a 15% walk in a market
+/// whose bankruptcy residual exceeds `public_b_chunk_atoms` (2 USDC). After the bust's crank the
+/// account's unabsorbed deficit is pending (`negative_pnl_account_count` = 1) and the shorts are
+/// K/F-stale; the redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused
+/// with 118 and nothing moves.
+///
+/// Why not `b_stale_account_count`: measured (`a5_explore_real_chunked_bankruptcy`, ignored), a
+/// residual > `public_b_chunk_atoms` never starts the multi-step close in this harness (every
+/// later crank fails EngineInvalidConfig = 14: an engine-side wedge, recorded in findings.md),
+/// and a residual <= the chunk is socialized through K at once, so every account settles its B
+/// share in one touch: per-account B-staleness is not reachable here. The pending state that IS
+/// reachable is the unabsorbed negative PnL, which the gate now includes.
+#[test]
+fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
+    let mut lm = r2_market();
+    lm.params.public_b_chunk_atoms = 2_000_000;
+    let mut r = Replay::new(lm);
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    for _ in 0..3 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, -q).expect("short");
+    }
+    let lp = r.lp;
+    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
+    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(20_000_000);
+    r.trade(&bk, bp, qb).expect("levered long");
+    r.request_76(&h, h_ata, None).expect("H 76");
+    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
+    r.crank_pf(bp);
+    eprintln!("A5 real: {}", r.loss_snapshot());
+    let (_, g) = r.env.market_state();
+    assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
+    assert!(!r.no_genuine_loss_now());
+    let before = r.exit_state(&h.pubkey());
+    let res = r.execute_77(&h, None, true);
+    assert_eq!(code(&res), Some(ERR_NOT_LOSS_CURRENT), "A5 real: {res:?}");
+    assert_eq!(r.exit_state(&h.pubkey()), before);
+}
+
+/// Round 2 multi-asset: the vault (asset 0) is loss-current, asset 1 is not (a trader holds
+/// legs on both; asset 1's mark moves and only the counterparty is touched). The UNSIGNED
+/// keeper exit is refused (118: every configured asset must be loss-current); the redeemer-
+/// signed exit is unaffected (the vault asset's own pot is exact). NEGATIVE CONTROL in the same
+/// test: once asset 1 is refreshed the keeper exit executes.
+#[test]
+fn multi_asset_keeper_exit_needs_every_asset_loss_current() {
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let m = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let (m_ata, _) = r.deposit_shares(&m, R3M1_DEPOSIT, 0).expect("M 75");
+    let s = r.now() + 1;
+    r.env.svm.warp_to_slot(s);
+    r.env.configure_auth_mark_for_asset_as_admin(1, s, 1_000_000);
+    let cp_owner = Keypair::new();
+    r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();
+    let cp = r.env.create_portfolio(&cp_owner);
+    r.env.deposit(&cp_owner, cp, 10_000_000_000);
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let (tk, t) = r.new_trader(1_000_000_000);
+    r.trade(&tk, t, q).expect("asset 0 leg vs LP");
+    r.env.svm.expire_blockhash();
+    r.env.try_trade_asset_with_cu(1, &tk, t, &cp_owner, cp, q, 1_000_000, 0).expect("asset 1 leg");
+    r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
+    r.request_76(&m, m_ata, None).expect("M 76");
+    // asset 1 moves; only the counterparty is cranked on asset 1 (the trader stays stale there)
+    let crank1 = |r: &mut Replay, p: Pubkey| {
+        let payer = r.env.payer.pubkey();
+        let market = r.env.market;
+        r.env.svm.expire_blockhash();
+        r.env
+            .send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations: vec![
+                        CrankObservationHint { asset_index: 0, oracle_accounts: 0 },
+                        CrankObservationHint { asset_index: 1, oracle_accounts: 0 },
+                    ],
+                },
+                vec![AccountMeta::new(payer, true), AccountMeta::new(market, false), AccountMeta::new(p, false)],
+                &[],
+            )
+            .ok();
+    };
+    for i in 1..=5u64 {
+        let s = r.now() + 1;
+        r.env.svm.warp_to_slot(s);
+        r.env.push_auth_mark_for_asset_as_admin(1, s, 1_000_000 + 1_000 * i);
+        r.env.push_auth_mark_for_asset_as_admin(0, s, 1_000_000);
+        crank1(&mut r, cp);
+        let lp = r.lp;
+        crank1(&mut r, lp);
+    }
+    // the trader's asset-0 leg stays current: asset 0's mark never moves (K unchanged)
+    let (_, g) = r.env.market_state();
+    let a0 = &g.assets[0];
+    let a1 = &g.assets[1];
+    eprintln!(
+        "MULTI: asset0 stale {}/{} asset1 stale {}/{}",
+        a0.stale_account_count_long, a0.stale_account_count_short, a1.stale_account_count_long, a1.stale_account_count_short
+    );
+    assert_eq!(a0.stale_account_count_long + a0.stale_account_count_short, 0, "vault asset current");
+    assert!(a1.stale_account_count_long + a1.stale_account_count_short > 0, "asset 1 stale");
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    let keeper = r.execute_77(&h, None, false);
+    assert_eq!(code(&keeper), Some(ERR_NOT_LOSS_CURRENT), "keeper exit with asset 1 stale: {keeper:?}");
+    let (m_paid, _) = r.execute_77(&m, None, true).expect("signed exit: the vault asset is current");
+    assert!(m_paid + 2 >= R3M1_DEPOSIT, "{m_paid}");
+    crank1(&mut r, t);
+    let (h_paid, _) = r.execute_77(&h, None, false).expect("control: keeper exit once every asset is current");
+    assert!(h_paid + 2 >= R3M1_DEPOSIT, "{h_paid}");
 }

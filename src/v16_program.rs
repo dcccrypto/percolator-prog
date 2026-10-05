@@ -12843,26 +12843,18 @@ pub mod processor {
         collect_maintenance_fee_before_value_debit_view(cfg, group, portfolio)
     }
 
-    /// Item 7 precision floor at a growth asset's LAUNCH anchor (ConfigureAuthMark before any
-    /// portfolio was ever created on the market: asset 0's `next_portfolio_id == 0`). A creator
-    /// cannot InitMarket at the floor and then re-anchor the empty, never-used market to an
-    /// untrackable price. Security review A2: once the market was used, a re-anchor is NOT
-    /// floored (and RestartAssetOracle never is), so an asset whose mark fell below the floor by
-    /// ordinary pushes can be revived at its true price. Non-growth assets are unchanged. 119.
-    fn require_lot_launch_floor_view(
+    /// Item 7 precision floor on EVERY ConfigureAuthMark of a growth asset (security review
+    /// R2-1: a "launch only" proxy was bypassable by one permissionless InitPortfolio, after which
+    /// the oracle authority could re-anchor to an untrackable micro-price). Only
+    /// RestartAssetOracle -- the exit from asset Recovery -- is exempt (A2), so a crashed asset can
+    /// still be revived at its true price. Non-growth assets are unchanged. Custom(119).
+    fn require_lot_reanchor_floor_view(
         group: &state::MarketViewMutV16<'_>,
-        cfg: &WrapperConfigV16,
         asset_index: usize,
         mark_e6: u64,
     ) -> ProgramResult {
         let growth = asset_growth_view(group, asset_index)?.is_some();
-        if !growth {
-            return Ok(());
-        }
-        let used = read_oracle_profile_from_view(group, cfg, 0)?.next_portfolio_id != 0;
-        if crate::wave_a_v22::reanchor_floor_applies(growth, used)
-            && crate::wave_a_v22::lot_price_below_floor(growth, mark_e6)
-        {
+        if crate::wave_a_v22::lot_price_below_floor(growth, mark_e6) {
             return Err(PercolatorError::LotConfigInvalid.into());
         }
         Ok(())
@@ -24829,7 +24821,7 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
-            require_lot_launch_floor_view(&group, &cfg, asset_index_usize, initial_mark_e6)?;
+            require_lot_reanchor_floor_view(&group, asset_index_usize, initial_mark_e6)?;
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
@@ -27152,6 +27144,8 @@ pub mod processor {
                 obligation_long: slot.asset.pending_obligation_count_long.get(),
                 obligation_short: slot.asset.pending_obligation_count_short.get(),
                 b_stale_accounts: group.header.b_stale_account_count.get(),
+                negative_pnl_accounts: group.header.negative_pnl_account_count.get(),
+                stale_certificates: group.header.stale_certificate_count.get(),
             };
             // A1: a redeemer-signed exit on a book that is only K/F-stale may proceed under
             // the bounded-dip floor (checked once the payout is priced); a keeper exit, or any
@@ -27163,11 +27157,45 @@ pub mod processor {
                     return Err(PercolatorError::ExitRequiresLossCurrent.into());
                 }
             }
+            // Security review round 2 (multi-asset residual): an UNSIGNED keeper exit needs EVERY
+            // configured asset loss-current, not only the vault's, so a cross-margined loser
+            // whose solvency rests on a stale leg elsewhere cannot leave the vault's pot
+            // under-routed at a third party's chosen moment.
+            if !redeemer_signed && !all_assets_loss_current_view(&group, &counters)? {
+                return Err(PercolatorError::ExitRequiresLossCurrent.into());
+            }
         }
         Ok((
             crate::wave_a_v22::effective_min_payout(wire_min_payout_atoms, ext.min_payout_atoms),
             dip_floor,
         ))
+    }
+
+    /// Round 2 (multi-asset): every configured, in-service asset is loss-current (per-asset
+    /// cohorts, barriers and obligations zero; the header-wide counters are in `vault`).
+    fn all_assets_loss_current_view(
+        group: &state::MarketViewMutV16<'_>,
+        vault: &crate::wave_a_v22::LossCounters,
+    ) -> Result<bool, ProgramError> {
+        let n = core::cmp::min(group.markets.len(), group.header.config.max_market_slots.get() as usize);
+        let mut i = 0usize;
+        while i < n {
+            let slot = &group.markets[i].engine;
+            let c = crate::wave_a_v22::LossCounters {
+                stale_long: slot.asset.stale_account_count_long.get(),
+                stale_short: slot.asset.stale_account_count_short.get(),
+                barrier_long: slot.pending_domain_loss_barrier_long.get(),
+                barrier_short: slot.pending_domain_loss_barrier_short.get(),
+                obligation_long: slot.asset.pending_obligation_count_long.get(),
+                obligation_short: slot.asset.pending_obligation_count_short.get(),
+                ..*vault
+            };
+            if !crate::wave_a_v22::loss_current(&c) {
+                return Ok(false);
+            }
+            i += 1;
+        }
+        Ok(true)
     }
 
     /// Security review A1: the bounded-dip floor for a redeemer-signed exit that is not
