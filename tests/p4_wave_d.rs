@@ -2175,3 +2175,76 @@ fn xprog_fee_leg_refuses_fee_only_pool() {
     let want = percolator_prog::error::PercolatorError::StakePoolModeMismatch as u32;
     assert!(r.as_ref().err().map_or(false, |e| code(e) == Some(want)), "fee-only pool must be refused the fee leg: {r:?}");
 }
+
+/// Tag 101 with the units ledger appended (after [11] system program).
+fn settle_resolved_units(w: &mut P3, junior_owner: Pubkey, topup: u8) -> Result<u64, String> {
+    let dest = w.token(junior_owner, 0);
+    let payer = w.env.payer.pubkey();
+    let metas = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new_readonly(w.registry, false),
+        AccountMeta::new(w.state_pda, false),
+        AccountMeta::new(w.lp, false),
+        AccountMeta::new(w.ledger0, false),
+        AccountMeta::new_readonly(w.ledger1, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(w.env.vault, false),
+        AccountMeta::new_readonly(w.env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(units_pda(w), false),
+    ];
+    w.send_raw(raw(101, &[topup]), metas, &[])
+}
+
+/// G9-4 (I-S6 in Resolved): the settled vault LP's payouts repay the backstop FIRST, into
+/// asset-0 insurance (where unit holders withdraw it through tag 41); a progress-only call never
+/// writes anything off early; both ledgers keep the same receivable; tokens are conserved.
+#[test]
+fn g9_resolved_settle_repays_backstop_first() {
+    let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    backstop_111(&mut w, 0, 0, true).expect("draw");
+    let b0 = backstop_st(&w) as u128;
+    assert!(b0 > 0);
+    // The market falls back (the short LP recovers) and the trader closes in Live: the LP ends
+    // with realised profit that is NOT restored in Live (no tag 111 mode 1) before resolution.
+    for _ in 0..8 {
+        let m = MARK.with(|c| c.get()) * 80 / 100;
+        MARK.with(|c| c.set(m.max(PRICE / 4)));
+        w.push(m.max(PRICE / 4));
+        let lp = w.lp;
+        w.catch_up(&[tp, lp], 30);
+    }
+    for _ in 0..8 {
+        let pos = w.pos(tp);
+        if pos == 0 { break; }
+        let _ = w.trade_vs_lp(&t, tp, -pos);
+        let lp = w.lp;
+        w.catch_up(&[tp, lp], 5);
+    }
+    let l = w.lp_state();
+    eprintln!("G9-4: LP before resolve cap {} pnl {}", l.capital, l.pnl);
+    w.env.resolve();
+    assert_eq!(w.env.market_state().1.mode, percolator::MarketModeV16::Resolved);
+    let ins0 = w.env.market_state().1.insurance;
+    let jo = w.env.admin.pubkey();
+    for i in 0..40 {
+        let l = w.env.portfolio_state(w.lp);
+        if i > 0 && l.capital == 0 && l.pnl == 0 && l.legs.iter().all(|x| !x.active) { break; }
+        let topup = 0;
+        let r = settle_resolved_units(&mut w, jo, topup);
+        let u = units(&w).unwrap();
+        eprintln!("G9-4: 101({topup}) -> {:?} | backstop {} receivable {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w), u.backstop_receivable_atoms);
+        assert_eq!(u.backstop_receivable_atoms, backstop_st(&w) as u128, "mirror kept in step");
+        let s = w.slot() + 50;
+        w.env.svm.warp_to_slot(s);
+    }
+    let b1 = backstop_st(&w) as u128;
+    let repaid = w.env.market_state().1.insurance.saturating_sub(ins0);
+    eprintln!("G9-4: b0 {b0} -> {b1}, insurance +{repaid}");
+    assert_eq!(repaid, b0 - b1, "insurance rises by exactly the repayment");
+    assert!(repaid > 0, "vacuity: the recovered vault LP repaid part of the backstop");
+    conserved(&w, "after resolved settle");
+}

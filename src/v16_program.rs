@@ -33258,7 +33258,13 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
-            let mut units_state = if ins_units_required_view(&group, &cfg)? {
+            // G9 lends the unit holders' insurance, so it runs ONLY on a unitised market (the
+            // receivable must be mirrored from the first draw on; a ledger created after a
+            // draw would start with a stale receivable of 0).
+            if !ins_units_required_view(&group, &cfg)? {
+                return Err(PercolatorError::InsuranceBackstopRefused.into());
+            }
+            let mut units_state = {
                 let ai = units_ai.ok_or(PercolatorError::InsuranceBackstopRefused)?;
                 let u = state::read_insurance_units(&ai.try_borrow_data()?)?;
                 if u.market_group != market_ai.key.to_bytes()
@@ -33267,8 +33273,6 @@ pub mod processor {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
                 Some((ai, u))
-            } else {
-                None
             };
             let rec = read_vault_lp_draw_from_view(&group, 0)?;
             let pending = rec
@@ -34209,27 +34213,29 @@ pub mod processor {
             };
             let recycled = vlp_claim_payout.max(recv_atoms.min(to_backing)).min(to_backing);
             let to_backing = to_backing - recycled;
-            // Phase 4 item 6 (I-S6): the settled vault LP's payout repays the G9 backstop FIRST,
-            // into asset-0 insurance (the payout already left header.vault inside the engine
-            // close). A settled vault LP can recover nothing more, so any unrepaid remainder is a
-            // realised insurance loss: the receivable is written off on both ledgers.
+            // Phase 4 item 6 (I-S6): EVERY vault-LP payout in Resolved (the resolved close and
+            // any later top-up claim) repays the G9 backstop FIRST, into asset-0 insurance (the
+            // payout already left header.vault inside the engine close). Nothing is written off
+            // early: a progress-only close pays 0 and the LP may still pay later. Whatever is never
+            // repaid simply stays a realised insurance loss (it blocks nothing in Resolved: the
+            // junior halt counts the backstop in Live only).
             let backstop = st.backstop_outstanding_atoms as u128;
             let to_insurance = to_backing.min(backstop);
             let to_backing = to_backing - to_insurance;
-            if backstop != 0 {
-                if to_insurance != 0 {
-                    deposit_market_zero_insurance_view(&mut group, to_insurance)?;
-                }
-                st.backstop_outstanding_atoms = 0;
+            if to_insurance != 0 {
+                deposit_market_zero_insurance_view(&mut group, to_insurance)?;
+                let left = backstop - to_insurance;
+                st.backstop_outstanding_atoms =
+                    u64::try_from(left).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
                 backstop_settled = true;
                 if ins_units_required_view(&group, &cfg)? {
                     let units_ai = ins_units_find(program_id, market_ai.key, accounts, 12)?;
-                    ins_units_set_receivable(units_ai, &group, market_ai.key, 0)?;
+                    ins_units_set_receivable(units_ai, &group, market_ai.key, left)?;
                 }
                 solana_program::log::sol_log(&alloc::format!(
-                    "p4_backstop_settled repaid={} written_off={}",
+                    "p4_backstop_repaid_resolved repaid={} outstanding={}",
                     to_insurance,
-                    backstop - to_insurance
+                    left
                 ));
             }
             if recycled != 0 {
@@ -34428,7 +34434,10 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
-        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms.saturating_add(st.backstop_outstanding_atoms as u128), vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
+        // Phase 4: the backstop halts the junior in LIVE only; in Resolved every vault-LP payout repays
+        // it first at tag 101, so what is left in the pots after that is the junior's / seniors'.
+        let backstop_halt = if resolved { 0 } else { st.backstop_outstanding_atoms as u128 };
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms.saturating_add(backstop_halt), vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
