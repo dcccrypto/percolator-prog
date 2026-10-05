@@ -68,7 +68,8 @@ const MAX_PAYLOAD: usize = 512;
 /// still breaks the build at the match arm.
 fn variant_name(ix: &Instruction) -> &'static str {
     match ix {
-        Instruction::InitMarket { .. } => "InitMarket",
+        // growth-v19: the optional-trailer forms are the SAME tags (0 / 94), same names.
+        Instruction::InitMarket { .. } | Instruction::InitMarketV19 { .. } => "InitMarket",
         Instruction::InitPortfolio { .. } => "InitPortfolio",
         Instruction::Deposit { .. } => "DepositCollateral",
         Instruction::Withdraw { .. } => "WithdrawCollateral",
@@ -140,9 +141,11 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::UpdateMaintenanceFeePerSlot { .. } => "UpdateMaintenanceFeePerSlot",
         Instruction::ExpireBackingBucket { .. } => "ExpireBackingBucket",
         Instruction::WithdrawCreatorFee { .. } => "WithdrawCreatorFee",
-        Instruction::SetAssetRiskLimits { .. } => "SetAssetRiskLimits",
+        Instruction::SetAssetRiskLimits { .. } | Instruction::SetAssetRiskLimitsV19 { .. } => {
+            "SetAssetRiskLimits"
+        }
         // P3 vault-owned LP (2026-09-29), tags 94..=102.
-        Instruction::InitVaultLp { .. } => "InitVaultLp",
+        Instruction::InitVaultLp { .. } | Instruction::InitVaultLpV19 { .. } => "InitVaultLp",
         Instruction::VaultLpSetMatcher { .. } => "VaultLpSetMatcher",
         Instruction::DepositJuniorTranche { .. } => "DepositJuniorTranche",
         Instruction::WithdrawJuniorTranche { .. } => "WithdrawJuniorTranche",

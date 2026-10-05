@@ -1,0 +1,23 @@
+[package]
+name = "growth-v19-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: proves the EXACT production files ../../src/growth_v19.rs and
+# ../../src/vault_lp_v18.rs (pure, no deps). growth_v19 refers to crate::vault_lp_v18.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Negative controls: swap in mutants/growth_v19_mutant.rs.
+growth_mutant = []
+# Primitive negative controls: swap in mutants/vault_lp_v18_mutant.rs (mul_div_floor).
+vlp_mutant = []
+# R11 negative control: the view's pre-N-1 capacity measure (LP net) in the harness model.
+lpnet_mutant = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

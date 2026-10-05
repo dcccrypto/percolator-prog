@@ -1,0 +1,21 @@
+# SBF stack-frame baseline for scripts/sbf_stack_sizes.py (security round 3, F-1).
+# Format: <bytes> <function path> [pin]
+#   * Any function > 3840 B (4096 - 256) that is NOT listed here fails the gate.
+#   * A listed function may never grow past its recorded size if it is over 3840 B or pinned.
+#   * Nothing may reach 4096 B (the SBF frame; cargo build-sbf gives no diagnostic there).
+# Update a number ONLY in a reviewed commit that says why, with the measured value.
+#
+# PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
+# never allowed to grow; each should be brought under 3840 in its own change):
+4032 percolator_prog::processor::handle_execute_redemption
+3968 percolator_prog::processor::handle_lp_vault_crank_fees
+#
+# PINNED hot paths (the trade executors and their routes): may not grow at all.
+# handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the
+# source-domain admission, the post-fill gates and the fee split/accrual into their own frames.
+3648 percolator_prog::processor::handle_trade_nocpi_zero_copy pin
+3584 percolator_prog::processor::handle_batch_execute_zero_copy pin
+1664 percolator_prog::processor::handle_trade_cpi pin
+2048 percolator_prog::processor::handle_batch_trade_cpi pin
+1536 percolator_prog::processor::p1_cpi_preflight_before_matcher pin
+3776 percolator_prog::processor::handle_init_vault_lp pin

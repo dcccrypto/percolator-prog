@@ -40,6 +40,10 @@ declare_id!("Perco1ator111111111111111111111111111111111");
 /// leverage step-down. See `~/percolator-ops/ledger/p3-vault-owned-lp-2026-09-29.md`.
 pub mod vault_lp_v18;
 
+/// growth-v19 (2026-10-04): pure math for dynamic leverage and capital-derived capacity. See
+/// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
+pub mod growth_v19;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -433,6 +437,17 @@ pub mod constants {
     const _: () = assert!(ASSET_VAULT_POT_OWNED_OFF >= 672);
     pub const ASSET_VAULT_LP_DRAW_LEN: usize = 64;
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF + ASSET_VAULT_LP_DRAW_LEN == ASSET_VAULT_LP_OFF);
+
+    /// growth-v19 (2026-10-04): per-asset `state::AssetGrowthV19` (120 B) at [672, 792) of EACH
+    /// asset's 1024-byte wrapper slot: the zero spare headroom between P1's risk limits (end 672)
+    /// and asset-0's market-wide resolved-receipt counter (792). NO LAYOUT CHANGE: every other
+    /// offset is unchanged and a deployed / fresh slot reads all-zero == growth OFF (today's
+    /// behaviour, byte for byte). The range is pinned at compile time on BOTH sides.
+    pub const ASSET_GROWTH_OFF: usize = 672;
+    pub const ASSET_GROWTH_LEN: usize = 120;
+    const _: () = assert!(ASSET_GROWTH_OFF == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
+    const _: () = assert!(ASSET_GROWTH_OFF + ASSET_GROWTH_LEN == MARKET_RESOLVED_RECEIPT_ONLY_OFF);
+    const _: () = assert!(ASSET_GROWTH_OFF + ASSET_GROWTH_LEN <= ASSET_VAULT_POT_OWNED_OFF);
     const _: () = assert!(ASSET_VAULT_LP_DRAW_OFF >= 672);
 
     /// P3 vault-LP state account kind (kinds 1-8 are taken; see KIND_CLOSED_MARKET).
@@ -1367,6 +1382,51 @@ VaultLpMultiAssetMarket,
         /// (77) are not affected. Custom(91), appended at the END (no existing code shifts).
         /// SDK/app: map to "Earn deposits paused while this vault settles".
         LpVaultTargetPotImpaired,
+        /// growth-v19: a risk-increasing fill on a growth-enabled asset leaves the taker's
+        /// conservative equity (no credit for positive PnL) below the dynamic initial margin:
+        /// the launch ceiling `IMR(L_ceil)`, stepped up on the crowded side as the LP's
+        /// capacity fills. Reductions and closes are never refused. Custom(92), appended at
+        /// the END. SDK/app: "Max N.Nx on new <side>: this market's liquidity is U% used."
+        GrowthLeverageExceeded,
+        /// growth-v19: a crowd-side risk-increasing fill when the LP counterparty's capacity
+        /// `N_cap = lambda * C_m / P` is full (u >= 1), its capital is 0, the price is 0 /
+        /// the cap overflows (fail closed), or the market's bankruptcy h-lock is latched. The
+        /// thin side, reductions and closes stay open. Custom(93), appended at the END.
+        /// SDK/app: "New <side> paused: this side is full. Closes and <other side> are open."
+        GrowthCapacityFull,
+        /// growth-v19: an invalid growth configuration. InitMarket with a growth block:
+        /// `MMR < r_gap + liquidation fee`, `r_gap == 0`, `l_launch` outside [1x, tier max],
+        /// or `max_abs_funding_e9_per_slot == 0` on a single-slot market. InitVaultLp (94)
+        /// with an `l_launch` on an asset whose growth block is off or outside the tier.
+        /// Custom(94), appended at the END.
+        GrowthInvalidConfig,
+        /// growth-v19 (security review M-1 / P1 F-7): on a growth asset every RISK-INCREASING
+        /// fill must face an LP counterparty (it then pays the crowd step and counts against
+        /// N_cap). A NoCpi fill between two non-LP portfolios (or two LPs) may only reduce /
+        /// close. Without this, a pair opened trader-vs-trader at the launch ceiling could be
+        /// "closed" into an LP past its capacity through the close exemption. Custom(95),
+        /// appended at the END. SDK/app: "Open against the market maker (trade via the book)".
+        /// Since N-1 the counterparty must be the asset's BOUND vault LP.
+        GrowthNeedsLpCounterparty,
+        /// growth-v19 L-6 (security re-verification): a BatchTradeCpi carrying a growth leg
+        /// has more than `growth_v19::GROWTH_BATCH_MAX_LEGS` (10) legs. Custom(96), appended
+        /// at the END. SDK/app: "Split this order into batches of at most 10 markets".
+        GrowthBatchTooManyLegs,
+        /// growth-v19 N-1 (security re-verification): growth-1 admits OPENS only on assets with
+        /// a BOUND P3 vault LP, where every user position faces that one LP and capacity is
+        /// measured on users open interest. Reductions / closes are never refused by this.
+        /// Custom(97), appended at the END. SDK/app: "This market is not open for new positions".
+        GrowthRequiresBoundVaultLp,
+        /// growth-v19 N-2 (security round 3): a TradeCpi open into a side above its utilisation
+        /// kink owes the utilisation fee (paid to the vault LP), and the taker's signed `fee_bps`
+        /// (or the market's engine fee cap) does not cover base + matcher request + that fee.
+        /// Custom(98), appended at the END. SDK/app: "This side is busy: raise your max fee to
+        /// cover the utilisation fee (see the quote)".
+        GrowthUtilisationFeeNotCovered,
+        /// growth-v19 N-2: a BatchTradeCpi leg would OPEN into a side above its utilisation kink;
+        /// the batch route carries no LP fee credit, so such opens must use TradeCpi. Closes and
+        /// opens at or below the kink are unaffected. Custom(99), appended at the END.
+        GrowthUtilisationFeeRequiresTradeCpi,
     }
 
     impl From<PercolatorError> for ProgramError {
@@ -2647,6 +2707,20 @@ pub mod state {
         Ok(limits)
     }
 
+    /// Encode into an asset's wrapper-slot bytes (the view-level twin of
+    /// `write_asset_risk_limits`); validates first.
+    pub fn asset_risk_limits_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        limits: &AssetRiskLimitsV17,
+    ) -> Result<(), ProgramError> {
+        validate_asset_risk_limits(limits)?;
+        wrapper
+            .get_mut(ASSET_RISK_LIMITS_OFF..ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(limits));
+        Ok(())
+    }
+
     #[inline]
     fn asset_risk_limits_range(
         data: &[u8],
@@ -2672,6 +2746,47 @@ pub mod state {
         let limits: AssetRiskLimitsV17 = bytemuck::pod_read_unaligned(bytes);
         validate_asset_risk_limits(&limits)?;
         Ok(limits)
+    }
+
+    /// growth-v19: absolute byte range of asset `asset_index`'s `AssetGrowthV19` in a market
+    /// account (`dynamic_slot_offset(asset) + [672, 792)`).
+    pub fn asset_growth_range(
+        data: &[u8],
+        asset_index: usize,
+    ) -> Result<core::ops::Range<usize>, ProgramError> {
+        let capacity = market_slot_capacity(data)?;
+        if asset_index >= capacity {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let start = dynamic_slot_offset(asset_index)?
+            .checked_add(crate::constants::ASSET_GROWTH_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(start..start + crate::constants::ASSET_GROWTH_LEN)
+    }
+
+    /// growth-v19: the one-byte `version` of asset `asset_index`'s growth record (0 == off).
+    pub fn asset_growth_version(data: &[u8], asset_index: usize) -> Result<u8, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_growth_range(data, asset_index)?;
+        data.get(range.start + ASSET_GROWTH_VERSION_FIELD_OFF)
+            .copied()
+            .ok_or_else(|| PercolatorError::InvalidAccountLen.into())
+    }
+
+    /// growth-v19: decode asset `asset_index`'s growth record from a market account (`None` ==
+    /// off). `engine_imr_bps` is the market's engine IMR (validation of the tier).
+    pub fn read_asset_growth(
+        data: &[u8],
+        asset_index: usize,
+        engine_imr_bps: u64,
+    ) -> Result<Option<AssetGrowthV19>, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let range = asset_growth_range(data, asset_index)?;
+        let start = range.start - crate::constants::ASSET_GROWTH_OFF;
+        let wrapper = data
+            .get(start..range.end)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        asset_growth_from_wrapper_bytes(wrapper, engine_imr_bps)
     }
 
     pub fn write_asset_risk_limits(
@@ -5951,6 +6066,132 @@ pub mod state {
         Ok(())
     }
 
+    /// growth-v19 per-asset dynamic-leverage / capacity record at `constants::ASSET_GROWTH_OFF`
+    /// (672) of each asset's wrapper slot. ALL-ZERO == OFF (today's behaviour); `version == 1`
+    /// == on. Written by InitMarket's optional growth block (asset 0, creator, at creation:
+    /// the only place the MMR >= r_gap + fee rule can be checked) and re-set by InitVaultLp's
+    /// optional `l_launch` (creator, at bind, asset flat). No other writer in growth-1.
+    ///
+    /// No u128 field (a 16-aligned field would pad 120 B to 128 and break `Pod`).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct AssetGrowthV19 {
+        /// Junior risk capital at launch (atoms), the graduation reference. 0 = not recorded.
+        pub c_launch_atoms: u64, // 0..8
+        /// Slot of the last ceiling change (ratchet).
+        pub ceil_slot: u64, // 8..16
+        /// LP leverage on capital: `N_cap = lambda * C_m / P`. Default 10_000 (1x).
+        pub lambda_bps: u32, // 16..20
+        /// Creator's starting leverage cap, x100 (bounded by the tier).
+        pub l_launch_x100: u16, // 20..22
+        /// Protocol tier maximum, x100 == floor(1e6 / engine IMR) at enable time.
+        pub l_tier_x100: u16, // 22..24
+        /// Current graduated ceiling, x100 (== l_launch while graduation is off).
+        pub ceil_x100: u16, // 24..26
+        /// Utilisation kink u_k (bps). Default 5_000.
+        pub kink_bps: u16, // 26..28
+        /// Worst move between liquidation opportunities (bps), validated at InitMarket.
+        pub r_gap_bps: u16, // 28..30
+        /// Phase-2 dials (Earn allocation, fee cushion); must be 0 in growth-1.
+        pub alloc_alpha_bps: u16, // 30..32
+        pub alloc_buffer_bps: u16,   // 32..34
+        pub cushion_target_bps: u16, // 34..36
+        pub cushion_share_bps: u16,  // 36..38
+        /// 0 = off, 1 = on.
+        pub version: u8, // 38
+        pub flags: u8,               // 39
+        /// N-2 (security round 3): the per-side utilisation fee at `u = 1` (bps of the opening
+        /// notional, paid to the vault LP). 0 = `growth_v19::GROWTH_UTIL_FEE_DEFAULT_BPS`.
+        pub util_fee_max_bps: u16, // 40..42
+        pub _reserved0: [u8; 30],    // 42..72
+        pub _reserved1: [u8; 32],    // 72..104
+        pub _reserved2: [u8; 16],    // 104..120
+    }
+    const _: () =
+        assert!(core::mem::size_of::<AssetGrowthV19>() == crate::constants::ASSET_GROWTH_LEN);
+    /// Offset of `version` inside the record: the one-byte OFF fast path (CU) reads only this.
+    pub const ASSET_GROWTH_VERSION_FIELD_OFF: usize = 38;
+    const _: () =
+        assert!(core::mem::offset_of!(AssetGrowthV19, version) == ASSET_GROWTH_VERSION_FIELD_OFF);
+
+    /// Structural validation (`engine_imr_bps` is the market's engine IMR). All-zero is valid
+    /// (off). `version == 0` with ANY other non-zero byte is corrupt (fail closed), as is an
+    /// unknown version, a non-zero reserved / phase-2 byte, `l_launch` outside [1x, l_tier],
+    /// a tier looser than the engine IMR, `lambda` outside [1, MAX], or a kink above 100%.
+    pub fn validate_asset_growth(
+        g: &AssetGrowthV19,
+        engine_imr_bps: u64,
+    ) -> Result<(), ProgramError> {
+        if g.version == 0 {
+            if *g != AssetGrowthV19::default() {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            return Ok(());
+        }
+        let tier_max = crate::growth_v19::leverage_x100_for_imr_bps(engine_imr_bps)
+            .ok_or(ProgramError::InvalidAccountData)?;
+        if g.version != crate::growth_v19::GROWTH_VERSION
+            || g.flags != 0
+            || g._reserved0 != [0u8; 30]
+            || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
+            || g._reserved1 != [0u8; 32]
+            || g._reserved2 != [0u8; 16]
+            || g.alloc_alpha_bps != 0
+            || g.alloc_buffer_bps != 0
+            || g.cushion_target_bps != 0
+            || g.cushion_share_bps != 0
+            || g.l_launch_x100 < crate::growth_v19::LEVERAGE_X100_ONE
+            || g.l_launch_x100 > g.l_tier_x100
+            || g.l_tier_x100 > tier_max
+            || g.ceil_x100 < crate::growth_v19::LEVERAGE_X100_ONE
+            || g.ceil_x100 > g.l_tier_x100
+            || g.lambda_bps == 0
+            || g.lambda_bps > crate::growth_v19::MAX_LAMBDA_BPS
+            || g.kink_bps as u128 > crate::growth_v19::BPS
+            || g.r_gap_bps == 0
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    /// `None` when growth is OFF on this asset (one-byte read), else the validated record.
+    pub fn asset_growth_from_wrapper_bytes(
+        wrapper: &[u8],
+        engine_imr_bps: u64,
+    ) -> Result<Option<AssetGrowthV19>, ProgramError> {
+        let off = crate::constants::ASSET_GROWTH_OFF;
+        let version = *wrapper
+            .get(off + ASSET_GROWTH_VERSION_FIELD_OFF)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        if version == 0 {
+            // OFF: exactly the deployed behaviour, which never reads these bytes. Only the
+            // version byte is read on this path (CU: it runs per leg on every trade route);
+            // the writers (`asset_growth_to_wrapper_bytes`) validate the whole record.
+            return Ok(None);
+        }
+        let bytes = wrapper
+            .get(off..off + crate::constants::ASSET_GROWTH_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let g: AssetGrowthV19 = bytemuck::pod_read_unaligned(bytes);
+        validate_asset_growth(&g, engine_imr_bps)?;
+        Ok(Some(g))
+    }
+
+    pub fn asset_growth_to_wrapper_bytes(
+        wrapper: &mut [u8],
+        g: &AssetGrowthV19,
+        engine_imr_bps: u64,
+    ) -> Result<(), ProgramError> {
+        validate_asset_growth(g, engine_imr_bps)?;
+        let off = crate::constants::ASSET_GROWTH_OFF;
+        wrapper
+            .get_mut(off..off + crate::constants::ASSET_GROWTH_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(g));
+        Ok(())
+    }
+
     /// Vault-owned atoms of pot `parity` (0 = even/long, 1 = odd/short) of this asset.
     pub fn vault_pot_owned_from_wrapper_bytes(wrapper: &[u8], parity: usize) -> Result<u128, ProgramError> {
         let off = crate::constants::ASSET_VAULT_POT_OWNED_OFF + 16 * (parity & 1);
@@ -7076,6 +7317,35 @@ pub mod ix {
         /// a portfolio OWNED BY THE LP-VAULT REGISTRY PDA, binds it as the asset's exclusive
         /// matcher LP and seeds the senior claim at the vault's current backing NAV.
         InitVaultLp { junior_floor_bps: u16 },
+        /// growth-v19: tag 0 with a 4-byte trailing growth block `[r_gap_bps u16][l_launch_x100
+        /// u16]` (both non-zero). `market` is always an `InitMarket`. Enables growth on asset 0
+        /// and validates `MMR >= r_gap + liquidation fee` and, on a single-slot market,
+        /// `max_abs_funding_e9_per_slot > 0`. Without the block tag 0 is byte-for-byte legacy.
+        InitMarketV19 {
+            market: alloc::boxed::Box<Instruction>,
+            growth_r_gap_bps: u16,
+            growth_l_launch_x100: u16,
+        },
+        /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
+        /// starting leverage cap, written at bind on an asset whose growth block is on.
+        InitVaultLpV19 {
+            junior_floor_bps: u16,
+            l_launch_x100: u16,
+        },
+        /// growth-v19: tag 93 (upgrade authority) with the FULL legacy body (ext mode + max
+        /// requested fee always present) and a 6-byte trailer `[lambda_bps u32][kink_bps u16]`:
+        /// the growth dials of a growth asset. Until the epoch clamp exists they may only
+        /// tighten / stay within the growth-1 defaults (`growth_v19::growth_dials_ok`).
+        /// `limits` is always a `SetAssetRiskLimits`. N-2: an 8-byte trailer
+        /// `[lambda u32][kink u16][util_fee_max_bps u16]` also sets the utilisation-fee dial
+        /// (`growth_util_fee_max_bps != 0`; tighten-only, `growth_v19::util_fee_dial_ok`); the
+        /// 6-byte form leaves it unchanged (`growth_util_fee_max_bps == 0`).
+        SetAssetRiskLimitsV19 {
+            limits: alloc::boxed::Box<Instruction>,
+            growth_lambda_bps: u32,
+            growth_kink_bps: u16,
+            growth_util_fee_max_bps: u16,
+        },
         /// Tag 95, UPGRADE-AUTHORITY-gated (P3-H2). SetMatcherConfig + InitMatcherCtx for the
         /// vault LP (whose owner, a PDA, cannot sign either), with the protocol-approved matcher.
         VaultLpSetMatcher {
@@ -7133,30 +7403,46 @@ pub mod ix {
                 .split_first()
                 .ok_or(ProgramError::InvalidInstructionData)?;
             let ix = match tag {
-                0 => Self::InitMarket {
-                    max_portfolio_assets: read_u16(&mut rest)?,
-                    h_min: read_u64(&mut rest)?,
-                    h_max: read_u64(&mut rest)?,
-                    initial_price: read_u64(&mut rest)?,
-                    min_nonzero_mm_req: read_u128(&mut rest)?,
-                    min_nonzero_im_req: read_u128(&mut rest)?,
-                    maintenance_margin_bps: read_u64(&mut rest)?,
-                    initial_margin_bps: read_u64(&mut rest)?,
-                    max_trading_fee_bps: read_u64(&mut rest)?,
-                    trade_fee_base_bps: read_u64(&mut rest)?,
-                    liquidation_fee_bps: read_u64(&mut rest)?,
-                    liquidation_fee_cap: read_u128(&mut rest)?,
-                    min_liquidation_abs: read_u128(&mut rest)?,
-                    max_price_move_bps_per_slot: read_u64(&mut rest)?,
-                    max_accrual_dt_slots: read_u64(&mut rest)?,
-                    max_abs_funding_e9_per_slot: read_u64(&mut rest)?,
-                    min_funding_lifetime_slots: read_u64(&mut rest)?,
-                    max_account_b_settlement_chunks: read_u64(&mut rest)?,
-                    max_bankrupt_close_chunks: read_u64(&mut rest)?,
-                    max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
-                    public_b_chunk_atoms: read_u128(&mut rest)?,
-                    maintenance_fee_per_slot: read_u128(&mut rest)?,
-                },
+                0 => {
+                    let base = Self::InitMarket {
+                        max_portfolio_assets: read_u16(&mut rest)?,
+                        h_min: read_u64(&mut rest)?,
+                        h_max: read_u64(&mut rest)?,
+                        initial_price: read_u64(&mut rest)?,
+                        min_nonzero_mm_req: read_u128(&mut rest)?,
+                        min_nonzero_im_req: read_u128(&mut rest)?,
+                        maintenance_margin_bps: read_u64(&mut rest)?,
+                        initial_margin_bps: read_u64(&mut rest)?,
+                        max_trading_fee_bps: read_u64(&mut rest)?,
+                        trade_fee_base_bps: read_u64(&mut rest)?,
+                        liquidation_fee_bps: read_u64(&mut rest)?,
+                        liquidation_fee_cap: read_u128(&mut rest)?,
+                        min_liquidation_abs: read_u128(&mut rest)?,
+                        max_price_move_bps_per_slot: read_u64(&mut rest)?,
+                        max_accrual_dt_slots: read_u64(&mut rest)?,
+                        max_abs_funding_e9_per_slot: read_u64(&mut rest)?,
+                        min_funding_lifetime_slots: read_u64(&mut rest)?,
+                        max_account_b_settlement_chunks: read_u64(&mut rest)?,
+                        max_bankrupt_close_chunks: read_u64(&mut rest)?,
+                        max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
+                        public_b_chunk_atoms: read_u128(&mut rest)?,
+                        maintenance_fee_per_slot: read_u128(&mut rest)?,
+                    };
+                    if rest.is_empty() {
+                        base
+                    } else {
+                        let growth_r_gap_bps = read_u16(&mut rest)?;
+                        let growth_l_launch_x100 = read_u16(&mut rest)?;
+                        if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::InitMarketV19 {
+                            market: alloc::boxed::Box::new(base),
+                            growth_r_gap_bps,
+                            growth_l_launch_x100,
+                        }
+                    }
+                }
                 1 => Self::InitPortfolio,
                 3 => Self::Deposit {
                     portfolio_id: read_u64(&mut rest)?,
@@ -7573,23 +7859,47 @@ pub mod ix {
                 85 => Self::SetProtocolFeeAuthority {
                     new_authority: read_bytes32(&mut rest)?,
                 },
-                crate::constants::TAG_SET_ASSET_RISK_LIMITS => Self::SetAssetRiskLimits {
-                    asset_index: read_u16(&mut rest)?,
-                    exec_band_bps: read_u16(&mut rest)?,
-                    lp_exposure_k_bps: read_u32(&mut rest)?,
-                    lp_floor_atoms: read_u128(&mut rest)?,
-                    side_oi_cap_q: read_u128(&mut rest)?,
-                    matcher_ext_mode: if rest.is_empty() {
-                        0
+                crate::constants::TAG_SET_ASSET_RISK_LIMITS => {
+                    let base = Self::SetAssetRiskLimits {
+                        asset_index: read_u16(&mut rest)?,
+                        exec_band_bps: read_u16(&mut rest)?,
+                        lp_exposure_k_bps: read_u32(&mut rest)?,
+                        lp_floor_atoms: read_u128(&mut rest)?,
+                        side_oi_cap_q: read_u128(&mut rest)?,
+                        matcher_ext_mode: if rest.is_empty() {
+                            0
+                        } else {
+                            read_u8(&mut rest)?
+                        },
+                        max_requested_fee_bps: if rest.is_empty() {
+                            0
+                        } else {
+                            read_u16(&mut rest)?
+                        },
+                    };
+                    if rest.len() == 6 || rest.len() == 8 {
+                        let growth_lambda_bps = read_u32(&mut rest)?;
+                        let growth_kink_bps = read_u16(&mut rest)?;
+                        let growth_util_fee_max_bps = if rest.is_empty() {
+                            0
+                        } else {
+                            let v = read_u16(&mut rest)?;
+                            if v == 0 {
+                                // the 8-byte form must carry a non-zero dial (0 = the 6-byte form)
+                                return Err(ProgramError::InvalidInstructionData);
+                            }
+                            v
+                        };
+                        Self::SetAssetRiskLimitsV19 {
+                            limits: alloc::boxed::Box::new(base),
+                            growth_lambda_bps,
+                            growth_kink_bps,
+                            growth_util_fee_max_bps,
+                        }
                     } else {
-                        read_u8(&mut rest)?
-                    },
-                    max_requested_fee_bps: if rest.is_empty() {
-                        0
-                    } else {
-                        read_u16(&mut rest)?
-                    },
-                },
+                        base
+                    }
+                }
                 86 => Self::UpdateFeeSplit {
                     creator_share_bps: read_u16(&mut rest)?,
                     lp_share_bps: read_u16(&mut rest)?,
@@ -7608,9 +7918,21 @@ pub mod ix {
                     asset_index: read_u16(&mut rest)?,
                     authority_epoch: read_u64(&mut rest)?,
                 },
-                94 => Self::InitVaultLp {
-                    junior_floor_bps: read_u16(&mut rest)?,
-                },
+                94 => {
+                    let junior_floor_bps = read_u16(&mut rest)?;
+                    if rest.is_empty() {
+                        Self::InitVaultLp { junior_floor_bps }
+                    } else {
+                        let l_launch_x100 = read_u16(&mut rest)?;
+                        if l_launch_x100 == 0 {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::InitVaultLpV19 {
+                            junior_floor_bps,
+                            l_launch_x100,
+                        }
+                    }
+                }
                 95 => Self::VaultLpSetMatcher {
                     expected_sequence: read_u64(&mut rest)?,
                     asset_generation_frontier: read_u64(&mut rest)?,
@@ -8456,6 +8778,55 @@ pub mod ix {
                 Self::InitVaultLp { junior_floor_bps } => {
                     out.push(94);
                     push_u16(&mut out, junior_floor_bps);
+                }
+                Self::SetAssetRiskLimitsV19 {
+                    ref limits,
+                    growth_lambda_bps,
+                    growth_kink_bps,
+                    growth_util_fee_max_bps,
+                } => {
+                    if let Self::SetAssetRiskLimits {
+                        asset_index,
+                        exec_band_bps,
+                        lp_exposure_k_bps,
+                        lp_floor_atoms,
+                        side_oi_cap_q,
+                        matcher_ext_mode,
+                        max_requested_fee_bps,
+                    } = **limits
+                    {
+                        out.push(crate::constants::TAG_SET_ASSET_RISK_LIMITS);
+                        push_u16(&mut out, asset_index);
+                        push_u16(&mut out, exec_band_bps);
+                        push_u32(&mut out, lp_exposure_k_bps);
+                        push_u128(&mut out, lp_floor_atoms);
+                        push_u128(&mut out, side_oi_cap_q);
+                        // the full legacy body is mandatory under the growth trailer
+                        out.push(matcher_ext_mode);
+                        push_u16(&mut out, max_requested_fee_bps);
+                        push_u32(&mut out, growth_lambda_bps);
+                        push_u16(&mut out, growth_kink_bps);
+                        if growth_util_fee_max_bps != 0 {
+                            push_u16(&mut out, growth_util_fee_max_bps);
+                        }
+                    }
+                }
+                Self::InitVaultLpV19 {
+                    junior_floor_bps,
+                    l_launch_x100,
+                } => {
+                    out.push(94);
+                    push_u16(&mut out, junior_floor_bps);
+                    push_u16(&mut out, l_launch_x100);
+                }
+                Self::InitMarketV19 {
+                    ref market,
+                    growth_r_gap_bps,
+                    growth_l_launch_x100,
+                } => {
+                    out = market.encode();
+                    push_u16(&mut out, growth_r_gap_bps);
+                    push_u16(&mut out, growth_l_launch_x100);
                 }
                 Self::VaultLpSetMatcher {
                     expected_sequence,
@@ -11867,13 +12238,50 @@ pub mod processor {
         Ok(())
     }
 
-    #[inline(never)]
-    fn process_instruction_dispatch<'a>(
+    /// Tag 93 (both encodings): destructure once, then `handle_set_asset_risk_limits`.
+    fn dispatch_set_asset_risk_limits<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        instruction_data: &[u8],
+        ix: &Instruction,
+        growth: Option<(u32, u16, u16)>,
     ) -> ProgramResult {
-        match Instruction::decode(instruction_data)? {
+        match *ix {
+            Instruction::SetAssetRiskLimits {
+                asset_index,
+                exec_band_bps,
+                lp_exposure_k_bps,
+                lp_floor_atoms,
+                side_oi_cap_q,
+                matcher_ext_mode,
+                max_requested_fee_bps,
+            } => handle_set_asset_risk_limits(
+                program_id,
+                accounts,
+                asset_index,
+                state::AssetRiskLimitsV17 {
+                    side_oi_cap_q,
+                    lp_floor_atoms,
+                    lp_exposure_k_bps,
+                    exec_band_bps,
+                    matcher_ext_mode,
+                    _reserved0: 0,
+                    max_requested_fee_bps,
+                    _reserved: [0u8; 22],
+                },
+                growth,
+            ),
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+
+    /// Tag 0 (both encodings): destructure once, then `handle_init_market`.
+    fn dispatch_init_market<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        ix: &Instruction,
+        growth: Option<(u16, u16)>,
+    ) -> ProgramResult {
+        match *ix {
             Instruction::InitMarket {
                 max_portfolio_assets,
                 h_min,
@@ -11922,6 +12330,31 @@ pub mod processor {
                 max_bankrupt_close_lifetime_slots,
                 public_b_chunk_atoms,
                 maintenance_fee_per_slot,
+                growth,
+            ),
+            _ => Err(ProgramError::InvalidInstructionData),
+        }
+    }
+
+    #[inline(never)]
+    fn process_instruction_dispatch<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        instruction_data: &[u8],
+    ) -> ProgramResult {
+        match Instruction::decode(instruction_data)? {
+            ix @ Instruction::InitMarket { .. } => {
+                dispatch_init_market(program_id, accounts, &ix, None)
+            }
+            Instruction::InitMarketV19 {
+                market,
+                growth_r_gap_bps,
+                growth_l_launch_x100,
+            } => dispatch_init_market(
+                program_id,
+                accounts,
+                &market,
+                Some((growth_r_gap_bps, growth_l_launch_x100)),
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -12577,28 +13010,19 @@ pub mod processor {
                 amount,
                 authority_epoch,
             } => handle_withdraw_protocol_fee(program_id, accounts, amount, authority_epoch),
-            Instruction::SetAssetRiskLimits {
-                asset_index,
-                exec_band_bps,
-                lp_exposure_k_bps,
-                lp_floor_atoms,
-                side_oi_cap_q,
-                matcher_ext_mode,
-                max_requested_fee_bps,
-            } => handle_set_asset_risk_limits(
+            ix @ Instruction::SetAssetRiskLimits { .. } => {
+                dispatch_set_asset_risk_limits(program_id, accounts, &ix, None)
+            }
+            Instruction::SetAssetRiskLimitsV19 {
+                limits,
+                growth_lambda_bps,
+                growth_kink_bps,
+                growth_util_fee_max_bps,
+            } => dispatch_set_asset_risk_limits(
                 program_id,
                 accounts,
-                asset_index,
-                state::AssetRiskLimitsV17 {
-                    side_oi_cap_q,
-                    lp_floor_atoms,
-                    lp_exposure_k_bps,
-                    exec_band_bps,
-                    matcher_ext_mode,
-                    _reserved0: 0,
-                    max_requested_fee_bps,
-                    _reserved: [0u8; 22],
-                },
+                &limits,
+                Some((growth_lambda_bps, growth_kink_bps, growth_util_fee_max_bps)),
             ),
             Instruction::SetProtocolFeeAuthority { new_authority } => {
                 handle_set_protocol_fee_authority(program_id, accounts, new_authority)
@@ -12635,8 +13059,12 @@ pub mod processor {
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
             Instruction::InitVaultLp { junior_floor_bps } => {
-                handle_init_vault_lp(program_id, accounts, junior_floor_bps)
+                handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)
             }
+            Instruction::InitVaultLpV19 {
+                junior_floor_bps,
+                l_launch_x100,
+            } => handle_init_vault_lp(program_id, accounts, junior_floor_bps, Some(l_launch_x100)),
             Instruction::VaultLpSetMatcher {
                 expected_sequence,
                 asset_generation_frontier,
@@ -12742,6 +13170,8 @@ pub mod processor {
         max_bankrupt_close_lifetime_slots: u64,
         public_b_chunk_atoms: u128,
         maintenance_fee_per_slot: u128,
+        // growth-v19: `(r_gap_bps, l_launch_x100)` from the optional trailing block.
+        growth: Option<(u16, u16)>,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -12869,7 +13299,91 @@ pub mod processor {
             market_ai.key.to_bytes(),
             initial_price,
             init_slot,
-        )
+        )?;
+        if let Some((r_gap_bps, l_launch_x100)) = growth {
+            init_market_growth_block(
+                market_ai,
+                r_gap_bps,
+                l_launch_x100,
+                maintenance_margin_bps,
+                initial_margin_bps,
+                liquidation_fee_bps,
+                max_abs_funding_e9_per_slot,
+                max_price_move_bps_per_slot,
+                init_slot,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// growth-v19: InitMarket's optional growth block (creator == InitMarket admin, at
+    /// creation; the engine MMR is immutable afterwards, so this is the only place the
+    /// bankruptcy-safety rule can be enforced). Enables growth on asset 0:
+    /// * `MMR >= r_gap + liquidation_fee_bps`, `r_gap > 0` (plan §2.1 "bankruptcy safety");
+    /// * `l_launch` in [1x, L_tier], `L_tier = floor(1e6 / engine IMR)` (the engine IMR is
+    ///   the protocol ceiling; the creator's choice is stored separately);
+    /// * a single-slot market (the P3 shape) must have `max_abs_funding_e9_per_slot > 0`
+    ///   (funding has no setter; plan §2.3 step 1 / §2.4);
+    /// * N-2: `max_trading_fee_bps >= base + 100 (pinned matcher request) + 500 (default
+    ///   utilisation fee at u = 1)`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn init_market_growth_block(
+        market_ai: &AccountInfo<'_>,
+        r_gap_bps: u16,
+        l_launch_x100: u16,
+        maintenance_margin_bps: u64,
+        initial_margin_bps: u64,
+        liquidation_fee_bps: u64,
+        max_abs_funding_e9_per_slot: u64,
+        max_price_move_bps_per_slot: u64,
+        init_slot: u64,
+    ) -> ProgramResult {
+        if !growth_v19::init_margin_rule_ok(
+            maintenance_margin_bps,
+            r_gap_bps,
+            liquidation_fee_bps,
+            max_price_move_bps_per_slot,
+        ) {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let l_tier_x100 = growth_v19::leverage_x100_for_imr_bps(initial_margin_bps)
+            .ok_or(PercolatorError::GrowthInvalidConfig)?;
+        if l_launch_x100 < growth_v19::LEVERAGE_X100_ONE || l_launch_x100 > l_tier_x100 {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if max_market_slots == 1 && max_abs_funding_e9_per_slot == 0 {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let g = state::AssetGrowthV19 {
+            ceil_slot: init_slot,
+            lambda_bps: growth_v19::DEFAULT_LAMBDA_BPS,
+            l_launch_x100,
+            l_tier_x100,
+            ceil_x100: l_launch_x100,
+            kink_bps: growth_v19::DEFAULT_KINK_BPS,
+            r_gap_bps,
+            version: growth_v19::GROWTH_VERSION,
+            ..Default::default()
+        };
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut market_data)?;
+        // N-2: the engine fee cap must leave room for base + the pinned matcher request + the
+        // default utilisation fee at u = 1 (the fee channel charges them through the engine).
+        if !growth_v19::util_fee_fits_trading_cap(
+            group.header.config.max_trading_fee_bps.get(),
+            cfg.trade_fee_base_bps,
+            growth_v19::GROWTH_UTIL_FEE_DEFAULT_BPS,
+        ) {
+            return Err(PercolatorError::GrowthInvalidConfig.into());
+        }
+        let market = group
+            .markets
+            .get_mut(0)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, initial_margin_bps)
     }
 
     #[inline(never)]
@@ -13343,38 +13857,16 @@ pub mod processor {
             // trade cannot fill either account's source-domain table and starve a sibling leg's
             // later liquidation/ADL/force-close of the slot it will need. Only pays the O(active
             // legs) snapshot cost when this trade's own delta could newly touch a domain.
-            let account_a_needs_source_capacity =
-                trade_delta_may_require_source_domain_capacity(account_a_position, size_q)?;
-            let account_b_needs_source_capacity =
-                trade_delta_may_require_source_domain_capacity(account_b_position, -size_q)?;
-            if account_a_needs_source_capacity || account_b_needs_source_capacity {
-                let mut admitted_source_domains_a =
-                    reserved_source_domains_snapshot_for_trade_view(
-                        &group,
-                        &account_a,
-                        core::slice::from_ref(&req),
-                        size_q < 0,
-                    )?;
-                let mut admitted_source_domains_b =
-                    reserved_source_domains_snapshot_for_trade_view(
-                        &group,
-                        &account_b,
-                        core::slice::from_ref(&req),
-                        size_q > 0,
-                    )?;
-                ensure_trade_delta_source_domain_capacity_view(
-                    &mut admitted_source_domains_a,
-                    asset_index as usize,
-                    account_a_position,
-                    size_q,
-                )?;
-                ensure_trade_delta_source_domain_capacity_view(
-                    &mut admitted_source_domains_b,
-                    asset_index as usize,
-                    account_b_position,
-                    -size_q,
-                )?;
-            }
+            // F-1 (round 3): the per-trade source-domain admission lives in its own frame.
+            ensure_single_trade_source_domain_capacity_view(
+                &group,
+                &account_a,
+                &account_b,
+                &req,
+                account_a_position,
+                account_b_position,
+                size_q,
+            )?;
             // sync/w1-abacking (adopt upstream 57d04a7d, "reject newly backed liens after
             // expiry"): these snapshots used to be gated on `backing_trade_fee_policy_count`
             // (they only existed to drive the fee split below). The freshness check right
@@ -13431,18 +13923,21 @@ pub mod processor {
                     exhausted,
                 )?;
             }
-            // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
-            ensure_protocol_side_oi_cap_view(&group, asset_index as usize, oi_before)?;
-            // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
-            // and the same-owner rule (reduce-only exemption).
-            p1_post_fill_checks_view(
+            // P1 item 3 (protocol side-OI cap), the growth-v19 gate and the P1 post-fill checks,
+            // in that order, behind ONE call (F-1, security round 3: frame size).
+            single_trade_post_fill_gates_view(
                 &group,
                 &account_a,
                 &account_b,
-                asset_index as usize,
-                account_a_position,
-                account_b_position,
-                roles,
+                &SingleTradePostFill {
+                    keys: (account_a_ai.key, account_b_ai.key),
+                    asset_index: asset_index as usize,
+                    size_q,
+                    position_a_before: account_a_position,
+                    position_b_before: account_b_position,
+                    oi_before,
+                    roles,
+                },
             )?;
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
             // cached slot and a provider's signed backing expiry. Only newly-created
@@ -13482,103 +13977,22 @@ pub mod processor {
             // P2 fee channel: only the fee at the BASE rate goes through the four-way split;
             // what the engine collected beyond it is the LP's requested fee, credited to the LP
             // below. With the channel off `base_owed = u128::MAX` and this is the legacy split.
-            let base_owed = if lp_requested_fee_bps == 0 {
-                u128::MAX
-            } else {
-                batch_leg_fee(size_abs, fee_basis_price, base_fee_bps)?
-            };
-            let (split_in_a, split_in_b, lp_fee_credit) =
-                risk_limits_v17::allocate_fee_with_lp_request(outcome.fee_a, outcome.fee_b, base_owed);
-            let split_a = policy_v16::split_trade_fee(
-                split_in_a,
-                constants::PROTOCOL_FEE_BPS,
-                cfg.creator_share_bps,
-                cfg.lp_share_bps,
-                cfg.insurance_share_bps,
-            )?;
-            let split_b = policy_v16::split_trade_fee(
-                split_in_b,
-                constants::PROTOCOL_FEE_BPS,
-                cfg.creator_share_bps,
-                cfg.lp_share_bps,
-                cfg.insurance_share_bps,
-            )?;
-            if lp_fee_credit != 0 {
-                // The atoms were moved into `header.insurance` by this very trade's fee charge,
-                // so the unbudgeted pool holds them; pay them to the LP's capital.
-                group
-                    .credit_account_from_insurance_not_atomic(&mut account_b, lp_fee_credit, 0)
-                    .map_err(map_v16_error)?;
-            }
-            // Creator-fee-claim change (2026-07-23): the creator leg NO LONGER
-            // goes to the domain insurance budget. That budget is the loss
-            // backstop the engine draws down via
-            // `consume_domain_insurance_for_negative_pnl`, and its only exit
-            // (tag 57 `WithdrawInsuranceAsset`) let a creator drain the
-            // backstop while the market was healthy. The leg now accrues to a
-            // dedicated counter claimable only via tag 90.
-            let creator_cut_total = split_a
-                .creator
-                .checked_add(split_b.creator)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-
-            let protocol_cut_total = split_a
-                .protocol
-                .checked_add(split_b.protocol)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            let lp_cut_total = split_a
-                .lp
-                .checked_add(split_b.lp)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            let insurance_cut_total = split_a
-                .insurance
-                .checked_add(split_b.insurance)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-
-            if protocol_cut_total != 0
-                || lp_cut_total != 0
-                || insurance_cut_total != 0
-                || creator_cut_total != 0
-            {
-                cfg.protocol_fee_accrued_atoms = cfg
-                    .protocol_fee_accrued_atoms
-                    .checked_add(protocol_cut_total)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                cfg.lp_fee_accrued_atoms = cfg
-                    .lp_fee_accrued_atoms
-                    .checked_add(lp_cut_total)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                cfg.insurance_reserve_accrued_atoms = cfg
-                    .insurance_reserve_accrued_atoms
-                    .checked_add(insurance_cut_total)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                // u128 -> u64 narrowing: the counter is u64 because it had to
-                // fit the 8 spare bytes of `_padding_split`. Overflow (either
-                // the narrowing or the add) ERRORS the whole trade rather than
-                // wrapping or saturating.
-                // GH#420: the creator cut accrues to THIS ASSET's profile, not to
-                // the market-wide config counter. The old global accumulator paid
-                // out against asset 0's `asset_admin` only, so in a multi-asset
-                // market the base deployer could drain fees earned on assets 1..N
-                // and those assets' creators could never claim their own.
-                // Mutate the `oracle_profile` ALREADY IN SCOPE rather than doing a
-                // fresh read/write here. That profile was read earlier in this
-                // function and is written back below; a separate write at this
-                // point is silently CLOBBERED by that later write-back, which is
-                // exactly what happened in the first version of this change and
-                // what `..._creator_fee_accrual_is_written_back_to_the_account_...`
-                // caught. Same pattern as the batch path.
-                oracle_profile.creator_fee_claimable_atoms = oracle_profile
-                    .creator_fee_claimable_atoms
-                    .checked_add(
-                        u64::try_from(creator_cut_total)
-                            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
-                    )
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                // CRITICAL: force the write-back below even if nothing else in
-                // this instruction would otherwise have dirtied cfg. The cfg_after
-                // pattern is opt-in per mutation -- a missed write-back here
-                // SILENTLY DISCARDS accrued fees for all four legs.
+            // F-1 (security round 3): the base-fee four-way split, the P2 LP credit and the
+            // accrual into cfg / this asset's profile run in their own frame (unchanged).
+            if single_trade_accrue_fee_split_view(
+                &mut cfg,
+                &mut oracle_profile,
+                &mut group,
+                &mut account_b,
+                &SingleTradeFeeIn {
+                    fee_a: outcome.fee_a,
+                    fee_b: outcome.fee_b,
+                    lp_requested_fee_bps,
+                    size_abs,
+                    fee_basis_price,
+                    base_fee_bps,
+                },
+            )? {
                 cfg_after = Some(cfg);
             }
             update_hybrid_mark_after_trade_view(
@@ -14103,7 +14517,18 @@ pub mod processor {
             for (i, request) in requests.iter().enumerate() {
                 ensure_protocol_side_oi_cap_view(&group, request.asset_index, oi_before_legs[i])?;
             }
-            for ctx in &leg_ctx {
+            for (ctx, request) in leg_ctx.iter().zip(requests.iter()) {
+                // growth-v19: per leg on the FINAL batch state against the PRE-batch positions
+                // (one leg per asset), the same frame as the engine's final-portfolio IM check.
+                growth_post_fill_view(
+                    &group,
+                    &account_a,
+                    &account_b,
+                    (account_a_ai.key, account_b_ai.key),
+                    ctx.0,
+                    request.size_q,
+                    roles,
+                )?;
                 p1_post_fill_checks_view(
                     &group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles,
                 )?;
@@ -14422,8 +14847,18 @@ pub mod processor {
         let b = state::portfolio_view_mut_for_market_slots(&mut b_data, max_market_slots)?;
         for &(asset, b_before, a_before) in pre.iter() {
             let idx = asset as usize;
-            let a_after = signed_position_for_asset_view(&group, &a, idx)?;
-            let b_after = signed_position_for_asset_view(&group, &b, idx)?;
+            // growth-v19: `pre` is ADL-effective on a growth asset (see the capture).
+            let (a_after, b_after) = if asset_growth_view(&group, idx)?.is_some() {
+                (
+                    effective_signed_position_for_asset_view(&group, &a, idx)?,
+                    effective_signed_position_for_asset_view(&group, &b, idx)?,
+                )
+            } else {
+                (
+                    signed_position_for_asset_view(&group, &a, idx)?,
+                    signed_position_for_asset_view(&group, &b, idx)?,
+                )
+            };
             if vault_lp_v18::joins_crowd(a_before, a_after)
                 || vault_lp_v18::joins_crowd(b_before, b_after)
             {
@@ -15147,6 +15582,7 @@ pub mod processor {
             max_market_slots_pre,
             &[(asset_index, size_q)],
             lp_position_sync,
+            true,
         )?;
         let lp_headroom_q = p1_pre[0].headroom_q;
         let size_q = if size_q.unsigned_abs() > lp_headroom_q {
@@ -15171,16 +15607,29 @@ pub mod processor {
         // Matcher-inventory-sync: the canonical matcher gets the 40-byte v2 block carrying the
         // LP's real engine position; any other matcher the unchanged 24-byte block.
         let call_ext: Vec<u8> = match p1_pre[0].lp_position_q {
-            Some(lp_position_q) => risk_limits_v17::encode_matcher_call_ext_v2(
-                p1_pre[0].matcher_ext_mode,
-                oracle_profile_pre.last_good_oracle_slot,
-                lp_headroom_q,
-                p1_pre[0].band_bps,
-                p1_pre[0].taker_reducing,
-                accepts_fee_request,
-                lp_position_q,
-            )
-            .to_vec(),
+            Some(lp_position_q) => {
+                let v2 = risk_limits_v17::encode_matcher_call_ext_v2(
+                    p1_pre[0].matcher_ext_mode,
+                    oracle_profile_pre.last_good_oracle_slot,
+                    lp_headroom_q,
+                    p1_pre[0].band_bps,
+                    p1_pre[0].taker_reducing,
+                    accepts_fee_request,
+                    lp_position_q,
+                );
+                // growth-v19: the canonical matcher gets ext v3 on a growth asset (the same
+                // N_cap that clips the headroom and gates the fill post-trade).
+                match p1_pre[0].growth_ext {
+                    // M-1: a growth leg that only reduces the taker carries TAKER_REDUCING (any
+                    // ext mode): the matcher then skips the v3 cap / closed-mode / size clips.
+                    Some((cap, liq)) => growth_v19::ext_v3_mark_taker_reducing(
+                        growth_v19::encode_ext_v3_from_v2(&v2, cap, liq),
+                        p1_pre[0].taker_reducing,
+                    )
+                    .to_vec(),
+                    None => v2.to_vec(),
+                }
+            }
             None => risk_limits_v17::encode_matcher_call_ext(
                 p1_pre[0].matcher_ext_mode,
                 oracle_profile_pre.last_good_oracle_slot,
@@ -15247,6 +15696,27 @@ pub mod processor {
         ) {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // N-2 (security round 3): an open into a side above its utilisation kink pays the
+        // utilisation fee to the vault LP through the same LP-credit channel (on top of the
+        // matcher's request; the base fee's four-way split is untouched). Closes / reduces and
+        // the closing part of a flip never pay it. The taker's signed fee_bps must cover it.
+        let util_fee_bps = match p1_pre[0].growth_util {
+            Some(ref u) => u64::from(growth_util_fee_for_fill_bps(u, ret.exec_size)),
+            None => 0,
+        };
+        let requested_fee_bps = if util_fee_bps == 0 {
+            requested_fee_bps
+        } else {
+            let total = cfg_pre
+                .trade_fee_base_bps
+                .checked_add(requested_fee_bps)
+                .and_then(|v| v.checked_add(util_fee_bps))
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if total > fee_bps || total > max_trading_fee_bps {
+                return Err(PercolatorError::GrowthUtilisationFeeNotCovered.into());
+            }
+            requested_fee_bps + util_fee_bps
+        };
         if limit_price != 0 {
             let limit_ok = if size_q > 0 {
                 ret.exec_price_e6 <= limit_price
@@ -15360,11 +15830,22 @@ pub mod processor {
             if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 {
                 continue;
             }
-            out.push((
-                asset,
-                signed_position_for_asset_view(&group, &b, asset as usize)?,
-                signed_position_for_asset_view(&group, &a, asset as usize)?,
-            ));
+            // growth-v19 (N-1 / Q2): on a growth asset the M-1 `lp_mid_q` below compares with
+            // the post-fill (re-based, effective) positions, so capture the ADL-EFFECTIVE
+            // pre-fill positions; legacy assets keep the raw basis (S-3).
+            if asset_growth_view(&group, asset as usize)?.is_some() {
+                out.push((
+                    asset,
+                    effective_signed_position_for_asset_view(&group, &b, asset as usize)?,
+                    effective_signed_position_for_asset_view(&group, &a, asset as usize)?,
+                ));
+            } else {
+                out.push((
+                    asset,
+                    signed_position_for_asset_view(&group, &b, asset as usize)?,
+                    signed_position_for_asset_view(&group, &a, asset as usize)?,
+                ));
+            }
         }
         Ok(out)
     }
@@ -15390,13 +15871,31 @@ pub mod processor {
         for &(asset, lp_before, taker_before) in pre.iter() {
             let idx = asset as usize;
             let mut rec = read_asset_vault_lp_from_view(&group, idx)?;
-            let lp_after = signed_position_for_asset_view(&group, &b, idx)?;
+            // growth-v19 (N-1 / Q2): on a growth asset `pre` holds the ADL-EFFECTIVE pre-fill
+            // positions, so compare with the effective post-fill ones (the raw basis is not
+            // re-based by a fill and overstates |pos| while A < 1).
+            let growth_asset = asset_growth_view(&group, idx)?.is_some();
+            let lp_after = if growth_asset {
+                effective_signed_position_for_asset_view(&group, &b, idx)?
+            } else {
+                signed_position_for_asset_view(&group, &b, idx)?
+            };
             if account_b_ai.key.to_bytes() != rec.vault_lp_portfolio {
                 if vault_lp_v18::joins_crowd(lp_before, lp_after) {
                     return Err(PercolatorError::VaultLpExclusiveCounterparty.into());
                 }
                 continue;
             }
+            // M-1 (security review 2026-10-04): on a growth asset the vault LP's draw halt, H2
+            // exposure cap and step-down measure its growth from the position AFTER the
+            // taker's reducing part, so a taker close is never refused by them.
+            let lp_before = if growth_asset {
+                let taker_after_now = effective_signed_position_for_asset_view(&group, &a, idx)?;
+                growth_v19::lp_mid_q(lp_before, taker_before, taker_after_now)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            } else {
+                lp_before
+            };
             // S-2 (security review 2026-10-03): the skew-funding numerator must be the vault LP's
             // ADL-EFFECTIVE position, the same measure as its denominator
             // `max(oi_eff_long_q, oi_eff_short_q)`; the raw basis overstates |LP| while A < 1.
@@ -15429,10 +15928,12 @@ pub mod processor {
                     b.header.fee_credits.get(),
                 )
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                let lev = if rec.vault_lp_max_lev_bps == 0 {
-                    crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS
-                } else {
-                    rec.vault_lp_max_lev_bps
+                // growth-v19: one number -- on a growth asset the default vault-LP leverage is
+                // the growth `lambda_bps` (N_cap); an explicit tag-99 value stays an override.
+                let lev = match (rec.vault_lp_max_lev_bps, asset_growth_view(&group, idx)?) {
+                    (0, Some(g)) => g.lambda_bps,
+                    (0, None) => crate::constants::VAULT_LP_DEFAULT_MAX_LEV_BPS,
+                    (v, _) => v,
                 };
                 if !vault_lp_v18::vault_lp_exposure_allowed(
                     lp_before,
@@ -15446,7 +15947,11 @@ pub mod processor {
                 }
             }
             if rec.lev_cap_q != 0 && vault_lp_v18::joins_crowd(lp_before, lp_after) {
-                let taker_after = signed_position_for_asset_view(&group, &a, idx)?;
+                let taker_after = if growth_asset {
+                    effective_signed_position_for_asset_view(&group, &a, idx)?
+                } else {
+                    signed_position_for_asset_view(&group, &a, idx)?
+                };
                 if taker_after.unsigned_abs() > taker_before.unsigned_abs() {
                     let imr = vault_lp_v18::step_imr_bps(
                         lp_after.unsigned_abs(),
@@ -15872,7 +16377,11 @@ pub mod processor {
             }
             // Uniform width: all 24-byte (v0/v1) or all 40-byte (v2) blocks.
             let w = exts.first().map(|e| e.len()).unwrap_or(0);
-            if (w != 24 && w != risk_limits_v17::CALL_EXT_V2_LEN) || exts.iter().any(|e| e.len() != w) {
+            if (w != 24
+                && w != risk_limits_v17::CALL_EXT_V2_LEN
+                && w != growth_v19::CALL_EXT_V3_LEN)
+                || exts.iter().any(|e| e.len() != w)
+            {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             for e in exts {
@@ -15957,6 +16466,18 @@ pub mod processor {
             || matcher_ctx.data_len() < constants::MATCHER_CONTEXT_MIN_LEN
         {
             return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // growth-v19 (security review L-6): a batch carrying ANY growth leg sends ext v3 (72 B)
+        // on every leg; 11 such legs measured 1,392,150-1,396,650 CU (inside the 3k safety
+        // margin under 1.4M), so growth batches are capped at GROWTH_BATCH_MAX_LEGS (10).
+        // Refused up front, before any market-state work or matcher CPI.
+        if legs.len() > growth_v19::GROWTH_BATCH_MAX_LEGS {
+            let data = market_ai.try_borrow_data()?;
+            for leg in legs {
+                if state::asset_growth_version(&data, leg.asset_index as usize)? != 0 {
+                    return Err(PercolatorError::GrowthBatchTooManyLegs.into());
+                }
+            }
         }
         // TB-1b (ADOPT upstream 0492ebbc): fail fast, before any market-state work.
         expect_portfolio_position_binding(
@@ -16128,6 +16649,7 @@ pub mod processor {
             max_market_slots_pre,
             &cpi_requests,
             lp_position_sync,
+            false,
         )?;
         // F-10: behavioural parity with TradeCpi. When ANY leg's asset has the P2 call
         // extension on, every leg carries its 24-byte extension (a mode-0 leg gets the all-zero
@@ -16139,22 +16661,43 @@ pub mod processor {
         // (each carrying the LP's PRE-batch real position on that leg's asset; the matcher
         // carries earlier same-asset legs itself), regardless of the ext mode.
         let batch_exts: Option<Vec<Vec<u8>>> = if lp_position_sync {
+            // growth-v19: a batch's extensions are one width (the matcher never mixes). If ANY
+            // leg is on a growth asset every leg is v3; a non-growth leg gets the neutral pair
+            // (MAX_POSITION_ABS_Q, u128::MAX), under which `min(ctx, ext)` is the ctx value.
+            let any_growth = p1_pre.iter().any(|l| l.growth_ext.is_some());
             let mut v = Vec::with_capacity(legs.len());
             for (i, leg) in legs.iter().enumerate() {
-                v.push(
-                    risk_limits_v17::encode_matcher_call_ext_v2(
-                        p1_pre[i].matcher_ext_mode,
-                        leg_mark_slots[i],
-                        leg.size_q.unsigned_abs(),
-                        p1_pre[i].band_bps,
-                        p1_pre[i].taker_reducing,
-                        false,
-                        p1_pre[i]
-                            .lp_position_q
-                            .ok_or(PercolatorError::InvalidInstruction)?,
-                    )
-                    .to_vec(),
+                let v2 = risk_limits_v17::encode_matcher_call_ext_v2(
+                    p1_pre[i].matcher_ext_mode,
+                    leg_mark_slots[i],
+                    leg.size_q.unsigned_abs(),
+                    p1_pre[i].band_bps,
+                    p1_pre[i].taker_reducing,
+                    false,
+                    p1_pre[i]
+                        .lp_position_q
+                        .ok_or(PercolatorError::InvalidInstruction)?,
                 );
+                v.push(if any_growth {
+                    // Non-growth legs: the neutral pair (cap >= 1e14 is "no ext cap" to the
+                    // matcher, L-5). Growth legs that only reduce the taker carry
+                    // TAKER_REDUCING (M-1).
+                    match p1_pre[i].growth_ext {
+                        Some((cap, liq)) => growth_v19::ext_v3_mark_taker_reducing(
+                            growth_v19::encode_ext_v3_from_v2(&v2, cap, liq),
+                            p1_pre[i].taker_reducing,
+                        )
+                        .to_vec(),
+                        None => growth_v19::encode_ext_v3_from_v2(
+                            &v2,
+                            percolator::MAX_POSITION_ABS_Q,
+                            u128::MAX,
+                        )
+                        .to_vec(),
+                    }
+                } else {
+                    v2.to_vec()
+                });
             }
             Some(v)
         } else if p1_pre.iter().any(|l| l.matcher_ext_mode == state::MATCHER_EXT_MODE_V1) {
@@ -18983,6 +19526,8 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
         limits: state::AssetRiskLimitsV17,
+        // growth-v19: `(lambda_bps, kink_bps)` from the optional trailer.
+        growth: Option<(u32, u16, u16)>,
     ) -> ProgramResult {
         let upgrade_authority = account(accounts, 0)?;
         let program_data_ai = account(accounts, 1)?;
@@ -19005,7 +19550,52 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let mut market_data = market_ai.try_borrow_mut_data()?;
-        state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)
+        if growth.is_none() {
+            state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)?;
+        } else if limits != state::AssetRiskLimitsV17::default() {
+            // L-4 (security review): the growth-dial form touches ONLY the dial bytes. Its
+            // legacy body is there for wire disambiguation and must be all-zero; it is never
+            // applied (a dial change can no longer wipe the G4 / UA risk limits).
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if let Some((lambda_bps, kink_bps, util_fee_max_bps)) = growth {
+            // growth-v19 dials: growth assets only; tighten-only / within bounds until the epoch
+            // clamp is enforced (plan §2.9 L3).
+            if !growth_v19::growth_dials_ok(growth_v19::EPOCH_CLAMP_ENFORCED, lambda_bps, kink_bps)
+                || (util_fee_max_bps != 0
+                    && !growth_v19::util_fee_dial_ok(
+                        growth_v19::EPOCH_CLAMP_ENFORCED,
+                        util_fee_max_bps,
+                    ))
+            {
+                return Err(PercolatorError::GrowthInvalidConfig.into());
+            }
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            // N-2: the engine fee cap must carry base + matcher request + this utilisation fee.
+            if util_fee_max_bps != 0
+                && !growth_v19::util_fee_fits_trading_cap(
+                    group.header.config.max_trading_fee_bps.get(),
+                    cfg.trade_fee_base_bps,
+                    util_fee_max_bps,
+                )
+            {
+                return Err(PercolatorError::GrowthInvalidConfig.into());
+            }
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let market = group
+                .markets
+                .get_mut(asset_index as usize)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            let mut g = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
+                .ok_or(PercolatorError::GrowthInvalidConfig)?;
+            g.lambda_bps = lambda_bps;
+            g.kink_bps = kink_bps;
+            if util_fee_max_bps != 0 {
+                g.util_fee_max_bps = util_fee_max_bps;
+            }
+            state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+        }
+        Ok(())
     }
 
     #[inline(never)]
@@ -29220,6 +29810,8 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         junior_floor_bps: u16,
+        // growth-v19: optional creator starting leverage cap (x100).
+        l_launch_x100: Option<u16>,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -29393,6 +29985,17 @@ pub mod processor {
             profile0.next_portfolio_id = next_portfolio_id;
             write_oracle_profile_to_view(&mut group, 0, &profile0)?;
 
+            // growth-v19: the creator's starting leverage cap (optional trailing field) may only
+            // be set on an asset whose growth block is on (InitMarket validated its MMR rule),
+            // within [1x, L_tier]. A growth asset pins NON-BINDING matcher caps: N_cap (ext v3)
+            // replaces the fixed $5k / $25k auto-pin caps.
+            // F-1 (security round 3): the growth bind block lives in its own frame.
+            let growth_on = init_vault_lp_growth_bind_view(
+                &mut group,
+                asset_index,
+                l_launch_x100,
+                last_fee_slot,
+            )?;
             rec.vault_lp_portfolio = lp_portfolio_ai.key.to_bytes();
             rec.flags |= state::ASSET_VAULT_LP_FLAG_BOUND;
             rec.lp_net_q = 0;
@@ -29402,11 +30005,15 @@ pub mod processor {
             rec.vault_lp_max_lev_bps = 0;
             write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
             let price = group.markets[asset_index].engine.asset.effective_price.get();
-            let caps = vault_lp_v18::pinned_matcher_caps(price)
-                .ok_or(PercolatorError::InvalidInstruction)?;
-            (senior_claim, caps)
+            let caps = if growth_on {
+                growth_v19::growth_pinned_matcher_caps()
+            } else {
+                vault_lp_v18::pinned_matcher_caps(price)
+                    .ok_or(PercolatorError::InvalidInstruction)?
+            };
+            (senior_claim, caps, growth_on)
         };
-        let (senior_claim, pinned_caps) = senior_claim;
+        let (senior_claim, pinned_caps, growth_on) = senior_claim;
 
         let market_bytes = market_ai.key.to_bytes();
         let bump_bytes = [vault_lp_bump];
@@ -29464,7 +30071,12 @@ pub mod processor {
                 asset_generation_frontier,
                 trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
                 expiry_slot: u64::MAX,
-                kind: vault_lp_v18::PIN_MATCHER_KIND,
+                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
+                kind: if growth_on {
+                    growth_v19::GROWTH_PIN_MATCHER_KIND
+                } else {
+                    vault_lp_v18::PIN_MATCHER_KIND
+                },
                 trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
                 base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
                 max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
@@ -29785,6 +30397,29 @@ pub mod processor {
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
             group.deposit_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+            // growth-v19: record the launch risk capital `c_launch` ONCE, at the first junior
+            // deposit into a growth asset: the vault LP's conservative equity right after it
+            // (the graduation reference, plan §2.1; graduation itself is compiled off).
+            let idx = st.asset_index as usize;
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let c_m = vault_lp_v18::conservative_equity(
+                lp.header.capital.get(),
+                lp.header.pnl.get(),
+                lp.header.fee_credits.get(),
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let market = group
+                .markets
+                .get_mut(idx)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            if let Some(mut g) =
+                state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
+            {
+                if g.c_launch_atoms == 0 && c_m > 0 {
+                    g.c_launch_atoms = u64::try_from(c_m).unwrap_or(u64::MAX);
+                    state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+                }
+            }
         }
         transfer_tokens(token_program, source_token, vault_token, owner, amount_u64)?;
         st.junior_deposited_atoms = st
@@ -32294,6 +32929,11 @@ pub mod processor {
         let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
         let a_after = position_a.checked_add(size_q).ok_or_else(overflow)?;
         let b_after = position_b.checked_sub(size_q).ok_or_else(overflow)?;
+        // M-1: on a growth asset a counterparty that STRICTLY reduces is never floor-halted
+        // (its close may grow the LP; the LP floor protects LP growth from new opens only).
+        let growth = asset_growth_view(group, asset_index)?.is_some();
+        let a_closes = growth && growth_v19::taker_strictly_reduces(position_a, a_after);
+        let b_closes = growth && growth_v19::taker_strictly_reduces(position_b, b_after);
         // No counterparty exemption (finding F-7, see `lp_fill_gate`).
         // On the CPI routes account_b's floor was already enforced by
         // `p1_cpi_preflight_before_matcher` with the identical predicate on identical state (the
@@ -32301,12 +32941,14 @@ pub mod processor {
         // here (CU). The post-fill gate still re-checks account_b on every route.
         if roles.b_is_lp
             && !roles.cpi
+            && !a_closes
             && risk_limits_v17::lp_risk_increasing(position_b, b_after)
             && lp_floor_breached_view(group, account_b, asset_index)?
         {
             return Err(PercolatorError::LpFloorHalt.into());
         }
         if roles.a_is_lp
+            && !b_closes
             && risk_limits_v17::lp_risk_increasing(position_a, a_after)
             && lp_floor_breached_view(group, account_a, asset_index)?
         {
@@ -32330,13 +32972,51 @@ pub mod processor {
         position_b_before: i128,
         roles: P1TradeRoles,
     ) -> ProgramResult {
+        // growth-v19 (N-1 / Q2): on a growth asset these checks run INSIDE
+        // `growth_post_fill_view`, on the ADL-effective pre-fill positions (the M-1 `lp_mid_q`
+        // must compare like with like). Kept out of the executors so their call arity and
+        // frames are unchanged (the single executor's frame is at the SBF limit: one extra
+        // 32-byte local there corrupted the fee accrual with no build warning).
+        if asset_growth_view(group, asset_index)?.is_some() {
+            return Ok(());
+        }
+        p1_post_fill_checks_inner(
+            group,
+            account_a,
+            account_b,
+            asset_index,
+            position_a_before,
+            position_b_before,
+            roles,
+            None,
+        )
+    }
+
+    /// `effective_after`: `Some((a, b))` = the ADL-effective post-fill positions (growth path,
+    /// with ADL-effective `position_*_before`); `None` = read the raw basis (legacy, S-3).
+    #[allow(clippy::too_many_arguments)]
+    fn p1_post_fill_checks_inner(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        position_a_before: i128,
+        position_b_before: i128,
+        roles: P1TradeRoles,
+        effective_after: Option<(i128, i128)>,
+    ) -> ProgramResult {
         let lp_involved = roles.cpi || roles.a_is_lp || roles.b_is_lp;
         if !lp_involved {
             return Ok(());
         }
         // One position read per side (each walks the leg table -- CU).
-        let a_after = signed_position_for_asset_view(group, account_a, asset_index)?;
-        let b_after = signed_position_for_asset_view(group, account_b, asset_index)?;
+        let (a_after, b_after) = match effective_after {
+            Some(e) => e,
+            None => (
+                signed_position_for_asset_view(group, account_a, asset_index)?,
+                signed_position_for_asset_view(group, account_b, asset_index)?,
+            ),
+        };
         if roles.b_is_lp {
             ensure_lp_limits_after_fill_view(
                 group,
@@ -32377,6 +33057,511 @@ pub mod processor {
             }
         }
         Ok(())
+    }
+
+    /// growth-v19 record of `asset_index` (`None` == growth OFF: a one-byte read).
+    fn asset_growth_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<Option<state::AssetGrowthV19>, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::asset_growth_from_wrapper_bytes(
+            &market.wrapper[..],
+            group.header.config.initial_margin_bps.get(),
+        )
+    }
+
+    /// growth-v19: the leverage ceiling (x100) in force. Graduation is OFF in growth-1, so this
+    /// is `min(L_launch, L_tier)`; once it is on, the stored ratcheted `ceil_x100`.
+    fn growth_ceiling_x100(g: &state::AssetGrowthV19) -> u16 {
+        if growth_v19::GRADUATION_ENABLED {
+            g.ceil_x100
+        } else {
+            growth_v19::graduated_ceiling_x100(false, g.l_launch_x100, g.l_tier_x100, 0, 0)
+        }
+    }
+
+    /// growth-v19 `(inventory_cap_q, liquidity_notional_e6)` for the matcher's ext v3, from the
+    /// LP's conservative equity `C_m`. Fails CLOSED to `(0, 0)` (0 = closed to LP growth) on a
+    /// zero price / overflow, and while the market's bankruptcy h-lock is latched (the same
+    /// crowd-side refusal the post-fill gate applies, so the quote and the gate agree).
+    fn growth_matcher_caps_view(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        g: &state::AssetGrowthV19,
+    ) -> Result<(u128, u128), ProgramError> {
+        let price = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let c_m = vault_lp_v18::conservative_equity(
+            lp.header.capital.get(),
+            lp.header.pnl.get(),
+            lp.header.fee_credits.get(),
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // R8: the pure extraction (Kani target) is the whole decision.
+        Ok(growth_v19::growth_matcher_caps(
+            group.header.bankruptcy_hlock_active != 0,
+            c_m,
+            g.lambda_bps,
+            price,
+            percolator::POS_SCALE,
+            percolator::MAX_POSITION_ABS_Q,
+        ))
+    }
+
+    /// growth-v19 post-fill gate (plan §2.1), every route: called from BOTH shared executors
+    /// (`handle_trade_nocpi_zero_copy` single, `handle_batch_execute_zero_copy` per leg) after
+    /// the engine applied the fill and BEFORE the P1 LP checks (so a full crowd side answers
+    /// with the named `GrowthCapacityFull`). No new accounts: the market and both portfolios
+    /// are already borrowed. Growth OFF (all-zero slot) costs one byte read and returns.
+    ///
+    /// Who is checked: every side that is NOT the fill's LP counterparty. The LP is account_b
+    /// on the CPI routes; on NoCpi it is the single side with an enabled matcher config (if
+    /// both or neither are LPs there is no crowd step and both sides face the ceiling).
+    /// Maintenance is untouched: this only refuses risk-increasing fills.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn growth_post_fill_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        keys: (&Pubkey, &Pubkey),
+        asset_index: usize,
+        // The fill: account_a moved by `+size_q`, account_b by `-size_q` (executor convention).
+        size_q: i128,
+        roles: P1TradeRoles,
+    ) -> ProgramResult {
+        let g = match asset_growth_view(group, asset_index)? {
+            Some(g) => g,
+            None => return Ok(()),
+        };
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let ceil_imr_bps = growth_v19::ceiling_imr_bps(engine_imr, growth_ceiling_x100(&g))
+            .ok_or(PercolatorError::GrowthLeverageExceeded)?;
+        let price = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        // N-1 / Q2: the gate compares ADL-effective positions (before: the executors' pre-trade
+        // effective read; after: the effective read here).
+        let (_, a_eff) =
+            raw_and_effective_signed_position_for_asset_view(group, account_a, asset_index)?;
+        let (_, b_eff) =
+            raw_and_effective_signed_position_for_asset_view(group, account_b, asset_index)?;
+        // N-1 / Q2: the ADL-effective positions BEFORE this fill. The engine re-bases each
+        // touched leg to its effective size and then applies the fill, so `eff_after - delta`
+        // is the effective pre-fill position (no extra pre-trade walk, and no new locals in the
+        // executors' frames). A raw-basis "before" would read a grow inside the ADL haircut
+        // (`raw - eff`) as a reduction and skip the gate.
+        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        let position_a_before = a_eff.checked_sub(size_q).ok_or_else(overflow)?;
+        let position_b_before = b_eff.checked_add(size_q).ok_or_else(overflow)?;
+        // Side selection is the pure (Kani-target) `growth_v19::growth_sides`.
+        let (a_is_taker, b_is_taker, lp_is_b) =
+            growth_v19::growth_sides(roles.cpi, roles.a_is_lp, roles.b_is_lp);
+        // N-1: growth-1 admits opens only on a BOUND P3 asset, and only against ITS vault LP
+        // (every user position faces that LP, so users OI is that LP's book). Another LP
+        // counterparty is treated as no LP (GrowthNeedsLpCounterparty on an open).
+        let vault = read_asset_vault_lp_from_view(group, asset_index)?;
+        let asset_bound = vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0;
+        let lp_is_b = match lp_is_b {
+            Some(true) if asset_bound && keys.1.to_bytes() == vault.vault_lp_portfolio => {
+                Some(true)
+            }
+            Some(false) if asset_bound && keys.0.to_bytes() == vault.vault_lp_portfolio => {
+                Some(false)
+            }
+            _ => None,
+        };
+        let (oi_long, oi_short) = side_oi_snapshot_view(group, asset_index)?;
+        let equity_of = |p: &percolator::PortfolioV16ViewMut<'_>| -> Result<u128, ProgramError> {
+            vault_lp_v18::conservative_equity(
+                p.header.capital.get(),
+                p.header.pnl.get(),
+                p.header.fee_credits.get(),
+            )
+            .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        };
+        // M-1: LP growth is measured from the LP's position after the taker's REDUCING part
+        // (`growth_v19::lp_mid_q`), so only a flip's OPENING part joins the crowd.
+        // The taker's opening side is the sign of its position after the fill.
+        let users_oi = |taker_after: i128, lp_eff: i128| -> u128 {
+            if taker_after > 0 {
+                growth_v19::users_side_oi_q(oi_long, lp_eff, true)
+            } else {
+                growth_v19::users_side_oi_q(oi_short, lp_eff, false)
+            }
+        };
+        let lp_in = match lp_is_b {
+            Some(true) => Some(growth_v19::GrowthLpIn {
+                before_q: position_b_before,
+                mid_q: growth_v19::lp_mid_q(position_b_before, position_a_before, a_eff)
+                    .ok_or_else(overflow)?,
+                after_q: b_eff,
+                eff_after_abs_q: b_eff.unsigned_abs(),
+                users_oi_side_after_q: users_oi(a_eff, b_eff),
+                equity: equity_of(account_b)?,
+            }),
+            Some(false) => Some(growth_v19::GrowthLpIn {
+                before_q: position_a_before,
+                mid_q: growth_v19::lp_mid_q(position_a_before, position_b_before, b_eff)
+                    .ok_or_else(overflow)?,
+                after_q: a_eff,
+                eff_after_abs_q: a_eff.unsigned_abs(),
+                users_oi_side_after_q: users_oi(b_eff, a_eff),
+                equity: equity_of(account_a)?,
+            }),
+            None => None,
+        };
+        let sides: [(bool, &percolator::PortfolioV16ViewMut<'_>, i128, i128, i128); 2] = [
+            (a_is_taker, account_a, position_a_before, a_eff, a_eff),
+            (b_is_taker, account_b, position_b_before, b_eff, b_eff),
+        ];
+        for (is_taker, taker, before, after, eff) in sides {
+            if !is_taker || !growth_v19::taker_risk_increasing(before, after) {
+                continue;
+            }
+            let cert = taker
+                .header
+                .health_cert
+                .try_to_runtime()
+                .ok()
+                .filter(|c| c.valid)
+                .map(|c| c.certified_initial_req);
+            let input = growth_v19::GrowthGateIn {
+                taker_before_q: before,
+                taker_after_q: after,
+                taker_eff_after_abs_q: eff.unsigned_abs(),
+                taker_equity: equity_of(taker)?,
+                taker_cert_initial_req: cert,
+                lp: lp_in,
+                price_e6: price,
+                pos_scale: percolator::POS_SCALE,
+                engine_imr_bps: engine_imr,
+                min_nonzero_im_req: group.header.config.min_nonzero_im_req.get(),
+                ceil_imr_bps,
+                lambda_bps: g.lambda_bps,
+                kink_bps: g.kink_bps,
+                crowd_blocked: group.header.bankruptcy_hlock_active != 0,
+                asset_bound,
+            };
+            match growth_v19::growth_gate(&input) {
+                growth_v19::GrowthVerdict::Allow => {}
+                growth_v19::GrowthVerdict::LeverageExceeded => {
+                    return Err(PercolatorError::GrowthLeverageExceeded.into())
+                }
+                growth_v19::GrowthVerdict::CapacityFull => {
+                    return Err(PercolatorError::GrowthCapacityFull.into())
+                }
+                growth_v19::GrowthVerdict::NoLpCounterparty => {
+                    return Err(PercolatorError::GrowthNeedsLpCounterparty.into())
+                }
+                growth_v19::GrowthVerdict::NotBound => {
+                    return Err(PercolatorError::GrowthRequiresBoundVaultLp.into())
+                }
+            }
+        }
+        // P1 items 2, 3, 5 post-fill on the ADL-effective pre-fill positions (see
+        // `p1_post_fill_checks_view`): AFTER the gate, so a full crowd side still answers the
+        // named GrowthCapacityFull first.
+        p1_post_fill_checks_inner(
+            group,
+            account_a,
+            account_b,
+            asset_index,
+            position_a_before,
+            position_b_before,
+            roles,
+            Some((a_eff, b_eff)),
+        )
+    }
+
+    /// F-1 (security round 3): the single executor's w1-s3 source-domain admission, moved out
+    /// of `handle_trade_nocpi_zero_copy` UNCHANGED so its two snapshots live in this frame, not
+    /// the executor's (the executor sat at the 4,096-byte SBF frame limit).
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_single_trade_source_domain_capacity_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        req: &TradeRequestV16,
+        account_a_position: i128,
+        account_b_position: i128,
+        size_q: i128,
+    ) -> ProgramResult {
+        let asset_index = req.asset_index;
+        let account_a_needs_source_capacity =
+            trade_delta_may_require_source_domain_capacity(account_a_position, size_q)?;
+        let account_b_needs_source_capacity =
+            trade_delta_may_require_source_domain_capacity(account_b_position, -size_q)?;
+        if account_a_needs_source_capacity || account_b_needs_source_capacity {
+            let mut admitted_source_domains_a = reserved_source_domains_snapshot_for_trade_view(
+                group,
+                account_a,
+                core::slice::from_ref(req),
+                size_q < 0,
+            )?;
+            let mut admitted_source_domains_b = reserved_source_domains_snapshot_for_trade_view(
+                group,
+                account_b,
+                core::slice::from_ref(req),
+                size_q > 0,
+            )?;
+            ensure_trade_delta_source_domain_capacity_view(
+                &mut admitted_source_domains_a,
+                asset_index,
+                account_a_position,
+                size_q,
+            )?;
+            ensure_trade_delta_source_domain_capacity_view(
+                &mut admitted_source_domains_b,
+                asset_index,
+                account_b_position,
+                -size_q,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// F-1 (security round 3): the single executor's post-fill gate inputs, passed by
+    /// reference so the executor makes ONE call with few arguments.
+    struct SingleTradePostFill<'k> {
+        keys: (&'k Pubkey, &'k Pubkey),
+        asset_index: usize,
+        size_q: i128,
+        position_a_before: i128,
+        position_b_before: i128,
+        oi_before: (u128, u128),
+        roles: P1TradeRoles,
+    }
+
+    /// F-1: `ensure_protocol_side_oi_cap_view`, `growth_post_fill_view` and
+    /// `p1_post_fill_checks_view`, unchanged and in the same order, in their own frame.
+    #[inline(never)]
+    fn single_trade_post_fill_gates_view(
+        group: &state::MarketViewMutV16<'_>,
+        account_a: &percolator::PortfolioV16ViewMut<'_>,
+        account_b: &percolator::PortfolioV16ViewMut<'_>,
+        c: &SingleTradePostFill<'_>,
+    ) -> ProgramResult {
+        // P1 item 3: protocol per-asset side-OI cap (tag 93), growth-only.
+        ensure_protocol_side_oi_cap_view(group, c.asset_index, c.oi_before)?;
+        // growth-v19 (plan §2.1): dynamic leverage / capacity gate, every route. Before the
+        // P1 LP checks so a full crowd side answers GrowthCapacityFull.
+        growth_post_fill_view(
+            group,
+            account_a,
+            account_b,
+            c.keys,
+            c.asset_index,
+            c.size_q,
+            c.roles,
+        )?;
+        // P1 items 2, 3, 5 post-fill: LP exposure cap + floor on every LP side (any route),
+        // and the same-owner rule (reduce-only exemption).
+        p1_post_fill_checks_view(
+            group,
+            account_a,
+            account_b,
+            c.asset_index,
+            c.position_a_before,
+            c.position_b_before,
+            c.roles,
+        )
+    }
+
+    /// F-1 (security round 3): inputs of `single_trade_accrue_fee_split_view`.
+    struct SingleTradeFeeIn {
+        fee_a: u128,
+        fee_b: u128,
+        lp_requested_fee_bps: u64,
+        size_abs: u128,
+        fee_basis_price: u64,
+        base_fee_bps: u64,
+    }
+
+    /// F-1 (security round 3): the single executor's base-fee four-way split, P2 LP credit and
+    /// fee accrual, moved out of `handle_trade_nocpi_zero_copy` UNCHANGED. Returns `true` when
+    /// cfg / the profile were dirtied (the caller then forces the cfg write-back).
+    #[inline(never)]
+    fn single_trade_accrue_fee_split_view(
+        cfg: &mut WrapperConfigV16,
+        oracle_profile: &mut state::AssetOracleProfileV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        account_b: &mut percolator::PortfolioV16ViewMut<'_>,
+        f: &SingleTradeFeeIn,
+    ) -> Result<bool, ProgramError> {
+        let base_owed = if f.lp_requested_fee_bps == 0 {
+            u128::MAX
+        } else {
+            batch_leg_fee(f.size_abs, f.fee_basis_price, f.base_fee_bps)?
+        };
+        let (split_in_a, split_in_b, lp_fee_credit) =
+            risk_limits_v17::allocate_fee_with_lp_request(f.fee_a, f.fee_b, base_owed);
+        let split_a = policy_v16::split_trade_fee(
+            split_in_a,
+            constants::PROTOCOL_FEE_BPS,
+            cfg.creator_share_bps,
+            cfg.lp_share_bps,
+            cfg.insurance_share_bps,
+        )?;
+        let split_b = policy_v16::split_trade_fee(
+            split_in_b,
+            constants::PROTOCOL_FEE_BPS,
+            cfg.creator_share_bps,
+            cfg.lp_share_bps,
+            cfg.insurance_share_bps,
+        )?;
+        if lp_fee_credit != 0 {
+            // The atoms were moved into `header.insurance` by this very trade's fee charge,
+            // so the unbudgeted pool holds them; pay them to the LP's capital.
+            group
+                .credit_account_from_insurance_not_atomic(account_b, lp_fee_credit, 0)
+                .map_err(map_v16_error)?;
+        }
+        // Creator-fee-claim change (2026-07-23): the creator leg NO LONGER
+        // goes to the domain insurance budget. That budget is the loss
+        // backstop the engine draws down via
+        // `consume_domain_insurance_for_negative_pnl`, and its only exit
+        // (tag 57 `WithdrawInsuranceAsset`) let a creator drain the
+        // backstop while the market was healthy. The leg now accrues to a
+        // dedicated counter claimable only via tag 90.
+        let creator_cut_total = split_a
+            .creator
+            .checked_add(split_b.creator)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+        let protocol_cut_total = split_a
+            .protocol
+            .checked_add(split_b.protocol)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let lp_cut_total = split_a
+            .lp
+            .checked_add(split_b.lp)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let insurance_cut_total = split_a
+            .insurance
+            .checked_add(split_b.insurance)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+
+        if protocol_cut_total != 0
+            || lp_cut_total != 0
+            || insurance_cut_total != 0
+            || creator_cut_total != 0
+        {
+            cfg.protocol_fee_accrued_atoms = cfg
+                .protocol_fee_accrued_atoms
+                .checked_add(protocol_cut_total)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            cfg.lp_fee_accrued_atoms = cfg
+                .lp_fee_accrued_atoms
+                .checked_add(lp_cut_total)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            cfg.insurance_reserve_accrued_atoms = cfg
+                .insurance_reserve_accrued_atoms
+                .checked_add(insurance_cut_total)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // u128 -> u64 narrowing: the counter is u64 because it had to
+            // fit the 8 spare bytes of `_padding_split`. Overflow (either
+            // the narrowing or the add) ERRORS the whole trade rather than
+            // wrapping or saturating.
+            // GH#420: the creator cut accrues to THIS ASSET's profile, not to
+            // the market-wide config counter. The old global accumulator paid
+            // out against asset 0's `asset_admin` only, so in a multi-asset
+            // market the base deployer could drain fees earned on assets 1..N
+            // and those assets' creators could never claim their own.
+            // Mutate the `oracle_profile` ALREADY IN SCOPE rather than doing a
+            // fresh read/write here. That profile was read earlier in this
+            // function and is written back below; a separate write at this
+            // point is silently CLOBBERED by that later write-back, which is
+            // exactly what happened in the first version of this change and
+            // what `..._creator_fee_accrual_is_written_back_to_the_account_...`
+            // caught. Same pattern as the batch path.
+            oracle_profile.creator_fee_claimable_atoms = oracle_profile
+                .creator_fee_claimable_atoms
+                .checked_add(
+                    u64::try_from(creator_cut_total)
+                        .map_err(|_| PercolatorError::EngineArithmeticOverflow)?,
+                )
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            // CRITICAL: force the write-back below even if nothing else in
+            // this instruction would otherwise have dirtied cfg. The cfg_after
+            // pattern is opt-in per mutation -- a missed write-back here
+            // SILENTLY DISCARDS accrued fees for all four legs.
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// growth-v19 bind (tag 94): the optional `l_launch` and the G4 field-by-field defaults,
+    /// moved out of `handle_init_vault_lp` UNCHANGED (F-1, security round 3: frame size).
+    /// Returns whether the asset's growth block is on.
+    #[inline(never)]
+    fn init_vault_lp_growth_bind_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        l_launch_x100: Option<u16>,
+        last_fee_slot: u64,
+    ) -> Result<bool, ProgramError> {
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let growth = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?;
+        let on = match (growth, l_launch_x100) {
+            (None, None) => false,
+            (None, Some(_)) => return Err(PercolatorError::GrowthInvalidConfig.into()),
+            (Some(_), None) => true,
+            (Some(mut g), Some(l)) => {
+                if l < growth_v19::LEVERAGE_X100_ONE || l > g.l_tier_x100 {
+                    return Err(PercolatorError::GrowthInvalidConfig.into());
+                }
+                g.l_launch_x100 = l;
+                g.ceil_x100 = l;
+                g.ceil_slot = last_fee_slot;
+                state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+                true
+            }
+        };
+        // G4 (plan §2.3 step 5): a growth asset's protocol risk defaults -- the P2
+        // call extension on, the fee channel on (100 bps cap = pinned max_total), an LP
+        // floor > 0 -- are written here, at the existing creator bind, so a new creator
+        // market needs no upgrade-authority send. L-4 (security review): FIELD BY
+        // FIELD -- a field an upgrade-authority tag-93 send preset before the bind is
+        // kept, a zero field gets its default. Legacy (growth OFF) binds are unchanged.
+        if on {
+            let mut limits = state::asset_risk_limits_from_wrapper_bytes(&market.wrapper[..])?;
+            limits.matcher_ext_mode = growth_v19::g4_default_if_zero(
+                limits.matcher_ext_mode as u128,
+                growth_v19::GROWTH_PIN_MATCHER_EXT_MODE as u128,
+            ) as u8;
+            limits.max_requested_fee_bps = growth_v19::g4_default_if_zero(
+                limits.max_requested_fee_bps as u128,
+                growth_v19::GROWTH_PIN_MAX_REQUESTED_FEE_BPS as u128,
+            ) as u16;
+            limits.lp_floor_atoms = growth_v19::g4_default_if_zero(
+                limits.lp_floor_atoms,
+                growth_v19::GROWTH_PIN_LP_FLOOR_ATOMS,
+            );
+            state::asset_risk_limits_to_wrapper_bytes(&mut market.wrapper[..], &limits)?;
+        }
+        Ok(on)
     }
 
     fn side_oi_snapshot_view(
@@ -32424,6 +33609,17 @@ pub mod processor {
         counterparty_before: i128,
         counterparty_after: i128,
     ) -> ProgramResult {
+        // M-1 (security review 2026-10-04): on a growth asset the LP's growth is measured from
+        // its position AFTER the counterparty's reducing part (`growth_v19::lp_mid_q`): a
+        // counterparty that only reduces / closes is never refused for LP cap or floor, and a
+        // flip is judged on its opening part. (P1 F-7's "no counterparty exemption" stays on
+        // legacy assets; on growth assets the dump is closed by GrowthNeedsLpCounterparty.)
+        let position_before = if asset_growth_view(group, asset_index)?.is_some() {
+            growth_v19::lp_mid_q(position_before, counterparty_before, counterparty_after)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            position_before
+        };
         if !risk_limits_v17::lp_risk_increasing(position_before, position_after) {
             return Ok(());
         }
@@ -32476,10 +33672,20 @@ pub mod processor {
         if risk_limits_v17::lp_floor_halts(equity, limits.lp_floor_atoms, true) {
             return Ok((true, 0));
         }
-        let k = risk_limits_v17::effective_lp_exposure_k_bps(
+        // growth-v19: on a growth asset the DEFAULT multiplier is the growth `lambda_bps`
+        // (`N_cap = lambda * C_m / P` replaces `k = 1e8 / IMR`), so the headroom the matcher is
+        // clipped to and the post-fill LP cap are the same number as the growth gate's N_cap.
+        // An explicit tag-93 `lp_exposure_k_bps` stays an upgrade-authority override.
+        let k = match (
             limits.lp_exposure_k_bps,
-            group.header.config.initial_margin_bps.get(),
-        );
+            asset_growth_view(group, asset_index)?,
+        ) {
+            (0, Some(g)) => g.lambda_bps,
+            (stored, _) => risk_limits_v17::effective_lp_exposure_k_bps(
+                stored,
+                group.header.config.initial_margin_bps.get(),
+            ),
+        };
         let price = group
             .markets
             .get(asset_index)
@@ -32523,6 +33729,39 @@ pub mod processor {
         /// this leg's asset BEFORE the trade. `Some` only when the caller asked for it (the
         /// configured matcher takes the v2 extension).
         lp_position_q: Option<i128>,
+        /// growth-v19: `(inventory_cap_q, liquidity_notional_e6)` for the ext-v3 block. `Some`
+        /// only on a growth asset AND when the matcher takes the LP position (canonical
+        /// matcher, which understands v3 from the growth-1 matcher build on).
+        growth_ext: Option<(u128, u128)>,
+        /// N-2: the utilisation-fee inputs of an OPENING growth leg against the bound vault LP
+        /// (`None` for a close / reduce, a non-growth asset or a non-vault LP).
+        growth_util: Option<GrowthUtilIn>,
+    }
+
+    /// N-2 (security round 3): what the TradeCpi handler needs to price the utilisation fee on
+    /// the EXECUTED size (pre-fill snapshot, same instruction).
+    #[derive(Clone, Copy)]
+    struct GrowthUtilIn {
+        users_oi_before_q: u128,
+        n_cap_q: u128,
+        kink_bps: u16,
+        util_max_bps: u16,
+        taker_eff_before_q: i128,
+    }
+
+    /// N-2: the utilisation fee (as a rate on the whole fill) an executed fill of `exec_size`
+    /// owes. 0 for a close / reduce and at or below the kink.
+    fn growth_util_fee_for_fill_bps(u: &GrowthUtilIn, exec_size: i128) -> u16 {
+        let after = match u.taker_eff_before_q.checked_add(exec_size) {
+            Some(a) => a,
+            None => return 0,
+        };
+        let opening = growth_v19::opening_part_q(u.taker_eff_before_q, after);
+        let users_after = u.users_oi_before_q.saturating_add(opening);
+        let fee =
+            growth_v19::utilisation_fee_bps(users_after, u.n_cap_q, u.kink_bps, u.util_max_bps)
+                .unwrap_or(0);
+        growth_v19::util_fee_on_fill_bps(fee, opening, exec_size.unsigned_abs())
     }
 
     /// TradeCpi / BatchTradeCpi pre-matcher: the existing portfolio-currency preflight
@@ -32541,6 +33780,9 @@ pub mod processor {
         max_market_slots: usize,
         cpi_requests: &[(u16, i128)],
         want_lp_position: bool,
+        // M-1: single TradeCpi clips a growth-asset FLIP to its closing part (the opening part
+        // is a new order that faces the gate); BatchTradeCpi cannot clip (atomic legs).
+        clip_flips_to_close: bool,
     ) -> Result<Vec<P1CpiLegPreflight>, ProgramError> {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
@@ -32620,7 +33862,38 @@ pub mod processor {
                 asset_index,
                 lp_after_full.unsigned_abs(),
             )?;
-            let headroom_q = if floor {
+            let growth_rec = asset_growth_view(&group, asset_index)?;
+            // M-1 (security review 2026-10-04): on a growth asset a taker leg that STRICTLY
+            // reduces is never clipped or halted for LP capacity / floor: headroom = its own
+            // |size| (bounded by the taker's position). A flip on the single route is clipped to
+            // exactly its closing part, which is then a strict close.
+            // Q2 (re-verification): classified from the taker's ADL-EFFECTIVE position, so the
+            // TAKER_REDUCING bit is never set on a request that over-closes |eff| < |raw| into
+            // an opening remainder. `growth_open` carries, for an open / grow / batch flip, the
+            // taker's ADL-effective position before (N-1 OI room below).
+            let (taker_reducing, close_room, growth_open) = match growth_rec {
+                Some(_) => {
+                    let (_, taker_eff) = raw_and_effective_signed_position_for_asset_view(
+                        &group,
+                        &account_a,
+                        asset_index,
+                    )?;
+                    match growth_v19::growth_leg_reduce_class(
+                        taker_eff,
+                        size_q,
+                        clip_flips_to_close,
+                    )
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                    {
+                        (true, room) => (true, room, None),
+                        (false, _) => (false, None, Some(taker_eff)),
+                    }
+                }
+                None => (taker_reducing, None, None),
+            };
+            let headroom_q = if let Some(room) = close_room {
+                room
+            } else if floor {
                 let room = risk_limits_v17::floored_lp_reducing_room_q(before, lp_delta_sign);
                 if room == 0 {
                     return Err(PercolatorError::LpFloorHalt.into());
@@ -32629,7 +33902,91 @@ pub mod processor {
             } else {
                 risk_limits_v17::lp_fill_headroom_q(before, lp_delta_sign, cap)
             };
+            // N-1: an opening growth leg is also clipped to its side's users-OI room under
+            // N_cap (+ the closing part of a batch flip), so the TradeCpi clip and the post-fill
+            // gate agree (the gate refuses `OI_users(side) > N_cap`; landing on it is admitted).
+            // Only on a bound asset against its vault LP: anywhere else the gate refuses the
+            // open outright (GrowthRequiresBoundVaultLp / GrowthNeedsLpCounterparty).
+            let mut growth_util: Option<GrowthUtilIn> = None;
+            let headroom_q = match (growth_rec, growth_open) {
+                (Some(g), Some(taker_eff)) => {
+                    let vault = read_asset_vault_lp_from_view(&group, asset_index)?;
+                    if vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0
+                        && account_b_ai.key.to_bytes() == vault.vault_lp_portfolio
+                    {
+                        let (_, lp_eff) = raw_and_effective_signed_position_for_asset_view(
+                            &group,
+                            &account_b,
+                            asset_index,
+                        )?;
+                        let price = market.engine.asset.effective_price.get();
+                        let c_m = vault_lp_v18::conservative_equity(
+                            account_b.header.capital.get(),
+                            account_b.header.pnl.get(),
+                            account_b.header.fee_credits.get(),
+                        )
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        let n_cap =
+                            growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE)
+                                .unwrap_or(0);
+                        let long_side = size_q > 0;
+                        let oi_side = if long_side {
+                            market.engine.asset.oi_eff_long_q.get()
+                        } else {
+                            market.engine.asset.oi_eff_short_q.get()
+                        };
+                        let users = growth_v19::users_side_oi_q(oi_side, lp_eff, long_side);
+                        // A batch flip first closes |taker_eff| (that part is not on this side).
+                        let closing =
+                            if growth_v19::taker_flips(taker_eff, taker_eff.saturating_add(size_q))
+                            {
+                                taker_eff.unsigned_abs()
+                            } else {
+                                0
+                            };
+                        let room =
+                            closing.saturating_add(growth_v19::growth_open_room_q(n_cap, users));
+                        let util = GrowthUtilIn {
+                            users_oi_before_q: users,
+                            n_cap_q: n_cap,
+                            kink_bps: g.kink_bps,
+                            util_max_bps: growth_v19::util_fee_max_effective_bps(
+                                g.util_fee_max_bps,
+                            ),
+                            taker_eff_before_q: taker_eff,
+                        };
+                        // N-2: the batch route has no LP fee credit, so an open that would owe
+                        // the utilisation fee must go through TradeCpi (closes never owe it).
+                        if !clip_flips_to_close && growth_util_fee_for_fill_bps(&util, size_q) != 0
+                        {
+                            return Err(
+                                PercolatorError::GrowthUtilisationFeeRequiresTradeCpi.into()
+                            );
+                        }
+                        growth_util = Some(util);
+                        core::cmp::min(headroom_q, room)
+                    } else {
+                        headroom_q
+                    }
+                }
+                _ => headroom_q,
+            };
+            let growth_ext = if want_lp_position {
+                match growth_rec {
+                    Some(g) => Some(growth_matcher_caps_view(
+                        &group,
+                        &account_b,
+                        asset_index,
+                        &g,
+                    )?),
+                    None => None,
+                }
+            } else {
+                None
+            };
             out.push(P1CpiLegPreflight {
+                growth_util,
+                growth_ext,
                 lp_position_q,
                 taker_reducing,
                 headroom_q,
@@ -34193,7 +35550,10 @@ pub mod processor {
         seeds: &[&[u8]],
     ) -> ProgramResult {
         // 24-byte v0/v1 block (67-byte call) or 40-byte v2 block (83-byte call).
-        if call_ext.len() != 24 && call_ext.len() != risk_limits_v17::CALL_EXT_V2_LEN {
+        if call_ext.len() != 24
+            && call_ext.len() != risk_limits_v17::CALL_EXT_V2_LEN
+            && call_ext.len() != growth_v19::CALL_EXT_V3_LEN
+        {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let mut data = alloc::vec![0u8; 43 + call_ext.len()];
