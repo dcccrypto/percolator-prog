@@ -25970,9 +25970,9 @@ fn p2b_restart_asset_oracle_clears_the_adl_episode_record() {
         state::read_market_trade_preflight(&acc.data, 0).unwrap().3;
     let mut l = state::read_asset_risk_limits(&acc.data, 0).unwrap();
     l.adl_episode_since_slot = 5;
-    l.adl_episode_epoch_long = 0;
-    l.adl_episode_epoch_short = 0;
-    l.adl_episode_market_id_lo = old_market_id as u16;
+    let (kl, ks) = percolator_prog::processor::adl_episode_key(old_market_id, 0, 0);
+    l.adl_episode_epoch_long = kl;
+    l.adl_episode_epoch_short = ks;
     l.adl_max_episode_slots = 300;
     state::write_asset_risk_limits(&mut acc.data, 0, &l).unwrap();
     env.svm.set_account(env.market, acc).unwrap();
@@ -25997,7 +25997,7 @@ fn p2b_restart_asset_oracle_clears_the_adl_episode_record() {
     let after = state::read_asset_risk_limits(&data, 0).unwrap();
     assert_eq!(after.adl_episode_since_slot, 0, "old episode start must not survive a restart");
     assert_eq!(after.adl_max_episode_slots, 0, "old N override must not survive a restart");
-    assert_eq!(after.adl_episode_market_id_lo, 0);
+    assert_eq!((after.adl_episode_epoch_long, after.adl_episode_epoch_short), (0, 0));
     let new_market_id = state::read_market_trade_preflight(&data, 0).unwrap().3;
     assert_ne!(new_market_id, old_market_id);
 
@@ -26034,7 +26034,7 @@ fn p2b_privileged_reactivation_of_a_retired_slot_clears_the_adl_episode_record()
     let mut acc = env.svm.get_account(&env.market).unwrap();
     let mut l = state::read_asset_risk_limits(&acc.data, 1).unwrap();
     l.adl_episode_since_slot = 5;
-    l.adl_episode_market_id_lo = 2;
+    l.adl_episode_epoch_long = 7;
     l.adl_max_episode_slots = 300;
     state::write_asset_risk_limits(&mut acc.data, 1, &l).unwrap();
     env.svm.set_account(env.market, acc).unwrap();
@@ -26075,5 +26075,5 @@ fn p2b_privileged_reactivation_of_a_retired_slot_clears_the_adl_episode_record()
         .unwrap();
     assert_eq!(after.adl_episode_since_slot, 0, "old episode start must not survive re-activation");
     assert_eq!(after.adl_max_episode_slots, 0, "old N override must not survive re-activation");
-    assert_eq!(after.adl_episode_market_id_lo, 0);
+    assert_eq!(after.adl_episode_epoch_long, 0);
 }
