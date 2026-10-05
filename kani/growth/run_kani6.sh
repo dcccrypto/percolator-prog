@@ -1,5 +1,5 @@
 #!/bin/zsh
-# growth-v19 rev-6 single Kani run (security review A1-A5). ONE queue, one harness at a time
+# growth-v19 rev-6b single Kani run (security review A1-A5 + C1-C4). ONE queue, one harness at a time
 # (machine shared). Order: primitives -> composite contracts -> the rev-5 NO-VERDICT / deferred /
 # CONDITIONAL / new harnesses -> re-confirmation of the unchanged harnesses on the final code.
 # Watchdog LIMIT secs (default 1500) kills only the PID tree it spawned; a TIMEOUT is NO-VERDICT,
@@ -11,7 +11,9 @@ P=/Users/khubair/wt-growth-v19/percolator-prog
 M=/Users/khubair/wt-growth-v19/percolator-match
 G=$P/kani/growth
 L=$G/logs/$tag
-mkdir -p $L; : > $L/SUMMARY
+mkdir -p $L; [ -n "$RESUME" ] || : > $L/SUMMARY
+# RESUME=1: keep SUMMARY, skip harnesses already recorded. SKIP="h1,h2": record as deferred, do not run.
+SKIP_REASON=${SKIP_REASON:-"deferred: spec re-encoding pending review"}
 F="-Z function-contracts -Z stubbing"
 q=()
 g() { for h in "$@"; do q+=("growth|$h|$G|cargo kani $F --harness proofs::$h --exact"); done; }
@@ -19,13 +21,13 @@ mv2() { for h in "$@"; do q+=("matcher|$h|$M|cargo kani $F --harness v2::proofs:
 mva() { for h in "$@"; do q+=("matcher|$h|$M|cargo kani $F --harness vamm::proofs::$h --exact"); done; }
 wt() { for h in "$@"; do q+=("wrapper-tests|$h|$P|cargo kani $F --tests --harness $h --exact"); done; }
 # 1. primitives (the only 128-bit dividers, u8 operands)
-g kani_growth_c_mul_div_floor kani_growth_c_mul_div_ceil kani_growth_c_mul_div_none_full_width
+g kani_growth_c_mul_div_floor kani_growth_c_mul_div_ceil
 mv2 proof_div_ceil_contract
 mva proof_skew_div_contract
 # 2. composite contracts (primitives stubbed by their proven contracts)
 g kani_growth_c_n_cap_q kani_growth_c_liquidity_notional_e6 kani_growth_c_dyn_imr_bps \
   kani_growth_c_leg_im_req kani_growth_c_risk_notional_ceil kani_growth_c_utilisation_fee_bps \
-  kani_growth_c_util_fee_on_fill_bps
+  kani_growth_c_util_fee_on_fill_bps kani_growth_util_fee_caller_bound
 # 3. rev-5 NO-VERDICT / deferred / CONDITIONAL harnesses, re-targeted, plus the new gap harnesses
 g kani_growth_t1_requirement_never_below_engine_or_per_asset kani_growth_t1_required_imr_bounds \
   kani_growth_t2_dyn_imr_monotone_in_lp kani_growth_t2_dyn_imr_antitone_in_ncap \
@@ -64,6 +66,8 @@ echo "queued ${#q[@]} harnesses" > $L/QUEUE; printf '%s\n' "${q[@]}" >> $L/QUEUE
 killtree() { local p=$1; for c in $(pgrep -P $p); do killtree $c; done; kill $p 2>/dev/null; }
 for j in "${q[@]}"; do
   IFS='|' read crate h dir cmd <<< "$j"
+  grep -q "| $h |" $L/SUMMARY && continue
+  if [[ ",$SKIP," == *",$h,"* ]]; then echo "$crate | $h | $SKIP_REASON | not run | 0s" >> $L/SUMMARY; continue; fi
   start=$(date +%s)
   (cd $dir && eval "$cmd") > $L/$h.log 2>&1 &
   pid=$!

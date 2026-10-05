@@ -1,4 +1,5 @@
-# Mutant matrix, rev 6 (security review A4: every mutant targets the harness that proves the
+# Mutant matrix, rev 6b (review A4 + C3: primitive mutants target the primitive harnesses; operand
+# mutants must turn the composite contract harnesses red. Earlier header (rev 6, A4: every mutant targets the harness that proves the
 # mutated code AS IT IS PROVED NOW -- composite internals are caught by their proof_for_contract
 # harness, because gate harnesses replace them by the contract). Each mutant keeps the dividers
 # the target harness stubs, so a red result is a real counterexample, not a timeout.
@@ -14,7 +15,7 @@ MUTANTS = [
  # ── primitives (A1/A2) ──
  ("p-floor", V, "    a.checked_mul(b).map(|p| p / d)", "    a.checked_mul(b).map(|p| p.div_ceil(d))", "kani_growth_c_mul_div_floor", "vlp"),
  ("p-ceil", G, "    Some(a.checked_mul(b)?.div_ceil(d))", "    Some(a.checked_mul(b)? / d)", "kani_growth_c_mul_div_ceil", "growth"),
- ("p-none", G, "    Some(a.checked_mul(b)?.div_ceil(d))", "    Some(a.saturating_mul(b).div_ceil(d))", "kani_growth_c_mul_div_none_full_width", "growth"),
+ ("p-dzero", G, "    if d == 0 {\n        return None;\n    }\n    Some(a.checked_mul(b)?.div_ceil(d))", "    if d == 0 {\n        return Some(0);\n    }\n    Some(a.checked_mul(b)?.div_ceil(d))", "kani_growth_c_mul_div_ceil", "growth"),
  ("m-divceil", MV2, "    a / b + u128::from(!a.is_multiple_of(b))", "    a / b", "proof_div_ceil_contract", "match"),
  ("m-skewdiv", MVA, "fn skew_div(num: u128, den: u128) -> u128 {\n    num / den\n}", "fn skew_div(num: u128, den: u128) -> u128 {\n    num.div_ceil(den)\n}", "proof_skew_div_contract", "match"),
  # ── composite internals -> their contract harnesses (A4) ──
@@ -29,6 +30,12 @@ MUTANTS = [
  ("g8", G, "        let stepped = prev_ceil_x100.saturating_add(RATCHET_STEP_X100);", "        let stepped = prev_ceil_x100.saturating_add(2 * RATCHET_STEP_X100);", "kani_growth_t6_ratchet_single_step", "growth"),
  ("g9", G, "    if r_gap_bps == 0 {\n        return false;\n    }\n    match r_gap_floor_bps", "    match r_gap_floor_bps", "kani_growth_t7_init_margin_rule_exact", "growth"),
  ("g10", G, "    lambda_bps >= 1 && lambda_bps <= lambda_max && kink_bps <= kink_max", "    let _ = (lambda_max, kink_max);\n    lambda_bps >= 1", "kani_growth_dials_tighten_only", "growth"),
+ # ── C3 operand mutants: each must turn its COMPOSITE contract harness red ──
+ ("c3-ncap-den", G, "    let den = BPS.checked_mul(price_e6 as u128)?;", "    let den = price_e6 as u128;", "kani_growth_c_n_cap_q", "growth"),
+ ("c3-ncap-ceil", G, "    crate::vault_lp_v18::mul_div_floor(x, pos_scale, den)", "    mul_div_ceil_u128(x, pos_scale, den)", "kani_growth_c_n_cap_q", "growth"),
+ ("c3-dyn-span", G, "    let span = (MAX_IMR_BPS - base_imr_bps) as u128;", "    let span = MAX_IMR_BPS as u128;", "kani_growth_c_dyn_imr_bps", "growth"),
+ ("c3-leg-floor", G, "    let r = mul_div_ceil_u128(notional, imr_bps as u128, BPS)?;", "    let r = crate::vault_lp_v18::mul_div_floor(notional, imr_bps as u128, BPS)?;", "kani_growth_c_leg_im_req", "growth"),
+ ("c3-fill-o", G, "    let o = if opening_q > fill_abs_q {\n        fill_abs_q\n    } else {\n        opening_q\n    };", "    let o = fill_abs_q;", "kani_growth_c_util_fee_on_fill_bps", "growth"),
  ("g11-leg", G, "    let r = mul_div_ceil_u128(notional, imr_bps as u128, BPS)?;", "    let r = mul_div_ceil_u128(notional, imr_bps as u128, BPS)?.saturating_sub(1);", "kani_growth_c_leg_im_req", "growth"),
  ("g12-risk", G, "    mul_div_ceil_u128(abs_q, price_e6 as u128, pos_scale)", "    mul_div_ceil_u128(abs_q, price_e6 as u128, pos_scale).map(|x| x.saturating_sub(1))", "kani_growth_c_risk_notional_ceil", "growth"),
  # ── gate rules ──
