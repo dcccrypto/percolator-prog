@@ -2376,3 +2376,558 @@ proptest::proptest! {
         proptest::prop_assert!(paid <= dep + 2, "E extracted {}: deposited {dep}, paid {paid}, ops {ops:?}", paid as i128 - dep as i128);
     }
 }
+
+// ── v2.2 Wave A item 8: R3-M1 (security-review-p2b-earn-allocation round 3) ────────────────
+// R3-M1: a Live non-bound 77 is priced on E3 = min(P, phys - registered claims). Between a
+// winner's touch (claim registered) and its loser's touch (loss routed) E3 dips, so an HONEST
+// redeemer exiting inside that window is under-paid by share x (par - E3), and the remaining
+// holders (possibly the attacker who kept the dip open) gain it once the loser is touched.
+// The fix: (1) a redeemer-signed `min_payout`, (2) up to 8 stale portfolios refreshed inline,
+// (3) EXIT_REQUIRES_LOSS_CURRENT (p4 bit2, on for every new market; forced on in mainnet
+// builds), (4) keeper-executable requests (`keeper_ok`), always loss-gated.
+
+const R3M1_DEPOSIT: u64 = 1_000_000_000;
+const ERR_EXPECTED_SIGNER: u32 = percolator_prog::error::PercolatorError::ExpectedSigner as u32;
+const ERR_BELOW_MIN: u32 = 117;
+const ERR_NOT_LOSS_CURRENT: u32 = 118;
+
+struct R3m1 {
+    r: Replay,
+    q: i128,
+    a1k: Keypair,
+    a1: Pubkey,
+    a2k: Keypair,
+    a2: Pubkey,
+    h: Keypair,
+    h_ata: Pubkey,
+    m: Keypair,
+    m_ata: Pubkey,
+}
+
+/// H (honest) and M (the attacker) each enter at par in a calm book, then a zero-sum pair opens
+/// against the LP and the mark walks +18% touching ONLY the winner A1 and the LP: the reviewer's
+/// dip (claim registered, loser A2 untouched).
+fn r3m1_world() -> R3m1 {
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let m = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75 at par");
+    let (m_ata, _) = r.deposit_shares(&m, R3M1_DEPOSIT, 0).expect("M 75 at par");
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(1_000_000_000);
+    let (a2k, a2) = r.new_trader(1_000_000_000);
+    r.trade(&a1k, a1, q).expect("A1 long");
+    r.trade(&a2k, a2, -q).expect("A2 short");
+    let lp = r.lp;
+    walk_only(&mut r, 1_180_000, &[a1, lp]);
+    let (_, g) = r.env.market_state();
+    assert!(
+        g.assets[0].stale_account_count_long + g.assets[0].stale_account_count_short > 0,
+        "the dip must exist: the loser A2 is untouched (stale)"
+    );
+    R3m1 { r, q, a1k, a1, a2k, a2, h, h_ata, m, m_ata }
+}
+
+impl Replay {
+    fn redemption_pda(&self, who: &Pubkey) -> Pubkey {
+        state::derive_lp_redemption(&self.env.program_id, &self.registry, who).0
+    }
+    /// Tag 76, legacy (`ext == None`) or the v2.2 wire `(min_payout, keeper_ok)`.
+    fn request_76(&mut self, who: &Keypair, ata: Pubkey, ext: Option<(u64, u8)>) -> Result<u64, String> {
+        let shares = self.env.token_amount(ata) as u128;
+        let pid = self.env.program_id;
+        let escrow = state::derive_lp_escrow(&pid, &self.env.market).0;
+        let red = self.redemption_pda(&who.pubkey());
+        self.env.svm.expire_blockhash();
+        let ix = match ext {
+            None => ProgInstruction::RequestRedeemLpShares { shares },
+            Some((min_payout_atoms, keeper_ok)) => ProgInstruction::RequestRedeemLpSharesV22 {
+                shares,
+                min_payout_atoms,
+                keeper_ok,
+            },
+        };
+        self.env.send(
+            ix,
+            vec![
+                AccountMeta::new(who.pubkey(), true),
+                AccountMeta::new(self.registry, false),
+                AccountMeta::new(self.lp_mint, false),
+                AccountMeta::new(ata, false),
+                AccountMeta::new(escrow, false),
+                AccountMeta::new(red, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[who],
+        )
+    }
+    /// Tag 77 for `who`'s pending request. `wire == None`: the legacy 3-byte wire (what the app
+    /// sends today). `Some((min, refresh))`: the v2.2 wire with `refresh` as accounts [13..].
+    /// `signed`: the redeemer signs [12] (H-1(b)); otherwise only the payer (a keeper) signs.
+    /// Returns (SPL paid to `who` by THIS call, CU).
+    fn execute_77(
+        &mut self,
+        who: &Keypair,
+        wire: Option<(u64, Vec<Pubkey>)>,
+        signed: bool,
+    ) -> Result<(u64, u64), String> {
+        let pid = self.env.program_id;
+        let escrow = state::derive_lp_escrow(&pid, &self.env.market).0;
+        let red = self.redemption_pda(&who.pubkey());
+        let dest = self.env.token_account_for_mint(self.env.mint, who.pubkey(), 0);
+        let before = self.env.token_amount(dest);
+        let payer = self.env.payer.pubkey();
+        let mut metas = vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(self.env.market, false),
+            AccountMeta::new(self.registry, false),
+            AccountMeta::new(red, false),
+            AccountMeta::new(self.lp_mint, false),
+            AccountMeta::new(escrow, false),
+            AccountMeta::new(self.env.vault, false),
+            AccountMeta::new_readonly(self.env.vault_authority, false),
+            AccountMeta::new(self.ledgers[0], false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(self.ledgers[1], false),
+            AccountMeta::new(who.pubkey(), signed),
+        ];
+        let ix = match wire {
+            None => ProgInstruction::ExecuteRedemption { domain: 0 },
+            Some((min_payout_atoms, refresh)) => {
+                let n_refresh = refresh.len() as u8;
+                for p in refresh {
+                    metas.push(AccountMeta::new(p, false));
+                }
+                ProgInstruction::ExecuteRedemptionV22 {
+                    domain: 0,
+                    min_payout_atoms,
+                    n_refresh,
+                }
+            }
+        };
+        self.env.svm.expire_blockhash();
+        let signers: Vec<&Keypair> = if signed { vec![who] } else { vec![] };
+        let cu = self.env.send(ix, metas, &signers)?;
+        Ok((self.env.token_amount(dest) - before, cu))
+    }
+    /// The redeemer-visible state a refused 77 must leave untouched.
+    fn exit_state(&self, who: &Pubkey) -> (u64, u64, u128, bool, u64) {
+        let escrow = state::derive_lp_escrow(&self.env.program_id, &self.env.market).0;
+        let reg = state::read_lp_vault_registry(&self.env.svm.get_account(&self.registry).unwrap().data).unwrap();
+        let red = self.env.svm.get_account(&self.redemption_pda(who));
+        let live = red.is_some_and(|a| state::read_lp_redemption(&a.data).is_ok());
+        let vault_spl = self.env.token_amount(self.env.vault);
+        (self.env.token_amount(escrow), self.share_supply(), reg.total_lp_shares_outstanding, live, vault_spl)
+    }
+    /// Clear (`on == false`) or set p4_flags bit2 on asset 0's profile, by direct account write:
+    /// the legacy / devnet-off behaviour on the SAME binary (no setter exists, by design).
+    fn set_exit_requires_loss_current(&mut self, on: bool) {
+        let mut acct = self.env.svm.get_account(&self.env.market).unwrap();
+        let mut p = state::read_asset_oracle_profile(&acct.data, 0).unwrap();
+        let bit = percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT;
+        p._padding0[percolator_prog::constants::PROFILE_P4_FLAGS_IDX] =
+            if on { bit } else { 0 };
+        state::write_asset_oracle_profile(&mut acct.data, 0, &p).unwrap();
+        self.env.svm.set_account(self.env.market, acct).unwrap();
+    }
+}
+
+fn code(r: &Result<(u64, u64), String>) -> Option<u32> {
+    r.as_ref().err().and_then(|e| custom_code(e))
+}
+
+/// THE PORT. Reviewer's R3-M1: H exits inside the dip with the 3-byte 77 the app sends today.
+/// * ff65ec50 (before): H is paid ~share x E3 (< its 1,000 at par) and M later redeems the gap
+///   -> the first assertion FAILS (proved by running this test on the baseline .so).
+/// * v2.2 (after): the dip exit is REFUSED (118, nothing moves); H's SDK flow then refreshes
+///   the book inline (n_refresh = 3) under its own signed floor and is paid par; M gains 0.
+#[test]
+fn r3m1_honest_exit_inside_dip_is_not_skimmed() {
+    let mut w = r3m1_world();
+    let lp = w.r.lp;
+    w.r.request_76(&w.h, w.h_ata, None).expect("H 76");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let before = w.r.exit_state(&w.h.pubkey());
+    let dip = w.r.execute_77(&w.h, None, true);
+    eprintln!("R3-M1 legacy 77 inside the dip: {dip:?}");
+    let paid_in_dip = dip.as_ref().map(|x| x.0).unwrap_or(0) as u128;
+    assert!(
+        dip.is_err() || paid_in_dip + 2 >= R3M1_DEPOSIT as u128,
+        "R3-M1 skim: H deposited {R3M1_DEPOSIT} at par and was paid {paid_in_dip} inside the dip"
+    );
+    assert_eq!(code(&dip), Some(ERR_NOT_LOSS_CURRENT), "the dip exit is refused as not loss-current");
+    assert_eq!(w.r.exit_state(&w.h.pubkey()), before, "a refused 77 moves nothing");
+    // H's honest SDK flow: refresh every positioned portfolio inline, floor = its par quote.
+    let (paid, cu) = w
+        .r
+        .execute_77(&w.h, Some((R3M1_DEPOSIT - 2, vec![w.a1, w.a2, lp])), true)
+        .expect("H 77 with inline refresh");
+    eprintln!("R3-M1 H paid {paid} (deposit {R3M1_DEPOSIT}), CU {cu}");
+    assert!(paid + 2 >= R3M1_DEPOSIT, "H under-paid after the inline refresh: {paid}");
+    // M (the dip-holder) gains nothing from H's exit.
+    w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let (m_paid, _) = w.r.execute_77(&w.m, Some((1, vec![w.a1, w.a2, lp])), true).expect("M 77");
+    assert!(m_paid <= R3M1_DEPOSIT + 2, "M extracted {} from H's exit", m_paid as i128 - R3M1_DEPOSIT as i128);
+    let _ = (&w.a1k, &w.a2k, w.q);
+}
+
+/// Same binary, EXIT_REQUIRES_LOSS_CURRENT cleared (the devnet-off / legacy shape): the legacy
+/// dip exit reproduces the skim (this is the R3-M1 PoC, live), and rule 1 alone already stops
+/// it for a redeemer who signs a floor: 117 with no state change, then par once the loser is
+/// touched.
+#[test]
+fn r3m1_skim_reproduces_without_bit2_and_min_payout_stops_it() {
+    let mut w = r3m1_world();
+    w.r.set_exit_requires_loss_current(false);
+    // H2 = M here: a second redeemer who signs a floor.
+    w.r.request_76(&w.h, w.h_ata, None).expect("H 76");
+    w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    // M signs its par quote as the floor inside the dip: refused, nothing moves.
+    let before = w.r.exit_state(&w.m.pubkey());
+    let refused = w.r.execute_77(&w.m, Some((R3M1_DEPOSIT - 2, vec![])), true);
+    assert_eq!(code(&refused), Some(ERR_BELOW_MIN), "{refused:?}");
+    assert_eq!(w.r.exit_state(&w.m.pubkey()), before, "a 117 moves nothing");
+    // H, no floor, legacy wire, bit2 off: the skim (R3-M1 reproduced on the same binary).
+    let (h_paid, _) = w.r.execute_77(&w.h, None, true).expect("legacy 77 executes with bit2 off");
+    eprintln!("R3-M1 reproduced with bit2 off: H paid {h_paid} for {R3M1_DEPOSIT}");
+    assert!(h_paid + 2 < R3M1_DEPOSIT, "expected the R3-M1 under-payment with bit2 off, got {h_paid}");
+    // The loser is touched; M's floor now clears and M collects H's gap (the skim's beneficiary).
+    w.r.crank_pf(w.a2);
+    let (m_paid, _) = w
+        .r
+        .execute_77(&w.m, Some((R3M1_DEPOSIT - 2, vec![])), true)
+        .expect("M 77 after the loser touch");
+    assert!(m_paid >= R3M1_DEPOSIT - 2, "floor honoured: {m_paid}");
+    eprintln!("R3-M1 beneficiary M paid {m_paid}");
+}
+
+/// Rule 1 on a loss-current book: a floor above the quote is refused (117, nothing moves); the
+/// floor stored at tag 76 binds even a legacy 77; a floor at or below the quote executes.
+#[test]
+fn min_payout_is_honoured_wire_and_stored() {
+    let mut w = r3m1_world();
+    let lp = w.r.lp;
+    for p in [w.a1, w.a2, lp] {
+        w.r.crank_pf(p);
+    }
+    // Stored floor above the quote; legacy 77 (wire floor 0) still refuses.
+    w.r.request_76(&w.h, w.h_ata, Some((R3M1_DEPOSIT + 1_000, 0))).expect("H 76 v2.2");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let before = w.r.exit_state(&w.h.pubkey());
+    let r1 = w.r.execute_77(&w.h, None, true);
+    assert_eq!(code(&r1), Some(ERR_BELOW_MIN), "stored floor binds the legacy wire: {r1:?}");
+    // A lower wire floor cannot undercut the stored one (max of both).
+    let r2 = w.r.execute_77(&w.h, Some((1, vec![w.a1, w.a2, lp])), true);
+    assert_eq!(code(&r2), Some(ERR_BELOW_MIN), "{r2:?}");
+    assert_eq!(w.r.exit_state(&w.h.pubkey()), before, "117 moves nothing");
+    // M: a wire floor above the quote refuses; at the quote it pays >= the floor.
+    w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let r3 = w.r.execute_77(&w.m, Some((R3M1_DEPOSIT + 1, vec![])), true);
+    assert_eq!(code(&r3), Some(ERR_BELOW_MIN), "{r3:?}");
+    let (paid, _) = w.r.execute_77(&w.m, Some((R3M1_DEPOSIT - 2, vec![])), true).expect("M at its floor");
+    assert!(paid >= R3M1_DEPOSIT - 2, "I-X1: paid {paid} >= floor");
+}
+
+/// Rule 2's cap: at most REDEMPTION_REFRESH_MAX = 8 inline refreshes (9 is refused at decode);
+/// 8 refreshes of 9 stale portfolios leave the book stale (118); the full book inline (8 + one
+/// external crank) executes, and the 8-refresh 77 fits the 1.4M CU budget.
+#[test]
+fn refresh_cap_is_eight_and_fits_the_budget() {
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut traders = vec![];
+    for i in 0..9 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, if i % 2 == 0 { q } else { -q }).expect("open");
+        traders.push(p);
+    }
+    let lp = r.lp;
+    walk_only(&mut r, 1_050_000, &[lp]); // only the LP is touched: 9 stale traders
+    r.request_76(&h, h_ata, None).expect("H 76");
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    // 9 is not a valid wire.
+    let mut nine = ProgInstruction::ExecuteRedemptionV22 { domain: 0, min_payout_atoms: 1, n_refresh: 8 }.encode();
+    *nine.last_mut().unwrap() = 9;
+    assert!(ProgInstruction::decode(&nine).is_err(), "n_refresh 9 must not decode");
+    // 8 of 9: still stale (the whole transaction, refreshes included, reverts).
+    let r8 = r.execute_77(&h, Some((1, traders[..8].to_vec())), true);
+    assert_eq!(code(&r8), Some(ERR_NOT_LOSS_CURRENT), "{r8:?}");
+    let (_, g) = r.env.market_state();
+    assert_eq!(
+        g.assets[0].stale_account_count_long + g.assets[0].stale_account_count_short,
+        9,
+        "the refused 77 reverted its refreshes"
+    );
+    // The 9th refreshed by any permissionless crank; then 8 REAL inline refreshes complete it.
+    r.crank_pf(traders[8]);
+    let (paid, cu) = r.execute_77(&h, Some((1, traders[..8].to_vec())), true).expect("8 inline + 1 cranked");
+    eprintln!("refresh cap: 8-refresh 77 used {cu} CU, paid {paid}");
+    assert!(cu < 1_400_000, "8 inline refreshes + redemption must fit 1.4M CU, used {cu}");
+    assert!(paid > 0);
+}
+
+/// Rule 4: an unsigned (keeper) 77 needs a keeper_ok request; it is then loss-gated and floored
+/// by the redeemer's stored minimum; a legacy request stays redeemer-signed only.
+#[test]
+fn keeper_execution_requires_keeper_ok_loss_current_and_stored_floor() {
+    let mut w = r3m1_world();
+    let lp = w.r.lp;
+    // Legacy request: unsigned refused even on a current book.
+    w.r.request_76(&w.m, w.m_ata, None).expect("M 76 legacy");
+    // keeper_ok request with a floor.
+    w.r.request_76(&w.h, w.h_ata, Some((R3M1_DEPOSIT - 2, 1))).expect("H 76 keeper_ok");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let stale = w.r.execute_77(&w.h, None, false);
+    assert_eq!(code(&stale), Some(ERR_NOT_LOSS_CURRENT), "unsigned keeper exit in the dip: {stale:?}");
+    let unsigned_legacy = w.r.execute_77(&w.m, Some((1, vec![w.a1, w.a2, lp])), false);
+    assert_eq!(code(&unsigned_legacy), Some(ERR_EXPECTED_SIGNER), "{unsigned_legacy:?}");
+    // Keeper refreshes inline and executes H's request at par (>= H's own floor).
+    let (paid, _) = w
+        .r
+        .execute_77(&w.h, Some((1, vec![w.a1, w.a2, lp])), false)
+        .expect("keeper 77 on a loss-current book");
+    assert!(paid >= R3M1_DEPOSIT - 2, "I-X4: keeper exit at the redeemer's floor, paid {paid}");
+    // A keeper_ok request whose stored floor is above the (exact) quote: the keeper cannot
+    // execute it, on a loss-current book, at any wire floor of its own.
+    let k = Keypair::new();
+    let (k_ata, _) = w.r.deposit_shares(&k, R3M1_DEPOSIT, 0).expect("K 75");
+    w.r.request_76(&k, k_ata, Some((R3M1_DEPOSIT + 1_000, 1))).expect("K 76 keeper_ok");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let before = w.r.exit_state(&k.pubkey());
+    let low = w.r.execute_77(&k, Some((1, vec![w.a1, w.a2, lp])), false);
+    assert_eq!(code(&low), Some(ERR_BELOW_MIN), "stored floor binds the keeper: {low:?}");
+    assert_eq!(w.r.exit_state(&k.pubkey()), before, "117 moves nothing");
+}
+
+/// I-P/I-X: a new market's asset-0 profile carries EXIT_REQUIRES_LOSS_CURRENT and an oracle
+/// re-anchor keeps it (no reconfiguration can clear it).
+#[test]
+fn exit_requires_loss_current_is_default_and_survives_reconfiguration() {
+    let mut r = Replay::new(r2_market());
+    let bit = percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT;
+    let flags = |r: &Replay| {
+        let d = r.env.svm.get_account(&r.env.market).unwrap().data;
+        state::profile_p4_flags(&state::read_asset_oracle_profile(&d, 0).unwrap())
+    };
+    assert_eq!(flags(&r), bit, "set at InitMarket");
+    let s = r.now() + 1;
+    r.env.svm.warp_to_slot(s);
+    r.env.configure_auth_mark_for_asset_as_admin(0, s, 1_000_000);
+    assert_eq!(flags(&r), bit, "kept by ConfigureAuthMark");
+}
+
+// ── I-X1 / I-X2 property: an honest third-party redeemer inside attacker-ordered touches ─────
+#[derive(Clone, Debug)]
+enum HOp {
+    Touch(TouchOp),
+    /// H tries to exit: legacy 77 (`inline == false`) or v2.2 with the full book inline, floor =
+    /// `min_bps` of its par deposit.
+    HExit { inline: bool, min_bps: u64 },
+}
+
+fn h_program() -> impl proptest::strategy::Strategy<Value = Vec<HOp>> {
+    use proptest::prelude::*;
+    let h_exit = (proptest::bool::weighted(0.25), 0u64..10_001).prop_map(|(inline, min_bps)| HOp::HExit { inline, min_bps });
+    // An exit attempt right after every price walk (the moment an attacker's dip is open),
+    // plus the tail ones.
+    (touch_program(), proptest::collection::vec(h_exit, 4..8)).prop_map(|(ops, exits)| {
+        let mut v: Vec<HOp> = vec![];
+        let mut e = exits.into_iter();
+        for op in ops.into_iter() {
+            let walk = matches!(op, TouchOp::Walk { .. });
+            v.push(HOp::Touch(op));
+            if walk {
+                if let Some(x) = e.next() {
+                    v.push(x);
+                }
+            }
+        }
+        v.extend(e);
+        v
+    })
+}
+
+impl Replay {
+    fn loss_current_now(&self) -> bool {
+        let (_, g) = self.env.market_state();
+        g.assets[0].stale_account_count_long == 0
+            && g.assets[0].stale_account_count_short == 0
+            && g.pending_domain_loss_barriers.iter().take(2).all(|b| *b == 0)
+    }
+    /// H's exact claim on the CURRENT state under the program's own non-bound rule
+    /// (floor(shares x E3 NAV / S)), computed by the test's independent E3 model.
+    fn reference_payout(&self, shares: u128) -> u128 {
+        let (_, g) = self.env.market_state();
+        let (_, nav) = self.earn_nav(&g);
+        let reg = state::read_lp_vault_registry(&self.env.svm.get_account(&self.registry).unwrap().data).unwrap();
+        shares * nav / reg.total_lp_shares_outstanding
+    }
+}
+
+/// Coverage counter (non-vacuity): exits attempted inside an attacker-held dip and refused.
+static R3M1_DIP_REFUSALS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// One executed H exit: (paid, signed floor, all-touched reference payout).
+type HExitRecord = (u64, u64, u128);
+
+/// Runs the attacker's history with H's exit attempts interleaved; asserts R3-M1's two rules at
+/// every attempt and returns the executed exit. At every attempt:
+/// * NOT loss-current (an attacker-held dip) => the exit is REFUSED (118 / a value-safe wait);
+/// * executed => the book was loss-current, payout >= floor (I-X1) and payout == the
+///   all-touched reference (I-X2: no touch order moves value out of H's exit).
+///
+/// An inline exit first applies the same refreshes as permissionless cranks (I-X3: the inline
+/// refresh is exactly the tag 5 primitive), so its reference is taken on the refreshed state.
+fn run_h_ops(ops: &[HOp]) -> (HExitRecord, u32) {
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let h = Keypair::new();
+    let (h_ata, h_shares) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75 at par");
+    r.request_76(&h, h_ata, None).expect("H 76");
+    let (a1k, a1) = r.new_trader(3_000_000_000);
+    let (a2k, a2) = r.new_trader(3_000_000_000);
+    let lp = r.lp;
+    let e = Keypair::new();
+    let mut atas: Vec<Pubkey> = vec![];
+    let mut open = false;
+    let mut refusals = 0u32;
+    let attempt = |r: &mut Replay, inline: bool, min: u64, refusals: &mut u32| -> Option<HExitRecord> {
+        if inline {
+            for p in [a1, a2, lp] {
+                r.crank_pf(p);
+            }
+        }
+        let lc = r.loss_current_now();
+        let reference = r.reference_payout(h_shares as u128);
+        let wire = if inline {
+            Some((min.max(1), vec![a1, a2, lp]))
+        } else if min > 0 {
+            Some((min, vec![]))
+        } else {
+            None
+        };
+        match r.execute_77(&h, wire, true) {
+            Ok((paid, _)) => {
+                assert!(lc, "R3-M1: H's exit EXECUTED on a stale book (paid {paid}, reference {reference})");
+                assert!(paid >= min, "I-X1: paid {paid} < floor {min}");
+                assert!(
+                    (paid as u128).abs_diff(reference) <= 2,
+                    "I-X2: paid {paid}, all-touched reference {reference}"
+                );
+                Some((paid, min, reference))
+            }
+            Err(err) => {
+                let c = custom_code(&err);
+                if !lc {
+                    assert_eq!(c, Some(ERR_NOT_LOSS_CURRENT), "dip exit must be refused as 118: {err}");
+                    R3M1_DIP_REFUSALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    // Value-safe "wait" refusals only: below the floor (117), cooldown (36),
+                    // pot liquidity (21 / 25), the stay-fully-backed gate (122).
+                    assert!(
+                        matches!(c, Some(ERR_BELOW_MIN) | Some(36) | Some(21) | Some(25) | Some(122)),
+                        "H exit refused for an unexpected reason: {err}"
+                    );
+                    if c == Some(ERR_BELOW_MIN) {
+                        assert!(reference < min as u128 + 2, "117 although the reference {reference} clears {min}");
+                    }
+                }
+                *refusals += 1;
+                None
+            }
+        }
+    };
+    for op in ops {
+        match op {
+            HOp::HExit { inline, min_bps } => {
+                let min = R3M1_DEPOSIT * min_bps / 10_000;
+                if let Some(rec) = attempt(&mut r, *inline, min, &mut refusals) {
+                    return (rec, refusals);
+                }
+            }
+            HOp::Touch(t) => match t {
+                TouchOp::Open if !open => {
+                    if r.trade(&a1k, a1, q).is_ok() {
+                        if r.trade(&a2k, a2, -q).is_ok() {
+                            open = true;
+                        } else {
+                            let _ = r.trade(&a1k, a1, -q);
+                        }
+                    }
+                }
+                TouchOp::Walk { up, bps, touch_a1, touch_a2 } => {
+                    let p0 = r.env.market_state().1.assets[0].effective_price;
+                    let d = p0 * bps / 10_000;
+                    let target = if *up { p0 + d } else { p0.saturating_sub(d).max(200_000) };
+                    let mut who = vec![lp];
+                    if *touch_a1 {
+                        who.push(a1);
+                    }
+                    if *touch_a2 {
+                        who.push(a2);
+                    }
+                    walk_only(&mut r, target, &who);
+                }
+                TouchOp::Touch { a1: x } => r.crank_pf(if *x { a1 } else { a2 }),
+                TouchOp::Close if open => {
+                    let _ = r.trade(&a1k, a1, -q);
+                    let _ = r.trade(&a2k, a2, q);
+                    open = false;
+                }
+                TouchOp::Convert { a1: x } => {
+                    let (k, p) = if *x { (&a1k, a1) } else { (&a2k, a2) };
+                    let _ = r.convert_all(&k.insecure_clone(), p);
+                }
+                TouchOp::Deposit { pot, units } => {
+                    if let Ok((ata, _)) = r.deposit_shares(&e, units * 1_000_000, *pot) {
+                        if !atas.contains(&ata) {
+                            atas.push(ata);
+                        }
+                    }
+                }
+                TouchOp::Redeem => {
+                    for ata in atas.clone() {
+                        if r.env.token_amount(ata) > 0 {
+                            let _ = r.redeem_all(&e, ata);
+                        }
+                    }
+                }
+                _ => {}
+            },
+        }
+    }
+    // Liveness: once the pair is flat, H always gets out with the full book inline (the
+    // attacker cannot hold the exit hostage), at a floor of 0.
+    if open {
+        let _ = r.trade(&a1k, a1, -q);
+        let _ = r.trade(&a2k, a2, q);
+    }
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    let rec = attempt(&mut r, true, 0, &mut refusals).expect("H's final inline exit must execute");
+    (rec, refusals)
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, max_shrink_iters: 16, .. Default::default() })]
+    /// I-X1 and I-X2 for an honest third-party redeemer inside attacker-ordered touches (see
+    /// `run_h_ops`). NOTE: the reference is the ALL-TOUCHED E3 value, not par: E3 caps each pot
+    /// at its own principal, so a loss routed into one pot does not offset a claim on the
+    /// other (pre-existing E3 design, independent of touch order; found by this proptest at
+    /// 0.87% on a 3-walk history and recorded as an Info finding).
+    #[test]
+    fn r3m1_third_party_redeemer_proptest(ops in h_program()) {
+        // Every assertion is inside `run_h_ops` (per attempt); here only non-vacuity: H's exit
+        // executed exactly once, with a real payout.
+        let ((paid, _min, reference), refusals) = run_h_ops(&ops);
+        let dips = R3M1_DIP_REFUSALS.load(std::sync::atomic::Ordering::Relaxed);
+        eprintln!("R3-M1 property case: paid {paid}, refusals {refusals}, dip refusals so far {dips}");
+        proptest::prop_assert!(paid > 0 && reference > 0);
+    }
+}

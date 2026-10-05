@@ -41,7 +41,11 @@ use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
 const MATCHER_CONTEXT_LEN: usize = 320;
-const PRICE: u64 = 1_000_000;
+/// v2.2 Wave A item 7: a growth market must open at >= 10^7 e6 per LOT (precision floor), so
+/// this fixture is priced per lot of 10 tokens: $10 per lot, and `units(n)` (n USD of
+/// notional, n tokens at $1) is n/10 lots. Every notional, margin and fee below is unchanged
+/// (`units(n) * PRICE / POS_SCALE == n * 1e6` exactly).
+const PRICE: u64 = 10_000_000;
 const Q: i128 = POS_SCALE as i128;
 const USD: u128 = 1_000_000;
 
@@ -915,7 +919,7 @@ fn seeded_keypair(tag: u8) -> Keypair {
 }
 
 fn units(n: i128) -> i128 {
-    n * Q
+    n * Q / 10
 }
 
 /// The vault LP's N_cap (Q) at its CURRENT conservative equity (lambda 1x, $1). N-2: the
@@ -1527,8 +1531,27 @@ fn growth_off_is_byte_for_byte_legacy() {
         out
     }
     let base = run(&base_program_path());
-    let cand = run(&program_path());
+    let mut cand = run(&program_path());
     assert_eq!(base.len(), cand.len());
+    // v2.2 Wave A, the ONE deliberate divergence: every profile a v2.2 program creates carries
+    // p4_flags bit2 EXIT_REQUIRES_LOSS_CURRENT (asset profile byte +20; R3-M1 fix, "on by
+    // default for new v2.2 markets"). Assert it is exactly that byte, exactly that bit, in
+    // every asset slot of the market account, then mask it; every other byte stays identical.
+    let mut masked = 0;
+    for (_, accts) in cand.iter_mut() {
+        if let Some(m) = accts.first_mut() {
+            let slots = state::market_slot_capacity(m).unwrap();
+            for i in 0..slots {
+                let at = state::asset_growth_range(m, i).unwrap().start
+                    - percolator_prog::constants::ASSET_GROWTH_OFF
+                    + 20;
+                assert_eq!(m[at], percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
+                m[at] = 0;
+                masked += 1;
+            }
+        }
+    }
+    assert!(masked > 0, "the p4 divergence was checked");
     let mut compared = 0;
     for (b, c) in base.iter().zip(cand.iter()) {
         assert_eq!(b.0, c.0, "outcome diverged");
