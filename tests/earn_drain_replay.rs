@@ -188,6 +188,10 @@ struct Snap {
     earnings_total: u128,
     earn_principal: u128,
     earn_nav: u128,
+    /// The pre-E3 ledger reading of Earn NAV (`principal - (loss - recovery)`), kept for the
+    /// harvest tests' "value is stranded" vacuity guards: the Resolved harvest repairs exactly
+    /// the state that reading describes, which E3 no longer leaves stranded in Live.
+    earn_nav_ledger: u128,
     p_last: u64,
 }
 
@@ -203,6 +207,10 @@ impl Snap {
     /// Engine `Residual = V - (C_tot + I + E + F)` (spec §3), the junior pool. Every open claim
     /// here is source-backed (paid from F, never from Residual), so anything in Residual is owned
     /// by nobody.
+    /// `unowned` under the pre-E3 ledger reading of Earn NAV.
+    fn unowned_ledger(&self) -> i128 {
+        self.unowned() + self.earn_nav as i128 - self.earn_nav_ledger as i128
+    }
     fn engine_residual(&self) -> i128 {
         self.vault as i128
             - self.c_tot as i128
@@ -531,10 +539,22 @@ impl Replay {
         }
     }
 
-    /// Earn NAV exactly as the non-bound wrapper prices it (`lp_vault_combined_nav_atoms`):
-    /// per pot, sync the persisted ledger against the bucket (loss on a rise of
-    /// consumed + impaired, recovery on a fall), floor at principal, add the LP fee share.
+    /// Earn NAV exactly as the non-bound wrapper prices it (`lp_vault_combined_nav_atoms`).
+    /// E3 (2026-10-05): per pot the available principal is the PROGRAM's own pure rule
+    /// `vault_lp_v18::nonbound_pot_available(principal, pot_physical_net_atoms(..))`, i.e.
+    /// `min(ledger principal, physical backing net of the claims the pot owes)`, plus the LP fee
+    /// share of the synced earnings. (Before E3 this mirrored `principal - (loss - recovery)`:
+    /// `earn_nav_ledger` keeps that reading for the before/after reports.)
     fn earn_nav(&self, g: &state::MarketGroupV16) -> (u128, u128) {
+        self.earn_nav_rule(g, true)
+    }
+
+    /// The pre-E3 ledger reading (loss on a rise of consumed + impaired, recovery on a fall).
+    fn earn_nav_ledger(&self, g: &state::MarketGroupV16) -> (u128, u128) {
+        self.earn_nav_rule(g, false)
+    }
+
+    fn earn_nav_rule(&self, g: &state::MarketGroupV16, e3: bool) -> (u128, u128) {
         let mut principal = 0u128;
         let mut nav = 0u128;
         for d in 0..2usize {
@@ -559,10 +579,25 @@ impl Replay {
             .saturating_sub(l.total_earnings_withdrawn_atoms);
             let lp_earn = earn * self.lm.earn_fee_share_bps as u128 / 10_000;
             principal += l.total_principal_atoms;
-            nav += l
-                .total_principal_atoms
-                .saturating_sub(loss.saturating_sub(rec))
-                + lp_earn;
+            let available = if e3 {
+                let c = &g.source_credit[d];
+                let ins_cover = c.insurance_credit_reserved_num.saturating_sub(
+                    c.valid_liened_insurance_num + c.impaired_liened_insurance_num,
+                );
+                percolator_prog::vault_lp_v18::nonbound_pot_available(
+                    l.total_principal_atoms,
+                    percolator_prog::vault_lp_v18::pot_physical_net_atoms(
+                        b.fresh_unliened_backing_num,
+                        b.valid_liened_backing_num,
+                        c.positive_claim_bound_num,
+                        ins_cover,
+                        BOUND_SCALE,
+                    ),
+                )
+            } else {
+                l.total_principal_atoms.saturating_sub(loss.saturating_sub(rec))
+            };
+            nav += available + lp_earn;
         }
         (principal, nav)
     }
@@ -580,6 +615,7 @@ impl Replay {
         let (lp_capital, lp_pnl) = pf(self.lp);
         let (tc, tpnl) = self.traders.first().map(|(_, p)| pf(*p)).unwrap_or((0, 0));
         let (earn_principal, earn_nav) = self.earn_nav(&g);
+        let earn_nav_ledger = self.earn_nav_ledger(&g).1;
         let mut s = Snap {
             slot: self.env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot + self.offset,
             trader_cap: tc,
@@ -594,6 +630,7 @@ impl Replay {
             earnings_total: g.backing_provider_earnings_total,
             earn_principal,
             earn_nav,
+            earn_nav_ledger,
             p_last: g.assets[0].effective_price,
             ..Default::default()
         };
@@ -1309,8 +1346,8 @@ fn run_r2(l1: u64, l2: u64, e_deposit: u64, e_pot: u16) -> R2Outcome {
 /// zero-sum cannot take value from the incumbent holder. RED on the deployed bytes AND on E1 (the
 /// PoC): +89.50 taken from a 2,000 incumbent at 9% entry impairment. Closes with E3 (charge the
 /// vault only its pro-rata share of pot consumption / credit loss-routed gross as recovery).
+/// GREEN since E3 (2026-10-05, physical attribution `nonbound_available_e3`).
 #[test]
-#[ignore = "R-2 PoC: red until E3 lands; run with --ignored"]
 fn r2_attribution_round_trip_cannot_extract_from_incumbents() {
     // l1 = 9% of vault principal (under R-1's 10% entry pause), l2 = l1.
     let o = run_r2(180_000, 180_000, 1_800_000_000, 0);
@@ -1438,11 +1475,16 @@ fn backpack_winner_keeps_k_gain_and_no_unowned_residual() {
 /// books that as recovery. Step 1 of the R-2 world (pots physically whole, 180 booked as loss),
 /// then a deposit into d1. Safety property: after the deposit, NAV equals the pots' physical
 /// backing net of open claims. RED on deployed and E1 (needs E3: the add-path refill).
+/// GREEN since E3 (2026-10-05): NAV is the pots' physical backing net of claims.
 #[test]
-#[ignore = "attribution PoC: red until E3 lands; run with --ignored"]
 fn deposit_refilling_a_receivable_is_booked_as_recovery() {
     let mut r = Replay::new(r2_market());
     let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    // MEASURED witness (2026-10-05): an incumbent H whose redemption reveals the program's own
+    // NAV (the mirror below is the program's pure rule, so on its own it cannot catch a handler
+    // that does not apply it). Ledger rule: H ~940; E3: H whole at 1,000.
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, 1_000_000_000, 0).expect("H 75");
     let (a1k, a1) = r.new_trader(1_000_000_000);
     let (a2k, a2) = r.new_trader(1_000_000_000);
     let pair = [a1, a2, r.lp];
@@ -1464,6 +1506,11 @@ fn deposit_refilling_a_receivable_is_booked_as_recovery() {
         s.earn_nav, phys,
         "NAV {} vs physical {}: the depositor's principal paid the receivable (consumed {:?}) and no recovery was booked",
         s.earn_nav, phys, s.consumed
+    );
+    let h_paid = r.redeem_all(&h, h_ata).expect("H 77");
+    assert!(
+        (h_paid as i128 - 1_000_000_000).abs() <= 2,
+        "measured: H paid {h_paid} for 1,000e6 (the refill must not dilute the incumbent)"
     );
 }
 
@@ -1581,7 +1628,9 @@ fn resolved_world(closing: Closing) -> TerminalWorld {
     r.hold(r.lm.params.h_max + 2, &all);
     let s = r.snap();
     s.print("pre-resolve");
-    let stranded_before = s.unowned();
+    // Measured with the pre-E3 ledger reading: the stranding the harvest was built to return
+    // (under E3 the I-2 part is already priced to Earn in Live; Residual is not).
+    let stranded_before = s.unowned_ledger();
     let engine_residual_before = s.engine_residual();
     // Resolve and close every portfolio (terminal-flat).
     r.env.resolve();
@@ -1854,7 +1903,7 @@ fn f2_receipts_open_harvest_does_not_credit_pot_stray() {
     after.print("F-2 after 78");
     r78.unwrap_or_else(|e| panic!("78 with receipts open: {e}"));
     assert!(
-        before.fresh[0] > before.earn_nav.min(before.fresh[0]) || before.unowned() > 0,
+        before.fresh[0] > before.earn_nav_ledger.min(before.fresh[0]) || before.unowned_ledger() > 0,
         "vacuity: there is pot stray to protect"
     );
     assert_eq!(
@@ -1917,4 +1966,162 @@ fn f6_resolved_78_refused_while_a_real_portfolio_is_open() {
         (after.vault, after.insurance, after.fresh_total),
         (before.vault, before.insurance, before.fresh_total)
     );
+}
+
+
+// ---------------------------------------------------------------------------------------------
+// E3 conservation (2026-10-05, plan §2.8): `vault - c_tot - pnl_pos_tot - insurance - Earn NAV`
+// ("unowned") over random zero-sum pair flows, Earn deposits into either pot, and redemptions.
+// Property, after every step (all accounts cranked):
+//   (a) unowned >= -dust          nothing is promised twice (NAV never over-prices);
+//   (b) unowned <= stray + dust   the only unowned value is pot backing ABOVE the vault's own
+//       principal (loss backing beyond every registered claim, which the Resolved harvest hands
+//       to the vault); never value INSIDE Earn's principal -- which is exactly where the R-2
+//       round trip (I-2) and the deposit-refill leak stranded it before E3.
+// ---------------------------------------------------------------------------------------------
+
+fn pot_strays(r: &Replay, g: &state::MarketGroupV16) -> u128 {
+    let mut stray = 0u128;
+    for d in 0..2usize {
+        let principal = r
+            .env
+            .svm
+            .get_account(&r.ledgers[d])
+            .and_then(|a| state::read_backing_domain_ledger(&a.data).ok())
+            .map(|l| l.total_principal_atoms)
+            .unwrap_or(0);
+        let b = &g.source_backing_buckets[d];
+        let c = &g.source_credit[d];
+        let phys = (b.fresh_unliened_backing_num + b.valid_liened_backing_num) / BOUND_SCALE;
+        let owed = c.positive_claim_bound_num.div_ceil(BOUND_SCALE);
+        stray += phys.saturating_sub(owed).saturating_sub(principal);
+    }
+    stray
+}
+
+#[derive(Clone, Debug)]
+enum ConsOp {
+    Pair { up: bool, bps: u64 },
+    Deposit { pot: u16, units: u64 },
+    RedeemAll,
+}
+
+fn cons_op() -> impl proptest::strategy::Strategy<Value = ConsOp> {
+    use proptest::prelude::*;
+    prop_oneof![
+        (any::<bool>(), 50u64..900).prop_map(|(up, bps)| ConsOp::Pair { up, bps }),
+        (0u16..2, 100u64..2_000).prop_map(|(pot, units)| ConsOp::Deposit { pot, units }),
+        Just(ConsOp::RedeemAll),
+    ]
+}
+
+fn run_conservation(ops: &[ConsOp]) -> (i128, u128, usize) {
+    const DUST: i128 = 4;
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(2_000_000_000);
+    let (a2k, a2) = r.new_trader(2_000_000_000);
+    let all = [a1, a2, r.lp];
+    let e = Keypair::new();
+    let mut e_atas: Vec<Pubkey> = vec![];
+    let (mut worst_unowned, mut max_stray, mut checked) = (0i128, 0u128, 0usize);
+    for op in ops {
+        match op {
+            ConsOp::Pair { up, bps } => {
+                let (_, g) = r.env.market_state();
+                let p0 = g.assets[0].effective_price;
+                let delta = p0 * bps / 10_000;
+                let target = if *up { p0 + delta } else { p0.saturating_sub(delta).max(100_000) };
+                if r.trade(&a1k, a1, q).is_err() || r.trade(&a2k, a2, -q).is_err() {
+                    continue;
+                }
+                r.walk(target, &all);
+                let _ = r.trade(&a1k, a1, -q);
+                let _ = r.trade(&a2k, a2, q);
+                r.hold(r.lm.params.h_max + 2, &all);
+                let _ = r.convert_all(&a1k, a1);
+                let _ = r.convert_all(&a2k, a2);
+            }
+            ConsOp::Deposit { pot, units } => {
+                if let Ok((ata, _)) = r.deposit_shares(&e, units * 1_000_000, *pot) {
+                    if !e_atas.contains(&ata) {
+                        e_atas.push(ata);
+                    }
+                }
+            }
+            ConsOp::RedeemAll => {
+                for ata in e_atas.clone() {
+                    if r.env.token_amount(ata) > 0 {
+                        let _ = r.redeem_all(&e, ata);
+                    }
+                }
+            }
+        }
+        r.hold(1, &all);
+        let s = r.snap();
+        let (_, g) = r.env.market_state();
+        let stray = pot_strays(&r, &g);
+        let unowned = s.unowned();
+        assert!(
+            unowned >= -DUST,
+            "(a) over-promised: unowned {unowned} after {op:?} (NAV {} vault {} c_tot {} ppt {} ins {})",
+            s.earn_nav, s.vault, s.c_tot, s.ppt, s.insurance
+        );
+        assert!(
+            unowned <= stray as i128 + DUST,
+            "(b) {unowned} unowned but only {stray} of pot backing sits above principal after {op:?}: \
+             value inside Earn's principal is stranded (NAV {}, physical net {:?})",
+            s.earn_nav,
+            (0..2).map(|d| s.fresh[d] + s.valid[d] - s.claim[d].min(s.fresh[d] + s.valid[d])).collect::<Vec<_>>()
+        );
+        worst_unowned = worst_unowned.max(unowned);
+        max_stray = max_stray.max(stray);
+        checked += 1;
+    }
+    // MEASURED tie-in: the NAV the property used (the program's pure E3 rule, applied by the
+    // mirror) must be the NAV the PROGRAM prices a deposit at. Probe: 1,000 USDC into pot 0;
+    // implied NAV = amount * S / shares_minted, exact up to the floor on the minted shares.
+    let s = r.snap();
+    let s_before = state::read_lp_vault_registry(&r.env.svm.get_account(&r.registry).unwrap().data)
+        .unwrap()
+        .total_lp_shares_outstanding;
+    let probe = Keypair::new();
+    let amount: u128 = 1_000_000_000;
+    if s.earn_nav > 0 && s_before > 0 {
+        if let Ok((_, minted)) = r.deposit_shares(&probe, amount as u64, 0) {
+            let implied = amount * s_before / minted as u128;
+            let tol = s.earn_nav / minted as u128 + 2;
+            assert!(
+                implied.abs_diff(s.earn_nav) <= tol,
+                "program prices NAV {implied} but the property used {} (tol {tol})",
+                s.earn_nav
+            );
+        }
+    }
+    (worst_unowned, max_stray, checked)
+}
+
+/// Deterministic anchor for the property: the R-2 sequence itself, then a deposit into the
+/// receivable pot. GREEN on E3; RED before (unowned 180 with 0 stray).
+#[test]
+fn e3_conservation_r2_sequence() {
+    let ops = [
+        ConsOp::Pair { up: true, bps: 1_800 },
+        ConsOp::Deposit { pot: 0, units: 1_800 },
+        ConsOp::Pair { up: true, bps: 1_525 },
+        ConsOp::RedeemAll,
+        ConsOp::Deposit { pot: 1, units: 1_800 },
+    ];
+    let (u, st, n) = run_conservation(&ops);
+    eprintln!("E3 anchor: worst unowned {u}, max stray {st}, {n} checks");
+    assert_eq!(n, ops.len());
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 8, max_shrink_iters: 16, .. Default::default() })]
+    #[test]
+    fn e3_conservation_proptest(ops in proptest::collection::vec(cons_op(), 1..6)) {
+        let (u, st, n) = run_conservation(&ops);
+        eprintln!("E3 proptest: {n} checks, worst unowned {u}, max stray {st}");
+    }
 }
