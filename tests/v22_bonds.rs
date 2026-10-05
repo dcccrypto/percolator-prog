@@ -2145,6 +2145,40 @@ fn bond_self_funding_attack_is_refused() {
     env.assert_conserved("self-funding");
 }
 
+/// The lock in isolation: the vault LP is FLAT (the engine's flat-only withdraw would let the
+/// capital out) but users' open interest, opened against the capacity the bond created, is still
+/// open on both sides. Only `bond_withdraw_lock_ok` refuses here: under mutant MB1 (lock off) the
+/// withdrawal SUCCEEDS and this test fails. Control: once the OI is closed the exit pays par.
+#[test]
+fn bond_lock_binds_with_a_flat_vault_lp_and_open_user_oi() {
+    let (mut env, lp, _d) = p2b_world(growth_params(), 10_000, 1_000);
+    env.init_bonds(0);
+    let attacker = env.new_bond_holder();
+    env.bond_deposit(&attacker, lp.portfolio, 1_000 * U, 1).expect("bond");
+    env.bond_request(&attacker, 1_000 * U as u128).expect("109");
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.catch_up(lp.portfolio);
+    let long = env.new_trader(100_000 * U);
+    env.trade_signing_fee(&long, &lp, 1_500 * UQ, GROWTH_FEE).expect("long 1,500 (inside N_cap 2,000)");
+    let short = env.new_trader(100_000 * U);
+    env.trade_signing_fee(&short, &lp, -1_500 * UQ, GROWTH_FEE).expect("short 1,500 (LP back to flat)");
+    assert_eq!(env.position(lp.portfolio), 0, "vault LP flat");
+    let g = env.market_state().1;
+    assert_eq!((g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q), (1_500 * POS as u128, 1_500 * POS as u128));
+    let _ = env.crank(lp.portfolio);
+    let _ = env.crank_fees_bond(lp.portfolio);
+    // N_cap after the exit would be 1,000 < 1,500 open on each side.
+    err_has(&env.bond_execute(&attacker, lp.portfolio, 0), PercolatorError::BondCapacityLocked);
+    env.trade_signing_fee(&long, &lp, -1_500 * UQ, GROWTH_FEE).expect("close long");
+    env.trade_signing_fee(&short, &lp, 1_500 * UQ, GROWTH_FEE).expect("close short");
+    let _ = env.crank(lp.portfolio);
+    let _ = env.crank_fees_bond(lp.portfolio);
+    assert_eq!(env.bond_execute(&attacker, lp.portfolio, 0).expect("control"), 1_000 * U);
+    env.assert_conserved("flat-LP lock");
+}
+
 // ── loss waterfall ──────────────────────────────────────────────────────────────────────────
 
 /// junior -> bonds -> Earn seniors, on real losses (a winner against the vault LP), with the

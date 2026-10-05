@@ -22,6 +22,19 @@ use percolator_prog::vault_lp_v18::*;
 use proptest::prelude::*;
 
 const BIG: u128 = 1u128 << 90; // state magnitudes: sums of ~60 ops stay far from u128::MAX
+/// SPL-representable amounts / shares: the domain the share math is specified on (products of
+/// two of them fit u128 exactly; beyond it the functions fail closed, `share_math_fails_closed`).
+const SPL: u128 = u64::MAX as u128;
+
+#[test]
+fn share_math_fails_closed_beyond_spl_width() {
+    let big = 1u128 << 100;
+    assert_eq!(bond_shares_for_deposit(big, big, 1), None);
+    assert_eq!(bond_atoms_for_redemption(big, big, big), None);
+    assert_eq!(bond_claim_after_redemption(big, big, big), None);
+    assert_eq!(coupon_due(1u128 << 91, 3_000, u64::MAX), None);
+    assert!(coupon_due((1u128 << 90) - 1, 3_000, u64::MAX).is_some());
+}
 
 fn min(a: u128, b: u128) -> u128 {
     if a < b { a } else { b }
@@ -97,7 +110,7 @@ proptest! {
 
     // ── I-T5: deposits never dilute; redemptions never dilute ──────────────────────────────
     #[test]
-    fn it5_bond_deposit_no_dilution(amount in 1u128..BIG, b in 0u128..BIG, value in 0u128..BIG) {
+    fn it5_bond_deposit_no_dilution(amount in 1u128..=SPL, b in 0u128..=SPL, value in 0u128..=SPL) {
         if let Some(m) = bond_shares_for_deposit(amount, b, value) {
             if b == 0 {
                 prop_assert_eq!(m, amount);
@@ -113,7 +126,7 @@ proptest! {
     }
 
     #[test]
-    fn it5_bond_redemption_no_dilution(b in 1u128..BIG, sh in 0u128..BIG, cb in 0u128..BIG, value in 0u128..BIG) {
+    fn it5_bond_redemption_no_dilution(b in 1u128..=SPL, sh in 0u128..=SPL, cb in 0u128..=SPL, value in 0u128..=SPL) {
         let sh = sh % (b + 1);
         let value = min(value, cb);
         let (Some(pay), Some(cb2)) = (bond_atoms_for_redemption(sh, b, value), bond_claim_after_redemption(cb, sh, b)) else {
