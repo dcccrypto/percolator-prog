@@ -22916,6 +22916,11 @@ pub mod processor {
                             authenticated_slot,
                         )
                         .map_err(map_v16_error)?;
+                    // P2b (review L-1b): a re-activated (retired) slot is a new market and
+                    // starts with no ADL episode record or N override.
+                    state::clear_adl_episode_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                    )?;
                     if was_retired && cfg.free_market_slot_count != 0 {
                         cfg.free_market_slot_count -= 1;
                     }

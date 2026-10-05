@@ -26019,3 +26019,61 @@ fn p2b_restart_asset_oracle_clears_the_adl_episode_record() {
         percolator_prog::processor::adl_episode_step(l, old_market_id, 0, 0, 1_000_000);
     assert!(expired_same);
 }
+
+/// P2b (security review L-1b): the market-authority (privileged) re-activation of a RETIRED
+/// slot also starts a new market on that slot, so it must clear the ADL episode record and
+/// the N override exactly like RestartAssetOracle and the permissionless reuse path.
+#[test]
+fn p2b_privileged_reactivation_of_a_retired_slot_clears_the_adl_episode_record() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1_000);
+    env.mutate_market(|_, group| {
+        group.assets[1].lifecycle = AssetLifecycleV16::Retired;
+        group.assets[1].retired_slot = 1;
+    });
+    let mut acc = env.svm.get_account(&env.market).unwrap();
+    let mut l = state::read_asset_risk_limits(&acc.data, 1).unwrap();
+    l.adl_episode_since_slot = 5;
+    l.adl_episode_market_id_lo = 2;
+    l.adl_max_episode_slots = 300;
+    state::write_asset_risk_limits(&mut acc.data, 1, &l).unwrap();
+    env.svm.set_account(env.market, acc).unwrap();
+
+    let admin = env.admin.insecure_clone();
+    let authority = admin.pubkey().to_bytes();
+    let authority_epoch = env.control_sequences(0).authority_epoch;
+    let (_current, market_id) = state::read_asset_lifecycle_generation_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        1,
+        true,
+    )
+    .unwrap_or((0, 0));
+    env.send(
+        ProgInstruction::UpdateAssetLifecycle {
+            market_id,
+            action: 0, // ACTIVATE (re-activate the retired slot)
+            asset_index: 1,
+            authority_epoch,
+            now_slot: 1_000,
+            initial_price: 100,
+            max_init_fee: u128::MAX,
+            insurance_authority: authority,
+            insurance_operator: authority,
+            backing_bucket_authority: authority,
+            oracle_authority: authority,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("market authority re-activates the retired slot");
+    let (_, g) = env.market_state();
+    assert_eq!(g.assets[1].lifecycle, AssetLifecycleV16::Active);
+    let after = state::read_asset_risk_limits(&env.svm.get_account(&env.market).unwrap().data, 1)
+        .unwrap();
+    assert_eq!(after.adl_episode_since_slot, 0, "old episode start must not survive re-activation");
+    assert_eq!(after.adl_max_episode_slots, 0, "old N override must not survive re-activation");
+    assert_eq!(after.adl_episode_market_id_lo, 0);
+}

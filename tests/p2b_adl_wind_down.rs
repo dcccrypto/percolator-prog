@@ -684,3 +684,70 @@ fn p2b_dust_bound_scales_with_collateral_decimals() {
     let mint = f.svm.get_account(&f.mint).unwrap();
     assert_eq!(mint.data[44], 6, "live collateral mint decimals");
 }
+
+fn set_mint_decimals(f: &mut Fork, key: Pubkey, decimals: u8) {
+    let mut acc = f.svm.get_account(&f.mint).unwrap();
+    acc.data[44] = decimals;
+    f.svm.set_account(key, acc).unwrap();
+}
+
+/// Review I-5 (W5): tag 104 must reject any collateral-mint account other than the market's
+/// own (the dust bound is derived from it). A look-alike mint with 9 or 18 decimals would
+/// otherwise inflate the dust bound by 10^3..10^12 and let anyone close immediately.
+#[test]
+fn p2b_tag104_rejects_a_wrong_collateral_mint() {
+    for decimals in [9u8, 18u8] {
+        let mut f = fork();
+        let target = f.side_legs(SideV16::Short)[0];
+        let leg0 = f.leg(&target);
+        let fake = Pubkey::new_unique();
+        set_mint_decimals(&mut f, fake, decimals);
+        let d = f.data(&target);
+        let ix = Instruction {
+            program_id: WRAPPER_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(Pubkey::new_unique(), false),
+                AccountMeta::new(f.slab, false),
+                AccountMeta::new(target, false),
+                AccountMeta::new_readonly(fake, false),
+            ],
+            data: ProgInstruction::AdlWindDown {
+                now_slot: f.clock.slot,
+                asset_index: 0,
+                portfolio_id: state::read_portfolio_id(&d).unwrap(),
+                position_epoch: state::read_portfolio_position_epoch(&d).unwrap(),
+            }
+            .encode(),
+        };
+        let r = f.send(ix);
+        assert_eq!(
+            r,
+            Err(TransactionError::InstructionError(2, InstructionError::InvalidArgument)),
+            "a {decimals}-decimal look-alike mint must be refused"
+        );
+        assert_eq!(f.leg(&target), leg0);
+        assert_eq!(f.limits().adl_episode_since_slot, 0, "nothing recorded");
+    }
+}
+
+/// Review I-5 (W4): the handler derives the dust bound from the market's collateral decimals.
+/// The live Percolator short side is ~162.7 (6-dp) of notional: at 6 decimals (bound 1.00)
+/// the first call only arms; were the collateral 9 decimals (bound 10^9 atoms) the same side
+/// is dust and the first call closes at once.
+#[test]
+fn p2b_tag104_dust_bound_follows_collateral_decimals() {
+    // CONTROL: the real 6-decimal mint -> armed only.
+    let mut f = fork();
+    let target = f.side_legs(SideV16::Short)[0];
+    let leg0 = f.leg(&target);
+    f.wind_down_settled(&target).expect("arm");
+    assert_eq!(f.leg(&target), leg0, "6 dp: not dust, only armed");
+    assert_ne!(f.limits().adl_episode_since_slot, 0);
+
+    // The same market with 9-decimal collateral: the side is dust, closed on the first call.
+    let mut g = fork();
+    let mint = g.mint;
+    set_mint_decimals(&mut g, mint, 9);
+    g.wind_down_settled(&target).expect("dust close");
+    assert!(g.leg(&target).is_none(), "9 dp: the side is dust, closed without waiting");
+}
