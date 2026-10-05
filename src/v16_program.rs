@@ -496,6 +496,11 @@ pub mod constants {
     pub const TAG_VAULT_LP_CONVERT_PNL: u8 = 100;
     pub const TAG_VAULT_LP_SETTLE_RESOLVED: u8 = 101;
     pub const TAG_VAULT_LP_RELEASE_SURPLUS: u8 = 102;
+    /// P2b L2: permissionless ADL wind-down (engine `wind_down_adl_position_not_atomic`).
+    /// Tag 103 is Builder C's `VaultLpAllocate`; 104/105 are reserved for P2b.
+    pub const TAG_ADL_WIND_DOWN: u8 = 104;
+    /// P2b L2: upgrade-authority setter for the ADL episode bound; tighten-only.
+    pub const TAG_SET_ADL_WIND_DOWN_MAX_SLOTS: u8 = 105;
 
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -2697,7 +2702,50 @@ pub mod state {
         /// => the channel is OFF (ACCEPTS_FEE_REQUEST is never sent; any requested fee is
         /// refused). Only effective with `matcher_ext_mode = 1`.
         pub max_requested_fee_bps: u16,
-        pub _reserved: [u8; 22],
+        /// Still-reserved tail of the former 22-byte `_reserved` (must be zero).
+        pub _reserved: [u8; 2],
+        // ── P2b L2: ADL wind-down episode (tag 104 `AdlWindDown`) ───────────────────────
+        // Carved from the former `_reserved: [u8; 22]` (bytes 42..64 of this struct) -- NO
+        // layout change: `ASSET_RISK_LIMITS_LEN`, every offset and the struct size are
+        // unchanged (compile-time asserts below). Deployed slots read all-zero, which means
+        // "default bound, no episode recorded". Tag 93 PRESERVES these fields (it rewrites
+        // only the P1 limits); only tag 104 (episode) and tag 105 (bound, tighten-only) write
+        // them.
+        /// Max reduce-only episode length in slots before tag 104 may force-close at the
+        /// mark. 0 => `ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS`. Tag 105 can only LOWER it.
+        pub adl_max_episode_slots: u32,
+        /// Slot at which tag 104 first observed the current reduce-only episode. 0 = none.
+        pub adl_episode_since_slot: u64,
+        /// The episode key: the asset's side-reset epochs (low 32 bits) when the episode was
+        /// recorded. `A` returns to `ADL_ONE` only through a side reset, which bumps that
+        /// side's epoch, so a key mismatch always means a NEW episode (re-armed).
+        pub adl_episode_epoch_long: u32,
+        pub adl_episode_epoch_short: u32,
+    }
+    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, _reserved) == 42);
+    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_max_episode_slots) == 44);
+    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_since_slot) == 48);
+    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_long) == 56);
+    const _: () =
+        assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_short) == 60);
+    /// Absolute offsets inside each asset's 1024-byte wrapper slot (for SDK decoders).
+    pub const ASSET_ADL_EPISODE_OFF: usize = ASSET_RISK_LIMITS_OFF + 44;
+    pub const ASSET_ADL_EPISODE_LEN: usize = 20;
+    const _: () = assert!(ASSET_ADL_EPISODE_OFF == 652);
+    const _: () =
+        assert!(ASSET_ADL_EPISODE_OFF + ASSET_ADL_EPISODE_LEN == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
+    /// P2b L2: default bound, about one hour of slots (400 ms slots).
+    pub const ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS: u32 = 9_000;
+    /// P2b L2: a side whose remaining effective notional is at or below this many collateral
+    /// atoms (1.00 at 6 decimals) may be wound down at once, without waiting for the episode.
+    pub const ADL_WIND_DOWN_DUST_NOTIONAL_ATOMS: u128 = 1_000_000;
+
+    pub fn adl_effective_max_episode_slots(limits: &AssetRiskLimitsV17) -> u32 {
+        if limits.adl_max_episode_slots == 0 {
+            ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS
+        } else {
+            limits.adl_max_episode_slots
+        }
     }
     pub const MATCHER_EXT_MODE_LEGACY: u8 = 0;
     pub const MATCHER_EXT_MODE_V1: u8 = 1;
@@ -2705,7 +2753,8 @@ pub mod state {
 
     pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
         if limits._reserved0 != 0
-            || limits._reserved != [0u8; 22]
+            || limits._reserved != [0u8; 2]
+            || limits.adl_max_episode_slots > ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS
             || limits.max_requested_fee_bps > crate::risk_limits_v17::MAX_REQUESTED_FEE_BPS
             || limits.matcher_ext_mode > MATCHER_EXT_MODE_V1
             || limits.exec_band_bps > crate::risk_limits_v17::MAX_EXEC_BAND_BPS
@@ -7430,6 +7479,18 @@ pub mod ix {
         /// Tag 102, junior-owner-gated (P3-M1). Moves backing surplus over the senior claim
         /// (`nav - C`) from `source_domain`'s pot back into vault-LP capital.
         VaultLpReleaseSurplus { amount: u128, source_domain: u16 },
+        /// P2b L2 (tag 104). Permissionless. Accounts: [0] caller (any, not a signer
+        /// requirement), [1] market (w), [2] target portfolio (w), [3..] the asset's oracle
+        /// accounts (same as a `PermissionlessCrank` hint for this asset).
+        AdlWindDown {
+            now_slot: u64,
+            asset_index: u16,
+            portfolio_id: u64,
+            position_epoch: u64,
+        },
+        /// P2b L2 (tag 105). Upgrade-authority gated (same ProgramData check as tag 93).
+        /// Accounts: [0] upgrade authority (s), [1] program data, [2] market (w).
+        SetAdlWindDownMaxSlots { asset_index: u16, max_episode_slots: u32 },
     }
 
     impl Instruction {
@@ -8013,6 +8074,18 @@ pub mod ix {
                     amount: read_u128(&mut rest)?,
                     source_domain: read_u16(&mut rest)?,
                 },
+                crate::constants::TAG_ADL_WIND_DOWN => Self::AdlWindDown {
+                    now_slot: read_u64(&mut rest)?,
+                    asset_index: read_u16(&mut rest)?,
+                    portfolio_id: read_u64(&mut rest)?,
+                    position_epoch: read_u64(&mut rest)?,
+                },
+                crate::constants::TAG_SET_ADL_WIND_DOWN_MAX_SLOTS => {
+                    Self::SetAdlWindDownMaxSlots {
+                        asset_index: read_u16(&mut rest)?,
+                        max_episode_slots: read_u32(&mut rest)?,
+                    }
+                }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -8944,6 +9017,26 @@ pub mod ix {
                     out.push(102);
                     push_u128(&mut out, amount);
                     push_u16(&mut out, source_domain);
+                }
+                Self::AdlWindDown {
+                    now_slot,
+                    asset_index,
+                    portfolio_id,
+                    position_epoch,
+                } => {
+                    out.push(crate::constants::TAG_ADL_WIND_DOWN);
+                    push_u64(&mut out, now_slot);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, portfolio_id);
+                    push_u64(&mut out, position_epoch);
+                }
+                Self::SetAdlWindDownMaxSlots {
+                    asset_index,
+                    max_episode_slots,
+                } => {
+                    out.push(crate::constants::TAG_SET_ADL_WIND_DOWN_MAX_SLOTS);
+                    push_u16(&mut out, asset_index);
+                    push_u32(&mut out, max_episode_slots);
                 }
             }
             out
@@ -12301,7 +12394,13 @@ pub mod processor {
                     matcher_ext_mode,
                     _reserved0: 0,
                     max_requested_fee_bps,
-                    _reserved: [0u8; 22],
+                    _reserved: [0u8; 2],
+                    // P2b: tag 93 never writes the ADL episode fields; the handler copies
+                    // the stored ones over these zeros before writing.
+                    adl_max_episode_slots: 0,
+                    adl_episode_since_slot: 0,
+                    adl_episode_epoch_long: 0,
+                    adl_episode_epoch_short: 0,
                 },
                 growth,
             ),
@@ -13176,6 +13275,28 @@ pub mod processor {
             Instruction::VaultLpConvertPnl { amount } => {
                 handle_vault_lp_convert_pnl(program_id, accounts, amount)
             }
+            Instruction::AdlWindDown {
+                now_slot,
+                asset_index,
+                portfolio_id,
+                position_epoch,
+            } => handle_adl_wind_down(
+                program_id,
+                accounts,
+                now_slot,
+                asset_index,
+                portfolio_id,
+                position_epoch,
+            ),
+            Instruction::SetAdlWindDownMaxSlots {
+                asset_index,
+                max_episode_slots,
+            } => handle_set_adl_wind_down_max_slots(
+                program_id,
+                accounts,
+                asset_index,
+                max_episode_slots,
+            ),
         }
     }
 
@@ -19586,6 +19707,14 @@ pub mod processor {
         }
         let mut market_data = market_ai.try_borrow_mut_data()?;
         if growth.is_none() {
+            // P2b: tag 93 owns only the P1 limits; keep the ADL wind-down episode and its
+            // (tighten-only) bound exactly as stored.
+            let mut limits = limits;
+            let stored = state::read_asset_risk_limits(&market_data, asset_index as usize)?;
+            limits.adl_max_episode_slots = stored.adl_max_episode_slots;
+            limits.adl_episode_since_slot = stored.adl_episode_since_slot;
+            limits.adl_episode_epoch_long = stored.adl_episode_epoch_long;
+            limits.adl_episode_epoch_short = stored.adl_episode_epoch_short;
             state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)?;
         } else if limits != state::AssetRiskLimitsV17::default() {
             // L-4 (security review): the growth-dial form touches ONLY the dial bytes. Its
@@ -19631,6 +19760,304 @@ pub mod processor {
             state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
         }
         Ok(())
+    }
+
+    // ── P2b L2: ADL wind-down (tags 104 / 105) ────────────────────────────────────────────
+
+    /// Refresh one asset's oracle target and accrue it to `now_slot`, EXACTLY as one
+    /// `PermissionlessCrank` observation hint does for that asset (same primitives, same
+    /// order: resolve-maturity gate, `hybrid_effective_price_for_crank_view`, permissionless
+    /// funding, raw target, asset-0 config mirror, profile write-back, single-segment
+    /// `accrue_asset_to_not_atomic`). This is the price path liquidation uses. Returns
+    /// whether the asset is now fully caught up to `now_slot` (the single segment is capped at
+    /// `max_accrual_dt_slots`; when it is not, the caller must commit and stop, like the
+    /// crank's `bounded_market_catchup_only` return).
+    #[inline(never)]
+    fn adl_wind_down_refresh_asset_price_view(
+        cfg: &mut WrapperConfigV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        authenticated_now_slot: u64,
+        oracle_accounts: &[AccountInfo<'_>],
+    ) -> Result<bool, ProgramError> {
+        let asset = group.markets[asset_index].engine.asset;
+        if !matches!(
+            asset.lifecycle,
+            ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+        ) {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let mut oracle_profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
+        reject_permissionless_resolve_matured_live_for_profile_view(cfg, &oracle_profile, group)?;
+        let now_unix_ts = Clock::get().map(|c| c.unix_timestamp).unwrap_or_else(|_| {
+            let elapsed_slots =
+                authenticated_now_slot.saturating_sub(oracle_profile.last_good_oracle_slot);
+            oracle_profile
+                .oracle_target_publish_time
+                .saturating_add(i64::try_from(elapsed_slots).unwrap_or(i64::MAX))
+        });
+        let crank_price = hybrid_effective_price_for_crank_view(
+            cfg,
+            &mut oracle_profile,
+            group,
+            asset_index,
+            authenticated_now_slot,
+            now_unix_ts,
+            oracle_accounts,
+        )?;
+        let funding_rate_e9 = permissionless_funding_rate_e9_view(
+            &oracle_profile,
+            group,
+            asset_index,
+            authenticated_now_slot,
+            crank_price,
+        )?;
+        group
+            .set_asset_raw_oracle_target_not_atomic(
+                asset_index,
+                oracle_profile.oracle_target_price_e6,
+            )
+            .map_err(map_v16_error)?;
+        if asset_index == 0 {
+            cfg.last_good_oracle_slot =
+                core::cmp::max(cfg.last_good_oracle_slot, oracle_profile.last_good_oracle_slot);
+        }
+        if asset_index == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
+            cfg.oracle_mode = oracle_profile.oracle_mode;
+            cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
+            cfg.oracle_leg_flags = oracle_profile.oracle_leg_flags;
+            cfg.invert = oracle_profile.invert;
+            cfg.unit_scale = oracle_profile.unit_scale;
+            cfg.conf_filter_bps = oracle_profile.conf_filter_bps;
+            cfg.max_staleness_secs = oracle_profile.max_staleness_secs;
+            cfg.hybrid_soft_stale_slots = oracle_profile.hybrid_soft_stale_slots;
+            cfg.mark_ewma_e6 = oracle_profile.mark_ewma_e6;
+            cfg.mark_ewma_last_slot = oracle_profile.mark_ewma_last_slot;
+            cfg.mark_ewma_halflife_slots = oracle_profile.mark_ewma_halflife_slots;
+            cfg.mark_min_fee = oracle_profile.mark_min_fee;
+            cfg.oracle_target_price_e6 = oracle_profile.oracle_target_price_e6;
+            cfg.oracle_target_publish_time = oracle_profile.oracle_target_publish_time;
+            cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
+            cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
+            cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
+        }
+        write_oracle_profile_to_view(group, asset_index, &oracle_profile)?;
+        group
+            .accrue_asset_to_not_atomic(
+                asset_index,
+                authenticated_now_slot,
+                crank_price,
+                funding_rate_e9,
+                true,
+            )
+            .map_err(map_v16_error)?;
+        Ok(group.markets[asset_index].engine.asset.slot_last.get() >= authenticated_now_slot)
+    }
+
+    /// Pure episode step (unit-tested): given the stored limits, the asset's current
+    /// side-reset epochs and `now`, return the limits to store and whether the episode bound
+    /// has expired. A missing record or a key mismatch (a reset happened since) re-arms at
+    /// `now` and is never expired in the same call.
+    pub fn adl_episode_step(
+        mut limits: state::AssetRiskLimitsV17,
+        epoch_long: u64,
+        epoch_short: u64,
+        now_slot: u64,
+    ) -> (state::AssetRiskLimitsV17, bool) {
+        let key_long = epoch_long as u32;
+        let key_short = epoch_short as u32;
+        if limits.adl_episode_since_slot == 0
+            || limits.adl_episode_epoch_long != key_long
+            || limits.adl_episode_epoch_short != key_short
+        {
+            limits.adl_episode_since_slot = now_slot.max(1);
+            limits.adl_episode_epoch_long = key_long;
+            limits.adl_episode_epoch_short = key_short;
+            return (limits, false);
+        }
+        let n = u64::from(state::adl_effective_max_episode_slots(&limits));
+        let expired = now_slot.saturating_sub(limits.adl_episode_since_slot) >= n;
+        (limits, expired)
+    }
+
+    /// P2b L2: `AdlWindDown` (tag 104). PERMISSIONLESS and trustless.
+    ///
+    /// 1. Refresh the asset's price exactly as a liquidation crank does (above).
+    /// 2. Episode: the reduce-only episode is keyed by the asset's side-reset epochs and its
+    ///    start slot is recorded in the asset's wrapper slot the first time anyone calls this
+    ///    tag during it (a keeper does so every cycle). No signer or authority is trusted for
+    ///    time: the bound is `now - since >= N` on the authenticated clock.
+    /// 3. If the engine-checked dust bound holds, or the episode bound has expired, call
+    ///    `wind_down_adl_position_not_atomic` on the target portfolio (whole leg, at the
+    ///    mark, no fee; the engine refuses a deficit account and every non-ADL market).
+    ///    Otherwise commit the price refresh and the episode record and return Ok.
+    #[inline(never)]
+    fn handle_adl_wind_down<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        now_slot: u64,
+        asset_index: u16,
+        expected_portfolio_id: u64,
+        expected_position_epoch: u64,
+    ) -> ProgramResult {
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let oracle_accounts = accounts.get(3..).unwrap_or(&[]);
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+        let asset_index = asset_index as usize;
+        if asset_index >= max_market_slots {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let caught_up = adl_wind_down_refresh_asset_price_view(
+            &mut cfg,
+            &mut group,
+            asset_index,
+            authenticated_now_slot,
+            oracle_accounts,
+        )?;
+        if !caught_up {
+            group.validate_shape().map_err(map_v16_error)?;
+            drop(group);
+            state::write_wrapper_config(&mut market_data, &cfg)?;
+            return Ok(());
+        }
+        let asset = group.markets[asset_index]
+            .engine
+            .asset
+            .try_to_runtime()
+            .map_err(map_v16_error)?;
+        if asset.a_long == percolator::ADL_ONE && asset.a_short == percolator::ADL_ONE {
+            // Not in ADL reduce-only: nothing to wind down (no record is written).
+            return Err(PercolatorError::EngineNonProgress.into());
+        }
+        let stored = state::asset_risk_limits_from_wrapper_bytes(
+            &group.markets[asset_index].wrapper[..],
+        )?;
+        let (limits, expired) = adl_episode_step(
+            stored,
+            asset.epoch_long,
+            asset.epoch_short,
+            authenticated_now_slot,
+        );
+        if limits != stored {
+            state::asset_risk_limits_to_wrapper_bytes(
+                &mut group.markets[asset_index].wrapper[..],
+                &limits,
+            )?;
+        }
+        let bound = if expired {
+            percolator::AdlWindDownBoundV16::EpisodeExpired
+        } else {
+            percolator::AdlWindDownBoundV16::DustNotional {
+                max_notional_atoms: state::ADL_WIND_DOWN_DUST_NOTIONAL_ATOMS,
+            }
+        };
+        if !group
+            .adl_wind_down_eligible(asset_index, bound)
+            .map_err(map_v16_error)?
+        {
+            // adl_wind_down armed / not yet eligible: (104, 0, since, bound, now)
+            solana_program::log::sol_log_64(
+                104,
+                0,
+                limits.adl_episode_since_slot,
+                u64::from(state::adl_effective_max_episode_slots(&limits)),
+                authenticated_now_slot,
+            );
+            group.validate_shape().map_err(map_v16_error)?;
+            drop(group);
+            state::write_wrapper_config(&mut market_data, &cfg)?;
+            return Ok(());
+        }
+        {
+            let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+            let current_portfolio_id = state::read_portfolio_id(&portfolio_data)?;
+            let current_position_epoch = state::read_portfolio_position_epoch(&portfolio_data)?;
+            if !state::portfolio_position_binding_matches(
+                current_portfolio_id,
+                current_position_epoch,
+                expected_portfolio_id,
+                expected_position_epoch,
+            ) {
+                return Err(PercolatorError::EngineProvenanceMismatch.into());
+            }
+            let mut portfolio =
+                state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // Same pre-position-change settlement as RebalanceReduce (tag 44).
+            accrue_zero_move_funding_before_position_change_view(
+                &cfg,
+                &mut group,
+                asset_index,
+                true,
+            )
+            .map_err(map_v16_error)?;
+            let outcome = group
+                .wind_down_adl_position_not_atomic(
+                    &mut portfolio,
+                    percolator::AdlWindDownRequestV16 { asset_index, bound },
+                )
+                .map_err(map_v16_error)?;
+            // adl_wind_down closed: (104, 1, closed_q, adl_cleared, now)
+            solana_program::log::sol_log_64(
+                104,
+                1,
+                u64::try_from(outcome.closed_q).unwrap_or(u64::MAX),
+                u64::from(outcome.adl_cleared),
+                authenticated_now_slot,
+            );
+            group.validate_shape().map_err(map_v16_error)?;
+            portfolio
+                .validate_with_market(&group.as_view())
+                .map_err(map_v16_error)?;
+        }
+        drop(group);
+        state::write_wrapper_config(&mut market_data, &cfg)?;
+        Ok(())
+    }
+
+    /// P2b L2: `SetAdlWindDownMaxSlots` (tag 105). Upgrade-authority gated, TIGHTEN-ONLY:
+    /// `1 <= max_episode_slots <= current effective bound`. Nobody can loosen the bound.
+    #[inline(never)]
+    fn handle_set_adl_wind_down_max_slots<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        max_episode_slots: u32,
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        expect_signer(upgrade_authority)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let (program_data_key, _) = derive_program_data_address(program_id);
+        expect_key(program_data_ai, &program_data_key)?;
+        let stored_upgrade_authority = read_program_data_upgrade_authority(program_data_ai)?;
+        if stored_upgrade_authority != Some(*upgrade_authority.key) {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let mut limits = state::read_asset_risk_limits(&market_data, asset_index as usize)?;
+        if max_episode_slots == 0
+            || max_episode_slots > state::adl_effective_max_episode_slots(&limits)
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        limits.adl_max_episode_slots = max_episode_slots;
+        state::write_asset_risk_limits(&mut market_data, asset_index as usize, &limits)
     }
 
     #[inline(never)]
