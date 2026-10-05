@@ -2281,3 +2281,34 @@ fn growth_f1_single_route_fee_accrual_is_golden() {
         );
     }
 }
+
+/// P5 (security review rev-6c): the wrapper's engine-IMR leg (`leg_im_req` over
+/// `risk_notional_ceil`, what the gate and Kani R5 reason about) EQUALS the engine certificate's
+/// per-leg initial requirement for a single-leg portfolio, at engine 35ddd692 (the CI sibling pin).
+/// The engine computes `max(ceil(notional * IMR / 1e4), min_nonzero_im_req)` via
+/// `mul_div_ceil_u128_or_wide` (v16.rs:23050) over `liquidation_risk_notional_ceil`, plus the
+/// target-lag penalty, which is 0 at a constant mark (effective == target price). Sizes include
+/// non-round quantities so the ceil of the notional and of the requirement both bite.
+#[test]
+fn growth_p5_wrapper_leg_im_equals_engine_cert_per_leg_im() {
+    use percolator_prog::growth_v19 as gv;
+    let mut env = Env::new(MarketCfg::legacy());
+    let lp = env.lp(1_000_000 * USD);
+    let sizes: [i128; 6] = [units(1), units(37), -units(250), 1_234_567, -9_999_999, 3];
+    let mut checked = 0;
+    for &size in sizes.iter() {
+        let (x, xp) = env.trader(1_000 * USD);
+        assert_ok(&env.trade_cpi(&x, xp, &lp, size), "single-leg open");
+        let p = env.portfolio_state(xp);
+        let cert = p.health_cert;
+        assert!(cert.valid, "the engine certified the fresh single-leg portfolio");
+        let notional = gv::risk_notional_ceil(size.unsigned_abs(), PRICE, POS_SCALE).unwrap();
+        let wrapper = gv::leg_im_req(notional, ENGINE_IMR, 20).unwrap();
+        assert_eq!(
+            cert.certified_initial_req, wrapper,
+            "size {size}: engine per-leg IM == wrapper leg_im_req (penalty 0 at a constant mark)"
+        );
+        checked += 1;
+    }
+    assert_eq!(checked, sizes.len());
+}

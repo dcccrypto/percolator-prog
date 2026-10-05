@@ -11,6 +11,13 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 P = "/Users/khubair/wt-growth-v19/percolator-prog"
 M = "/Users/khubair/wt-growth-v19/percolator-match"
 LIMIT = int(os.environ.get("LIMIT", "1500"))
+# rev 6c: targets that bit-blast a REAL 128-bit divider (primitives, order lemmas, bounded
+# real-primitive composites) get the 4000 s watchdog, as in run_kani6c.sh.
+BIG = {"kani_growth_c_mul_div_floor", "kani_growth_c_mul_div_ceil", "kani_growth_c_n_cap_q",
+       "kani_growth_c_liquidity_notional_e6", "kani_growth_c_dyn_imr_bps", "kani_growth_c_leg_im_req",
+       "kani_growth_c_risk_notional_ceil", "kani_growth_c_utilisation_fee_bps",
+       "kani_growth_c_util_fee_on_fill_bps", "kani_growth_t5_at_capacity_costs_full_margin",
+       "kani_growth_t7_rule_implies_gap_solvency", "kani_growth_h2_admit_iff_within_ncap"}
 L = os.path.join(HERE, "logs", tag)
 os.makedirs(L, exist_ok=True)
 summ = open(os.path.join(L, "SUMMARY"), "w")
@@ -49,10 +56,10 @@ for name, f, old, new, h, crate in MUTANTS:
         cwd = M
     try:
         with open(log, "w") as out:
-            r = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, timeout=LIMIT)
+            r = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, timeout=(4000 if h in BIG else LIMIT))
         status = "ran"
     except subprocess.TimeoutExpired:
-        status = f"TIMEOUT ({LIMIT}s)"
+        status = f"TIMEOUT ({4000 if h in BIG else LIMIT}s)"
     finally:
         if restore:
             shutil.copy(restore + ".kani-orig", restore)
