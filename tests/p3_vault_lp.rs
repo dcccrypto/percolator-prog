@@ -4475,3 +4475,13 @@ fn p2b_r2_round_trip_on_an_allocated_vault_cannot_extract() {
     assert!(h_paid as u128 >= 10_000 * U as u128 - 1_000 - 2, "incumbent not whole: {h_paid}");
     env.assert_conserved("r2 allocated");
 }
+
+/// Security review I-2 (P2b lock exits): the Phase 2b codes are explicit and must never move
+/// (SDK error maps, app copy). Growth holds 92..=99; Builder D holds 120..=122.
+#[test]
+fn p2b_error_codes_are_pinned() {
+    assert_eq!(PercolatorError::VaultLpAllocateRefused as u32, 100);
+    assert_eq!(PercolatorError::VaultLpCapacityLocked as u32, 101);
+    assert_eq!(PercolatorError::VaultLpCreatorFeeVesting as u32, 102);
+    assert_eq!(PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32, 99);
+}

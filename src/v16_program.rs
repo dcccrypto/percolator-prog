@@ -1446,17 +1446,19 @@ VaultLpMultiAssetMarket,
         /// Phase 2b tag 103 (VaultLpAllocate): refused -- a senior draw is outstanding or
         /// pending, the vault is impaired (V < C_eff), the vault LP is insolvent, the market is
         /// not Live, or the alpha / buffer room is 0. Custom(100). Keeper: skip this crank.
-        VaultLpAllocateRefused,
+        VaultLpAllocateRefused = 100,
         /// Phase 2b A4 lock: lowering the vault LP's capital would leave its growth capacity
         /// `N_cap` below its ADL-effective inventory. Custom(101). SDK/app: "Capital is backing
         /// open positions; try again once the market's LP has closed them".
-        VaultLpCapacityLocked,
+        VaultLpCapacityLocked = 101,
         /// Phase 2b G6: creator discretionary fees vest only once the junior cushion is at its
         /// target. Custom(102). SDK/app: "Creator fees unlock when the market's first-loss
         /// cushion reaches its target".
-        VaultLpCreatorFeeVesting,
+        VaultLpCreatorFeeVesting = 102,
     }
-    // Phase 2b codes are pinned (the enum is implicitly numbered; growth holds 92..=99).
+    // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
+    // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
+    // block. Pinned here and in tests/p3_vault_lp.rs (p2b_error_codes_are_pinned).
     const _: () = assert!(PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32 == 99);
     const _: () = assert!(PercolatorError::VaultLpAllocateRefused as u32 == 100);
     const _: () = assert!(PercolatorError::VaultLpCapacityLocked as u32 == 101);

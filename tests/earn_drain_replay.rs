@@ -1480,6 +1480,11 @@ fn backpack_winner_keeps_k_gain_and_no_unowned_residual() {
 fn deposit_refilling_a_receivable_is_booked_as_recovery() {
     let mut r = Replay::new(r2_market());
     let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    // MEASURED witness (2026-10-05): an incumbent H whose redemption reveals the program's own
+    // NAV (the mirror below is the program's pure rule, so on its own it cannot catch a handler
+    // that does not apply it). Ledger rule: H ~940; E3: H whole at 1,000.
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, 1_000_000_000, 0).expect("H 75");
     let (a1k, a1) = r.new_trader(1_000_000_000);
     let (a2k, a2) = r.new_trader(1_000_000_000);
     let pair = [a1, a2, r.lp];
@@ -1501,6 +1506,11 @@ fn deposit_refilling_a_receivable_is_booked_as_recovery() {
         s.earn_nav, phys,
         "NAV {} vs physical {}: the depositor's principal paid the receivable (consumed {:?}) and no recovery was booked",
         s.earn_nav, phys, s.consumed
+    );
+    let h_paid = r.redeem_all(&h, h_ata).expect("H 77");
+    assert!(
+        (h_paid as i128 - 1_000_000_000).abs() <= 2,
+        "measured: H paid {h_paid} for 1,000e6 (the refill must not dilute the incumbent)"
     );
 }
 
@@ -2067,6 +2077,26 @@ fn run_conservation(ops: &[ConsOp]) -> (i128, u128, usize) {
         worst_unowned = worst_unowned.max(unowned);
         max_stray = max_stray.max(stray);
         checked += 1;
+    }
+    // MEASURED tie-in: the NAV the property used (the program's pure E3 rule, applied by the
+    // mirror) must be the NAV the PROGRAM prices a deposit at. Probe: 1,000 USDC into pot 0;
+    // implied NAV = amount * S / shares_minted, exact up to the floor on the minted shares.
+    let s = r.snap();
+    let s_before = state::read_lp_vault_registry(&r.env.svm.get_account(&r.registry).unwrap().data)
+        .unwrap()
+        .total_lp_shares_outstanding;
+    let probe = Keypair::new();
+    let amount: u128 = 1_000_000_000;
+    if s.earn_nav > 0 && s_before > 0 {
+        if let Ok((_, minted)) = r.deposit_shares(&probe, amount as u64, 0) {
+            let implied = amount * s_before / minted as u128;
+            let tol = s.earn_nav / minted as u128 + 2;
+            assert!(
+                implied.abs_diff(s.earn_nav) <= tol,
+                "program prices NAV {implied} but the property used {} (tol {tol})",
+                s.earn_nav
+            );
+        }
     }
     (worst_unowned, max_stray, checked)
 }
