@@ -37221,7 +37221,6 @@ pub mod processor {
             vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?;
         }
         group.validate_shape().map_err(map_v16_error)?;
-        drop(group);
         state::write_wrapper_config(&mut market_data, &cfg)?;
         Ok(())
     }
@@ -37919,12 +37918,15 @@ pub mod processor {
     /// been advanced to reflect every step (checkpoint promotions, the
     /// price-move remainder carry) -- the caller still owes the matching
     /// engine-side commit via `accrue_asset_path_to_not_atomic`.
+    /// `(now_slot, target, canonical path, (rent_long_e9, rent_short_e9))`.
+    type ZeroMovePathV22 = (u64, u64, Vec<AccrualStepV16>, (u64, u64));
+
     #[inline(never)]
     fn zero_move_funding_path_for_profile_view(
         profile: &mut state::AssetOracleProfileV16,
         group: &mut state::MarketViewMutV16<'_>,
         asset_index: usize,
-    ) -> Result<Option<(u64, u64, Vec<AccrualStepV16>, (u64, u64))>, V16Error> {
+    ) -> Result<Option<ZeroMovePathV22>, V16Error> {
         if !oracle_v16::profile_is_price_managed(profile)
             || asset_index >= group.header.config.max_market_slots.get() as usize
             || asset_index >= group.markets.len()

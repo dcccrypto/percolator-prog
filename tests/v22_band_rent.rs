@@ -24,7 +24,6 @@ use percolator_prog::{
 };
 use solana_sdk::{
     account::Account,
-    clock::Clock,
     compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
     program_option::COption,
@@ -224,6 +223,7 @@ fn init_market_ix(c: &Cfg) -> ProgInstruction {
 }
 
 struct Lp {
+    #[allow(dead_code)]
     owner: Keypair,
     account: Pubkey,
     ctx: Pubkey,
