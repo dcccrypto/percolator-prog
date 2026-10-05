@@ -950,7 +950,7 @@ proptest! {
                 }
             }
             let (lt, et) = (tranche_split3(l.nav, l.cs, l.cb), tranche_split3(e.nav, e.cs, e.cb));
-            let d = |a: u128, b: u128| if a > b { a - b } else { b - a };
+            let d = |a: u128, b: u128| a.abs_diff(b);
             // EXACT until the first share-rounding event; within the accumulated rounding dust
             // (one atom per deposit / redemption) afterwards.
             prop_assert!(d(l.cs, e.cs) <= dust && d(l.out, e.out) <= dust, "senior books {:?} vs {:?}", (l.cs, l.out), (e.cs, e.out));

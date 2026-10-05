@@ -62,7 +62,8 @@ pub const BOND_CAP_MAX_BPS: u16 = 5_000;
 /// it is refused as a config error rather than silently accepted.
 pub fn bond_config_ok(coupon_bps: u16, util_bonus_bps: u16, cooldown_slots: u32, cap_bps: u16) -> bool {
     coupon_bps <= BOND_COUPON_MAX_BPS
-        && util_bonus_bps <= BOND_UTIL_BONUS_MAX_BPS
+        // `bonus <= BOND_UTIL_BONUS_MAX_BPS`, written so it stays meaningful while the ceiling is 0.
+        && BOND_UTIL_BONUS_MAX_BPS.checked_sub(util_bonus_bps).is_some()
         && (BOND_COOLDOWN_MIN_SLOTS..=BOND_COOLDOWN_MAX_SLOTS).contains(&cooldown_slots)
         && (1..=BOND_CAP_MAX_BPS).contains(&cap_bps)
 }
