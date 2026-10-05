@@ -1178,14 +1178,15 @@ impl CrosscutEnv {
                 ),
                 // GH#412 (account 12): the redeemer's own SOL account. The
                 // redemption PDA's rent returns here rather than to the cranker.
-                AccountMeta::new(depositor.pubkey(), false),
+                // H-1(b) (2026-10-05): the redeemer signs a Live non-bound 77.
+                AccountMeta::new(depositor.pubkey(), true),
             ],
             data: ProgInstruction::ExecuteRedemption {
                 domain: CROSSCUT_DOMAIN,
             }
             .encode(),
         };
-        let res = send_ixs(&mut self.svm, &self.payer, vec![wix], &[]);
+        let res = send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]);
         (dest, res)
     }
 }

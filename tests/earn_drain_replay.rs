@@ -1242,9 +1242,9 @@ impl Replay {
                 AccountMeta::new(dest, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(self.ledgers[1], false),
-                AccountMeta::new(who.pubkey(), false),
+                AccountMeta::new(who.pubkey(), true), // H-1(b): the redeemer signs a Live non-bound 77
             ],
-            &[],
+            &[who],
         )?;
         Ok(self.env.token_amount(dest))
     }
@@ -2123,5 +2123,256 @@ proptest::proptest! {
     fn e3_conservation_proptest(ops in proptest::collection::vec(cons_op(), 1..6)) {
         let (u, st, n) = run_conservation(&ops);
         eprintln!("E3 proptest: {n} checks, worst unowned {u}, max stray {st}");
+    }
+}
+
+// ── Sentinel review (2026-10-05): E3 touch-order variant of R-2 ─────────────────────────────
+// E3 prices a non-bound pot at min(principal, held - registered claims). A winner's claim is
+// registered when the WINNER is touched; the loser's loss is routed into the pot only when the
+// LOSER is touched. A zero-sum pair can therefore order the two touches around a deposit.
+fn walk_only(r: &mut Replay, target: u64, who: &[Pubkey]) {
+    for _ in 0..400 {
+        let s = r.now() + 1;
+        r.env.svm.warp_to_slot(s);
+        r.env.push_auth_mark_for_asset_as_admin(0, s, target);
+        for p in who {
+            r.crank_pf(*p);
+        }
+        let (_, g) = r.env.market_state();
+        if g.assets[0].effective_price == target && g.assets[0].slot_last == g.current_slot {
+            return;
+        }
+    }
+    panic!("walk_only did not converge");
+}
+
+fn run_touch_order(l: u64, e_deposit: u64, e_pot: u16) -> (u128, u128, u64, u64, i128) {
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(1_000_000_000);
+    let (a2k, a2) = r.new_trader(1_000_000_000);
+    r.trade(&a1k, a1, q).expect("A1 long");
+    r.trade(&a2k, a2, -q).expect("A2 short");
+    let s0 = r.snap();
+    s0.print("TO s0 (pair open)");
+    // Price up: touch ONLY the winner A1 (and the LP); the loser A2 stays untouched.
+    let lp = r.lp;
+    walk_only(&mut r, 1_000_000 + l, &[a1, lp]);
+    let s1 = r.snap();
+    s1.print("TO s1 (winner touched, loser not)");
+    eprintln!("TO s1 claim {:?} fresh {:?} nav {} ledger_nav {}", s1.claim, s1.fresh, s1.earn_nav, s1.earn_nav_ledger);
+    let e = Keypair::new();
+    let (e_ata, e_shares) = r.deposit_shares(&e, e_deposit, e_pot).expect("E 75 at the dip");
+    // Now touch the loser: its loss is routed into the pot.
+    r.crank_pf(a2);
+    r.crank_pf(a1);
+    let s2 = r.snap();
+    s2.print("TO s2 (loser touched)");
+    eprintln!("TO s2 claim {:?} fresh {:?} nav {} ledger_nav {}", s2.claim, s2.fresh, s2.earn_nav, s2.earn_nav_ledger);
+    let e_paid = r.redeem_all(&e, e_ata).expect("E 77");
+    let s3 = r.snap();
+    s3.print("TO s3 (E redeemed)");
+    eprintln!("TO E deposited {e_deposit} for {e_shares} shares; paid {e_paid}; incumbents nav {}", s3.earn_nav);
+    let st1 = r.env.portfolio_state(a1);
+    let st2 = r.env.portfolio_state(a2);
+    let pair_net = st1.capital as i128 + st1.pnl + st2.capital as i128 + st2.pnl - 2_000_000_000;
+    (s1.earn_nav, s2.earn_nav, e_paid, e_shares, pair_net)
+}
+
+#[test]
+fn sentinel_e3_touch_order_round_trip_cannot_extract() {
+    let (nav_dip, nav_after, e_paid, _shares, pair_net) = run_touch_order(180_000, 1_800_000_000, 0);
+    eprintln!("TO nav at deposit {nav_dip}, after loser touch {nav_after}, E paid {e_paid}, pair net {pair_net}");
+    assert!(
+        e_paid as u128 <= 1_800_000_000,
+        "touch-order: E deposited 1,800 and redeemed {} (nav at entry {}, at exit {}), pair nets {}",
+        e_paid, nav_dip, nav_after, pair_net
+    );
+}
+
+// ── H-1 acceptance property (2026-10-05): touch order is attacker-chosen ────────────────────
+// A zero-sum pair (A1 long / A2 short against the LP, always opened and closed together) plus an
+// Earn identity E. Every step chooses WHICH accounts are touched, so a winner's claim can be
+// registered while the loser's loss is not yet routed (and the reverse), conversions can run
+// before the counterparty is touched, and E can deposit and redeem (its own 77) at any point.
+// Property: E never takes out more than it put in (+dust); its trading half is zero-sum, so any
+// excess would be taken from the incumbents.
+#[derive(Clone, Debug)]
+enum TouchOp {
+    Open,
+    Walk { up: bool, bps: u64, touch_a1: bool, touch_a2: bool },
+    Touch { a1: bool },
+    Close,
+    Convert { a1: bool },
+    Deposit { pot: u16, units: u64 },
+    Redeem,
+}
+
+fn touch_op() -> impl proptest::strategy::Strategy<Value = TouchOp> {
+    use proptest::prelude::*;
+    prop_oneof![
+        1 => Just(TouchOp::Open),
+        3 => (any::<bool>(), 300u64..1_800, any::<bool>(), any::<bool>())
+            .prop_map(|(up, bps, touch_a1, touch_a2)| TouchOp::Walk { up, bps, touch_a1, touch_a2 }),
+        2 => any::<bool>().prop_map(|a1| TouchOp::Touch { a1 }),
+        1 => Just(TouchOp::Close),
+        1 => any::<bool>().prop_map(|a1| TouchOp::Convert { a1 }),
+        2 => (0u16..2, 200u64..2_000).prop_map(|(pot, units)| TouchOp::Deposit { pot, units }),
+        2 => Just(TouchOp::Redeem),
+    ]
+}
+
+/// Returns (E deposited, E paid).
+fn run_touch_ops(ops: &[TouchOp]) -> (u128, u128) {
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(3_000_000_000);
+    let (a2k, a2) = r.new_trader(3_000_000_000);
+    let lp = r.lp;
+    let e = Keypair::new();
+    let (mut dep, mut paid) = (0u128, 0u128);
+    let mut atas: Vec<Pubkey> = vec![];
+    let mut open = false;
+    for op in ops {
+        match op {
+            TouchOp::Open if !open => {
+                if r.trade(&a1k, a1, q).is_ok() {
+                    if r.trade(&a2k, a2, -q).is_ok() {
+                        open = true;
+                    } else {
+                        let _ = r.trade(&a1k, a1, -q);
+                    }
+                }
+            }
+            TouchOp::Walk { up, bps, touch_a1, touch_a2 } => {
+                let p0 = r.env.market_state().1.assets[0].effective_price;
+                let d = p0 * bps / 10_000;
+                let target = if *up { p0 + d } else { p0.saturating_sub(d).max(200_000) };
+                let mut who = vec![lp];
+                if *touch_a1 {
+                    who.push(a1);
+                }
+                if *touch_a2 {
+                    who.push(a2);
+                }
+                walk_only(&mut r, target, &who);
+            }
+            TouchOp::Touch { a1: x } => r.crank_pf(if *x { a1 } else { a2 }),
+            TouchOp::Close if open => {
+                let _ = r.trade(&a1k, a1, -q);
+                let _ = r.trade(&a2k, a2, q);
+                open = false;
+            }
+            TouchOp::Convert { a1: x } => {
+                let (k, p) = if *x { (&a1k, a1) } else { (&a2k, a2) };
+                let _ = r.convert_all(&k.insecure_clone(), p);
+            }
+            TouchOp::Deposit { pot, units } => {
+                if let Ok((ata, _)) = r.deposit_shares(&e, units * 1_000_000, *pot) {
+                    dep += (*units as u128) * 1_000_000;
+                    if !atas.contains(&ata) {
+                        atas.push(ata);
+                    }
+                }
+            }
+            TouchOp::Redeem => {
+                for ata in atas.clone() {
+                    if r.env.token_amount(ata) > 0 {
+                        if let Ok(p) = r.redeem_all(&e, ata) {
+                            paid += p as u128;
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    // Attacker-optimal final exit: everything touched (every pending loss routed), then E leaves.
+    if open {
+        let _ = r.trade(&a1k, a1, -q);
+        let _ = r.trade(&a2k, a2, q);
+    }
+    for _ in 0..2 {
+        r.crank_pf(a1);
+        r.crank_pf(a2);
+        r.crank_pf(lp);
+    }
+    for ata in atas.clone() {
+        if r.env.token_amount(ata) > 0 {
+            if let Ok(p) = r.redeem_all(&e, ata) {
+                paid += p as u128;
+            }
+        }
+    }
+    (dep, paid)
+}
+
+/// Deterministic anchor: the reviewer's ordering expressed in the property's alphabet.
+#[test]
+fn h1_touch_order_anchor_cannot_extract() {
+    let ops = [
+        TouchOp::Open,
+        TouchOp::Walk { up: true, bps: 1_800, touch_a1: true, touch_a2: false },
+        TouchOp::Deposit { pot: 0, units: 1_800 },
+        TouchOp::Touch { a1: false },
+        TouchOp::Redeem,
+    ];
+    let (dep, paid) = run_touch_ops(&ops);
+    eprintln!("H-1 anchor: E deposited {dep}, paid {paid}");
+    assert!(paid <= dep + 2, "E extracted {} (deposited {dep}, paid {paid})", paid as i128 - dep as i128);
+}
+
+/// One round: a price walk touching a random subset of the pair, then (each optional) an E
+/// deposit, a separate touch, a conversion and an E redemption, in that order.
+fn touch_round() -> impl proptest::strategy::Strategy<Value = Vec<TouchOp>> {
+    use proptest::prelude::*;
+    (
+        any::<bool>(),
+        300u64..1_800,
+        any::<bool>(),
+        any::<bool>(),
+        proptest::option::of((0u16..2, 200u64..2_000)),
+        proptest::option::of(any::<bool>()),
+        proptest::option::of(any::<bool>()),
+        any::<bool>(),
+    )
+        .prop_map(|(up, bps, touch_a1, touch_a2, dep, touch, conv, redeem)| {
+            let mut v = vec![TouchOp::Walk { up, bps, touch_a1, touch_a2 }];
+            if let Some((pot, units)) = dep {
+                v.push(TouchOp::Deposit { pot, units });
+            }
+            if let Some(a1) = touch {
+                v.push(TouchOp::Touch { a1 });
+            }
+            if let Some(a1) = conv {
+                v.push(TouchOp::Convert { a1 });
+            }
+            if redeem {
+                v.push(TouchOp::Redeem);
+            }
+            v
+        })
+}
+
+fn touch_program() -> impl proptest::strategy::Strategy<Value = Vec<TouchOp>> {
+    use proptest::prelude::*;
+    (proptest::collection::vec(touch_round(), 1..4), proptest::collection::vec(touch_op(), 0..3)).prop_map(
+        |(rounds, tail)| {
+            let mut v = vec![TouchOp::Open];
+            for r in rounds {
+                v.extend(r);
+            }
+            v.extend(tail);
+            v
+        },
+    )
+}
+
+proptest::proptest! {
+    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, max_shrink_iters: 32, .. Default::default() })]
+    #[test]
+    fn h1_touch_order_proptest_cannot_extract(ops in touch_program()) {
+        let (dep, paid) = run_touch_ops(&ops);
+        proptest::prop_assert!(paid <= dep + 2, "E extracted {}: deposited {dep}, paid {paid}, ops {ops:?}", paid as i128 - dep as i128);
     }
 }

@@ -534,8 +534,9 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
         ),
         // GH#412 (account 12): the redeemer's own SOL account. The redemption
         // PDA's rent is returned here rather than to the cranker, matching what
-        // CancelRedemption already did.
-        AccountMeta::new(d.kp.pubkey(), false),
+        // CancelRedemption already did. H-1(b) (2026-10-05): it also SIGNS a Live non-bound 77
+        // (the cranker stays the fee payer, so the redeemer still pays no fee).
+        AccountMeta::new(d.kp.pubkey(), true),
     ]
 }
 
@@ -572,7 +573,7 @@ fn execute(env: &mut Env, d: &Depositor) -> Result<(), String> {
         pid,
         &payer,
         vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
-        &[],
+        &[&d.kp],
     )
 }
 
@@ -895,8 +896,8 @@ fn execute_returns_redemption_rent_to_the_redeemer_not_the_cranker() {
         .expect("redeemer")
         .lamports;
 
-    // The redeemer receives exactly the PDA's rent. They sign nothing here and pay
-    // no fee, so the delta is the reclaim and nothing else.
+    // The redeemer receives exactly the PDA's rent. They co-sign (H-1(b)) but the cranker is
+    // the fee payer, so the delta is the reclaim and nothing else.
     assert_eq!(
         redeemer_after - redeemer_before,
         pda_rent,

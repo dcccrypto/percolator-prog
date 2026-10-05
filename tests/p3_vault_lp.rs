@@ -4483,5 +4483,179 @@ fn p2b_error_codes_are_pinned() {
     assert_eq!(PercolatorError::VaultLpAllocateRefused as u32, 100);
     assert_eq!(PercolatorError::VaultLpCapacityLocked as u32, 101);
     assert_eq!(PercolatorError::VaultLpCreatorFeeVesting as u32, 102);
+    assert_eq!(PercolatorError::VaultLpSeniorCapitalHalt as u32, 103);
     assert_eq!(PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32, 99);
+}
+
+/// Q2 (2026-10-05 decision): once the junior is exhausted (V < C_eff) the vault LP is trading
+/// allocated SENIOR capital, so its risk-INCREASING fills are halted (Custom 103); reductions and
+/// thin-side opens (which shrink |LP|) are always allowed. CONTROL: the identical book without
+/// the adverse move admits the same crowd open.
+#[test]
+fn p2b_q2_senior_capital_halt_after_junior_exhausted() {
+    for exhausted in [false, true] {
+        let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 500);
+        env.allocate(lp.portfolio, u128::MAX).expect("103: 5,000 allocated");
+        let t = env.new_trader(3_000 * U);
+        env.trade(&t, &lp, 2_000 * UQ).expect("crowd long vs the LP");
+        if exhausted {
+            // +40%: the LP (short 2,000) loses 800 > junior 500 => V = C - 300.
+            env.move_price(1_400_000, &[t.portfolio, lp.portfolio]);
+            let (nav, lpv, c) = env.p2b_v(lp.portfolio);
+            assert!(nav + lpv < c, "junior exhausted: V {} < C {c}", nav + lpv);
+        } else {
+            env.hold(1, &[t.portfolio, lp.portfolio]);
+        }
+        let _ = env.crank(lp.portfolio);
+        let crowd = env.new_trader(1_000 * U);
+        let r = env.trade(&crowd, &lp, 100 * UQ);
+        if !exhausted {
+            r.expect("control: the same crowd open is admitted while the junior covers");
+            continue;
+        }
+        err_has(&r, PercolatorError::VaultLpSeniorCapitalHalt);
+        // a reduction of the LP's risk is always allowed
+        env.trade(&t, &lp, -500 * UQ).expect("crowd partial close (LP reduces)");
+        let thin = env.new_trader(1_000 * U);
+        env.trade(&thin, &lp, -100 * UQ).expect("thin-side open (LP reduces)");
+        env.trade(&t, &lp, -1_500 * UQ).expect("crowd full close");
+    }
+}
+
+/// Q2: the senior floor lives in `AssetRiskLimitsV17.p2b_senior_floor_code` (wrapper bytes 650..652);
+/// tag 93 rewrites the whole risk record and must not clear it.
+#[test]
+fn p2b_q2_senior_floor_survives_tag93() {
+    fn floor(env: &Env) -> u128 {
+        let data = env.svm.get_account(&env.market).unwrap().data;
+        let r = state::asset_growth_range(&data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        state::p2b_senior_floor_from_wrapper_bytes(
+            &data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+        )
+        .unwrap()
+    }
+    let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 2_000);
+    assert_eq!(floor(&env), 0, "no floor before allocation");
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    let f = floor(&env);
+    assert!(f >= 5_000 * U as u128 && f <= 5_000 * U as u128 + 5_000 * U as u128 / 512 + 1, "floor ~= allocated: {f}");
+    env.set_fee_channel(1, 50).expect("tag 93");
+    assert_eq!(floor(&env), f, "tag 93 preserved the floor");
+    env.recall_ext(lp.portfolio, env.allocated(), DOMAIN).expect("98");
+    assert_eq!(floor(&env), 0, "recall refreshes the floor");
+}
+
+/// Sentinel review (2026-10-05): a SMALL senior (10% of shares, far inside the 30% buffer)
+/// redeems after an allocation. The design says redemptions are served from the pot buffer.
+#[test]
+fn sentinel_small_redemption_inside_buffer_after_allocation() {
+    let mut env = Env::new(Params::default());
+    let a = env.new_depositor();
+    let b = env.new_depositor();
+    env.earn_deposit(&a, 1_000 * U, None).expect("a");
+    env.earn_deposit(&b, 9_000 * U, None).expect("b");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("junior");
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    eprintln!("allocated {}", env.allocated());
+    let sa = env.lp_shares(&a);
+    env.earn_request(&a, sa);
+    let r = env.earn_execute(&a, Some(lp.portfolio));
+    eprintln!("small redemption after allocation: {r:?}");
+    let paid = r.expect("10% senior redeems from the 5,000 buffer");
+    eprintln!("paid {paid}");
+    env.assert_conserved("small");
+}
+
+/// H-2: a senior inside the buffer is paid from the pots right after an allocation, WHILE the
+/// vault LP holds inventory (recall impossible): principal = min(payout, available).
+#[test]
+fn p2b_h2_small_redemption_pays_while_lp_holds_inventory() {
+    let mut env = Env::new(Params::default());
+    let a = env.new_depositor();
+    let b = env.new_depositor();
+    env.earn_deposit(&a, 1_000 * U, None).expect("a");
+    env.earn_deposit(&b, 9_000 * U, None).expect("b");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("junior");
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    let t = env.new_trader(1_000 * U);
+    env.trade(&t, &lp, 1_000 * UQ).expect("LP now holds inventory");
+    assert!(env.recall_ext(lp.portfolio, 1, DOMAIN).is_err(), "recall impossible with inventory");
+    let sa = env.lp_shares(&a);
+    env.earn_request(&a, sa);
+    let paid = env.earn_execute(&a, Some(lp.portfolio)).expect("inside the buffer: paid from the pots");
+    assert_eq!(paid, 1_000 * U - 1_000, "a paid in full (less the dead shares)");
+    env.assert_conserved("h2 small");
+}
+
+/// H-2 (the disclosed shape): a redemption ABOVE the pots' available principal waits for capital
+/// to be recalled (88); after the LP is flat and 98 runs, the same request pays in full.
+#[test]
+fn p2b_h2_redemption_above_buffer_waits_for_recall() {
+    let mut env = Env::new(Params::default());
+    let a = env.new_depositor();
+    let b = env.new_depositor();
+    env.earn_deposit(&a, 7_000 * U, None).expect("a");
+    env.earn_deposit(&b, 3_000 * U, None).expect("b");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("junior");
+    env.allocate(lp.portfolio, u128::MAX).expect("103: pots keep 5,000");
+    let sa = env.lp_shares(&a);
+    env.earn_request(&a, sa);
+    err_has(&env.earn_execute(&a, Some(lp.portfolio)), PercolatorError::VaultLpRedeemNeedsRecall);
+    let x = env.allocated();
+    env.recall_ext(lp.portfolio, x, DOMAIN).expect("recall (LP flat)");
+    let paid = env.earn_execute(&a, Some(lp.portfolio)).expect("paid after recall");
+    assert_eq!(paid, 7_000 * U - 1_000);
+    env.assert_conserved("h2 above buffer");
+}
+
+/// L-4: while the halt is active (junior exhausted), a THIN-side taker's own close is never
+/// refused even though it grows |LP| on a NON-growth bound asset (M-1 measure on every asset).
+#[test]
+fn p2b_l4_thin_side_close_never_refused_while_halted() {
+    let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 500);
+    env.allocate(lp.portfolio, u128::MAX).expect("103");
+    let thin = env.new_trader(1_000 * U);
+    env.trade(&thin, &lp, -100 * UQ).expect("thin short while healthy");
+    let crowd = env.new_trader(3_000 * U);
+    env.trade(&crowd, &lp, 2_100 * UQ).expect("crowd long");
+    env.move_price(1_400_000, &[crowd.portfolio, thin.portfolio, lp.portfolio]);
+    let (nav, lpv, c) = env.p2b_v(lp.portfolio);
+    assert!(nav + lpv < c, "junior exhausted");
+    let probe = env.new_trader(1_000 * U);
+    err_has(&env.trade(&probe, &lp, 10 * UQ), PercolatorError::VaultLpSeniorCapitalHalt);
+    env.trade(&thin, &lp, 100 * UQ).expect("the thin taker's own close is never refused");
+    assert_eq!(env.position(thin.portfolio), 0);
+}
+
+/// L-1: switching the cushion OFF clears the creator-fee vesting bit at once.
+#[test]
+fn p2b_l1_cushion_off_vests_creator_fees() {
+    let p = Params { fee_bps: 100, ..Params::default() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    let admin = env.admin.insecure_clone();
+    env.set_p2b_dials(&admin, [5_000, 3_000, 4_000, 5_000]).expect("cushion on");
+    let t = env.new_trader(5_000 * U);
+    env.trade(&t, &lp, 1_000 * UQ).expect("open");
+    env.trade(&t, &lp, -1_000 * UQ).expect("close");
+    let _ = env.crank(lp.portfolio);
+    env.crank_fees_ext(lp.portfolio).expect("78");
+    assert_eq!(env.asset_rec().p2b_flags & 1, 1, "vesting below target");
+    env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("cushion off");
+    assert_eq!(env.asset_rec().p2b_flags & 1, 0, "L-1: vested once the cushion is off");
+}
+
+/// L-3: tag 103 needs a junior of at least 5% of C_eff; control just above.
+#[test]
+fn p2b_l3_allocation_needs_a_minimum_junior() {
+    let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 499);
+    err_has(&env.allocate(lp.portfolio, u128::MAX), PercolatorError::VaultLpAllocateRefused);
+    let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 500);
+    env.allocate(lp.portfolio, u128::MAX).expect("control: 5% junior allocates");
 }
