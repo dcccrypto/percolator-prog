@@ -542,9 +542,13 @@ pub mod constants {
     /// (item 6): asset-0 insurance is unitised; every asset-0 insurance top-up / withdrawal path
     /// REQUIRES the `InsuranceUnitsV20` account (fail closed). Bits 1 (item 4) and 2 (item 8)
     /// belong to Waves C and A. Set once by tag 116, never cleared: every profile rewrite carries
-    /// `_padding0[0..2]` over (`state::carry_p4_profile_bytes`).
-    pub const P4_FLAGS_PROFILE_IDX: usize = 1;
+    /// `_padding0[0..2]` over (`state::carried_profile_padding0`, Wave A's API).
+    /// Same name / value as Wave A's `PROFILE_P4_FLAGS_IDX` (one definition at merge).
+    pub const PROFILE_P4_FLAGS_IDX: usize = 1;
     pub const P4_FLAG_INS_UNITS_REQUIRED: u8 = 1;
+    /// Bits the profile validator accepts. MERGE: the union with Wave A's bit2
+    /// (`P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT`) and, later, item 4's bit1.
+    pub const P4_FLAGS_KNOWN_MASK: u8 = P4_FLAG_INS_UNITS_REQUIRED;
     pub const TAG_INSURANCE_BACKSTOP_DRAW: u8 = 111;
     pub const TAG_RESCUE_DEPOSIT: u8 = 112;
     pub const TAG_INIT_INSURANCE_UNITS: u8 = 116;
@@ -4122,9 +4126,7 @@ pub mod state {
             // INS_UNITS_REQUIRED) is defined on this branch. Waves A / C widen this mask for
             // their own bits ([0] lot_exp, bits 1 / 2) when they merge.
             || profile._padding0[0] != 0
-            || (profile._padding0[crate::constants::P4_FLAGS_PROFILE_IDX]
-                & !crate::constants::P4_FLAG_INS_UNITS_REQUIRED)
-                != 0
+            || (profile_p4_flags(profile) & !crate::constants::P4_FLAGS_KNOWN_MASK) != 0
             || profile._padding0[2..] != [0u8; 3]
             || profile._padding1 != [0u8; 6]
             // FIX (ADOPT upstream 18f3ae94/2669bf1b, adapted): the carried
@@ -6510,19 +6512,35 @@ pub mod state {
         Ok(())
     }
 
-    /// The Phase 4 bytes of `AssetOracleProfileV16::_padding0` (`[0]` = item 7 `lot_exp`, `[1]` =
-    /// `p4_flags`) are CARRIED over every handler that rebuilds a profile literal (oracle
-    /// reconfiguration 34/35/62, asset restart 69). Zeroing them there would silently switch off
-    /// `P4_FLAG_INS_UNITS_REQUIRED`, i.e. remove the class bound on asset-0 insurance withdrawals.
-    pub fn carry_p4_profile_bytes(existing: &[u8; 5]) -> [u8; 5] {
-        [existing[0], existing[1], 0, 0, 0]
+    /// Phase 4: `_padding0[1]` (profile +20) is `p4_flags` (Wave A's accessor, same name).
+    pub fn profile_p4_flags(profile: &AssetOracleProfileV16) -> u8 {
+        profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX]
+    }
+
+    /// The `_padding0` a profile REBUILD must carry (oracle reconfiguration 34/35/62, asset
+    /// restart 69, the lifecycle oracle reset): `[0]` (item 7 `lot_exp`) and `[1]` (`p4_flags`)
+    /// are immutable through a rebuild, so a reconfigure can never clear
+    /// `P4_FLAG_INS_UNITS_REQUIRED` (it would remove the class bound on asset-0 insurance
+    /// withdrawals).
+    ///
+    /// ONE HELPER AT MERGE: this is Wave A's `state::carried_profile_padding0` signature. Wave A's
+    /// body adds the 119 rule (a non-zero `lot_exp` cannot move to Hybrid / EwmaMark); on this
+    /// branch `lot_exp` is always 0 (the validator refuses `_padding0[0] != 0`), so that rule is
+    /// unreachable here and Wave A's body is the one to keep.
+    pub fn carried_profile_padding0(
+        existing: &AssetOracleProfileV16,
+        new_mode: u8,
+    ) -> Result<[u8; 5], ProgramError> {
+        let _ = new_mode;
+        let mut out = [0u8; 5];
+        out[0] = existing._padding0[0];
+        out[crate::constants::PROFILE_P4_FLAGS_IDX] = profile_p4_flags(existing);
+        Ok(out)
     }
 
     /// Item 6: asset-0 insurance is unitised on this market.
     pub fn profile_ins_units_required(profile: &AssetOracleProfileV16) -> bool {
-        profile._padding0[crate::constants::P4_FLAGS_PROFILE_IDX]
-            & crate::constants::P4_FLAG_INS_UNITS_REQUIRED
-            != 0
+        profile_p4_flags(profile) & crate::constants::P4_FLAG_INS_UNITS_REQUIRED != 0
     }
 
     /// P3 per-asset vault-LP / skew-funding / leverage-step-down record, stored at
@@ -23078,7 +23096,7 @@ pub mod processor {
             let mut profile = *state::manual_asset_oracle_profile(initial_price, authenticated_slot);
             preserve_backing_fee_policy(&mut profile, &existing_profile);
             // Phase 4: the restart preserves the insurance budget, so it preserves the units gate.
-            profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
+            profile._padding0 = state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_MANUAL)?;
             profile.asset_admin = existing_profile.asset_admin;
             profile.insurance_authority = existing_profile.insurance_authority;
             profile.insurance_operator = existing_profile.insurance_operator;
@@ -23662,7 +23680,7 @@ pub mod processor {
                     let mut profile =
                         state::manual_asset_oracle_profile(initial_price, authenticated_slot);
                     preserve_backing_fee_policy(&mut profile, &existing_profile);
-                    profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
+                    profile._padding0 = state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_MANUAL)?;
                     profile.insurance_authority = insurance_authority;
                     profile.insurance_operator = insurance_operator;
                     profile.backing_bucket_authority = backing_bucket_authority;
@@ -23730,7 +23748,7 @@ pub mod processor {
                     // -- keep `profile` as `Box<...>` into `reset_profile`.
                     let mut profile = state::manual_asset_oracle_profile(price, authenticated_slot);
                     preserve_backing_fee_policy(&mut profile, &existing_profile);
-                    profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
+                    profile._padding0 = state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_MANUAL)?;
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, false);
                     }
@@ -24469,7 +24487,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_HYBRID_AFTER_HOURS)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24641,7 +24659,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_EWMA_MARK)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24785,7 +24803,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_AUTH_MARK)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -33154,7 +33172,7 @@ pub mod processor {
             };
             ins_units_snapshot(&mut u, &group)?;
             let mut profile0 = read_oracle_profile_from_view(&group, &cfg, 0)?;
-            profile0._padding0[crate::constants::P4_FLAGS_PROFILE_IDX] |=
+            profile0._padding0[crate::constants::PROFILE_P4_FLAGS_IDX] |=
                 crate::constants::P4_FLAG_INS_UNITS_REQUIRED;
             write_oracle_profile_to_view(&mut group, 0, &profile0)?;
             group.validate_shape().map_err(map_v16_error)?;
