@@ -808,12 +808,16 @@ fn sync_adl_partial_drift_heals_on_the_next_reducing_fill() {
     );
     assert_eq!(env.counter(&lp), -CAP, "counter did not move");
     assert!(!env.adl_one());
-    // engine reduce-only: the short's close grows the LP -> LockActive regardless of matcher
+    // engine reduce-only: the short's close grows the LP -> refused regardless of matcher.
+    // P2b E7 (engine #276 / wrapper #525): the ADL reduce-only refusal now has its own code,
+    // 120 EngineAdlReduceOnly (was the shared 21 EngineLockActive). Same refusal, same exact
+    // assertion, more precise code; 21 must NOT be what answers here any more.
     let close = env.eff(short.1);
     let r = env.trade_cpi(&short.0, short.1, &lp, -close);
+    let e = r.unwrap_err();
     assert!(
-        r.unwrap_err().contains("Custom(21)"),
-        "engine ADL reduce-only refuses LP growth"
+        e.contains("Custom(120)") && !e.contains("Custom(21)"),
+        "engine ADL reduce-only refuses LP growth with EngineAdlReduceOnly (120): {e}"
     );
     // the long sells a little (LP buys = reduces): fills, and the counter is now the real LP
     env.trade_cpi(&long.0, long.1, &lp, -Q)
@@ -954,11 +958,16 @@ fn sec_trade_during_reset_pending_window() {
     eprintln!("RESULT buy: {}", short_err(&r1));
     eprintln!("RESULT sell: {}", short_err(&r2));
     eprintln!("counter after {}", env.counter(&lp));
-    // While the short side is ResetPending the engine refuses every risk-increasing fill with
-    // LockActive (21). The v2 effective view must take the prior-reset-obligation branch (0)
-    // and let the engine refuse; an `InvalidLeg` from the wrapper would brick the market.
+    // While the short side is ResetPending the engine refuses every risk-increasing fill. P2b E7
+    // (engine #276 / wrapper #525): a side in ResetPending (or DrainOnly, or any A != ADL_ONE)
+    // is the ADL reduce-only state, so the refusal is now 120 EngineAdlReduceOnly, no longer the
+    // shared 21. The v2 effective view must take the prior-reset-obligation branch (0) and let
+    // the ENGINE refuse; an `InvalidLeg` (18) from the wrapper would brick the market.
     for (dir, r) in [("buy", &r1), ("sell", &r2)] {
         let e = r.as_ref().expect_err("a fill during ResetPending must be refused");
-        assert!(e.contains("Custom(21)"), "{dir}: expected LockActive (21), got {e}");
+        assert!(
+            e.contains("Custom(120)") && !e.contains("Custom(18)"),
+            "{dir}: expected the engine's EngineAdlReduceOnly (120), got {e}"
+        );
     }
 }
