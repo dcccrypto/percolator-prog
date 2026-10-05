@@ -172,7 +172,7 @@ pub fn ratchet_ceiling_x100(
 /// `ceil(a * b / d)`; `None` iff `d == 0` or `a * b` overflows u128. Rounds UP: every
 /// requirement / charge computed with it is never below the exact rational.
 #[inline(always)]
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::mul_div_ceil(a, b, d, *r)))]
+#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::mul_div_ceil(a, b, d, *r) && spec::mul_div_ceil_facts(a, b, d, *r)))]
 pub fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> Option<u128> {
     if d == 0 {
         return None;
@@ -269,7 +269,7 @@ pub fn joins_crowd(lp_before_q: i128, lp_after_q: i128) -> bool {
 }
 
 /// Spec §1 `RiskNotional = ceil(|pos| * price / POS_SCALE)`. `None` on overflow / zero scale.
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::mul_div_ceil(abs_q, price_e6 as u128, pos_scale, *r)))]
+#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::risk_notional_ceil(abs_q, price_e6, pos_scale, *r)))]
 pub fn risk_notional_ceil(abs_q: u128, price_e6: u64, pos_scale: u128) -> Option<u128> {
     mul_div_ceil_u128(abs_q, price_e6 as u128, pos_scale)
 }
@@ -838,11 +838,6 @@ pub fn ext_v3_mark_taker_reducing(
 pub mod spec {
     use super::{BPS, MAX_IMR_BPS};
 
-    /// `q == floor(p / d)` in remainder form: `q*d + r == p ∧ r < d` (`d > 0`).
-    pub fn floor_rel(p: u128, d: u128, q: u128) -> bool {
-        d > 0 && q.checked_mul(d).is_some_and(|qd| qd <= p && p - qd < d)
-    }
-
     /// `q == ceil(p / d)`: `q*d == p + r ∧ r < d`, written without the possibly-overflowing
     /// `q*d`: `q == 0 ⇔ p == 0`, else `(q-1)*d < p ∧ p - (q-1)*d <= d`.
     pub fn ceil_rel(p: u128, d: u128, q: u128) -> bool {
@@ -853,11 +848,6 @@ pub mod spec {
             return p == 0;
         }
         (q - 1).checked_mul(d).is_some_and(|x| x < p && p - x <= d)
-    }
-
-    /// `ceil(p / d) >= q0` (for the clamped branches), division-free.
-    pub fn ceil_at_least(p: u128, d: u128, q0: u128) -> bool {
-        q0 == 0 || (q0 - 1).checked_mul(d).is_none_or(|x| p > x)
     }
 
     /// Floor (rounds DOWN): the contract of `vault_lp_v18::mul_div_floor`.
@@ -871,7 +861,20 @@ pub mod spec {
         }
     }
 
-    /// `n_cap_q`: floor; `None ⇔ price == 0 ∨ c_m*λ overflows ∨ c_m*λ*scale overflows`.
+    /// Width-independent range facts of the ceil primitive (proved with the contract at u8,
+    /// paper lift): when it returns `Some(q)`, `b <= d ⇒ q <= a` and `b >= d ⇒ q >= a`.
+    pub fn mul_div_ceil_facts(a: u128, b: u128, d: u128, r: Option<u128>) -> bool {
+        r.is_none_or(|q| (b > d || q <= a) && (b < d || q >= a))
+    }
+
+    // ── Composite specs (rev 6b, review C1): each states its DESIGN formula, over the primitive
+    // spec applied to the formula's own operands, so a `stub_verified` primitive's assumption and
+    // the composite's assertion are the same predicate on the same terms. Branches whose truth is
+    // a nonlinear fact are split on a LINEAR test of those operands (num vs den), where the
+    // primitive range facts decide them.
+
+    /// Plan §2.1: `N_cap_q = floor(C_m · λ · POS_SCALE / (10_000 · price_e6))`; fails closed
+    /// (`None`) on price 0 or overflow. `10_000 · price_e6 <= 1e4 · u64::MAX` never overflows.
     pub fn n_cap_q(
         c_m: u128,
         lambda_bps: u32,
@@ -882,30 +885,44 @@ pub mod spec {
         if price_e6 == 0 {
             return r.is_none();
         }
-        let den = BPS * price_e6 as u128; // <= 1e4 * u64::MAX: never overflows
-        match c_m
-            .checked_mul(lambda_bps as u128)
-            .and_then(|x| x.checked_mul(pos_scale))
-        {
-            None => r.is_none(),
-            Some(p) => r.is_some_and(|n| floor_rel(p, den, n)),
+        // same terms as the code; `kani_growth_c_n_cap_q` asserts 1e4 · price never overflows
+        match (
+            c_m.checked_mul(lambda_bps as u128),
+            BPS.checked_mul(price_e6 as u128),
+        ) {
+            (Some(x), Some(den)) => mul_div_floor(x, pos_scale, den, r),
+            _ => r.is_none(),
         }
     }
 
-    /// `liquidity_notional_e6`: floor(c_m*λ*DEPTH_MULT / 1e4); `None ⇔` overflow.
+    /// Plan §2.2 (ext v3 depth): `liquidity_notional_e6 = floor(C_m · λ · DEPTH_MULT / 10_000)`;
+    /// `None` on overflow.
     pub fn liquidity_notional_e6(c_m: u128, lambda_bps: u32, r: Option<u128>) -> bool {
-        match c_m
-            .checked_mul(lambda_bps as u128)
-            .and_then(|x| x.checked_mul(super::DEPTH_MULT))
-        {
+        match c_m.checked_mul(lambda_bps as u128) {
             None => r.is_none(),
-            Some(p) => r.is_some_and(|q| floor_rel(p, BPS, q)),
+            Some(x) => mul_div_floor(x, super::DEPTH_MULT, BPS, r),
         }
     }
 
-    /// `dyn_imr_bps`, exact. `None ⇔` a corrupt input, `n == 0`, `u > 1` (`lp > n`) or an
-    /// overflow. Below / at the kink: `base`. Above: `base + ceil(span*(lp*1e4 - k*n) /
-    /// (n*(1e4-k)))` (rounds UP), clamped at 10_000. Branch fact: `lp == n ∧ k < 1e4 ⇒ 10_000`.
+    /// Plan §2.1 "Require" side: risk notional `= ceil(|q| · price_e6 / POS_SCALE)` (rounds UP,
+    /// against the taker); `None` on scale 0 or overflow.
+    pub fn risk_notional_ceil(
+        abs_q: u128,
+        price_e6: u64,
+        pos_scale: u128,
+        r: Option<u128>,
+    ) -> bool {
+        mul_div_ceil(abs_q, price_e6 as u128, pos_scale, r)
+    }
+
+    /// Plan §2.1 + N-1 (u = users OI on the side / N_cap):
+    ///   IMR_dyn = base                                    if u <= k
+    ///           = base + ceil(span · (u − k)/(1 − k))     if k < u <= 1   (u == 1 ⇒ 10_000)
+    ///           = refuse (None)                           if u > 1
+    /// with span = 10_000 − base and, in integers, (u − k)/(1 − k) = (lp·1e4 − k·n)/(n·(1e4 − k)).
+    /// Fails closed on n == 0, base > 10_000, k > 10_000, or overflow. The result is in
+    /// [base, 10_000]. `num > den` cannot happen while lp <= n; that branch only pins the
+    /// fail-closed shape (None or full margin).
     pub fn dyn_imr_bps(lp: u128, n: u128, base: u64, k: u16, r: Option<u64>) -> bool {
         if base > MAX_IMR_BPS || k as u128 > BPS || n == 0 || lp > n {
             return r.is_none();
@@ -922,27 +939,23 @@ pub mod spec {
             Some(d) => d,
             None => return r.is_none(),
         };
-        let p = match span.checked_mul(lhs - rhs) {
-            Some(p) => p,
-            None => return r.is_none(),
-        };
-        let v = match r {
-            Some(v) => v as u128,
-            None => return false,
-        };
-        let at_cap_fact = !(lp == n && k < 10_000) || v == MAX_IMR_BPS as u128;
-        at_cap_fact
-            && v >= base as u128
-            && v <= MAX_IMR_BPS as u128
-            && if v < MAX_IMR_BPS as u128 {
-                ceil_rel(p, den, v - base as u128)
-            } else {
-                ceil_at_least(p, den, span)
+        let num = lhs - rhs;
+        if num > den {
+            return r.is_none() || r == Some(MAX_IMR_BPS);
+        }
+        match r {
+            None => span.checked_mul(num).is_none(),
+            Some(v) => {
+                v >= base
+                    && v <= MAX_IMR_BPS
+                    && (num < den || v == MAX_IMR_BPS)
+                    && mul_div_ceil(span, num, den, Some((v - base) as u128))
             }
+        }
     }
 
-    /// `leg_im_req`: 0 when flat; `None ⇔ imr > 1e4 ∨ n*imr overflows`; else
-    /// `max(ceil(n*imr/1e4), min)` (rounds UP).
+    /// Engine per-leg IM (percolator src/v16.rs:23050-23056): `0` when flat, else
+    /// `max(ceil(notional · imr / 10_000), min_nonzero)`; imr > 10_000 fails closed.
     pub fn leg_im_req(n: u128, imr: u64, min: u128, r: Option<u128>) -> bool {
         if n == 0 {
             return r == Some(0);
@@ -953,15 +966,21 @@ pub mod spec {
         match n.checked_mul(imr as u128) {
             None => r.is_none(),
             Some(p) => r.is_some_and(|v| {
-                (v >= min && v > 0 && ceil_rel(p, BPS, v))
-                    || (v == min && min.checked_mul(BPS).is_none_or(|m| p <= m))
+                v >= min
+                    && if v > min {
+                        mul_div_ceil(n, imr as u128, BPS, Some(v))
+                    } else {
+                        // ceil(p / 1e4) <= min  ⇔  p <= min · 1e4
+                        min.checked_mul(BPS).is_none_or(|m| p <= m)
+                    }
             }),
         }
     }
 
-    /// `utilisation_fee_bps`: `None ⇔ n == 0 ∨ k > 1e4 ∨` overflow; 0 at/below the kink or
-    /// with `max == 0`; else `min(ceil(max*(o*1e4 - k*n) / (n*(1e4-k))), max)` (rounds UP).
-    pub fn utilisation_fee_bps(o: u128, n: u128, k: u16, m: u16, r: Option<u16>) -> bool {
+    /// Security round 3 N-2 / round 4 Q2: `fee = ceil(max · (u − k)/(1 − k))` capped at `max`;
+    /// 0 at or below the kink or when max == 0; `n == 0` (or k > 10_000) → None; `None` on
+    /// overflow. `num >= den` is u >= 1: the cap.
+    pub fn utilisation_fee_bps(o: u128, n: u128, k: u16, max: u16, r: Option<u16>) -> bool {
         if n == 0 || k as u128 > BPS {
             return r.is_none();
         }
@@ -969,43 +988,38 @@ pub mod spec {
             (Some(a), Some(b)) => (a, b),
             _ => return r.is_none(),
         };
-        if lhs <= rhs || m == 0 {
+        if lhs <= rhs || max == 0 {
             return r == Some(0);
         }
         let den = match n.checked_mul(BPS - k as u128) {
             Some(d) => d,
             None => return r.is_none(),
         };
-        let p = match (m as u128).checked_mul(lhs - rhs) {
-            Some(p) => p,
-            None => return r.is_none(),
-        };
-        match r {
-            None => false,
-            Some(v) => {
-                v <= m
-                    && if v < m {
-                        ceil_rel(p, den, v as u128)
-                    } else {
-                        ceil_at_least(p, den, m as u128)
-                    }
+        let num = lhs - rhs;
+        match (max as u128).checked_mul(num) {
+            None => r.is_none(),
+            Some(_) => {
+                if num >= den {
+                    r == Some(max)
+                } else {
+                    r.is_some_and(|v| {
+                        v <= max && mul_div_ceil(max as u128, num, den, Some(v as u128))
+                    })
+                }
             }
         }
     }
 
-    /// `util_fee_on_fill_bps`: `floor(fee * min(o, fill) / fill)` (rounds DOWN: the closing part
-    /// of a flip is never charged); 0 on a zero input; never above `fee`. Precondition (the
-    /// `requires`): `fee * min(o, fill)` fits u128 -- otherwise production aborts (fail closed).
+    /// N-2 (round 4 Q2: never on the closing part): the rate on a fill is
+    /// `floor(fee · min(opening, fill) / fill)` (rounds DOWN), 0 on a zero input, never above
+    /// `fee`. Precondition (the `requires`): `fee · min(opening, fill)` fits u128; production
+    /// aborts otherwise (fail closed).
     pub fn util_fee_on_fill_bps(fee: u16, o: u128, fill: u128, r: u16) -> bool {
         if fill == 0 || o == 0 || fee == 0 {
             return r == 0;
         }
         let o = if o > fill { fill } else { o };
-        r <= fee
-            && match (fee as u128).checked_mul(o) {
-                None => false,
-                Some(p) => floor_rel(p, fill, r as u128),
-            }
+        r <= fee && mul_div_floor(fee as u128, o, fill, Some(r as u128))
     }
 }
 
