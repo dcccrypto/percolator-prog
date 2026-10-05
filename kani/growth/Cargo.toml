@@ -14,6 +14,8 @@ path = "src/lib.rs"
 [features]
 # Negative controls: swap in mutants/growth_v19_mutant.rs.
 growth_mutant = []
+# Primitive negative controls: swap in mutants/vault_lp_v18_mutant.rs (mul_div_floor).
+vlp_mutant = []
 # R11 negative control: the view's pre-N-1 capacity measure (LP net) in the harness model.
 lpnet_mutant = []
 

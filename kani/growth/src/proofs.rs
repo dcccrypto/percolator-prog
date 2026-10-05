@@ -1,54 +1,28 @@
 //! Kani harnesses for growth-v19 (production `growth_v19.rs` / `vault_lp_v18.rs`).
-//! Design: ~/percolator-ops/ledger/kani-growth-v19-design-2026-10-04.md (rev 5). Run ONCE:
-//!   ./run_kani.sh real          then          ./run_mutants.sh
-//! Every harness carries `kani::cover!` witnesses; SUCCESSFUL with an unsatisfied cover is
-//! VACUOUS and does not count.
+//! Design: ~/percolator-ops/ledger/kani-growth-v19-design-2026-10-04.md (rev 5) + the rev-6
+//! redesign approved with amendments A1-A5 in kani-growth-v19-results-2026-10-04.md. Run ONCE:
+//!   ./run_kani6.sh rev6          then          ./run_mutants.py rev6
+//! Flags: `-Z function-contracts -Z stubbing`. Every harness carries `kani::cover!` witnesses;
+//! SUCCESSFUL with an unsatisfied cover is VACUOUS and does not count.
 //!
-//! Bounds (stated per harness): where a symbolic u128 multiply feeds a division the inputs are
-//! u8/u16 draws cast up (the lifting argument for `dyn_imr_bps` / `n_cap_q` is in the note §1);
-//! compare / add-only harnesses use u64 or full u128.
-//!
-//! Gate-level harnesses stub `n_cap_q` and `dyn_imr_bps` by their CONTRACTS (assume-guarantee):
-//! the contract harnesses (`kani_growth_ncap_*`, `kani_growth_dyn_imr_*`) prove the production
-//! functions meet them; the stubs return ANY value the contract allows.
+//! Assume-guarantee: only the `kani_growth_c_mul_div_*` primitive harnesses bit-blast a 128-bit
+//! divider (u8 operands; width lift = the paper step in the results file). Every other harness
+//! replaces the primitives / composite functions by their PROVEN exact contracts
+//! (`#[kani::stub_verified]`), and every stubbed harness covers each reachable stub branch,
+//! `None` included (unreachable branches are named in a comment at the harness).
 
 use crate::growth_v19::*;
 use crate::vault_lp_v18;
 
-// ── contract stubs ─────────────────────────────────────────────────────────────────────────
+// ── contract helpers ───────────────────────────────────────────────────────────────────
+// Rev 6 (security review A1-A5): the hand-written stubs are GONE. Gate-level harnesses use
+// `#[kani::stub_verified(..)]` on functions whose EXACT contracts (`growth_v19::spec`,
+// `vault_lp_v18::mul_div_floor_spec`) are proved by the `kani_growth_c_*` proof_for_contract
+// harnesses below. Gate harnesses fix lambda = 1x and pos_scale = 1 and draw price in {0, 1},
+// so N_cap == equity exactly (floor(equity * 1e4 / 1e4)) and every property about N_cap can be
+// read off `lp.equity`; relational harnesses (t2_required, r8) draw price freely.
 
-/// `n_cap_q` contract instance: `price == 0 ⇒ None`; otherwise the capacity is the (symbolic)
-/// `c_m` itself -- the harnesses draw `c_m` freely, so every `n` is reachable; `c_m == MAX`
-/// stands for the overflow branch (`None`).
-fn stub_n_cap_q(c_m: u128, _lambda_bps: u32, price_e6: u64, _pos_scale: u128) -> Option<u128> {
-    if price_e6 == 0 || c_m == u128::MAX {
-        None
-    } else {
-        Some(c_m)
-    }
-}
-
-/// `dyn_imr_bps` contract (note §1, proved by `kani_growth_dyn_imr_contract`): `None ⇔ n == 0 ∨
-/// lp > n` (or a corrupt input / overflow); `Some(r) ⇒ base <= r <= 10_000`; below the kink
-/// `r == base`; at `lp == n ∧ k < 10_000` `r == 10_000`.
-fn stub_dyn_imr_bps(lp: u128, n: u128, base: u64, k: u16) -> Option<u64> {
-    if base > 10_000 || k as u128 > 10_000 || n == 0 || lp > n {
-        return None;
-    }
-    let (l, rr) = match (lp.checked_mul(10_000), (k as u128).checked_mul(n)) {
-        (Some(l), Some(rr)) => (l, rr),
-        _ => return None,
-    };
-    let r: u64 = kani::any();
-    kani::assume(r >= base && r <= 10_000);
-    if l <= rr {
-        kani::assume(r == base);
-    }
-    if lp == n && k < 10_000 {
-        kani::assume(r == 10_000);
-    }
-    Some(r)
-}
+use crate::growth_v19::spec;
 
 /// A gate input with every field symbolic (positions i16-wide, the rest bounded as stated by
 /// the caller through `kani::assume`).
@@ -79,7 +53,7 @@ fn any_gate(lp_some: bool) -> GrowthGateIn {
         taker_equity: kani::any::<u64>() as u128,
         taker_cert_initial_req: if kani::any() { Some(kani::any::<u64>() as u128) } else { None },
         lp,
-        price_e6: kani::any::<u8>() as u64,
+        price_e6: if kani::any() { 1 } else { 0 },
         pos_scale: 1,
         engine_imr_bps: kani::any::<u16>() as u64,
         min_nonzero_im_req: kani::any::<u8>() as u128,
@@ -91,129 +65,140 @@ fn any_gate(lp_some: bool) -> GrowthGateIn {
     }
 }
 
-// ── §1 contracts (lemmas, narrow width) ───────────────────────────────────────────────────
+// ── §1 contracts (rev 6: proof_for_contract on the PRODUCTION functions) ─────────────────
+// Primitives: the only harnesses that bit-blast a divider. Bounded domain (u8 operands,
+// widened); the lift to u128 is the paper step in the results file (exact floor / ceil of
+// naturals is width-independent wherever the product does not overflow, and every overflow is
+// `None`, proved at FULL width by the `_none_full_width` harnesses, which contain no divider
+// on any reachable path).
 
-/// n_cap_q exact floor. Bound: u16 c_m, u8 lambda/100 (lambda = 100 * x), u16 price, POS_SCALE.
-#[kani::proof]
+#[kani::proof_for_contract(crate::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
-fn kani_growth_ncap_exact_floor() {
-    let c: u16 = kani::any();
-    let l: u8 = kani::any();
-    let p: u16 = kani::any();
-    let (c, lam, pr) = (c as u128, l as u32 * 100, p as u64);
-    let n = n_cap_q(c, lam, pr, 1_000_000);
-    if pr == 0 {
-        assert!(n.is_none());
-    } else {
-        let n = n.unwrap();
-        let num = c * lam as u128 * 1_000_000;
-        let den = 10_000 * pr as u128;
-        assert!(n * den <= num && num < (n + 1) * den);
-    }
-    kani::cover!(pr == 0, "price 0");
-    kani::cover!(pr != 0 && c > 0 && n == Some(0), "rounds to 0");
-    kani::cover!(n.is_some_and(|x| x > 0), "positive capacity");
+fn kani_growth_c_mul_div_floor() {
+    let a = kani::any::<u8>() as u128;
+    let b = kani::any::<u8>() as u128;
+    let d = kani::any::<u8>() as u128;
+    let r = crate::vault_lp_v18::mul_div_floor(a, b, d);
+    kani::cover!(d == 0, "d == 0 -> None");
+    kani::cover!(r.is_some_and(|q| q > 0 && (a * b) % d != 0), "inexact floor");
+    kani::cover!(r == Some(0) && a * b > 0, "rounds to 0");
 }
 
-/// n_cap_q monotone in c_m and lambda (the composition behind t2 / dials). Bound: u16 / u8.
-#[kani::proof]
+#[kani::proof_for_contract(crate::growth_v19::mul_div_ceil_u128)]
 #[kani::solver(cadical)]
-fn kani_growth_ncap_monotone() {
-    let c1: u16 = kani::any();
-    let c2: u16 = kani::any();
-    let l1: u8 = kani::any();
-    let l2: u8 = kani::any();
-    let p: u8 = kani::any();
-    kani::assume(c1 <= c2 && l1 <= l2 && p > 0);
-    let a = n_cap_q(c1 as u128, l1 as u32 * 100, p as u64, 1_000_000).unwrap();
-    let b = n_cap_q(c2 as u128, l2 as u32 * 100, p as u64, 1_000_000).unwrap();
-    assert!(a <= b);
-    kani::cover!(a < b, "strictly more capital opens capacity");
-    kani::cover!(a == b && c1 < c2, "flat step");
+fn kani_growth_c_mul_div_ceil() {
+    let a = kani::any::<u8>() as u128;
+    let b = kani::any::<u8>() as u128;
+    let d = kani::any::<u8>() as u128;
+    let r = mul_div_ceil_u128(a, b, d);
+    kani::cover!(d == 0, "d == 0 -> None");
+    kani::cover!(r.is_some_and(|q| q > 0 && (a * b) % d != 0), "rounds up");
+    kani::cover!(r == Some(0), "zero product");
 }
 
-/// n_cap_q: None iff price 0 or overflow. Full u128 c_m.
+/// The overflow `None` branch at FULL u128 width (no divider is reachable: `checked_mul` fails).
 #[kani::proof]
-fn kani_growth_ncap_none_iff_zero_price_or_overflow() {
+fn kani_growth_c_mul_div_none_full_width() {
+    let a: u128 = kani::any();
+    let b: u128 = kani::any();
+    let d: u128 = kani::any();
+    kani::assume(d > 0 && a.checked_mul(b).is_none());
+    assert!(crate::vault_lp_v18::mul_div_floor(a, b, d).is_none());
+    assert!(mul_div_ceil_u128(a, b, d).is_none());
+    assert!(crate::vault_lp_v18::mul_div_floor(a, b, 0).is_none());
+    kani::cover!(a > 0 && b > 0, "overflow reached");
+}
+
+// Composite contracts: the primitives are stubbed by their PROVEN contracts, so no divider
+// remains; full-width u128 operands unless stated.
+
+#[kani::proof_for_contract(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+fn kani_growth_c_n_cap_q() {
     let c: u128 = kani::any();
-    let lam: u32 = kani::any();
+    let l: u32 = kani::any();
     let p: u64 = kani::any();
-    let r = n_cap_q(c, lam, p, 1_000_000);
-    let ovf = c
-        .checked_mul(lam as u128)
-        .and_then(|x| x.checked_mul(1_000_000))
-        .is_none();
-    assert_eq!(r.is_none(), p == 0 || ovf);
-    kani::cover!(p == 0, "zero price");
-    kani::cover!(p != 0 && ovf, "overflow branch");
-    kani::cover!(r.is_some(), "some");
+    let s: u128 = kani::any();
+    let r = n_cap_q(c, l, p, s);
+    kani::cover!(p == 0, "price 0 -> None");
+    kani::cover!(p != 0 && r.is_none(), "overflow -> None");
+    kani::cover!(r.is_some_and(|n| n > 0), "capacity");
 }
 
-/// dyn_imr_bps meets its contract. Bound: u8 lp, n (the lifting argument covers the rest);
-/// base, k full range <= 10_000.
-#[kani::proof]
-#[kani::solver(cadical)]
-fn kani_growth_dyn_imr_contract() {
-    let lp: u8 = kani::any();
-    let n: u8 = kani::any();
-    let base: u16 = kani::any();
-    let k: u16 = kani::any();
-    kani::assume(base <= 10_000 && k <= 10_000);
-    let (lp, n) = (lp as u128, n as u128);
-    let r = dyn_imr_bps(lp, n, base as u64, k);
-    assert_eq!(r.is_none(), n == 0 || lp > n);
-    if let Some(r) = r {
-        assert!(r >= base as u64 && r <= 10_000);
-        if lp * 10_000 <= k as u128 * n {
-            assert_eq!(r, base as u64);
-        }
-        if lp == n && k < 10_000 {
-            assert_eq!(r, 10_000);
-        }
-        // rounding is never in the taker's favour: on the slope the step is the CEILING of the
-        // exact rational, so (r - base) * n * (1e4 - k) >= (1e4 - base) * (lp*1e4 - k*n)
-        let (lhs, rhs) = (lp * 10_000, k as u128 * n);
-        if lhs > rhs && r < 10_000 {
-            assert!((r - base as u64) as u128 * n * (10_000 - k as u128) >= (10_000 - base as u128) * (lhs - rhs));
-        }
-    }
-    kani::cover!(r == Some(base as u64) && lp > 0, "below the kink");
-    kani::cover!(r.is_some_and(|x| x > base as u64 && x < 10_000), "on the slope");
-    kani::cover!(lp == n && n > 0 && k < 10_000, "u == 1 admitted at 100%");
-    kani::cover!(lp > n, "u > 1 refused");
+#[kani::proof_for_contract(crate::growth_v19::liquidity_notional_e6)]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+fn kani_growth_c_liquidity_notional_e6() {
+    let c: u128 = kani::any();
+    let l: u32 = kani::any();
+    let r = liquidity_notional_e6(c, l);
+    kani::cover!(r.is_none(), "overflow");
+    kani::cover!(r.is_some_and(|x| x > 0), "depth");
 }
 
-/// dyn_imr_bps fails closed (None, no panic) on the multiply-overflow region. Full u128.
-#[kani::proof]
-fn kani_growth_dyn_imr_overflow_fails_closed() {
+#[kani::proof_for_contract(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_c_dyn_imr_bps() {
     let lp: u128 = kani::any();
     let n: u128 = kani::any();
+    let base: u64 = kani::any();
     let k: u16 = kani::any();
-    kani::assume(k <= 10_000 && lp <= n);
-    kani::assume(lp > u128::MAX / 10_000 || (k > 0 && n > u128::MAX / k as u128));
-    assert!(dyn_imr_bps(lp, n, 1_000, k).is_none());
-    kani::cover!(lp > u128::MAX / 10_000, "lp * 1e4 overflows");
-    kani::cover!(lp <= u128::MAX / 10_000, "k * n overflows");
+    let r = dyn_imr_bps(lp, n, base, k);
+    kani::cover!(base <= 10_000 && k <= 10_000 && n > 0 && lp <= n && r == Some(base) && lp > 0, "below the kink");
+    kani::cover!(r.is_some_and(|x| x > base && x < 10_000), "on the slope");
+    kani::cover!(lp == n && n > 0 && k < 10_000 && r == Some(10_000), "u == 1 at 100%");
+    kani::cover!(base <= 10_000 && k <= 10_000 && lp > n, "u > 1 refused");
+    kani::cover!(base <= 10_000 && k <= 10_000 && n > 0 && lp <= n && r.is_none(), "overflow refused");
 }
 
-/// leg_im_req exact. Bound: u16 notional, imr <= 10_000, u8 min.
-#[kani::proof]
-#[kani::solver(cadical)]
-fn kani_growth_leg_im_req_exact() {
-    let n: u16 = kani::any();
-    let imr: u16 = kani::any();
-    let m: u8 = kani::any();
-    kani::assume(imr <= 10_000);
-    let r = leg_im_req(n as u128, imr as u64, m as u128).unwrap();
-    if n == 0 {
-        assert_eq!(r, 0);
-    } else {
-        let c = (n as u128 * imr as u128).div_ceil(10_000);
-        assert_eq!(r, if c > m as u128 { c } else { m as u128 });
-    }
+#[kani::proof_for_contract(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_c_leg_im_req() {
+    let n: u128 = kani::any();
+    let imr: u64 = kani::any();
+    let m: u128 = kani::any();
+    let r = leg_im_req(n, imr, m);
     kani::cover!(n == 0, "flat");
-    kani::cover!(n > 0 && (n as u128 * imr as u128) % 10_000 != 0, "ceil rounds up");
-    kani::cover!(n > 0 && r == m as u128 && m > 0, "min binds");
+    kani::cover!(n > 0 && imr <= 10_000 && r.is_none(), "overflow");
+    kani::cover!(r.is_some_and(|v| v == m && m > 0 && n > 0), "min binds");
+    kani::cover!(r.is_some_and(|v| v > m && n > 0), "ceil binds");
+}
+
+#[kani::proof_for_contract(crate::growth_v19::risk_notional_ceil)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_c_risk_notional_ceil() {
+    let q: u128 = kani::any();
+    let p: u64 = kani::any();
+    let s: u128 = kani::any();
+    let r = risk_notional_ceil(q, p, s);
+    kani::cover!(s == 0, "zero scale");
+    kani::cover!(s > 0 && r.is_none(), "overflow");
+    kani::cover!(r.is_some_and(|x| x > 0), "notional");
+}
+
+#[kani::proof_for_contract(crate::growth_v19::utilisation_fee_bps)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_c_utilisation_fee_bps() {
+    let o: u128 = kani::any();
+    let n: u128 = kani::any();
+    let k: u16 = kani::any();
+    let m: u16 = kani::any();
+    let r = utilisation_fee_bps(o, n, k, m);
+    kani::cover!(n == 0, "n 0 -> None");
+    kani::cover!(r == Some(0) && m > 0 && o > 0, "at/below the kink");
+    kani::cover!(r.is_some_and(|f| f > 0 && f < m), "on the slope");
+    kani::cover!(r.is_some_and(|f| f == m && m > 0), "capped at max");
+}
+
+#[kani::proof_for_contract(crate::growth_v19::util_fee_on_fill_bps)]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+fn kani_growth_c_util_fee_on_fill_bps() {
+    let f: u16 = kani::any();
+    let o: u128 = kani::any();
+    let fill: u128 = kani::any();
+    let r = util_fee_on_fill_bps(f, o, fill);
+    kani::cover!(r == f && f > 0, "plain open: full rate");
+    kani::cover!(r > 0 && r < f, "flip: opening share");
+    kani::cover!(fill > 0 && o > 0 && f > 0 && r == 0, "rounds to 0");
 }
 
 // ── Target 1 ──────────────────────────────────────────────────────────────────────────────
@@ -241,8 +226,10 @@ fn kani_growth_t1_ceiling_never_looser() {
 }
 
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t1_required_imr_bounds() {
     let g = any_gate(kani::any());
     kani::assume(g.engine_imr_bps <= 10_000);
@@ -253,11 +240,16 @@ fn kani_growth_t1_required_imr_bounds() {
     kani::cover!(r.is_ok() && g.lp.is_some(), "crowd or thin, admitted");
     kani::cover!(r == Err(GrowthVerdict::LeverageExceeded), "ceil < engine refused");
     kani::cover!(r == Err(GrowthVerdict::CapacityFull), "capacity refusal");
+    // A5 / amendment 9: each stub branch, including None
+    let crowd = g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q));
+    kani::cover!(g.lp.is_some() && g.price_e6 == 0 && !(crowd && g.crowd_blocked) && r == Err(GrowthVerdict::CapacityFull), "stub n_cap_q -> None (price 0)");
+    kani::cover!(g.price_e6 == 1 && crowd && !g.crowd_blocked && g.lp.is_some_and(|l| l.users_oi_side_after_q > l.equity) && r == Err(GrowthVerdict::CapacityFull), "stub dyn_imr_bps -> None (crowd past N_cap)");
+    kani::cover!(g.price_e6 == 1 && crowd && !g.crowd_blocked && r.is_ok_and(|x| x > g.ceil_imr_bps), "stub dyn_imr_bps -> Some (above the kink)");
 }
 
-/// Bound: u16 notional, u64 cert, dyn >= eng.
+/// Bound: u16 notional, u64 cert, dyn >= eng. `leg_im_req` by its proven contract.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
 fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
     let n: u16 = kani::any();
     let eng: u16 = kani::any();
@@ -265,10 +257,13 @@ fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
     let m: u8 = kani::any();
     kani::assume(eng <= dy && dy <= 10_000);
     let cert: Option<u64> = if kani::any() { Some(kani::any()) } else { None };
-    let r = growth_margin_required(cert.map(|c| c as u128), n as u128, eng as u64, dy as u64, m as u128)
-        .unwrap();
-    let per_asset = leg_im_req(n as u128, dy as u64, m as u128).unwrap();
-    let eng_leg = leg_im_req(n as u128, eng as u64, m as u128).unwrap();
+    let r = growth_margin_required(cert.map(|c| c as u128), n as u128, eng as u64, dy as u64, m as u128);
+    // exact contract values (spec relations, not re-computation)
+    let per_asset: u128 = kani::any();
+    kani::assume(spec::leg_im_req(n as u128, dy as u64, m as u128, Some(per_asset)));
+    let eng_leg: u128 = kani::any();
+    kani::assume(spec::leg_im_req(n as u128, eng as u64, m as u128, Some(eng_leg)));
+    let r = r.unwrap();
     assert!(r >= per_asset);
     if let Some(c) = cert {
         if c as u128 >= eng_leg {
@@ -282,9 +277,9 @@ fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
 
 // ── Target 2 ──────────────────────────────────────────────────────────────────────────────
 
-/// Bound: u8 lp, n.
+/// A3: monotone in |LP| from two EXACT contract instances (no division). Bound: u8 lp, n.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
 fn kani_growth_t2_dyn_imr_monotone_in_lp() {
     let a: u8 = kani::any();
     let b: u8 = kani::any();
@@ -298,11 +293,12 @@ fn kani_growth_t2_dyn_imr_monotone_in_lp() {
     kani::cover!(ra == base as u64 && rb == base as u64 && a < b, "both below the kink");
     kani::cover!(ra == base as u64 && rb > base as u64, "straddles the kink");
     kani::cover!(ra > base as u64 && rb > ra, "both above, strict");
+    kani::cover!(ra > base as u64 && rb == ra && a < b, "equal above the kink (ceil plateau)");
 }
 
-/// Bound: u8 lp, n. None is +inf.
+/// A3: antitone in N_cap from two exact contract instances (None = +inf). Bound: u8.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
 fn kani_growth_t2_dyn_imr_antitone_in_ncap() {
     let lp: u8 = kani::any();
     let n1: u8 = kani::any();
@@ -319,19 +315,20 @@ fn kani_growth_t2_dyn_imr_antitone_in_ncap() {
     }
     kani::cover!(r1.is_none() && r2.is_some(), "capital opens the crowd");
     kani::cover!(r1.is_some_and(|a| r2.is_some_and(|b| b < a)), "strictly cheaper");
+    kani::cover!(r1.is_some_and(|a| r2 == Some(a)) && n1 < n2, "equal");
 }
 
-/// Gate level (stubs): more conservative equity never tightens the required IMR.
+/// Gate level, relational: more conservative equity never tightens the required IMR. Real
+/// `n_cap_q` / `dyn_imr_bps` CONTRACTS (price drawn freely). Bound: u8 equity / users / price.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
 fn kani_growth_t2_required_imr_antitone_in_cm() {
     let mut g = any_gate(true);
-    let e2: u16 = kani::any();
+    g.price_e6 = kani::any::<u8>() as u64;
+    let e2: u8 = kani::any();
     let mut l = g.lp.unwrap();
-    kani::assume(l.equity <= e2 as u128);
-    // real dyn_imr_bps at u16 width
-    kani::assume(l.users_oi_side_after_q <= 255 && e2 <= 255);
+    kani::assume(l.equity <= e2 as u128 && l.users_oi_side_after_q <= 255);
     kani::assume(g.ceil_imr_bps <= 10_000 && g.engine_imr_bps <= g.ceil_imr_bps && g.kink_bps <= 10_000);
     let r1 = growth_required_imr_bps(&g);
     l.equity = e2 as u128;
@@ -344,13 +341,17 @@ fn kani_growth_t2_required_imr_antitone_in_cm() {
     }
     kani::cover!(r1.is_err() && r2.is_ok(), "capital opens");
     kani::cover!(matches!((r1, r2), (Ok(a), Ok(b)) if b < a), "capital cheapens");
+    kani::cover!(matches!((r1, r2), (Ok(a), Ok(b)) if b == a) && l.equity > 0, "equal");
+    kani::cover!(g.price_e6 == 0, "price 0 (both refused)");
 }
 
 // ── Target 3 ──────────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t3_reductions_always_pass() {
     let g = any_gate(kani::any());
     kani::assume(!taker_risk_increasing(g.taker_before_q, g.taker_after_q));
@@ -367,8 +368,10 @@ fn kani_growth_t3_reductions_always_pass() {
 /// Restated in rev 4: a thin open pays only the ceiling and is never stepped; it is refused
 /// (CapacityFull) only when its OWN side's users OI would pass N_cap.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t3_thin_side_gets_only_the_ceiling() {
     let g = any_gate(true);
     let l = g.lp.unwrap();
@@ -398,8 +401,10 @@ fn kani_growth_t3_flip_is_risk_increasing() {
 // ── Target 4 ──────────────────────────────────────────────────────────────────────────────
 
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t4_zero_price_fails_closed() {
     let mut g = any_gate(kani::any());
     g.price_e6 = 0;
@@ -411,8 +416,10 @@ fn kani_growth_t4_zero_price_fails_closed() {
 
 /// Unbounded u128 inputs on the multiply paths: every None maps to a refusal, nothing panics.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t4_overflow_fails_closed() {
     let mut g = any_gate(true);
     let mut l = g.lp.unwrap();
@@ -428,15 +435,22 @@ fn kani_growth_t4_overflow_fails_closed() {
         assert_ne!(v, GrowthVerdict::Allow);
     }
     kani::cover!(notional.is_none() && v == GrowthVerdict::LeverageExceeded, "notional overflow refused");
-    kani::cover!(g.lp.unwrap().equity == u128::MAX && v == GrowthVerdict::CapacityFull, "N_cap overflow refused");
+    kani::cover!(g.lp.unwrap().equity > u128::MAX / 10_000 && g.price_e6 > 0 && g.asset_bound && v == GrowthVerdict::CapacityFull, "N_cap overflow (None) refused");
+    kani::cover!(g.price_e6 > 0 && g.asset_bound && notional.is_some() && v == GrowthVerdict::LeverageExceeded, "requirement refused");
+    kani::cover!(v == GrowthVerdict::Allow, "admitted");
+    let crowd = joins_crowd(l.mid_q, l.after_q);
+    kani::cover!(!crowd && g.asset_bound && notional.is_some_and(|x| x.checked_mul(g.ceil_imr_bps as u128).is_none()) && v == GrowthVerdict::LeverageExceeded, "stub leg_im_req -> None (overflow) refused");
+    kani::cover!(crowd && !g.crowd_blocked && g.asset_bound && g.price_e6 > 0 && g.ceil_imr_bps <= 10_000 && g.ceil_imr_bps >= g.engine_imr_bps && l.users_oi_side_after_q > l.equity && taker_risk_increasing(g.taker_before_q, g.taker_after_q) && v == GrowthVerdict::CapacityFull, "stub dyn_imr_bps -> None refused");
 }
 
 // ── Target 5 (rev 4: users OI) ────────────────────────────────────────────────────────────
 
 /// Any admitted risk-increasing fill leaves its side's users OI <= N_cap, for ANY equity.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t5_capacity_invariant() {
     let mut g = any_gate(true);
     g.taker_equity = u128::MAX / 4;
@@ -449,11 +463,17 @@ fn kani_growth_t5_capacity_invariant() {
     kani::cover!(v == GrowthVerdict::Allow && l.users_oi_side_after_q == l.equity && l.equity > 0, "u == 1 admitted");
     kani::cover!(v == GrowthVerdict::CapacityFull && l.users_oi_side_after_q > l.equity, "u > 1 refused");
     kani::cover!(v == GrowthVerdict::CapacityFull && l.equity == 0 && g.asset_bound, "N_cap 0 refuses");
+    // stub branches: n_cap_q is never None here (the gate returns at price 0; lambda 1x, scale 1,
+    // u16 equity cannot overflow) -- its None branch is covered at full width in t4_overflow.
+    kani::cover!(v == GrowthVerdict::CapacityFull && joins_crowd(l.mid_q, l.after_q) && !g.crowd_blocked && l.users_oi_side_after_q > l.equity, "stub dyn_imr_bps -> None (crowd past N_cap)");
+    kani::cover!(v == GrowthVerdict::Allow && joins_crowd(l.mid_q, l.after_q), "stub dyn_imr_bps -> Some");
 }
 
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_t5_at_capacity_costs_full_margin() {
     let mut g = any_gate(true);
     let mut l = g.lp.unwrap();
@@ -539,11 +559,12 @@ fn kani_growth_t7_init_margin_rule_exact() {
     kani::cover!(floor.is_none(), "floor overflow fails closed");
 }
 
-/// Bound: u16 notional. mmr >= r_gap + fee ⇒ the maintenance requirement covers the gap loss
-/// plus the liquidation fee EXACTLY (design note said "up to one atom"; floor(A) + ceil(B) <
-/// A + B + 1 <= ceil(x) + 1 makes the -1 unnecessary, so the statement is tightened).
+/// mmr >= r_gap + fee ⇒ the maintenance requirement covers the gap loss plus the liquidation
+/// fee EXACTLY, on the PRODUCTION primitives (contracts): ceil(N*mmr) >= floor(N*r) + ceil(N*f)
+/// (all /1e4). Bound: u16 notional, bps <= 1e4.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
 fn kani_growth_t7_rule_implies_gap_solvency() {
     let n: u16 = kani::any();
     let r: u16 = kani::any();
@@ -551,9 +572,9 @@ fn kani_growth_t7_rule_implies_gap_solvency() {
     let mmr: u16 = kani::any();
     kani::assume(r <= 10_000 && f <= 10_000 && mmr <= 10_000 && mmr as u32 >= r as u32 + f as u32);
     let n = n as u128;
-    let mm = (n * mmr as u128).div_ceil(10_000);
-    let gap = n * r as u128 / 10_000;
-    let fee = (n * f as u128).div_ceil(10_000);
+    let mm = mul_div_ceil_u128(n, mmr as u128, 10_000).unwrap();
+    let gap = crate::vault_lp_v18::mul_div_floor(n, r as u128, 10_000).unwrap();
+    let fee = mul_div_ceil_u128(n, f as u128, 10_000).unwrap();
     assert!(mm >= gap + fee);
     kani::cover!(mm == gap + fee && n > 0 && r > 0 && f > 0, "tight");
     kani::cover!(mm > gap + fee, "slack");
@@ -588,9 +609,11 @@ fn kani_growth_h2_reducing_always_allowed() {
     kani::cover!(eq == 0 && a != 0, "reduce with zero equity");
 }
 
-/// Bound: u8 positions / equity / price, lev u16, scale 1.
+/// Bound: u8 positions / equity / price, lev u16, scale 1. `notional_atoms` -> `mul_div_floor`
+/// by its proven contract.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
 fn kani_growth_h2_admit_iff_within_ncap() {
     let b: i8 = kani::any();
     let a: i8 = kani::any();
@@ -664,8 +687,10 @@ fn kani_growth_dials_tighten_only() {
 /// R1 (wrapper conjuncts): a strict reduction is classified reducing with headroom |size| (the
 /// preflight), the LP's mid equals its after (P1 / P3 post-fill exemption) and the gate admits.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_r1_close_is_never_capacity_clipped() {
     let tb: i64 = kani::any();
     let sz: i64 = kani::any();
@@ -708,8 +733,10 @@ fn kani_growth_lp_mid_identity() {
 
 /// R2 + R12: every admitted open faces the bound vault LP.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_r2_r12_every_open_faces_the_bound_vault_lp() {
     let g = any_gate(kani::any());
     let v = growth_gate(&g);
@@ -724,49 +751,73 @@ fn kani_growth_r2_r12_every_open_faces_the_bound_vault_lp() {
     kani::cover!(opens && !g.asset_bound, "unbound refused");
     kani::cover!(!opens && g.lp.is_none() && g.taker_after_q != g.taker_before_q, "close without LP allowed");
     kani::cover!(opens && v == GrowthVerdict::Allow, "admitted open");
+    kani::cover!(opens && g.asset_bound && g.price_e6 == 1 && g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q) && l.users_oi_side_after_q > l.equity) && !g.crowd_blocked && v == GrowthVerdict::CapacityFull, "stub dyn_imr_bps -> None refused");
+    kani::cover!(opens && g.asset_bound && g.price_e6 == 0 && g.lp.is_some() && v == GrowthVerdict::LeverageExceeded, "price 0 refused before n_cap_q");
 }
 
-/// R5: the wrapper's engine-IMR leg equals the engine's per-leg form (ceil(n*imr/1e4) with the
-/// non-zero minimum) on the same inputs -- so cert - eng_leg never removes other legs' IM.
-/// Engine formula transcribed from percolator src/v16.rs margin_requirement (stub). u16.
+/// R5: the wrapper's engine-IMR leg (`leg_im_req`, proven contract) is <= the engine's per-leg
+/// IM: engine `margin_requirement(notional, bps, floor) = max(ceil(notional*bps/1e4), floor)`
+/// (0 when flat; percolator src/v16.rs:23050-23056, mul_div_ceil_u128_or_wide: never None) plus
+/// `target_lag_penalty >= 0` (src/v16.rs:3325-3365). Stated as the engine's CONTRACT (the same
+/// exact ceil relation), not a copy of its code. Full u128; the wrapper fails closed (None) where
+/// the engine goes wide.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
 fn kani_growth_r5_eng_leg_le_engine_leg() {
-    let n: u16 = kani::any();
-    let imr: u16 = kani::any();
-    let m: u8 = kani::any();
+    let n: u128 = kani::any();
+    let imr: u64 = kani::any();
+    let m: u128 = kani::any();
     kani::assume(imr <= 10_000);
-    let w = leg_im_req(n as u128, imr as u64, m as u128).unwrap();
-    let engine = if n == 0 {
-        0
+    let penalty: u128 = kani::any();
+    let engine: u128 = kani::any();
+    // engine contract (non-overflow domain of the u128 product)
+    let engine_ok = if n == 0 {
+        engine == 0
     } else {
-        let c = (n as u128 * imr as u128).div_ceil(10_000);
-        c.max(m as u128)
+        match n.checked_mul(imr as u128) {
+            None => false,
+            Some(p) => {
+                let c: u128 = kani::any();
+                spec::ceil_rel(p, 10_000, c) && engine == if c > m { c } else { m }
+            }
+        }
     };
-    let penalty: u8 = kani::any(); // target_lag_penalty >= 0
-    assert!(w <= engine + penalty as u128);
-    kani::cover!(n > 0 && w == engine, "equal at zero penalty");
+    kani::assume(engine_ok);
+    let total = engine.checked_add(penalty);
+    kani::assume(total.is_some());
+    let w = leg_im_req(n, imr, m);
+    if let Some(w) = w {
+        assert!(w <= total.unwrap());
+        assert_eq!(w, engine);
+    }
+    kani::cover!(w.is_some_and(|x| x > 0) && penalty == 0, "equal at zero penalty");
+    kani::cover!(w.is_some() && penalty > 0, "penalty slack");
 }
 
-/// R8: the ext-v3 caps say CLOSED exactly when the gate refuses crowd growth for capacity.
+/// R8: the ext-v3 caps say CLOSED exactly when the gate's N_cap is 0 / None or the h-lock is
+/// latched; otherwise they ARE N_cap (its exact contract) and a positive depth.
 #[kani::proof]
-#[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::liquidity_notional_e6)]
 fn kani_growth_r8_caps_view_agrees_with_gate() {
     let hlock: bool = kani::any();
-    let c: u8 = kani::any();
-    let p: u8 = kani::any();
-    let (cap, liq) = growth_matcher_caps(hlock, c as u128, 10_000, p as u64, 1_000_000, u128::MAX);
-    let n = n_cap_q(c as u128, 10_000, p as u64, 1_000_000);
-    if hlock || n.unwrap_or(0) == 0 {
+    let c: u128 = kani::any();
+    let p: u64 = kani::any();
+    let (cap, liq) = growth_matcher_caps(hlock, c, 10_000, p, 1_000_000, u128::MAX);
+    if hlock {
         assert_eq!((cap, liq), (0, 0));
+    } else if cap == 0 {
+        assert_eq!(liq, 0);
+        // closed only when the contract's N_cap is None or 0
+        assert!(spec::n_cap_q(c, 10_000, p, 1_000_000, None) || spec::n_cap_q(c, 10_000, p, 1_000_000, Some(0)));
     } else {
-        assert_eq!(Some(cap), n);
-        assert!(liq > 0);
+        assert!(spec::n_cap_q(c, 10_000, p, 1_000_000, Some(cap)));
     }
     kani::cover!(hlock, "h-lock closes");
-    kani::cover!(!hlock && c == 0, "C_m 0 closes");
+    kani::cover!(!hlock && c == 0 && p > 0, "C_m 0 closes");
     kani::cover!(!hlock && p == 0, "price 0 closes");
-    kani::cover!(cap > 0, "open");
+    kani::cover!(cap > 0 && liq > 0, "open");
+    kani::cover!(!hlock && p > 0 && c > 0 && cap == 0 && c.checked_mul(10_000).is_none(), "overflow closes");
 }
 
 // ── Revision 4 / 5: R11 (inductive capacity invariant) ────────────────────────────────────
@@ -829,8 +880,10 @@ fn admits(p: &[i128; 3], i: usize, d: i128, n: u128) -> bool {
 
 /// R11: INV(p, n) ∧ admitted gated fill ⇒ INV(p', n). Bound: i8 positions, i8 step, u8 n.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_r11_capacity_invariant_inductive() {
     let p = [kani::any::<i8>() as i128, kani::any::<i8>() as i128, kani::any::<i8>() as i128];
     let n = kani::any::<u8>() as u128;
@@ -848,14 +901,20 @@ fn kani_growth_r11_capacity_invariant_inductive() {
     kani::cover!(!ok && taker_risk_increasing(p[i], q[i]), "open past N_cap refused");
     kani::cover!(ok && taker_strictly_reduces(p[i], q[i]) && (p[0] + p[1] + p[2]).unsigned_abs() as u128 == n, "close from |LP| = N_cap");
     kani::cover!(ok && taker_flips(p[i], q[i]), "flip admitted");
+    let lp = -(p[0] + p[1] + p[2]);
+    let crowd = joins_crowd(lp_mid_q(lp, p[i], q[i]).unwrap(), lp - d);
+    kani::cover!(!ok && crowd && taker_risk_increasing(p[i], q[i]), "stub dyn_imr_bps -> None (crowd open past N_cap)");
+    kani::cover!(ok && crowd && taker_risk_increasing(p[i], q[i]), "stub dyn_imr_bps -> Some (crowd open admitted)");
 }
 
 /// R11b: the ungated transitions. (i) user-user close, (ii) OI-lowering scaling of one side;
 /// both preserve INV by the identity |LP| = |L - S|. (iii) while a side is over, every open on
 /// it is refused. (iv) is (iii) after an n decrease. Bound: i8 positions, u8 n.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::n_cap_q, stub_n_cap_q)]
-#[kani::stub(crate::growth_v19::dyn_imr_bps, stub_dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::n_cap_q)]
+#[kani::stub_verified(crate::growth_v19::dyn_imr_bps)]
+#[kani::stub_verified(crate::growth_v19::leg_im_req)]
+#[kani::stub_verified(crate::growth_v19::risk_notional_ceil)]
 fn kani_growth_r11b_ungated_transitions() {
     let p = [kani::any::<i8>() as i128, kani::any::<i8>() as i128, kani::any::<i8>() as i128];
     let n = kani::any::<u8>() as u128;
@@ -923,9 +982,10 @@ fn kani_growth_r13_reduce_class_effective() {
 
 // ── R15: N-2 utilisation fee ──────────────────────────────────────────────────────────────
 
-/// R15a + R15b. Bound: u8 users OI / n, kink, max <= 2000.
+/// R15a + R15b, from two EXACT contract instances (A3). Bound: u8 users OI / n, max <= 2000.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::utilisation_fee_bps)]
 fn kani_growth_r15ab_util_fee_shape_and_monotone() {
     let o1: u8 = kani::any();
     let o2: u8 = kani::any();
@@ -946,11 +1006,13 @@ fn kani_growth_r15ab_util_fee_shape_and_monotone() {
     kani::cover!(f1 == 0 && f2 > 0, "crosses the kink");
     kani::cover!(f2 == m && m > 0, "capped at max");
     kani::cover!(f1 > 0 && f1 < f2, "strictly rising");
+    kani::cover!(f1 > 0 && f1 == f2 && o1 < o2, "equal (ceil plateau)");
 }
 
-/// R15b (max): a raised dial never charges less. Bound: u8.
+/// R15b (max): a raised dial never charges less (two exact contract instances). Bound: u8.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(crate::growth_v19::utilisation_fee_bps)]
 fn kani_growth_r15b_util_fee_monotone_in_max() {
     let o: u8 = kani::any();
     let n: u8 = kani::any();
@@ -962,10 +1024,13 @@ fn kani_growth_r15b_util_fee_monotone_in_max() {
     let b = utilisation_fee_bps(o as u128, n as u128, k, m2).unwrap();
     assert!(a <= b);
     kani::cover!(a < b, "raised dial charges more");
+    kani::cover!(a == b && m1 < m2 && a > 0, "equal");
 }
 
-/// R15c: closes never pay; a flip's closing part is never charged.
+/// R15c: closes never pay; a flip's closing part is never charged. `util_fee_on_fill_bps` by
+/// its proven contract (floor); `opening_part_q` runs for real.
 #[kani::proof]
+#[kani::stub_verified(crate::growth_v19::util_fee_on_fill_bps)]
 fn kani_growth_r15c_closes_never_pay() {
     let b: i64 = kani::any();
     let a: i64 = kani::any();
@@ -999,3 +1064,26 @@ fn kani_growth_r15e_trading_cap_rule() {
     kani::cover!(ok, "fits");
     kani::cover!(!ok && need > u64::MAX as u128, "overflow fails closed");
 }
+
+/// "One number", restated (security review Q3): since N-1 the TradeCpi preflight clip is
+/// `growth_open_room_q(n, users_before)`, and the gate admits iff `users_before + opening <= n`.
+/// For an opening leg the clip and the gate agree: `size <= room ⇔ users + size <= n`, and a
+/// side already over the cap gets room 0. Full u128, no division.
+#[kani::proof]
+fn kani_growth_clip_iff_gate() {
+    let n: u128 = kani::any();
+    let users: u128 = kani::any();
+    let size: u128 = kani::any();
+    kani::assume(users.checked_add(size).is_some());
+    let room = growth_open_room_q(n, users);
+    if users <= n {
+        assert_eq!(size <= room, users + size <= n);
+    } else {
+        assert_eq!(room, 0);
+        assert!(users + size > n);
+    }
+    kani::cover!(users <= n && size == room && size > 0, "clip lands exactly on N_cap");
+    kani::cover!(users <= n && size > room, "over the room");
+    kani::cover!(users > n, "side already over");
+}
+

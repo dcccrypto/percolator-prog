@@ -15,6 +15,7 @@ L = os.path.join(HERE, "logs", tag)
 os.makedirs(L, exist_ok=True)
 summ = open(os.path.join(L, "SUMMARY"), "w")
 os.chdir(HERE)
+ZF = ["-Z", "function-contracts", "-Z", "stubbing"]  # rev 6: contracts + stub_verified
 ONLY = [x for x in os.environ.get("ONLY", "").split(",") if x]
 for name, f, old, new, h, crate in MUTANTS:
     if ONLY and name not in ONLY:
@@ -26,10 +27,16 @@ for name, f, old, new, h, crate in MUTANTS:
         src = open(f).read()
         assert src.count(old) == 1, name
         open("mutants/growth_v19_mutant.rs", "w").write(src.replace(old, new))
-        cmd = ["cargo", "kani", "-Z", "stubbing", "--features", "growth_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cmd = ["cargo", "kani", *ZF, "--features", "growth_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cwd = HERE
+    elif crate == "vlp":
+        src = open(f).read()
+        assert src.count(old) == 1, name
+        open("mutants/vault_lp_v18_mutant.rs", "w").write(src.replace(old, new))
+        cmd = ["cargo", "kani", *ZF, "--features", "vlp_mutant", "--harness", f"proofs::{h}", "--exact"]
         cwd = HERE
     elif crate == "lpnet":
-        cmd = ["cargo", "kani", "-Z", "stubbing", "--features", "lpnet_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cmd = ["cargo", "kani", *ZF, "--features", "lpnet_mutant", "--harness", f"proofs::{h}", "--exact"]
         cwd = HERE
     else:
         orig = open(f).read()
@@ -38,7 +45,7 @@ for name, f, old, new, h, crate in MUTANTS:
         open(f, "w").write(orig.replace(old, new))
         restore = f
         mod = "v2" if f.endswith("v2.rs") else "vamm"
-        cmd = ["cargo", "kani", "--harness", f"{mod}::proofs::{h}", "--exact"]
+        cmd = ["cargo", "kani", *ZF, "--harness", f"{mod}::proofs::{h}", "--exact"]
         cwd = M
     try:
         with open(log, "w") as out:
@@ -57,6 +64,7 @@ for name, f, old, new, h, crate in MUTANTS:
     caught = bool(v) and "FAILED" in v[-1]
     summ.write(f"{name} | {h} | {(v[-1] if v else status)} | {(c[-1].strip() if c else 'no cover line')} | {'CAUGHT' if caught else 'CHECK'} | {int(time.time()-t0)}s\n")
     summ.flush()
-if os.path.exists("mutants/growth_v19_mutant.rs"):
-    os.remove("mutants/growth_v19_mutant.rs")
+for m in ("mutants/growth_v19_mutant.rs", "mutants/vault_lp_v18_mutant.rs"):
+    if os.path.exists(m):
+        os.remove(m)
 summ.write("DONE\n")

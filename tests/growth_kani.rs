@@ -10,7 +10,10 @@ use percolator_prog::ix::Instruction;
 use percolator_prog::risk_limits_v17::allocate_fee_with_lp_request;
 
 /// R6 (tag 94): InitVaultLpV19 round-trips; l_launch 0 and any other trailer length refuse.
+/// A5: every `Instruction` value is `mem::forget`-ed (no recursive `drop_in_place` in the
+/// model; R6 is about bytes, not destructors) and the 5-byte loops are bounded by unwind(56).
 #[kani::proof]
+#[kani::unwind(56)]
 fn kani_growth_r6_tag94_v19_roundtrip() {
     let f: u16 = kani::any();
     let l: u16 = kani::any();
@@ -21,19 +24,26 @@ fn kani_growth_r6_tag94_v19_roundtrip() {
     if l == 0 {
         assert!(d.is_err());
     } else {
-        assert!(d.unwrap() == ix);
+        assert!(d.as_ref().is_ok_and(|x| *x == ix));
     }
     // 1 extra byte (an odd trailer) never decodes as the growth form
     let mut odd = [0u8; 4];
     odd.copy_from_slice(&b[..4]);
-    assert!(!matches!(Instruction::decode(&odd), Ok(Instruction::InitVaultLpV19 { .. })));
+    let o = Instruction::decode(&odd);
+    assert!(!matches!(o, Ok(Instruction::InitVaultLpV19 { .. })));
     kani::cover!(l != 0, "round trip");
     kani::cover!(l == 0, "l_launch 0 refused");
+    core::mem::forget(o);
+    core::mem::forget(d);
+    core::mem::forget(ix);
+    core::mem::forget(b);
 }
 
 /// R6 (tag 93): SetAssetRiskLimitsV19 round-trips in BOTH trailer forms (6 bytes: util 0 /
-/// unchanged; 8 bytes: util != 0); an 8-byte trailer carrying util 0 refuses.
+/// unchanged; 8 bytes: util != 0); an 8-byte trailer carrying util 0 refuses. A5: forget +
+/// unwind(56) (the 52-byte encode / decode loops).
 #[kani::proof]
+#[kani::unwind(56)]
 fn kani_growth_r6_tag93_v19_roundtrip() {
     let limits = Instruction::SetAssetRiskLimits {
         asset_index: kani::any(),
@@ -53,17 +63,27 @@ fn kani_growth_r6_tag93_v19_roundtrip() {
     };
     let b = ix.encode();
     assert_eq!(b.len(), if util == 0 { 50 } else { 52 });
-    assert!(Instruction::decode(&b).unwrap() == ix);
+    let d = Instruction::decode(&b);
+    assert!(d.as_ref().is_ok_and(|x| *x == ix));
     // the legacy body alone decodes as the legacy instruction
-    assert!(Instruction::decode(&b[..44]).unwrap() == limits);
+    let d2 = Instruction::decode(&b[..44]);
+    assert!(d2.as_ref().is_ok_and(|x| *x == limits));
     if util != 0 {
         let mut z = b.clone();
         z[50] = 0;
         z[51] = 0;
-        assert!(Instruction::decode(&z).is_err());
+        let d3 = Instruction::decode(&z);
+        assert!(d3.is_err());
+        core::mem::forget(d3);
+        core::mem::forget(z);
     }
     kani::cover!(util == 0, "6-byte form");
     kani::cover!(util != 0, "8-byte form");
+    core::mem::forget(d);
+    core::mem::forget(d2);
+    core::mem::forget(ix);
+    core::mem::forget(limits);
+    core::mem::forget(b);
 }
 
 /// R15d: the P2 LP-credit allocation the utilisation fee travels in. Conservation, the base
