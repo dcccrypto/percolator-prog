@@ -649,6 +649,15 @@ pub mod constants {
     /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
     pub const REDEMPTION_REFRESH_MAX: u8 = 8;
+    /// Security review A6: the inline refresh is also LEG-weighted. One refresh costs ~85k CU
+    /// fixed plus ~32k CU per active leg it re-certifies (measured: 1 leg ~117k, 14 legs ~530k;
+    /// the 77 itself ~60k). Weight of a refreshed portfolio = `REDEMPTION_REFRESH_BASE_WEIGHT +
+    /// legs`, and the sum must be <= `REDEMPTION_REFRESH_WEIGHT_BUDGET` (34 units), so a 77 stays
+    /// under ~1.3M CU and never exhausts the 1.4M meter. Measured with the budget check included:
+    /// 8 single-leg (32 units) 1,016,434 CU; 2 x 14-leg (34 units) 1,204,159 CU; 3 x 14-leg (51)
+    /// is refused up front (InvalidInstruction).
+    pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
+    pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
     pub const MAX_DYNAMIC_TRADE_FEE_BPS: u64 = 10_000;
@@ -7570,8 +7579,8 @@ pub mod ix {
             shares: u128,
         },
         /// v2.2 Wave A item 8, rule 4: tag 76 with a 9-byte trailer `[min_payout_atoms u64]
-        /// [keeper_ok u8]` (`keeper_ok` in {0, 1}; canonical: not both zero -- use the legacy
-        /// 17-byte form for that). Stored in the request's 16-byte extension
+        /// [keeper_ok u8]` (`keeper_ok` in {0, 1}; `min_payout_atoms` must be non-zero, A4 --
+        /// a request without a floor uses the legacy 17-byte form). Stored in the request's 16-byte extension
         /// (`state::LpRedemptionExtV22`).
         RequestRedeemLpSharesV22 {
             shares: u128,
@@ -8390,7 +8399,11 @@ pub mod ix {
                     } else {
                         let min_payout_atoms = read_u64(&mut rest)?;
                         let keeper_ok = read_u8(&mut rest)?;
-                        if keeper_ok > 1 || (min_payout_atoms == 0 && keeper_ok == 0) {
+                        // Security review A4: a v2.2 request ALWAYS carries a non-zero floor.
+                        // `keeper_ok = 1` with no floor would let any third party execute at any
+                        // (exact) moment with no payout bound; `(0, 0)` is the non-canonical
+                        // legacy form.
+                        if keeper_ok > 1 || min_payout_atoms == 0 {
                             return Err(ProgramError::InvalidInstructionData);
                         }
                         Self::RequestRedeemLpSharesV22 {
@@ -12830,16 +12843,25 @@ pub mod processor {
         collect_maintenance_fee_before_value_debit_view(cfg, group, portfolio)
     }
 
-    /// Item 7 precision floor at every re-anchor of a growth asset (ConfigureAuthMark,
-    /// RestartAssetOracle, lifecycle oracle reset): the new per-lot mark must be at least
-    /// `LOT_PRICE_FLOOR_E6`, so a creator cannot InitMarket at the floor and then re-anchor an
-    /// empty market to an untrackable price. Non-growth assets are unchanged. Custom(119).
-    fn require_lot_price_floor_view(
+    /// Item 7 precision floor at a growth asset's LAUNCH anchor (ConfigureAuthMark before any
+    /// portfolio was ever created on the market: asset 0's `next_portfolio_id == 0`). A creator
+    /// cannot InitMarket at the floor and then re-anchor the empty, never-used market to an
+    /// untrackable price. Security review A2: once the market was used, a re-anchor is NOT
+    /// floored (and RestartAssetOracle never is), so an asset whose mark fell below the floor by
+    /// ordinary pushes can be revived at its true price. Non-growth assets are unchanged. 119.
+    fn require_lot_launch_floor_view(
         group: &state::MarketViewMutV16<'_>,
+        cfg: &WrapperConfigV16,
         asset_index: usize,
         mark_e6: u64,
     ) -> ProgramResult {
-        if crate::wave_a_v22::lot_price_below_floor(asset_growth_view(group, asset_index)?.is_some(), mark_e6)
+        let growth = asset_growth_view(group, asset_index)?.is_some();
+        if !growth {
+            return Ok(());
+        }
+        let used = read_oracle_profile_from_view(group, cfg, 0)?.next_portfolio_id != 0;
+        if crate::wave_a_v22::reanchor_floor_applies(growth, used)
+            && crate::wave_a_v22::lot_price_below_floor(growth, mark_e6)
         {
             return Err(PercolatorError::LotConfigInvalid.into());
         }
@@ -23100,7 +23122,6 @@ pub mod processor {
             }
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
             expect_live_authority(&existing_profile.asset_admin, authority.key)?;
-            require_lot_price_floor_view(&group, asset_index, initial_price)?;
             advance_control_sequence_view(
                 &mut group,
                 asset_index,
@@ -24808,7 +24829,7 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
-            require_lot_price_floor_view(&group, asset_index_usize, initial_mark_e6)?;
+            require_lot_launch_floor_view(&group, &cfg, asset_index_usize, initial_mark_e6)?;
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
@@ -27035,7 +27056,7 @@ pub mod processor {
         redeemer_signed: bool,
         wire_min_payout_atoms: u64,
         n_refresh: u8,
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, bool), ProgramError> {
         let ext = state::read_lp_redemption_ext(&redemption_ai.try_borrow_data()?)?;
         let asset_index = registry.domain as usize / 2;
         let market_requires = {
@@ -27075,9 +27096,26 @@ pub mod processor {
             }];
             let (_, _, max_market_slots, _) =
                 state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+            // A6: leg-weighted refresh budget, checked before any refresh runs.
+            let mut weight: u32 = 0;
             for portfolio_ai in refresh.iter() {
                 expect_writable(portfolio_ai)?;
                 expect_owner(portfolio_ai, program_id)?;
+                let legs = {
+                    let mut data = portfolio_ai.try_borrow_mut_data()?;
+                    let view = state::portfolio_view_mut_for_market_slots(&mut data, max_market_slots)?;
+                    percolator::active_bitmap_count_ones(
+                        view.header.active_bitmap.map(percolator::V16PodU64::get),
+                    )
+                };
+                weight = weight
+                    .checked_add(crate::wave_a_v22::refresh_weight(legs))
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+            if weight > constants::REDEMPTION_REFRESH_WEIGHT_BUDGET {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            for portfolio_ai in refresh.iter() {
                 match handle_permissionless_crank_zero_copy(
                     program_id,
                     cranker,
@@ -27094,29 +27132,154 @@ pub mod processor {
                 }
             }
         }
+        let mut dip_floor = false;
         if require_loss_current {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_, group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::ExitRequiresLossCurrent.into());
+            }
             let slot = &group
                 .markets
                 .get(asset_index)
                 .ok_or(PercolatorError::InvalidInstruction)?
                 .engine;
-            if group.header.mode != 0
-                || !crate::wave_a_v22::loss_current(
-                    slot.asset.stale_account_count_long.get(),
-                    slot.asset.stale_account_count_short.get(),
-                    slot.pending_domain_loss_barrier_long.get(),
-                    slot.pending_domain_loss_barrier_short.get(),
-                )
-            {
-                return Err(PercolatorError::ExitRequiresLossCurrent.into());
+            let counters = crate::wave_a_v22::LossCounters {
+                stale_long: slot.asset.stale_account_count_long.get(),
+                stale_short: slot.asset.stale_account_count_short.get(),
+                barrier_long: slot.pending_domain_loss_barrier_long.get(),
+                barrier_short: slot.pending_domain_loss_barrier_short.get(),
+                obligation_long: slot.asset.pending_obligation_count_long.get(),
+                obligation_short: slot.asset.pending_obligation_count_short.get(),
+                b_stale_accounts: group.header.b_stale_account_count.get(),
+            };
+            // A1: a redeemer-signed exit on a book that is only K/F-stale may proceed under
+            // the bounded-dip floor (checked once the payout is priced); a keeper exit, or any
+            // exit while a genuine loss is pending (A5), is refused.
+            match crate::wave_a_v22::loss_gate(true, &counters, redeemer_signed) {
+                crate::wave_a_v22::LossGate::Pass => {}
+                crate::wave_a_v22::LossGate::DipFloor => dip_floor = true,
+                crate::wave_a_v22::LossGate::Refuse => {
+                    return Err(PercolatorError::ExitRequiresLossCurrent.into());
+                }
             }
         }
-        Ok(crate::wave_a_v22::effective_min_payout(
-            wire_min_payout_atoms,
-            ext.min_payout_atoms,
+        Ok((
+            crate::wave_a_v22::effective_min_payout(wire_min_payout_atoms, ext.min_payout_atoms),
+            dip_floor,
         ))
+    }
+
+    /// Security review A1: the bounded-dip floor for a redeemer-signed exit that is not
+    /// loss-current: `atoms >= ceil(par * (10_000 - EXIT_DIP_BPS) / 10_000)` with
+    /// `par = floor(shares * (P_own + P_sibling) / S)` (both pots' ledger principal, after the
+    /// A3 netting, which leaves the sum unchanged). Otherwise 118 (wait for a refreshed book).
+    #[inline(never)]
+    fn execute_redemption_dip_floor_check(
+        ledger_ai: &AccountInfo<'_>,
+        sibling_ledger_ai: &AccountInfo<'_>,
+        shares: u128,
+        total_shares: u128,
+        atoms: u128,
+    ) -> ProgramResult {
+        let principal = |ai: &AccountInfo<'_>| -> Result<u128, ProgramError> {
+            let data = ai.try_borrow_data()?;
+            if data.is_empty() || !state::is_initialized(&data) {
+                return Ok(0);
+            }
+            Ok(state::read_backing_domain_ledger(&data)?.total_principal_atoms)
+        };
+        let total = principal(ledger_ai)?
+            .checked_add(principal(sibling_ledger_ai)?)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let par = crate::wave_a_v22::par_atoms(shares, total, total_shares)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if !crate::wave_a_v22::dip_floor_ok(atoms, par) {
+            return Err(PercolatorError::ExitRequiresLossCurrent.into());
+        }
+        Ok(())
+    }
+
+    /// Security review A3 (combined-pot E3 for exits): net a non-bound vault's cross-pot
+    /// surplus against its cross-pot deficit by relabelling LEDGER principal (no backing moves,
+    /// so the per-pot claim coverage and `EarnExitWouldUnderBackClaims` are untouched, and ΣP --
+    /// the entry par -- is unchanged). Per-pot E3 then sums to `min(ΣP, Σ phys)` exactly
+    /// (`wave_a_v22::cross_pot_netting`). Both pots must be initialised, Fresh and unlapsed, and
+    /// both ledgers writable; otherwise nothing is netted (the per-pot reading is the
+    /// conservative one).
+    #[inline(never)]
+    fn nonbound_exit_cross_pot_netting(
+        market_ai: &AccountInfo<'_>,
+        registry_pda: [u8; 32],
+        domain: u16,
+        own_ai: &AccountInfo<'_>,
+        sib_ai: &AccountInfo<'_>,
+    ) -> ProgramResult {
+        if !own_ai.is_writable
+            || !sib_ai.is_writable
+            || own_ai.data_is_empty()
+            || sib_ai.data_is_empty()
+        {
+            return Ok(());
+        }
+        let market_key = market_ai.key.to_bytes();
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let now = authenticated_market_slot_or_fallback_view(&group);
+        let sib_domain = sibling_domain(domain);
+        let (s_own, b_own) = backing_domain_parts_view(&group, domain as usize)?;
+        let (s_sib, b_sib) = backing_domain_parts_view(&group, sib_domain as usize)?;
+        for b in [&b_own, &b_sib] {
+            if b.status != BackingBucketStatusV16::Fresh
+                || !policy_v16::backing_principal_withdrawal_is_fresh(b.expiry_slot, now)
+            {
+                return Ok(());
+            }
+        }
+        let (mut l_own, own_init) = read_or_new_backing_domain_ledger(
+            &own_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            domain,
+            &b_own,
+        )?;
+        let (mut l_sib, sib_init) = read_or_new_backing_domain_ledger(
+            &sib_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            sib_domain,
+            &b_sib,
+        )?;
+        if !own_init || !sib_init {
+            return Ok(());
+        }
+        sync_backing_domain_ledger(&mut l_own, &b_own)?;
+        sync_backing_domain_ledger(&mut l_sib, &b_sib)?;
+        let (m, from_own) = crate::wave_a_v22::cross_pot_netting(
+            l_own.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_own, &b_own),
+            l_sib.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_sib, &b_sib),
+        );
+        if m == 0 {
+            return Ok(());
+        }
+        let (from, to) = if from_own { (&mut l_own, &mut l_sib) } else { (&mut l_sib, &mut l_own) };
+        from.total_principal_atoms = from
+            .total_principal_atoms
+            .checked_sub(m)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        to.total_principal_atoms = to
+            .total_principal_atoms
+            .checked_add(m)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        write_or_init_backing_domain_ledger(&mut own_ai.try_borrow_mut_data()?, &l_own, true)?;
+        write_or_init_backing_domain_ledger(&mut sib_ai.try_borrow_mut_data()?, &l_sib, true)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "v22_exit_pot_netting domain={} from_own={} atoms={}",
+            domain, from_own, m
+        ));
+        Ok(())
     }
 
     /// LP Vault — ExecuteRedemption (tag 77).
@@ -27815,7 +27978,7 @@ pub mod processor {
         // v2.2 Wave A item 8 (R3-M1): the H-1(b) signature rule now lives in
         // `execute_redemption_v22_preflight` (with the keeper_ok carve-out, the inline refresh
         // and the loss-current rule). Out of line: tag 77 sits at the SBF frame edge.
-        let min_payout_atoms = execute_redemption_v22_preflight(
+        let (min_payout_atoms, dip_floor) = execute_redemption_v22_preflight(
             program_id,
             accounts,
             cranker,
@@ -27833,6 +27996,16 @@ pub mod processor {
                 program_id,
                 market_ai,
                 &registry_pda,
+                registry.domain,
+                ledger_ai,
+                sibling_ledger_ai,
+            )?;
+        }
+        // v2.2 security review A3: combined-pot E3 for a non-bound exit (ledger netting).
+        if bound_tail.is_none() {
+            nonbound_exit_cross_pot_netting(
+                market_ai,
+                registry_pda.to_bytes(),
                 registry.domain,
                 ledger_ai,
                 sibling_ledger_ai,
@@ -27956,6 +28129,16 @@ pub mod processor {
         // Checked before any write; the shares stay escrowed.
         if !crate::wave_a_v22::payout_meets_min(atoms, min_payout_atoms) {
             return Err(PercolatorError::RedemptionBelowMinPayout.into());
+        }
+        // v2.2 security review A1: the bounded-dip floor (signed exit on a K/F-stale book).
+        if dip_floor {
+            execute_redemption_dip_floor_check(
+                ledger_ai,
+                sibling_ledger_ai,
+                redemption.shares,
+                registry.total_lp_shares_outstanding,
+                atoms,
+            )?;
         }
         let atoms_u64 = amount_to_u64(atoms)?;
         // backing_num is derived from principal_portion only (the fresh-unliened

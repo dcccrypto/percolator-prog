@@ -27,7 +27,10 @@ l_launch_x100 u16`) forms. NEW lot form: growth block + `lot_exp u8` (+5 bytes),
 lands, follows `lot_exp`.
 
 **Precision floor.** Every growth market must open at `initial_price >= 10_000_000` (=$10 per lot);
-the same floor binds ConfigureAuthMark (tag 62) and RestartAssetOracle on growth assets. Choose
+the same floor binds a ConfigureAuthMark (tag 62) made BEFORE launch (no portfolio ever created on
+the market). Security review A2: after launch, a re-anchor (ConfigureAuthMark of a used market,
+RestartAssetOracle, lifecycle reset) is not floored, so an asset whose mark fell below $10 per lot
+can be revived at its true price. Choose
 `lot_exp` so the per-lot price at launch is in [$10, $10,000]:
 `lot_exp = clamp(ceil(log10(10 / P_token_usd)), 0, 15)`.
 
@@ -50,8 +53,9 @@ program creates; forced on in mainnet builds. Bits 0/1 are reserved for items 6/
 
 **Tag 76 RequestRedeemLpShares.**
 - Legacy: `[76, shares u128]` (17 B) → request account body 96 B (unchanged).
-- v2.2: `[76, shares u128, min_payout_atoms u64, keeper_ok u8]` (26 B); `keeper_ok ∈ {0,1}`; the
-  all-zero trailer is refused (send legacy). The request PDA is created **16 bytes longer**
+- v2.2: `[76, shares u128, min_payout_atoms u64, keeper_ok u8]` (26 B); `keeper_ok ∈ {0,1}`;
+  `min_payout_atoms` MUST be non-zero (security review A4: a `keeper_ok` request without a floor is
+  refused at decode; a request without a floor is the legacy form). The request PDA is created **16 bytes longer**
   (`HEADER_LEN + 112`) with `LpRedemptionExtV22 { min_payout_atoms u64 @96, keeper_ok u8 @104,
   _reserved [u8;7] @105 }` (body offsets). Any `getProgramAccounts` filter on the request's
   `dataSize` must accept both lengths.
@@ -59,14 +63,26 @@ program creates; forced on in mainnet builds. Bits 0/1 are reserved for items 6/
 **Tag 77 ExecuteRedemption.**
 - Legacy: `[77, domain u16]` (3 B).
 - v2.2: `[77, domain u16, min_payout_atoms u64, n_refresh u8]` (12 B); `n_refresh <= 8`; the
-  all-zero trailer is refused.
+  all-zero trailer is refused. **Leg-weighted (A6):** each refreshed portfolio weighs
+  `3 + active legs`; the sum must be <= 34 (else `InvalidInstruction`, before any refresh). Measured:
+  8 single-leg 1,016,434 CU; 2 x 14-leg 1,199,659 CU; 8 liquidating single-leg 1,066,615 CU.
 - Accounts: unchanged [0..12]; then `n_refresh` stale positioned portfolios (writable) at
   [13..13+n]; then the vault asset's oracle accounts (none for AuthMark). Refresh is non-bound Live
   only (bound vaults keep [13]/[14] for the vault-LP tail).
-- Rules: payout `>= max(wire min, stored min)` else 117; on a Live non-bound vault with bit2 (all
-  v2.2 markets), after the inline refresh the asset must have zero stale portfolios and zero domain
-  loss barriers, else 118; the redeemer signs [12], **unless** the request stored `keeper_ok = 1`, in
-  which case anyone may execute (always loss-gated, always at the stored floor).
+- Rules: payout `>= max(wire min, stored min)` else 117. On a Live non-bound vault with bit2 (all
+  v2.2 markets), after the inline refresh:
+  - loss-current (zero stale portfolios, zero domain loss barriers, zero retained socialized-loss
+    obligations, zero B-index-stale accounts; A5) -> priced as is;
+  - only K/F-stale and the redeemer SIGNED -> allowed iff the payout is within `EXIT_DIP_BPS` = 25
+    bps of par (`par = shares * ΣP / S`), else 118 (security review A1: exits stay live on books
+    with more than 8 positioned portfolios; the touch-order skim is bounded by 25 bps x share);
+  - a genuine loss pending, or an unsigned keeper exit on a stale book -> 118.
+  The redeemer signs [12], **unless** the request stored `keeper_ok = 1`, in which case anyone may
+  execute (always strictly loss-gated, always at the stored floor).
+- **Combined-pot exit (A3):** before pricing, a non-bound 77 nets the vault's cross-pot surplus
+  against its cross-pot deficit by moving LEDGER principal (no backing moves), so the exit NAV is
+  `min(ΣP, Σ phys)` + earnings. A loss routed into one pot now offsets a claim on the other (the
+  0.87% wedge is gone). Quotes must use the combined reading.
 
 **SDK `quoteRedemption()`** must simulate the refreshes: collect every positioned portfolio on the
 vault's asset with `stale` (or simply every positioned one), build the 77 with them as [13..]

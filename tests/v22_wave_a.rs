@@ -20,7 +20,7 @@ use percolator_prog::{
     ix::Instruction as ProgInstruction,
     oracle_v16::clamp_toward_engine_dt,
     state,
-    wave_a_v22::{self, ExitGate},
+    wave_a_v22::{self, ExitGate, LossCounters, LossGate, EXIT_DIP_BPS},
 };
 use proptest::prelude::*;
 use solana_sdk::{
@@ -127,10 +127,54 @@ proptest! {
         prop_assert_eq!(wave_a_v22::payout_meets_min(atoms, m), atoms >= m as u128);
     }
 
-    /// Rule 3 at full width: loss-current iff all four counters are zero.
+    /// Rule 3 at full width (A5 widened): loss-current iff all seven counters are zero; the dip
+    /// fallback (A1) only ever applies to a signed exit with K/F staleness alone.
     #[test]
-    fn loss_current_full_width(a in any::<u64>(), b in any::<u64>(), c in any::<u64>(), d in any::<u64>()) {
-        prop_assert_eq!(wave_a_v22::loss_current(a, b, c, d), a == 0 && b == 0 && c == 0 && d == 0);
+    fn loss_current_and_gate_full_width(
+        sl in any::<u64>(), ss in any::<u64>(), bl in any::<u64>(), bs in any::<u64>(),
+        ol in any::<u64>(), os in any::<u64>(), bst in any::<u64>(),
+        zero_mask in any::<u8>(), signed in any::<bool>(), require in any::<bool>(),
+    ) {
+        // zero a random subset so the all-zero corners are reached often
+        let z = |bit: u8, v: u128| if zero_mask & (1 << bit) != 0 { 0 } else { v };
+        let c = LossCounters {
+            stale_long: z(0, sl as u128) as u64, stale_short: z(1, ss as u128) as u64,
+            barrier_long: z(2, bl as u128) as u64, barrier_short: z(3, bs as u128) as u64,
+            obligation_long: z(4, ol as u128) as u64, obligation_short: z(5, os as u128) as u64,
+            b_stale_accounts: z(6, bst as u128) as u64,
+        };
+        let genuine = c.barrier_long == 0 && c.barrier_short == 0 && c.obligation_long == 0
+            && c.obligation_short == 0 && c.b_stale_accounts == 0;
+        let lc = c.stale_long == 0 && c.stale_short == 0 && genuine;
+        prop_assert_eq!(wave_a_v22::loss_current(&c), lc);
+        let expect = if !require || lc { LossGate::Pass } else if signed && genuine { LossGate::DipFloor } else { LossGate::Refuse };
+        prop_assert_eq!(wave_a_v22::loss_gate(require, &c, signed), expect);
+    }
+
+    /// A1 dip floor at full width: payout >= ceil(par * 9_975 / 10_000), fail-closed on overflow.
+    #[test]
+    fn dip_floor_full_width(payout in any::<u128>(), par in 0u128..=(u64::MAX as u128) * 1_000) {
+        let need = (par * (10_000 - EXIT_DIP_BPS as u128)).div_ceil(10_000);
+        prop_assert_eq!(wave_a_v22::dip_floor_ok(payout, par), payout >= need);
+        // never more than 25 bps below par
+        if wave_a_v22::dip_floor_ok(payout, par) {
+            prop_assert!(payout.checked_mul(10_000).map_or(true, |x| x >= par * 9_975));
+        }
+    }
+
+    /// A3 netting at full u64 width: ΣP is unchanged, no principal goes negative, and the
+    /// per-pot E3 after netting sums to exactly min(ΣP, Σphys).
+    #[test]
+    fn cross_pot_netting_is_combined_e3(pa in 0u128..=u64::MAX as u128, xa in 0u128..=u64::MAX as u128,
+                                        pb in 0u128..=u64::MAX as u128, xb in 0u128..=u64::MAX as u128) {
+        let e3 = |p: u128, x: u128| p.min(x);
+        let before = e3(pa, xa) + e3(pb, xb);
+        let (m, from_a) = wave_a_v22::cross_pot_netting(pa, xa, pb, xb);
+        let (pa2, pb2) = if m == 0 { (pa, pb) } else if from_a { (pa - m, pb + m) } else { (pa + m, pb - m) };
+        prop_assert_eq!(pa2 + pb2, pa + pb);
+        let after = e3(pa2, xa) + e3(pb2, xb);
+        prop_assert_eq!(after, (pa + pb).min(xa + xb));
+        prop_assert!(after >= before);
     }
 }
 
@@ -228,6 +272,11 @@ fn wave_a_wire_round_trips_and_canonical_forms() {
     assert!(ProgInstruction::decode(&bad).is_err());
     let z76 = ProgInstruction::RequestRedeemLpSharesV22 { shares: 7, min_payout_atoms: 0, keeper_ok: 0 };
     assert!(ProgInstruction::decode(&z76.encode()).is_err());
+    // Security review A4: keeper_ok with no floor is refused at decode.
+    let k0 = ProgInstruction::RequestRedeemLpSharesV22 { shares: 7, min_payout_atoms: 0, keeper_ok: 1 };
+    assert!(ProgInstruction::decode(&k0.encode()).is_err(), "A4: keeper_ok=1 with min_payout=0");
+    let k1 = ProgInstruction::RequestRedeemLpSharesV22 { shares: 7, min_payout_atoms: 1, keeper_ok: 1 };
+    assert_eq!(ProgInstruction::decode(&k1.encode()).unwrap(), k1);
     // 77: legacy 3 B; v2.2 12 B; n_refresh 9 and the all-zero trailer refused.
     assert_eq!(ProgInstruction::ExecuteRedemption { domain: 1 }.encode().len(), 3);
     for n in 0..=REDEMPTION_REFRESH_MAX {
@@ -302,11 +351,11 @@ fn init_lot_market_records_lot_exp_and_p4_default() {
 
 /// I-P1: the lot exponent survives ConfigureAuthMark; a Hybrid / EWMA reconfiguration (modes
 /// that cannot carry a lot) is refused with 119 instead of silently clearing it; and a growth
-/// re-anchor below the floor is refused (the creator cannot launch at the floor and re-anchor
-/// to an untrackable mark). NEGATIVE CONTROL: the same EWMA reconfiguration on a lot-0 market
+/// LAUNCH re-anchor (no portfolio ever created) below the floor is refused (the creator cannot
+/// launch at the floor and re-anchor to an untrackable mark). NEGATIVE CONTROL: the same EWMA reconfiguration on a lot-0 market
 /// succeeds.
 #[test]
-fn lot_exp_is_immutable_and_the_floor_binds_every_reanchor() {
+fn lot_exp_is_immutable_and_the_floor_binds_the_launch_anchor() {
     let mut env = V16CuEnv::new();
     init_on_fresh(&mut env, growth_init(20_000_000, Some(6))).expect("lot 6 market");
     env.svm.warp_to_slot(2);
@@ -352,4 +401,157 @@ fn lot_exp_is_immutable_and_the_floor_binds_every_reanchor() {
     init_on_fresh(&mut env, growth_init(20_000_000, None)).expect("lot 0 market");
     env.configure_ewma_mark_with_cu(2, 30_000_000, 10, 0);
     assert_eq!(profile0(&env).oracle_mode, 2);
+}
+
+// ─────────────────────────── security review A2 regressions ─────────────────────────────────
+
+/// STATE POKE (test only): asset 0 -> Recovery. `state::write_market` (an off-chain fixture
+/// helper) rebuilds asset 0's oracle profile from the config for a non-Manual mode, which would
+/// clobber the profile bytes under test, so the original profile is written back afterwards.
+fn set_asset0_lifecycle_recovery(env: &mut V16CuEnv) {
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let profile = state::read_asset_oracle_profile(&m.data, 0).unwrap();
+    let (cfg, mut group) = state::read_market(&m.data).unwrap();
+    group.assets[0].lifecycle = percolator::AssetLifecycleV16::Recovery;
+    state::write_market(&mut m.data, &cfg, &group).unwrap();
+    state::write_asset_oracle_profile(&mut m.data, 0, &profile).unwrap();
+    env.svm.set_account(env.market, m).unwrap();
+}
+
+fn restart(env: &mut V16CuEnv, price: u64) -> Result<u64, String> {
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::RestartAssetOracle {
+            asset_index: 0,
+            market_id: 1,
+            now_slot: 3,
+            initial_price: price,
+            observation_sequence: seq,
+        },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+        &[&admin],
+    )
+}
+
+/// Reviewer's S9 as a regression (A2). A growth market launched at the floor is pushed below it
+/// by ordinary price action; the asset goes to Recovery; RestartAssetOracle at the TRUE (dipped)
+/// price must succeed (before the fix: Custom(119), so a crashed asset could never be revived).
+#[test]
+fn sec_s9_restart_after_a_dip_below_the_floor_is_allowed() {
+    let mut env = V16CuEnv::new();
+    init_on_fresh(&mut env, growth_init(LOT_PRICE_FLOOR_E6, Some(3))).expect("lot 3 at the floor");
+    env.svm.warp_to_slot(2);
+    env.configure_auth_mark_for_asset_as_admin(0, 2, LOT_PRICE_FLOOR_E6);
+    env.svm.warp_to_slot(3);
+    let dipped = LOT_PRICE_FLOOR_E6 - 4_000;
+    env.push_auth_mark_for_asset_as_admin(0, 3, dipped);
+    set_asset0_lifecycle_recovery(&mut env);
+    assert_eq!(state::profile_lot_exp(&profile0(&env)), 3, "lot before the restart");
+    let r = restart(&mut env, dipped);
+    assert!(r.is_ok(), "A2: restart at the true price below the floor: {r:?}");
+    assert_eq!(state::profile_lot_exp(&profile0(&env)), 3, "lot kept by the restart");
+}
+
+/// A2: the floor binds only the LAUNCH anchor. Once the market was used (a portfolio exists),
+/// ConfigureAuthMark may re-anchor below the floor. NEGATIVE CONTROL (same test): before any
+/// portfolio, the same re-anchor is refused with 119.
+#[test]
+fn a2_configure_auth_mark_below_floor_only_refused_before_launch() {
+    let mut env = V16CuEnv::new();
+    init_on_fresh(&mut env, growth_init(LOT_PRICE_FLOOR_E6, Some(3))).expect("lot 3");
+    env.svm.warp_to_slot(2);
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let ix = |seq: u64| ProgInstruction::ConfigureAuthMark {
+        asset_index: 0,
+        market_id: 1,
+        now_slot: 2,
+        initial_mark_e6: 5_000_000,
+        observation_sequence: seq,
+    };
+    let pre = env.send(ix(seq), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
+    assert_eq!(code(&pre), Some(ERR_LOT), "pre-launch re-anchor below the floor: {pre:?}");
+    let owner = solana_sdk::signature::Keypair::new();
+    env.create_portfolio(&owner);
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    env.svm.expire_blockhash();
+    let post = env.send(ix(seq), vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)], &[&admin]);
+    assert!(post.is_ok(), "A2: re-anchor of a used market below the floor: {post:?}");
+}
+
+/// Reviewer S5 (sec_v22a_replay.rs): wire hygiene of the v2.2 trailers, adopted as a regression.
+#[test]
+fn sec_s5_wire_malleability() {
+    let ok76 = ProgInstruction::RequestRedeemLpSharesV22 { shares: 5, min_payout_atoms: 7, keeper_ok: 1 }.encode();
+    assert_eq!(ok76.len(), 26);
+    let mut v = ok76.clone();
+    v.push(0);
+    assert!(ProgInstruction::decode(&v).is_err(), "trailing byte after the 76 trailer");
+    let mut v = ok76.clone();
+    v[25] = 2;
+    assert!(ProgInstruction::decode(&v).is_err(), "keeper_ok 2");
+    for cut in 18..26 {
+        assert!(ProgInstruction::decode(&ok76[..cut]).is_err(), "partial 76 trailer len {cut}");
+    }
+    let ok77 = ProgInstruction::ExecuteRedemptionV22 { domain: 0, min_payout_atoms: 7, n_refresh: 3 }.encode();
+    assert_eq!(ok77.len(), 12);
+    let mut v = ok77.clone();
+    v.push(0);
+    assert!(ProgInstruction::decode(&v).is_err());
+    for cut in 4..12 {
+        assert!(ProgInstruction::decode(&ok77[..cut]).is_err(), "partial 77 trailer len {cut}");
+    }
+    assert!(ProgInstruction::decode(&ProgInstruction::ExecuteRedemption { domain: 0 }.encode()).is_ok());
+    assert!(ProgInstruction::decode(&ProgInstruction::RequestRedeemLpShares { shares: 1 }.encode()).is_ok());
+    let mut z = ok76.clone();
+    z[17..25].copy_from_slice(&0u64.to_le_bytes());
+    for k in [0u8, 1] {
+        z[25] = k;
+        assert!(ProgInstruction::decode(&z).is_err(), "zero floor with keeper_ok {k} (A4)");
+    }
+}
+
+/// Reviewer sec_v22a_len.rs: account lengths (the v2.2 request is 16 B longer than legacy and
+/// collides with no other wrapper account kind's length).
+#[test]
+fn sec_account_lens() {
+    let legacy = state::lp_redemption_account_len();
+    let v22 = state::lp_redemption_v22_account_len();
+    assert_eq!(v22, legacy + 16);
+    for other in [
+        state::lp_vault_registry_account_len(),
+        state::vault_lp_state_account_len(),
+        state::vault_lp_ext_account_len(),
+        state::nft_registry_account_len(),
+        state::backing_domain_ledger_account_len(),
+        state::insurance_ledger_account_len(),
+    ] {
+        assert!(other != legacy && other != v22, "length collision {other}");
+    }
+}
+
+/// Merge prep (Wave B): the merged InitMarket tag-0 trailer grammar is
+/// `growth(4) [lot(1)] [rent(6) [band(10)]]` -- an ODD trailer length carries the lot byte at
+/// offset 4. On this branch only the first two rows exist; this pins them and pins that every
+/// Wave B length (10 / 20) and every lot-bearing Wave B length (11 / 21) is refused here, so the
+/// merge must extend the decoder deliberately (Wave B's own test must add the 10/11/20/21 rows).
+#[test]
+fn merge_prep_init_market_trailer_grammar() {
+    let base = base_init(LOT_PRICE_FLOOR_E6).encode();
+    let mut g4 = base.clone();
+    g4.extend_from_slice(&400u16.to_le_bytes());
+    g4.extend_from_slice(&1_000u16.to_le_bytes());
+    assert!(matches!(ProgInstruction::decode(&g4), Ok(ProgInstruction::InitMarketV19 { .. })));
+    let mut g5 = g4.clone();
+    g5.push(6);
+    assert!(matches!(ProgInstruction::decode(&g5), Ok(ProgInstruction::InitMarketLotV22 { lot_exp: 6, .. })));
+    for extra in [6usize, 7, 16, 17] {
+        let mut t = g4.clone();
+        t.extend(std::iter::repeat(1u8).take(extra));
+        assert!(ProgInstruction::decode(&t).is_err(), "trailer len {} refused on Wave A", 4 + extra);
+    }
 }
