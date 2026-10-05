@@ -154,6 +154,8 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::VaultLpConvertPnl { .. } => "VaultLpConvertPnl",
         Instruction::VaultLpSettleResolved { .. } => "VaultLpSettleResolved",
         Instruction::VaultLpReleaseSurplus { .. } => "VaultLpReleaseSurplus",
+        Instruction::AdlWindDown { .. } => "AdlWindDown",
+        Instruction::SetAdlWindDownMaxSlots { .. } => "SetAdlWindDownMaxSlots",
     }
 }
 
