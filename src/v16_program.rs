@@ -17797,7 +17797,21 @@ pub mod processor {
         // E3: the R-1 windfall cap measures what NAV actually prices as missing (physical);
         // the H-1 either-pot pause keeps the ledger predicate, which is never lower.
         let impairment = principal - nonbound_available_e3(&source, &bucket, &ledger);
-        Ok((principal, impairment, backing_ledger_over_impaired(&ledger)))
+        Ok((principal, impairment, nonbound_pot_over_impaired_e3(&source, &bucket, &ledger)))
+    }
+
+    /// E3-consistent "over-impaired" (the H-1 either-pot pause and tag 91's destination guard):
+    /// the ledger's booked net impairment exceeds the principal AND the pot is physically short
+    /// of its principal net of claims. A pot the ledger books as over-impaired but which is
+    /// physically whole (the I-2 / SI shape: consumed lien, fresh untouched) is priced at its
+    /// principal by E3, so pausing on it would only lock the vault -- e.g. after an E3-priced 77
+    /// drained that pot's ledger principal below its phantom booked loss.
+    fn nonbound_pot_over_impaired_e3(
+        source: &SourceCreditStateV16,
+        bucket: &percolator::BackingBucketV16,
+        l: &state::BackingDomainLedgerAccountV16,
+    ) -> bool {
+        backing_ledger_over_impaired(l) && nonbound_available_e3(source, bucket, l) < l.total_principal_atoms
     }
 
     /// `impairment * 10_000 > max_bps * principal`, exactly, without overflow: for integers
@@ -26154,7 +26168,7 @@ pub mod processor {
             // underflowed (77 -> 25), and a floored NAV would instead hide the loss from the
             // remaining holders. The impairment stays with the pot that took it. Same code (25)
             // as the old principal-only bound.
-            if amount > backing_ledger_available_principal_atoms(&from_ledger) {
+            if amount > nonbound_available_e3(&from_source, &from_bucket, &from_ledger) {
                 return Err(PercolatorError::EngineCounterUnderflow.into());
             }
 
@@ -26226,7 +26240,7 @@ pub mod processor {
             // watermark to the post-refill value so the NEXT sync sees no phantom recovery.
             // Suppressing the sync outright would have been simpler and wrong — it would
             // also swallow real impairment that happened before this instruction.
-            let (_, to_bucket_pre) = backing_domain_parts_view(&group, to_domain as usize)?;
+            let (to_source_pre, to_bucket_pre) = backing_domain_parts_view(&group, to_domain as usize)?;
             let (mut to_ledger, to_initialized) = read_or_new_backing_domain_ledger(
                 &to_ledger_data,
                 market_ai.key.to_bytes(),
@@ -26245,7 +26259,7 @@ pub mod processor {
             // equals its principal is not over-impaired and still accepts (NAV-neutral).
             // Fail closed before any destination write; the source-side writes above are
             // discarded with the transaction.
-            if backing_ledger_over_impaired(&to_ledger) {
+            if nonbound_pot_over_impaired_e3(&to_source_pre, &to_bucket_pre, &to_ledger) {
                 return Err(PercolatorError::LpVaultTargetPotImpaired.into());
             }
             add_fresh_counterparty_backing_view(
@@ -26284,15 +26298,18 @@ pub mod processor {
     #[inline(never)]
     fn execute_redemption_oi_reservation_check(
         ledger: &state::BackingDomainLedgerAccountV16,
+        // E3: the pot's AVAILABLE principal the payout was priced on (non-bound: the physical
+        // attribution; bound: the ledger reading, unchanged), so the guard and the payout agree.
+        available_pre: u128,
         principal_portion: u128,
         gross_consumed: u128,
         outstanding_post: u128,
-        oi_reservation_threshold_bps: u16,
-        fee_share_bps: u16,
+        registry: &state::LpVaultRegistryV16,
     ) -> ProgramResult {
-        // Post-redeem NAV: recompute with post-withdrawal counters.
-        let post_principal = ledger
-            .total_principal_atoms
+        let oi_reservation_threshold_bps = registry.oi_reservation_threshold_bps;
+        let fee_share_bps = registry.fee_share_bps;
+        // Post-redeem NAV: the available principal after this redemption's principal leaves.
+        let post_principal = available_pre
             .checked_sub(principal_portion)
             .ok_or(PercolatorError::EngineCounterUnderflow)?;
         // Use gross_consumed (not earnings_portion) so nav_post reflects
@@ -26305,8 +26322,8 @@ pub mod processor {
             post_principal,
             ledger.total_earnings_atoms,
             post_earnings_withdrawn,
-            ledger.cumulative_loss_atoms,
-            ledger.cumulative_recovery_atoms,
+            0,
+            0,
             fee_share_bps,
         )?;
         let nav_post_num = nav_post_atoms
@@ -26960,11 +26977,15 @@ pub mod processor {
                 // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
                 execute_redemption_oi_reservation_check(
                     &ledger,
+                    if bound_tail.is_some() {
+                        backing_ledger_available_principal_atoms(&ledger)
+                    } else {
+                        ledger_cap
+                    },
                     principal_portion,
                     gross_consumed,
                     bucket.valid_liened_backing_num,
-                    registry.oi_reservation_threshold_bps,
-                    registry.fee_share_bps,
+                    &registry,
                 )?;
             }
             // ── Principal-side bucket mutation. ──
