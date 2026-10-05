@@ -2813,7 +2813,18 @@ pub mod state {
 
     pub fn clear_adl_episode_in_wrapper_bytes(wrapper: &mut [u8]) -> Result<(), ProgramError> {
         let limits = asset_risk_limits_from_wrapper_bytes(wrapper)?;
-        asset_risk_limits_to_wrapper_bytes(wrapper, &clear_adl_episode(limits))
+        asset_risk_limits_to_wrapper_bytes(wrapper, &clear_adl_episode(limits))?;
+        // Phase 2b (review I-2): a restarted / re-activated slot starts with no senior floor.
+        p2b_senior_floor_to_wrapper_bytes(wrapper, 0)
+    }
+
+    /// Phase 2b (review I-2): zero asset `asset_index`'s senior floor code in a market account.
+    pub fn clear_p2b_senior_floor(data: &mut [u8], asset_index: usize) -> Result<(), ProgramError> {
+        let range = asset_risk_limits_range(data, asset_index)?;
+        data.get_mut(range.start + 42..range.start + 44)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&[0u8; 2]);
+        Ok(())
     }
 
     pub fn adl_effective_max_episode_slots(limits: &AssetRiskLimitsV17) -> u32 {
@@ -16428,8 +16439,17 @@ pub mod processor {
                     return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
                 }
                 // Phase 2b Q2: junior exhausted (V < C_eff) => the LP is trading senior capital;
-                // only reductions / closes (the same M-1 growth-aware measure as the draw halt).
-                if lp_after.unsigned_abs() > lp_before.unsigned_abs() {
+                // only reductions / closes. L-4 (security review 2026-10-05): the M-1 measure on
+                // EVERY bound asset (growth: effective, already in `lp_before`; non-growth: the
+                // raw positions `pre` holds), so a taker's own reducing part is never "growth".
+                let q2_before = if growth_asset {
+                    lp_before
+                } else {
+                    let taker_after_raw = signed_position_for_asset_view(&group, &a, idx)?;
+                    growth_v19::lp_mid_q(lp_before, taker_before, taker_after_raw)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                };
+                if lp_after.unsigned_abs() > q2_before.unsigned_abs() {
                     p2b_senior_capital_halt_check(&group, &b, idx)?;
                 }
             }
@@ -17912,6 +17932,8 @@ pub mod processor {
         domain: u16,
         fee_share_bps: u16,
         ledger_data: &[u8],
+        // H-1: true prices an ENTRY (75) on `nonbound_entry_available`, false an EXIT (77) on E3.
+        entry: bool,
     ) -> Result<u128, ProgramError> {
         let (source, bucket) = backing_domain_parts_view(group, domain as usize)?;
         let (mut ledger, _) = read_or_new_backing_domain_ledger(
@@ -17924,8 +17946,13 @@ pub mod processor {
         sync_backing_domain_ledger(&mut ledger, &bucket)?;
         // E3: the principal term is the physical attribution (`nonbound_available_e3`), passed
         // as an unimpaired principal so the earnings term is computed exactly as before.
+        let available = if entry {
+            nonbound_entry_available(&bucket, &ledger)
+        } else {
+            nonbound_available_e3(&source, &bucket, &ledger)
+        };
         lp_vault_nav_atoms_floored(
-            nonbound_available_e3(&source, &bucket, &ledger),
+            available,
             ledger.total_earnings_atoms,
             ledger.total_earnings_withdrawn_atoms,
             0,
@@ -18140,6 +18167,7 @@ pub mod processor {
             .min(group.header.vault.get()))
     }
 
+    /// EXIT reading (tag 77): E3 per pot. Entries use `lp_vault_combined_entry_nav_atoms`.
     fn lp_vault_combined_nav_atoms(
         group: &state::MarketViewMutV16<'_>,
         market_group: [u8; 32],
@@ -18149,6 +18177,39 @@ pub mod processor {
         own_ledger_data: &[u8],
         sibling_ledger_data: &[u8],
     ) -> Result<u128, ProgramError> {
+        lp_vault_combined_nav_rule(
+            group, market_group, authority, domain, fee_share_bps, own_ledger_data, sibling_ledger_data, false,
+        )
+    }
+
+    /// H-1 ENTRY reading (tag 75): `min(principal, held + receivable)` per pot, never below the
+    /// exit reading, so no deposit-then-redeem round trip can gain from touch order.
+    fn lp_vault_combined_entry_nav_atoms(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        own_ledger_data: &[u8],
+        sibling_ledger_data: &[u8],
+    ) -> Result<u128, ProgramError> {
+        lp_vault_combined_nav_rule(
+            group, market_group, authority, domain, fee_share_bps, own_ledger_data, sibling_ledger_data, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn lp_vault_combined_nav_rule(
+        group: &state::MarketViewMutV16<'_>,
+        market_group: [u8; 32],
+        authority: [u8; 32],
+        domain: u16,
+        fee_share_bps: u16,
+        own_ledger_data: &[u8],
+        sibling_ledger_data: &[u8],
+        entry: bool,
+    ) -> Result<u128, ProgramError> {
         let own = lp_vault_domain_nav_atoms(
             group,
             market_group,
@@ -18156,6 +18217,7 @@ pub mod processor {
             domain,
             fee_share_bps,
             own_ledger_data,
+            entry,
         )?;
         let sib = lp_vault_domain_nav_atoms(
             group,
@@ -18164,6 +18226,7 @@ pub mod processor {
             sibling_domain(domain),
             fee_share_bps,
             sibling_ledger_data,
+            entry,
         )?;
         own.checked_add(sib)
             .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
@@ -23017,6 +23080,7 @@ pub mod processor {
                         asset_index,
                         &state::clear_adl_episode(limits),
                     )?;
+                    state::clear_p2b_senior_floor(&mut data, asset_index)?;
                     if init_fee != 0 {
                         let (_cfg, mut group) = state::market_view_mut(&mut data)?;
                         deposit_market_zero_insurance_view(&mut group, init_fee)?;
@@ -26171,7 +26235,7 @@ pub mod processor {
                 )
                 .map(|p| p.1)
             } else {
-                lp_vault_combined_nav_atoms(
+                lp_vault_combined_entry_nav_atoms(
                     &group,
                     market_ai.key.to_bytes(),
                     registry_pda.to_bytes(),
@@ -26893,6 +26957,9 @@ pub mod processor {
             // equals its principal is not over-impaired and still accepts (NAV-neutral).
             // Fail closed before any destination write; the source-side writes above are
             // discarded with the transaction.
+            // 91 is value-neutral for the EXIT reading (sum of min(P_i, phys_i) is invariant under
+            // any move between the vault's pots), and entries price at par, so the destination
+            // guard keeps the E3-consistent predicate (no lock on a physically whole I-2 pot).
             if nonbound_pot_over_impaired_e3(&to_source_pre, &to_bucket_pre, &to_ledger) {
                 return Err(PercolatorError::LpVaultTargetPotImpaired.into());
             }
@@ -27063,16 +27130,18 @@ pub mod processor {
         // and the ledger's impairment can be stale there (see
         // `vault_physical_idle_backing_atoms`), so the whole payout is drawn as principal;
         // the bucket gates below still enforce that it physically exists.
+        // H-2 (security review 2026-10-05): in Live the principal is `min(payout, available)`,
+        // NOT the redeemer's pro-rata share of pot principal. With allocated senior capital in
+        // the vault LP the pro-rata rule labelled `shares * allocated / S` of EVERY payout as
+        // "earnings", which no pot held, so any allocation turned every redemption into 88. The
+        // payout is priced on the senior value either way (value-neutral: V and C fall by the
+        // same atoms when whole); a payout above the pots' available principal still needs a
+        // recall first (88), which is the disclosed buffer behaviour.
+        let _ = shares;
         let principal = if resolved {
             atoms
         } else {
-            vault_lp_v18::senior_principal_portion(
-                shares,
-                available_principal,
-                registry.total_lp_shares_outstanding,
-                atoms,
-            )
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            vault_lp_v18::live_bound_principal_portion(atoms, available_principal)
         };
         Ok((atoms, principal))
     }
@@ -27249,6 +27318,14 @@ pub mod processor {
         // permissionless way to do the same without redeeming. Chosen over refusing (a new error
         // code would collide with growth-v19's 92-94 in this sequential enum, and refusing would
         // make every app/keeper bundle 78 x2 before 77). No-op unless terminal-flat.
+        // H-1(b) (security review 2026-10-05): a Live NON-bound exit is priced on E3, whose claim
+        // term can sit in a touch-order dip (a winner registered, its loser not yet touched). A
+        // third party must not choose WHEN someone else's redemption executes, so the redeemer
+        // ([12], pinned to `redemption.redeemer` below) must sign. Bound vaults price without a
+        // claim term and Resolved exits after the terminal harvest: unchanged there.
+        if bound_tail.is_none() && mode == MarketModeV16::Live && !redeemer_rent_dest.is_signer {
+            return Err(PercolatorError::ExpectedSigner.into());
+        }
         if bound_tail.is_none() && mode == MarketModeV16::Resolved {
             nonbound_terminal_absorb_both_pots(
                 program_id,
@@ -28629,6 +28706,8 @@ pub mod processor {
             return Ok(base);
         };
         if x.cushion_share_bps == 0 || x.cushion_target_bps == 0 {
+            // L-1: a cushion that is off never leaves creator fees locked.
+            p2b_clear_creator_vesting(market_ai, st.asset_index as usize)?;
             return Ok(base);
         }
         // Resolved (terminal harvest): the vault LP may already be settled and closed, and there
@@ -30219,6 +30298,14 @@ pub mod processor {
     /// the pot as the vault's loss, whoever's backing it was (R-2), and miss a receivable that a
     /// new deposit paid down (the refill leak). Rebalance (91) and the OI-reservation guard keep
     /// the ledger reading, which is never higher here (refusal-only, conservative).
+    /// H-1 ENTRY reading of one non-bound pot: par (`vault_lp_v18::nonbound_pot_entry_available`).
+    fn nonbound_entry_available(
+        _bucket: &percolator::BackingBucketV16,
+        l: &state::BackingDomainLedgerAccountV16,
+    ) -> u128 {
+        vault_lp_v18::nonbound_pot_entry_available(l.total_principal_atoms)
+    }
+
     /// `nonbound_available_e3`'s physical term for pot `domain`, read from the group.
     #[inline(never)]
     fn nonbound_pot_physical_view(
@@ -32239,7 +32326,7 @@ pub mod processor {
         own_ledger: &mut [u8],
         sib_ledger: &mut [u8],
         amount: u128,
-    ) -> Result<u128, ProgramError> {
+    ) -> Result<(u128, u128), ProgramError> {
         let a = st.asset_index as usize;
         let rec = read_vault_lp_draw_from_view(group, a)?;
         let draw_pending = rec.pending_moved_atoms != 0
@@ -32288,9 +32375,13 @@ pub mod processor {
             v,
             c_eff,
             cert.certified_equity,
-        ) {
+        ) || !vault_lp_v18::alloc_junior_ok(v, c_eff)
+        {
+            // L-3: no allocation onto a near-zero junior.
             return Err(PercolatorError::VaultLpAllocateRefused.into());
         }
+        // L-2: allocated capital a draw consumed no longer counts against alpha.
+        let allocated = vault_lp_v18::alloc_written_down(x.allocated_atoms, lp_value);
         let d_even = d_even_pre.min(p2b_alloc_drawable(group, cfg, &registry_pda, even, even_present)?);
         let d_odd = d_odd_pre.min(p2b_alloc_drawable(group, cfg, &registry_pda, odd, odd_present)?);
         let drawable = d_even
@@ -32298,7 +32389,7 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         let limit = vault_lp_v18::vault_lp_alloc_limit(
             c_eff,
-            x.allocated_atoms,
+            allocated,
             drawable,
             x.alloc_alpha_bps,
             x.alloc_buffer_bps,
@@ -32336,9 +32427,9 @@ pub mod processor {
         group.validate_shape().map_err(map_v16_error)?;
         solana_program::log::sol_log(&alloc::format!(
             "p2b_allocate moved={} even={} odd={} c_eff={} allocated_before={} limit={}",
-            moved, take_even, take_odd, c_eff, x.allocated_atoms, limit
+            moved, take_even, take_odd, c_eff, allocated, limit
         ));
-        Ok(moved)
+        Ok((moved, allocated))
     }
 
     /// Q2 trade-path check: refuse when the vault LP's conservative equity after the fill is below
@@ -32494,7 +32585,7 @@ pub mod processor {
             true,
         )?;
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
-        let moved = {
+        let (moved, allocated_before) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
             if group.header.mode != 0 {
@@ -32525,8 +32616,11 @@ pub mod processor {
             )?
         };
         p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
-        x.allocated_atoms = x
-            .allocated_atoms
+        x.deallocated_total_atoms = x
+            .deallocated_total_atoms
+            .checked_add(x.allocated_atoms - allocated_before)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        x.allocated_atoms = allocated_before
             .checked_add(moved)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         x.allocated_total_atoms = x
@@ -33340,7 +33434,25 @@ pub mod processor {
         x.alloc_buffer_bps = buffer;
         x.cushion_target_bps = target;
         x.cushion_share_bps = share;
-        state::write_vault_lp_ext(&mut ext_ai.try_borrow_mut_data()?, &x)
+        state::write_vault_lp_ext(&mut ext_ai.try_borrow_mut_data()?, &x)?;
+        // L-1: switching the cushion OFF vests creator fees again at once.
+        if target == 0 {
+            p2b_clear_creator_vesting(market_ai, registry.domain as usize / 2)?;
+        }
+        Ok(())
+    }
+
+    /// L-1: clear the asset's creator-fee vesting bit (no-op when already clear).
+    #[inline(never)]
+    fn p2b_clear_creator_vesting(market_ai: &AccountInfo<'_>, asset_index: usize) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, mut group) = state::market_view_mut(&mut market_data)?;
+        let mut rec = read_asset_vault_lp_from_view(&group, asset_index)?;
+        if rec.p2b_flags & state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING != 0 {
+            rec.p2b_flags &= !state::ASSET_VAULT_LP_P2B_CREATOR_FEE_VESTING;
+            write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
+        }
+        Ok(())
     }
 
     /// Tag 99 parameters (grouped).

@@ -165,6 +165,18 @@ pub fn senior_principal_portion(
     })
 }
 
+/// H-2: a LIVE bound senior payout's principal portion: everything the pots can pay, i.e.
+/// `min(payout, available)`. Any remainder is not backing (it sits in the vault LP) and needs a
+/// recall first. Property: `principal <= payout` and `principal <= available`, and a payout at or
+/// below the pots' available principal is paid entirely as principal.
+pub fn live_bound_principal_portion(atoms_out: u128, available_principal: u128) -> u128 {
+    if atoms_out < available_principal {
+        atoms_out
+    } else {
+        available_principal
+    }
+}
+
 /// The junior floor while any senior claim exists: `ceil(C * floor_bps / 10_000)`.
 pub fn junior_floor_atoms(senior_claim: u128, junior_floor_bps: u16) -> Option<u128> {
     bps_ceil(senior_claim, junior_floor_bps)
@@ -709,6 +721,30 @@ pub fn vault_lp_alloc_admitted(
         && lp_equity >= 0
 }
 
+/// L-3 (security review 2026-10-05): allocation needs a real first-loss buffer. Tag 103 is
+/// refused unless the junior (`V - C_eff`) is at least this share of `C_eff` (protocol floor;
+/// raising it is a tighten-only code change).
+pub const ALLOC_MIN_JUNIOR_BPS: u16 = 500;
+
+pub fn alloc_junior_ok(vault_value: u128, senior_claim_eff: u128) -> bool {
+    let junior = vault_value.saturating_sub(senior_claim_eff);
+    match bps_ceil(senior_claim_eff, ALLOC_MIN_JUNIOR_BPS) {
+        Some(need) => junior >= need,
+        None => false,
+    }
+}
+
+/// L-2: the allocation counter written down to what the vault LP can still be holding of it
+/// (its current value). A senior draw that consumed allocated capital otherwise left 103 at
+/// "no room" for good.
+pub fn alloc_written_down(allocated: u128, lp_value: u128) -> u128 {
+    if allocated < lp_value {
+        allocated
+    } else {
+        lp_value
+    }
+}
+
 /// Per-pot split of one allocation, the SAME rule as the senior draw
 /// (`vault_lp_physical_draw`): proportional to each pot's drawable backing, the floor on the
 /// SMALLER pot's take so a small pot is never left an atom short of its seniors' pro-rata claim.
@@ -793,6 +829,27 @@ pub fn nonbound_pot_available(principal: u128, physical_net: u128) -> u128 {
     } else {
         physical_net
     }
+}
+
+/// H-1 (security review 2026-10-05): the ENTRY reading of a non-bound pot (tag 75 pricing) is
+/// PAR: the ledger principal the vault put in (plus the usual LP-earnings term).
+///
+/// E3's claim term is touch-order dependent (a winner's claim registers when the WINNER is
+/// touched, the loser's loss arrives when the LOSER is touched), so pricing entries and exits on
+/// one reading let a zero-sum pair deposit inside that window and redeem after it (+89.50 per
+/// round). Two weaker entry readings were rejected:
+/// * `min(principal, held)`: dips when a winner converts against principal before its loser is
+///   touched (the residual window);
+/// * `min(principal, held + receivable)`: dips when a permissionless tag 91 moves principal into
+///   a pot carrying a receivable (the engine add pays the receivable down with the vault's own
+///   atoms).
+///
+/// Par moves only with principal flows, so NO settlement order and no 91 can dip it, and
+/// `entry (par) >= exit (E3)` always: every entry-to-exit round trip is non-positive. Cost, by
+/// design: on a genuine default an entrant pays par, bounded by the R-1 pause (deposits stop
+/// once the physical impairment exceeds 10% of principal).
+pub fn nonbound_pot_entry_available(principal: u128) -> u128 {
+    principal
 }
 
 // ── G6 fee waterfall (junior cushion) ────────────────────────────────────────────────────
@@ -966,6 +1023,29 @@ mod tests {
         assert_eq!(nonbound_pot_available(1_000, 1_100), 1_000);
         // rounding: floor the backing, ceil the claims.
         assert_eq!(pot_physical_net_atoms(1_999, 0, 1, 0, 1_000), 0);
+    }
+
+    #[test]
+    fn l2_l3_and_h2_rules() {
+        // L-2: a draw that consumed the LP's capital writes the allocation down with it.
+        assert_eq!(alloc_written_down(5_000, 6_500), 5_000);
+        assert_eq!(alloc_written_down(5_000, 0), 0);
+        assert_eq!(vault_lp_alloc_limit(10_000, alloc_written_down(5_000, 0), 10_000, 5_000, 3_000), Some(5_000));
+        // L-3: junior >= 5% of C_eff.
+        assert!(alloc_junior_ok(10_500, 10_000));
+        assert!(!alloc_junior_ok(10_499, 10_000));
+        // H-2: inside the buffer everything is principal; above it the rest waits for a recall.
+        assert_eq!(live_bound_principal_portion(900, 5_000), 900);
+        assert_eq!(live_bound_principal_portion(7_000, 5_000), 5_000);
+    }
+
+    #[test]
+    fn h1_entry_reading_dominates_exit() {
+        // entry (par) >= exit (E3) for any physical state
+        for (p, f, c) in [(1_000u128, 1_000u128, 180u128), (1_000, 820, 0), (1_000, 1_180, 180), (1_000, 500, 900)] {
+            let exit = nonbound_pot_available(p, pot_physical_net_atoms(f, 0, c, 0, 1));
+            assert!(nonbound_pot_entry_available(p) >= exit, "{p} {f} {c}");
+        }
     }
 
     #[test]
