@@ -2312,3 +2312,57 @@ fn growth_p5_wrapper_leg_im_equals_engine_cert_per_leg_im() {
     }
     assert_eq!(checked, sizes.len());
 }
+
+/// fix/v21-funding-scale: layout-aware replacement for `growth_off_is_byte_for_byte_legacy`
+/// across an engine layout change. The engine asset slot grew by 160 bytes (appended K/F
+/// drift-generation state), so a program of the previous layout cannot run on accounts sized
+/// by this build. With `GROWTH_PARITY_DUMP=<file>` set, this runs the SAME legacy sequence on
+/// `program_path()` and writes every outcome and account snapshot to `<file>`; running it from
+/// a tree of each layout and diffing with the appended region stripped proves the change
+/// leaves every other byte identical. Without the env var it is a no-op.
+#[test]
+fn growth_off_legacy_snapshot_dump() {
+    let Some(out_path) = std::env::var_os("GROWTH_PARITY_DUMP") else {
+        return;
+    };
+    let mut env = Env::try_new_with(&program_path(), MarketCfg::legacy()).expect("init");
+    let mut out: Vec<String> = Vec::new();
+    let lp = env.lp(1_000 * USD);
+    let (x, xp) = env.trader(200 * USD);
+    let (y, yp) = env.trader(50 * USD);
+    let keys = [env.market, lp.account, xp, yp, lp.ctx];
+    let names = ["market", "lp", "x", "y", "ctx"];
+    let snap = |env: &Env, what: &str, out: &mut Vec<String>| {
+        for (k, n) in keys.iter().zip(names) {
+            let d = env.svm.get_account(k).unwrap().data;
+            let hex: String = d.iter().map(|b| format!("{b:02x}")).collect();
+            out.push(format!("SNAP {what} {n} {hex}"));
+        }
+    };
+    snap(&env, "setup", &mut out);
+    let steps: Vec<(&str, Result<u64, String>)> = vec![
+        ("cpi_open", env.trade_cpi(&x, xp, &lp, units(600))),
+        ("cpi_crowd_5x", env.trade_cpi(&y, yp, &lp, units(100))),
+        ("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))),
+        ("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))),
+        ("crank", env.crank(xp)),
+        ("cpi_close", env.trade_cpi(&x, xp, &lp, -units(610))),
+    ];
+    for (what, r) in steps {
+        let outcome = match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.split(", meta:").next().unwrap_or(&e).replace(' ', "_"),
+        };
+        out.push(format!("OUTCOME {what} {outcome}"));
+        snap(&env, what, &mut out);
+    }
+    out.push(format!(
+        "LAYOUT group_off={} group_len={} slot_len={} wrapper_len={} asset_len={}",
+        percolator_prog::constants::MARKET_GROUP_OFF,
+        percolator_prog::constants::MARKET_GROUP_LEN,
+        percolator_prog::constants::MARKET_ASSET_SLOT_LEN,
+        percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN,
+        core::mem::size_of::<percolator::AssetStateV16Account>()
+    ));
+    std::fs::write(out_path, out.join("\n")).unwrap();
+}
