@@ -16,11 +16,29 @@ pub const BPS: u128 = 10_000;
 /// Floor of `a * b / d`, `None` on `d == 0` or on an overflowing product. Every caller works in
 /// SPL-u64-bounded quantities (amounts, shares), so `a * b` is `u64 * u64` and fits `u128`; an
 /// overflow therefore means a corrupt input and fails closed.
+#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| mul_div_floor_spec(a, b, d, *r) && mul_div_floor_facts(a, b, d, *r)))]
 pub fn mul_div_floor(a: u128, b: u128, d: u128) -> Option<u128> {
     if d == 0 {
         return None;
     }
     a.checked_mul(b).map(|p| p / d)
+}
+
+/// Kani contract of `mul_div_floor` (security review A2): EXACT floor in remainder form,
+/// `q*d + r == a*b ∧ r < d`; `None ⇔ d == 0 ∨ a*b overflows`. `cfg(kani)` only.
+#[cfg(kani)]
+pub fn mul_div_floor_spec(a: u128, b: u128, d: u128, r: Option<u128>) -> bool {
+    match (d == 0, a.checked_mul(b)) {
+        (true, _) | (false, None) => r.is_none(),
+        (false, Some(p)) => r.is_some_and(|q| q.checked_mul(d).is_some_and(|qd| qd <= p && p - qd < d)),
+    }
+}
+
+/// Width-independent range fact of the floor primitive (proved with the contract at u8, paper
+/// lift): `Some(q)` with `b <= d` has `q <= a`. `cfg(kani)` only.
+#[cfg(kani)]
+pub fn mul_div_floor_facts(a: u128, b: u128, d: u128, r: Option<u128>) -> bool {
+    r.is_none_or(|q| b > d || q <= a)
 }
 
 /// `floor(x * bps / 10_000)` for `bps <= 10_000`, exact and overflow-free for every `u128` `x`:

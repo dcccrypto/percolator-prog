@@ -1,0 +1,77 @@
+#!/usr/bin/env python3
+"""Mutant matrix, run ONCE after the real run (sequential: one mutant file / one matcher src at
+a time). Each mutant must turn its target harness red (VERIFICATION FAILED, or a cover
+UNSATISFIED that the real run satisfied). Matcher sources are copied aside and restored, and
+restoration is checked byte-for-byte. Usage: ./run_mutants.py <tag>"""
+import os, subprocess, sys, time, shutil, re
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "mutants"))
+from mutants import MUTANTS
+tag = sys.argv[1]
+HERE = os.path.dirname(os.path.abspath(__file__))
+P = "/Users/khubair/wt-growth-v19/percolator-prog"
+M = "/Users/khubair/wt-growth-v19/percolator-match"
+LIMIT = int(os.environ.get("LIMIT", "1500"))
+# rev 6c: targets that bit-blast a REAL 128-bit divider (primitives, order lemmas, bounded
+# real-primitive composites) get the 4000 s watchdog, as in run_kani6c.sh.
+BIG = {"kani_growth_c_mul_div_floor", "kani_growth_c_mul_div_ceil", "kani_growth_c_n_cap_q",
+       "kani_growth_c_liquidity_notional_e6", "kani_growth_c_dyn_imr_bps", "kani_growth_c_leg_im_req",
+       "kani_growth_c_risk_notional_ceil", "kani_growth_c_utilisation_fee_bps",
+       "kani_growth_c_util_fee_on_fill_bps", "kani_growth_t5_at_capacity_costs_full_margin",
+       "kani_growth_t7_rule_implies_gap_solvency", "kani_growth_h2_admit_iff_within_ncap"}
+L = os.path.join(HERE, "logs", tag)
+os.makedirs(L, exist_ok=True)
+summ = open(os.path.join(L, "SUMMARY"), "w")
+os.chdir(HERE)
+ZF = ["-Z", "function-contracts", "-Z", "stubbing"]  # rev 6: contracts + stub_verified
+ONLY = [x for x in os.environ.get("ONLY", "").split(",") if x]
+for name, f, old, new, h, crate in MUTANTS:
+    if ONLY and name not in ONLY:
+        continue
+    t0 = time.time()
+    log = os.path.join(L, f"{name}.log")
+    restore = None
+    if crate == "growth":
+        src = open(f).read()
+        assert src.count(old) == 1, name
+        open("mutants/growth_v19_mutant.rs", "w").write(src.replace(old, new))
+        cmd = ["cargo", "kani", *ZF, "--features", "growth_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cwd = HERE
+    elif crate == "vlp":
+        src = open(f).read()
+        assert src.count(old) == 1, name
+        open("mutants/vault_lp_v18_mutant.rs", "w").write(src.replace(old, new))
+        cmd = ["cargo", "kani", *ZF, "--features", "vlp_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cwd = HERE
+    elif crate == "lpnet":
+        cmd = ["cargo", "kani", *ZF, "--features", "lpnet_mutant", "--harness", f"proofs::{h}", "--exact"]
+        cwd = HERE
+    else:
+        orig = open(f).read()
+        assert orig.count(old) == 1, name
+        shutil.copy(f, f + ".kani-orig")
+        open(f, "w").write(orig.replace(old, new))
+        restore = f
+        mod = "v2" if f.endswith("v2.rs") else "vamm"
+        cmd = ["cargo", "kani", *ZF, "--harness", f"{mod}::proofs::{h}", "--exact"]
+        cwd = M
+    try:
+        with open(log, "w") as out:
+            r = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, timeout=(4000 if h in BIG else LIMIT))
+        status = "ran"
+    except subprocess.TimeoutExpired:
+        status = f"TIMEOUT ({4000 if h in BIG else LIMIT}s)"
+    finally:
+        if restore:
+            shutil.copy(restore + ".kani-orig", restore)
+            os.remove(restore + ".kani-orig")
+            assert open(restore).read() == orig, f"{name}: restore mismatch"
+    txt = open(log).read()
+    v = re.findall(r"^VERIFICATION:.*$", txt, re.M)
+    c = re.findall(r"^.*cover properties satisfied.*$", txt, re.M)
+    caught = bool(v) and "FAILED" in v[-1]
+    summ.write(f"{name} | {h} | {(v[-1] if v else status)} | {(c[-1].strip() if c else 'no cover line')} | {'CAUGHT' if caught else 'CHECK'} | {int(time.time()-t0)}s\n")
+    summ.flush()
+for m in ("mutants/growth_v19_mutant.rs", "mutants/vault_lp_v18_mutant.rs"):
+    if os.path.exists(m):
+        os.remove(m)
+summ.write("DONE\n")

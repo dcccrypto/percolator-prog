@@ -44,6 +44,74 @@ jobs:
         working-directory: percolator-prog
         run: ./scripts/parity-check.sh
 
+  # =========================================================================================
+  # SBF STACK-FRAME GATE (security round 3, F-1). The SBF VM gives every function a fixed
+  # 4,096-byte frame and `cargo build-sbf` prints nothing when a function reaches it: one extra
+  # 32-byte local in the trade executor silently corrupted the fee accrual. This job builds with
+  # `-Z emit-stack-sizes` (codegen unchanged) and fails on any function > 4096 - 256 that is not
+  # a frozen pre-existing entry, on anything at 4096, and on any pinned executor growing.
+  # Baseline: ci/sbf-frame-baseline.txt. Local: ./scripts/sbf-frame-gate.sh
+  # =========================================================================================
+  sbf-frame-gate:
+    name: SBF stack-frame gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: checkout percolator-prog
+        uses: actions/checkout@v4
+        with: { path: percolator-prog }
+      - name: load canonical deployed refs
+        id: refs
+        run: grep -E '^[A-Z_]+=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
+      - name: checkout engine (path dependency, pinned to ENGINE_CI_SIBLING)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@stable
+      # R4-1 (security round 4): the DEPLOY toolchain, not the test job's 4.2.2 -- frame sizes
+      # depend on it. cargo-build-sbf 3.1.15 + platform-tools v1.52 (deployments.md); the gate
+      # script refuses any other cargo-build-sbf and passes --tools-version v1.52.
+      - name: install the deploy solana toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52)
+        env:
+          SOLANA_CLI_VERSION: "3.1.15"
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: frame gate
+        working-directory: percolator-prog
+        run: ./scripts/sbf-frame-gate.sh
+
+  # =========================================================================================
+  # Kani contracts must not change the program (security review rev 6, Q2.3). The growth-v19
+  # contracts live in src/ as `#[cfg_attr(kani, kani::requires/ensures(..))]`; this job builds
+  # the .so with the DEPLOY toolchain twice -- as committed, and with every such line blanked
+  # (line numbers kept, same build path) -- and fails unless the two are byte-identical.
+  # Local: ./scripts/kani-contracts-bytecheck.sh
+  # =========================================================================================
+  kani-contracts-bytecheck:
+    name: Kani contracts leave the .so byte-identical
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: checkout percolator-prog
+        uses: actions/checkout@v4
+        with: { path: percolator-prog }
+      - name: load canonical deployed refs
+        id: refs
+        run: grep -E '^[A-Z_]+=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
+      - name: checkout engine (path dependency, pinned to ENGINE_CI_SIBLING)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install the deploy solana toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52)
+        env:
+          SOLANA_CLI_VERSION: "3.1.15"
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: byte-diff the .so with and without the Kani contracts
+        working-directory: percolator-prog
+        run: ./scripts/kani-contracts-bytecheck.sh
+
   test:
     name: build + test
     runs-on: ubuntu-latest
