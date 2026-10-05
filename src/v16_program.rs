@@ -18182,8 +18182,9 @@ pub mod processor {
         )
     }
 
-    /// H-1 ENTRY reading (tag 75): `min(principal, held + receivable)` per pot, never below the
-    /// exit reading, so no deposit-then-redeem round trip can gain from touch order.
+    /// H-1 ENTRY reading (tag 75): PAR per pot (ledger principal, `nonbound_entry_available`) plus
+    /// the usual LP-earnings term. Never below the exit reading (E3), so no deposit-then-redeem
+    /// round trip can gain from touch order or from a tag 91.
     fn lp_vault_combined_entry_nav_atoms(
         group: &state::MarketViewMutV16<'_>,
         market_group: [u8; 32],
@@ -30291,14 +30292,8 @@ pub mod processor {
         )
     }
 
-    /// E3 (R-2 / deposit-refill, 2026-10-05): a NON-bound pot's available principal for
-    /// PRICING and for 77's per-pot cap = `min(ledger principal, physical backing net of the
-    /// claims the pot owes)` (`vault_lp_v18::nonbound_pot_available`). The ledger's loss /
-    /// recovery counters (farm-facing, monotonic) are not used: they book every consumption of
-    /// the pot as the vault's loss, whoever's backing it was (R-2), and miss a receivable that a
-    /// new deposit paid down (the refill leak). Rebalance (91) and the OI-reservation guard keep
-    /// the ledger reading, which is never higher here (refusal-only, conservative).
-    /// H-1 ENTRY reading of one non-bound pot: par (`vault_lp_v18::nonbound_pot_entry_available`).
+    /// H-1 ENTRY reading of one non-bound pot: PAR, the ledger principal
+    /// (`vault_lp_v18::nonbound_pot_entry_available`). Only principal flows move it.
     fn nonbound_entry_available(
         _bucket: &percolator::BackingBucketV16,
         l: &state::BackingDomainLedgerAccountV16,
@@ -30335,6 +30330,14 @@ pub mod processor {
         )
     }
 
+    /// E3 (R-2 / deposit-refill, 2026-10-05): a NON-bound pot's available principal for EXITS
+    /// = `min(ledger principal, physical backing net of the claims the pot owes)`
+    /// (`vault_lp_v18::nonbound_pot_available`). Used by tag 77's pricing, its per-pot cap and
+    /// OI-reservation guard, the sibling top-up, tag 91's source cap, the R-1 impairment ratio
+    /// and the H-1 / 91-destination over-impaired predicate. ENTRIES (75) price at par instead
+    /// (H-1). The ledger's loss / recovery counters (farm-facing, monotonic) are not used for
+    /// pricing: they book every consumption of the pot as the vault's loss, whoever's backing it
+    /// was (R-2), and miss a receivable that a new deposit paid down (the refill leak).
     #[inline(never)]
     fn nonbound_available_e3(
         source: &SourceCreditStateV16,
