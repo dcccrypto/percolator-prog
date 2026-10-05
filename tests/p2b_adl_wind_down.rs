@@ -43,6 +43,8 @@ const E_PROVENANCE: u32 = 16;
 const E_UNAUTHORIZED: u32 = 8;
 const E_INVALID_INSTRUCTION: u32 = 9;
 const E_ADL_REDUCE_ONLY: u32 = 120;
+const E_LOCK_ACTIVE: u32 = 21;
+const E_ORACLE_STALE: u32 = 27;
 
 fn so(path: &str) -> Vec<u8> {
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -82,6 +84,7 @@ fn b64(s: &str) -> Vec<u8> {
 struct Fork {
     svm: LiteSVM,
     slab: Pubkey,
+    mint: Pubkey,
     clock: Clock,
     portfolios: Vec<Pubkey>,
     obs_seq: u64,
@@ -116,9 +119,13 @@ fn fork() -> Fork {
     let obs_seq = state::read_asset_control_sequences(&svm.get_account(&slab).unwrap().data, 0)
         .map(|c| c.oracle_observation)
         .unwrap_or(0);
+    let mint = Pubkey::new_from_array(
+        state::read_market(&svm.get_account(&slab).unwrap().data).unwrap().0.collateral_mint,
+    );
     Fork {
         svm,
         slab,
+        mint,
         clock,
         portfolios,
         obs_seq,
@@ -195,9 +202,13 @@ impl Fork {
 
     /// Re-push the CURRENT effective mark as the live oracle authority (fresh, unmoved price).
     fn push_same_mark(&mut self) {
+        let px = self.group().assets[0].effective_price;
+        self.push_mark(px);
+    }
+
+    fn push_mark(&mut self, mark: u64) {
         let md = self.data(&self.slab);
         let profile = state::read_asset_oracle_profile(&md, 0).unwrap();
-        let (_, g) = state::read_market(&md).unwrap();
         let authority = Pubkey::new_from_array(profile.oracle_authority);
         let market_id = state::read_market_trade_preflight(&md, 0).unwrap().3;
         self.obs_seq += 1;
@@ -211,7 +222,7 @@ impl Fork {
                 asset_index: 0,
                 market_id,
                 now_slot: self.clock.slot,
-                mark_e6: g.assets[0].effective_price,
+                mark_e6: mark,
                 observation_sequence: self.obs_seq,
             }
             .encode(),
@@ -227,6 +238,7 @@ impl Fork {
                 AccountMeta::new_readonly(Pubkey::new_unique(), false),
                 AccountMeta::new(self.slab, false),
                 AccountMeta::new(*k, false),
+                AccountMeta::new_readonly(self.mint, false),
             ],
             data: ProgInstruction::AdlWindDown {
                 now_slot: self.clock.slot,
@@ -406,6 +418,7 @@ fn p2b_tag104_arms_then_waits_for_the_episode_bound() {
             AccountMeta::new_readonly(Pubkey::new_unique(), false),
             AccountMeta::new(f.slab, false),
             AccountMeta::new(target, false),
+            AccountMeta::new_readonly(f.mint, false),
         ],
         data: ProgInstruction::AdlWindDown {
             now_slot: f.clock.slot,
@@ -595,4 +608,79 @@ fn p2b_tag105_tightens_only_and_tag93_preserves_the_episode() {
     f.push_same_mark();
     f.wind_down_settled(&target).expect("bound met");
     assert!(f.leg(&target).is_none(), "closed once the tightened bound is met");
+}
+
+/// Review M-1: tag 104 never force-closes at a lagging, pending or stale mark.
+#[test]
+fn p2b_tag104_refuses_a_lagging_or_stale_mark() {
+    let mut f = fork();
+    let target = f.side_legs(SideV16::Short)[0];
+    f.wind_down_settled(&target).expect("arm");
+    let n = state::ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS as u64;
+    f.warp(n);
+    f.push_same_mark();
+    // Catch the asset fully up to the clock first (bounded segments), re-pushing so the mark
+    // stays fresh, so the next push lands with dt = 0 and the effective price cannot move.
+    for _ in 0..256 {
+        if f.group().assets[0].slot_last >= f.clock.slot {
+            break;
+        }
+        let _ = f.crank(&target);
+        f.push_same_mark();
+    }
+    assert_eq!(f.group().assets[0].slot_last, f.clock.slot, "asset caught up to the clock");
+    let leg0 = f.leg(&target);
+
+    // (a) LAGGING / PENDING: the oracle authority pushes a mark 40% away. The effective price
+    // steps toward it rate-limited, so target != effective (and the pushed mark is pending).
+    let mut lag = fork_clone_state(&f);
+    let px = lag.group().assets[0].effective_price;
+    lag.push_mark(px + px * 2 / 5);
+    let r = lag.wind_down_settled(&target);
+    {
+        let a = &lag.group().assets[0];
+        eprintln!(
+            "lag probe: r={r:?} target={} eff={} slot_last={} clock={} leg={:?}",
+            a.raw_oracle_target_price, a.effective_price, a.slot_last, lag.clock.slot, lag.leg(&target)
+        );
+    }
+    assert_eq!(custom(&r), Some(E_LOCK_ACTIVE), "lagging/pending mark: refused: {r:?}");
+    assert_eq!(lag.leg(&target), leg0, "nothing moved");
+
+    // (b) STALE: the keeper stopped. No push for longer than the mark-age bound.
+    let mut stale = fork_clone_state(&f);
+    stale.warp(state::ADL_WIND_DOWN_MAX_MARK_AGE_SLOTS + 1);
+    let r = stale.wind_down_settled(&target);
+    assert_eq!(custom(&r), Some(E_ORACLE_STALE), "stale pushed mark: refused: {r:?}");
+    assert_eq!(stale.leg(&target), leg0);
+
+    // NEGATIVE CONTROL: the same state with a fresh, unmoved mark closes.
+    f.push_same_mark();
+    f.wind_down_settled(&target).expect("fresh mark");
+    assert!(f.leg(&target).is_none(), "fresh, unmoved mark: closed at the mark");
+}
+
+/// A second fork carrying the CURRENT state of `f` (accounts, clock, obs sequence).
+fn fork_clone_state(f: &Fork) -> Fork {
+    let mut g = fork();
+    for k in f.portfolios.iter().chain([f.slab].iter()) {
+        g.svm.set_account(*k, f.svm.get_account(k).unwrap()).unwrap();
+    }
+    g.clock = f.clock.clone();
+    g.svm.set_sysvar(&g.clock);
+    g.svm.warp_to_slot(g.clock.slot);
+    g.obs_seq = f.obs_seq;
+    g
+}
+
+/// Review I-1: the dust bound is one whole unit of the market's collateral mint.
+#[test]
+fn p2b_dust_bound_scales_with_collateral_decimals() {
+    assert_eq!(state::adl_wind_down_dust_notional_atoms(6), 1_000_000);
+    assert_eq!(state::adl_wind_down_dust_notional_atoms(9), 1_000_000_000);
+    assert_eq!(state::adl_wind_down_dust_notional_atoms(0), 1);
+    // The live Percolator collateral (sim-USDC) has 6 decimals: the bound is 1.00.
+    let f = fork();
+    let mint = f.svm.get_account(&f.mint).unwrap();
+    assert_eq!(mint.data[44], 6, "live collateral mint decimals");
 }

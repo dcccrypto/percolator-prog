@@ -2702,8 +2702,11 @@ pub mod state {
         /// => the channel is OFF (ACCEPTS_FEE_REQUEST is never sent; any requested fee is
         /// refused). Only effective with `matcher_ext_mode = 1`.
         pub max_requested_fee_bps: u16,
-        /// Still-reserved tail of the former 22-byte `_reserved` (must be zero).
-        pub _reserved: [u8; 2],
+        /// Episode key part (security review L-1, defense in depth): low 16 bits of the
+        /// asset's engine `market_id` when the episode was recorded. A restart/activation
+        /// assigns a new market_id (and also zeroes this record), so an old `since` can never
+        /// be inherited by a new market even if the epochs restart at 0.
+        pub adl_episode_market_id_lo: u16,
         // ── P2b L2: ADL wind-down episode (tag 104 `AdlWindDown`) ───────────────────────
         // Carved from the former `_reserved: [u8; 22]` (bytes 42..64 of this struct) -- NO
         // layout change: `ASSET_RISK_LIMITS_LEN`, every offset and the struct size are
@@ -2722,23 +2725,47 @@ pub mod state {
         pub adl_episode_epoch_long: u32,
         pub adl_episode_epoch_short: u32,
     }
-    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, _reserved) == 42);
+    const _: () =
+        assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_market_id_lo) == 42);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_max_episode_slots) == 44);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_since_slot) == 48);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_long) == 56);
     const _: () =
         assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_short) == 60);
     /// Absolute offsets inside each asset's 1024-byte wrapper slot (for SDK decoders).
-    pub const ASSET_ADL_EPISODE_OFF: usize = ASSET_RISK_LIMITS_OFF + 44;
-    pub const ASSET_ADL_EPISODE_LEN: usize = 20;
-    const _: () = assert!(ASSET_ADL_EPISODE_OFF == 652);
+    pub const ASSET_ADL_EPISODE_OFF: usize = ASSET_RISK_LIMITS_OFF + 42;
+    pub const ASSET_ADL_EPISODE_LEN: usize = 22;
+    const _: () = assert!(ASSET_ADL_EPISODE_OFF == 650);
     const _: () =
         assert!(ASSET_ADL_EPISODE_OFF + ASSET_ADL_EPISODE_LEN == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
     /// P2b L2: default bound, about one hour of slots (400 ms slots).
     pub const ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS: u32 = 9_000;
-    /// P2b L2: a side whose remaining effective notional is at or below this many collateral
-    /// atoms (1.00 at 6 decimals) may be wound down at once, without waiting for the episode.
-    pub const ADL_WIND_DOWN_DUST_NOTIONAL_ATOMS: u128 = 1_000_000;
+    /// P2b L2 (review I-1): a side whose remaining effective notional is at or below ONE
+    /// WHOLE UNIT of collateral (10^decimals atoms, read from the market's collateral mint)
+    /// may be wound down at once, without waiting for the episode.
+    pub fn adl_wind_down_dust_notional_atoms(collateral_decimals: u8) -> u128 {
+        10u128.saturating_pow(u32::from(collateral_decimals.min(30)))
+    }
+    /// P2b L2 (review M-1): a price-managed (AUTH_MARK / EWMA_MARK) mark older than this many
+    /// slots cannot anchor a forced close (~60 s at 400 ms slots; the keeper pushes every few
+    /// seconds). A stopped keeper therefore cannot leave a stale mark for tag 104 to use.
+    pub const ADL_WIND_DOWN_MAX_MARK_AGE_SLOTS: u64 = 150;
+
+    /// P2b (review L-1): the cleared episode record (and N override) a restart or an
+    /// activation must leave behind.
+    pub fn clear_adl_episode(mut limits: AssetRiskLimitsV17) -> AssetRiskLimitsV17 {
+        limits.adl_episode_market_id_lo = 0;
+        limits.adl_max_episode_slots = 0;
+        limits.adl_episode_since_slot = 0;
+        limits.adl_episode_epoch_long = 0;
+        limits.adl_episode_epoch_short = 0;
+        limits
+    }
+
+    pub fn clear_adl_episode_in_wrapper_bytes(wrapper: &mut [u8]) -> Result<(), ProgramError> {
+        let limits = asset_risk_limits_from_wrapper_bytes(wrapper)?;
+        asset_risk_limits_to_wrapper_bytes(wrapper, &clear_adl_episode(limits))
+    }
 
     pub fn adl_effective_max_episode_slots(limits: &AssetRiskLimitsV17) -> u32 {
         if limits.adl_max_episode_slots == 0 {
@@ -2753,7 +2780,6 @@ pub mod state {
 
     pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
         if limits._reserved0 != 0
-            || limits._reserved != [0u8; 2]
             || limits.adl_max_episode_slots > ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS
             || limits.max_requested_fee_bps > crate::risk_limits_v17::MAX_REQUESTED_FEE_BPS
             || limits.matcher_ext_mode > MATCHER_EXT_MODE_V1
@@ -12394,7 +12420,7 @@ pub mod processor {
                     matcher_ext_mode,
                     _reserved0: 0,
                     max_requested_fee_bps,
-                    _reserved: [0u8; 2],
+                    adl_episode_market_id_lo: 0,
                     // P2b: tag 93 never writes the ADL episode fields; the handler copies
                     // the stored ones over these zeros before writing.
                     adl_max_episode_slots: 0,
@@ -19711,6 +19737,7 @@ pub mod processor {
             // (tighten-only) bound exactly as stored.
             let mut limits = limits;
             let stored = state::read_asset_risk_limits(&market_data, asset_index as usize)?;
+            limits.adl_episode_market_id_lo = stored.adl_episode_market_id_lo;
             limits.adl_max_episode_slots = stored.adl_max_episode_slots;
             limits.adl_episode_since_slot = stored.adl_episode_since_slot;
             limits.adl_episode_epoch_long = stored.adl_episode_epoch_long;
@@ -19779,7 +19806,7 @@ pub mod processor {
         asset_index: usize,
         authenticated_now_slot: u64,
         oracle_accounts: &[AccountInfo<'_>],
-    ) -> Result<bool, ProgramError> {
+    ) -> Result<(bool, AutoCrankObservationV16), ProgramError> {
         let asset = group.markets[asset_index].engine.asset;
         if !matches!(
             asset.lifecycle,
@@ -19851,7 +19878,14 @@ pub mod processor {
                 true,
             )
             .map_err(map_v16_error)?;
-        Ok(group.markets[asset_index].engine.asset.slot_last.get() >= authenticated_now_slot)
+        Ok((
+            group.markets[asset_index].engine.asset.slot_last.get() >= authenticated_now_slot,
+            AutoCrankObservationV16 {
+                asset_index,
+                effective_price: crank_price,
+                funding_rate_e9,
+            },
+        ))
     }
 
     /// Pure episode step (unit-tested): given the stored limits, the asset's current
@@ -19860,17 +19894,21 @@ pub mod processor {
     /// `now` and is never expired in the same call.
     pub fn adl_episode_step(
         mut limits: state::AssetRiskLimitsV17,
+        market_id: u64,
         epoch_long: u64,
         epoch_short: u64,
         now_slot: u64,
     ) -> (state::AssetRiskLimitsV17, bool) {
+        let key_market = market_id as u16;
         let key_long = epoch_long as u32;
         let key_short = epoch_short as u32;
         if limits.adl_episode_since_slot == 0
+            || limits.adl_episode_market_id_lo != key_market
             || limits.adl_episode_epoch_long != key_long
             || limits.adl_episode_epoch_short != key_short
         {
             limits.adl_episode_since_slot = now_slot.max(1);
+            limits.adl_episode_market_id_lo = key_market;
             limits.adl_episode_epoch_long = key_long;
             limits.adl_episode_epoch_short = key_short;
             return (limits, false);
@@ -19878,6 +19916,43 @@ pub mod processor {
         let n = u64::from(state::adl_effective_max_episode_slots(&limits));
         let expired = now_slot.saturating_sub(limits.adl_episode_since_slot) >= n;
         (limits, expired)
+    }
+
+    /// Review M-1 / L-4 / C5: every price-freshness precondition tag 104 needs before the
+    /// engine call, in one frame. Errors: target/effective lag or a pending price-managed mark
+    /// -> EngineLockActive (21); a pushed mark older than `ADL_WIND_DOWN_MAX_MARK_AGE_SLOTS`
+    /// -> OracleStale; incomplete per-leg health observations -> the crank's own codes.
+    #[inline(never)]
+    fn reject_adl_wind_down_unfresh_mark_view(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+        now_slot: u64,
+        observation: &AutoCrankObservationV16,
+    ) -> ProgramResult {
+        reject_exposed_target_effective_lag_view(group, asset_index)?;
+        reject_portfolio_pending_price_managed_mark_view(cfg, group, portfolio)?;
+        let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
+        // Freshness of a pushed mark: PushAuthMark advances `last_good_oracle_slot` on every
+        // push (and `mark_ewma_last_slot` only when the mark changes); PushEwmaMark advances
+        // `mark_ewma_last_slot`. The crank never advances either for these modes.
+        if (oracle_v16::profile_is_auth_mark(&profile)
+            || oracle_v16::profile_is_ewma_mark(&profile))
+            && now_slot.saturating_sub(core::cmp::max(
+                profile.last_good_oracle_slot,
+                profile.mark_ewma_last_slot,
+            )) > state::ADL_WIND_DOWN_MAX_MARK_AGE_SLOTS
+        {
+            return Err(PercolatorError::OracleStale.into());
+        }
+        reject_incomplete_account_health_observations_view(
+            cfg,
+            group,
+            portfolio,
+            now_slot,
+            core::slice::from_ref(observation),
+        )
     }
 
     /// P2b L2: `AdlWindDown` (tag 104). PERMISSIONLESS and trustless.
@@ -19902,7 +19977,8 @@ pub mod processor {
     ) -> ProgramResult {
         let market_ai = account(accounts, 1)?;
         let portfolio_ai = account(accounts, 2)?;
-        let oracle_accounts = accounts.get(3..).unwrap_or(&[]);
+        let collateral_mint_ai = account(accounts, 3)?;
+        let oracle_accounts = accounts.get(4..).unwrap_or(&[]);
         expect_writable(market_ai)?;
         expect_writable(portfolio_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -19920,7 +19996,11 @@ pub mod processor {
         if group.header.mode != 0 {
             return Err(PercolatorError::EngineLockActive.into());
         }
-        let caught_up = adl_wind_down_refresh_asset_price_view(
+        // Review I-1: the dust bound is one whole unit of THIS market's collateral.
+        expect_key(collateral_mint_ai, &Pubkey::new_from_array(cfg.collateral_mint))?;
+        let dust_atoms =
+            state::adl_wind_down_dust_notional_atoms(unpack_mint(collateral_mint_ai)?.decimals);
+        let (caught_up, observation) = adl_wind_down_refresh_asset_price_view(
             &mut cfg,
             &mut group,
             asset_index,
@@ -19947,6 +20027,7 @@ pub mod processor {
         )?;
         let (limits, expired) = adl_episode_step(
             stored,
+            asset.market_id,
             asset.epoch_long,
             asset.epoch_short,
             authenticated_now_slot,
@@ -19961,7 +20042,7 @@ pub mod processor {
             percolator::AdlWindDownBoundV16::EpisodeExpired
         } else {
             percolator::AdlWindDownBoundV16::DustNotional {
-                max_notional_atoms: state::ADL_WIND_DOWN_DUST_NOTIONAL_ATOMS,
+                max_notional_atoms: dust_atoms,
             }
         };
         if !group
@@ -19996,6 +20077,17 @@ pub mod processor {
             let mut portfolio =
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+            // Review M-1: never force-close at a lagging, pending or stale mark (the guards the
+            // fee-sync crank uses, upstream b2d4190b), plus a bounded mark age for pushed
+            // marks. Review L-4: the crank's per-leg health-observation completeness check.
+            reject_adl_wind_down_unfresh_mark_view(
+                &cfg,
+                &group,
+                &portfolio,
+                asset_index,
+                authenticated_now_slot,
+                &observation,
+            )?;
             // Same pre-position-change settlement as RebalanceReduce (tag 44).
             accrue_zero_move_funding_before_position_change_view(
                 &cfg,
@@ -22272,6 +22364,9 @@ pub mod processor {
                 mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
             }
             write_oracle_profile_to_view(&mut group, asset_index, &profile)?;
+            // P2b (review L-1): the restarted asset is a new market (new market_id, epochs
+            // back at 0): it must not inherit the old ADL episode start or N override.
+            state::clear_adl_episode_in_wrapper_bytes(&mut group.markets[asset_index].wrapper[..])?;
             group.validate_shape().map_err(map_v16_error)?;
             cfg
         };
@@ -22521,6 +22616,10 @@ pub mod processor {
                             asset_index,
                             &profile,
                         )?;
+                        // P2b (review L-1): a reused slot starts with no ADL episode.
+                        state::clear_adl_episode_in_wrapper_bytes(
+                            &mut group.markets[asset_index].wrapper[..],
+                        )?;
                         group.validate_shape().map_err(map_v16_error)?;
                         reuse_cfg_after = Some(cfg);
                         reuse_activated = true;
@@ -22553,6 +22652,13 @@ pub mod processor {
                     // creator or the asset_authority); rotatable / burnable via UpdateAssetAuthority.
                     profile.asset_admin = authority.key.to_bytes();
                     state::write_asset_oracle_profile(&mut data, asset_index, &profile)?;
+                    // P2b (review L-1): a newly activated slot starts with no ADL episode.
+                    let limits = state::read_asset_risk_limits(&data, asset_index)?;
+                    state::write_asset_risk_limits(
+                        &mut data,
+                        asset_index,
+                        &state::clear_adl_episode(limits),
+                    )?;
                     if init_fee != 0 {
                         let (_cfg, mut group) = state::market_view_mut(&mut data)?;
                         deposit_market_zero_insurance_view(&mut group, init_fee)?;
