@@ -158,6 +158,9 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SetAdlWindDownMaxSlots { .. } => "SetAdlWindDownMaxSlots",
         // Phase 2b (2026-10-05), tag 103.
         Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
+        Instruction::InsuranceBackstopDraw { .. } => "InsuranceBackstopDraw",
+        Instruction::RescueDeposit { .. } => "RescueDeposit",
+        Instruction::InitInsuranceUnits => "InitInsuranceUnits",
     }
 }
 

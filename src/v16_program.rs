@@ -44,6 +44,11 @@ pub mod vault_lp_v18;
 /// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
 pub mod growth_v19;
 
+/// Phase 4 items 5 + 6 (2026-10-05): pure math for the rescue tranche (L-RES), the insurance
+/// unit ledger and the G9 insurance backstop. See
+/// `~/percolator-ops/ledger/phase4-design-2026-10-05.md` items 5 and 6.
+pub mod p4_rescue_ins;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -526,6 +531,23 @@ pub mod constants {
     /// Deployed registries read 0 (zero-reserved bytes): no ext, today's behaviour.
     pub const VAULT_LP_REGISTRY_EXT_FLAG_IDX: usize = 1;
     const _: () = assert!(VAULT_LP_REGISTRY_EXT_FLAG_IDX != VAULT_LP_REGISTRY_BOUND_FLAG_IDX);
+
+    // ── Phase 4 Wave D (items 5 + 6), claimed in `~/percolator-ops/ledger/v22-allocations.md`.
+    /// Item 6: per-market `InsuranceUnitsV20` (`["ins_units", market]`). Kinds 11/12/14 belong to
+    /// items 3 and 4.
+    pub const KIND_INSURANCE_UNITS: u8 = 13;
+    pub const INS_UNITS_SEED: &[u8] = b"ins_units";
+    pub const INS_UNITS_VERSION: u8 = 1;
+    /// `AssetOracleProfileV16::_padding0[1]` (profile +20) is the Phase 4 `p4_flags` byte. Bit 0
+    /// (item 6): asset-0 insurance is unitised; every asset-0 insurance top-up / withdrawal path
+    /// REQUIRES the `InsuranceUnitsV20` account (fail closed). Bits 1 (item 4) and 2 (item 8)
+    /// belong to Waves C and A. Set once by tag 116, never cleared: every profile rewrite carries
+    /// `_padding0[0..2]` over (`state::carry_p4_profile_bytes`).
+    pub const P4_FLAGS_PROFILE_IDX: usize = 1;
+    pub const P4_FLAG_INS_UNITS_REQUIRED: u8 = 1;
+    pub const TAG_INSURANCE_BACKSTOP_DRAW: u8 = 111;
+    pub const TAG_RESCUE_DEPOSIT: u8 = 112;
+    pub const TAG_INIT_INSURANCE_UNITS: u8 = 116;
 
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1493,7 +1515,27 @@ VaultLpMultiAssetMarket,
         /// Custom(103). SDK/app: "This side is paused while the market's first-loss capital is
         /// rebuilt; closing is always allowed".
         VaultLpSeniorCapitalHalt = 103,
+        // ── Phase 4 Wave D (items 5 + 6): explicit discriminants 114..=116, claimed in
+        //    `~/percolator-ops/ledger/v22-allocations.md` (104..=113 / 117..=119 belong to
+        //    Waves A..C). ─────────────────────────────────────────────────────────────────
+        /// Item 5 tag 112 RescueDeposit refused: the vault is not impaired (use 75), the cert is
+        /// stale, a draw is pending or booked late, a non-bound source asset is not
+        /// loss-current, the amount is outside `[RESCUE_MIN_ATOMS, 10 * v]`, the vault is paused,
+        /// or the requested tranche does not exist. Custom(114).
+        RescueRefused = 114,
+        /// Item 5: the certified value is below `RESCUE_NAV_FLOOR_BPS` (5%) of par: the vault is
+        /// dead and must resolve or wind down. Custom(115). App: "This market can no longer be
+        /// recapitalised; it will be wound down".
+        RescueNavFloor = 115,
+        /// Item 6: insurance-unit refusal. Tag 111 G9 is not due (no certified deficit, pots not
+        /// exhausted, draw pending, stale cert) or would exceed the cap; OR an asset-0 insurance
+        /// path on a units market was called without the `InsuranceUnitsV20` account, or would
+        /// burn more units than the caller's class holds. Custom(116).
+        InsuranceBackstopRefused = 116,
     }
+    const _: () = assert!(PercolatorError::RescueRefused as u32 == 114);
+    const _: () = assert!(PercolatorError::RescueNavFloor as u32 == 115);
+    const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
     // block. Pinned here and in tests/p3_vault_lp.rs (p2b_error_codes_are_pinned).
@@ -4066,7 +4108,14 @@ pub mod state {
             || (profile.oracle_mode != ORACLE_MODE_HYBRID_AFTER_HOURS
                 && profile.oracle_mode != ORACLE_MODE_EWMA_MARK
                 && profile.effective_price_provenance != EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED)
-            || profile._padding0 != [0u8; 5]
+            // Phase 4 (Wave D): `_padding0[1]` is `p4_flags`; only bit 0 (item 6
+            // INS_UNITS_REQUIRED) is defined on this branch. Waves A / C widen this mask for
+            // their own bits ([0] lot_exp, bits 1 / 2) when they merge.
+            || profile._padding0[0] != 0
+            || (profile._padding0[crate::constants::P4_FLAGS_PROFILE_IDX]
+                & !crate::constants::P4_FLAG_INS_UNITS_REQUIRED)
+                != 0
+            || profile._padding0[2..] != [0u8; 3]
             || profile._padding1 != [0u8; 6]
             // FIX (ADOPT upstream 18f3ae94/2669bf1b, adapted): the carried
             // price-move-cap numerator remainder is a bps-of-10,000 fraction and
@@ -6102,7 +6151,13 @@ pub mod state {
         pub senior_fee_share_bps: u16,          // 212..214
         pub version: u8,                        // 214
         pub bump: u8,                           // 215
-        pub _padding: [u8; 8],                  // 216..224
+        /// Phase 4 item 6 G9 (Wave D): insurance atoms the backstop (tag 111) lent to the vault LP
+        /// and not yet repaid. SENIOR to the Earn seniors and the junior in recovery: every
+        /// senior / junior valuation nets it off the vault value
+        /// (`p4_rescue_ins::vault_value_net_of_backstop`) and seniors are restored only from value
+        /// above C plus this. Was the zero `_padding` (validated == 0), so every deployed / fresh
+        /// record reads 0 == no backstop. u64: token atoms.
+        pub backstop_outstanding_atoms: u64,    // 216..224
         /// P3 senior draw: cumulative atoms of senior backing moved into the vault LP's capital
         /// (booked draws, junior cover excluded).
         pub senior_drawn_atoms: u128,           // 224..240
@@ -6126,7 +6181,6 @@ pub mod state {
             || st.junior_floor_bps < crate::constants::VAULT_LP_MIN_JUNIOR_FLOOR_BPS
             || st.junior_floor_bps > crate::constants::VAULT_LP_MAX_JUNIOR_FLOOR_BPS
             || st.senior_fee_share_bps != crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS
-            || st._padding != [0u8; 8]
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -6323,6 +6377,142 @@ pub mod state {
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(bytemuck::bytes_of(x));
         Ok(())
+    }
+
+    // ── Phase 4 item 6 (Wave D): the insurance unit ledger ──────────────────────────────────
+    /// `["ins_units", market]`.
+    pub fn derive_insurance_units(
+        program_id: &solana_program::pubkey::Pubkey,
+        market_group: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::constants::INS_UNITS_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// Item 6: ownership ledger of the market's ASSET-0 insurance (the domain budgets 0 and 1,
+    /// which `TopUpInsurance` (9) credits and `WithdrawInsuranceAsset` (57) / `WithdrawInsurance`
+    /// (41) debit). Insurance is unitised: a top-up mints `x * U / I_mint` units to its
+    /// depositor's class, a withdrawal burns `ceil(a * U / I_free)` of the withdrawer's class, and
+    /// every engine insurance spend (bankruptcy residuals, the G9 backstop) lowers `I` with `U`
+    /// unchanged, so every unit loses pro rata, automatically.
+    ///
+    /// CROSS-PROGRAM: percolator-stake v5 reads this account RAW (owner = this program, header
+    /// kind 13, `version == 1`, length, PDA). The offsets below are pinned by const asserts here
+    /// and by `tests/p4_wave_d_units.rs::ins_units_layout_pin`; stake mirrors them in
+    /// `state::WRAPPER_INS_UNITS_OFF_*`. Stake and wrapper deploy together.
+    ///
+    /// The snapshot (`snap_*`) is refreshed by tag 116 (permissionless) and by every unit-touching
+    /// instruction; stake requires `snap_slot == Clock::slot`, i.e. it CPIs tag 116 first.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct InsuranceUnitsV20 {
+        pub market_group: [u8; 32], // 0..32
+        /// `U` = `units_stake + units_creator` (invariant, validated).
+        pub units_total: u128, // 32..48
+        pub units_stake: u128, // 48..64
+        pub units_creator: u128, // 64..80
+        /// Mirror of `VaultLpStateV18::backstop_outstanding_atoms`: insurance lent to the vault LP
+        /// by G9 (tag 111) and owed back FIRST. Part of the MINT (entry) reading only.
+        pub backstop_receivable_atoms: u128, // 80..96
+        /// Entry reading at `snap_slot`: asset-0 budgets remaining + backstop receivable.
+        pub snap_insurance_mint_atoms: u128, // 96..112
+        /// Exit reading at `snap_slot`: asset-0 withdraw capacity (budgets net of reservations,
+        /// capped by the unreserved insurance and the vault).
+        pub snap_insurance_free_atoms: u128, // 112..128
+        pub snap_slot: u64, // 128..136
+        pub version: u8, // 136
+        pub bump: u8, // 137
+        pub _padding: [u8; 6], // 138..144
+        /// S1 (creator seed return): cumulative creator-class value paid to the bound stake
+        /// pool's vault by a TERMINAL `WithdrawInsurance` (41) once the stake class is exhausted.
+        /// percolator-stake v5 forwards `creator_paid_to_stake_atoms - forwarded` to the pool
+        /// admin (the creator). Never decreases.
+        pub creator_paid_to_stake_atoms: u128, // 144..160
+    }
+    const _: () = assert!(core::mem::size_of::<InsuranceUnitsV20>() == 160);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, creator_paid_to_stake_atoms) == 144);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, units_total) == 32);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, units_stake) == 48);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, units_creator) == 64);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, backstop_receivable_atoms) == 80);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, snap_insurance_mint_atoms) == 96);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, snap_insurance_free_atoms) == 112);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, snap_slot) == 128);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, version) == 136);
+
+    pub const fn insurance_units_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<InsuranceUnitsV20>()
+    }
+
+    pub fn validate_insurance_units(x: &InsuranceUnitsV20) -> Result<(), ProgramError> {
+        if x.version != crate::constants::INS_UNITS_VERSION
+            || x.market_group == [0u8; 32]
+            || x.units_stake.checked_add(x.units_creator) != Some(x.units_total)
+            || x._padding != [0u8; 6]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    pub fn init_insurance_units(data: &mut [u8], x: &InsuranceUnitsV20) -> Result<(), ProgramError> {
+        if data.len() < insurance_units_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        validate_insurance_units(x)?;
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, crate::constants::KIND_INSURANCE_UNITS)?;
+        data.get_mut(HEADER_LEN..insurance_units_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
+    pub fn read_insurance_units(data: &[u8]) -> Result<InsuranceUnitsV20, ProgramError> {
+        if data.len() < insurance_units_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_INSURANCE_UNITS)?;
+        let bytes = data
+            .get(HEADER_LEN..insurance_units_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let x: InsuranceUnitsV20 = bytemuck::pod_read_unaligned(bytes);
+        validate_insurance_units(&x)?;
+        Ok(x)
+    }
+
+    pub fn write_insurance_units(data: &mut [u8], x: &InsuranceUnitsV20) -> Result<(), ProgramError> {
+        if data.len() < insurance_units_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_INSURANCE_UNITS)?;
+        validate_insurance_units(x)?;
+        data.get_mut(HEADER_LEN..insurance_units_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
+    /// The Phase 4 bytes of `AssetOracleProfileV16::_padding0` (`[0]` = item 7 `lot_exp`, `[1]` =
+    /// `p4_flags`) are CARRIED over every handler that rebuilds a profile literal (oracle
+    /// reconfiguration 34/35/62, asset restart 69). Zeroing them there would silently switch off
+    /// `P4_FLAG_INS_UNITS_REQUIRED`, i.e. remove the class bound on asset-0 insurance withdrawals.
+    pub fn carry_p4_profile_bytes(existing: &[u8; 5]) -> [u8; 5] {
+        [existing[0], existing[1], 0, 0, 0]
+    }
+
+    /// Item 6: asset-0 insurance is unitised on this market.
+    pub fn profile_ins_units_required(profile: &AssetOracleProfileV16) -> bool {
+        profile._padding0[crate::constants::P4_FLAGS_PROFILE_IDX]
+            & crate::constants::P4_FLAG_INS_UNITS_REQUIRED
+            != 0
     }
 
     /// P3 per-asset vault-LP / skew-funding / leverage-step-down record, stored at
@@ -7767,6 +7957,21 @@ pub mod ix {
         /// up to `amount` (clamped to the alpha / buffer limit) of Earn principal from the vault's
         /// pots into the bound vault LP's engine capital. The inverse of tag 98; no SPL moves.
         VaultLpAllocate { amount: u128 },
+        /// Tag 111, PERMISSIONLESS (Phase 4 item 6 G9). `mode` 0 = DRAW: once the vault LP's
+        /// certified deficit can no longer be funded by the junior or any senior pot, move
+        /// `min(deficit, I_free, cap room, max_amount if nonzero)` of asset-0 insurance into its
+        /// capital and book it as `backstop_outstanding`. `mode` 1 = RESTORE: repay
+        /// `min(outstanding, LP equity, max_amount if nonzero)` from the vault LP's capital back
+        /// into asset-0 insurance (repaid FIRST, before seniors are restored).
+        InsuranceBackstopDraw { mode: u8, max_amount: u128 },
+        /// Tag 112 (Phase 4 item 5). The rescuer buys senior shares at the certified IMPAIRED
+        /// value, never par. `tranche` 0 = senior (the only tranche on this branch; 1 = bond,
+        /// item 3, refused until bonds ship). Refuses unless `minted >= min_shares`.
+        RescueDeposit { tranche: u8, amount: u64, min_shares: u128 },
+        /// Tag 116, PERMISSIONLESS (Phase 4 item 6). Creates `InsuranceUnitsV20` (genesis:
+        /// existing asset-0 insurance becomes creator-class units 1:1) and sets the profile's
+        /// `INS_UNITS_REQUIRED` flag; on an existing ledger it only refreshes the snapshot.
+        InitInsuranceUnits,
     }
 
     impl Instruction {
@@ -8390,6 +8595,16 @@ pub mod ix {
                 103 => Self::VaultLpAllocate {
                     amount: read_u128(&mut rest)?,
                 },
+                crate::constants::TAG_INSURANCE_BACKSTOP_DRAW => Self::InsuranceBackstopDraw {
+                    mode: read_u8(&mut rest)?,
+                    max_amount: read_u128(&mut rest)?,
+                },
+                crate::constants::TAG_RESCUE_DEPOSIT => Self::RescueDeposit {
+                    tranche: read_u8(&mut rest)?,
+                    amount: read_u64(&mut rest)?,
+                    min_shares: read_u128(&mut rest)?,
+                },
+                crate::constants::TAG_INIT_INSURANCE_UNITS => Self::InitInsuranceUnits,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -9372,6 +9587,22 @@ pub mod ix {
                     out.push(103);
                     push_u128(&mut out, amount);
                 }
+                Self::InsuranceBackstopDraw { mode, max_amount } => {
+                    out.push(crate::constants::TAG_INSURANCE_BACKSTOP_DRAW);
+                    out.push(mode);
+                    push_u128(&mut out, max_amount);
+                }
+                Self::RescueDeposit {
+                    tranche,
+                    amount,
+                    min_shares,
+                } => {
+                    out.push(crate::constants::TAG_RESCUE_DEPOSIT);
+                    out.push(tranche);
+                    out.extend_from_slice(&amount.to_le_bytes());
+                    push_u128(&mut out, min_shares);
+                }
+                Self::InitInsuranceUnits => out.push(crate::constants::TAG_INIT_INSURANCE_UNITS),
             }
             out
         }
@@ -13630,6 +13861,15 @@ pub mod processor {
             Instruction::VaultLpAllocate { amount } => {
                 handle_vault_lp_allocate(program_id, accounts, amount)
             }
+            Instruction::InsuranceBackstopDraw { mode, max_amount } => {
+                handle_insurance_backstop_draw(program_id, accounts, mode, max_amount)
+            }
+            Instruction::RescueDeposit {
+                tranche,
+                amount,
+                min_shares,
+            } => handle_rescue_deposit(program_id, accounts, tranche, amount, min_shares),
+            Instruction::InitInsuranceUnits => handle_init_insurance_units(program_id, accounts),
             Instruction::VaultLpSettleResolved { topup } => {
                 handle_vault_lp_settle_resolved(program_id, accounts, topup)
             }
@@ -17523,7 +17763,9 @@ pub mod processor {
         let source_token = account(accounts, 2)?;
         let vault_token = account(accounts, 3)?;
         let token_program = account(accounts, 4)?;
-        let ledger_ai = accounts.get(5);
+        // Phase 4 item 6: the units ledger rides anywhere after [4], found by its PDA; the
+        // optional insurance ledger stays at [5] (never confused with the units account).
+        let (ledger_ai, units_ai) = ins_units_split_tail(program_id, market_ai.key, accounts, 5)?;
         expect_signer(signer)?;
         expect_writable(market_ai)?;
         expect_writable(source_token)?;
@@ -17616,7 +17858,14 @@ pub mod processor {
             } else {
                 None
             };
+            // Phase 4 item 6: mint units to the depositor's class at the ENTRY reading.
+            let units_on = ins_units_pre_op(
+                units_ai, &group, &cfg, market_ai.key, signer.key, INS_OP_MINT, amount, 0,
+            )?;
             deposit_market_zero_insurance_view(&mut group, amount)?;
+            if units_on {
+                ins_units_post_op(units_ai, &group)?;
+            }
             if let Some((ledger, _)) = ledger_state.as_mut() {
                 ledger.total_principal_atoms = ledger
                     .total_principal_atoms
@@ -17669,7 +17918,7 @@ pub mod processor {
         let source_token = account(accounts, 2)?;
         let vault_token = account(accounts, 3)?;
         let token_program = account(accounts, 4)?;
-        let ledger_ai = accounts.get(5);
+        let (ledger_ai, units_ai) = ins_units_split_tail(program_id, market_ai.key, accounts, 5)?;
         expect_signer(signer)?;
         expect_writable(market_ai)?;
         expect_writable(source_token)?;
@@ -17755,9 +18004,17 @@ pub mod processor {
             } else {
                 None
             };
+            // Phase 4 item 6: an asset-0 domain top-up mints units like tag 9.
+            let units_on = asset_index == 0
+                && ins_units_pre_op(
+                    units_ai, &group, &cfg, market_ai.key, signer.key, INS_OP_MINT, amount, 0,
+                )?;
             group
                 .deposit_domain_insurance_not_atomic(domain, amount)
                 .map_err(map_v16_error)?;
+            if units_on {
+                ins_units_post_op(units_ai, &group)?;
+            }
             if let Some((ledger, _)) = ledger_state.as_mut() {
                 ledger.total_principal_atoms = ledger
                     .total_principal_atoms
@@ -19377,7 +19634,7 @@ pub mod processor {
         let vault_token = account(accounts, 3)?;
         let vault_authority_ai = account(accounts, 4)?;
         let token_program = account(accounts, 5)?;
-        let ledger_ai = accounts.get(6);
+        let (ledger_ai, units_ai) = ins_units_split_tail(program_id, market_ai.key, accounts, 6)?;
         // W4-PAYOUT (upstream d64cdeeb "make terminal insurance payout permissionless" +
         // 82f44d11/c162d7c7): this is our fork's terminal (tag 41) reserve payout -- it
         // only ever succeeds when `group.header.mode == Resolved` (checked, unconditionally,
@@ -19460,12 +19717,29 @@ pub mod processor {
             };
             // insurance + vault + per-domain budget all decremented atomically inside the engine
             // withdraw (called per domain by the helper); no separate header decrement here.
+            // Phase 4 item 6: terminal payout to the AUTHORITY's class, at the terminal capacity
+            // reading. S1: when the authority is the bound stake pool and the stake class is
+            // exhausted, the rest is creator-class value paid INTO the stake vault; it is recorded
+            // (`creator_paid_to_stake_atoms`) and percolator-stake v5 forwards it to the creator.
+            let units_on = ins_units_pre_op(
+                units_ai,
+                &group,
+                &cfg,
+                market_ai.key,
+                authority.key,
+                INS_OP_TERMINAL_BURN,
+                amount,
+                available_insurance,
+            )?;
             debit_terminal_insurance_budgets_for_authority_view(
                 &mut group,
                 &cfg,
                 authority.key,
                 amount,
             )?;
+            if units_on {
+                ins_units_post_op(units_ai, &group)?;
+            }
             if let Some((ledger, _)) = ledger_state.as_mut() {
                 ledger.total_withdrawn_atoms = ledger
                     .total_withdrawn_atoms
@@ -19560,7 +19834,7 @@ pub mod processor {
         let vault_token = account(accounts, 3)?;
         let vault_authority_ai = account(accounts, 4)?;
         let token_program = account(accounts, 5)?;
-        let ledger_ai = accounts.get(6);
+        let (ledger_ai, units_ai) = ins_units_split_tail(program_id, market_ai.key, accounts, 6)?;
         expect_signer(operator)?;
         expect_writable(market_ai)?;
         expect_writable(dest_token)?;
@@ -19688,7 +19962,16 @@ pub mod processor {
             };
             // Atomic insurance/vault/budget withdraw through the engine (maintains the
             // insurance_domain_budget_remaining_total aggregate).
+            // Phase 4 item 6: an asset-0 withdrawal burns the OPERATOR's class at the EXIT
+            // reading; a class can never withdraw another class's insurance (116).
+            let units_on = asset_index == 0
+                && ins_units_pre_op(
+                    units_ai, &group, &cfg, market_ai.key, operator.key, INS_OP_BURN, amount, 0,
+                )?;
             debit_market_insurance_budget_view(&mut group, asset_index, amount)?;
+            if units_on {
+                ins_units_post_op(units_ai, &group)?;
+            }
             if let Some((ledger, _)) = ledger_state.as_mut() {
                 ledger.total_withdrawn_atoms = ledger
                     .total_withdrawn_atoms
@@ -22777,6 +23060,8 @@ pub mod processor {
             // function is not stack-tight, so an owned copy is fine here.
             let mut profile = *state::manual_asset_oracle_profile(initial_price, authenticated_slot);
             preserve_backing_fee_policy(&mut profile, &existing_profile);
+            // Phase 4: the restart preserves the insurance budget, so it preserves the units gate.
+            profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
             profile.asset_admin = existing_profile.asset_admin;
             profile.insurance_authority = existing_profile.insurance_authority;
             profile.insurance_operator = existing_profile.insurance_operator;
@@ -23360,6 +23645,7 @@ pub mod processor {
                     let mut profile =
                         state::manual_asset_oracle_profile(initial_price, authenticated_slot);
                     preserve_backing_fee_policy(&mut profile, &existing_profile);
+                    profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
                     profile.insurance_authority = insurance_authority;
                     profile.insurance_operator = insurance_operator;
                     profile.backing_bucket_authority = backing_bucket_authority;
@@ -23427,6 +23713,7 @@ pub mod processor {
                     // -- keep `profile` as `Box<...>` into `reset_profile`.
                     let mut profile = state::manual_asset_oracle_profile(price, authenticated_slot);
                     preserve_backing_fee_policy(&mut profile, &existing_profile);
+                    profile._padding0 = state::carry_p4_profile_bytes(&existing_profile._padding0);
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, false);
                     }
@@ -24165,7 +24452,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24337,7 +24624,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24481,7 +24768,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carry_p4_profile_bytes(&existing_profile._padding0),
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -26313,7 +26600,10 @@ pub mod processor {
                             outstanding: st.senior_draw_outstanding_atoms,
                             pending: 0,
                         },
-                        v_better.saturating_sub(c_eff),
+                        // Phase 4 item 6: the backstop receivable is repaid before seniors.
+                        v_better
+                            .saturating_sub(c_eff)
+                            .saturating_sub(st.backstop_outstanding_atoms as u128),
                     );
                     c_eff
                         .checked_add(to_seniors)
@@ -26321,14 +26611,18 @@ pub mod processor {
                 } else {
                     c_eff
                 };
-                if nav < c_eff {
+                // Phase 4 item 6: the vault value seniors price against is net of the G9
+                // backstop receivable (senior to them in recovery).
+                let backstop = st.backstop_outstanding_atoms as u128;
+                if nav < c_eff.saturating_add(backstop) {
                     // Backing alone does not cover the senior: the LP must be valued, and new
-                    // money is refused outright if the senior is impaired.
+                    // money is refused outright if the senior is impaired (tag 112 rescues).
                     let lp_value =
                         with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
                     let v = nav
                         .checked_add(lp_value)
                         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    let v = crate::p4_rescue_ins::vault_value_net_of_backstop(v, backstop);
                     if vault_lp_v18::senior_impaired(v, c_eff) {
                         return Err(PercolatorError::VaultLpSeniorImpaired.into());
                     }
@@ -27112,11 +27406,13 @@ pub mod processor {
             } else {
                 0
             };
-            vault_lp_v18::live_exit_senior_value(
+            // Phase 4 item 6: net of the G9 backstop receivable (identical when it is 0).
+            crate::p4_rescue_ins::live_exit_senior_value_net_backstop(
                 senior_claim,
                 nav,
                 lp_value_at_eff,
                 lp_equity_worse,
+                st.backstop_outstanding_atoms as u128,
             )
         };
         let atoms = vault_lp_v18::senior_atoms_for_redemption(
@@ -29609,6 +29905,8 @@ pub mod processor {
             .checked_add(harvestable)
             .and_then(|x| x.checked_add(lp_value))
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // Phase 4 item 6 (I-S6): the G9 backstop receivable is repaid BEFORE the seniors are
+        // restored, so only value above C plus the receivable restores C.
         let (next, to_seniors) = vault_lp_v18::vault_lp_recover(
             vault_lp_v18::DrawLedger {
                 senior_claim: st.senior_claim_atoms,
@@ -29616,7 +29914,8 @@ pub mod processor {
                 outstanding: st.senior_draw_outstanding_atoms,
                 pending: 0,
             },
-            v.saturating_sub(c_eff),
+            v.saturating_sub(c_eff)
+                .saturating_sub(st.backstop_outstanding_atoms as u128),
         );
         if to_seniors == 0 {
             return Ok(false);
@@ -31293,7 +31592,7 @@ pub mod processor {
             senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
             version: crate::constants::VAULT_LP_STATE_VERSION,
             bump: vault_lp_bump,
-            _padding: [0u8; 8],
+            backstop_outstanding_atoms: 0,
             senior_drawn_atoms: 0,
             senior_draw_outstanding_atoms: 0,
         };
@@ -31792,7 +32091,7 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
-        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_WITHDRAW_97) {
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms.saturating_add(st.backstop_outstanding_atoms as u128), vault_lp_v18::DRAW_OP_JUNIOR_WITHDRAW_97) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -31987,7 +32286,7 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
-        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_RECALL_98) {
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms.saturating_add(st.backstop_outstanding_atoms as u128), vault_lp_v18::DRAW_OP_RECALL_98) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
         let (_, mode, max_market_slots, _) =
@@ -32494,6 +32793,1001 @@ pub mod processor {
         state::p2b_senior_floor_to_wrapper_bytes(&mut market.wrapper[..], floor)
     }
 
+    // ════════════════════════════════════════════════════════════════════════════════════
+    // Phase 4 Wave D, item 6: insurance unit ledger (`InsuranceUnitsV20`), tag 116, and the
+    // unit hooks of the asset-0 insurance paths (9 / 56 / 57 / 41).
+    // ════════════════════════════════════════════════════════════════════════════════════
+
+    /// Item 6: is asset-0 insurance unitised on this market (profile `p4_flags` bit 0)?
+    fn ins_units_required_view(
+        group: &state::MarketViewMutV16<'_>,
+        cfg: &WrapperConfigV16,
+    ) -> Result<bool, ProgramError> {
+        let profile0 = read_oracle_profile_from_view(group, cfg, 0)?;
+        Ok(state::profile_ins_units_required(&profile0))
+    }
+
+    /// Item 6 readings of the asset-0 fund: `(mint, free)`.
+    /// * `mint` (ENTRY, higher): asset-0 budgets remaining + the G9 backstop receivable;
+    /// * `free` (EXIT, lower): asset-0 withdraw capacity (net of source / domain reservations,
+    ///   capped by the unreserved insurance and the vault), never above the budgets remaining.
+    fn ins_units_readings_view(
+        group: &state::MarketViewMutV16<'_>,
+        backstop_receivable: u128,
+    ) -> Result<(u128, u128), ProgramError> {
+        let gross = market_insurance_remaining_view(group, 0)?;
+        let free = market_insurance_withdraw_capacity_view(group, 0)?.min(gross);
+        let mint = gross
+            .checked_add(backstop_receivable)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((mint, free))
+    }
+
+    /// Item 6: the unit class of `who` on `market`. STAKE iff `who` is the `vault_auth` PDA of
+    /// THE stake pool of this market under the PINNED stake program (the same derivation tag 87
+    /// trusts); every other key is CREATOR class. A non-devnet build pins no stake program, so
+    /// every unit is creator class there (and tag 87 already fails closed).
+    fn ins_unit_class_for(market_key: &Pubkey, who: &Pubkey) -> u8 {
+        #[cfg(feature = "devnet")]
+        {
+            let stake = crate::constants::STAKE_PROGRAM_ID;
+            let (pool, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_POOL_SEED, market_key.as_ref()],
+                &stake,
+            );
+            let (va, _) = Pubkey::find_program_address(
+                &[crate::constants::STAKE_VAULT_AUTHORITY_SEED, pool.as_ref()],
+                &stake,
+            );
+            if va == *who {
+                return crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE;
+            }
+        }
+        #[cfg(not(feature = "devnet"))]
+        {
+            let _ = (market_key, who);
+        }
+        crate::p4_rescue_ins::INS_UNIT_CLASS_CREATOR
+    }
+
+    /// Item 6: the market's `InsuranceUnitsV20` among `accounts[from..]`, found by its PDA (so it
+    /// can ride after any optional account without shifting indices). `Ok(None)` when absent.
+    fn ins_units_find<'a>(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        from: usize,
+    ) -> Result<Option<&'a AccountInfo<'a>>, ProgramError> {
+        let (pda, _) = state::derive_insurance_units(program_id, market_key);
+        for ai in accounts.iter().skip(from) {
+            if ai.key == &pda {
+                expect_owner(ai, program_id)?;
+                expect_writable(ai)?;
+                return Ok(Some(ai));
+            }
+        }
+        Ok(None)
+    }
+
+    /// The optional insurance ledger at `accounts[idx]` (never the units account) and the units
+    /// ledger anywhere in `accounts[idx..]`. Kept out of the insurance handlers' frames.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn ins_units_split_tail<'a>(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        idx: usize,
+    ) -> Result<(Option<&'a AccountInfo<'a>>, Option<&'a AccountInfo<'a>>), ProgramError> {
+        let (pda, _) = state::derive_insurance_units(program_id, market_key);
+        let ledger_ai = accounts.get(idx).filter(|a| a.key != &pda);
+        let units_ai = ins_units_find(program_id, market_key, accounts, idx)?;
+        Ok((ledger_ai, units_ai))
+    }
+
+    /// Mint `x` atoms' worth of units to `class` at the ENTRY reading `mint_reading` (pre-top-up).
+    fn ins_units_apply_mint(
+        u: &mut state::InsuranceUnitsV20,
+        class: u8,
+        x: u128,
+        mint_reading: u128,
+    ) -> ProgramResult {
+        if crate::p4_rescue_ins::ins_units_reset_needed(u.units_total, mint_reading) {
+            // Every outstanding unit is worth exactly 0 (fund AND receivable empty).
+            u.units_total = 0;
+            u.units_stake = 0;
+            u.units_creator = 0;
+        }
+        let minted = crate::p4_rescue_ins::ins_units_for_topup(x, u.units_total, mint_reading)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        u.units_total = u
+            .units_total
+            .checked_add(minted)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if class == crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE {
+            u.units_stake = u
+                .units_stake
+                .checked_add(minted)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        } else {
+            u.units_creator = u
+                .units_creator
+                .checked_add(minted)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        }
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_ins_units_mint class={} x={} minted={} U={} I_mint={}",
+            class, x, minted, u.units_total, mint_reading
+        ));
+        Ok(())
+    }
+
+    /// Burn the units for a withdrawal of `a` atoms by `class` at the EXIT reading `free`
+    /// (pre-withdrawal). Refuses (116) when the class holds fewer units than the burn: a
+    /// withdrawer can never take another class's insurance.
+    fn ins_units_apply_burn(
+        u: &mut state::InsuranceUnitsV20,
+        class: u8,
+        a: u128,
+        free: u128,
+    ) -> ProgramResult {
+        let burned = crate::p4_rescue_ins::ins_units_to_burn(a, u.units_total, free)
+            .ok_or(PercolatorError::InsuranceBackstopRefused)?;
+        let held = if class == crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE {
+            &mut u.units_stake
+        } else {
+            &mut u.units_creator
+        };
+        if burned > *held {
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_ins_units_burn_refused class={} a={} burn={} held={}",
+                class, a, burned, *held
+            ));
+            return Err(PercolatorError::InsuranceBackstopRefused.into());
+        }
+        *held -= burned;
+        u.units_total -= burned;
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_ins_units_burn class={} a={} burned={} U={} I_free={}",
+            class, a, burned, u.units_total, free
+        ));
+        Ok(())
+    }
+
+    /// Tag 41 (terminal) burn. A STAKE-class payee is paid its own units' value first; beyond
+    /// it, creator-class units are burned for the remainder and the creator value paid into the
+    /// stake vault is recorded for the S1 forward. A creator-class payee burns its own class only.
+    fn ins_units_terminal_burn(
+        u: &mut state::InsuranceUnitsV20,
+        class: u8,
+        a: u128,
+        free: u128,
+    ) -> ProgramResult {
+        if class != crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE {
+            return ins_units_apply_burn(u, class, a, free);
+        }
+        let stake_value =
+            crate::p4_rescue_ins::ins_units_value(u.units_stake, u.units_total, free)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if a <= stake_value {
+            return ins_units_apply_burn(u, class, a, free);
+        }
+        let burned = crate::p4_rescue_ins::ins_units_to_burn(a, u.units_total, free)
+            .ok_or(PercolatorError::InsuranceBackstopRefused)?;
+        let from_creator = burned.saturating_sub(u.units_stake);
+        if from_creator > u.units_creator {
+            return Err(PercolatorError::InsuranceBackstopRefused.into());
+        }
+        u.units_creator -= from_creator;
+        u.units_total -= u.units_stake + from_creator;
+        u.units_stake = 0;
+        u.creator_paid_to_stake_atoms = u
+            .creator_paid_to_stake_atoms
+            .checked_add(a - stake_value)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_ins_units_terminal a={} stake_value={} creator_paid={} U={}",
+            a, stake_value, a - stake_value, u.units_total
+        ));
+        Ok(())
+    }
+
+    fn ins_units_snapshot(
+        u: &mut state::InsuranceUnitsV20,
+        group: &state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        let (mint, free) = ins_units_readings_view(group, u.backstop_receivable_atoms)?;
+        u.snap_insurance_mint_atoms = mint;
+        u.snap_insurance_free_atoms = free;
+        u.snap_slot = Clock::get()?.slot;
+        Ok(())
+    }
+
+    /// Unit hook kinds for `ins_units_pre_op`.
+    const INS_OP_MINT: u8 = 0;
+    const INS_OP_BURN: u8 = 1;
+    const INS_OP_TERMINAL_BURN: u8 = 2;
+
+    /// Item 6 unit hook, BEFORE the engine moves asset-0 insurance (kept out of the callers'
+    /// frames: the record is 176 bytes). No-op (`Ok(false)`) on a market that is not unitised;
+    /// on a units market the ledger account is REQUIRED (116). `reading` is the caller's terminal
+    /// capacity for `INS_OP_TERMINAL_BURN` and ignored otherwise (mint: the ENTRY reading, burn:
+    /// the EXIT reading, both computed here). Writes the ledger; `ins_units_post_op` snapshots.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn ins_units_pre_op(
+        units_ai: Option<&AccountInfo<'_>>,
+        group: &state::MarketViewMutV16<'_>,
+        cfg: &WrapperConfigV16,
+        market_key: &Pubkey,
+        who: &Pubkey,
+        op: u8,
+        amount: u128,
+        reading: u128,
+    ) -> Result<bool, ProgramError> {
+        if !ins_units_required_view(group, cfg)? {
+            return Ok(false);
+        }
+        let ai = units_ai.ok_or(PercolatorError::InsuranceBackstopRefused)?;
+        let mut u = state::read_insurance_units(&ai.try_borrow_data()?)?;
+        if u.market_group != market_key.to_bytes() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let class = ins_unit_class_for(market_key, who);
+        let (mint, free) = ins_units_readings_view(group, u.backstop_receivable_atoms)?;
+        match op {
+            INS_OP_MINT => ins_units_apply_mint(&mut u, class, amount, mint)?,
+            INS_OP_BURN => ins_units_apply_burn(&mut u, class, amount, free)?,
+            _ => ins_units_terminal_burn(&mut u, class, amount, reading)?,
+        }
+        state::write_insurance_units(&mut ai.try_borrow_mut_data()?, &u)?;
+        Ok(true)
+    }
+
+    /// Item 6 unit hook, AFTER the engine moved the insurance: refresh the snapshot.
+    #[inline(never)]
+    fn ins_units_post_op(
+        units_ai: Option<&AccountInfo<'_>>,
+        group: &state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        let ai = units_ai.ok_or(PercolatorError::InsuranceBackstopRefused)?;
+        let mut u = state::read_insurance_units(&ai.try_borrow_data()?)?;
+        ins_units_snapshot(&mut u, group)?;
+        state::write_insurance_units(&mut ai.try_borrow_mut_data()?, &u)
+    }
+
+    /// InitInsuranceUnits (tag 116). PERMISSIONLESS.
+    ///
+    /// Accounts: `[0]` payer (signer, w), `[1]` market (w), `[2]` ins_units PDA (w),
+    /// `[3]` system program.
+    ///
+    /// * Ledger absent (Live only): create it; the asset-0 insurance that exists NOW becomes
+    ///   creator-class units 1:1 (genesis), and the asset-0 profile gets `INS_UNITS_REQUIRED`.
+    ///   From then on every asset-0 insurance path requires the ledger (fail closed).
+    /// * Ledger present (any mode): refresh the snapshot (`snap_*`, `snap_slot = now`). The stake
+    ///   program CPIs this before it prices LP tokens or syncs its deployment.
+    #[inline(never)]
+    fn handle_init_insurance_units<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let payer = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let units_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
+        expect_signer(payer)?;
+        expect_writable(market_ai)?;
+        expect_writable(units_ai)?;
+        expect_owner(market_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (pda, bump) = state::derive_insurance_units(program_id, market_ai.key);
+        expect_key(units_ai, &pda)?;
+        if !units_ai.data_is_empty() {
+            expect_owner(units_ai, program_id)?;
+            let mut u = state::read_insurance_units(&units_ai.try_borrow_data()?)?;
+            if u.market_group != market_ai.key.to_bytes() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            {
+                let mut market_data = market_ai.try_borrow_mut_data()?;
+                let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+                ins_units_snapshot(&mut u, &group)?;
+            }
+            return state::write_insurance_units(&mut units_ai.try_borrow_mut_data()?, &u);
+        }
+        expect_writable(payer)?;
+        let bump_bytes = [bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::INS_UNITS_SEED,
+            market_ai.key.as_ref(),
+            bump_bytes.as_ref(),
+        ];
+        create_pda_account(
+            payer,
+            units_ai,
+            system_program_ai,
+            state::insurance_units_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let u = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let (mint, _) = ins_units_readings_view(&group, 0)?;
+            let mut u = state::InsuranceUnitsV20 {
+                market_group: market_ai.key.to_bytes(),
+                units_total: mint,
+                units_stake: 0,
+                units_creator: mint,
+                version: crate::constants::INS_UNITS_VERSION,
+                bump,
+                ..state::InsuranceUnitsV20::default()
+            };
+            ins_units_snapshot(&mut u, &group)?;
+            let mut profile0 = read_oracle_profile_from_view(&group, &cfg, 0)?;
+            profile0._padding0[crate::constants::P4_FLAGS_PROFILE_IDX] |=
+                crate::constants::P4_FLAG_INS_UNITS_REQUIRED;
+            write_oracle_profile_to_view(&mut group, 0, &profile0)?;
+            group.validate_shape().map_err(map_v16_error)?;
+            u
+        };
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_ins_units_init genesis_creator_units={}",
+            u.units_creator
+        ));
+        state::init_insurance_units(&mut units_ai.try_borrow_mut_data()?, &u)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════
+    // Phase 4 Wave D, item 6 G9: the insurance backstop of the vault LP (tag 111).
+    // ════════════════════════════════════════════════════════════════════════════════════
+
+    /// InsuranceBackstopDraw (tag 111). PERMISSIONLESS, Live only, bound vault on asset 0.
+    ///
+    /// Accounts: `[0]` cranker (signer, w) · `[1]` market (w) · `[2]` registry · `[3]`
+    /// vault_lp_state (w) · `[4]` vault LP portfolio (w) · `[5]` own ledger (w) · `[6]` sibling
+    /// ledger (w) · `[7..]` `InsuranceUnitsV20` (w; REQUIRED on a units market).
+    ///
+    /// DRAW (`mode` 0). Runs the senior draw and books it first (junior, then every senior pot).
+    /// Only if a certified deficit is LEFT with no drawable pot backing and nothing pending
+    /// (`p4_rescue_ins::backstop_due`) does it move `backstop_draw_amount` of asset-0 insurance
+    /// into the vault LP's capital: the asset-0 budgets are debited (vault out) and the LP is
+    /// credited (vault in), so `header.vault` nets to zero and no SPL moves. Every insurance unit
+    /// loses pro rata (I falls, U unchanged); the receivable is booked on both ledgers.
+    ///
+    /// RESTORE (`mode` 1). Repays `min(outstanding, certified equity, max_amount)` from the vault
+    /// LP's capital (flat-only engine withdraw, after the maintenance fee, A4-checked) back into
+    /// asset-0 insurance. Repayment never moves a senior's or the junior's value: both price on
+    /// the vault value NET of the receivable, so `V - b` is unchanged by it.
+    #[inline(never)]
+    fn handle_insurance_backstop_draw<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        mode: u8,
+        max_amount: u128,
+    ) -> ProgramResult {
+        let cranker = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        expect_signer(cranker)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_ai)?;
+        expect_writable(own_ledger_ai)?;
+        expect_writable(sibling_ledger_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        if mode > 1 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let registry_pda = Pubkey::new_from_array(st.registry);
+        expect_key(registry_ai, &registry_pda)?;
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        // Units are kept for asset 0 only; the backstop lends asset-0 insurance.
+        if st.asset_index != 0 {
+            return Err(PercolatorError::InsuranceBackstopRefused.into());
+        }
+        let (own_ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        let units_ai = ins_units_find(program_id, market_ai.key, accounts, 7)?;
+        // Draw and book first: the junior and the senior pots always go before insurance.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        let moved = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+            let mut units_state = if ins_units_required_view(&group, &cfg)? {
+                let ai = units_ai.ok_or(PercolatorError::InsuranceBackstopRefused)?;
+                let u = state::read_insurance_units(&ai.try_borrow_data()?)?;
+                if u.market_group != market_ai.key.to_bytes()
+                    || u.backstop_receivable_atoms != st.backstop_outstanding_atoms as u128
+                {
+                    return Err(PercolatorError::InvalidInstruction.into());
+                }
+                Some((ai, u))
+            } else {
+                None
+            };
+            let rec = read_vault_lp_draw_from_view(&group, 0)?;
+            let pending = rec
+                .pending_moved_atoms
+                .saturating_add(rec.pending_out_even_atoms)
+                .saturating_add(rec.pending_out_odd_atoms);
+            let max_slots = group.header.config.max_market_slots.get() as usize;
+            let mut lp_data = lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_slots)?;
+            expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+            let outstanding = st.backstop_outstanding_atoms as u128;
+            let moved = if mode == 0 {
+                // A CURRENT certificate (the draw above refreshed the LP) or a flat LP.
+                let deficit = vault_lp_undrawn_deficit_ro(&group, &lp.header)?;
+                let reg = registry_pda.to_bytes();
+                let drawable = vault_pot_drawable_atoms(&group, &cfg, &reg, 0)?
+                    .saturating_add(vault_pot_drawable_atoms(&group, &cfg, &reg, 1)?);
+                if !crate::p4_rescue_ins::backstop_due(deficit, drawable, pending) {
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_not_due deficit={} drawable={} pending={}",
+                        deficit, drawable, pending
+                    ));
+                    return Err(PercolatorError::InsuranceBackstopRefused.into());
+                }
+                let gross = market_insurance_remaining_view(&group, 0)?;
+                let free = market_insurance_withdraw_capacity_view(&group, 0)?.min(gross);
+                let mut amt = crate::p4_rescue_ins::backstop_draw_amount(
+                    deficit,
+                    free,
+                    gross,
+                    outstanding,
+                    crate::p4_rescue_ins::BACKSTOP_CAP_BPS,
+                );
+                if max_amount != 0 {
+                    amt = amt.min(max_amount);
+                }
+                if amt == 0 {
+                    return Err(PercolatorError::InsuranceBackstopRefused.into());
+                }
+                // Asset-0 budgets out (vault -amt), vault LP capital in (vault +amt).
+                debit_market_insurance_budget_view(&mut group, 0, amt)?;
+                group.deposit_not_atomic(&mut lp, amt).map_err(map_v16_error)?;
+                // Settle the refilled capital against the LP's loss, then re-label the settled
+                // loss into the winners' pots exactly as the senior draw does.
+                group.full_account_refresh_not_atomic(&mut lp).map_err(map_v16_error)?;
+                if vault_lp_relabel_residual_to_claims(&mut group)? != 0 {
+                    group.full_account_refresh_not_atomic(&mut lp).map_err(map_v16_error)?;
+                }
+                let next = outstanding
+                    .checked_add(amt)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                st.backstop_outstanding_atoms =
+                    u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                solana_program::log::sol_log(&alloc::format!(
+                    "p4_backstop_draw deficit={} moved={} outstanding={} I_gross={} I_free={}",
+                    deficit, amt, next, gross, free
+                ));
+                amt
+            } else {
+                if outstanding == 0 || pending != 0 {
+                    return Err(PercolatorError::InsuranceBackstopRefused.into());
+                }
+                // The maintenance fee is senior to the repayment (as for recall 98).
+                collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut lp)?;
+                let cert = group
+                    .full_account_refresh_not_atomic(&mut lp)
+                    .map_err(map_v16_error)?;
+                let equity = if cert.certified_equity > 0 {
+                    cert.certified_equity as u128
+                } else {
+                    0
+                };
+                let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, equity, max_amount);
+                if amt == 0 {
+                    return Err(PercolatorError::InsuranceBackstopRefused.into());
+                }
+                let c_m_before = p2b_c_m(&lp)?;
+                // Flat-only, equity-checked engine withdraw (vault -amt), then asset-0 insurance
+                // in (vault +amt): `header.vault` nets to zero.
+                group.withdraw_not_atomic(&mut lp, amt).map_err(map_v16_error)?;
+                p2b_a4_capacity_check(&group, &lp, 0, c_m_before)?;
+                deposit_market_zero_insurance_view(&mut group, amt)?;
+                let next = outstanding - amt;
+                st.backstop_outstanding_atoms =
+                    u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                solana_program::log::sol_log(&alloc::format!(
+                    "p4_backstop_restore repaid={} outstanding={}",
+                    amt, next
+                ));
+                amt
+            };
+            group.validate_shape().map_err(map_v16_error)?;
+            if let Some((ai, u)) = units_state.as_mut() {
+                u.backstop_receivable_atoms = st.backstop_outstanding_atoms as u128;
+                ins_units_snapshot(u, &group)?;
+                state::write_insurance_units(&mut ai.try_borrow_mut_data()?, u)?;
+            }
+            moved
+        };
+        let _ = moved;
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)
+    }
+
+    // ════════════════════════════════════════════════════════════════════════════════════
+    // Phase 4 Wave D, item 5: rescue / recapitalisation of an impaired vault (tag 112).
+    // ════════════════════════════════════════════════════════════════════════════════════
+
+    /// Item 5 rescue readings `(V, v, par)` of the vault's senior shares (no mutation):
+    /// * bound: `V`/`v` from `p4_rescue_ins::rescue_bound_readings` (the price BETTER for the vault
+    ///   LP, net of the backstop; CURRENT certificate required, else 85), `par = C`;
+    /// * non-bound: `V = v = ` the E3 EXIT NAV (tag 77's reading), `par = ` the ENTRY (par) NAV.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn rescue_readings(
+        group: &state::MarketViewMutV16<'_>,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        registry: &state::LpVaultRegistryV16,
+        bound: Option<(&AccountInfo<'_>, &state::VaultLpStateV18)>,
+        own_ledger: &[u8],
+        sib_ledger: &[u8],
+    ) -> Result<(u128, u128, u128), ProgramError> {
+        match bound {
+            Some((lp_ai, st)) => {
+                let nav = lp_vault_combined_nav_parts_p3(
+                    group,
+                    market_key,
+                    registry_pda,
+                    registry.domain,
+                    registry.fee_share_bps,
+                    own_ledger,
+                    sib_ledger,
+                )?
+                .1;
+                let better =
+                    with_portfolio_header_ro(lp_ai, |h| vault_lp_equity_lag_bounds_ro(group, h))?.1;
+                let (v_raw, v) = crate::p4_rescue_ins::rescue_bound_readings(
+                    st.senior_claim_atoms,
+                    nav,
+                    better,
+                    st.backstop_outstanding_atoms as u128,
+                );
+                Ok((v_raw, v, st.senior_claim_atoms))
+            }
+            None => {
+                let v = lp_vault_combined_nav_atoms(
+                    group,
+                    market_key,
+                    registry_pda,
+                    registry.domain,
+                    registry.fee_share_bps,
+                    own_ledger,
+                    sib_ledger,
+                )?;
+                let par = lp_vault_combined_entry_nav_atoms(
+                    group,
+                    market_key,
+                    registry_pda,
+                    registry.domain,
+                    registry.fee_share_bps,
+                    own_ledger,
+                    sib_ledger,
+                )?;
+                Ok((v, v, par))
+            }
+        }
+    }
+
+    /// Tag 112 phase 3: the rescue atoms become the vault's own pot principal + fresh backing,
+    /// exactly as tag 75 phase 3 (incl. #413's re-baseline). Kept out of the handler's frame.
+    #[inline(never)]
+    fn rescue_pot_deposit(
+        market_ai: &AccountInfo<'_>,
+        ledger_ai: &AccountInfo<'_>,
+        registry_pda: &Pubkey,
+        registry_domain: u16,
+        amount: u128,
+    ) -> ProgramResult {
+        let domain = registry_domain as usize;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+        let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+        let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+        let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+            &ledger_data,
+            market_ai.key.to_bytes(),
+            registry_pda.to_bytes(),
+            registry_domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        let next_vault = group
+            .header
+            .vault
+            .get()
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        add_fresh_counterparty_backing_view(
+            &mut group,
+            domain,
+            amount
+                .checked_mul(BOUND_SCALE)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+        )?;
+        {
+            let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+            ledger.last_observed_unavailable_principal_atoms =
+                backing_unavailable_principal_atoms(&bucket_after)?;
+        }
+        ledger.total_principal_atoms = ledger
+            .total_principal_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        ledger.total_deposited_atoms = ledger
+            .total_deposited_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        group.header.vault = percolator::V16PodU128::new(next_vault);
+        group.validate_shape().map_err(map_v16_error)?;
+        write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+        Ok(())
+    }
+
+    /// Tag 112 phases 4-5: mint the rescue shares (registry PDA signs) and bump the registry's
+    /// outstanding count. Kept out of the handler's frame.
+    #[inline(never)]
+    fn rescue_mint_shares<'a>(
+        token_program: &AccountInfo<'a>,
+        mint_ai: &AccountInfo<'a>,
+        rescuer_lp_ata: &AccountInfo<'a>,
+        registry_ai: &AccountInfo<'a>,
+        market_key: &Pubkey,
+        registry_pda: &Pubkey,
+        registry_bump: u8,
+        shares: u128,
+    ) -> ProgramResult {
+        let shares_u64 =
+            u64::try_from(shares).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let mint_ix = spl_token::instruction::mint_to(
+            token_program.key,
+            mint_ai.key,
+            rescuer_lp_ata.key,
+            registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &mint_ix,
+            &[
+                mint_ai.clone(),
+                rescuer_lp_ata.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+        let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        reg.total_lp_shares_outstanding = reg
+            .total_lp_shares_outstanding
+            .checked_add(shares)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)
+    }
+
+    /// Item 6: set the units ledger's backstop receivable mirror and refresh its snapshot (101).
+    #[inline(never)]
+    fn ins_units_set_receivable(
+        units_ai: Option<&AccountInfo<'_>>,
+        group: &state::MarketViewMutV16<'_>,
+        market_key: &Pubkey,
+        receivable: u128,
+    ) -> ProgramResult {
+        let ai = units_ai.ok_or(PercolatorError::InsuranceBackstopRefused)?;
+        let mut u = state::read_insurance_units(&ai.try_borrow_data()?)?;
+        if u.market_group != market_key.to_bytes() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        u.backstop_receivable_atoms = receivable;
+        ins_units_snapshot(&mut u, group)?;
+        state::write_insurance_units(&mut ai.try_borrow_mut_data()?, &u)
+    }
+
+    /// RescueDeposit (tag 112). The rescuer buys senior shares at the certified IMPAIRED value,
+    /// never at par (item 5, L-RES).
+    ///
+    /// Accounts (as tag 75): `[0]` rescuer (signer, w) · `[1]` market (w) · `[2]` registry (w) ·
+    /// `[3]` LP mint (w) · `[4]` rescuer LP ATA (w) · `[5]` source token (w) · `[6]` vault token
+    /// (w) · `[7]` own ledger (w) · `[8]` token program · `[9]` system program · `[10]` sibling
+    /// ledger (w) · bound vaults: `[11]` vault_lp_state (w), `[12]` vault LP portfolio (w).
+    ///
+    /// Refused (114) unless: Live; not paused; tranche 0; senior shares exist; harvestable fees
+    /// are 0 (bundle 78 first); bound: the draw is booked (nothing pending) and the certificate
+    /// is current; non-bound: the source asset is loss-current (no clock lag, no open K/F cohort,
+    /// no exposed target/effective lag: E3 is exact then, which kills the H-1 touch-order dip);
+    /// impaired (`v < par`); `x` in `[RESCUE_MIN_ATOMS, 10 * v]`; `minted >= min_shares`.
+    /// Refused (115) below the NAV floor (`v < 5% * par`).
+    ///
+    /// The atoms go into the vault's own pot exactly as a tag-75 deposit (principal + fresh
+    /// backing). Shares: `m = floor(x_eff * S / v)` where `x_eff` is the value the deposit
+    /// actually added on the same reading (re-measured after the move; `x_eff <= x`), so L-RES
+    /// holds by construction. Bound vaults also add `dC = floor(m * C / S)` (par per share kept).
+    #[inline(never)]
+    fn handle_rescue_deposit<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        tranche: u8,
+        amount_u64: u64,
+        min_shares: u128,
+    ) -> ProgramResult {
+        let rescuer = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let mint_ai = account(accounts, 3)?;
+        let rescuer_lp_ata = account(accounts, 4)?;
+        let source_token = account(accounts, 5)?;
+        let vault_token = account(accounts, 6)?;
+        let ledger_ai = account(accounts, 7)?;
+        let token_program = account(accounts, 8)?;
+        let system_program_ai = account(accounts, 9)?;
+        let sibling_ledger_ai = account(accounts, 10)?;
+        expect_signer(rescuer)?;
+        expect_writable(rescuer)?;
+        expect_writable(market_ai)?;
+        expect_writable(registry_ai)?;
+        expect_writable(mint_ai)?;
+        expect_writable(rescuer_lp_ata)?;
+        expect_writable(source_token)?;
+        expect_writable(vault_token)?;
+        expect_writable(ledger_ai)?;
+        expect_writable(sibling_ledger_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // Bond rescue (tranche 1) needs item 3's tranche; refused until it ships.
+        if tranche != 0 || amount_u64 == 0 {
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        let amount = amount_u64 as u128;
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        if registry.paused != 0 {
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        let (registry_pda, registry_bump) =
+            state::derive_lp_vault_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &registry_pda)?;
+        if registry.market_group != market_ai.key.to_bytes()
+            || mint_ai.key.to_bytes() != registry.lp_mint
+        {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        let shares_before = registry.total_lp_shares_outstanding;
+        if shares_before == 0 {
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        let domain = registry.domain as usize;
+        let mut bound_tail = if state::registry_vault_lp_bound(&registry)? {
+            let t = load_bound_vault_lp_tail(
+                program_id,
+                accounts,
+                11,
+                market_ai.key,
+                &registry_pda,
+                true,
+                false,
+            )?;
+            expect_writable(t.0)?;
+            Some(t)
+        } else {
+            None
+        };
+        let (cfg, mode, configured_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let asset_index = domain / 2;
+        if asset_index >= configured_slots {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        {
+            let market_data = market_ai.try_borrow_data()?;
+            let profile = read_oracle_profile_for_asset(&market_data, &cfg, asset_index)?;
+            let authorities = domain_authorities_from_profile(&cfg, &profile, asset_index);
+            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+            }
+        }
+        let mint = primary_collateral_mint(&cfg);
+        let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+        let source_balance = verify_user_token_account(source_token, rescuer.key, &mint)?;
+        verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+        verify_user_token_account(rescuer_lp_ata, rescuer.key, mint_ai.key)?;
+        require_token_balance(source_balance, amount_u64)?;
+        let (ledger_pda, ledger_bump) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(ledger_ai, &ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        if ledger_ai.data_is_empty() {
+            // An impaired vault with shares outstanding always has its own pot ledger; a
+            // missing one is a corrupt call.
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        let _ = ledger_bump;
+        // Bound: draw and book first (fail closed on a stale certificate or an unbooked move).
+        if let Some((vault_lp_ai, lp_ai, st)) = bound_tail.as_mut() {
+            vault_lp_draw_then_book(
+                program_id,
+                market_ai,
+                &registry,
+                &registry_pda,
+                vault_lp_ai,
+                st,
+                *lp_ai,
+                ledger_ai,
+                sibling_ledger_ai,
+                true,
+            )?;
+        }
+        // ── Phase 1: certified readings + admission (no mutation). ──
+        let (v_raw_before, v, par) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            if lp_vault_harvestable_fee_atoms(&cfg_v, &group)? != 0 {
+                return Err(PercolatorError::RescueRefused.into());
+            }
+            if let Some((_, _, _)) = bound_tail.as_ref() {
+                let rec = read_vault_lp_draw_from_view(&group, asset_index)?;
+                if rec.pending_moved_atoms != 0
+                    || rec.pending_out_even_atoms != 0
+                    || rec.pending_out_odd_atoms != 0
+                {
+                    return Err(PercolatorError::RescueRefused.into());
+                }
+            } else if asset_local_loss_stale_view(&group, asset_index)
+                || asset_local_open_kf_cohort_view(&group, asset_index)
+                || asset_has_exposed_target_effective_lag_view(&group, asset_index)?
+            {
+                // Non-bound source asset must be loss-current: E3 is then exact.
+                return Err(PercolatorError::RescueRefused.into());
+            }
+            let ledger_data = ledger_ai.try_borrow_data()?;
+            let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+            rescue_readings(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                &registry,
+                bound_tail
+                    .as_ref()
+                    .and_then(|(_, lp, st)| lp.map(|l| (l, st))),
+                &ledger_data,
+                &sibling_ledger_data,
+            )?
+        };
+        match crate::p4_rescue_ins::rescue_admitted(amount, v, par, shares_before) {
+            Ok(()) => {}
+            Err(crate::p4_rescue_ins::RescueRefusal::NavFloor) => {
+                return Err(PercolatorError::RescueNavFloor.into())
+            }
+            Err(_) => return Err(PercolatorError::RescueRefused.into()),
+        }
+        // ── Phase 2: rescuer collateral into the market vault. ──
+        transfer_tokens(token_program, source_token, vault_token, rescuer, amount_u64)?;
+        // ── Phase 3: backing + ledger principal (identical to tag 75 phase 3, own pot). ──
+        rescue_pot_deposit(market_ai, ledger_ai, &registry_pda, registry.domain, amount)?;
+        // ── Phase 3b: the value the deposit actually added, on the SAME reading. ──
+        let v_raw_after = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            let ledger_data = ledger_ai.try_borrow_data()?;
+            let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+            rescue_readings(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                &registry,
+                bound_tail
+                    .as_ref()
+                    .and_then(|(_, lp, st)| lp.map(|l| (l, st))),
+                &ledger_data,
+                &sibling_ledger_data,
+            )?
+            .0
+        };
+        let x_eff = v_raw_after.saturating_sub(v_raw_before).min(amount);
+        let shares = crate::p4_rescue_ins::rescue_shares(x_eff, shares_before, v)
+            .ok_or(PercolatorError::RescueRefused)?;
+        if shares == 0 || shares < min_shares {
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        // L-RES, checked on the real numbers (fail closed, never expected to fire).
+        if !crate::p4_rescue_ins::rescue_value_no_dilution(v, x_eff, shares_before, shares) {
+            return Err(PercolatorError::RescueRefused.into());
+        }
+        // ── Phases 4-5: mint the rescue shares, bump outstanding. ──
+        rescue_mint_shares(
+            token_program,
+            mint_ai,
+            rescuer_lp_ata,
+            registry_ai,
+            market_ai.key,
+            &registry_pda,
+            registry_bump,
+            shares,
+        )?;
+        // ── Phase 6 (bound): C grows by the par of the new shares (C / S unchanged). ──
+        let mut dc = 0u128;
+        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+            dc = crate::p4_rescue_ins::rescue_claim_delta(shares, st.senior_claim_atoms, shares_before)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if !crate::p4_rescue_ins::rescue_claim_no_dilution(v, st.senior_claim_atoms, shares_before, shares, dc) {
+                return Err(PercolatorError::RescueRefused.into());
+            }
+            st.senior_claim_atoms = st
+                .senior_claim_atoms
+                .checked_add(dc)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        }
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_rescue x={} x_eff={} v={} par={} S={} minted={} dC={}",
+            amount, x_eff, v, par, shares_before, shares, dc
+        ));
+        Ok(())
+    }
+
     /// Phase 2b — VaultLpAllocate (tag 103). PERMISSIONLESS (keeper-cranked), Live only.
     ///
     /// Accounts: 0 cranker [signer, w] · 1 market [w] · 2 registry [w] · 3 vault_lp_state [w] ·
@@ -32587,6 +33881,10 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
+        // Phase 4 item 6: no senior allocation while the G9 backstop is lent to the vault LP.
+        if st.backstop_outstanding_atoms != 0 {
+            return Err(PercolatorError::VaultLpAllocateRefused.into());
+        }
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         let (moved, allocated_before) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -32741,6 +34039,7 @@ pub mod processor {
         )?;
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         let domain = registry.domain as usize;
+        let mut backstop_settled = false;
         let to_junior = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -32869,6 +34168,29 @@ pub mod processor {
             };
             let recycled = vlp_claim_payout.max(recv_atoms.min(to_backing)).min(to_backing);
             let to_backing = to_backing - recycled;
+            // Phase 4 item 6 (I-S6): the settled vault LP's payout repays the G9 backstop FIRST,
+            // into asset-0 insurance (the payout already left header.vault inside the engine
+            // close). A settled vault LP can recover nothing more, so any unrepaid remainder is a
+            // realised insurance loss: the receivable is written off on both ledgers.
+            let backstop = st.backstop_outstanding_atoms as u128;
+            let to_insurance = to_backing.min(backstop);
+            let to_backing = to_backing - to_insurance;
+            if backstop != 0 {
+                if to_insurance != 0 {
+                    deposit_market_zero_insurance_view(&mut group, to_insurance)?;
+                }
+                st.backstop_outstanding_atoms = 0;
+                backstop_settled = true;
+                if ins_units_required_view(&group, &cfg)? {
+                    let units_ai = ins_units_find(program_id, market_ai.key, accounts, 12)?;
+                    ins_units_set_receivable(units_ai, &group, market_ai.key, 0)?;
+                }
+                solana_program::log::sol_log(&alloc::format!(
+                    "p4_backstop_settled repaid={} written_off={}",
+                    to_insurance,
+                    backstop - to_insurance
+                ));
+            }
             if recycled != 0 {
                 let (_, rb) = backing_domain_parts_view(&group, domain)?;
                 let expiry = if rb.status == BackingBucketStatusV16::Fresh {
@@ -32945,6 +34267,10 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
             to_junior
         };
+        if backstop_settled {
+            expect_writable(vault_lp_ai)?;
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        }
         if to_junior != 0 {
             let amount_u64 = amount_to_u64(to_junior)?;
             require_token_balance(vault_balance, amount_u64)?;
@@ -33061,7 +34387,7 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
-        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms, vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
+        if vault_lp_v18::vault_lp_draw_halts(st.senior_draw_outstanding_atoms.saturating_add(st.backstop_outstanding_atoms as u128), vault_lp_v18::DRAW_OP_JUNIOR_RELEASE_102) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
