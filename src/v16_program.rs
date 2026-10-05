@@ -39,6 +39,8 @@ declare_id!("Perco1ator111111111111111111111111111111111");
 /// P3 (2026-09-29): pure math for the vault-owned LP / tranche waterfall / skew funding /
 /// leverage step-down. See `~/percolator-ops/ledger/p3-vault-owned-lp-2026-09-29.md`.
 pub mod vault_lp_v18;
+/// Phase 4 item 3 (2026-10-05): capacity bonds (mezzanine tranche) pure math.
+pub mod bond_v20;
 
 /// growth-v19 (2026-10-04): pure math for dynamic leverage and capital-derived capacity. See
 /// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
@@ -526,6 +528,27 @@ pub mod constants {
     /// Deployed registries read 0 (zero-reserved bytes): no ext, today's behaviour.
     pub const VAULT_LP_REGISTRY_EXT_FLAG_IDX: usize = 1;
     const _: () = assert!(VAULT_LP_REGISTRY_EXT_FLAG_IDX != VAULT_LP_REGISTRY_BOUND_FLAG_IDX);
+
+    // ── Phase 4 item 3 (2026-10-05): capacity bonds (v22 Wave C) ────────────────────────────
+    /// `["bond_tranche", market]`: the market's pooled bond claim, shares and coupon dials.
+    pub const KIND_BOND_TRANCHE: u8 = 11;
+    pub const BOND_TRANCHE_SEED: &[u8] = b"bond_tranche";
+    pub const BOND_TRANCHE_VERSION: u8 = 1;
+    /// `["bond", market, owner]`: one holder's bond shares and pending withdrawal.
+    pub const KIND_BOND_POSITION: u8 = 12;
+    pub const BOND_POSITION_SEED: &[u8] = b"bond";
+    pub const BOND_POSITION_VERSION: u8 = 1;
+    /// Index into `LpVaultRegistryV16::_reserved`: 1 once the market's `BondTrancheV20` exists.
+    /// While it is 1, every handler whose arithmetic the bond claim changes (78 coupon + cushion
+    /// level, 97 junior withdraw, 102 Resolved junior surplus, 103 L-3) REQUIRES the tranche
+    /// account (fail closed), so no caller can make the junior look larger by omitting it.
+    pub const VAULT_LP_REGISTRY_BOND_FLAG_IDX: usize = 2;
+    const _: () = assert!(VAULT_LP_REGISTRY_BOND_FLAG_IDX != VAULT_LP_REGISTRY_BOUND_FLAG_IDX);
+    const _: () = assert!(VAULT_LP_REGISTRY_BOND_FLAG_IDX != VAULT_LP_REGISTRY_EXT_FLAG_IDX);
+    pub const TAG_INIT_BOND_TRANCHE: u8 = 107;
+    pub const TAG_BOND_DEPOSIT: u8 = 108;
+    pub const TAG_BOND_REQUEST_WITHDRAW: u8 = 109;
+    pub const TAG_BOND_EXECUTE_WITHDRAW: u8 = 110;
 
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1493,7 +1516,38 @@ VaultLpMultiAssetMarket,
         /// Custom(103). SDK/app: "This side is paused while the market's first-loss capital is
         /// rebuilt; closing is always allowed".
         VaultLpSeniorCapitalHalt = 103,
+        // ── Phase 4 item 3 capacity bonds (v22 Wave C; ledger v22-allocations.md). EXPLICIT
+        // discriminants (I-2 lesson): 104-106 Wave B, 111-116 Wave D, 117-119 Wave A.
+        /// Tag 108: the bond tranche is impaired (its value at the price worse for the vault is
+        /// below its claim) or the seniors are; deposits at par would buy into a loss. Use the
+        /// item 5 rescue path. Custom(107). SDK/app: "Bond deposits are paused while the bond
+        /// tranche is below par".
+        BondTrancheImpaired = 107,
+        /// Tag 110: the bond's capital is still backing open exposure -- growth capacity after
+        /// the withdrawal would fall below the open interest on either side or the vault LP's
+        /// inventory (A4 lock vs OPEN OI), or the seniors are not fully covered by the pots.
+        /// Custom(108). SDK/app: "Withdrawable when the market's open interest is below the
+        /// capacity your bond backs".
+        BondCapacityLocked = 108,
+        /// Tag 110 before `request_slot + bond_cooldown_slots`, or with no pending request.
+        /// Custom(109). SDK/app: "Bond withdrawal is cooling down (about an hour after request)".
+        BondWithdrawCooldown = 109,
+        /// Tags 107-110: bad tranche config (coupon / bonus / cooldown / cap out of the protocol
+        /// bounds), tranche already created, tranche or position account mismatch, or a request
+        /// for more shares than held. Custom(110).
+        BondConfigInvalid = 110,
+        /// Tag 108: the deposit would take the bond claim above `bond_cap_bps_of_c` of
+        /// `C_eff + junior`. Custom(123). SDK/app: "This market's bond tranche is full".
+        BondDepositAboveCap = 123,
+        /// Tag 108 `min_shares` / tag 110 `min_out` not met. Custom(124).
+        BondSlippage = 124,
     }
+    const _: () = assert!(PercolatorError::BondTrancheImpaired as u32 == 107);
+    const _: () = assert!(PercolatorError::BondCapacityLocked as u32 == 108);
+    const _: () = assert!(PercolatorError::BondWithdrawCooldown as u32 == 109);
+    const _: () = assert!(PercolatorError::BondConfigInvalid as u32 == 110);
+    const _: () = assert!(PercolatorError::BondDepositAboveCap as u32 == 123);
+    const _: () = assert!(PercolatorError::BondSlippage as u32 == 124);
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
     // block. Pinned here and in tests/p3_vault_lp.rs (p2b_error_codes_are_pinned).
@@ -6325,6 +6379,234 @@ pub mod state {
         Ok(())
     }
 
+    // ── Phase 4 item 3 (2026-10-05): capacity bonds ─────────────────────────────────────────
+
+    /// Registry "BondTrancheV20 exists" flag (`_reserved[VAULT_LP_REGISTRY_BOND_FLAG_IDX]`).
+    /// Deployed / pre-bond registries read 0: no tranche, byte-identical v2.1 behaviour (I-T8).
+    pub fn registry_bond_tranche(reg: &LpVaultRegistryV16) -> Result<bool, ProgramError> {
+        match reg._reserved[crate::constants::VAULT_LP_REGISTRY_BOND_FLAG_IDX] {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(ProgramError::InvalidAccountData),
+        }
+    }
+
+    pub fn set_registry_bond_tranche(reg: &mut LpVaultRegistryV16) {
+        reg._reserved[crate::constants::VAULT_LP_REGISTRY_BOND_FLAG_IDX] = 1;
+    }
+
+    /// `["bond_tranche", market]`.
+    pub fn derive_bond_tranche(
+        program_id: &solana_program::pubkey::Pubkey,
+        market_group: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::constants::BOND_TRANCHE_SEED, market_group.as_ref()],
+            program_id,
+        )
+    }
+
+    /// `["bond", market, owner]`.
+    pub fn derive_bond_position(
+        program_id: &solana_program::pubkey::Pubkey,
+        market_group: &solana_program::pubkey::Pubkey,
+        owner: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::constants::BOND_POSITION_SEED, market_group.as_ref(), owner.as_ref()],
+            program_id,
+        )
+    }
+
+    /// The market's capacity-bond tranche (`bond_v20`): the pooled principal claim `C_b`, the
+    /// share supply `B` and the coupon / cooldown / cap dials (immutable after tag 107).
+    /// 128 bytes, `#[repr(C)]` Pod with no implicit padding.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct BondTrancheV20 {
+        pub market_group: [u8; 32], // 0..32
+        /// `C_b`: deposits + credited coupons - redeemed pro-rata slices. Never written down by a
+        /// draw: the bond's VALUE is the middle layer of `bond_v20::tranche_split3`.
+        pub c_b_atoms: u128, // 32..48
+        /// `B`: bond shares outstanding (sum of every `BondPositionV20::shares`).
+        pub b_shares_total: u128, // 48..64
+        /// Cumulative atoms bonds credited to the vault LP's engine capital, net of the capital
+        /// bond redemptions withdrew from it (accounting; not a pricing input).
+        pub principal_in_lp_atoms: u128, // 64..80
+        /// Informational mirror of the impairment (`C_b - bond value`) observed the last time a
+        /// bond instruction priced the tranche. Nothing prices off it.
+        pub bond_drawn_outstanding_atoms: u128, // 80..96
+        /// Coupon checkpoint. Reset to "now" by every coupon crank (non-cumulative) and by every
+        /// 108/110 (which require the fee leg harvested first, so nothing earned is forfeited).
+        pub last_coupon_slot: u64, // 96..104
+        pub coupon_bps_per_year: u16,   // 104..106
+        pub coupon_util_bonus_bps: u16, // 106..108
+        pub bond_cooldown_slots: u32,   // 108..112
+        /// Concentration cap: `C_b <= cap * (C_eff + junior)` at deposit time.
+        pub bond_cap_bps_of_c: u16, // 112..114
+        pub version: u8, // 114
+        pub bump: u8,    // 115
+        /// Utilisation (bps) observed at the last coupon checkpoint; the next interval's bonus
+        /// uses `min(last, now)`.
+        pub last_util_bps: u16, // 116..118
+        pub _padding: [u8; 2], // 118..120
+        /// Cumulative coupon atoms credited to `C_b` (saturating; for the realised-APY readout).
+        pub coupon_paid_total_atoms: u64, // 120..128
+    }
+    const _: () = assert!(core::mem::size_of::<BondTrancheV20>() == 128);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, c_b_atoms) == 32);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, last_coupon_slot) == 96);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, bond_cap_bps_of_c) == 112);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, version) == 114);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_paid_total_atoms) == 120);
+
+    pub const fn bond_tranche_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<BondTrancheV20>()
+    }
+
+    /// Reachable-state validation: dials inside the protocol bounds, padding zero, and
+    /// `C_b == 0 <=> B == 0` (a full redemption removes the whole claim; the genesis deposit
+    /// creates both together).
+    pub fn validate_bond_tranche(t: &BondTrancheV20) -> Result<(), ProgramError> {
+        if t.version != crate::constants::BOND_TRANCHE_VERSION
+            || t.market_group == [0u8; 32]
+            || !crate::bond_v20::bond_config_ok(
+                t.coupon_bps_per_year,
+                t.coupon_util_bonus_bps,
+                t.bond_cooldown_slots,
+                t.bond_cap_bps_of_c,
+            )
+            || t.last_util_bps as u128 > crate::vault_lp_v18::BPS
+            || t._padding != [0u8; 2]
+            || (t.c_b_atoms == 0) != (t.b_shares_total == 0)
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    pub fn init_bond_tranche(data: &mut [u8], t: &BondTrancheV20) -> Result<(), ProgramError> {
+        if data.len() < bond_tranche_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        validate_bond_tranche(t)?;
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, crate::constants::KIND_BOND_TRANCHE)?;
+        data.get_mut(HEADER_LEN..bond_tranche_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(t));
+        Ok(())
+    }
+
+    pub fn read_bond_tranche(data: &[u8]) -> Result<BondTrancheV20, ProgramError> {
+        if data.len() < bond_tranche_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_BOND_TRANCHE)?;
+        let bytes = data
+            .get(HEADER_LEN..bond_tranche_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let t: BondTrancheV20 = bytemuck::pod_read_unaligned(bytes);
+        validate_bond_tranche(&t)?;
+        Ok(t)
+    }
+
+    pub fn write_bond_tranche(data: &mut [u8], t: &BondTrancheV20) -> Result<(), ProgramError> {
+        if data.len() < bond_tranche_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_BOND_TRANCHE)?;
+        validate_bond_tranche(t)?;
+        data.get_mut(HEADER_LEN..bond_tranche_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(t));
+        Ok(())
+    }
+
+    /// One holder's capacity bonds. 96 bytes, `#[repr(C)]` Pod with no implicit padding. The
+    /// market is bound by the PDA seeds (checked with the stored bump on every load).
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct BondPositionV20 {
+        pub owner: [u8; 32], // 0..32
+        pub shares: u128,    // 32..48
+        /// Shares requested for withdrawal (tag 109), `<= shares`; still in `B` until 110.
+        pub pending_withdraw_shares: u128, // 48..64
+        pub request_slot: u64, // 64..72
+        pub version: u8,       // 72
+        pub bump: u8,          // 73
+        pub _padding: [u8; 6], // 74..80
+        pub _reserved: [u8; 16], // 80..96
+    }
+    const _: () = assert!(core::mem::size_of::<BondPositionV20>() == 96);
+    const _: () = assert!(core::mem::offset_of!(BondPositionV20, shares) == 32);
+    const _: () = assert!(core::mem::offset_of!(BondPositionV20, request_slot) == 64);
+    const _: () = assert!(core::mem::offset_of!(BondPositionV20, version) == 72);
+
+    pub const fn bond_position_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<BondPositionV20>()
+    }
+
+    pub fn validate_bond_position(x: &BondPositionV20) -> Result<(), ProgramError> {
+        if x.version != crate::constants::BOND_POSITION_VERSION
+            || x.owner == [0u8; 32]
+            || x.pending_withdraw_shares > x.shares
+            || x._padding != [0u8; 6]
+            || x._reserved != [0u8; 16]
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(())
+    }
+
+    pub fn init_bond_position(data: &mut [u8], x: &BondPositionV20) -> Result<(), ProgramError> {
+        if data.len() < bond_position_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        if is_initialized(data) {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        validate_bond_position(x)?;
+        for b in data.iter_mut() {
+            *b = 0;
+        }
+        write_header(data, crate::constants::KIND_BOND_POSITION)?;
+        data.get_mut(HEADER_LEN..bond_position_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
+    pub fn read_bond_position(data: &[u8]) -> Result<BondPositionV20, ProgramError> {
+        if data.len() < bond_position_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_BOND_POSITION)?;
+        let bytes = data
+            .get(HEADER_LEN..bond_position_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let x: BondPositionV20 = bytemuck::pod_read_unaligned(bytes);
+        validate_bond_position(&x)?;
+        Ok(x)
+    }
+
+    pub fn write_bond_position(data: &mut [u8], x: &BondPositionV20) -> Result<(), ProgramError> {
+        if data.len() < bond_position_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_BOND_POSITION)?;
+        validate_bond_position(x)?;
+        data.get_mut(HEADER_LEN..bond_position_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
     /// P3 per-asset vault-LP / skew-funding / leverage-step-down record, stored at
     /// `constants::ASSET_VAULT_LP_OFF` (896) inside each asset's 1024-byte wrapper slot.
     /// All-zero = "no vault LP bound, skew off, step-down off".
@@ -7767,6 +8049,24 @@ pub mod ix {
         /// up to `amount` (clamped to the alpha / buffer limit) of Earn principal from the vault's
         /// pots into the bound vault LP's engine capital. The inverse of tag 98; no SPL moves.
         VaultLpAllocate { amount: u128 },
+        /// Tag 107 (Phase 4 item 3). Market authority (or the upgrade authority) creates the
+        /// market's `BondTrancheV20` with immutable, protocol-bounded dials. 11 B.
+        InitBondTranche {
+            coupon_bps: u16,
+            util_bonus_bps: u16,
+            cooldown_slots: u32,
+            cap_bps: u16,
+        },
+        /// Tag 108. Depositor-signed: SPL `amount` into the bound vault LP's engine capital,
+        /// minting bond shares at par (refused while impaired / a draw is outstanding / above
+        /// the cap). 25 B.
+        BondDeposit { amount: u64, min_shares: u128 },
+        /// Tag 109. Holder-signed: set the pending withdrawal (0 cancels); restarts the cooldown.
+        BondRequestWithdraw { shares: u128 },
+        /// Tag 110. Holder-signed: after the cooldown, redeem every pending share at the worse
+        /// price, subject to the open-interest lock (Live) or from the pots (Resolved,
+        /// `source_domain`'s pot). 11 B.
+        BondExecuteWithdraw { min_out: u64, source_domain: u16 },
     }
 
     impl Instruction {
@@ -8389,6 +8689,23 @@ pub mod ix {
                 }
                 103 => Self::VaultLpAllocate {
                     amount: read_u128(&mut rest)?,
+                },
+                crate::constants::TAG_INIT_BOND_TRANCHE => Self::InitBondTranche {
+                    coupon_bps: read_u16(&mut rest)?,
+                    util_bonus_bps: read_u16(&mut rest)?,
+                    cooldown_slots: read_u32(&mut rest)?,
+                    cap_bps: read_u16(&mut rest)?,
+                },
+                crate::constants::TAG_BOND_DEPOSIT => Self::BondDeposit {
+                    amount: read_u64(&mut rest)?,
+                    min_shares: read_u128(&mut rest)?,
+                },
+                crate::constants::TAG_BOND_REQUEST_WITHDRAW => Self::BondRequestWithdraw {
+                    shares: read_u128(&mut rest)?,
+                },
+                crate::constants::TAG_BOND_EXECUTE_WITHDRAW => Self::BondExecuteWithdraw {
+                    min_out: read_u64(&mut rest)?,
+                    source_domain: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -9371,6 +9688,32 @@ pub mod ix {
                 Self::VaultLpAllocate { amount } => {
                     out.push(103);
                     push_u128(&mut out, amount);
+                }
+                Self::InitBondTranche {
+                    coupon_bps,
+                    util_bonus_bps,
+                    cooldown_slots,
+                    cap_bps,
+                } => {
+                    out.push(crate::constants::TAG_INIT_BOND_TRANCHE);
+                    push_u16(&mut out, coupon_bps);
+                    push_u16(&mut out, util_bonus_bps);
+                    push_u32(&mut out, cooldown_slots);
+                    push_u16(&mut out, cap_bps);
+                }
+                Self::BondDeposit { amount, min_shares } => {
+                    out.push(crate::constants::TAG_BOND_DEPOSIT);
+                    push_u64(&mut out, amount);
+                    push_u128(&mut out, min_shares);
+                }
+                Self::BondRequestWithdraw { shares } => {
+                    out.push(crate::constants::TAG_BOND_REQUEST_WITHDRAW);
+                    push_u128(&mut out, shares);
+                }
+                Self::BondExecuteWithdraw { min_out, source_domain } => {
+                    out.push(crate::constants::TAG_BOND_EXECUTE_WITHDRAW);
+                    push_u64(&mut out, min_out);
+                    push_u16(&mut out, source_domain);
                 }
             }
             out
@@ -12690,7 +13033,9 @@ pub mod processor {
         // run beside open resolved receipts; they must never lower the claim-free residual that
         // is reserved for those receipts. Fail closed if they do.
         let reserve = match instruction_data.first() {
-            Some(77) | Some(78) | Some(102) => Some(resolved_receipt_reserve_snapshot(program_id, accounts)?),
+            Some(77) | Some(78) | Some(102) | Some(110) => {
+                Some(resolved_receipt_reserve_snapshot(program_id, accounts)?)
+            }
             _ => None,
         };
         process_instruction_dispatch(program_id, accounts, instruction_data)?;
@@ -13629,6 +13974,26 @@ pub mod processor {
             ),
             Instruction::VaultLpAllocate { amount } => {
                 handle_vault_lp_allocate(program_id, accounts, amount)
+            }
+            Instruction::InitBondTranche {
+                coupon_bps,
+                util_bonus_bps,
+                cooldown_slots,
+                cap_bps,
+            } => handle_init_bond_tranche(
+                program_id,
+                accounts,
+                [coupon_bps, util_bonus_bps, cap_bps],
+                cooldown_slots,
+            ),
+            Instruction::BondDeposit { amount, min_shares } => {
+                handle_bond_deposit(program_id, accounts, amount, min_shares)
+            }
+            Instruction::BondRequestWithdraw { shares } => {
+                handle_bond_request_withdraw(program_id, accounts, shares)
+            }
+            Instruction::BondExecuteWithdraw { min_out, source_domain } => {
+                handle_bond_execute_withdraw(program_id, accounts, min_out, source_domain)
             }
             Instruction::VaultLpSettleResolved { topup } => {
                 handle_vault_lp_settle_resolved(program_id, accounts, topup)
@@ -28653,14 +29018,17 @@ pub mod processor {
     ) -> ProgramResult {
         // [6] vault_lp_state (key-checked by tag 78's bound tail) and [2] the registry.
         let vault_lp_ai = account(accounts, 6)?;
-        let no_real_seniors = state::read_lp_vault_registry(&account(accounts, 2)?.try_borrow_data()?)?
-            .total_lp_shares_outstanding
-            <= crate::constants::LP_VAULT_MINIMUM_LIQUIDITY;
+        let registry = state::read_lp_vault_registry(&account(accounts, 2)?.try_borrow_data()?)?;
+        let no_real_seniors =
+            registry.total_lp_shares_outstanding <= crate::constants::LP_VAULT_MINIMUM_LIQUIDITY;
         let mut st = *st;
+        // Phase 4 item 3: the bond coupon comes off the TOP of the leg (before the junior
+        // cushion, the seniors and the creator's vesting); `(0, available)` without a tranche.
+        let (_coupon, rest, bond_claim) = bond_coupon_take(program_id, accounts, &st, &registry, available)?;
         let (senior_part, _junior_part) = if no_real_seniors {
-            (0, available)
+            (0, rest)
         } else {
-            p2b_fee_waterfall(program_id, accounts, &st, available)?
+            p2b_fee_waterfall(program_id, accounts, &st, rest, bond_claim)?
         };
         st.senior_claim_atoms = st
             .senior_claim_atoms
@@ -28671,6 +29039,105 @@ pub mod processor {
             .checked_add(senior_part)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)
+    }
+
+    /// Phase 4 item 3: take the capacity-bond coupon off the TOP of one harvested LP fee leg
+    /// (tag 78's bound tail). Returns `(coupon, rest, C_b after)`; `(0, available, 0)` when the
+    /// market has no bond tranche. Once the registry's bond flag is set, [9] bond_tranche (w) is
+    /// REQUIRED (fail closed; [7] ext and [8] the vault LP portfolio must then be passed too).
+    ///
+    /// `coupon = min(coupon_due, available)` with `coupon_due = C_b * rate * dt / (1e4 * 1y)`,
+    /// `rate = base + bonus * min(u_last, u_now)` and `dt` since the last checkpoint. The coupon
+    /// atoms stay in the pots (already harvested there as principal) and are credited to `C_b`, so
+    /// the split hands them to the bonds. NON-CUMULATIVE: the checkpoint moves to "now" whatever
+    /// was paid. Closed (coupon 0) unless Live, the tranche is non-empty and NO senior principal
+    /// loss is outstanding: the coupon never takes priority over Earn principal (I-T7). The
+    /// utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward the
+    /// seniors), never as full.
+    #[inline(never)]
+    fn bond_coupon_take<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        st: &state::VaultLpStateV18,
+        registry: &state::LpVaultRegistryV16,
+        available: u128,
+    ) -> Result<(u128, u128, u128), ProgramError> {
+        let market_ai = account(accounts, 1)?;
+        let Some((t_ai, mut t)) =
+            load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, registry)?
+        else {
+            return Ok((0, available, 0));
+        };
+        expect_writable(t_ai)?;
+        let now = authenticated_slot_or_fallback(t.last_coupon_slot);
+        let live = state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
+            == MarketModeV16::Live;
+        let open = bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms);
+        let u_now = if open && t.coupon_util_bonus_bps != 0 {
+            bond_util_now_bps(program_id, accounts, st).unwrap_or(0)
+        } else {
+            0
+        };
+        let u_eff = if u_now < t.last_util_bps { u_now } else { t.last_util_bps };
+        let due = if open {
+            bond_v20::coupon_due(
+                t.c_b_atoms,
+                bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff),
+                now.saturating_sub(t.last_coupon_slot),
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            0
+        };
+        let (coupon, rest) = bond_v20::bond_coupon_split(available, due);
+        t.c_b_atoms = t
+            .c_b_atoms
+            .checked_add(coupon)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_paid_total_atoms = t
+            .coupon_paid_total_atoms
+            .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
+        if now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.last_util_bps = u_now;
+        state::write_bond_tranche(&mut t_ai.try_borrow_mut_data()?, &t)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "bond_coupon available={} due={} coupon={} c_b={} u_now={} u_eff={} open={}",
+            available, due, coupon, t.c_b_atoms, u_now, u_eff, open
+        ));
+        Ok((coupon, rest, t.c_b_atoms))
+    }
+
+    /// The utilisation of the bond-backed capacity right now: `min(1, max side OI / N_cap)` on the
+    /// bound asset, `N_cap` from the vault LP ([8], bound-key checked) conservative equity.
+    #[inline(never)]
+    fn bond_util_now_bps<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        st: &state::VaultLpStateV18,
+    ) -> Result<u16, ProgramError> {
+        let market_ai = account(accounts, 1)?;
+        let lp_ai = account(accounts, 8)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio || lp_ai.owner != program_id {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+        let a = st.asset_index as usize;
+        let c_m = with_portfolio_header_ro(lp_ai, |h| {
+            vault_lp_v18::conservative_equity(h.capital.get(), h.pnl.get(), h.fee_credits.get())
+                .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        })?;
+        let n_cap = growth_n_cap_for_view(&group, a, c_m)?.unwrap_or(0);
+        let asset = &group
+            .markets
+            .get(a)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        let oi = asset.oi_eff_long_q.get().max(asset.oi_eff_short_q.get());
+        Ok(bond_v20::bond_util_bps(oi, n_cap))
     }
 
     /// Phase 2b G6 fee waterfall for one bound-vault harvest of `available` LP-fee atoms (already
@@ -28692,6 +29159,9 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         st: &state::VaultLpStateV18,
         available: u128,
+        // Phase 4 item 3: the bonds' claim AFTER this crank's coupon (0 without a tranche). The
+        // junior's level excludes it: bond value is never the junior's cushion.
+        bond_claim: u128,
     ) -> Result<(u128, u128), ProgramError> {
         let base = vault_lp_v18::split_fee(available, st.senior_fee_share_bps)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -28756,7 +29226,10 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // The harvested leg is already in the pots (in `nav`) and belongs to the seniors unless
         // the waterfall says otherwise, so the junior's level excludes it.
-        let junior_level = v.saturating_sub(c_eff).saturating_sub(base.0);
+        let junior_level = v
+            .saturating_sub(c_eff)
+            .saturating_sub(base.0)
+            .saturating_sub(bond_claim);
         let (senior, cushion) = vault_lp_v18::cushion_split(
             base.0,
             x.cushion_share_bps,
@@ -31778,6 +32251,12 @@ pub mod processor {
         // Phase 2b G6: once the market's VaultLpExtV19 exists, [11] is REQUIRED (fail closed):
         // the junior cushion the fee waterfall accrued is locked up to its target.
         let ext = load_vault_lp_ext_if_flagged(program_id, accounts, 11, market_ai.key, &registry)?;
+        // Phase 4 item 3: once the market's bond tranche exists, [12] is REQUIRED (fail closed):
+        // the junior is the residual over the seniors AND the bonds' claim, so it can never
+        // withdraw bond value. ([11] must then be passed too, as the ext slot.)
+        let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)?
+            .map(|(_, t)| t.c_b_atoms)
+            .unwrap_or(0);
         {
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
@@ -31846,7 +32325,7 @@ pub mod processor {
             let gated = amount
                 .checked_add(locked)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            if !vault_lp_v18::junior_withdraw_allowed(v, c_eff, cover, gated, st.junior_floor_bps) {
+            if !bond_v20::junior_withdraw_allowed3(v, c_eff, bond_claim, cover, gated, st.junior_floor_bps) {
                 return Err(PercolatorError::VaultLpJuniorWithdrawRefused.into());
             }
             let c_m_before = p2b_c_m(&lp)?;
@@ -32329,6 +32808,7 @@ pub mod processor {
         own_ledger: &mut [u8],
         sib_ledger: &mut [u8],
         amount: u128,
+        bond_claim: u128,
     ) -> Result<(u128, u128), ProgramError> {
         let a = st.asset_index as usize;
         let rec = read_vault_lp_draw_from_view(group, a)?;
@@ -32378,9 +32858,10 @@ pub mod processor {
             v,
             c_eff,
             cert.certified_equity,
-        ) || !vault_lp_v18::alloc_junior_ok(v, c_eff)
+        ) || !bond_v20::alloc_junior_ok3(v, c_eff, bond_claim)
         {
-            // L-3: no allocation onto a near-zero junior.
+            // L-3: no allocation onto a near-zero junior. Phase 4: the JUNIOR alone (bonds can
+            // leave, subject to their lock); `bond_claim == 0` is exactly `alloc_junior_ok`.
             return Err(PercolatorError::VaultLpAllocateRefused.into());
         }
         // L-2: allocated capital a draw consumed no longer counts against alpha.
@@ -32574,6 +33055,11 @@ pub mod processor {
             &mut registry,
             ext_ai,
         )?;
+        // Phase 4 item 3: once the bond tranche exists, [9] is REQUIRED (fail closed) so L-3
+        // measures the junior net of the bonds' claim.
+        let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)?
+            .map(|(_, t)| t.c_b_atoms)
+            .unwrap_or(0);
         // Fund an insolvent vault LP and book any pending draw FIRST (both refuse below).
         vault_lp_draw_then_book(
             program_id,
@@ -32616,6 +33102,7 @@ pub mod processor {
                 &mut own,
                 &mut sib,
                 amount,
+                bond_claim,
             )?
         };
         p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
@@ -32962,6 +33449,126 @@ pub mod processor {
         Ok(())
     }
 
+    /// Principal-only withdrawal of `amount` atoms out of the vault's pot `source_domain`,
+    /// EXTRACTED VERBATIM from tag 102 (P3-M1) so the Resolved bond exit (tag 110) runs the exact
+    /// same gates: the ExecuteRedemption bucket gates (Fresh, idle unliened backing, RESYNC
+    /// 5ebd136 dual gate on `fresh_reserved`), the source's credit rate must stay whole,
+    /// `header.vault -= amount`, the vault-owned counter and the pot ledger's principal fall by
+    /// `amount`. A Live caller is additionally bounded by the ledger principal; the Resolved
+    /// (terminal) path is gated on physical backing only (F-14). The caller moves the atoms on.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn vault_pot_principal_withdraw(
+        group: &mut state::MarketViewMutV16<'_>,
+        ledger_data: &mut [u8],
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        source_domain: u16,
+        amount: u128,
+        resolved: bool,
+    ) -> ProgramResult {
+        let domain = source_domain as usize;
+        let asset_index = domain / 2;
+        let backing_num = amount
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if asset_index >= group.markets.len() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        // ── Principal-only backing withdraw: MIRRORS handle_execute_redemption. ──
+        let (source_acc, bucket_acc) = if domain.is_multiple_of(2) {
+            (
+                &mut group.markets[asset_index].engine.source_credit_long,
+                &mut group.markets[asset_index].engine.backing_long,
+            )
+        } else {
+            (
+                &mut group.markets[asset_index].engine.source_credit_short,
+                &mut group.markets[asset_index].engine.backing_short,
+            )
+        };
+        let mut source = source_acc.try_to_runtime().map_err(map_v16_error)?;
+        let mut bucket = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
+        let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+            ledger_data,
+            market_key,
+            registry_pda,
+            source_domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        // F-14: the Resolved (terminal) path is gated on physical backing only; the ledger
+        // principal can trail the pot (see handle_execute_redemption).
+        if (!resolved && amount > ledger.total_principal_atoms)
+            || bucket.status != BackingBucketStatusV16::Fresh
+            || bucket.fresh_unliened_backing_num < backing_num
+            || source.fresh_reserved_backing_num < backing_num
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        bucket.fresh_unliened_backing_num -= backing_num;
+        if bucket.fresh_unliened_backing_num == 0 && bucket.valid_liened_backing_num == 0 {
+            if bucket.impaired_liened_backing_num != 0 {
+                bucket.status = BackingBucketStatusV16::Impaired;
+            } else if bucket.consumed_liened_backing_num != 0 {
+                bucket.status = BackingBucketStatusV16::Expired;
+            } else {
+                bucket.status = BackingBucketStatusV16::Empty;
+                bucket.expiry_slot = 0;
+            }
+        }
+        let mut source_after = source;
+        source_after.fresh_reserved_backing_num -= backing_num;
+        source_after.credit_rate_num =
+            expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
+        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        source = source_after;
+        source.credit_epoch = source
+            .credit_epoch
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
+        *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
+        group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
+            group
+                .header
+                .source_fresh_backing_total_num
+                .get()
+                .checked_sub(backing_num)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?,
+        );
+        group.header.risk_epoch = percolator::V16PodU64::new(
+            group
+                .header
+                .risk_epoch
+                .get()
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
+        group.header.vault = percolator::V16PodU128::new(
+            group
+                .header
+                .vault
+                .get()
+                .checked_sub(amount)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?,
+        );
+        ledger.total_principal_atoms = ledger.total_principal_atoms.saturating_sub(amount);
+        vault_pot_owned_adjust(group, domain, amount, false)?;
+        ledger.total_principal_withdrawn_atoms = ledger
+            .total_principal_withdrawn_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        {
+            let (_, bucket_after) = backing_domain_parts_view(group, domain)?;
+            ledger.last_observed_unavailable_principal_atoms =
+                backing_unavailable_principal_atoms(&bucket_after)?;
+        }
+        write_or_init_backing_domain_ledger(ledger_data, &ledger, initialized)
+    }
+
     /// P3 — VaultLpReleaseSurplus (tag 102). Junior-owner-gated, Live only (P3-M1).
     ///
     /// Accounts: 0 junior_owner [signer] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
@@ -33043,10 +33650,17 @@ pub mod processor {
             ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         }
         let domain = source_domain as usize;
-        let asset_index = domain / 2;
-        let backing_num = amount
-            .checked_mul(BOUND_SCALE)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // Phase 4 item 3: on the Resolved (terminal) path the junior is paid only what the pots
+        // hold over the seniors' claim AND the bonds' full claim. Once the market's bond tranche
+        // exists, [11] is REQUIRED there (fail closed). The Live path only moves pot surplus into
+        // vault-LP capital (value-neutral), so it does not read the tranche.
+        let bond_claim = if resolved {
+            load_bond_tranche_if_flagged(program_id, accounts, 11, market_ai.key, &registry)?
+                .map(|(_, t)| t.c_b_atoms)
+                .unwrap_or(0)
+        } else {
+            0
+        };
         {
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
@@ -33110,111 +33724,32 @@ pub mod processor {
             )
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             let surplus = if resolved {
-                // Terminal: the pots' physical idle backing above the remaining senior claim.
-                vault_physical_idle_backing_atoms(&group, registry.domain)?
-                    .saturating_sub(st.senior_claim_atoms)
+                // Terminal: the pots' physical idle backing above the remaining senior claim and
+                // (Phase 4) the bonds' claim. `bond_claim == 0` is exactly the old
+                // `physical.saturating_sub(C)`.
+                bond_v20::resolved_junior_surplus3(
+                    vault_physical_idle_backing_atoms(&group, registry.domain)?,
+                    st.senior_claim_atoms,
+                    bond_claim,
+                )
             } else {
                 cover.saturating_sub(c_eff)
             };
             if amount > surplus {
                 return Err(PercolatorError::VaultLpReleaseRefused.into());
             }
-            if asset_index >= group.markets.len() {
-                return Err(PercolatorError::InvalidInstruction.into());
-            }
-            // ── Principal-only backing withdraw: MIRRORS handle_execute_redemption. ──
-            let (source_acc, bucket_acc) = if domain.is_multiple_of(2) {
-                (
-                    &mut group.markets[asset_index].engine.source_credit_long,
-                    &mut group.markets[asset_index].engine.backing_long,
-                )
-            } else {
-                (
-                    &mut group.markets[asset_index].engine.source_credit_short,
-                    &mut group.markets[asset_index].engine.backing_short,
-                )
-            };
-            let mut source = source_acc.try_to_runtime().map_err(map_v16_error)?;
-            let mut bucket = bucket_acc.try_to_runtime().map_err(map_v16_error)?;
-            let mut ledger_data = source_ledger_ai.try_borrow_mut_data()?;
-            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
-                &ledger_data,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                source_domain,
-                &bucket,
-            )?;
-            sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            // F-14: the Resolved (terminal) path is gated on physical backing only; the ledger
-            // principal can trail the pot (see handle_execute_redemption).
-            if (!resolved && amount > ledger.total_principal_atoms)
-                || bucket.status != BackingBucketStatusV16::Fresh
-                || bucket.fresh_unliened_backing_num < backing_num
-                || source.fresh_reserved_backing_num < backing_num
             {
-                return Err(PercolatorError::EngineLockActive.into());
+                let mut ledger_data = source_ledger_ai.try_borrow_mut_data()?;
+                vault_pot_principal_withdraw(
+                    &mut group,
+                    &mut ledger_data,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    source_domain,
+                    amount,
+                    resolved,
+                )?;
             }
-            bucket.fresh_unliened_backing_num -= backing_num;
-            if bucket.fresh_unliened_backing_num == 0 && bucket.valid_liened_backing_num == 0 {
-                if bucket.impaired_liened_backing_num != 0 {
-                    bucket.status = BackingBucketStatusV16::Impaired;
-                } else if bucket.consumed_liened_backing_num != 0 {
-                    bucket.status = BackingBucketStatusV16::Expired;
-                } else {
-                    bucket.status = BackingBucketStatusV16::Empty;
-                    bucket.expiry_slot = 0;
-                }
-            }
-            let mut source_after = source;
-            source_after.fresh_reserved_backing_num -= backing_num;
-            source_after.credit_rate_num =
-                expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-            if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            source = source_after;
-            source.credit_epoch = source
-                .credit_epoch
-                .checked_add(1)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            *source_acc = percolator::SourceCreditStateV16Account::from_runtime(&source);
-            *bucket_acc = percolator::BackingBucketV16Account::from_runtime(&bucket);
-            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(
-                group
-                    .header
-                    .source_fresh_backing_total_num
-                    .get()
-                    .checked_sub(backing_num)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
-            );
-            group.header.risk_epoch = percolator::V16PodU64::new(
-                group
-                    .header
-                    .risk_epoch
-                    .get()
-                    .checked_add(1)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
-            );
-            group.header.vault = percolator::V16PodU128::new(
-                group
-                    .header
-                    .vault
-                    .get()
-                    .checked_sub(amount)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?,
-            );
-            ledger.total_principal_atoms = ledger.total_principal_atoms.saturating_sub(amount);
-            vault_pot_owned_adjust(&mut group, domain, amount, false)?;
-            ledger.total_principal_withdrawn_atoms = ledger
-                .total_principal_withdrawn_atoms
-                .checked_add(amount)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            {
-                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
-                ledger.last_observed_unavailable_principal_atoms =
-                    backing_unavailable_principal_atoms(&bucket_after)?;
-            }
-            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
             if !resolved {
                 // ── Credit it to the vault LP (junior) as capital: header.vault +x, c_tot +x. ──
                 let mut lp_data = lp_ai.try_borrow_mut_data()?;
@@ -33595,6 +34130,835 @@ pub mod processor {
         );
         debug_assert_eq!(p.owner, new_owner, "unwrap: owner not written");
         Ok(())
+    }
+
+    // ── Phase 4 item 3 (2026-10-05): capacity bonds (tags 107-110) ──────────────────────────
+    //
+    // Pure math: `bond_v20`. Loss order junior -> bonds -> Earn seniors -> insurance -> winner
+    // haircut. The bonds' VALUE is the middle layer of `bond_v20::tranche_split3(V, C_s, C_b)`;
+    // `C_b` moves only with 108 (+amount), 110 (-pro-rata slice) and the 78 coupon (+coupon).
+    // The P3 senior draw needs no bond booking: it already treats all pot value above C_eff
+    // (junior AND bond) as subordinate (see the `bond_v20` module doc).
+
+    /// Load the market's bond tranche from `ai`: program-owned, the canonical PDA (stored bump),
+    /// this market's.
+    #[inline(never)]
+    fn load_bond_tranche(
+        program_id: &Pubkey,
+        ai: &AccountInfo<'_>,
+        market_key: &Pubkey,
+    ) -> Result<state::BondTrancheV20, ProgramError> {
+        expect_owner(ai, program_id)?;
+        let t = state::read_bond_tranche(&ai.try_borrow_data()?)?;
+        let expected = Pubkey::create_program_address(
+            &[crate::constants::BOND_TRANCHE_SEED, market_key.as_ref(), &[t.bump]],
+            program_id,
+        )
+        .map_err(|_| PercolatorError::BondConfigInvalid)?;
+        if ai.key != &expected || t.market_group != market_key.to_bytes() {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        }
+        Ok(t)
+    }
+
+    /// The tranche at `idx` once the registry's bond flag is set (then REQUIRED: fail closed),
+    /// else `None` and the slot is not read.
+    #[inline(never)]
+    fn load_bond_tranche_if_flagged<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        idx: usize,
+        market_key: &Pubkey,
+        registry: &state::LpVaultRegistryV16,
+    ) -> Result<Option<(&'a AccountInfo<'a>, state::BondTrancheV20)>, ProgramError> {
+        if !state::registry_bond_tranche(registry)? {
+            return Ok(None);
+        }
+        let ai = account(accounts, idx)?;
+        let t = load_bond_tranche(program_id, ai, market_key)?;
+        Ok(Some((ai, t)))
+    }
+
+    /// Load `owner`'s bond position on `market_key` from `ai` (program-owned, canonical PDA with
+    /// the stored bump, owner field matches).
+    #[inline(never)]
+    fn load_bond_position(
+        program_id: &Pubkey,
+        ai: &AccountInfo<'_>,
+        market_key: &Pubkey,
+        owner: &Pubkey,
+    ) -> Result<state::BondPositionV20, ProgramError> {
+        expect_owner(ai, program_id)?;
+        let x = state::read_bond_position(&ai.try_borrow_data()?)?;
+        let expected = Pubkey::create_program_address(
+            &[
+                crate::constants::BOND_POSITION_SEED,
+                market_key.as_ref(),
+                owner.as_ref(),
+                &[x.bump],
+            ],
+            program_id,
+        )
+        .map_err(|_| PercolatorError::BondConfigInvalid)?;
+        if ai.key != &expected || x.owner != owner.to_bytes() {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        }
+        Ok(x)
+    }
+
+    /// Phase 4 — InitBondTranche (tag 107). Market authority, or the upgrade authority; Live,
+    /// bound vault LP only.
+    ///
+    /// Accounts: 0 authority [signer] · 1 market · 2 registry [w] · 3 vault_lp_state ·
+    /// 4 vault_lp_ext [w] (`["vault_lp_ext", market]`; created with the P2b defaults if absent,
+    /// so every bond-aware handler can rely on the ext slot existing) · 5 bond_tranche [w]
+    /// (`["bond_tranche", market]`) · 6 payer [signer, w] · 7 system_program ·
+    /// 8 program_data (only when [0] is not the market authority).
+    ///
+    /// The dials are protocol-bounded (`bond_v20::bond_config_ok`) and immutable afterwards.
+    /// Sets registry flag 2: from then on 78/97/102(Resolved)/103 REQUIRE the tranche.
+    #[inline(never)]
+    fn handle_init_bond_tranche<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        // [coupon_bps, util_bonus_bps, cap_bps]
+        dials: [u16; 3],
+        cooldown_slots: u32,
+    ) -> ProgramResult {
+        let authority = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let ext_ai = account(accounts, 4)?;
+        let tranche_ai = account(accounts, 5)?;
+        let payer = account(accounts, 6)?;
+        let system_program_ai = account(accounts, 7)?;
+        expect_signer(authority)?;
+        expect_signer(payer)?;
+        expect_writable(payer)?;
+        expect_writable(registry_ai)?;
+        expect_writable(tranche_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let [coupon_bps, util_bonus_bps, cap_bps] = dials;
+        if !bond_v20::bond_config_ok(coupon_bps, util_bonus_bps, cooldown_slots, cap_bps) {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        }
+        let mut registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let (registry_pda, _) = state::derive_lp_vault_registry(program_id, market_ai.key);
+        expect_key(registry_ai, &registry_pda)?;
+        if registry.market_group != market_ai.key.to_bytes() {
+            return Err(PercolatorError::LpVaultNotFound.into());
+        }
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        if state::registry_bond_tranche(&registry)? {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        }
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if st.registry != registry_pda.to_bytes() {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (cfg, mode, _, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if authority.key.to_bytes() != cfg.marketauth {
+            let program_data_ai = account(accounts, 8)?;
+            let (program_data_key, _) = derive_program_data_address(program_id);
+            expect_key(program_data_ai, &program_data_key)?;
+            if read_program_data_upgrade_authority(program_data_ai)? != Some(*authority.key) {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+        }
+        // The ext slot exists from here on (creates it, and raises its flag, if absent).
+        load_or_create_vault_lp_ext(
+            program_id,
+            payer,
+            system_program_ai,
+            market_ai.key,
+            registry_ai,
+            &mut registry,
+            ext_ai,
+        )?;
+        let (pda, bump) = state::derive_bond_tranche(program_id, market_ai.key);
+        expect_key(tranche_ai, &pda)?;
+        if !tranche_ai.data_is_empty() {
+            return Err(PercolatorError::AlreadyInitialized.into());
+        }
+        let market_bytes = market_ai.key.to_bytes();
+        let bump_bytes = [bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::BOND_TRANCHE_SEED,
+            market_bytes.as_ref(),
+            bump_bytes.as_ref(),
+        ];
+        create_pda_account(
+            payer,
+            tranche_ai,
+            system_program_ai,
+            state::bond_tranche_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let t = state::BondTrancheV20 {
+            market_group: market_bytes,
+            last_coupon_slot: Clock::get()?.slot,
+            coupon_bps_per_year: coupon_bps,
+            coupon_util_bonus_bps: util_bonus_bps,
+            bond_cooldown_slots: cooldown_slots,
+            bond_cap_bps_of_c: cap_bps,
+            version: crate::constants::BOND_TRANCHE_VERSION,
+            bump,
+            ..state::BondTrancheV20::default()
+        };
+        state::init_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
+        state::set_registry_bond_tranche(&mut registry);
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "bond_tranche_init coupon_bps={} util_bonus_bps={} cooldown={} cap_bps={}",
+            coupon_bps, util_bonus_bps, cooldown_slots, cap_bps
+        ));
+        Ok(())
+    }
+
+    /// The validated common tail of 108 / 110: registry (bound, this market), the two pot
+    /// ledgers, the vault-LP state and its bound LP, the tranche, the flag. Accounts
+    /// 1 market · 2 registry · 3 vault_lp_state · 4 lp_portfolio · 5 own ledger · 6 sibling
+    /// ledger · 7 bond_tranche.
+    #[inline(never)]
+    fn load_bond_vault_accounts<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> Result<
+        (
+            state::LpVaultRegistryV16,
+            Pubkey,
+            state::VaultLpStateV18,
+            state::BondTrancheV20,
+        ),
+        ProgramError,
+    > {
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(registry_ai, program_id)?;
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let registry_pda = Pubkey::new_from_array(st.registry);
+        expect_key(registry_ai, &registry_pda)?;
+        if !state::registry_vault_lp_bound(&registry)? {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let (own_ledger_pda, _) =
+            state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
+        expect_key(own_ledger_ai, &own_ledger_pda)?;
+        let (sibling_ledger_pda, _) = state::derive_lp_backing_ledger(
+            program_id,
+            market_ai.key,
+            sibling_domain(registry.domain),
+        );
+        expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
+        let Some((_, t)) = load_bond_tranche_if_flagged(program_id, accounts, 7, market_ai.key, &registry)?
+        else {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        };
+        Ok((registry, registry_pda, st, t))
+    }
+
+    /// Phase 4 — BondDeposit (tag 108). Depositor-signed, Live only.
+    ///
+    /// Accounts: 0 depositor [signer, w] (pays the position's rent on first deposit) ·
+    /// 1 market [w] · 2 registry · 3 vault_lp_state [w] · 4 lp_portfolio [w] · 5 own ledger [w] ·
+    /// 6 sibling ledger [w] · 7 bond_tranche [w] · 8 bond_position [w] (`["bond", market,
+    /// depositor]`, created if absent) · 9 source token [w] · 10 vault token [w] ·
+    /// 11 token_program · 12 system_program.
+    ///
+    /// The SPL `amount` becomes vault-LP ENGINE CAPITAL (like the junior's tag 96), so it raises
+    /// `C_m`, growth's `N_cap = lambda * C_m / P` and the H2 exposure cap: N_cap counts junior +
+    /// allocated Earn (<= alpha * C_eff) + bonds. Shares mint at par (`C_b / B`, 1:1 at genesis),
+    /// rounded down. Refused (fail closed) while a senior draw is outstanding, while the fee leg
+    /// is unharvested (bundle 78 first: the coupon is settled before the share price is read),
+    /// while the vault LP's deficit is undrawn, while the tranche or the seniors are impaired at
+    /// the price WORSE for the vault, or above `bond_cap_bps_of_c`.
+    #[inline(never)]
+    fn handle_bond_deposit<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        amount: u64,
+        min_shares: u128,
+    ) -> ProgramResult {
+        let depositor = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let tranche_ai = account(accounts, 7)?;
+        let position_ai = account(accounts, 8)?;
+        let source_token = account(accounts, 9)?;
+        let vault_token = account(accounts, 10)?;
+        let token_program = account(accounts, 11)?;
+        let system_program_ai = account(accounts, 12)?;
+        expect_signer(depositor)?;
+        expect_writable(depositor)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(lp_ai)?;
+        expect_writable(tranche_ai)?;
+        expect_writable(position_ai)?;
+        expect_writable(source_token)?;
+        expect_writable(vault_token)?;
+        expect_owner(lp_ai, program_id)?;
+        verify_token_program(token_program)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if amount == 0 {
+            return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        let (registry, registry_pda, mut st, mut t) = load_bond_vault_accounts(program_id, accounts)?;
+        let (cfg, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let mint = primary_collateral_mint(&cfg);
+        let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+        let source_balance = verify_user_token_account(source_token, depositor.key, &mint)?;
+        verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+        require_token_balance(source_balance, amount)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        // Fund an insolvent vault LP and book any pending draw FIRST.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        if st.senior_draw_outstanding_atoms != 0 {
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
+        }
+        let minted = bond_deposit_core(
+            program_id,
+            accounts,
+            &registry,
+            &registry_pda,
+            &st,
+            &t,
+            [amount as u128, min_shares, max_market_slots as u128],
+        )?;
+        transfer_tokens(token_program, source_token, vault_token, depositor, amount)?;
+        let now = Clock::get()?.slot;
+        // Position: create on the first deposit.
+        let mut pos = if position_ai.data_is_empty() {
+            let (pda, bump) =
+                state::derive_bond_position(program_id, market_ai.key, depositor.key);
+            expect_key(position_ai, &pda)?;
+            let market_bytes = market_ai.key.to_bytes();
+            let owner_bytes = depositor.key.to_bytes();
+            let bump_bytes = [bump];
+            let seeds: &[&[u8]] = &[
+                crate::constants::BOND_POSITION_SEED,
+                market_bytes.as_ref(),
+                owner_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(
+                depositor,
+                position_ai,
+                system_program_ai,
+                state::bond_position_account_len(),
+                program_id,
+                seeds,
+            )?;
+            let x = state::BondPositionV20 {
+                owner: owner_bytes,
+                version: crate::constants::BOND_POSITION_VERSION,
+                bump,
+                ..state::BondPositionV20::default()
+            };
+            state::init_bond_position(&mut position_ai.try_borrow_mut_data()?, &x)?;
+            x
+        } else {
+            load_bond_position(program_id, position_ai, market_ai.key, depositor.key)?
+        };
+        pos.shares = pos
+            .shares
+            .checked_add(minted)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)?;
+        let amount = amount as u128;
+        t.c_b_atoms = t
+            .c_b_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.b_shares_total = t
+            .b_shares_total
+            .checked_add(minted)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.principal_in_lp_atoms = t
+            .principal_in_lp_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // The fee leg was harvested (refused otherwise), so moving the checkpoint forfeits
+        // nothing earned; the newcomer accrues coupon only from now (no coupon farming).
+        if now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.bond_drawn_outstanding_atoms = 0;
+        state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "bond_deposit amount={} minted={} c_b={} b={}",
+            amount, minted, t.c_b_atoms, t.b_shares_total
+        ));
+        Ok(())
+    }
+
+    /// The value side of tag 108 inside one market borrow: pricing, gates, the engine deposit.
+    /// `args = [amount, min_shares, max_market_slots]`. Returns the shares minted.
+    #[inline(never)]
+    fn bond_deposit_core<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        st: &state::VaultLpStateV18,
+        t: &state::BondTrancheV20,
+        args: [u128; 3],
+    ) -> Result<u128, ProgramError> {
+        let [amount, min_shares, max_market_slots] = args;
+        let market_ai = account(accounts, 1)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let _ = program_id;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+        if lp_vault_harvestable_fee_atoms(&cfg_v, &group)? != 0 {
+            return Err(PercolatorError::VaultLpHarvestPending.into());
+        }
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots as usize)?;
+        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        let nav = {
+            let own = own_ledger_ai.try_borrow_data()?;
+            let sib = sibling_ledger_ai.try_borrow_data()?;
+            lp_vault_combined_nav_parts_p3(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                registry.fee_share_bps,
+                &own,
+                &sib,
+            )?
+            .1
+        };
+        // No undrawn deficit (the draw runs first), a CURRENT valuation, and the price worse for
+        // the vault: a depositor at par never buys into a pending loss.
+        if vault_lp_undrawn_deficit_ro(&group, lp.header)? != 0 {
+            return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+        }
+        let lp_value = vault_lp_value_atoms(&group, lp.header)?;
+        let worse = vault_lp_equity_lag_bounds_ro(&group, lp.header)?.0;
+        let c_eff = st.senior_claim_atoms;
+        let v = nav
+            .checked_add(lp_value)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let v_worse = bond_v20::vault_value_worse(nav, lp_value, worse);
+        if v_worse < c_eff || bond_v20::bond_impaired(v_worse, c_eff, t.c_b_atoms) {
+            return Err(PercolatorError::BondTrancheImpaired.into());
+        }
+        let split = bond_v20::tranche_split3(v, c_eff, t.c_b_atoms);
+        let c_b_after = t
+            .c_b_atoms
+            .checked_add(amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if !bond_v20::bond_cap_ok(c_b_after, c_eff, split.junior, t.bond_cap_bps_of_c) {
+            return Err(PercolatorError::BondDepositAboveCap.into());
+        }
+        // Not impaired => the tranche is worth exactly its claim: mint at par.
+        let minted = bond_v20::bond_shares_for_deposit(amount, t.b_shares_total, split.bond)
+            .ok_or(PercolatorError::BondTrancheImpaired)?;
+        if minted == 0 || minted < min_shares {
+            return Err(PercolatorError::BondSlippage.into());
+        }
+        group.deposit_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+        group.validate_shape().map_err(map_v16_error)?;
+        Ok(minted)
+    }
+
+    /// Phase 4 — BondRequestWithdraw (tag 109). Holder-signed.
+    ///
+    /// Accounts: 0 holder [signer] · 1 market · 2 bond_tranche · 3 bond_position [w].
+    ///
+    /// Sets the pending withdrawal to `shares` (0 cancels) and restarts the cooldown. Pending
+    /// shares stay in `B`: they keep absorbing losses and earning coupons until 110 executes.
+    #[inline(never)]
+    fn handle_bond_request_withdraw<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        shares: u128,
+    ) -> ProgramResult {
+        let holder = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let tranche_ai = account(accounts, 2)?;
+        let position_ai = account(accounts, 3)?;
+        expect_signer(holder)?;
+        expect_writable(position_ai)?;
+        expect_owner(market_ai, program_id)?;
+        load_bond_tranche(program_id, tranche_ai, market_ai.key)?;
+        let mut pos = load_bond_position(program_id, position_ai, market_ai.key, holder.key)?;
+        if shares > pos.shares {
+            return Err(PercolatorError::BondConfigInvalid.into());
+        }
+        pos.pending_withdraw_shares = shares;
+        pos.request_slot = Clock::get()?.slot;
+        state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)
+    }
+
+    /// Phase 4 — BondExecuteWithdraw (tag 110). Holder-signed.
+    ///
+    /// Accounts: 0 holder [signer] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
+    /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger [w] · 7 bond_tranche [w] ·
+    /// 8 bond_position [w] · 9 dest token [w] (owner = holder) · 10 vault token [w] ·
+    /// 11 vault_authority · 12 token_program.
+    ///
+    /// Redeems EVERY pending share, after `request_slot + bond_cooldown_slots`, at the bond
+    /// value priced at the price WORSE for the vault; `C_b` falls by the pro-rata slice
+    /// (rounded down: the remaining holders are never diluted).
+    /// * Live: paid out of the vault LP's engine capital (the engine admits the withdrawal only
+    ///   from a FLAT vault LP), and only if (a) no senior draw is outstanding, (b) the pots alone
+    ///   cover the seniors, and (c) the OPEN-INTEREST LOCK holds after the withdrawal:
+    ///   `N_cap(C_m - x) >= max(OI_long, OI_short, |LP_eff|)` (`bond_v20::bond_withdraw_lock_ok`,
+    ///   the fix for the bond self-funding attack). The P2b A4 check runs again after the move.
+    /// * Resolved (terminal-flat, vault LP settled into the pots by 101): paid from
+    ///   `source_domain`'s pot, principal-only, through tag 102's exact gates; the bonds' value is
+    ///   their layer of the pots' PHYSICAL backing over the seniors' claim, so a bond exit never
+    ///   reaches senior backing and the junior (102) is paid only after every bond is whole.
+    #[inline(never)]
+    fn handle_bond_execute_withdraw<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        min_out: u64,
+        source_domain: u16,
+    ) -> ProgramResult {
+        let holder = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let tranche_ai = account(accounts, 7)?;
+        let position_ai = account(accounts, 8)?;
+        let dest_token = account(accounts, 9)?;
+        let vault_token = account(accounts, 10)?;
+        let vault_authority_ai = account(accounts, 11)?;
+        let token_program = account(accounts, 12)?;
+        expect_signer(holder)?;
+        expect_writable(market_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_writable(tranche_ai)?;
+        expect_writable(position_ai)?;
+        expect_writable(dest_token)?;
+        expect_writable(vault_token)?;
+        verify_token_program(token_program)?;
+        let (registry, registry_pda, mut st, mut t) = load_bond_vault_accounts(program_id, accounts)?;
+        let mut pos = load_bond_position(program_id, position_ai, market_ai.key, holder.key)?;
+        let shares = pos.pending_withdraw_shares;
+        let now = Clock::get()?.slot;
+        if shares == 0 || !bond_v20::bond_cooldown_elapsed(now, pos.request_slot, t.bond_cooldown_slots) {
+            return Err(PercolatorError::BondWithdrawCooldown.into());
+        }
+        let (cfg, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let (vault_authority, vault_bump) = derive_vault_authority(program_id, market_ai.key);
+        expect_key(vault_authority_ai, &vault_authority)?;
+        let vault_balance = verify_withdrawable_token_accounts(
+            dest_token,
+            holder.key,
+            vault_token,
+            &vault_authority,
+            &cfg,
+            false,
+        )?;
+        let live = match mode {
+            MarketModeV16::Live => true,
+            MarketModeV16::Resolved => false,
+            _ => return Err(PercolatorError::EngineLockActive.into()),
+        };
+        if live {
+            expect_writable(lp_ai)?;
+            expect_owner(lp_ai, program_id)?;
+            ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        }
+        // Fund an insolvent vault LP (Live) and book any pending draw FIRST, in both modes (the
+        // 102 order): the bonds are priced against the booked senior claim.
+        vault_lp_draw_then_book(
+            program_id,
+            market_ai,
+            &registry,
+            &registry_pda,
+            vault_lp_ai,
+            &mut st,
+            Some(lp_ai),
+            own_ledger_ai,
+            sibling_ledger_ai,
+            true,
+        )?;
+        if vault_lp_v18::vault_lp_draw_halts(
+            st.senior_draw_outstanding_atoms,
+            vault_lp_v18::DRAW_OP_BOND_WITHDRAW,
+        ) {
+            return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
+        }
+        let (payout, impairment) = match mode {
+            MarketModeV16::Live => {
+                bond_withdraw_live_core(
+                    accounts,
+                    &registry,
+                    &registry_pda,
+                    &st,
+                    &t,
+                    [shares, min_out as u128, max_market_slots as u128],
+                )?
+            }
+            MarketModeV16::Resolved => {
+                if source_domain as usize / 2 != registry.domain as usize / 2 {
+                    return Err(PercolatorError::InvalidInstruction.into());
+                }
+                let source_ledger_ai = if source_domain == registry.domain {
+                    own_ledger_ai
+                } else {
+                    sibling_ledger_ai
+                };
+                expect_writable(source_ledger_ai)?;
+                expect_owner(source_ledger_ai, program_id)?;
+                bond_withdraw_resolved_core(
+                    accounts,
+                    &registry,
+                    &registry_pda,
+                    &st,
+                    &t,
+                    source_ledger_ai,
+                    [shares, min_out as u128, source_domain as u128],
+                )?
+            }
+            _ => return Err(PercolatorError::EngineLockActive.into()),
+        };
+        if payout != 0 {
+            let amount_u64 = amount_to_u64(payout)?;
+            require_token_balance(vault_balance, amount_u64)?;
+            let bump_arr = [vault_bump];
+            let signer_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &bump_arr]];
+            transfer_tokens_signed(
+                token_program,
+                vault_token,
+                dest_token,
+                vault_authority_ai,
+                amount_u64,
+                signer_seeds,
+            )?;
+        }
+        let total = t.b_shares_total;
+        t.c_b_atoms = bond_v20::bond_claim_after_redemption(t.c_b_atoms, shares, total)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        t.b_shares_total = total
+            .checked_sub(shares)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        if mode == MarketModeV16::Live {
+            t.principal_in_lp_atoms = t.principal_in_lp_atoms.saturating_sub(payout);
+        }
+        // 110 requires the fee leg harvested (refused otherwise): nothing earned is forfeited.
+        if now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.bond_drawn_outstanding_atoms = if t.c_b_atoms == 0 { 0 } else { impairment };
+        state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
+        pos.shares = pos
+            .shares
+            .checked_sub(shares)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        pos.pending_withdraw_shares = 0;
+        state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)?;
+        // No Q2 floor refresh: the floor `T = C - nav` does not move with a bond exit (only the
+        // vault LP's capital does, and the halt compares that capital against T live).
+        let _ = (&registry, &registry_pda, &st);
+        solana_program::log::sol_log(&alloc::format!(
+            "bond_withdraw shares={} payout={} c_b={} b={} impairment={}",
+            shares, payout, t.c_b_atoms, t.b_shares_total, impairment
+        ));
+        Ok(())
+    }
+
+    /// Tag 110 Live value side inside one market borrow. `args = [shares, min_out,
+    /// max_market_slots]`. Returns `(payout, impairment observed)`.
+    #[inline(never)]
+    fn bond_withdraw_live_core<'a>(
+        accounts: &'a [AccountInfo<'a>],
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        st: &state::VaultLpStateV18,
+        t: &state::BondTrancheV20,
+        args: [u128; 3],
+    ) -> Result<(u128, u128), ProgramError> {
+        let [shares, min_out, max_market_slots] = args;
+        let market_ai = account(accounts, 1)?;
+        let lp_ai = account(accounts, 4)?;
+        let own_ledger_ai = account(accounts, 5)?;
+        let sibling_ledger_ai = account(accounts, 6)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        reject_permissionless_resolve_matured_live_view(&cfg_v, &group)?;
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots as usize)?;
+        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        // Same order as 97: crystallize the accrued maintenance fee BEFORE the value is read.
+        collect_maintenance_fee_before_value_debit_view(&cfg_v, &mut group, &mut lp)?;
+        if lp_vault_harvestable_fee_atoms(&cfg_v, &group)? != 0 {
+            return Err(PercolatorError::VaultLpHarvestPending.into());
+        }
+        let nav = {
+            let own = own_ledger_ai.try_borrow_data()?;
+            let sib = sibling_ledger_ai.try_borrow_data()?;
+            lp_vault_combined_nav_parts_p3(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                registry.fee_share_bps,
+                &own,
+                &sib,
+            )?
+            .1
+        };
+        let c_eff = st.senior_claim_atoms;
+        // Seniors keep their liquidity: a bond exit draws on the vault LP, never on backing, and
+        // only while the pots alone cover the seniors (the 97 rule).
+        if nav < c_eff {
+            return Err(PercolatorError::BondCapacityLocked.into());
+        }
+        if vault_lp_undrawn_deficit_ro(&group, lp.header)? != 0 {
+            return Err(PercolatorError::VaultLpSeniorDrawRequired.into());
+        }
+        let lp_value = vault_lp_value_atoms(&group, lp.header)?;
+        let worse = vault_lp_equity_lag_bounds_ro(&group, lp.header)?.0;
+        let v_worse = bond_v20::vault_value_worse(nav, lp_value, worse);
+        let bond_value = bond_v20::tranche_split3(v_worse, c_eff, t.c_b_atoms).bond;
+        let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
+            .ok_or(PercolatorError::BondConfigInvalid)?;
+        if payout < min_out {
+            return Err(PercolatorError::BondSlippage.into());
+        }
+        // OPEN-INTEREST LOCK, checked BEFORE the capital moves (I-T6).
+        let a = st.asset_index as usize;
+        let c_m_before = p2b_c_m(&lp)?;
+        let n_after = growth_n_cap_for_view(&group, a, c_m_before.saturating_sub(payout))?;
+        let (oi_long, oi_short) = {
+            let asset = &group
+                .markets
+                .get(a)
+                .ok_or(PercolatorError::InvalidInstruction)?
+                .engine
+                .asset;
+            (asset.oi_eff_long_q.get(), asset.oi_eff_short_q.get())
+        };
+        let lp_eff = effective_signed_position_for_asset_view(&group, &lp, a)?.unsigned_abs();
+        if !bond_v20::bond_withdraw_lock_ok(n_after, oi_long, oi_short, lp_eff) {
+            return Err(PercolatorError::BondCapacityLocked.into());
+        }
+        if payout != 0 {
+            group.withdraw_not_atomic(&mut lp, payout).map_err(map_v16_error)?;
+            // P2b A4 (defence in depth: the engine withdraw above is flat-only).
+            p2b_a4_capacity_check(&group, &lp, a, c_m_before)?;
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        Ok((payout, bond_v20::bond_impairment(v_worse, c_eff, t.c_b_atoms)))
+    }
+
+    /// Tag 110 Resolved value side inside one market borrow. `args = [shares, min_out,
+    /// source_domain]`. Returns `(payout, impairment observed)`.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn bond_withdraw_resolved_core<'a>(
+        accounts: &'a [AccountInfo<'a>],
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        st: &state::VaultLpStateV18,
+        t: &state::BondTrancheV20,
+        source_ledger_ai: &AccountInfo<'a>,
+        args: [u128; 3],
+    ) -> Result<(u128, u128), ProgramError> {
+        let [shares, min_out, source_domain] = args;
+        let source_domain = source_domain as u16;
+        let market_ai = account(accounts, 1)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+        // Terminal-flat only (the 102 Resolved rule): every loss realised, every winner paid,
+        // the vault LP settled into the pots.
+        let (flat, receipts_open) = resolved_terminal_flat(&group)?;
+        if !flat {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        // F-14 (the 77 rule): a claim-free residual or stray must be absorbed by 78 first.
+        if (!receipts_open && vault_terminal_residual_atoms(&group)? != 0)
+            || vault_terminal_stray_atoms(&group, st.asset_index as usize)?
+                .iter()
+                .any(|x| *x != 0)
+        {
+            return Err(PercolatorError::VaultLpHarvestPending.into());
+        }
+        let authorities = domain_authorities_from_view(&group, &cfg_v, source_domain as usize)?;
+        if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+            return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+        }
+        let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
+        let bond_value = bond_v20::resolved_bond_value(physical, st.senior_claim_atoms, t.c_b_atoms);
+        let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
+            .ok_or(PercolatorError::BondConfigInvalid)?;
+        if payout < min_out {
+            return Err(PercolatorError::BondSlippage.into());
+        }
+        if payout != 0 {
+            let mut ledger_data = source_ledger_ai.try_borrow_mut_data()?;
+            vault_pot_principal_withdraw(
+                &mut group,
+                &mut ledger_data,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                source_domain,
+                payout,
+                true,
+            )?;
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        Ok((payout, bond_v20::bond_impairment(physical, st.senior_claim_atoms, t.c_b_atoms)))
     }
 
     /// SetNftProgramId (tag 73) — creates or updates the per-market NftRegistry PDA.

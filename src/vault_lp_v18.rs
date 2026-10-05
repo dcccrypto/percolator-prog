@@ -481,16 +481,19 @@ pub const DRAW_OP_SENIOR_DEPOSIT_75: u8 = 4;
 pub const DRAW_OP_SENIOR_REQUEST_76: u8 = 5;
 pub const DRAW_OP_SENIOR_REDEEM_77: u8 = 6;
 pub const DRAW_OP_RECALL_98: u8 = 7;
+/// Phase 4 item 3: bond withdrawal (tag 110). Halted while a senior draw is outstanding.
+pub const DRAW_OP_BOND_WITHDRAW: u8 = 8;
 
 /// Owner rule (2026-09-30): while a draw is outstanding HALT the vault LP's risk-increasing fills,
-/// junior withdraw (97), junior release (102) and recall (98); NEVER halt senior deposit /
-/// request / redeem (75/76/77).
+/// junior withdraw (97), junior release (102), recall (98) and (Phase 4) bond withdrawal (110);
+/// NEVER halt senior deposit / request / redeem (75/76/77).
 pub fn vault_lp_draw_halts(draw_outstanding: u128, op: u8) -> bool {
     draw_outstanding > 0
         && (op == DRAW_OP_LP_RISK_INCREASING_FILL
             || op == DRAW_OP_JUNIOR_WITHDRAW_97
             || op == DRAW_OP_JUNIOR_RELEASE_102
-            || op == DRAW_OP_RECALL_98)
+            || op == DRAW_OP_RECALL_98
+            || op == DRAW_OP_BOND_WITHDRAW)
 }
 
 /// The persisted draw ledger of one vault (`VaultLpStateV18` fields + the market's pending move).
