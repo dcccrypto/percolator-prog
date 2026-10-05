@@ -15,7 +15,10 @@ L = os.path.join(HERE, "logs", tag)
 os.makedirs(L, exist_ok=True)
 summ = open(os.path.join(L, "SUMMARY"), "w")
 os.chdir(HERE)
+ONLY = [x for x in os.environ.get("ONLY", "").split(",") if x]
 for name, f, old, new, h, crate in MUTANTS:
+    if ONLY and name not in ONLY:
+        continue
     t0 = time.time()
     log = os.path.join(L, f"{name}.log")
     restore = None
