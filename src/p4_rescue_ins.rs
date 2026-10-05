@@ -126,9 +126,13 @@ pub fn ins_burn_no_dilution(insurance: u128, units_total: u128, a: u128, burned:
 pub const BACKSTOP_CAP_BPS: u16 = 5_000;
 
 /// G9 is due only when the vault LP has a certified deficit that the junior and the seniors can
-/// no longer fund: the draw has run (nothing pending) and found NO drawable pot backing.
-pub fn backstop_due(deficit: u128, drawable_backing: u128, pending: u128) -> bool {
-    deficit != 0 && drawable_backing == 0 && pending == 0
+/// no longer fund: the draw has run (nothing pending), found NO drawable pot backing, AND the
+/// seniors' pots are worth nothing (`senior_nav == 0`). The last clause matters: pot backing that
+/// is merely RESERVED against a winner's registered claim is not drawable, but it is still the
+/// seniors' and still backs that winner; lending insurance then would shield the seniors from a
+/// loss the waterfall assigns to them (junior -> seniors -> backstop).
+pub fn backstop_due(deficit: u128, drawable_backing: u128, pending: u128, senior_nav: u128) -> bool {
+    deficit != 0 && drawable_backing == 0 && pending == 0 && senior_nav == 0
 }
 
 /// Atoms G9 moves now: `min(deficit, I_free, cap_room)` where
@@ -348,10 +352,12 @@ mod tests {
 
     #[test]
     fn backstop_bounds() {
-        assert!(backstop_due(10, 0, 0));
-        assert!(!backstop_due(10, 1, 0));
-        assert!(!backstop_due(10, 0, 1));
-        assert!(!backstop_due(0, 0, 0));
+        assert!(backstop_due(10, 0, 0, 0));
+        assert!(!backstop_due(10, 1, 0, 0));
+        assert!(!backstop_due(10, 0, 1, 0));
+        assert!(!backstop_due(0, 0, 0, 0));
+        // Reserved-but-not-drawable senior backing: not due.
+        assert!(!backstop_due(10, 0, 0, 1));
         // cap 50% of (I + outstanding) = 50 of 100.
         assert_eq!(backstop_draw_amount(1_000, 100, 100, 0, 5_000), 50);
         assert_eq!(backstop_draw_amount(1_000, 100, 60, 40, 5_000), 10);

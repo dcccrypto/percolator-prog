@@ -33262,10 +33262,24 @@ pub mod processor {
                 let reg = registry_pda.to_bytes();
                 let drawable = vault_pot_drawable_atoms(&group, &cfg, &reg, 0)?
                     .saturating_add(vault_pot_drawable_atoms(&group, &cfg, &reg, 1)?);
-                if !crate::p4_rescue_ins::backstop_due(deficit, drawable, pending) {
+                let senior_nav = {
+                    let own = own_ledger_ai.try_borrow_data()?;
+                    let sib = sibling_ledger_ai.try_borrow_data()?;
+                    lp_vault_combined_nav_parts_p3(
+                        &group,
+                        market_ai.key.to_bytes(),
+                        reg,
+                        registry.domain,
+                        registry.fee_share_bps,
+                        &own,
+                        &sib,
+                    )?
+                    .1
+                };
+                if !crate::p4_rescue_ins::backstop_due(deficit, drawable, pending, senior_nav) {
                     solana_program::log::sol_log(&alloc::format!(
-                        "p4_backstop_not_due deficit={} drawable={} pending={}",
-                        deficit, drawable, pending
+                        "p4_backstop_not_due deficit={} drawable={} pending={} senior_nav={}",
+                        deficit, drawable, pending, senior_nav
                     ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
@@ -33317,7 +33331,10 @@ pub mod processor {
                 } else {
                     0
                 };
-                let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, equity, max_amount);
+                // Only CAPITAL can leave the account (the flat-only engine withdraw); positive PnL
+                // is converted first by the permissionless tag 100 (keeper: 100 then 111 mode 1).
+                let free = equity.min(lp.header.capital.get());
+                let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, free, max_amount);
                 if amt == 0 {
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
