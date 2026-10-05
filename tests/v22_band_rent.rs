@@ -242,6 +242,8 @@ struct Env {
     portfolio_account_len: usize,
     next_key: u8,
     slot: u64,
+    upgrade_authority: Keypair,
+    program_data: Pubkey,
 }
 
 impl Env {
@@ -289,7 +291,35 @@ impl Env {
                 .unwrap(),
             next_key: 0x40,
             slot: 1,
+            upgrade_authority: seeded_keypair(3),
+            program_data: Pubkey::find_program_address(
+                &[program_id.as_ref()],
+                &solana_sdk::bpf_loader_upgradeable::id(),
+            )
+            .0,
         };
+        // ProgramData mock for the tag-93 upgrade-authority gate (as tests/growth_v19.rs).
+        {
+            let ua = env.upgrade_authority.pubkey();
+            env.svm.airdrop(&ua, 1_000_000_000).unwrap();
+            let mut pd = vec![0u8; 45];
+            pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+            pd[12] = 1;
+            pd[13..45].copy_from_slice(ua.as_ref());
+            let pdk = env.program_data;
+            env.svm
+                .set_account(
+                    pdk,
+                    Account {
+                        lamports: 1_000_000_000,
+                        data: pd,
+                        owner: solana_sdk::bpf_loader_upgradeable::id(),
+                        executable: false,
+                        rent_epoch: 0,
+                    },
+                )
+                .unwrap();
+        }
         let admin = env.admin.insecure_clone();
         env.send(
             init_market_ix(&cfg),
@@ -660,6 +690,34 @@ impl Env {
         )
     }
 
+    /// Tag 93 with the growth dial trailer (8-byte form when `util != 0`), signed by the UA.
+    fn set_growth_dials(&mut self, lambda_bps: u32, kink_bps: u16, util: u16) -> Result<u64, String> {
+        let ua = self.upgrade_authority.insecure_clone();
+        let (pd, market) = (self.program_data, self.market);
+        self.send(
+            ProgInstruction::SetAssetRiskLimitsV19 {
+                limits: Box::new(ProgInstruction::SetAssetRiskLimits {
+                    asset_index: 0,
+                    exec_band_bps: 0,
+                    lp_exposure_k_bps: 0,
+                    lp_floor_atoms: 0,
+                    side_oi_cap_q: 0,
+                    matcher_ext_mode: 0,
+                    max_requested_fee_bps: 0,
+                }),
+                growth_lambda_bps: lambda_bps,
+                growth_kink_bps: kink_bps,
+                growth_util_fee_max_bps: util,
+            },
+            vec![
+                AccountMeta::new(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&ua],
+        )
+    }
+
     fn engine_asset(&self) -> percolator::AssetStateV16 {
         let mut data = self.svm.get_account(&self.market).unwrap().data;
         let (_, g) = state::market_view_mut(&mut data).unwrap();
@@ -807,6 +865,29 @@ fn v22_init_market_refusals_are_named() {
     assert!(Env::try_new(band_cfg()).is_ok());
 }
 
+#[test]
+fn v22_band_market_refuses_a_maintenance_fee() {
+    // The per-slot maintenance fee is unpriced by the Band Safety Law: refused at init...
+    let mut env = Env::new(band_cfg());
+    let admin = env.admin.insecure_clone();
+    let m = env.market;
+    let r = env.send(
+        ProgInstruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: 1 },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    );
+    assert_err(&r, &code(PercolatorError::PriceBandConfigInvalid), "maintenance fee on a band market");
+    // ...while a band-off growth market accepts it (control).
+    let mut legacy = Env::new(Cfg { slots: 1, phase4: None, r_gap: 400 });
+    let m = legacy.market;
+    let r = legacy.send(
+        ProgInstruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: 1 },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    );
+    assert!(r.is_ok(), "control: {r:?}");
+}
+
 // ---------------------------------------------------------------------------
 // Band on BPF: staircase, edge pin, favourable close, re-anchor
 // ---------------------------------------------------------------------------
@@ -951,4 +1032,88 @@ fn v22_rent_is_zero_at_or_below_the_kink_and_off_without_rent() {
         env.crank_current(taker.1);
     }
     assert_eq!(env.engine_asset().rent_index_long_num, 0, "no rent ceiling, no rent");
+}
+
+// ---------------------------------------------------------------------------
+// growth-v19 interaction: the leverage ceiling, lambda, alpha and toll dials vs the band
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v22_growth_dials_unlock_only_on_a_band_market() {
+    use percolator_prog::growth_v19 as gv;
+    // Band market (MMR 500, G(100) = 304): lambda may exceed 1x (up to band_lambda_max, capped
+    // at MAX_LAMBDA_BPS), kink up to 100%, toll down to 0.
+    let mut env = Env::new(band_cfg());
+    assert!(env.set_growth_dials(50_000, 9_000, 0).is_ok(), "band: lambda 5x, kink 90%");
+    assert_eq!(env.growth().lambda_bps, 50_000);
+    assert!(env.set_growth_dials(50_000, 9_000, 1).is_ok(), "band: toll down to 1 bps");
+    assert_eq!(env.growth().util_fee_max_bps, 1);
+    // Off-band growth market (v2.1 growth-1): tighten-only, lambda <= 1x, toll >= 500 bps.
+    let mut legacy = Env::new(Cfg { slots: 1, phase4: None, r_gap: 400 });
+    assert_err(&legacy.set_growth_dials(50_000, 5_000, 0), &code(PercolatorError::GrowthInvalidConfig), "off-band lambda > 1x");
+    assert_err(&legacy.set_growth_dials(10_000, 9_000, 0), &code(PercolatorError::GrowthInvalidConfig), "off-band kink > 50%");
+    assert_err(&legacy.set_growth_dials(10_000, 5_000, 100), &code(PercolatorError::GrowthInvalidConfig), "off-band toll < 500");
+    assert!(legacy.set_growth_dials(10_000, 5_000, 0).is_ok(), "control: the growth-1 box");
+    // Rent-only market (no band): toll down to the 25 bps entry floor, never below.
+    let mut c = band_cfg();
+    c.phase4 = Some(phase4(0, RENT_MAX));
+    c.r_gap = 400;
+    let mut rent_only = Env::new(c);
+    assert!(rent_only.set_growth_dials(10_000, 5_000, gv::RENT_ENTRY_FLOOR_BPS).is_ok());
+    assert_err(&rent_only.set_growth_dials(10_000, 5_000, gv::RENT_ENTRY_FLOOR_BPS - 1), &code(PercolatorError::GrowthInvalidConfig), "rent market toll < floor");
+    assert_err(&rent_only.set_growth_dials(20_000, 5_000, 0), &code(PercolatorError::GrowthInvalidConfig), "no band, no lambda > 1x");
+}
+
+#[test]
+fn v22_growth_pure_band_gates() {
+    use percolator_prog::growth_v19 as gv;
+    // Graduation: band AND an on-chain depth tier (item 4 supplies the tier; 0 until then).
+    assert!(!gv::graduation_allowed(0, 0) && !gv::graduation_allowed(130, 0) && !gv::graduation_allowed(0, 2));
+    assert!(gv::graduation_allowed(130, 1));
+    // r_gap derived = G(d).
+    assert_eq!(gv::band_r_gap_bps(130), Some(397));
+    assert_eq!(gv::band_r_gap_bps(0), None);
+    // lambda ceiling: floor(1e4 * 9_500 / (MMR + G)), capped.
+    assert_eq!(gv::band_lambda_max_bps(1_000, 938), Some(10_000 * 9_500 / 1_938));
+    assert_eq!(gv::band_lambda_max_bps(500, 397), Some(gv::MAX_LAMBDA_BPS), "capped at 10x");
+    assert!(gv::growth_dials_ok_for(Some((1_000, 938)), 49_019, 10_000));
+    assert!(!gv::growth_dials_ok_for(Some((1_000, 938)), 49_020, 10_000), "above band_lambda_max");
+    assert!(!gv::growth_dials_ok_for(None, 10_001, 0), "off-band box unchanged");
+    // alpha: 50% off-band, 70% on a band market.
+    assert_eq!(gv::alloc_alpha_max_bps(false), 5_000);
+    assert_eq!(gv::alloc_alpha_max_bps(true), 7_000);
+    // I-1: c_launch never below $1,000.
+    assert_eq!(gv::c_launch_atoms_for(1), gv::MIN_C_LAUNCH_ATOMS);
+    assert_eq!(gv::c_launch_atoms_for(5 * gv::MIN_C_LAUNCH_ATOMS), 5 * gv::MIN_C_LAUNCH_ATOMS);
+    // The toll in force: stored, else 25 bps on a rent market, else the growth-1 500 bps.
+    assert_eq!(gv::util_fee_max_effective_bps_for(0, true), gv::RENT_ENTRY_FLOOR_BPS);
+    assert_eq!(gv::util_fee_max_effective_bps_for(0, false), gv::GROWTH_UTIL_FEE_DEFAULT_BPS);
+    assert_eq!(gv::util_fee_max_effective_bps_for(77, true), 77);
+}
+
+#[test]
+fn v22_rent_rate_kink_cap_monotone_exhaustive() {
+    use percolator_prog::growth_v19::rent_rate_e9;
+    // I-R1 on a small exhaustive domain (the Kani twin bounds the same function).
+    for n in [1u128, 7, 100, 1_000] {
+        for kink in [0u16, 1, 5_000, 9_999, 10_000] {
+            for max in [0u64, 1, 23, 10_000] {
+                let mut prev = 0u64;
+                for users in 0..=(2 * n) {
+                    let r = rent_rate_e9(users, n, kink, max).unwrap();
+                    assert!(r <= max);
+                    assert!(r >= prev, "monotone in users");
+                    if users * 10_000 <= kink as u128 * n {
+                        assert_eq!(r, 0, "zero at or below the kink");
+                    }
+                    if users >= n && users * 10_000 > kink as u128 * n {
+                        assert_eq!(r, max, "max at u >= 1");
+                    }
+                    prev = r;
+                }
+            }
+        }
+    }
+    assert_eq!(rent_rate_e9(5, 0, 5_000, 23), None, "no capacity measured -> no rate");
+    assert_eq!(rent_rate_e9(5, 10, 10_001, 23), None, "kink above 100%");
 }

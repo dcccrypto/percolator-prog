@@ -17,6 +17,9 @@
 //! Negative controls are in-test (the same fork, one input changed): not yet armed, armed but
 //! not expired, after the reset (no ADL), loosening the bound, a non-upgrade-authority signer,
 //! and tag 93 rewriting the P1 limits (must not touch the episode).
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, ADL_ONE};
 use percolator_prog::{
@@ -103,10 +106,16 @@ fn fork() -> Fork {
     let mut portfolios = Vec::new();
     for a in v["accounts"].as_array().unwrap() {
         let k: Pubkey = a["pubkey"].as_str().unwrap().parse().unwrap();
+        let owner: Pubkey = a["owner"].as_str().unwrap().parse().unwrap();
         let acc = Account {
             lamports: a["lamports"].as_u64().unwrap(),
-            data: b64(a["data_b64"].as_str().unwrap()),
-            owner: a["owner"].as_str().unwrap().parse().unwrap(),
+            // v2.2: the captured v2.1 bytes are re-encoded with the band/rent words zeroed.
+            data: v21_upgrade::upgrade_v21_account(
+                &WRAPPER_ID,
+                &owner,
+                b64(a["data_b64"].as_str().unwrap()),
+            ),
+            owner,
             executable: a["executable"].as_bool().unwrap(),
             rent_epoch: 0,
         };

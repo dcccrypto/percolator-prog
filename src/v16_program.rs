@@ -77,7 +77,12 @@ pub mod constants {
                                                   // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
                                                   // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
                                                   // so the nft MUST bump to 18 and redeploy in the same flag day.
-    pub const VERSION: u16 = 18;
+    // 18 -> 19 (v2.2 Wave B): the same policy for the v2.2 engine layout bump
+    // (`V16_LAYOUT_DISCRIMINATOR` 18 -> 19; band/rent fields grow `AssetStateV16`,
+    // `PortfolioLegV16` and `V16Config`; PORTFOLIO_ACCOUNT_LEN 9563 -> 10091), so a
+    // v2.1 image is refused by the wrapper's own gate (Custom(1)) on every KIND_*.
+    // percolator-nft vendors this constant: it must bump to 19 in the same flag day.
+    pub const VERSION: u16 = 19;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
@@ -13896,6 +13901,12 @@ pub mod processor {
         // config error, by validating the config with and without the new words.
         let band_on = phase4.map(|p| p.band_bps != 0).unwrap_or(false);
         init_market_apply_phase4_view(&mut cfg, phase4, growth.is_some())?;
+        // v2.2 band: the wrapper maintenance fee is an absolute per-slot debit with no health
+        // check, which the Band Safety Law does not price (the engine never sees it); a band
+        // market keeps it at 0, here and in the maintenance-fee setter (105).
+        if band_on && maintenance_fee_per_slot != 0 {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
         // WARNING (not a repair): say so loudly when this market's funding
         // cannot accrue at its genesis price. See `warn_if_funding_cannot_accrue`
         // for why this warns rather than rejects. The flooring itself lives in
@@ -24020,6 +24031,11 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // v2.2 band: the maintenance fee is an absolute per-slot debit with no health check,
+        // which the Band Safety Law does not price; band markets keep it at 0 (105).
+        if maintenance_fee_per_slot != 0 && state::market_band_bps(&market_ai.try_borrow_data()?)? != 0 {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
 
         // ── GH#444 (A): checkpoint the change so the new rate is NOT retroactive ──
         //
@@ -37054,6 +37070,9 @@ pub mod processor {
         position_before: i128,
         delta: i128,
     ) -> ProgramResult {
+        if group.header.config.band_bps.get() == 0 {
+            return Ok(());
+        }
         // Only the REDUCING part matters: a reduce, a close, or the closing part of a flip.
         let after = position_before.saturating_add(delta);
         let reduces = position_before != 0
@@ -37090,7 +37109,10 @@ pub mod processor {
         lp_key: &Pubkey,
         asset_index: usize,
     ) -> Result<u128, ProgramError> {
-        if asset_index >= group.header.config.max_market_slots.get() as usize {
+        // CU: a market without a rent ceiling has nothing to route and no rent rate to measure.
+        if group.header.config.rent_max_e9_per_slot.get() == 0
+            || asset_index >= group.header.config.max_market_slots.get() as usize
+        {
             return Ok(0);
         }
         let rec = read_asset_vault_lp_from_view(group, asset_index)?;
@@ -37809,9 +37831,14 @@ pub mod processor {
         // accruing), and the same value the permissionless crank path combines.
         let skew_e9 = vault_lp_skew_rate_e9_view(group, asset_index)?;
         // v2.2 band: the gate the engine will validate this path against (post re-anchor).
-        let band = group
-            .band_path_preview(asset_index, now_slot)
-            .map_err(map_v16_error)?;
+        // (CU: a band-off market skips the preview, which re-validates the engine config.)
+        let band = if group.header.config.band_bps.get() == 0 {
+            None
+        } else {
+            group
+                .band_path_preview(asset_index, now_slot)
+                .map_err(map_v16_error)?
+        };
         let mut steps = Vec::with_capacity(step_count as usize);
         for _ in 0..step_count {
             advance_funding_mark_checkpoint_view(&mut simulated_profile, simulated_slot);
@@ -39530,14 +39557,15 @@ pub mod processor {
         }
 
         #[test]
-        fn portfolio_account_len_is_9563_with_full_identity_trailer() {
+        fn portfolio_account_len_is_10091_with_full_identity_trailer() {
             let data = init_test_portfolio(7);
             assert_eq!(
                 data.len(),
                 constants::PORTFOLIO_ACCOUNT_LEN,
                 "the wrapper tail contains matcher config, portfolio ID, sequence, and expiry"
             );
-            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 9563);
+            // v2.2: engine legs +33 B each (band / rent snapshots) => 9563 + 528.
+            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 10091);
             assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
             assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);

@@ -19,6 +19,9 @@
 //! Every test pairs with a NEGATIVE CONTROL: the identical sequence on the legacy market
 //! (growth OFF) is accepted where the growth market refuses. File-copy negative controls on
 //! the program (gate removed) are recorded in the PR.
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{
@@ -311,6 +314,12 @@ struct Env {
 
 impl Env {
     fn try_new_with(so: &PathBuf, cfg: MarketCfg) -> Result<Self, String> {
+        Self::try_new_with_layout(so, cfg, false)
+    }
+
+    /// `v21_layout`: size the market/portfolio accounts for the v2.1 (pre-band/rent) layout,
+    /// for running the deployed v2.1-layout program in the growth-off byte-parity test.
+    fn try_new_with_layout(so: &PathBuf, cfg: MarketCfg, v21_layout: bool) -> Result<Self, String> {
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         svm.add_program(program_id, &std::fs::read(so).expect("read wrapper BPF"));
@@ -349,7 +358,17 @@ impl Env {
         svm.set_account(
             market,
             acct(
-                vec![0u8; state::market_account_len_for_capacity(cfg.slots).unwrap()],
+                vec![
+                    0u8;
+                    {
+                        let len = state::market_account_len_for_capacity(cfg.slots).unwrap();
+                        if v21_layout {
+                            v21_upgrade::v21_market_len(len, cfg.slots)
+                        } else {
+                            len
+                        }
+                    }
+                ],
                 program_id,
             ),
         )
@@ -362,8 +381,14 @@ impl Env {
             mint,
             vault,
             matcher_program,
-            portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
-                .unwrap(),
+            portfolio_account_len: {
+                let len = state::portfolio_account_len_for_market_slots(cfg.slots).unwrap();
+                if v21_layout {
+                    v21_upgrade::v21_portfolio_len(len)
+                } else {
+                    len
+                }
+            },
             next_key: 0x40,
             bind_growth_lp: cfg.growth.is_some() && cfg.slots == 1,
             upgrade_authority: seeded_keypair(3),
@@ -526,8 +551,15 @@ impl Env {
         (k, p)
     }
 
+    /// Account bytes as THIS build reads them: a v2.1-layout account (the deployed base program
+    /// in the growth-off parity run) is re-encoded first, so the test's readers stay current.
+    fn read(&self, key: &Pubkey) -> Vec<u8> {
+        let account = self.svm.get_account(key).unwrap();
+        v21_upgrade::upgrade_v21_account(&self.program_id, &account.owner, account.data)
+    }
+
     fn identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
-        let data = self.svm.get_account(&portfolio).unwrap().data;
+        let data = self.read(&portfolio);
         (
             state::read_portfolio_id(&data).unwrap(),
             state::read_portfolio_matcher_sequence(&data).unwrap(),
@@ -536,7 +568,7 @@ impl Env {
     }
 
     fn market_id(&self) -> u64 {
-        state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, 0)
+        state::read_market_trade_preflight(&self.read(&self.market), 0)
             .unwrap()
             .3
     }
@@ -581,7 +613,7 @@ impl Env {
             .unwrap();
         let (portfolio_id, expected_sequence, _) = self.identity(account);
         let asset_generation_frontier = state::read_market_asset_generation_frontier(
-            &self.svm.get_account(&self.market).unwrap().data,
+            &self.read(&self.market),
         )
         .unwrap();
         let m = self.market;
@@ -1491,8 +1523,11 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
 /// account state on the base (7c906e45) wrapper and on this build.
 #[test]
 fn growth_off_is_byte_for_byte_legacy() {
-    fn run(so: &PathBuf) -> Vec<(String, Vec<Vec<u8>>)> {
-        let mut env = Env::try_new_with(so, MarketCfg::legacy()).expect("init");
+    // v2.2: the deployed base program is v2.1-layout, so it runs on v2.1-sized accounts and the
+    // candidate's bytes are compared through the v2.1 projection, which also ASSERTS every
+    // appended band/rent word stayed zero on this band-off, rent-off market.
+    fn run(so: &PathBuf, v21_layout: bool) -> Vec<(String, Vec<Vec<u8>>)> {
+        let mut env = Env::try_new_with_layout(so, MarketCfg::legacy(), v21_layout).expect("init");
         let mut out = Vec::new();
         let lp = env.lp(1_000 * USD);
         let (x, xp) = env.trader(200 * USD);
@@ -1502,7 +1537,14 @@ fn growth_off_is_byte_for_byte_legacy() {
             out.push((
                 what.to_string(),
                 keys.iter()
-                    .map(|k| env.svm.get_account(k).unwrap().data)
+                    .map(|k| {
+                        let data = env.svm.get_account(k).unwrap().data;
+                        if v21_layout {
+                            data
+                        } else {
+                            v21_upgrade::project_v22_account_to_v21(&data)
+                        }
+                    })
                     .collect(),
             ));
         };
@@ -1526,8 +1568,8 @@ fn growth_off_is_byte_for_byte_legacy() {
         }
         out
     }
-    let base = run(&base_program_path());
-    let cand = run(&program_path());
+    let base = run(&base_program_path(), true);
+    let cand = run(&program_path(), false);
     assert_eq!(base.len(), cand.len());
     let mut compared = 0;
     for (b, c) in base.iter().zip(cand.iter()) {

@@ -23,6 +23,9 @@
 //!   growth record only: every open is refused, 97). The live engine may refuse first (h-lock,
 //!   loss-stale, ADL); every outcome is printed and the assertions are exactly what the
 //!   bytes support.
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{
@@ -107,7 +110,12 @@ fn load(name: &str) -> Fixture {
                 a["pubkey"].as_str().unwrap().parse().unwrap(),
                 Account {
                     lamports: a["lamports"].as_u64().unwrap(),
-                    data: b64(a["data_b64"].as_str().unwrap()),
+                    // v2.2: the captured v2.1 bytes are re-encoded with the band/rent words zeroed.
+                    data: v21_upgrade::upgrade_v21_account(
+                        &WRAPPER_ID,
+                        &a["owner"].as_str().unwrap().parse().unwrap(),
+                        b64(a["data_b64"].as_str().unwrap()),
+                    ),
                     owner: a["owner"].as_str().unwrap().parse().unwrap(),
                     executable: a["executable"].as_bool().unwrap(),
                     rent_epoch: 0,
