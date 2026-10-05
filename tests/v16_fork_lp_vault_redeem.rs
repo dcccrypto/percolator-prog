@@ -479,7 +479,8 @@ fn execute_accounts(env: &Env, d: &Depositor) -> Vec<AccountMeta> {
         ),
         // GH#412 (account 12): the redeemer's own SOL account. The redemption PDA's
         // rent returns here rather than to the cranker, matching CancelRedemption.
-        AccountMeta::new(d.kp.pubkey(), false),
+        // H-1(b) (2026-10-05): on a Live non-bound vault the redeemer must SIGN tag 77.
+        AccountMeta::new(d.kp.pubkey(), true),
     ]
 }
 
@@ -521,7 +522,7 @@ fn execute_from(env: &mut Env, d: &Depositor, domain: u16) -> Result<(), String>
         pid,
         &payer,
         vec![(ProgInstruction::ExecuteRedemption { domain }, accts)],
-        &[],
+        &[&d.kp], // H-1(b): the redeemer signs a Live non-bound 77
     )
 }
 
@@ -737,7 +738,7 @@ fn execute_redemption_rejects_a_substituted_backing_ledger() {
         pid,
         &payer,
         vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
-        &[],
+        &[&d.kp], // H-1(b): the redeemer signs a Live non-bound 77
     );
 
     assert!(
@@ -835,7 +836,7 @@ fn execute_twice_same_tx_second_rejects() {
             (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a1),
             (ProgInstruction::ExecuteRedemption { domain: DOMAIN }, a2),
         ],
-        &[],
+        &[&d.kp], // H-1(b): the redeemer signs a Live non-bound 77
     );
     assert!(
         res.is_err(),
@@ -1466,7 +1467,7 @@ fn execute_redemption_rejects_noncanonical_vault() {
         pid,
         &payer,
         vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)],
-        &[],
+        &[&d.kp], // H-1(b): the redeemer signs a Live non-bound 77
     );
     let msg = res.expect_err("ExecuteRedemption from a non-canonical vault must reject");
     assert!(
@@ -3158,7 +3159,7 @@ fn exec_draw_from(env: &mut Env, d: &Depositor, domain: u16) -> Result<(), Strin
         pid,
         &payer,
         vec![(ProgInstruction::ExecuteRedemption { domain }, accts)],
-        &[],
+        &[&d.kp], // H-1(b): the redeemer signs a Live non-bound 77
     )
 }
 

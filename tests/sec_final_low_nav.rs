@@ -644,9 +644,9 @@ fn execute(env: &mut Env, v: &Vault, domain: u16) -> Result<(), String> {
             AccountMeta::new(v.dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(v.sibling_ledger, false),
-            AccountMeta::new(v.lp.pubkey(), false),
+            AccountMeta::new(v.lp.pubkey(), true), // H-1(b): the redeemer signs a Live non-bound 77
         ],
-        &[],
+        &[&v.lp.insecure_clone()],
     )
 }
 
@@ -1045,8 +1045,8 @@ fn sec_91_refuses_an_over_impaired_destination() {
 
 /// Tag 91 still works into a healthy, a merely-impaired (impairment < principal) and a boundary
 /// (impairment == principal) destination; principal moves 1:1 and NAV is unchanged. Up to the
-/// R-1 limit (10% of total principal = 200,000,000) a deposit after the move prices exactly on
-/// 2P - impairment; above it the deposit is paused (91) while 91 itself is unaffected.
+/// R-1 limit (10% of total principal = 200,000,000) a deposit after the move prices at par (H-1
+/// entry reading); above it the deposit is paused (91) while 91 itself is unaffected.
 #[test]
 fn sec_91_still_moves_into_a_non_over_impaired_destination() {
     for dest_impairment in [0u128, 200_000_000, 400_000_000, P] {
@@ -1067,7 +1067,10 @@ fn sec_91_still_moves_into_a_non_over_impaired_destination() {
             dest_impairment,
             "impairment stays with the pot"
         );
-        // NAV unchanged: a deposit after the move prices exactly as on 2P - impairment.
+        // H-1 (2026-10-05): an ENTRY after the move prices at PAR (2P), whatever the move did to
+        // the destination's receivable. This also pins the closure of the "91 dips the entry"
+        // attack: the move pays the destination's receivable down with the vault's own atoms,
+        // which dipped the rejected `min(P, held + receivable)` entry reading by up to `amt`.
         let atk = new_actor(&mut env, &v);
         let t = registry_shares(&env, &v);
         if dest_impairment * 10 > 2 * P {
@@ -1077,7 +1080,7 @@ fn sec_91_still_moves_into_a_non_over_impaired_destination() {
         try_deposit(&mut env, &atk, 100_000_000, DOMAIN).expect("deposit after the move");
         assert_eq!(
             shares_of(&env, atk.lp_ata),
-            floor_mul_div(100_000_000, t, 2 * P - dest_impairment),
+            floor_mul_div(100_000_000, t, 2 * P),
             "dest impairment {dest_impairment}"
         );
     }

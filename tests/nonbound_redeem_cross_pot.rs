@@ -602,9 +602,9 @@ fn execute(env: &mut Env, v: &Vault, domain: u16) -> Result<(), String> {
             AccountMeta::new(v.dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(v.sibling_ledger, false),
-            AccountMeta::new(v.lp.pubkey(), false),
+            AccountMeta::new(v.lp.pubkey(), true), // H-1(b): the redeemer signs a Live non-bound 77
         ],
-        &[],
+        &[&v.lp.insecure_clone()],
     )
 }
 
@@ -1128,4 +1128,47 @@ fn nonbound_77_refuses_a_lapsed_source_pot() {
     assert!(err.contains("Custom(21)"), "got {err}");
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, before, "atomic");
     assert_eq!(token_amount(&env.svm, v.dest), 0);
+}
+
+/// H-1(b) (security review 2026-10-05): on a Live non-bound vault a third party cannot choose WHEN
+/// someone else's matured redemption executes (the E3 exit reading can sit in a touch-order dip).
+/// The same 77 with the redeemer NOT signing is refused (ExpectedSigner, Custom(6)); signed, it pays.
+#[test]
+fn h1b_third_party_cannot_execute_someone_elses_77() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 1_000_000_000, DOMAIN);
+    let shares = token_amount(&env.svm, v.lp_ata) as u128 / 2;
+    request(&mut env, &v, shares);
+    let payer = env.payer.insecure_clone();
+    let (escrow, _) = derive_lp_escrow(&env.program_id, &env.market);
+    let (redemption, _) = derive_lp_redemption(&env.program_id, &v.registry, &v.lp.pubkey());
+    let va = vault_authority(&env);
+    let metas = |signed: bool| {
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(v.registry, false),
+            AccountMeta::new(redemption, false),
+            AccountMeta::new(v.mint, false),
+            AccountMeta::new(escrow, false),
+            AccountMeta::new(env.vault_token, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new(v.ledger, false),
+            AccountMeta::new(v.dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(v.sibling_ledger, false),
+            AccountMeta::new(v.lp.pubkey(), signed),
+        ]
+    };
+    let (m0, m1) = (metas(false), metas(true));
+    let r = send(&mut env.svm, env.program_id, &payer, ProgInstruction::ExecuteRedemption { domain: DOMAIN }, m0, &[]);
+    let e = r.expect_err("a third party's 77 must be refused");
+    assert!(e.contains("Custom(6)"), "ExpectedSigner, got {e}");
+    assert_eq!(token_amount(&env.svm, v.dest), 0);
+    env.svm.expire_blockhash();
+    let lp = v.lp.insecure_clone();
+    send(&mut env.svm, env.program_id, &payer, ProgInstruction::ExecuteRedemption { domain: DOMAIN }, m1, &[&lp])
+        .expect("control: the redeemer's own 77 pays");
+    assert!(token_amount(&env.svm, v.dest) > 0);
 }

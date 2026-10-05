@@ -651,9 +651,9 @@ fn execute(env: &mut Env, v: &Vault, domain: u16) -> Result<(), String> {
             AccountMeta::new(v.dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(v.sibling_ledger, false),
-            AccountMeta::new(v.lp.pubkey(), false),
+            AccountMeta::new(v.lp.pubkey(), true), // H-1(b): the redeemer signs a Live non-bound 77
         ],
-        &[],
+        &[&v.lp.insecure_clone()],
     )
 }
 
@@ -899,8 +899,10 @@ fn r1_boundary_is_exact_and_vault_total() {
                 .unwrap_or_else(|e| panic!("exactly 10% ({own},{sib}) pot {d}: {}", code_of(&e)));
             assert_eq!(
                 shares_of(&env, atk.lp_ata),
-                floor_mul_div(100_000_000, t, TOTAL_P - R1_BOUNDARY),
-                "priced on 2P - impairment ({own},{sib}) pot {d}"
+                // H-1 (2026-10-05): entries price at PAR; R-1 still bounds what an entrant can
+                // overpay on a genuine default (here the boundary, 10%).
+                floor_mul_div(100_000_000, t, TOTAL_P),
+                "priced at par ({own},{sib}) pot {d}"
             );
         }
     }
@@ -926,21 +928,18 @@ fn r1_reads_synced_ledgers_and_lifts_on_recovery() {
         }
         let atk = new_actor(&mut env, &v);
         assert_refused_91_without_side_effects(&mut env, &v, &atk, 100_000_000, DOMAIN);
-        // Recover 300M: impairment 200M = exactly 10% -> open again, priced on 2P - 200M.
+        // Recover 300M: impairment 200M = exactly 10% -> open again, priced at par (H-1 entry).
         recover_pot_backing(&mut env, SIBLING_DOMAIN, 300_000_000);
         let t = registry_shares(&env, &v);
         try_deposit(&mut env, &atk, 100_000_000, DOMAIN).unwrap_or_else(|e| {
             panic!("booked={booked}: healed vault must reopen: {}", code_of(&e))
         });
-        assert_eq!(
-            shares_of(&env, atk.lp_ata),
-            floor_mul_div(100_000_000, t, TOTAL_P - R1_BOUNDARY)
-        );
+        assert_eq!(shares_of(&env, atk.lp_ata), floor_mul_div(100_000_000, t, TOTAL_P));
     }
 }
 
-/// Healthy and lightly-impaired vaults are unaffected: 0% prices 1:1, 1% prices on the
-/// unfloored NAV, into either pot.
+/// Healthy and lightly-impaired vaults are unaffected: both open, and (H-1, 2026-10-05) both
+/// price entries at par, into either pot.
 #[test]
 fn r1_healthy_and_lightly_impaired_vaults_unaffected() {
     for imp in [0u128, TOTAL_P / 100] {
@@ -951,7 +950,7 @@ fn r1_healthy_and_lightly_impaired_vaults_unaffected() {
             try_deposit(&mut env, &atk, 100_000_000, d).expect("deposit");
             assert_eq!(
                 shares_of(&env, atk.lp_ata),
-                floor_mul_div(100_000_000, t, TOTAL_P - imp),
+                floor_mul_div(100_000_000, t, TOTAL_P),
                 "imp {imp} pot {d}"
             );
         }

@@ -611,9 +611,9 @@ fn execute(env: &mut Env, v: &Vault, domain: u16) -> Result<(), String> {
             AccountMeta::new(v.dest, false),
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(v.sibling_ledger, false),
-            AccountMeta::new(v.lp.pubkey(), false),
+            AccountMeta::new(v.lp.pubkey(), true), // H-1(b): the redeemer signs a Live non-bound 77
         ],
-        &[],
+        &[&v.lp.insecure_clone()],
     )
 }
 
@@ -850,14 +850,16 @@ fn attacker_profit_after_full_recovery(consumed: u128) -> Result<(u128, u128), S
 
 #[test]
 fn deposit_then_recovery_captures_no_more_than_the_boundary_state() {
-    // R-1 boundary: impairment 200 of 2,000 (10%). NAV 1,800 over 2,000 shares: the attacker's
-    // 100 tokens buy floor(100 * 2000 / 1800) shares; after the recovery NAV is 2,100.
+    // R-1 boundary: impairment 200 of 2,000 (10%), a consumed lien still owed back (receivable).
+    // H-1 (2026-10-05): ENTRIES price `min(principal, held + receivable)` = par here, so the
+    // attacker's 100 buy exactly floor(100 * 2000 / 2000) shares and the recovery gives it
+    // nothing (pre-H-1 it bought at 1,800 and captured up to 1/9 per token -- the windfall R-1
+    // had only bounded is now gone).
     let imp = 200_000_000u128;
     let (got, amt) = attacker_profit_after_full_recovery(imp).expect("open at exactly 10%");
-    let s = floor_mul_div(amt, 2 * P, 2 * P - imp);
+    let s = floor_mul_div(amt, 2 * P, 2 * P);
     assert_eq!(got, floor_mul_div(s, 2 * P + amt, 2 * P + s));
-    assert!(got > amt, "documented pre-existing property, now bounded");
-    assert!(got * 9 <= amt * 10, "windfall <= 1/9 per token at the R-1 boundary");
+    assert!(got <= amt, "no windfall: entry priced at par while the loss is a receivable");
     // One atom over 10%, the impairment == principal boundary, and the over-impaired state:
     // the entry is refused, so no capture at all.
     for consumed in [imp + 1, P, OVER] {
@@ -953,7 +955,8 @@ fn earnings_in_the_over_impaired_pot_still_count_toward_nav() {
     let held = shares_of(&env, v.lp_ata);
     let amt = 100_000_000u128;
     try_deposit(&mut env, &v, amt, DOMAIN).expect("deposit");
-    let nav = 2 * P - 200_000_000 + 10_000_000; // fee_share_bps 5_000 -> LP gets half of the 20
+    // H-1 entry reading: principal backed by held + receivable (= par) + 50% of the 20 earnings.
+    let nav = 2 * P + 10_000_000; // fee_share_bps 5_000 -> LP gets half of the 20
     assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(amt, t, nav));
 
     let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
@@ -991,15 +994,16 @@ fn control_healthy_vault_prices_unchanged() {
     assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, 2 * P));
 }
 
-/// Moderate impairment (below principal, within the R-1 limit) is priced exactly as before:
-/// unfloored. 400M (20% of total principal) is now paused by R-1.
+/// Moderate impairment (below principal, within the R-1 limit): an ENTRY is priced on
+/// `min(principal, held + receivable)` (H-1, 2026-10-05) = par while the consumed backing is a
+/// receivable; exits price the physical loss (E3). 400M (20%) is still paused by R-1.
 #[test]
 fn control_impairment_below_principal_is_priced_unfloored() {
     let (mut env, v) = otc_env(SIBLING_DOMAIN, 200_000_000);
     let t = registry_shares(&env, &v);
     let held = shares_of(&env, v.lp_ata);
     try_deposit(&mut env, &v, 100_000_000, DOMAIN).expect("deposit");
-    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, 2 * P - 200_000_000));
+    assert_eq!(shares_of(&env, v.lp_ata) - held, floor_mul_div(100_000_000, t, 2 * P));
     // and a deposit into the (merely) impaired pot is allowed.
     try_deposit(&mut env, &v, 100_000_000, SIBLING_DOMAIN).expect("impairment < principal is a normal pot");
 
