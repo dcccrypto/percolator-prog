@@ -396,8 +396,8 @@ fn p2b_tag104_arms_then_waits_for_the_episode_bound() {
     let armed_at = l.adl_episode_since_slot;
     assert_eq!(armed_at, f.clock.slot);
     let a = &f.group().assets[0];
-    assert_eq!(l.adl_episode_epoch_long, a.epoch_long as u32);
-    assert_eq!(l.adl_episode_epoch_short, a.epoch_short as u32);
+    let key = percolator_prog::processor::adl_episode_key(a.market_id, a.epoch_long, a.epoch_short);
+    assert_eq!((l.adl_episode_epoch_long, l.adl_episode_epoch_short), key);
     assert_eq!(f.leg(&target), leg0, "NEGATIVE CONTROL: armed, not expired -> no close");
 
     // One slot short of the default bound: still nothing.
@@ -683,4 +683,102 @@ fn p2b_dust_bound_scales_with_collateral_decimals() {
     let f = fork();
     let mint = f.svm.get_account(&f.mint).unwrap();
     assert_eq!(mint.data[44], 6, "live collateral mint decimals");
+}
+
+fn set_mint_decimals(f: &mut Fork, key: Pubkey, decimals: u8) {
+    let mut acc = f.svm.get_account(&f.mint).unwrap();
+    acc.data[44] = decimals;
+    f.svm.set_account(key, acc).unwrap();
+}
+
+/// Review I-5 (W5): tag 104 must reject any collateral-mint account other than the market's
+/// own (the dust bound is derived from it). A look-alike mint with 9 or 18 decimals would
+/// otherwise inflate the dust bound by 10^3..10^12 and let anyone close immediately.
+#[test]
+fn p2b_tag104_rejects_a_wrong_collateral_mint() {
+    for decimals in [9u8, 18u8] {
+        let mut f = fork();
+        let target = f.side_legs(SideV16::Short)[0];
+        let leg0 = f.leg(&target);
+        let fake = Pubkey::new_unique();
+        set_mint_decimals(&mut f, fake, decimals);
+        let d = f.data(&target);
+        let ix = Instruction {
+            program_id: WRAPPER_ID,
+            accounts: vec![
+                AccountMeta::new_readonly(Pubkey::new_unique(), false),
+                AccountMeta::new(f.slab, false),
+                AccountMeta::new(target, false),
+                AccountMeta::new_readonly(fake, false),
+            ],
+            data: ProgInstruction::AdlWindDown {
+                now_slot: f.clock.slot,
+                asset_index: 0,
+                portfolio_id: state::read_portfolio_id(&d).unwrap(),
+                position_epoch: state::read_portfolio_position_epoch(&d).unwrap(),
+            }
+            .encode(),
+        };
+        let r = f.send(ix);
+        assert_eq!(
+            r,
+            Err(TransactionError::InstructionError(2, InstructionError::InvalidArgument)),
+            "a {decimals}-decimal look-alike mint must be refused"
+        );
+        assert_eq!(f.leg(&target), leg0);
+        assert_eq!(f.limits().adl_episode_since_slot, 0, "nothing recorded");
+    }
+}
+
+/// Review I-5 (W4): the handler derives the dust bound from the market's collateral decimals.
+/// The live Percolator short side is ~162.7 (6-dp) of notional: at 6 decimals (bound 1.00)
+/// the first call only arms; were the collateral 9 decimals (bound 10^9 atoms) the same side
+/// is dust and the first call closes at once.
+#[test]
+fn p2b_tag104_dust_bound_follows_collateral_decimals() {
+    // CONTROL: the real 6-decimal mint -> armed only.
+    let mut f = fork();
+    let target = f.side_legs(SideV16::Short)[0];
+    let leg0 = f.leg(&target);
+    f.wind_down_settled(&target).expect("arm");
+    assert_eq!(f.leg(&target), leg0, "6 dp: not dust, only armed");
+    assert_ne!(f.limits().adl_episode_since_slot, 0);
+
+    // The same market with 9-decimal collateral: the side is dust, closed on the first call.
+    let mut g = fork();
+    let mint = g.mint;
+    set_mint_decimals(&mut g, mint, 9);
+    g.wind_down_settled(&target).expect("dust close");
+    assert!(g.leg(&target).is_none(), "9 dp: the side is dust, closed without waiting");
+}
+
+/// Coordination with Builder C (#526): record bytes 42..44 (asset-slot 650..652) are C's
+/// senior floor, 44..64 (652..672) are the P2b episode. With BOTH non-zero, the record must
+/// validate, and a tag-93 rewrite of the P1 limits must preserve both ranges bit for bit.
+#[test]
+fn p2b_tag93_preserves_both_owned_ranges_of_the_risk_limits_tail() {
+    let mut f = fork();
+    let ua = f.mount_programdata();
+    use percolator_prog::constants::{ASSET_RISK_LIMITS_OFF, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
+    let off = MARKET_GROUP_OFF + MARKET_GROUP_LEN + ASSET_RISK_LIMITS_OFF; // asset 0
+    let mut acc = f.svm.get_account(&f.slab).unwrap();
+    // C's range (650..652) and the P2b episode (652..672), both non-zero.
+    acc.data[off + 42] = 0x34;
+    acc.data[off + 43] = 0x12;
+    let mut l = state::read_asset_risk_limits(&acc.data, 0).unwrap();
+    l.adl_max_episode_slots = 300;
+    l.adl_episode_since_slot = 77;
+    l.adl_episode_epoch_long = 0xAABB_CCDD;
+    l.adl_episode_epoch_short = 0x1122_3344;
+    state::write_asset_risk_limits(&mut acc.data, 0, &l).unwrap();
+    let tail_before = acc.data[off + 42..off + 64].to_vec();
+    assert_eq!(&tail_before[..2], &[0x34, 0x12], "the writer keeps C's bytes");
+    f.svm.set_account(f.slab, acc).unwrap();
+    state::read_asset_risk_limits(&f.data(&f.slab), 0).expect("both ranges non-zero validate");
+
+    f.set_p1_limits(ua).expect("tag 93");
+    let d = f.data(&f.slab);
+    let after = state::read_asset_risk_limits(&d, 0).expect("still validates after tag 93");
+    assert_eq!(after.lp_floor_atoms, 7, "tag 93 applied the P1 limits");
+    assert_eq!(&d[off + 42..off + 64], &tail_before[..], "tag 93 preserved bytes 42..64 exactly");
 }

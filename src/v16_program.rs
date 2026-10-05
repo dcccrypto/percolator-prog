@@ -2737,11 +2737,10 @@ pub mod state {
         /// => the channel is OFF (ACCEPTS_FEE_REQUEST is never sent; any requested fee is
         /// refused). Only effective with `matcher_ext_mode = 1`.
         pub max_requested_fee_bps: u16,
-        /// Episode key part (security review L-1, defense in depth): low 16 bits of the
-        /// asset's engine `market_id` when the episode was recorded. A restart/activation
-        /// assigns a new market_id (and also zeroes this record), so an old `since` can never
-        /// be inherited by a new market even if the epochs restart at 0.
-        pub adl_episode_market_id_lo: u16,
+        /// Record bytes 42..44 (asset-slot bytes 650..652): NOT P2b's. Reserved for Builder C's
+        /// Earn senior floor (prog #526, `P2B_SENIOR_FLOOR_OFF == 650`). P2b neither validates
+        /// nor clears them, and tag 93 preserves them (the whole tail 42..64 is carried over).
+        pub _reserved: [u8; 2],
         // ── P2b L2: ADL wind-down episode (tag 104 `AdlWindDown`) ───────────────────────
         // Carved from the former `_reserved: [u8; 22]` (bytes 42..64 of this struct) -- NO
         // layout change: `ASSET_RISK_LIMITS_LEN`, every offset and the struct size are
@@ -2754,23 +2753,22 @@ pub mod state {
         pub adl_max_episode_slots: u32,
         /// Slot at which tag 104 first observed the current reduce-only episode. 0 = none.
         pub adl_episode_since_slot: u64,
-        /// The episode key: the asset's side-reset epochs (low 32 bits) when the episode was
-        /// recorded. `A` returns to `ADL_ONE` only through a side reset, which bumps that
+        /// The episode key (see `processor::adl_episode_key`): the asset's side-reset epochs
+        /// (low 32 bits) XOR a mix of its market_id, when the episode was recorded. `A` returns to `ADL_ONE` only through a side reset, which bumps that
         /// side's epoch, so a key mismatch always means a NEW episode (re-armed).
         pub adl_episode_epoch_long: u32,
         pub adl_episode_epoch_short: u32,
     }
-    const _: () =
-        assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_market_id_lo) == 42);
+    const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, _reserved) == 42);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_max_episode_slots) == 44);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_since_slot) == 48);
     const _: () = assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_long) == 56);
     const _: () =
         assert!(core::mem::offset_of!(AssetRiskLimitsV17, adl_episode_epoch_short) == 60);
     /// Absolute offsets inside each asset's 1024-byte wrapper slot (for SDK decoders).
-    pub const ASSET_ADL_EPISODE_OFF: usize = ASSET_RISK_LIMITS_OFF + 42;
-    pub const ASSET_ADL_EPISODE_LEN: usize = 22;
-    const _: () = assert!(ASSET_ADL_EPISODE_OFF == 650);
+    pub const ASSET_ADL_EPISODE_OFF: usize = ASSET_RISK_LIMITS_OFF + 44;
+    pub const ASSET_ADL_EPISODE_LEN: usize = 20;
+    const _: () = assert!(ASSET_ADL_EPISODE_OFF == 652);
     const _: () =
         assert!(ASSET_ADL_EPISODE_OFF + ASSET_ADL_EPISODE_LEN == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
     /// P2b L2: default bound, about one hour of slots (400 ms slots).
@@ -2789,7 +2787,6 @@ pub mod state {
     /// P2b (review L-1): the cleared episode record (and N override) a restart or an
     /// activation must leave behind.
     pub fn clear_adl_episode(mut limits: AssetRiskLimitsV17) -> AssetRiskLimitsV17 {
-        limits.adl_episode_market_id_lo = 0;
         limits.adl_max_episode_slots = 0;
         limits.adl_episode_since_slot = 0;
         limits.adl_episode_epoch_long = 0;
@@ -12673,7 +12670,7 @@ pub mod processor {
                     matcher_ext_mode,
                     _reserved0: 0,
                     max_requested_fee_bps,
-                    adl_episode_market_id_lo: 0,
+                    _reserved: [0u8; 2],
                     // P2b: tag 93 never writes the ADL episode fields; the handler copies
                     // the stored ones over these zeros before writing.
                     adl_max_episode_slots: 0,
@@ -20036,7 +20033,7 @@ pub mod processor {
             // (tighten-only) bound exactly as stored.
             let mut limits = limits;
             let stored = state::read_asset_risk_limits(&market_data, asset_index as usize)?;
-            limits.adl_episode_market_id_lo = stored.adl_episode_market_id_lo;
+            limits._reserved = stored._reserved;
             limits.adl_max_episode_slots = stored.adl_max_episode_slots;
             limits.adl_episode_since_slot = stored.adl_episode_since_slot;
             limits.adl_episode_epoch_long = stored.adl_episode_epoch_long;
@@ -20191,6 +20188,19 @@ pub mod processor {
     /// side-reset epochs and `now`, return the limits to store and whether the episode bound
     /// has expired. A missing record or a key mismatch (a reset happened since) re-arms at
     /// `now` and is never expired in the same call.
+    /// The episode key (review L-1, defense in depth): each side-reset epoch (low 32 bits)
+    /// XOR a multiplicative mix of the asset's `market_id`. A restart/activation assigns a new
+    /// market_id (and also zeroes the record), so even with the epochs back at 0 the key
+    /// differs and an old `since` cannot be inherited. (Stored in the two epoch words so no
+    /// extra byte is needed: record bytes 42..44 belong to Builder C's senior floor.)
+    pub fn adl_episode_key(market_id: u64, epoch_long: u64, epoch_short: u64) -> (u32, u32) {
+        let mix = ((market_id as u32) ^ ((market_id >> 32) as u32)).wrapping_mul(0x9E37_79B1);
+        (
+            (epoch_long as u32) ^ mix,
+            (epoch_short as u32) ^ mix.rotate_left(16),
+        )
+    }
+
     pub fn adl_episode_step(
         mut limits: state::AssetRiskLimitsV17,
         market_id: u64,
@@ -20198,16 +20208,12 @@ pub mod processor {
         epoch_short: u64,
         now_slot: u64,
     ) -> (state::AssetRiskLimitsV17, bool) {
-        let key_market = market_id as u16;
-        let key_long = epoch_long as u32;
-        let key_short = epoch_short as u32;
+        let (key_long, key_short) = adl_episode_key(market_id, epoch_long, epoch_short);
         if limits.adl_episode_since_slot == 0
-            || limits.adl_episode_market_id_lo != key_market
             || limits.adl_episode_epoch_long != key_long
             || limits.adl_episode_epoch_short != key_short
         {
             limits.adl_episode_since_slot = now_slot.max(1);
-            limits.adl_episode_market_id_lo = key_market;
             limits.adl_episode_epoch_long = key_long;
             limits.adl_episode_epoch_short = key_short;
             return (limits, false);
@@ -23215,6 +23221,11 @@ pub mod processor {
                             authenticated_slot,
                         )
                         .map_err(map_v16_error)?;
+                    // P2b (review L-1b): a re-activated (retired) slot is a new market and
+                    // starts with no ADL episode record or N override.
+                    state::clear_adl_episode_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                    )?;
                     if was_retired && cfg.free_market_slot_count != 0 {
                         cfg.free_market_slot_count -= 1;
                     }
