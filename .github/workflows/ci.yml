@@ -80,6 +80,38 @@ jobs:
         working-directory: percolator-prog
         run: ./scripts/sbf-frame-gate.sh
 
+  # =========================================================================================
+  # Kani contracts must not change the program (security review rev 6, Q2.3). The growth-v19
+  # contracts live in src/ as `#[cfg_attr(kani, kani::requires/ensures(..))]`; this job builds
+  # the .so with the DEPLOY toolchain twice -- as committed, and with every such line blanked
+  # (line numbers kept, same build path) -- and fails unless the two are byte-identical.
+  # Local: ./scripts/kani-contracts-bytecheck.sh
+  # =========================================================================================
+  kani-contracts-bytecheck:
+    name: Kani contracts leave the .so byte-identical
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - name: checkout percolator-prog
+        uses: actions/checkout@v4
+        with: { path: percolator-prog }
+      - name: load canonical deployed refs
+        id: refs
+        run: grep -E '^[A-Z_]+=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
+      - name: checkout engine (path dependency, pinned to ENGINE_CI_SIBLING)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: install the deploy solana toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52)
+        env:
+          SOLANA_CLI_VERSION: "3.1.15"
+        run: |
+          sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
+          echo "$HOME/.local/share/solana/install/active_release/bin" >> "$GITHUB_PATH"
+      - name: byte-diff the .so with and without the Kani contracts
+        working-directory: percolator-prog
+        run: ./scripts/kani-contracts-bytecheck.sh
+
   test:
     name: build + test
     runs-on: ubuntu-latest
