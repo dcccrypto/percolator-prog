@@ -33115,6 +33115,13 @@ pub mod processor {
             return state::write_insurance_units(&mut units_ai.try_borrow_mut_data()?, &u);
         }
         expect_writable(payer)?;
+        // Units are classed by the PINNED stake program (`ins_unit_class_for`). A build with no
+        // pinned stake program cannot tell the stake class from the creator's, so it must never
+        // unitise a market (the class bound would collapse into one class): fail closed, as
+        // tag 87 does.
+        if !cfg!(feature = "devnet") {
+            return Err(PercolatorError::StakeProgramNotPinned.into());
+        }
         let bump_bytes = [bump];
         let seeds: &[&[u8]] = &[
             crate::constants::INS_UNITS_SEED,
