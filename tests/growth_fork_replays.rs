@@ -817,3 +817,109 @@ fn growth_fork_oi_eff_equals_sum_of_effective_legs_after_adl() {
     assert!(r.is_ok(), "a reduce fills: {r:?}");
     check(&svm, "after a fill");
 }
+
+// ---------------------------------------------------------------------------------------------
+// Phase 2b (2026-10-05): Earn raises N_cap on the Percolator flagship (`9EPm8nB8…`).
+// Read-only fixture `percolator.json` (FETCH_ONLY=percolator fetch.py, slot in the JSON).
+// Part 1 (pure, the program's own functions on the live bytes): what tag 103 would move if the
+// market were P3-bound at today's Earn NAV (tag 94 seeds C = NAV), and the vault LP's growth
+// capacity before and after. Part 2 (a LiteSVM fork with a real 103) is NOT possible on this
+// slab: tag 94 refuses it (max_market_slots = 14 -> Custom 86; open interest -> Custom 90;
+// marketauth is the stake-pool PDA), and the fresh-deploy rule forbids a migration path. The
+// live allocation is exercised on a fresh bound market in tests/p3_vault_lp.rs (p2b_*).
+// ---------------------------------------------------------------------------------------------
+#[test]
+fn p2b_fork_percolator_earn_raises_ncap() {
+    use percolator::{BackingBucketStatusV16, BOUND_SCALE};
+    use percolator_prog::vault_lp_v18 as v;
+    let fx = load("percolator");
+    let slab_data = data(&fx, &fx.slab).to_vec();
+    let (_, g) = state::read_market(&slab_data).unwrap();
+    let (registry, _) = state::derive_lp_vault_registry(&WRAPPER_ID, &fx.slab);
+    let reg = state::read_lp_vault_registry(data(&fx, &registry)).expect("Earn registry in fixture");
+    // Asset 0's wrapper bytes (pot-owned counters).
+    let r = state::asset_growth_range(&slab_data, 0).unwrap();
+    let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+    let wrapper = &slab_data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN];
+    let (mut c_nav, mut drawable, mut ledger_nav) = (0u128, 0u128, 0u128);
+    for d in 0..2u16 {
+        let (lk, _) = state::derive_lp_backing_ledger(&WRAPPER_ID, &fx.slab, d);
+        let Some(l) = fx
+            .accounts
+            .iter()
+            .find(|(k, _)| *k == lk)
+            .and_then(|(_, a)| state::read_backing_domain_ledger(&a.data).ok())
+        else {
+            continue;
+        };
+        let b = &g.source_backing_buckets[d as usize];
+        let c = &g.source_credit[d as usize];
+        let ins = c
+            .insurance_credit_reserved_num
+            .saturating_sub(c.valid_liened_insurance_num + c.impaired_liened_insurance_num);
+        let phys = v::pot_physical_net_atoms(
+            b.fresh_unliened_backing_num,
+            b.valid_liened_backing_num,
+            c.positive_claim_bound_num,
+            ins,
+            BOUND_SCALE,
+        );
+        let avail = v::nonbound_pot_available(l.total_principal_atoms, phys);
+        c_nav += avail;
+        ledger_nav += l
+            .total_principal_atoms
+            .saturating_sub(l.cumulative_loss_atoms.saturating_sub(l.cumulative_recovery_atoms));
+        // `vault_pot_drawable_atoms` as if bound: Fresh, unreserved by claims, vault-owned.
+        let owned = state::vault_pot_owned_from_wrapper_bytes(wrapper, d as usize).unwrap();
+        let unreserved = c.fresh_reserved_backing_num.saturating_sub(c.positive_claim_bound_num);
+        let dr = if b.status == BackingBucketStatusV16::Fresh {
+            (b.fresh_unliened_backing_num.min(unreserved) / BOUND_SCALE).min(owned)
+        } else {
+            0
+        };
+        eprintln!(
+            "  pot {d}: principal {} physical-net {phys} E3 avail {avail} owned {owned} drawable {dr}",
+            l.total_principal_atoms
+        );
+        drawable += dr;
+    }
+    let lv = live(&fx);
+    let moved = v::vault_lp_alloc_limit(c_nav, 0, drawable, v::ALLOC_ALPHA_DEFAULT_BPS, v::ALLOC_BUFFER_DEFAULT_BPS)
+        .unwrap();
+    let n_after = growth_v19::n_cap_q(lv.c_m + moved, growth_v19::DEFAULT_LAMBDA_BPS, lv.price, POS_SCALE).unwrap();
+    let u = |n: u128| -> String {
+        if n == 0 {
+            "inf".into()
+        } else {
+            let b = lv.lp_eff.unsigned_abs() * 10_000 / n;
+            format!("{}.{:02}%", b / 100, b % 100)
+        }
+    };
+    eprintln!(
+        "PERCOLATOR @ {} (registry domain {}): Earn NAV E3 {c_nav} (ledger rule {ledger_nav}), drawable {drawable}",
+        fx.clock.slot, reg.domain
+    );
+    eprintln!(
+        "  vault LP C_m {} | |LP_eff| {} | N_cap {} -> {} after allocating {moved} (alpha 50%, buffer 30%) | u {} -> {}",
+        lv.c_m,
+        lv.lp_eff.unsigned_abs(),
+        lv.n_cap,
+        n_after,
+        u(lv.n_cap),
+        u(n_after)
+    );
+    // Vacuity: the flagship carries Earn principal.
+    assert!(c_nav > 0, "fixture has Earn NAV");
+    // The allocation is exactly the pure rule's min(alpha*C, drawable - buffer*C)...
+    let alpha_room = v::bps_floor(c_nav, v::ALLOC_ALPHA_DEFAULT_BPS).unwrap();
+    let liquid_room = drawable.saturating_sub(v::bps_ceil(c_nav, v::ALLOC_BUFFER_DEFAULT_BPS).unwrap());
+    assert_eq!(moved, alpha_room.min(liquid_room));
+    // ... and capacity grows by exactly lambda * moved / P (floors aside), never shrinks.
+    assert!(n_after >= lv.n_cap);
+    if moved > 0 {
+        assert!(n_after > lv.n_cap, "Earn allocation must raise N_cap");
+        let grew = n_after - lv.n_cap;
+        let expect = growth_v19::n_cap_q(moved, growth_v19::DEFAULT_LAMBDA_BPS, lv.price, POS_SCALE).unwrap();
+        assert!(grew + 1 >= expect && grew <= expect + 1, "N_cap grew {grew}, expected ~{expect}");
+    }
+}

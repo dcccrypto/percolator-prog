@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 809898530a49954f0020e4e58c24436ae6ce3bfa6da368c5920068dfb6e72675 # shrinks to ops = [Open, Walk { up: true, bps: 300, touch_a1: true, touch_a2: false }, Deposit { pot: 0, units: 200 }]
+cc 168d746d72b1d87d60787819678c2358aea14fab5b04b30a1de514f169a1508e # shrinks to ops = [Open, Walk { up: true, bps: 536, touch_a1: false, touch_a2: false }, Walk { up: false, bps: 841, touch_a1: true, touch_a2: false }, Touch { a1: false }, Convert { a1: false }, Redeem, Walk { up: true, bps: 1174, touch_a1: false, touch_a2: false }, Deposit { pot: 0, units: 459 }, Walk { up: false, bps: 956, touch_a1: false, touch_a2: true }]

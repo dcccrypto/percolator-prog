@@ -183,6 +183,18 @@ pub fn senior_principal_portion(
     })
 }
 
+/// H-2: a LIVE bound senior payout's principal portion: everything the pots can pay, i.e.
+/// `min(payout, available)`. Any remainder is not backing (it sits in the vault LP) and needs a
+/// recall first. Property: `principal <= payout` and `principal <= available`, and a payout at or
+/// below the pots' available principal is paid entirely as principal.
+pub fn live_bound_principal_portion(atoms_out: u128, available_principal: u128) -> u128 {
+    if atoms_out < available_principal {
+        atoms_out
+    } else {
+        available_principal
+    }
+}
+
 /// The junior floor while any senior claim exists: `ceil(C * floor_bps / 10_000)`.
 pub fn junior_floor_atoms(senior_claim: u128, junior_floor_bps: u16) -> Option<u128> {
     bps_ceil(senior_claim, junior_floor_bps)
@@ -660,9 +672,416 @@ pub fn live_exit_senior_value(c: u128, nav: u128, lp_value_at_eff: u128, lp_equi
     }
 }
 
+// ── Phase 2b (2026-10-05): Earn as the counterparty ─────────────────────────────────────────
+//
+// Spec: `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.3 / §2.5 / §2.8 and
+// `markets-grow-plan-2026-10-04.md` P1-B. Tag 103 `VaultLpAllocate` is the exact inverse of tag
+// 98 recall: it moves senior principal out of the vault's own pots (principal-only decrement,
+// the draw's primitive) into the vault LP's engine capital. `header.vault` nets to zero, no SPL
+// moves, C is unchanged and V = NAV + H + LP value is unchanged at the moment of the move.
+
+/// Default share of the effective senior claim that may sit in the vault LP's capital.
+pub const ALLOC_ALPHA_DEFAULT_BPS: u16 = 5_000;
+/// Hard ceiling on alpha until the L3 epoch clamp ships (plan §2.9: L3 gates alpha > 50%).
+pub const ALLOC_ALPHA_MAX_BPS: u16 = 5_000;
+/// Default (and minimum) redemption buffer kept liquid in the pots, bps of the senior claim.
+pub const ALLOC_BUFFER_DEFAULT_BPS: u16 = 3_000;
+pub const ALLOC_BUFFER_MIN_BPS: u16 = 3_000;
+
+/// The most tag 103 may move now:
+/// `min(alpha * C_eff - allocated, drawable - ceil(buffer * C_eff))`, both saturating at 0.
+///
+/// `drawable` is the pots' vault-owned, unreserved Fresh backing (`vault_pot_drawable_atoms`
+/// summed): backing reserved against winners' claims and loss backing the engine routed in for
+/// untouched winners are already excluded, so the buffer is kept ON TOP of the claims reserve
+/// (stricter than the plan's `max(buffer, liened reserve)`). `None` on an out-of-range dial.
+///
+/// Properties (Kani `kani_p2b_alloc_*`): `allocated + limit <= floor(alpha * C_eff)` whenever
+/// `allocated <= floor(alpha * C_eff)` (else 0); `drawable - limit >= ceil(buffer * C_eff)`
+/// whenever `limit > 0`; monotone non-decreasing in `drawable` and in `C_eff`.
+pub fn vault_lp_alloc_limit(
+    c_eff: u128,
+    allocated: u128,
+    drawable: u128,
+    alpha_bps: u16,
+    buffer_bps: u16,
+) -> Option<u128> {
+    if alpha_bps > ALLOC_ALPHA_MAX_BPS
+        || buffer_bps < ALLOC_BUFFER_MIN_BPS
+        || buffer_bps as u128 > BPS
+    {
+        return None;
+    }
+    let alpha_room = bps_floor(c_eff, alpha_bps)?.saturating_sub(allocated);
+    let liquid_room = drawable.saturating_sub(bps_ceil(c_eff, buffer_bps)?);
+    Some(if alpha_room < liquid_room {
+        alpha_room
+    } else {
+        liquid_room
+    })
+}
+
+/// Tag 103 admission (spec: refused during a senior draw, an impairment, or with the vault LP
+/// insolvent). `draw_outstanding` is the booked, unrecovered senior loss; `draw_pending` any
+/// physical draw not yet booked; `lp_equity` the vault LP's certified equity AFTER the
+/// instruction's own draw-then-book. Receipts-open is a Resolved state and is excluded by the
+/// processor's Live-only gate.
+pub fn vault_lp_alloc_admitted(
+    draw_outstanding: u128,
+    draw_pending: bool,
+    vault_value: u128,
+    senior_claim_eff: u128,
+    lp_equity: i128,
+) -> bool {
+    draw_outstanding == 0
+        && !draw_pending
+        && !senior_impaired(vault_value, senior_claim_eff)
+        && lp_equity >= 0
+}
+
+/// L-3 (security review 2026-10-05): allocation needs a real first-loss buffer. Tag 103 is
+/// refused unless the junior (`V - C_eff`) is at least this share of `C_eff` (protocol floor;
+/// raising it is a tighten-only code change).
+pub const ALLOC_MIN_JUNIOR_BPS: u16 = 500;
+
+pub fn alloc_junior_ok(vault_value: u128, senior_claim_eff: u128) -> bool {
+    let junior = vault_value.saturating_sub(senior_claim_eff);
+    match bps_ceil(senior_claim_eff, ALLOC_MIN_JUNIOR_BPS) {
+        Some(need) => junior >= need,
+        None => false,
+    }
+}
+
+/// L-2: the allocation counter written down to what the vault LP can still be holding of it
+/// (its current value). A senior draw that consumed allocated capital otherwise left 103 at
+/// "no room" for good.
+pub fn alloc_written_down(allocated: u128, lp_value: u128) -> u128 {
+    if allocated < lp_value {
+        allocated
+    } else {
+        lp_value
+    }
+}
+
+/// Per-pot split of one allocation, the SAME rule as the senior draw
+/// (`vault_lp_physical_draw`): proportional to each pot's drawable backing, the floor on the
+/// SMALLER pot's take so a small pot is never left an atom short of its seniors' pro-rata claim.
+/// Returns `(take_even, take_odd)` with `take_even + take_odd == moved`, each within its pot.
+/// `None` when `moved` exceeds the two pots together (fail closed).
+pub fn vault_lp_alloc_split(moved: u128, d_even: u128, d_odd: u128) -> Option<(u128, u128)> {
+    let total = d_even.checked_add(d_odd)?;
+    if moved > total {
+        return None;
+    }
+    if moved == 0 {
+        return Some((0, 0));
+    }
+    let small_is_odd = d_odd <= d_even;
+    let (d_small, d_large) = if small_is_odd { (d_odd, d_even) } else { (d_even, d_odd) };
+    let take_small = mul_div_floor(moved, d_small, total)?.min(d_small);
+    let take_large = moved - take_small;
+    if take_large > d_large {
+        return None;
+    }
+    Some(if small_is_odd {
+        (take_large, take_small)
+    } else {
+        (take_small, take_large)
+    })
+}
+
+/// `allocated` after a recall of `recalled` atoms (tag 98 is the inverse of tag 103). A recall
+/// can also move junior-held value (its pre-P2b role), so the counter saturates at zero.
+pub fn vault_lp_dealloc(allocated: u128, recalled: u128) -> u128 {
+    allocated.saturating_sub(recalled)
+}
+
+/// A4 capacity lock (plan §2.3): an operation that lowers the vault LP's capital may not leave
+/// `N_cap(after) < |LP_eff|`. An operation that does not lower capacity is never refused here
+/// (an over-capacity LP must stay closable, M-1). Today the engine's withdraw is flat-only
+/// (`withdraw_not_atomic` -> Stale with an active leg), so 97/98 can only run with
+/// `|LP_eff| == 0` and this is defence in depth: it pins the invariant if that engine rule moves.
+pub fn a4_capacity_lock_ok(n_cap_before: u128, n_cap_after: u128, lp_eff_abs: u128) -> bool {
+    n_cap_after >= n_cap_before || n_cap_after >= lp_eff_abs
+}
+
+// ── E3 (R-2 / I-2 attribution) ────────────────────────────────────────────────────────────
+
+/// A pot's physical backing net of the claims it still owes, in atoms:
+/// `floor((fresh_unliened + valid_liened) / scale) - ceil(max(0, claims - insurance_cover) / scale)`,
+/// saturating at 0. `claims` is the source's `positive_claim_bound_num`; `insurance_cover` the
+/// part of it reserved on insurance (`insurance_credit_reserved - insurance liens`), which the
+/// pot does not owe. Floor on the backing, ceil on the claims: never overstates.
+pub fn pot_physical_net_atoms(
+    fresh_unliened_num: u128,
+    valid_liened_num: u128,
+    claim_bound_num: u128,
+    insurance_cover_num: u128,
+    scale: u128,
+) -> u128 {
+    if scale == 0 {
+        return 0;
+    }
+    let held = fresh_unliened_num.saturating_add(valid_liened_num) / scale;
+    let uncovered = claim_bound_num.saturating_sub(insurance_cover_num);
+    held.saturating_sub(uncovered.div_ceil(scale))
+}
+
+/// E3: a NON-bound Earn pot's available principal = `min(ledger principal, physical net of
+/// claims)`. Replaces `principal - (loss - recovery)` for pricing.
+///
+/// The ledger books EVERY rise of a pot's consumed backing as the vault's loss and every fall as
+/// recovery, whoever's backing it was. Two leaks follow:
+/// * R-2: a pair's own loss refills the pot, the winner's conversion then consumes it; the pot is
+///   physically whole but the ledger books a loss (NAV depressed), a later refill books it back
+///   (NAV restored). A deposit at the low and a redemption at the high extract from incumbents.
+/// * deposit refill: a 75/91/78 add pays a receivable down; the add path re-baselines the
+///   watermark, so the paydown is never booked as recovery and the value is stranded.
+///
+/// The physical reading is exact in both: the vault's value in a pot is what the pot holds net
+/// of what it owes, never more than the vault put in (`principal`). Loss and recovery counters
+/// stay untouched (they are the farm-facing `residual_received` scalars).
+pub fn nonbound_pot_available(principal: u128, physical_net: u128) -> u128 {
+    if principal < physical_net {
+        principal
+    } else {
+        physical_net
+    }
+}
+
+/// H-1 (security review 2026-10-05): the ENTRY reading of a non-bound pot (tag 75 pricing) is
+/// PAR: the ledger principal the vault put in (plus the usual LP-earnings term).
+///
+/// E3's claim term is touch-order dependent (a winner's claim registers when the WINNER is
+/// touched, the loser's loss arrives when the LOSER is touched), so pricing entries and exits on
+/// one reading let a zero-sum pair deposit inside that window and redeem after it (+89.50 per
+/// round). Two weaker entry readings were rejected:
+/// * `min(principal, held)`: dips when a winner converts against principal before its loser is
+///   touched (the residual window);
+/// * `min(principal, held + receivable)`: dips when a permissionless tag 91 moves principal into
+///   a pot carrying a receivable (the engine add pays the receivable down with the vault's own
+///   atoms).
+///
+/// Par moves only with principal flows, so NO settlement order and no 91 can dip it, and
+/// `entry (par) >= exit (E3)` always: every entry-to-exit round trip is non-positive. Cost, by
+/// design: on a genuine default an entrant pays par, bounded by the R-1 pause (deposits stop
+/// once the physical impairment exceeds 10% of principal).
+pub fn nonbound_pot_entry_available(principal: u128) -> u128 {
+    principal
+}
+
+// ── G6 fee waterfall (junior cushion) ────────────────────────────────────────────────────
+
+/// Split one harvested LP fee leg `available` on a bound vault (plan §2.5 / CSV-FL++ B.6):
+/// 1. bond coupon (capacity bonds, G7, are not built: 0);
+/// 2. `cushion_share_bps` of it to the junior cushion, but only up to the target gap
+///    `ceil(target_bps * C_eff) - junior_level` (nothing once the junior is at target);
+/// 3. the rest to the seniors (credited to C).
+///
+/// Returns `(senior, cushion)`, `senior + cushion == available`. With either dial 0 the whole
+/// leg goes to the seniors (today's rule). Creator fees vest only once the cushion is at target
+/// (`creator_fee_vested`). `None` on overflow / out-of-range bps.
+pub fn cushion_split(
+    available: u128,
+    cushion_share_bps: u16,
+    cushion_target_bps: u16,
+    c_eff: u128,
+    junior_level: u128,
+) -> Option<(u128, u128)> {
+    if cushion_share_bps == 0 || cushion_target_bps == 0 {
+        return Some((available, 0));
+    }
+    let need = bps_ceil(c_eff, cushion_target_bps)?.saturating_sub(junior_level);
+    let share = bps_floor(available, cushion_share_bps)?;
+    let cushion = if share < need { share } else { need };
+    Some((available - cushion, cushion))
+}
+
+/// The cushion the junior may not withdraw (97): `min(accrued, ceil(target * C_eff))`.
+pub fn cushion_locked(cushion_accrued: u128, c_eff: u128, cushion_target_bps: u16) -> Option<u128> {
+    let target = bps_ceil(c_eff, cushion_target_bps)?;
+    Some(if cushion_accrued < target {
+        cushion_accrued
+    } else {
+        target
+    })
+}
+
+/// Creator discretionary fees vest only at or above the cushion target (always vested when the
+/// cushion is off).
+pub fn creator_fee_vested(
+    junior_level: u128,
+    c_eff: u128,
+    cushion_share_bps: u16,
+    cushion_target_bps: u16,
+) -> bool {
+    if cushion_share_bps == 0 || cushion_target_bps == 0 {
+        return true;
+    }
+    match bps_ceil(c_eff, cushion_target_bps) {
+        Some(t) => junior_level >= t,
+        None => false,
+    }
+}
+
+// ── Skew-funding defaults (plan §2.4, auto-pin) ──────────────────────────────────────────
+
+/// Tag 94's protocol default skew parameters for a bound asset: `slope = max(1, max_abs / 2)`,
+/// `cap = max_abs`, inside the engine's `max_abs_funding_e9_per_slot` (so the combined rate is
+/// never clamped by more than the premium). `(0, 0)` (skew off) when the market has no funding.
+pub fn skew_defaults_e9(max_abs_funding_e9: u64) -> (u64, u64) {
+    if max_abs_funding_e9 == 0 {
+        return (0, 0);
+    }
+    let half = max_abs_funding_e9 / 2;
+    (if half == 0 { 1 } else { half }, max_abs_funding_e9)
+}
+
+// ── Q2 senior-capital halt (2026-10-05 decision) ─────────────────────────────────────────
+//
+// Once the junior is exhausted (V < C_eff) the vault LP is trading allocated SENIOR capital:
+// its risk-INCREASING fills are halted (reductions / closes never are). With the 100% senior
+// fee share `C_eff - H == C`, so `V < C_eff  <=>  lp_value < C - nav =: T` (the "senior floor").
+// T is recomputed by every instruction that can LOWER it relative to the LP's capital (102,
+// 103, draw booking / recovery, 98) and stored as a 16-bit ceiling code (`senior_floor_encode`);
+// every other change (75 / 77 / 78 / harvestable growth) only lowers the true T, so a stale
+// code halts EARLIER, never later. The trade path compares the LP's conservative equity
+// (no credit for positive PnL, <= the certified value V uses) against it: again only earlier.
+
+/// 16-bit ceiling float: 6-bit exponent, 10-bit mantissa, `decode(encode(v)) >= v` and
+/// `<= v * (1 + 2^-9) + 1`. 0 encodes 0 (no floor). Saturates to `u16::MAX` (a huge floor:
+/// halt) only above `1023 * 2^63` atoms, unreachable for SPL amounts.
+pub fn senior_floor_encode(v: u128) -> u16 {
+    if v == 0 {
+        return 0;
+    }
+    let bits = 128 - v.leading_zeros();
+    if bits <= 10 {
+        return v as u16;
+    }
+    let mut e = bits - 10;
+    let mut m = (v >> e) + u128::from(v & ((1u128 << e) - 1) != 0);
+    if m == 1024 {
+        e += 1;
+        m = 512;
+    }
+    if e > 63 {
+        return u16::MAX;
+    }
+    ((e as u16) << 10) | (m as u16)
+}
+
+pub fn senior_floor_decode(code: u16) -> u128 {
+    let e = (code >> 10) as u32;
+    let m = (code & 1023) as u128;
+    m << e
+}
+
+/// The halt: a risk-increasing vault-LP fill is refused while its conservative equity after the
+/// fill is below the stored senior floor.
+pub fn senior_capital_halt(lp_conservative_equity: u128, floor: u128) -> bool {
+    lp_conservative_equity < floor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q2_senior_floor_code() {
+        for v in [0u128, 1, 1023, 1024, 1025, 2047, 2048, 999_999, 5_000_000_000, u64::MAX as u128] {
+            let d = senior_floor_decode(senior_floor_encode(v));
+            assert!(d >= v, "ceil {v} -> {d}");
+            assert!(d <= v + v / 512 + 1, "precision {v} -> {d}");
+        }
+        assert_eq!(senior_floor_decode(senior_floor_encode(1023)), 1023);
+        assert!(senior_capital_halt(99, 100) && !senior_capital_halt(100, 100));
+        assert!(!senior_capital_halt(0, 0));
+    }
+
+    #[test]
+    fn p2b_alloc_limit_and_split() {
+        // C = 1,000, alpha 50%, buffer 30%, drawable 1,000: min(500, 700) = 500.
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, 5_000, 3_000), Some(500));
+        // after 500 allocated the alpha room is spent.
+        assert_eq!(vault_lp_alloc_limit(1_000, 500, 500, 5_000, 3_000), Some(0));
+        // buffer binds: drawable 600 -> 600 - 300 = 300 < 500.
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 600, 5_000, 3_000), Some(300));
+        // drawable under the buffer: nothing.
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 299, 5_000, 3_000), Some(0));
+        // out-of-range dials fail closed.
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, 5_001, 3_000), None);
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, 5_000, 2_999), None);
+        assert_eq!(vault_lp_alloc_split(500, 600, 400), Some((300, 200)));
+        assert_eq!(vault_lp_alloc_split(1, 1, 1), Some((1, 0)));
+        assert_eq!(vault_lp_alloc_split(3, 1, 1), None);
+        assert_eq!(vault_lp_dealloc(500, 700), 0);
+        assert!(vault_lp_alloc_admitted(0, false, 1_000, 1_000, 0));
+        assert!(!vault_lp_alloc_admitted(1, false, 1_000, 1_000, 0));
+        assert!(!vault_lp_alloc_admitted(0, true, 1_000, 1_000, 0));
+        assert!(!vault_lp_alloc_admitted(0, false, 999, 1_000, 0));
+        assert!(!vault_lp_alloc_admitted(0, false, 1_000, 1_000, -1));
+        assert!(a4_capacity_lock_ok(10, 5, 5));
+        assert!(!a4_capacity_lock_ok(10, 5, 6));
+        assert!(a4_capacity_lock_ok(10, 10, 99));
+    }
+
+    #[test]
+    fn e3_physical_rule() {
+        // R-2 step 1: d1 holds its 1,000 principal net of claims (the pair's own loss refilled
+        // it before the conversion consumed it); the ledger had booked 180 of loss.
+        assert_eq!(nonbound_pot_available(1_000, pot_physical_net_atoms(1_000, 0, 0, 0, 1)), 1_000);
+        // a registered winner claim of 180 on a pot holding 1,180: 1,000.
+        assert_eq!(pot_physical_net_atoms(1_180, 0, 180, 0, 1), 1_000);
+        // claims covered by insurance are not owed by the pot.
+        assert_eq!(pot_physical_net_atoms(1_000, 0, 180, 180, 1), 1_000);
+        // a real loss: never more than physical.
+        assert_eq!(nonbound_pot_available(1_000, 820), 820);
+        // never more than principal (loss backing routed for an untouched winner).
+        assert_eq!(nonbound_pot_available(1_000, 1_100), 1_000);
+        // rounding: floor the backing, ceil the claims.
+        assert_eq!(pot_physical_net_atoms(1_999, 0, 1, 0, 1_000), 0);
+    }
+
+    #[test]
+    fn l2_l3_and_h2_rules() {
+        // L-2: a draw that consumed the LP's capital writes the allocation down with it.
+        assert_eq!(alloc_written_down(5_000, 6_500), 5_000);
+        assert_eq!(alloc_written_down(5_000, 0), 0);
+        assert_eq!(vault_lp_alloc_limit(10_000, alloc_written_down(5_000, 0), 10_000, 5_000, 3_000), Some(5_000));
+        // L-3: junior >= 5% of C_eff.
+        assert!(alloc_junior_ok(10_500, 10_000));
+        assert!(!alloc_junior_ok(10_499, 10_000));
+        // H-2: inside the buffer everything is principal; above it the rest waits for a recall.
+        assert_eq!(live_bound_principal_portion(900, 5_000), 900);
+        assert_eq!(live_bound_principal_portion(7_000, 5_000), 5_000);
+    }
+
+    #[test]
+    fn h1_entry_reading_dominates_exit() {
+        // entry (par) >= exit (E3) for any physical state
+        for (p, f, c) in [(1_000u128, 1_000u128, 180u128), (1_000, 820, 0), (1_000, 1_180, 180), (1_000, 500, 900)] {
+            let exit = nonbound_pot_available(p, pot_physical_net_atoms(f, 0, c, 0, 1));
+            assert!(nonbound_pot_entry_available(p) >= exit, "{p} {f} {c}");
+        }
+    }
+
+    #[test]
+    fn g6_cushion() {
+        // C 10,000, target 10% => 1,000; junior at 900 => need 100; share 50% of 1,000 = 500.
+        assert_eq!(cushion_split(1_000, 5_000, 1_000, 10_000, 900), Some((900, 100)));
+        // at target: all to seniors.
+        assert_eq!(cushion_split(1_000, 5_000, 1_000, 10_000, 1_000), Some((1_000, 0)));
+        // off: all to seniors.
+        assert_eq!(cushion_split(1_000, 0, 1_000, 10_000, 0), Some((1_000, 0)));
+        assert_eq!(cushion_locked(5_000, 10_000, 1_000), Some(1_000));
+        assert!(!creator_fee_vested(999, 10_000, 5_000, 1_000));
+        assert!(creator_fee_vested(1_000, 10_000, 5_000, 1_000));
+        assert!(creator_fee_vested(0, 10_000, 0, 1_000));
+        assert_eq!(skew_defaults_e9(111), (55, 111));
+        assert_eq!(skew_defaults_e9(1), (1, 1));
+        assert_eq!(skew_defaults_e9(0), (0, 0));
+    }
 
     #[test]
     fn senior_draw_rule() {
