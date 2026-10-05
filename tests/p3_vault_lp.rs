@@ -4522,7 +4522,7 @@ fn p2b_q2_senior_capital_halt_after_junior_exhausted() {
     }
 }
 
-/// Q2: the senior floor lives in `AssetRiskLimitsV17._reserved[0..2]` (wrapper bytes 650..652);
+/// Q2: the senior floor lives in `AssetRiskLimitsV17.p2b_senior_floor_code` (wrapper bytes 650..652);
 /// tag 93 rewrites the whole risk record and must not clear it.
 #[test]
 fn p2b_q2_senior_floor_survives_tag93() {

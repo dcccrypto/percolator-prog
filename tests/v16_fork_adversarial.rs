@@ -1987,9 +1987,10 @@ fn adv_target_lag_trade_no_external_value_movement() {
 
     // v16: the consenting trade on the loss-stale asset is rejected (safety over
     // liveness). The economic invariant holds because nothing moves.
+    // P2b E7: the loss-stale refusal has its own code (was Custom(21)).
     assert_custom(
         env.try_trade(&user, ua, &lp, la, POS_SCALE as i128, 100, 0),
-        E_LOCK_ACTIVE,
+        121,
         "trade on loss-stale asset",
     );
     assert_eq!(
