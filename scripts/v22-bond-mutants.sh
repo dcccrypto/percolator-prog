@@ -87,7 +87,8 @@ pure)
 '    let need = if side > lp_eff_abs_q { side } else { lp_eff_abs_q };' \
 '    let need = lp_eff_abs_q; let _ = side;'
   run_pure MP4_coupon_not_capped_by_leg $B \
-'    let coupon = if due < available { due } else { available };
+'    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);
+    let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)' \
 '    (due, available.saturating_sub(due))'
   run_pure MP5_junior_gate_ignores_bonds $B \
@@ -110,6 +111,24 @@ pure)
 '    let bond_cover = if sub_cover < bond_in_pots { sub_cover } else { bond_in_pots };
     let _ = junior_in_pots;
     (next, moved, sub_cover - bond_cover, bond_cover, senior_loss)'
+  # ── security review fixes (2026-10-05) ──
+  run_pure MP8_coupon_cap_removed_M2 $B \
+'    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);' \
+'    let cap = available;'
+  run_pure MP9_util_bonus_allowed_L2 $B \
+'pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 0;' \
+'pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 1_000;'
+  run_pure MP10_coupon_gate_ignores_bond_impairment_M1 $B \
+'    live && bond_claim > 0 && senior_draw_outstanding == 0 && bond_value >= bond_claim' \
+'    let _ = bond_value; live && bond_claim > 0 && senior_draw_outstanding == 0'
+  run_pure MP11_coupon_base_full_claim_M1 $B \
+'    if bond_value < bond_claim {
+        bond_value
+    } else {
+        bond_claim
+    }' \
+'    let _ = bond_value;
+    bond_claim'
   ;;
 bpf)
   run_bpf MB1_lock_disabled $B \
@@ -133,10 +152,29 @@ bond_junior_cannot_withdraw_bond_value_and_tranche_is_required
                 )
             } else {' bond_resolved_exit_and_junior_after_bonds
   run_bpf MB4_no_coupon_first $B \
-'    let coupon = if due < available { due } else { available };
+'    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);
+    let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)' \
 '    let _ = due;
     (0, available)' bond_coupon_first_conserves_and_is_noncumulative
+  # ── security review fixes (2026-10-05) ──
+  run_bpf MB5_107_after_earn_M2 $W \
+'        if registry.total_lp_shares_outstanding != 0 || st.senior_claim_atoms != 0 {' \
+'        if false && (registry.total_lp_shares_outstanding != 0 || st.senior_claim_atoms != 0) {' \
+bond_tranche_refused_after_the_first_earn_deposit
+  run_bpf MB6_coupon_cap_removed_M2 $B \
+'    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);' \
+'    let cap = available;' bond_coupon_first_conserves_and_is_noncumulative
+  # MB7: the coupon gate blind to tranche impairment (the base stays min(C_b, value); MP11 covers
+  # the base on its own).
+  run_bpf MB7_coupon_on_full_claim_while_impaired_M1 $B \
+'    live && bond_claim > 0 && senior_draw_outstanding == 0 && bond_value >= bond_claim
+}' \
+'    let _ = bond_value; live && bond_claim > 0 && senior_draw_outstanding == 0
+}' sec_c1_impaired_bond_earns_no_coupon
+  run_bpf MB8_util_bonus_allowed_L2 $B \
+'pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 0;' \
+'pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 1_000;' bond_init_authority_bounds_and_flag
   ;;
 esac
 rm -rf "$BAK"

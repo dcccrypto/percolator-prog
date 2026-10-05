@@ -43,8 +43,14 @@ pub const SLOTS_PER_YEAR: u128 = 78_840_000;
 /// Base coupon ceiling: 20%/yr. Coupons are paid from the LP fee leg BEFORE the seniors, so an
 /// unbounded coupon would let a creator holding bonds redirect every Earn fee to itself.
 pub const BOND_COUPON_MAX_BPS: u16 = 2_000;
-/// Utilisation-bonus ceiling: +10%/yr at full utilisation.
-pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 1_000;
+/// Utilisation-bonus ceiling: 0 (security review L-2, 2026-10-05). Max-side OI is washable with
+/// self-hedged positions, so `InitBondTranche` REJECTS any non-zero bonus until a wash-resistant
+/// utilisation metric exists. The rate plumbing stays (inert at 0).
+pub const BOND_UTIL_BONUS_MAX_BPS: u16 = 0;
+/// Coupon ceiling per crank, bps of the harvested LP fee leg (security review M-2, safe default
+/// pending founder review): the coupon can never take more than half of a fee leg, so Earn keeps
+/// at least half of every leg whatever the bond rate.
+pub const BOND_COUPON_MAX_LEG_BPS: u16 = 5_000;
 /// Withdrawal cooldown floor (~1 h): coupon farming around a fee crank is worthless.
 pub const BOND_COOLDOWN_MIN_SLOTS: u32 = 9_000;
 /// Withdrawal cooldown ceiling (~7 days).
@@ -292,16 +298,33 @@ pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> 
 }
 
 /// Coupon gate: paid only on a Live market, from a non-empty tranche, while NO senior principal
-/// loss is outstanding (the coupon never takes priority over Earn principal).
-pub fn coupon_gate_open(live: bool, bond_claim: u128, senior_draw_outstanding: u128) -> bool {
-    live && bond_claim > 0 && senior_draw_outstanding == 0
+/// loss is outstanding (the coupon never takes priority over Earn principal) AND while the bond
+/// tranche itself is whole (`bond_value >= C_b`, security review M-1): an impaired tranche earns
+/// nothing, so Earn's fee leg never recapitalises it. `bond_value` is the bonds' layer of the
+/// vault value BEFORE this crank's fee leg.
+pub fn coupon_gate_open(live: bool, bond_claim: u128, senior_draw_outstanding: u128, bond_value: u128) -> bool {
+    live && bond_claim > 0 && senior_draw_outstanding == 0 && bond_value >= bond_claim
+}
+
+/// The principal the coupon accrues on: `min(C_b, bond value)` (security review M-1; equals the
+/// explicit model's written-down principal). With the gate above it is `C_b` whenever a coupon is
+/// paid at all; kept separate so the base can never exceed the bond's value even if the gate is
+/// relaxed later.
+pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
+    if bond_value < bond_claim {
+        bond_value
+    } else {
+        bond_claim
+    }
 }
 
 /// Take the coupon off the TOP of one harvested LP fee leg: `(coupon, rest)` with
-/// `coupon = min(due, available)` and `coupon + rest == available`. Paid only from the fee leg,
-/// never from principal; the unpaid part of `due` is forfeited (non-cumulative).
+/// `coupon = min(due, floor(available * BOND_COUPON_MAX_LEG_BPS / 1e4))` and
+/// `coupon + rest == available`. Paid only from the fee leg, never from principal, never more than
+/// half of it (M-2); the unpaid part of `due` is forfeited (non-cumulative).
 pub fn bond_coupon_split(available: u128, due: u128) -> (u128, u128) {
-    let coupon = if due < available { due } else { available };
+    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);
+    let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)
 }
 
@@ -426,14 +449,19 @@ mod tests {
         assert_eq!(coupon_due(1_000_000, 800, u64::MAX), Some(80_000));
         // one hour at 8% on 1e9: 1e9 * 800 * 9,000 / (1e4 * 78.84e6) = 9,132.42 -> 9,132
         assert_eq!(coupon_due(1_000_000_000, 800, 9_000), Some(9_132));
+        assert_eq!(bond_coupon_rate_bps(800, 0, 5_000), 800);
         assert_eq!(bond_coupon_rate_bps(800, 1_000, 5_000), 1_300);
         assert_eq!(bond_coupon_rate_bps(800, 1_000, u16::MAX), 1_800);
         assert_eq!(bond_coupon_split(100, 30), (30, 70));
-        assert_eq!(bond_coupon_split(100, 300), (100, 0));
+        assert_eq!(bond_coupon_split(100, 300), (50, 50), "never more than half the leg (M-2)");
+        assert_eq!(bond_coupon_split(101, 300), (50, 51));
         assert_eq!(fee_waterfall3(1_000, 100, 5_000, 1_000, 10_000, 900), Some((100, 100, 800)));
-        assert!(!coupon_gate_open(true, 1, 1));
-        assert!(!coupon_gate_open(false, 1, 0));
-        assert!(coupon_gate_open(true, 1, 0));
+        assert!(!coupon_gate_open(true, 1, 1, 1));
+        assert!(!coupon_gate_open(false, 1, 0, 1));
+        assert!(coupon_gate_open(true, 1, 0, 1));
+        assert!(!coupon_gate_open(true, 10, 0, 9), "impaired tranche earns nothing (M-1)");
+        assert_eq!(coupon_base(10, 4), 4);
+        assert_eq!(coupon_base(10, 40), 10);
         assert_eq!(bond_util_bps(0, 0), 0);
         assert_eq!(bond_util_bps(1, 0), 10_000);
         assert_eq!(bond_util_bps(50, 100), 5_000);
@@ -447,9 +475,9 @@ mod tests {
         assert!(!bond_withdraw_lock_ok(Some(99), 0, 0, 100));
         assert!(bond_withdraw_lock_ok(None, 0, 0, 0));
         assert!(!bond_withdraw_lock_ok(None, 1, 0, 0));
-        assert!(bond_config_ok(800, 1_000, 9_000, 5_000));
+        assert!(bond_config_ok(800, 0, 9_000, 5_000));
+        assert!(!bond_config_ok(800, 1, 9_000, 5_000), "non-zero utilisation bonus refused (L-2)");
         assert!(!bond_config_ok(2_001, 0, 9_000, 5_000));
-        assert!(!bond_config_ok(800, 1_001, 9_000, 5_000));
         assert!(!bond_config_ok(800, 0, 8_999, 5_000));
         assert!(!bond_config_ok(800, 0, 9_000, 0));
         assert!(!bond_config_ok(800, 0, 9_000, 5_001));

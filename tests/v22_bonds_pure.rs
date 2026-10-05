@@ -170,6 +170,8 @@ proptest! {
         prop_assert_eq!(due, coupon_due(cb, rate, core::cmp::max(dt, SLOTS_PER_YEAR as u64)).unwrap().min(due));
         let (coupon, rest) = bond_coupon_split(avail, due);
         prop_assert!(coupon <= avail && coupon <= due && coupon + rest == avail);
+        prop_assert!(coupon <= avail / 2, "M-2: never more than half the leg");
+        prop_assert_eq!(coupon, due.min(avail / 2));
         let (share, target) = if share == 0 || target == 0 { (0, 0) } else { (share, target) };
         if let Some((cp, cu, se)) = fee_waterfall3(avail, due, share, target, c, level) {
             prop_assert_eq!(cp, coupon);
@@ -178,9 +180,12 @@ proptest! {
             prop_assert!(cu <= bps_floor(rest, share).unwrap());
         }
         // gate: never while a senior loss is outstanding, never off Live, never on an empty tranche
-        prop_assert!(!coupon_gate_open(true, cb, 1));
-        prop_assert!(!coupon_gate_open(false, cb, 0));
-        prop_assert_eq!(coupon_gate_open(true, cb, 0), cb > 0);
+        prop_assert!(!coupon_gate_open(true, cb, 1, cb));
+        prop_assert!(!coupon_gate_open(false, cb, 0, cb));
+        prop_assert_eq!(coupon_gate_open(true, cb, 0, cb), cb > 0);
+        // M-1: an impaired tranche earns nothing; the base never exceeds the bond's value
+        if cb > 0 { prop_assert!(!coupon_gate_open(true, cb, 0, cb - 1)); }
+        prop_assert_eq!(coupon_base(cb, level), cb.min(level));
     }
 
     #[test]
@@ -193,7 +198,8 @@ proptest! {
     }
 
     #[test]
-    fn util_and_rate_bounded(oi in any_u128(), n in any_u128(), base in 0u16..=BOND_COUPON_MAX_BPS, bonus in 0u16..=BOND_UTIL_BONUS_MAX_BPS, u in any::<u16>()) {
+    fn util_and_rate_bounded(oi in any_u128(), n in any_u128(), base in 0u16..=BOND_COUPON_MAX_BPS, bonus in 0u16..=1_000, u in any::<u16>()) {
+        prop_assert_eq!(bond_config_ok(base, bonus, 9_000, 5_000), bonus == 0, "L-2: non-zero bonus refused");
         let x = bond_util_bps(oi, n);
         prop_assert!(x as u128 <= BPS);
         if oi == 0 { prop_assert_eq!(x, 0); }
@@ -513,6 +519,7 @@ struct Cov {
     recovery_to_bonds: u64,
     coupon_paid: u64,
     coupon_gated_by_senior_loss: u64,
+    coupon_gated_by_bond_impairment: u64,
     bond_deposit: u64,
     bond_exit: u64,
     bond_exit_impaired: u64,
@@ -609,13 +616,17 @@ fn five_claimant_case(
                 }
             }
             Op::Fee(x, dt) => {
-                let Some(due0) = coupon_due(w.c_b, coupon_bps as u32, dt) else { continue };
-                let open = coupon_gate_open(true, w.c_b, w.outstanding);
+                let Some(due0) = coupon_due(coupon_base(w.c_b, before.bond), coupon_bps as u32, dt) else { continue };
+                let open = coupon_gate_open(true, w.c_b, w.outstanding, before.bond);
                 let due = if open { due0 } else { 0 };
                 let (coupon, cushion, senior) = fee_waterfall3(x, due, share, target, w.c_s, before.junior)
                     .expect("in-range dials");
                 prop_assert_eq!(coupon + cushion + senior, x, "the fee leg is split exactly");
-                prop_assert!(coupon <= due && coupon <= x);
+                prop_assert!(coupon <= due && coupon <= x / 2);
+                if before.bond < w.c_b {
+                    prop_assert_eq!(coupon, 0, "M-1: no coupon on an impaired tranche");
+                    if due0 > 0 && x > 1 { cov.coupon_gated_by_bond_impairment += 1; }
+                }
                 if w.outstanding > 0 {
                     prop_assert_eq!(coupon, 0, "no coupon ahead of senior principal");
                     if due0 > 0 && x > 0 { cov.coupon_gated_by_senior_loss += 1; }
@@ -728,6 +739,7 @@ fn g7_five_claimant_conservation_and_order() {
         ("recovery_to_bonds", c.recovery_to_bonds),
         ("coupon_paid", c.coupon_paid),
         ("coupon_gated_by_senior_loss", c.coupon_gated_by_senior_loss),
+        ("coupon_gated_by_bond_impairment", c.coupon_gated_by_bond_impairment),
         ("bond_deposit", c.bond_deposit),
         ("bond_exit", c.bond_exit),
         ("bond_exit_impaired", c.bond_exit_impaired),
@@ -783,5 +795,172 @@ proptest! {
             prop_assert_eq!(lazy.bond, expl.bond);
             prop_assert_eq!(lazy.junior, expl.junior);
         }
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Security review M-1: lazy == explicit over the FULL bond lifecycle -- draws, recoveries, fee
+// legs (coupon + senior credit + cushion-like junior inflow), bond deposits, bond redemptions.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+#[derive(Clone, Debug)]
+enum Life {
+    Loss(u128),
+    Gain(u128),
+    Fee(u128, u64),
+    JuniorIn(u128),
+    Deposit(u128),
+    Redeem(u8),
+}
+
+fn life() -> impl Strategy<Value = Life> {
+    prop_oneof![
+        3 => (0u128..(1u128 << 58)).prop_map(Life::Loss),
+        2 => (0u128..(1u128 << 58)).prop_map(Life::Gain),
+        3 => ((0u128..(1u128 << 56)), any::<u64>()).prop_map(|(x, t)| Life::Fee(x, t)),
+        1 => (0u128..(1u128 << 56)).prop_map(Life::JuniorIn),
+        2 => (1u128..(1u128 << 56)).prop_map(Life::Deposit),
+        2 => (1u8..=16).prop_map(Life::Redeem),
+    ]
+}
+
+/// One side of the comparison. `explicit` = the design doc's model: a draw's bond cover WRITES
+/// DOWN the bond claim (`cb`) into `bout`; recovery restores seniors' outstanding first, then
+/// `bout`; the coupon accrues on the written-down `cb` and is forfeited while `bout > 0`.
+/// `lazy` = production: `cb` is never written down; value = split layer; coupon on
+/// `coupon_base(cb, value)` with `coupon_gate_open(.., value)`.
+#[derive(Clone, Debug, Default)]
+struct Side {
+    nav: u128,
+    cs: u128,
+    out: u128,
+    cb: u128,
+    bout: u128,
+    b: u128,
+    paid: u128,
+}
+
+impl Side {
+    fn bond_value(&self) -> u128 {
+        tranche_split3(self.nav, self.cs, self.cb).bond
+    }
+    /// After any inflow: the seniors' booked outstanding first (production `recover3`), then
+    /// (explicit model only) the written-down bond claim, then the junior.
+    fn recover(&mut self, explicit: bool) {
+        let (c2, o2, _) = recover3(self.nav, self.cs, self.out, self.cb);
+        self.cs = c2;
+        self.out = o2;
+        if explicit {
+            let above = self.nav.saturating_sub(self.cs).saturating_sub(self.cb);
+            let to_b = min(above, self.bout);
+            self.cb += to_b;
+            self.bout -= to_b;
+        }
+    }
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig { cases: 2_048, .. ProptestConfig::default() })]
+
+    #[test]
+    fn g7_lazy_equals_explicit_full_lifecycle(
+        // SPL domain: every share product of two such amounts fits u128 exactly.
+        senior0 in 1u128..(1u128 << 60), cb0 in 1u128..(1u128 << 60), junior0 in 0u128..(1u128 << 60),
+        rate in 1u32..=2_000,
+        seq in prop::collection::vec(life(), 1..50)
+    ) {
+        let mut l = Side { nav: senior0 + cb0 + junior0, cs: senior0, cb: cb0, b: cb0, ..Side::default() };
+        let mut e = l.clone();
+        let mut dust = 0u128; // rounding allowance: +1 per redemption / deposit
+        let mut coupons = 0u64;
+        for op in seq {
+            match op {
+                Life::Loss(x) => {
+                    for (s, expl) in [(&mut l, false), (&mut e, true)] {
+                        let st = DrawState { senior_claim: s.cs, outstanding: s.out, junior_surplus: s.nav.saturating_sub(s.cs), drawable: s.nav };
+                        let (n, moved, _jc, bc, _sl) = draw_step3(st, s.cb, x);
+                        s.nav -= moved;
+                        s.cs = n.senior_claim;
+                        s.out = n.outstanding;
+                        if expl { s.cb -= bc; s.bout += bc; }
+                    }
+                }
+                Life::Gain(x) | Life::JuniorIn(x) => {
+                    for (s, expl) in [(&mut l, false), (&mut e, true)] {
+                        s.nav += x;
+                        s.recover(expl);
+                    }
+                }
+                Life::Fee(x, dt) => {
+                    // lazy (production)
+                    let lv = l.bond_value();
+                    let l_open = coupon_gate_open(true, l.cb, l.out, lv);
+                    let l_due = if l_open { coupon_due(coupon_base(l.cb, lv), rate, dt).unwrap() } else { 0 };
+                    let (lc, lrest) = bond_coupon_split(x, l_due);
+                    // explicit (design): forfeited while written down, base = written-down claim
+                    let e_open = e.cb > 0 && e.out == 0 && e.bout == 0;
+                    let e_due = if e_open { coupon_due(e.cb, rate, dt).unwrap() } else { 0 };
+                    let (ec, erest) = bond_coupon_split(x, e_due);
+                    if dust == 0 {
+                        prop_assert_eq!(l_open, e_open, "gates agree");
+                        prop_assert_eq!(lc, ec, "coupons agree");
+                    }
+                    if lc > 0 { coupons += 1; }
+                    // half the remainder to the seniors, half stays as junior value (cushion-like)
+                    let (ls, es) = (lrest / 2, erest / 2);
+                    l.nav += x; l.cb += lc; l.cs += ls;
+                    e.nav += x; e.cb += ec; e.cs += es;
+                    l.recover(false);
+                    e.recover(true);
+                }
+                Life::Deposit(x) => {
+                    let (lv, ev) = (l.bond_value(), e.bond_value());
+                    let l_ok = l.nav >= l.cs && lv >= l.cb && l.out == 0;
+                    let e_ok = e.nav >= e.cs && e.bout == 0 && ev >= e.cb && e.out == 0;
+                    if dust == 0 { prop_assert_eq!(l_ok, e_ok, "deposit admission agrees"); }
+                    if !(l_ok && e_ok) { continue; }
+                    let (Some(lm), Some(em)) = (bond_shares_for_deposit(x, l.b, lv), bond_shares_for_deposit(x, e.b, ev)) else { continue };
+                    if lm == 0 || em == 0 { continue; }
+                    l.nav += x; l.cb += x; l.b += lm;
+                    e.nav += x; e.cb += x; e.b += em;
+                    dust += 1;
+                }
+                Life::Redeem(k) => {
+                    if l.b == 0 || e.b == 0 { continue; }
+                    for (s, expl) in [(&mut l, false), (&mut e, true)] {
+                        let sh = s.b / 16 * k as u128 + (s.b % 16) * k as u128 / 16;
+                        let v = s.bond_value();
+                        let pay = bond_atoms_for_redemption(sh, s.b, v).unwrap();
+                        s.nav -= pay;
+                        s.paid += pay;
+                        if expl {
+                            // slice the ORIGINAL claim (cb + bout) like production slices C_b,
+                            // then the written-down part pro rata
+                            let t = s.cb + s.bout;
+                            let t2 = bond_claim_after_redemption(t, sh, s.b).unwrap();
+                            let bout2 = bond_claim_after_redemption(s.bout, sh, s.b).unwrap();
+                            s.bout = bout2.min(t2);
+                            s.cb = t2 - s.bout;
+                        } else {
+                            s.cb = bond_claim_after_redemption(s.cb, sh, s.b).unwrap();
+                        }
+                        s.b -= sh;
+                    }
+                    dust += 1;
+                }
+            }
+            let (lt, et) = (tranche_split3(l.nav, l.cs, l.cb), tranche_split3(e.nav, e.cs, e.cb));
+            let d = |a: u128, b: u128| if a > b { a - b } else { b - a };
+            // EXACT until the first share-rounding event; within the accumulated rounding dust
+            // (one atom per deposit / redemption) afterwards.
+            prop_assert!(d(l.cs, e.cs) <= dust && d(l.out, e.out) <= dust, "senior books {:?} vs {:?}", (l.cs, l.out), (e.cs, e.out));
+            prop_assert!(d(lt.senior, et.senior) <= dust);
+            prop_assert!(d(lt.bond, et.bond) <= dust, "bond value lazy {} explicit {} dust {}", lt.bond, et.bond, dust);
+            prop_assert!(d(lt.junior, et.junior) <= dust, "junior value lazy {} explicit {} dust {}", lt.junior, et.junior, dust);
+            prop_assert!(d(l.paid, e.paid) <= dust);
+            // the lazy claim is the original claim: cb_lazy == cb_explicit + written-down part
+            prop_assert!(d(l.cb, e.cb + e.bout) <= dust);
+        }
+        let _ = coupons;
     }
 }

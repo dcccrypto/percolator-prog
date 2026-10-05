@@ -29046,8 +29046,10 @@ pub mod processor {
     /// market has no bond tranche. Once the registry's bond flag is set, [9] bond_tranche (w) is
     /// REQUIRED (fail closed; [7] ext and [8] the vault LP portfolio must then be passed too).
     ///
-    /// `coupon = min(coupon_due, available)` with `coupon_due = C_b * rate * dt / (1e4 * 1y)`,
-    /// `rate = base + bonus * min(u_last, u_now)` and `dt` since the last checkpoint. The coupon
+    /// `coupon = min(coupon_due, available / 2)` (M-2: never more than half of a leg) with
+    /// `coupon_due = min(C_b, bond value) * rate * dt / (1e4 * 1y)` (M-1),
+    /// `rate = base + bonus * min(u_last, u_now)` (bonus forced 0, L-2) and `dt` since the last
+    /// checkpoint. The coupon
     /// atoms stay in the pots (already harvested there as principal) and are credited to `C_b`, so
     /// the split hands them to the bonds. NON-CUMULATIVE: the checkpoint moves to "now" whatever
     /// was paid. Closed (coupon 0) unless Live, the tranche is non-empty and NO senior principal
@@ -29072,7 +29074,23 @@ pub mod processor {
         let now = authenticated_slot_or_fallback(t.last_coupon_slot);
         let live = state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
             == MarketModeV16::Live;
-        let open = bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms);
+        // M-1 (security review 2026-10-05): the coupon accrues on min(C_b, bond value) and is
+        // forfeited while the tranche is impaired. The bond value is its layer of V BEFORE this
+        // crank's leg. If the vault LP cannot be valued now (stale certificate with inventory) the
+        // coupon is DEFERRED: nothing is paid and the checkpoint does not move, so a crank timed on
+        // a stale LP cannot strip the bonds' coupon; a deferral never pays more than the fresh
+        // cranks would have (the next crank's coupon is still capped by its own leg, M-2).
+        let pre_open = live && t.c_b_atoms > 0 && st.senior_draw_outstanding_atoms == 0;
+        let (bond_value, defer) = if pre_open {
+            match bond_value_before_leg(program_id, accounts, st, registry, t.c_b_atoms, available) {
+                Ok(v) => (v, false),
+                Err(_) => (0, true),
+            }
+        } else {
+            (0, false)
+        };
+        let open = !defer
+            && bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms, bond_value);
         let u_now = if open && t.coupon_util_bonus_bps != 0 {
             bond_util_now_bps(program_id, accounts, st).unwrap_or(0)
         } else {
@@ -29081,7 +29099,7 @@ pub mod processor {
         let u_eff = if u_now < t.last_util_bps { u_now } else { t.last_util_bps };
         let due = if open {
             bond_v20::coupon_due(
-                t.c_b_atoms,
+                bond_v20::coupon_base(t.c_b_atoms, bond_value),
                 bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff),
                 now.saturating_sub(t.last_coupon_slot),
             )
@@ -29097,16 +29115,67 @@ pub mod processor {
         t.coupon_paid_total_atoms = t
             .coupon_paid_total_atoms
             .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
-        if now > t.last_coupon_slot {
+        if !defer && now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
         t.last_util_bps = u_now;
         state::write_bond_tranche(&mut t_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_coupon available={} due={} coupon={} c_b={} u_now={} u_eff={} open={}",
-            available, due, coupon, t.c_b_atoms, u_now, u_eff, open
+            "bond_coupon available={} due={} coupon={} c_b={} bond_value={} open={} defer={}",
+            available, due, coupon, t.c_b_atoms, bond_value, open, defer
         ));
         Ok((coupon, rest, t.c_b_atoms))
+    }
+
+    /// M-1: the bonds' layer of the vault value BEFORE the fee leg `available` that tag 78 just
+    /// harvested into the pots: `tranche_split3(V - available, C_eff, C_b).bond` with
+    /// `V = nav + harvestable + vault-LP value`. [3]/[4] are 78's key-checked pot ledgers, [8] the
+    /// bound vault LP. Errors (e.g. a stale vault-LP certificate) make the caller defer the coupon.
+    #[inline(never)]
+    fn bond_value_before_leg<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        st: &state::VaultLpStateV18,
+        registry: &state::LpVaultRegistryV16,
+        bond_claim: u128,
+        available: u128,
+    ) -> Result<u128, ProgramError> {
+        let market_ai = account(accounts, 1)?;
+        let registry_ai = account(accounts, 2)?;
+        let own_ledger_ai = account(accounts, 3)?;
+        let sibling_ledger_ai = account(accounts, 4)?;
+        let lp_ai = account(accounts, 8)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio || lp_ai.owner != program_id {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut market_data)?;
+        let lp_value = with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
+        let nav = {
+            let own = own_ledger_ai.try_borrow_data()?;
+            let sib = sibling_ledger_ai.try_borrow_data()?;
+            lp_vault_combined_nav_parts_p3(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_ai.key.to_bytes(),
+                registry.domain,
+                registry.fee_share_bps,
+                &own,
+                &sib,
+            )?
+            .1
+        };
+        let harvestable = lp_vault_harvestable_fee_atoms(&cfg, &group)?;
+        let c_eff = vault_lp_v18::effective_senior_claim(
+            st.senior_claim_atoms,
+            harvestable,
+            st.senior_fee_share_bps,
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let v = vault_lp_v18::vault_value(nav, harvestable, lp_value)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            .saturating_sub(available);
+        Ok(bond_v20::tranche_split3(v, c_eff, bond_claim).bond)
     }
 
     /// The utilisation of the bond-backed capacity right now: `min(1, max side OI / N_cap)` on the
@@ -34215,7 +34284,10 @@ pub mod processor {
     /// (`["bond_tranche", market]`) · 6 payer [signer, w] · 7 system_program ·
     /// 8 program_data (only when [0] is not the market authority).
     ///
-    /// The dials are protocol-bounded (`bond_v20::bond_config_ok`) and immutable afterwards.
+    /// The dials are protocol-bounded (`bond_v20::bond_config_ok`; the utilisation bonus must be 0
+    /// until a wash-resistant metric exists, security review L-2) and immutable afterwards.
+    /// Refused once the vault has ANY Earn deposit (LP shares or a senior claim): the coupon-first
+    /// fee terms are fixed before the first senior arrives (security review M-2).
     /// Sets registry flag 2: from then on 78/97/102(Resolved)/103 REQUIRE the tranche.
     #[inline(never)]
     fn handle_init_bond_tranche<'a>(
@@ -34262,6 +34334,12 @@ pub mod processor {
         let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
         if st.registry != registry_pda.to_bytes() {
             return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        // M-2 (security review 2026-10-05, safe default pending founder review): a tranche can
+        // only be created BEFORE the first Earn deposit, so the coupon-first fee terms can never
+        // change under existing Earn depositors. No LP shares ever minted and no senior claim.
+        if registry.total_lp_shares_outstanding != 0 || st.senior_claim_atoms != 0 {
+            return Err(PercolatorError::BondConfigInvalid.into());
         }
         let (cfg, mode, _, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
@@ -34651,7 +34729,11 @@ pub mod processor {
     /// value priced at the price WORSE for the vault; `C_b` falls by the pro-rata slice
     /// (rounded down: the remaining holders are never diluted).
     /// * Live: paid out of the vault LP's engine capital (the engine admits the withdrawal only
-    ///   from a FLAT vault LP), and only if (a) no senior draw is outstanding, (b) the pots alone
+    ///   from a FLAT vault LP: `withdraw_not_atomic` refuses any portfolio with an active leg, so
+    ///   ONE open position against the vault LP, even dust, blocks every Live bond exit until it
+    ///   closes -- security review M-3, accepted: a partial Live exit cannot be paid from the
+    ///   capital of a non-flat LP without an engine change, and the bonds keep absorbing losses and
+    ///   earning coupons meanwhile; the Resolved path below is the escape), and only if (a) no senior draw is outstanding, (b) the pots alone
     ///   cover the seniors, and (c) the OPEN-INTEREST LOCK holds after the withdrawal:
     ///   `N_cap(C_m - x) >= max(OI_long, OI_short, |LP_eff|)` (`bond_v20::bond_withdraw_lock_ok`,
     ///   the fix for the bond self-funding attack). The P2b A4 check runs again after the move.

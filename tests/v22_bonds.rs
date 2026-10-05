@@ -1920,8 +1920,15 @@ impl Env {
 /// Bound vault with `senior` Earn, floor 20%, `junior`, a bond tranche (`coupon_bps`, no bonus,
 /// 9,000-slot cooldown, cap 50%) and one bond holder with `bond` deposited.
 fn bond_world(p: Params, senior: u64, junior: u64, bond: u64, coupon_bps: u16) -> (Env, Lp, Depositor, BondHolder) {
-    let (mut env, lp, d) = p2b_world(p, senior, junior);
+    // M-2: the tranche must exist BEFORE the first Earn deposit, so: bind, 107, then Earn (75,
+    // bound path), then the junior (96), then the bond.
+    let mut env = Env::new(p);
+    let lp = env.bind(2_000);
     env.init_bonds(coupon_bps);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, senior * U, Some(lp.portfolio)).expect("75 senior (bound)");
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, junior * U).expect("96 junior");
     let h = env.new_bond_holder();
     if bond > 0 {
         env.bond_deposit(&h, lp.portfolio, bond * U, 1).expect("108 bond deposit");
@@ -1941,23 +1948,23 @@ fn bond_init_authority_bounds_and_flag() {
     env.set_program_data_authority(&a);
     // unbound vault: refused
     err_has(&env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 5_000)), PercolatorError::VaultLpNotBound);
-    let d = env.new_depositor();
-    env.earn_deposit(&d, 10_000 * U, None).expect("senior");
     let lp = env.bind(2_000);
     // stranger (neither market authority nor upgrade authority): refused
     let stranger = Keypair::new();
     env.svm.airdrop(&stranger.pubkey(), 10_000_000_000).unwrap();
     err_has(&env.init_bond_tranche_as(&stranger, (800, 0, COOLDOWN, 5_000)), PercolatorError::Unauthorized);
     // out-of-bounds dials: each refused
-    for bad in [(2_001, 0, COOLDOWN, 5_000), (800, 1_001, COOLDOWN, 5_000), (800, 0, COOLDOWN - 1, 5_000), (800, 0, 1_512_001, 5_000), (800, 0, COOLDOWN, 0), (800, 0, COOLDOWN, 5_001)] {
+    // (800, 300, ..): a non-zero utilisation bonus is refused until a wash-resistant metric
+    // exists (security review L-2).
+    for bad in [(2_001, 0, COOLDOWN, 5_000), (800, 300, COOLDOWN, 5_000), (800, 1_001, COOLDOWN, 5_000), (800, 0, COOLDOWN - 1, 5_000), (800, 0, 1_512_001, 5_000), (800, 0, COOLDOWN, 0), (800, 0, COOLDOWN, 5_001)] {
         err_has(&env.init_bond_tranche_as(&admin, bad), PercolatorError::BondConfigInvalid);
     }
     assert!(env.svm.get_account(&env.tranche_key()).is_none_or(|a| a.data.is_empty()), "nothing created by a refusal");
     assert_eq!(env.registry_state()._reserved[2], 0, "flag 2 not set by a refusal");
     // market authority: created
-    env.init_bond_tranche_as(&admin, (800, 300, COOLDOWN, 4_000)).expect("marketauth creates");
+    env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 4_000)).expect("marketauth creates");
     let t = env.tranche();
-    assert_eq!((t.coupon_bps_per_year, t.coupon_util_bonus_bps, t.bond_cooldown_slots, t.bond_cap_bps_of_c), (800, 300, COOLDOWN, 4_000));
+    assert_eq!((t.coupon_bps_per_year, t.coupon_util_bonus_bps, t.bond_cooldown_slots, t.bond_cap_bps_of_c), (800, 0, COOLDOWN, 4_000));
     assert_eq!((t.c_b_atoms, t.b_shares_total), (0, 0));
     assert_eq!(env.registry_state()._reserved[2], 1, "registry flag 2 (BOND_TRANCHE_EXISTS)");
     assert_eq!(env.registry_state()._reserved[1], 1, "the ext slot exists from 107 on");
@@ -1968,14 +1975,34 @@ fn bond_init_authority_bounds_and_flag() {
 
     // upgrade-authority path on a fresh market (UA != market authority)
     let mut env = Env::new(Params::default());
-    let d = env.new_depositor();
-    env.earn_deposit(&d, 10_000 * U, None).expect("senior");
     env.bind(2_000);
     let ua = Keypair::new();
     env.svm.airdrop(&ua.pubkey(), 10_000_000_000).unwrap();
     let k = ua.pubkey();
     env.set_program_data_authority(&k);
     env.init_bond_tranche_as(&ua, (800, 0, COOLDOWN, 5_000)).expect("upgrade authority creates");
+}
+
+/// M-2 (security review 2026-10-05): a bond tranche can never be added under existing Earn
+/// depositors (coupon-first would change their fee terms after they deposited). Refused once the
+/// vault holds any Earn deposit, whether made before or after the bind; the same call on a fresh
+/// vault (control) succeeds. Negative control: mutant MB5 (timing check removed).
+#[test]
+fn bond_tranche_refused_after_the_first_earn_deposit() {
+    let (mut env, _lp, _d) = p2b_world(Params::default(), 10_000, 1_000); // Earn before the bind
+    let admin = env.admin.insecure_clone();
+    err_has(&env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 5_000)), PercolatorError::BondConfigInvalid);
+    assert_eq!(env.registry_state()._reserved[2], 0);
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(2_000);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 1_000 * U, Some(lp.portfolio)).expect("bound Earn deposit");
+    let admin = env.admin.insecure_clone();
+    err_has(&env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 5_000)), PercolatorError::BondConfigInvalid);
+    let mut env = Env::new(Params::default());
+    env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 5_000)).expect("control: no Earn yet");
 }
 
 // ── 108 + N_cap ─────────────────────────────────────────────────────────────────────────────
@@ -1986,9 +2013,9 @@ fn bond_init_authority_bounds_and_flag() {
 #[test]
 fn bond_deposit_mints_at_par_and_ncap_counts_junior_alpha_earn_and_bonds() {
     let fill = |bond: bool| -> (u128, i128) {
-        let (mut env, lp, _d) = p2b_world(growth_params(), 10_000, 1_000);
-        env.allocate(lp.portfolio, u128::MAX).expect("103: 5,000 of Earn");
-        env.init_bonds(800);
+        let (mut env, lp, _d, _h) = bond_world(growth_params(), 10_000, 1_000, 0, 800);
+        let t = Some(env.tranche_key());
+        env.allocate_bond(lp.portfolio, u128::MAX, t).expect("103: 5,000 of Earn");
         let cap_before = env.n_cap(lp.portfolio);
         assert_eq!(cap_before, 6_000 * POS as u128, "junior 1,000 + alpha 50% x Earn 10,000");
         if bond {
@@ -2025,11 +2052,13 @@ fn bond_deposit_mints_at_par_and_ncap_counts_junior_alpha_earn_and_bonds() {
 /// slippage (and a zero-share mint).
 #[test]
 fn bond_deposit_refusals_and_controls() {
-    let (mut env, lp, _d) = p2b_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_000);
-    let h = env.new_bond_holder();
-    // no tranche yet: the tranche account does not load
-    err_has(&env.bond_deposit(&h, lp.portfolio, U, 1), PercolatorError::BondConfigInvalid);
-    env.init_bonds(800);
+    {
+        // no tranche: the tranche account does not load
+        let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 2_000);
+        let h = env.new_bond_holder();
+        err_has(&env.bond_deposit(&h, lp.portfolio, U, 1), PercolatorError::BondConfigInvalid);
+    }
+    let (mut env, lp, _d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_000, 0, 800);
     err_has(&env.bond_deposit(&h, lp.portfolio, 0, 0), PercolatorError::LpVaultZeroAmount);
     // cap: 50% x (C 10,000 + junior 2,000) = 6,000
     err_has(&env.bond_deposit(&h, lp.portfolio, 6_000 * U + 1, 1), PercolatorError::BondDepositAboveCap);
@@ -2095,8 +2124,7 @@ fn bond_request_and_cooldown_rules() {
 /// pays par.
 #[test]
 fn bond_self_funding_attack_is_refused() {
-    let (mut env, lp, _d) = p2b_world(growth_params(), 10_000, 1_000);
-    env.init_bonds(0);
+    let (mut env, lp, _d, _h) = bond_world(growth_params(), 10_000, 1_000, 0, 0);
     let attacker = env.new_bond_holder();
     env.bond_deposit(&attacker, lp.portfolio, 1_000 * U, 1).expect("attacker posts a 1,000 bond");
     assert_eq!(env.n_cap(lp.portfolio), 2_000 * POS as u128, "capacity doubled by the bond");
@@ -2151,8 +2179,7 @@ fn bond_self_funding_attack_is_refused() {
 /// withdrawal SUCCEEDS and this test fails. Control: once the OI is closed the exit pays par.
 #[test]
 fn bond_lock_binds_with_a_flat_vault_lp_and_open_user_oi() {
-    let (mut env, lp, _d) = p2b_world(growth_params(), 10_000, 1_000);
-    env.init_bonds(0);
+    let (mut env, lp, _d, _h) = bond_world(growth_params(), 10_000, 1_000, 0, 0);
     let attacker = env.new_bond_holder();
     env.bond_deposit(&attacker, lp.portfolio, 1_000 * U, 1).expect("bond");
     env.bond_request(&attacker, 1_000 * U as u128).expect("109");
@@ -2310,10 +2337,11 @@ fn bond_does_not_count_as_l3_junior() {
 
 // ── coupon ──────────────────────────────────────────────────────────────────────────────────
 
-/// Coupon first: on tag 78 the bonds take `min(due, LP fee leg)` before the seniors, credited to
-/// C_b (value conserved: coupon + senior credit == the leg); the holder exits at principal +
-/// coupon. NON-CUMULATIVE: an interval whose leg could not cover the due is not carried. No
-/// coupon without a bond claim (control).
+/// Coupon first: on tag 78 the bonds take `min(due, half the LP fee leg)` (M-2 cap) before the
+/// seniors, credited to C_b (value conserved: coupon + senior credit == the leg); the holder
+/// exits at principal + coupon. NON-CUMULATIVE: an interval whose leg could not cover the due is
+/// not carried. Negative control for the cap: mutant MB6 (cap removed) gives the whole thin leg
+/// to the coupon and fails this test.
 #[test]
 fn bond_coupon_first_conserves_and_is_noncumulative() {
     let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
@@ -2342,11 +2370,12 @@ fn bond_coupon_first_conserves_and_is_noncumulative() {
     let senior = env.vlp().senior_claim_atoms - c0;
     eprintln!("COUPON 1: leg {avail} due {due} coupon {coupon} senior {senior}");
     assert!(avail > 0 && due > 0, "vacuity");
-    assert_eq!(coupon, due.min(avail), "coupon = min(due, leg)");
+    assert_eq!(coupon, due.min(avail / 2), "coupon = min(due, leg / 2)");
     assert_eq!(coupon + senior, avail, "coupon + senior credit == the leg (cushion off)");
     assert_eq!(tr1.coupon_paid_total_atoms as u128, coupon);
     assert_eq!(tr1.last_coupon_slot, env.slot);
-    // interval 2: long again but a THIN leg -> coupon = the whole leg, seniors 0 ...
+    // interval 2: long again but a THIN leg -> the coupon is capped at HALF the leg (M-2); the
+    // seniors keep the other half ...
     env.slot += 500_000;
     env.svm.warp_to_slot(env.slot);
     env.hold(1, &[lp.portfolio]);
@@ -2361,8 +2390,8 @@ fn bond_coupon_first_conserves_and_is_noncumulative() {
     env.crank_fees_bond(lp.portfolio).expect("78 thin");
     let tr2 = env.tranche();
     assert!(due2 > leg2, "vacuity: the leg cannot cover the due");
-    assert_eq!(tr2.c_b_atoms - tr1.c_b_atoms, leg2, "the whole thin leg goes to the coupon");
-    assert_eq!(env.vlp().senior_claim_atoms, c1, "seniors get nothing of it");
+    assert_eq!(tr2.c_b_atoms - tr1.c_b_atoms, leg2 / 2, "the coupon takes at most half the leg (M-2)");
+    assert_eq!(env.vlp().senior_claim_atoms - c1, leg2 - leg2 / 2, "Earn keeps the other half");
     // ... interval 3: SHORT (1 slot) with a fat leg -> only that slot's due; the shortfall of
     // interval 2 is NOT carried
     env.hold(1, &[lp.portfolio]);
@@ -2456,13 +2485,16 @@ fn bond_error_codes_and_tags_are_pinned() {
 /// omitting [9]); with it the leg is harvested. Inert before 107 (control): the P2b tail alone.
 #[test]
 fn bond_fee_crank_requires_the_tranche() {
-    let (mut env, lp, _d) = p2b_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_000);
+    {
+        let (mut env, lp, _d) = p2b_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_000);
+        let t = env.new_trader(1_000 * U);
+        env.allocate(lp.portfolio, 1_000 * U as u128).expect("103 creates the ext");
+        env.trade(&t, &lp, 100 * UQ).expect("open");
+        env.trade(&t, &lp, -100 * UQ).expect("close");
+        env.crank_fees_ext(lp.portfolio).expect("control: no tranche, the P2b tail is enough");
+    }
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_000, 0, 800);
     let t = env.new_trader(1_000 * U);
-    env.allocate(lp.portfolio, 1_000 * U as u128).expect("103 creates the ext");
-    env.trade(&t, &lp, 100 * UQ).expect("open");
-    env.trade(&t, &lp, -100 * UQ).expect("close");
-    env.crank_fees_ext(lp.portfolio).expect("control: no tranche, the P2b tail is enough");
-    env.init_bonds(800);
     env.trade(&t, &lp, 100 * UQ).expect("open");
     env.trade(&t, &lp, -100 * UQ).expect("close");
     assert!(env.crank_fees_ext(lp.portfolio).is_err(), "78 without [9] once the tranche exists");
@@ -2498,5 +2530,149 @@ impl Env {
             }
         }
         panic!("catch_up did not converge");
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Regressions ported from the security review of #530 (Sentinel, 2026-10-05;
+// ~/wt-sec-v22c/percolator-prog/tests/sec_v22c_adv.rs). sec_c1 is INVERTED: it demonstrated the
+// M-1 finding and now pins the fix.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// Leave the bond tranche impaired (junior 500 gone, bonds -500) with the vault LP flat.
+fn impaired_bond_world(coupon_bps: u16) -> (Env, Lp, Depositor, BondHolder, Trader) {
+    let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, coupon_bps);
+    let t = env.new_trader(5_000 * U);
+    env.trade(&t, &lp, 1_000 * UQ).expect("long");
+    env.move_price(2_000_000, &[t.portfolio, lp.portfolio]);
+    env.trade(&t, &lp, -1_000 * UQ).expect("close");
+    env.hold(12, &[t.portfolio, lp.portfolio]);
+    let _ = env.crank_fees_bond(lp.portfolio);
+    (env, lp, d, h, t)
+}
+
+/// SEC-C1 / M-1: an IMPAIRED tranche earns no coupon (before the fix it earned the coupon on its
+/// FULL claim, 2x what its value would earn at 50% impairment, paid out of Earn's fee leg). The
+/// whole leg goes to the seniors. CONTROL: the identical crank on a WHOLE tranche pays the
+/// coupon. Negative control: mutant MB7 (impairment gate removed, base = C_b) fails this test.
+#[test]
+fn sec_c1_impaired_bond_earns_no_coupon() {
+    let run = |impaired: bool| -> (u128, u128, u128) {
+        let (mut env, lp, _d, _h, t) = if impaired {
+            impaired_bond_world(2_000)
+        } else {
+            let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
+            let t = env.new_trader(5_000 * U);
+            env.hold(1, &[lp.portfolio]);
+            (env, lp, d, h, t)
+        };
+        let s = env.split3(lp.portfolio);
+        let tr = env.tranche();
+        if impaired {
+            assert_eq!(s.junior, 0);
+            assert!(s.bond < tr.c_b_atoms, "vacuity: bonds impaired");
+        } else {
+            assert_eq!(s.bond, tr.c_b_atoms, "control: bonds whole");
+        }
+        env.slot += 500_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio, t.portfolio]);
+        let t2 = env.new_trader(20_000 * U);
+        for _ in 0..6 {
+            env.trade(&t2, &lp, 200 * UQ).expect("open");
+            env.trade(&t2, &lp, -200 * UQ).expect("close");
+        }
+        let tr0 = env.tranche();
+        let avail = {
+            let (cfg, _) = env.market_state();
+            cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
+        };
+        let c0 = env.vlp().senior_claim_atoms;
+        env.crank_fees_bond(lp.portfolio).expect("78");
+        let coupon = env.tranche().c_b_atoms - tr0.c_b_atoms;
+        let senior = env.vlp().senior_claim_atoms - c0;
+        eprintln!("SEC-C1 impaired={impaired}: leg {avail} coupon {coupon} senior-credit {senior}");
+        (avail, coupon, senior)
+    };
+    let (leg_i, coupon_i, senior_i) = run(true);
+    let (leg_w, coupon_w, senior_w) = run(false);
+    assert!(leg_i > 0 && leg_w > 0, "vacuity: fee legs");
+    assert_eq!(coupon_i, 0, "M-1: an impaired tranche earns nothing");
+    assert_eq!(senior_i, leg_i, "the whole leg goes to Earn");
+    assert!(coupon_w > 0, "control: a whole tranche earns its coupon");
+    assert_eq!(coupon_w + senior_w, leg_w);
+}
+
+/// SEC-M1 / M-3 (accepted, documented): ONE dust position against the vault LP blocks every
+/// Live bond exit (the engine's withdraw is flat-only); closing it restores the par exit.
+#[test]
+fn sec_m1_dust_position_blocks_live_bond_exit() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    let g = env.new_trader(10 * U);
+    env.trade(&g, &lp, UQ / 1000).expect("griefer buys 0.001 unit");
+    assert_ne!(env.position(lp.portfolio), 0);
+    env.wait_cooldown(&[lp.portfolio, g.portfolio]);
+    assert!(env.bond_execute(&h, lp.portfolio, 0).is_err(), "M-3: blocked by a dust position");
+    env.trade(&g, &lp, -UQ / 1000).expect("griefer closes");
+    env.hold(1, &[lp.portfolio, g.portfolio]);
+    assert_eq!(env.bond_execute(&h, lp.portfolio, 0).expect("control"), 2_000 * U);
+}
+
+/// SEC-A1: a holder cannot execute or request on another holder's position.
+#[test]
+fn sec_a1_position_substitution_refused() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    let mallory = env.new_bond_holder();
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.wait_cooldown(&[lp.portfolio]);
+    let dest = env.token_account(env.mint, mallory.kp.pubkey(), 0);
+    let forged = BondHolder { kp: mallory.kp.insecure_clone(), source: mallory.source, position: h.position };
+    let ix = env.bond_execute_ix(&forged, lp.portfolio, dest, 0);
+    let kp = mallory.kp.insecure_clone();
+    err_has(&env.send_many(vec![ix], &[&kp]), PercolatorError::BondConfigInvalid);
+    err_has(&env.bond_request(&forged, 1), PercolatorError::BondConfigInvalid);
+    assert_eq!(env.bond_execute(&h, lp.portfolio, 0).expect("control: the owner exits"), 2_000 * U);
+}
+
+/// SEC-D1: a dust deposit cannot move the coupon checkpoint while a fee leg is pending.
+#[test]
+fn sec_d1_deposit_requires_harvest() {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+    let t = env.new_trader(10_000 * U);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.trade(&t, &lp, 1_000 * UQ).expect("open");
+    env.trade(&t, &lp, -1_000 * UQ).expect("close");
+    let g = env.new_bond_holder();
+    let last = env.tranche().last_coupon_slot;
+    err_has(&env.bond_deposit(&g, lp.portfolio, 1, 0), PercolatorError::VaultLpHarvestPending);
+    assert_eq!(env.tranche().last_coupon_slot, last, "checkpoint untouched");
+}
+
+/// SEC-L1: a junior withdrawing ahead of the coupon crank cannot reach bond value.
+#[test]
+fn sec_l1_junior_ahead_of_the_coupon_crank_cannot_reach_bonds() {
+    for crank_first in [true, false] {
+        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+        let t = env.new_trader(10_000 * U);
+        env.slot += 500_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        for _ in 0..6 {
+            env.trade(&t, &lp, 1_000 * UQ).expect("open");
+            env.trade(&t, &lp, -1_000 * UQ).expect("close");
+        }
+        if crank_first {
+            env.crank_fees_bond(lp.portfolio).expect("78");
+        }
+        let _ = env.max_junior_out_bond(lp.portfolio);
+        if !crank_first {
+            env.crank_fees_bond(lp.portfolio).expect("78");
+        }
+        let s = env.split3(lp.portfolio);
+        assert_eq!(s.bond, env.tranche().c_b_atoms, "bonds whole whatever the order (crank_first {crank_first})");
+        env.assert_conserved("sec_l1");
     }
 }
