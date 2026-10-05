@@ -792,6 +792,146 @@ pub fn growth_pinned_matcher_caps() -> crate::vault_lp_v18::PinnedMatcherCaps {
     }
 }
 
+// ── v2.2 Phase 4 items 1 + 2: band-gated growth and holding-fee rent ──────────────────────────
+
+/// Graduation of the leverage ceiling above `L_launch` (design §1.1 "Graduation unlock").
+/// Replaces the `GRADUATION_ENABLED` constant: allowed only on a band market (the Band Safety
+/// Law, validated at InitMarket, is the program-enforced epoch clamp `r_gap` waited for) AND
+/// with an on-chain depth tier >= 1 (item 4, Wave C). Until item 4 supplies a tier, callers
+/// pass 0 and the ceiling stays at `min(L_launch, L_tier)` (I-D1: stale/absent depth is tier
+/// 0, never looser).
+pub fn graduation_allowed(band_bps: u64, depth_tier: u8) -> bool {
+    band_bps != 0 && depth_tier >= 1
+}
+
+/// v2.2: on a band market `r_gap` is DERIVED, `r_gap := G(d)` (the worst two-epoch adverse
+/// move), no longer creator-declared. `None` when `d` is out of range or `G` does not fit u16.
+pub fn band_r_gap_bps(band_bps: u64) -> Option<u16> {
+    let g = percolator::band_rent::band_worst_adverse_bps(band_bps).ok()?;
+    u16::try_from(g).ok()
+}
+
+/// v2.2: the vault-LP leverage ceiling a band market allows:
+/// `floor(10_000 * (10_000 - 500) / (MMR + G))` bps, capped at `MAX_LAMBDA_BPS`, so the vault
+/// LP itself stays at least 5% clear of its own maintenance over two epochs. `None` on a zero
+/// denominator.
+pub fn band_lambda_max_bps(maintenance_bps: u64, g_bps: u64) -> Option<u32> {
+    let den = (maintenance_bps as u128).checked_add(g_bps as u128)?;
+    if den == 0 {
+        return None;
+    }
+    let v = BPS * (BPS - 500) / den;
+    Some(if v > MAX_LAMBDA_BPS as u128 {
+        MAX_LAMBDA_BPS
+    } else {
+        v as u32
+    })
+}
+
+/// v2.2: the UA dial bounds. Off-band (no epoch clamp): the growth-1 tighten-only box
+/// (`growth_dials_ok(false, ..)`). On a band market: `lambda in [1, band_lambda_max]`, kink
+/// in [0, 100%].
+pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: u16) -> bool {
+    match band {
+        None => growth_dials_ok(false, lambda_bps, kink_bps),
+        Some((maintenance_bps, g_bps)) => match band_lambda_max_bps(maintenance_bps, g_bps) {
+            Some(max) => lambda_bps >= 1 && lambda_bps <= max && kink_bps as u128 <= BPS,
+            None => false,
+        },
+    }
+}
+
+/// v2.2: alpha (Earn allocation) above 50% only on a band market, up to 70%.
+pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
+pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
+    if band_on {
+        ALLOC_ALPHA_MAX_BAND_BPS
+    } else {
+        crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS
+    }
+}
+
+/// v2.2 (security review I-1): the graduation reference `c_launch` is never below $1,000 of
+/// 6-decimal collateral, so a 1-atom first junior deposit cannot pin it and graduate the
+/// ceiling on the first real deposit.
+pub const MIN_C_LAUNCH_ATOMS: u128 = 1_000_000_000;
+pub fn c_launch_atoms_for(c_m: u128) -> u128 {
+    if c_m > MIN_C_LAUNCH_ATOMS {
+        c_m
+    } else {
+        MIN_C_LAUNCH_ATOMS
+    }
+}
+
+/// v2.2 item 2: on a rent market the one-time utilisation toll is only an ENTRY floor (a
+/// one-slot flash lock pays no rent), 25 bps at `u = 1` instead of 500 (closes N-2: rent, not
+/// a toll, prices a held lock-out).
+pub const RENT_ENTRY_FLOOR_BPS: u16 = 25;
+
+/// The utilisation-fee maximum in force: the stored dial, or the default when 0 (the rent
+/// entry floor on rent markets, `GROWTH_UTIL_FEE_DEFAULT_BPS` elsewhere).
+pub fn util_fee_max_effective_bps_for(stored_bps: u16, rent_on: bool) -> u16 {
+    if stored_bps != 0 {
+        stored_bps
+    } else if rent_on {
+        RENT_ENTRY_FLOOR_BPS
+    } else {
+        GROWTH_UTIL_FEE_DEFAULT_BPS
+    }
+}
+
+/// UA dial bounds for the utilisation fee: tighten-only from the default off-band without
+/// rent; down to the rent entry floor on a rent market; down to 0 on a band market.
+pub fn util_fee_dial_ok_for(band_on: bool, rent_on: bool, util_max_bps: u16) -> bool {
+    let lo = if band_on {
+        0
+    } else if rent_on {
+        RENT_ENTRY_FLOOR_BPS
+    } else {
+        GROWTH_UTIL_FEE_DEFAULT_BPS
+    };
+    util_max_bps >= lo && util_max_bps <= GROWTH_UTIL_FEE_HARD_MAX_BPS
+}
+
+/// v2.2 item 2 (design §2.1): the per-side holding-fee rent rate, e9 of notional per slot.
+///
+/// ```text
+/// u = users_OI_side / N_cap
+/// r = 0                                              u <= kink
+///   = ceil(max * (u - kink) / (1 - kink))            kink < u < 1
+///   = max                                            u >= 1
+/// ```
+///
+/// `None` on `n_cap == 0`, a kink above 100% or an overflow; callers treat `None` as 0 (no
+/// capacity measured, no rent; the growth gate refuses opens there anyway). I-R1: 0 at or
+/// below the kink, never above `max`, monotone non-decreasing in `users_oi_side_q`.
+pub fn rent_rate_e9(
+    users_oi_side_q: u128,
+    n_cap_q: u128,
+    kink_bps: u16,
+    max_e9_per_slot: u64,
+) -> Option<u64> {
+    if n_cap_q == 0 || kink_bps as u128 > BPS {
+        return None;
+    }
+    let lhs = users_oi_side_q.checked_mul(BPS)?;
+    let rhs = (kink_bps as u128).checked_mul(n_cap_q)?;
+    if lhs <= rhs || max_e9_per_slot == 0 {
+        return Some(0);
+    }
+    if users_oi_side_q >= n_cap_q {
+        return Some(max_e9_per_slot);
+    }
+    // Here kink < 10_000 (else lhs <= rhs because users < n).
+    let den = n_cap_q.checked_mul(BPS - kink_bps as u128)?;
+    let r = mul_div_ceil_u128(max_e9_per_slot as u128, lhs - rhs, den)?;
+    Some(if r > max_e9_per_slot as u128 {
+        max_e9_per_slot
+    } else {
+        r as u64
+    })
+}
+
 // ── Matcher call extension v3 ───────────────────────────────────────────────────────────────
 
 pub const CALL_EXT_V3_VERSION: u8 = 3;

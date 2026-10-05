@@ -5844,6 +5844,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale_long.active_bitmap = active_bitmap_with(&[0, 1]);
     state::write_portfolio(&mut long_account.data, &stale_long).unwrap();
@@ -6418,6 +6422,10 @@ Instruction::PermissionlessCrank {
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale_prediction_leg.active_bitmap = active_bitmap_with(&[0, 1, 2]);
     state::write_portfolio(&mut long_account.data, &stale_prediction_leg).unwrap();
@@ -6555,6 +6563,10 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale.active_bitmap = active_bitmap_with(&[0]);
     state::write_portfolio(&mut long_account.data, &stale).unwrap();

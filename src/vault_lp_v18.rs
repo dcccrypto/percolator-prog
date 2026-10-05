@@ -706,7 +706,9 @@ pub fn vault_lp_alloc_limit(
     alpha_bps: u16,
     buffer_bps: u16,
 ) -> Option<u128> {
-    if alpha_bps > ALLOC_ALPHA_MAX_BPS
+    // v2.2: the hard ceiling is the band-market maximum (70%); the per-market cap (50%
+    // off-band) is enforced where alpha is written.
+    if alpha_bps > crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS
         || buffer_bps < ALLOC_BUFFER_MIN_BPS
         || buffer_bps as u128 > BPS
     {
