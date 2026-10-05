@@ -2587,89 +2587,45 @@ fn source_credit_fresh_reserved_atoms(env: &Env, domain: u16) -> u128 {
     group.source_credit[domain as usize].fresh_reserved_backing_num / percolator::BOUND_SCALE
 }
 
+/// RE-DERIVED for E3 (2026-10-05). A live lien of 2,000,000 is registered against the vault's own
+/// 3,000,000 of backing (claims on principal, no routed backing). E3 prices the domain at
+/// `min(principal, physical - claims) = 1,000,000`, so:
+///  * D1's full exit SUCCEEDS against the existing lien (the proportional gate, not a hard
+///    lien-exists reject: the original fix this test pins) and is paid exactly its pro-rata
+///    share of the CLAIM-NETTED NAV, `floor(MINTED * 1,000,000 / S)` -- not the full 999,000,
+///    which (pre-E3) let the first redeemer leave the whole claim to the remaining holders;
+///  * the domain stays fully covered after every exit: a payout priced net of claims can never
+///    leave it under-backed, so the pre-E3 "under-backed partial exit is rejected" step is
+///    unreachable through pricing; D2's partial exit is paid its claim-netted share and the
+///    claim stays covered.
 #[test]
 fn execute_redemption_succeeds_against_covered_lien_and_rejects_under_backed_redemption() {
-    // Two depositors share the vault's DOMAIN backing pool:
-    //   D1 (genesis): deposits DEPOSIT (1_000_000), mints MINTED (999_000).
-    //   D2: deposits 2*DEPOSIT (2_000_000), mints 2_000_000 (1:1, not genesis).
-    // Total pool backing = 3_000_000 atoms (no earnings seeded, so 1:1 with
-    // deposited atoms).
     let mut env = setup_vault(0); // immediate cooldown
     let d1 = new_depositor(&mut env, DEPOSIT);
     let d2 = new_depositor(&mut env, 2 * DEPOSIT);
     let total_backing = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(
-        total_backing,
-        DEPOSIT + 2 * DEPOSIT,
-        "sanity: pool backing == sum of deposits (no earnings)"
-    );
-
-    // Hand-craft a live lien for 2_000_000 atoms -- fully covered right now
-    // (3_000_000 available >= 2_000_000 claimed), but leaves only 1_000_000
-    // atoms of headroom for redemptions before the domain would go
-    // under-backed.
+    assert_eq!(total_backing, DEPOSIT + 2 * DEPOSIT, "sanity: pool backing == sum of deposits");
     let claim_atoms: u128 = 2 * DEPOSIT;
     set_source_credit_lien_for_test(&mut env, DOMAIN, claim_atoms);
+    let s_total = lp_shares_outstanding(&env);
 
-    // D1 redeems its full MINTED (999_000) balance. Post-redemption backing:
-    // 3_000_000 - 999_000 = 2_001_000, still >= the 2_000_000 claim bound
-    // (1_000 atoms of margin) -- fully covered, so this MUST SUCCEED even
-    // though positive_claim_bound_num != 0 on this domain. Before the fix,
-    // this redemption would have been rejected outright by the over-broad
-    // `positive_claim_bound_num != 0` clause regardless of coverage.
     request(&mut env, &d1, MINTED).expect("request d1");
     env.svm.expire_blockhash();
-    execute(&mut env, &d1).expect(
-        "ExecuteRedemption against a fully-covered lien must succeed (proportional gate, not a hard lien-exists reject)",
-    );
-    assert_eq!(tok(&env.svm, d1.dest), MINTED as u64, "d1 paid in full");
+    execute(&mut env, &d1).expect("ExecuteRedemption against a fully-covered lien must succeed");
+    let d1_owed = MINTED * (total_backing - claim_atoms) / s_total;
+    assert_eq!(tok(&env.svm, d1.dest) as u128, d1_owed, "d1 paid its share of the claim-netted NAV");
     let after_d1 = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(
-        after_d1,
-        total_backing - MINTED,
-        "backing decremented by exactly d1's principal"
-    );
-    assert!(
-        after_d1 >= claim_atoms,
-        "domain must remain fully covered after d1's redemption"
-    );
+    assert_eq!(after_d1, total_backing - d1_owed, "backing decremented by exactly d1's payout");
+    assert!(after_d1 >= claim_atoms, "domain fully covered after d1");
 
-    // D2 now tries to redeem 100_000 of its 2_000_000 shares. Post-redemption
-    // backing would be 2_001_000 - 100_000 = 1_901_000 < the 2_000_000 claim
-    // bound -- UNDER-BACKED -- so this MUST be REJECTED. This proves the
-    // proportional gate still protects solvency: the fix only removed the
-    // over-broad "any lien exists" reject, not the actual coverage check.
+    let s1 = lp_shares_outstanding(&env);
     request(&mut env, &d2, 100_000).expect("request d2 (partial)");
     env.svm.expire_blockhash();
-    let res = execute(&mut env, &d2);
-    assert!(
-        res.is_err(),
-        "ExecuteRedemption that would leave the domain under-backed relative to its claim must be rejected: {res:?}"
-    );
-    assert_eq!(
-        tok(&env.svm, d2.dest),
-        0,
-        "no payout on the rejected under-backed redemption"
-    );
-    let after_rejected = source_credit_fresh_reserved_atoms(&env, DOMAIN);
-    assert_eq!(
-        after_rejected, after_d1,
-        "rejected redemption must not mutate backing state (atomic rollback)"
-    );
-
-    // Sanity: the SAME 100_000 request, once the lien is relaxed back to 0,
-    // executes cleanly -- confirms the D2 rejection above was specifically
-    // the solvency gate (not some unrelated account/setup issue) and that
-    // the pending redemption request survives a prior rejected execute.
-    set_source_credit_lien_for_test(&mut env, DOMAIN, 0);
-    env.svm.expire_blockhash();
-    execute(&mut env, &d2)
-        .expect("same request executes once the lien no longer makes it under-backed");
-    assert_eq!(
-        tok(&env.svm, d2.dest),
-        100_000,
-        "d2 paid once solvency is restored"
-    );
+    execute(&mut env, &d2).expect("a claim-netted partial exit keeps the domain covered");
+    let d2_owed = 100_000 * (after_d1 - claim_atoms) / s1;
+    assert_eq!(tok(&env.svm, d2.dest) as u128, d2_owed, "d2 paid its claim-netted share");
+    let after_d2 = source_credit_fresh_reserved_atoms(&env, DOMAIN);
+    assert!(after_d2 >= claim_atoms, "domain still fully covered");
 }
 
 // ── Finding 1 (mode gate) + Finding 3 (crank with no LPs) ───────────────────

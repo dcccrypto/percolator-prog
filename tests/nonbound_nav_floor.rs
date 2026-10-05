@@ -439,16 +439,39 @@ fn market_group(env: &Env) -> state::MarketGroupV16 {
         .1
 }
 
-/// The SI shape on pot `domain`: backing the pot lent out was consumed (a winner was paid from
-/// it) and is now a provider receivable. Fresh backing is untouched (live: d1 fresh 1,000.000002,
-/// consumed 0.032976), so the next ledger sync books `atoms` of impairment on that pot.
+/// PHYSICAL consumption (E3, 2026-10-05): `atoms` of pot `domain`'s backing paid a winner who
+/// withdrew them (fresh -> consumed lien / provider receivable; the atoms left the vault). If
+/// the pot's fresh backing is short, the excess is first ROUTED in (a loser's settled loss
+/// landing in the pot) and consumed with it: the only physical way a pot's booked loss can
+/// exceed its principal. (This fixture used to book the receivable with fresh untouched -- a
+/// physically whole pot, the I-2 shape E3 rightly prices as unimpaired.)
 fn consume_pot_backing(env: &mut Env, domain: u16, atoms: u128) {
+    let fresh = market_group(env).source_backing_buckets[domain as usize].fresh_unliened_backing_num
+        / BOUND_SCALE;
+    let routed = atoms.saturating_sub(fresh);
     with_market(env, |g| {
-        let num = atoms * BOUND_SCALE;
-        g.source_backing_buckets[domain as usize].consumed_liened_backing_num += num;
-        g.source_credit[domain as usize].spent_backing_num += num;
-        g.source_credit[domain as usize].provider_receivable_num += num;
+        let (r, n) = (routed * BOUND_SCALE, atoms * BOUND_SCALE);
+        let b = &mut g.source_backing_buckets[domain as usize];
+        b.fresh_unliened_backing_num = b.fresh_unliened_backing_num + r - n;
+        b.consumed_liened_backing_num += n;
+        // The program's own rule when a pot's idle backing hits zero (77 / draw decrement).
+        if b.fresh_unliened_backing_num == 0 && b.valid_liened_backing_num == 0 {
+            b.status = if b.impaired_liened_backing_num != 0 {
+                percolator::BackingBucketStatusV16::Impaired
+            } else {
+                percolator::BackingBucketStatusV16::Expired
+            };
+        }
+        let s = &mut g.source_credit[domain as usize];
+        s.fresh_reserved_backing_num = s.fresh_reserved_backing_num + r - n;
+        s.spent_backing_num += n;
+        s.provider_receivable_num += n;
+        g.source_fresh_backing_total_num = g.source_fresh_backing_total_num + r - n;
+        g.vault = g.vault + routed - atoms;
     });
+    let bal = token_amount(&env.svm, env.vault_token) as u128;
+    let (mint, va) = (env.collateral_mint, vault_authority(env));
+    set_token(&mut env.svm, env.vault_token, mint, va, (bal + routed - atoms) as u64);
 }
 
 /// A live winner claim of `atoms` registered against pot `domain` (live: source d0
@@ -624,15 +647,28 @@ fn has_code(e: &str, code: u32) -> bool {
     e.contains(&format!("Custom({code})"))
 }
 
-/// Recovery of `atoms` on pot `domain`: the provider receivable is paid back, the consumed lien
-/// shrinks, the next ledger sync books a `cumulative_recovery_atoms`.
+/// PHYSICAL recovery (E3): a loser's loss of `atoms` lands in pot `domain` and pays its
+/// receivable down (fresh +atoms, consumed -atoms; the atoms are in the vault).
 fn recover_pot_backing(env: &mut Env, domain: u16, atoms: u128) {
     with_market(env, |g| {
-        let num = atoms * BOUND_SCALE;
-        g.source_backing_buckets[domain as usize].consumed_liened_backing_num -= num;
-        g.source_credit[domain as usize].spent_backing_num -= num;
-        g.source_credit[domain as usize].provider_receivable_num -= num;
+        let n = atoms * BOUND_SCALE;
+        let b = &mut g.source_backing_buckets[domain as usize];
+        b.fresh_unliened_backing_num += n;
+        b.consumed_liened_backing_num -= n;
+        // a backing add re-opens a drained pot (the engine add path)
+        if b.status == percolator::BackingBucketStatusV16::Expired {
+            b.status = percolator::BackingBucketStatusV16::Fresh;
+        }
+        let s = &mut g.source_credit[domain as usize];
+        s.fresh_reserved_backing_num += n;
+        s.spent_backing_num -= n;
+        s.provider_receivable_num -= n;
+        g.source_fresh_backing_total_num += n;
+        g.vault += atoms;
     });
+    let bal = token_amount(&env.svm, env.vault_token);
+    let (mint, va) = (env.collateral_mint, vault_authority(env));
+    set_token(&mut env.svm, env.vault_token, mint, va, bal + atoms as u64);
 }
 
 /// Pin a pot's LEDGER to the state a live 75/77/91 leaves behind after syncing against a
@@ -830,11 +866,16 @@ fn deposit_then_recovery_captures_no_more_than_the_boundary_state() {
     }
 }
 
-/// ADVERSARIAL: a recovery that stays INSIDE the over-impaired segment (net impairment still above
-/// principal) leaves the pot over-impaired, so deposits stay paused (H-1) and an existing holder's
-/// exit through the healthy pot is still priced on the floored NAV (the recovery moved no value).
+/// ADVERSARIAL: a recovery that stays INSIDE the over-impaired segment (booked net impairment still
+/// above principal) leaves the pot over-impaired, so deposits stay paused (H-1).
+///
+/// E3 (2026-10-05) re-derivation: the recovered 300 physically sit in the sibling pot with no
+/// claim against them (a loser's loss repaying the vault's receivable), so they ARE the
+/// holders' value: the healthy-pot exit is priced on `P + 300` exactly. The pre-E3 ledger
+/// assigned the first 500 recovered to the routed segment (backing the vault never fronted)
+/// and priced the exit on `P`, stranding the 300 -- the attribution leak E3 closes.
 #[test]
-fn recovery_inside_the_over_impaired_segment_moves_no_value() {
+fn recovery_inside_the_over_impaired_segment_is_priced_physically_and_keeps_the_pause() {
     let (mut env, v) = otc_env(SIBLING_DOMAIN, OVER);
     book_synced_impairment(&mut env, v.sibling_ledger, OVER);
     recover_pot_backing(&mut env, SIBLING_DOMAIN, 300_000_000); // 1,500 -> 1,200 (> principal 1,000)
@@ -845,7 +886,11 @@ fn recovery_inside_the_over_impaired_segment_moves_no_value() {
     let shares = shares_of(&env, v.lp_ata) / 2;
     request(&mut env, &v, shares);
     execute(&mut env, &v, DOMAIN).expect("redeem");
-    assert_eq!(token_amount(&env.svm, v.dest) as u128, floor_mul_div(shares, P, t), "floored NAV");
+    assert_eq!(
+        token_amount(&env.svm, v.dest) as u128,
+        floor_mul_div(shares, P + 300_000_000, t),
+        "priced on the physical NAV: healthy pot P + the 300 recovered into the sibling"
+    );
 }
 
 /// REDEEM AFTER THE FLOOR: a holder exits (all but the 1,000 dead shares) through the healthy
