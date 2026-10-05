@@ -63,7 +63,7 @@ pub const NFT_PROGRAM_ID: Pubkey = pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45
 /// `cargo test --features devnet`. Without the feature the wrapper has no
 /// pinned id at all and tag 87 fails closed with `StakeProgramNotPinned`
 /// (Custom(60)) — correct behaviour, but it makes the tag-87 suite red.
-pub const STAKE_ID: Pubkey = pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w");
+pub const STAKE_ID: Pubkey = pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
 
 /// Token-2022 program id (loaded via `with_spl_programs()`).
 pub const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");

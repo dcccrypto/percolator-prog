@@ -29,7 +29,7 @@ use solana_sdk::{
     signature::{Keypair, Signer},
 };
 
-const CANONICAL_MATCHER: &str = "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX";
+const CANONICAL_MATCHER: &str = "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam";
 
 /// Live market + LP + Earn + trade parameters, all decoded from the market's own transactions.
 #[derive(Clone)]

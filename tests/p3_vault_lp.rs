@@ -35,7 +35,7 @@ const DOMAIN: u16 = 0; // asset 0, long side
 const MATCHER_CONTEXT_LEN: usize = 320;
 /// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
 /// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
-const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
+const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
 fn code(e: PercolatorError) -> String {

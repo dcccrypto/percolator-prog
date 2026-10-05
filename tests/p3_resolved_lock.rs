@@ -298,7 +298,7 @@ impl World {
     }
 
     fn setup_stake(&mut self, total_lp_supply: u64) {
-        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
+        let stake_id: Pubkey = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".parse().unwrap();
         assert!(self.env.program_id.to_string() == "ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv" || std::env::var("INDEP_PROGRAM_ID").is_ok(), "FUZZ_STAKE needs INDEP_MAINNET_ID=1 (plain stake) or INDEP_PROGRAM_ID=<id the stake build allowlists>");
         let so = std::env::var("INDEP_STAKE_SO").unwrap_or_else(|_| format!("{}/wt-indep/so/stake-e0ace2c-plain.so", std::env::var("HOME").unwrap()));
         if self.env.svm.get_account(&stake_id).map_or(true, |a| !a.executable) {
@@ -348,7 +348,7 @@ impl World {
 
     fn do_stake87_accrue(&mut self) -> Result<u64, String> {
         let (pool, _va, sv) = self.stake.ok_or("no stake pool")?;
-        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
+        let stake_id: Pubkey = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".parse().unwrap();
         let payer = self.env.payer.pubkey();
         let (m, v, va) = (self.env.market, self.env.vault, self.env.vault_authority);
         let r87 = self.send(
@@ -2685,7 +2685,7 @@ impl World {
     /// account-9 vault_auth-owned token account to sweep.
     fn do_stake_recover_terminal(&mut self, amount: u64, stray: Option<Pubkey>) -> Result<u64, String> {
         let (pool, va, sv) = self.stake.ok_or("no stake pool")?;
-        let stake_id: Pubkey = "VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w".parse().unwrap();
+        let stake_id: Pubkey = "A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE".parse().unwrap();
         let (m, v, wva, pid) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.program_id);
         let mut accounts = vec![
             AccountMeta::new_readonly(self.env.payer.pubkey(), false),
@@ -3121,7 +3121,7 @@ pub fn p3_legacy_bind() -> bool {
 
 /// CANONICAL_VAULT_LP_MATCHER_PROGRAM (devnet) at 07a1d0eb — the live matcher id.
 pub fn p3_canonical_matcher() -> Pubkey {
-    "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse().unwrap()
+    "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse().unwrap()
 }
 
 pub fn p3_mode() -> bool {

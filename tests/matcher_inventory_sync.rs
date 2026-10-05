@@ -46,7 +46,7 @@ const BASE_BPS: u64 = 10;
 const CAP: i128 = 40 * Q;
 const DEPOSIT: u128 = 1_000_000_000_000;
 const CANONICAL_MATCHER: Pubkey =
-    solana_sdk::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
+    solana_sdk::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 
 fn wrapper_path() -> PathBuf {
     if let Some(p) = std::env::var_os("P1_WRAPPER_SO") {

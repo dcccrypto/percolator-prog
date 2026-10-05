@@ -80,7 +80,7 @@ const MATCHER_ID: Pubkey = pubkey!("4seJWjv3R5qfXY8R5ntuPHWsoqcVvaxvfFSnU2AnGMhT
 /// RELAUNCH (all-fresh program IDs, 2026-09-30): the candidate wrapper's tag-94 auto-pin matcher
 /// (`CANONICAL_VAULT_LP_MATCHER_PROGRAM`, devnet). The same matcher bytes are mounted at both ids;
 /// every vault-LP bind / trade on the fork uses this one.
-const VAULT_MATCHER_ID: Pubkey = pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
+const VAULT_MATCHER_ID: Pubkey = pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 const STAKE_ID: Pubkey = pubkey!("GCHhcgwPyrai8SWHEVWw3odedguFXEtJobNnWSfWBCU3");
 
 const DEPLOYED_SO_DEFAULT: &str = "/Users/khubair/deploycand-v182/out/wrapper-v18.2.so";

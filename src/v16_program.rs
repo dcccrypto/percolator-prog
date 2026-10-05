@@ -483,13 +483,13 @@ pub mod constants {
         crate::vault_lp_v18::ENGINE_MAX_POSITION_ABS_Q == percolator::MAX_POSITION_ABS_Q
     );
     /// P3 auto-pin: the ONE matcher program a vault LP is bound to at tag 94. Protocol constant
-    /// (never instruction data). devnet = the RELAUNCH matcher `EDKKgRaV…` (all-fresh program IDs,
+    /// (never instruction data). devnet = the v2.1 matcher `DfTxJUT5…` (v2.1 fresh IDs 2026-10-05; ETDLAdi used EDKKgRaV…,
     /// 2026-09-30; the pre-relaunch matcher was `4seJWjv3…`). There is deliberately
     /// no mainnet arm yet: tag 94 fails closed off-devnet until the mainnet matcher ID is set
     /// here (same compile-time-absent / runtime-fail-closed pattern as STAKE_PROGRAM_ID).
     #[cfg(feature = "devnet")]
     pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
-        solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
+        solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -979,7 +979,7 @@ pub mod constants {
     //     sha256 0e9c25725615c3f11fa4db0cd53a3220f8d7d6f24fc4631bc9975c8970fd6e9c
     //   ⇒ MATCH. GCHhcgw IS percolator-stake@1e08d35.
     //   RELAUNCH (2026-09-30, all-fresh program IDs): the devnet pin is now the fresh stake
-    //   deployment `VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w`; the lineage note above is the
+    //   deployment `VmpVUArR…`, and v2.1 (2026-10-05) moves it to `A6DVNubv…`; the lineage note above is the
     //   pre-relaunch `GCHhcgw…` deployment (old world, kept by the live-fork test fixtures).
     //   GOTCHA: the build is PATH-DEPENDENT (root-crate `-C metadata` hash).
     //   Rebuilding at any path other than the canonical `~/v17/percolator-stake`
@@ -1008,7 +1008,7 @@ pub mod constants {
     // the matching `declare_id!` arm in percolator-stake, in the same change.
     #[cfg(feature = "devnet")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
-        solana_program::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w");
+        solana_program::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
 
     /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
     /// the wrapper market it is bound to, so there is exactly ONE pool per
@@ -34598,7 +34598,7 @@ pub mod processor {
     }
 
     /// Matcher-inventory-sync: the matcher programs that understand the 40-byte `ext_version = 2`
-    /// call extension (LP engine position). Only the canonical (devnet: EDKKgRaV, upgraded to
+    /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
         #[cfg(feature = "devnet")]
