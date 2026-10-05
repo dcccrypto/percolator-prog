@@ -2750,6 +2750,11 @@ fn crank_fees_rejected_outside_live_mode() {
     seed_lp_fee_accrued(&mut env2, LP_FEES);
     let (v2_before, i2_before) = vault_and_insurance(&env2);
     resolve_market(&mut env2).expect("resolve empty market with LP backing");
+    // Earn-drain §5 (2026-10-04): a Resolved market that is TERMINAL-FLAT (no materialized
+    // portfolio, c_tot == 0) now harvests for non-bound vaults too, as bound (P3) vaults already
+    // did: no trader can draw on insurance any more, so the Finding-1 hazard cannot arise. The
+    // hazard is a Resolved market that still has trader capital — pin that it is still refused.
+    set_c_tot_for_test(&mut env2, 1);
     env2.svm.expire_blockhash();
     let err2 = crank_fees(&mut env2).expect_err("a permissionless crank in Resolved must reject");
     assert!(
@@ -2766,6 +2771,15 @@ fn crank_fees_rejected_outside_live_mode() {
         (LP_FEES, 0),
         "Resolved: claim intact"
     );
+    // Terminal-flat Resolved (c_tot back to 0, nothing materialized): the crank now runs and
+    // harvests the fee leg into the vault's backing; header.vault is unchanged (no SPL moves).
+    set_c_tot_for_test(&mut env2, 0);
+    env2.svm.expire_blockhash();
+    crank_fees(&mut env2).expect("terminal-flat Resolved non-bound crank harvests");
+    let (v2_after, i2_after) = vault_and_insurance(&env2);
+    assert_eq!(v2_after, v2_before, "terminal harvest: header.vault unchanged");
+    assert!(i2_after < i2_before, "terminal harvest: the LP fee leg left insurance");
+    assert!(lp_fee_counters(&env2).1 > 0, "terminal harvest: the claim was withdrawn");
 
     // ---- Live-but-MATURED: still mode 0, but past the permissionless
     //      stale-resolve horizon, i.e. a market anyone may resolve and that is
