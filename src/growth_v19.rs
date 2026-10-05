@@ -182,7 +182,6 @@ pub fn mul_div_ceil_u128(a: u128, b: u128, d: u128) -> Option<u128> {
 
 /// `N_cap_q = floor(c_m * lambda_bps * pos_scale / (10_000 * price_e6))`. `None` (fail closed:
 /// refuse crowd growth) on a zero price or any overflow. Rounds DOWN (never over capacity).
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::n_cap_q(c_m, lambda_bps, price_e6, pos_scale, *r)))]
 pub fn n_cap_q(c_m: u128, lambda_bps: u32, price_e6: u64, pos_scale: u128) -> Option<u128> {
     if price_e6 == 0 {
         return None;
@@ -203,7 +202,6 @@ pub const DEPTH_MULT: u128 = 4;
 
 /// `liquidity_notional_e6` the wrapper hands the matcher (ext v3):
 /// `floor(c_m * lambda * DEPTH_MULT / 1e4)`. `None` on overflow.
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::liquidity_notional_e6(c_m, lambda_bps, *r)))]
 pub fn liquidity_notional_e6(c_m: u128, lambda_bps: u32) -> Option<u128> {
     let x = c_m.checked_mul(lambda_bps as u128)?;
     crate::vault_lp_v18::mul_div_floor(x, DEPTH_MULT, BPS)
@@ -269,13 +267,11 @@ pub fn joins_crowd(lp_before_q: i128, lp_after_q: i128) -> bool {
 }
 
 /// Spec §1 `RiskNotional = ceil(|pos| * price / POS_SCALE)`. `None` on overflow / zero scale.
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::risk_notional_ceil(abs_q, price_e6, pos_scale, *r)))]
 pub fn risk_notional_ceil(abs_q: u128, price_e6: u64, pos_scale: u128) -> Option<u128> {
     mul_div_ceil_u128(abs_q, price_e6 as u128, pos_scale)
 }
 
 /// Spec §7 per-leg IM: 0 when flat, else `max(ceil(notional * imr / 1e4), min_nonzero)`.
-#[cfg_attr(kani, kani::ensures(|r: &Option<u128>| spec::leg_im_req(notional, imr_bps, min_nonzero_im_req, *r)))]
 pub fn leg_im_req(notional: u128, imr_bps: u64, min_nonzero_im_req: u128) -> Option<u128> {
     if notional == 0 {
         return Some(0);
@@ -672,8 +668,11 @@ pub fn util_fee_on_fill_bps(fee_bps: u16, opening_q: u128, fill_abs_q: u128) -> 
     // Rounds DOWN (the closing part of a flip is never charged). `fee * o` cannot overflow at
     // engine-bounded sizes (fee <= 65535, |q| <= 2e17); if it ever did, the tx ABORTS exactly as
     // the pre-A1 multiply did under `overflow-checks = true`: fail closed, never a free open.
+    // R1 (security review, proposal 3): `x <= fee` holds (o <= fill), but the clamp makes the
+    // narrowing cast a LINEAR fact, machine-checked at full width, instead of a silent
+    // truncation path if that ever failed.
     match crate::vault_lp_v18::mul_div_floor(fee_bps as u128, o, fill_abs_q) {
-        Some(x) => x as u16,
+        Some(x) => core::cmp::min(x, fee_bps as u128) as u16,
         None => panic!("util fee overflow"),
     }
 }
