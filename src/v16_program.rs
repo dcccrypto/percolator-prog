@@ -385,6 +385,15 @@ pub mod constants {
         PROTOCOL_FEE_AUTHORITY_EPOCH_OFF + PROTOCOL_FEE_AUTHORITY_EPOCH_LEN;
     pub const ASSET_RISK_LIMITS_LEN: usize = 64;
     const _: () = assert!(ASSET_RISK_LIMITS_OFF == 608);
+    /// Phase 2b Q2 (2026-10-05): the vault LP's senior floor `T = C - nav` as a 16-bit ceiling
+    /// code (`vault_lp_v18::senior_floor_encode`) in the first two bytes of
+    /// `AssetRiskLimitsV17::_reserved` = absolute wrapper-slot bytes [650, 652). Builder D owns
+    /// [652, 672) (ADL wind-down), growth-v19 [672, 792). Both risk-limit writers preserve
+    /// these two bytes (tag 93 rewrites the whole record).
+    pub const P2B_SENIOR_FLOOR_OFF: usize = ASSET_RISK_LIMITS_OFF + 42;
+    pub const P2B_SENIOR_FLOOR_LEN: usize = 2;
+    const _: () = assert!(P2B_SENIOR_FLOOR_OFF == 650);
+    const _: () = assert!(P2B_SENIOR_FLOOR_OFF + P2B_SENIOR_FLOOR_LEN == 652);
     const _: () = assert!(ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN <= ASSET_ORACLE_WRAPPER_LEN);
 
     /// P1: SetAssetRiskLimits -- upgrade-authority-gated (same ProgramData check as tag 85),
@@ -1455,6 +1464,11 @@ VaultLpMultiAssetMarket,
         /// target. Custom(102). SDK/app: "Creator fees unlock when the market's first-loss
         /// cushion reaches its target".
         VaultLpCreatorFeeVesting = 102,
+        /// Phase 2b Q2: the junior is exhausted (V < C_eff): the vault LP is trading senior
+        /// capital, so its risk-INCREASING fills are halted; reductions and closes are not.
+        /// Custom(103). SDK/app: "This side is paused while the market's first-loss capital is
+        /// rebuilt; closing is always allowed".
+        VaultLpSeniorCapitalHalt = 103,
     }
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
@@ -1463,6 +1477,7 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::VaultLpAllocateRefused as u32 == 100);
     const _: () = assert!(PercolatorError::VaultLpCapacityLocked as u32 == 101);
     const _: () = assert!(PercolatorError::VaultLpCreatorFeeVesting as u32 == 102);
+    const _: () = assert!(PercolatorError::VaultLpSeniorCapitalHalt as u32 == 103);
 
     impl From<PercolatorError> for ProgramError {
         fn from(value: PercolatorError) -> Self {
@@ -2716,9 +2731,16 @@ pub mod state {
     pub const MATCHER_EXT_MODE_V1: u8 = 1;
     const _: () = assert!(core::mem::size_of::<AssetRiskLimitsV17>() == ASSET_RISK_LIMITS_LEN);
 
+    /// `_reserved[0..2]` holds the Phase 2b senior floor code (wrapper-owned, any value).
+    pub const P2B_SENIOR_FLOOR_RESERVED_IDX: usize = 0;
+    const _: () = assert!(
+        core::mem::offset_of!(AssetRiskLimitsV17, _reserved) + crate::constants::ASSET_RISK_LIMITS_OFF
+            == crate::constants::P2B_SENIOR_FLOOR_OFF
+    );
+
     pub fn validate_asset_risk_limits(limits: &AssetRiskLimitsV17) -> Result<(), ProgramError> {
         if limits._reserved0 != 0
-            || limits._reserved != [0u8; 22]
+            || limits._reserved[2..] != [0u8; 20]
             || limits.max_requested_fee_bps > crate::risk_limits_v17::MAX_REQUESTED_FEE_BPS
             || limits.matcher_ext_mode > MATCHER_EXT_MODE_V1
             || limits.exec_band_bps > crate::risk_limits_v17::MAX_EXEC_BAND_BPS
@@ -2749,10 +2771,32 @@ pub mod state {
         limits: &AssetRiskLimitsV17,
     ) -> Result<(), ProgramError> {
         validate_asset_risk_limits(limits)?;
-        wrapper
+        let dst = wrapper
             .get_mut(ASSET_RISK_LIMITS_OFF..ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        // Phase 2b Q2: the senior floor code is not part of the risk dials; keep it.
+        let keep = [dst[42], dst[43]];
+        dst.copy_from_slice(bytemuck::bytes_of(limits));
+        dst[42] = keep[0];
+        dst[43] = keep[1];
+        Ok(())
+    }
+
+    /// Phase 2b Q2: the decoded senior floor of an asset (0 = none).
+    pub fn p2b_senior_floor_from_wrapper_bytes(wrapper: &[u8]) -> Result<u128, ProgramError> {
+        let off = crate::constants::P2B_SENIOR_FLOOR_OFF;
+        let b = wrapper
+            .get(off..off + crate::constants::P2B_SENIOR_FLOOR_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        Ok(crate::vault_lp_v18::senior_floor_decode(u16::from_le_bytes([b[0], b[1]])))
+    }
+
+    pub fn p2b_senior_floor_to_wrapper_bytes(wrapper: &mut [u8], floor: u128) -> Result<(), ProgramError> {
+        let off = crate::constants::P2B_SENIOR_FLOOR_OFF;
+        wrapper
+            .get_mut(off..off + crate::constants::P2B_SENIOR_FLOOR_LEN)
             .ok_or(PercolatorError::InvalidAccountLen)?
-            .copy_from_slice(bytemuck::bytes_of(limits));
+            .copy_from_slice(&crate::vault_lp_v18::senior_floor_encode(floor).to_le_bytes());
         Ok(())
     }
 
@@ -2832,9 +2876,12 @@ pub mod state {
         check_header(data, KIND_MARKET)?;
         validate_asset_risk_limits(limits)?;
         let range = asset_risk_limits_range(data, asset_index)?;
-        data.get_mut(range)
-            .ok_or(PercolatorError::InvalidAccountLen)?
-            .copy_from_slice(bytemuck::bytes_of(limits));
+        let dst = data.get_mut(range).ok_or(PercolatorError::InvalidAccountLen)?;
+        // Phase 2b Q2: preserve the senior floor code (tag 93 writes the whole record).
+        let keep = [dst[42], dst[43]];
+        dst.copy_from_slice(bytemuck::bytes_of(limits));
+        dst[42] = keep[0];
+        dst[43] = keep[1];
         Ok(())
     }
 
@@ -16200,6 +16247,11 @@ pub mod processor {
                 {
                     return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
                 }
+                // Phase 2b Q2: junior exhausted (V < C_eff) => the LP is trading senior capital;
+                // only reductions / closes (the same M-1 growth-aware measure as the draw halt).
+                if lp_after.unsigned_abs() > lp_before.unsigned_abs() {
+                    p2b_senior_capital_halt_check(&group, &b, idx)?;
+                }
             }
             // P3-H2: protocol exposure cap on the vault LP (default 1x its conservative equity,
             // i.e. the junior's capital), stricter than P1's generic LP cap.
@@ -29187,6 +29239,10 @@ pub mod processor {
         if booked || st.senior_draw_outstanding_atoms != rec.outstanding_mirror_atoms {
             state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, st)?;
         }
+        // Phase 2b Q2: a booking cuts C by less than nav, a recovery raises C: refresh the floor.
+        if booked {
+            p2b_refresh_senior_floor(market_ai, registry, registry_pda, st, own_ledger_ai, sib_ledger_ai)?;
+        }
         Ok(booked)
     }
 
@@ -31381,6 +31437,7 @@ pub mod processor {
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
         if let Some((ext_ai, mut x)) = ext {
             let after = vault_lp_v18::vault_lp_dealloc(x.allocated_atoms, amount);
             x.deallocated_total_atoms = x
@@ -31704,6 +31761,65 @@ pub mod processor {
         Ok(moved)
     }
 
+    /// Q2 trade-path check: refuse when the vault LP's conservative equity after the fill is below
+    /// the stored senior floor (`vault_lp_v18::senior_capital_halt`).
+    #[inline(never)]
+    fn p2b_senior_capital_halt_check(
+        group: &state::MarketViewMutV16<'_>,
+        lp: &percolator::PortfolioV16ViewMut<'_>,
+        asset_index: usize,
+    ) -> ProgramResult {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let floor = state::p2b_senior_floor_from_wrapper_bytes(&market.wrapper[..])?;
+        if floor == 0 {
+            return Ok(());
+        }
+        if vault_lp_v18::senior_capital_halt(p2b_c_m(lp)?, floor) {
+            return Err(PercolatorError::VaultLpSeniorCapitalHalt.into());
+        }
+        Ok(())
+    }
+
+    /// Q2: recompute and store the senior floor `T = C - nav` (saturating) for the vault's
+    /// asset. Called after every instruction that can raise T relative to the LP's capital
+    /// (103, 102, draw booking / recovery) and after 98 (keeps it tight).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn p2b_refresh_senior_floor<'a>(
+        market_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        st: &state::VaultLpStateV18,
+        own_ledger_ai: &AccountInfo<'a>,
+        sib_ledger_ai: &AccountInfo<'a>,
+    ) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let nav = {
+            let own = own_ledger_ai.try_borrow_data()?;
+            let sib = sib_ledger_ai.try_borrow_data()?;
+            lp_vault_combined_nav_parts_p3(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                registry.fee_share_bps,
+                &own,
+                &sib,
+            )?
+            .1
+        };
+        let floor = st.senior_claim_atoms.saturating_sub(nav);
+        let market = group
+            .markets
+            .get_mut(st.asset_index as usize)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        state::p2b_senior_floor_to_wrapper_bytes(&mut market.wrapper[..], floor)
+    }
+
     /// Phase 2b — VaultLpAllocate (tag 103). PERMISSIONLESS (keeper-cranked), Live only.
     ///
     /// Accounts: 0 cranker [signer, w] · 1 market [w] · 2 registry [w] · 3 vault_lp_state [w] ·
@@ -31828,6 +31944,7 @@ pub mod processor {
                 amount,
             )?
         };
+        p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
         x.allocated_atoms = x
             .allocated_atoms
             .checked_add(moved)
@@ -32465,6 +32582,9 @@ pub mod processor {
                 amount_u64,
                 signer_seeds,
             )?;
+        }
+        if !resolved {
+            p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
         }
         let _ = &mut st;
         Ok(())

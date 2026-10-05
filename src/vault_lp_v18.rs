@@ -862,9 +862,67 @@ pub fn skew_defaults_e9(max_abs_funding_e9: u64) -> (u64, u64) {
     (if half == 0 { 1 } else { half }, max_abs_funding_e9)
 }
 
+// ── Q2 senior-capital halt (2026-10-05 decision) ─────────────────────────────────────────
+//
+// Once the junior is exhausted (V < C_eff) the vault LP is trading allocated SENIOR capital:
+// its risk-INCREASING fills are halted (reductions / closes never are). With the 100% senior
+// fee share `C_eff - H == C`, so `V < C_eff  <=>  lp_value < C - nav =: T` (the "senior floor").
+// T is recomputed by every instruction that can LOWER it relative to the LP's capital (102,
+// 103, draw booking / recovery, 98) and stored as a 16-bit ceiling code (`senior_floor_encode`);
+// every other change (75 / 77 / 78 / harvestable growth) only lowers the true T, so a stale
+// code halts EARLIER, never later. The trade path compares the LP's conservative equity
+// (no credit for positive PnL, <= the certified value V uses) against it: again only earlier.
+
+/// 16-bit ceiling float: 6-bit exponent, 10-bit mantissa, `decode(encode(v)) >= v` and
+/// `<= v * (1 + 2^-9) + 1`. 0 encodes 0 (no floor). Saturates to `u16::MAX` (a huge floor:
+/// halt) only above `1023 * 2^63` atoms, unreachable for SPL amounts.
+pub fn senior_floor_encode(v: u128) -> u16 {
+    if v == 0 {
+        return 0;
+    }
+    let bits = 128 - v.leading_zeros();
+    if bits <= 10 {
+        return v as u16;
+    }
+    let mut e = bits - 10;
+    let mut m = (v >> e) + u128::from(v & ((1u128 << e) - 1) != 0);
+    if m == 1024 {
+        e += 1;
+        m = 512;
+    }
+    if e > 63 {
+        return u16::MAX;
+    }
+    ((e as u16) << 10) | (m as u16)
+}
+
+pub fn senior_floor_decode(code: u16) -> u128 {
+    let e = (code >> 10) as u32;
+    let m = (code & 1023) as u128;
+    m << e
+}
+
+/// The halt: a risk-increasing vault-LP fill is refused while its conservative equity after the
+/// fill is below the stored senior floor.
+pub fn senior_capital_halt(lp_conservative_equity: u128, floor: u128) -> bool {
+    lp_conservative_equity < floor
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn q2_senior_floor_code() {
+        for v in [0u128, 1, 1023, 1024, 1025, 2047, 2048, 999_999, 5_000_000_000, u64::MAX as u128] {
+            let d = senior_floor_decode(senior_floor_encode(v));
+            assert!(d >= v, "ceil {v} -> {d}");
+            assert!(d <= v + v / 512 + 1, "precision {v} -> {d}");
+        }
+        assert_eq!(senior_floor_decode(senior_floor_encode(1023)), 1023);
+        assert!(senior_capital_halt(99, 100) && !senior_capital_halt(100, 100));
+        assert!(!senior_capital_halt(0, 0));
+    }
 
     #[test]
     fn p2b_alloc_limit_and_split() {
