@@ -1044,7 +1044,12 @@ pub mod constants {
     /// `state.rs:237` at percolator-stake@d0c6ecb, which is `origin/main`).
     /// NOTE: `tests/v16_five_program_crosscut.rs:1662` still crafts the
     /// v2 384-byte shape; that harness is stale, not this constant.
-    pub const STAKE_POOL_LEN: usize = 408;
+    /// v5 (Phase 4 item 6, Wave D): 408 -> 480 (fields APPENDED at 408; every offset below is
+    /// unchanged — re-verified against percolator-stake `state.rs` const asserts on
+    /// `feat/v22-stake-v5`: is_initialized@0, slab@8, vault@136, percolator_program@224,
+    /// pool_mode@280, _reserved@320, risk_mode@408, size 480). Stake v5 and this wrapper
+    /// deploy together (stake v5 also reads this wrapper's `InsuranceUnitsV20`).
+    pub const STAKE_POOL_LEN: usize = 480;
     pub const STAKE_POOL_DISCRIMINATOR: [u8; 8] = *b"SPOOL_V1";
     /// `StakePool::CURRENT_VERSION` (`pub const CURRENT_VERSION: u8 = 4`,
     /// `state.rs:584` at percolator-stake@d0c6ecb = `origin/main`). Checked
@@ -1068,7 +1073,7 @@ pub mod constants {
     /// day: `STAKE_POOL_LEN` is checked with `<`, so a 392-byte v3 pool is now
     /// rejected on length before the version byte is ever read, and every live
     /// pool must be recreated. That is an accepted, deliberate break.
-    pub const STAKE_POOL_VERSION: u8 = 4;
+    pub const STAKE_POOL_VERSION: u8 = 5;
     /// Byte offsets into `StakePool` (percolator-stake `state.rs:19-114`).
     pub const STAKE_POOL_OFF_IS_INITIALIZED: usize = 0;
     /// The wrapper market this pool is bound to.
@@ -1082,6 +1087,11 @@ pub mod constants {
     pub const STAKE_POOL_OFF_MODE: usize = 280;
     pub const STAKE_POOL_MODE_INSURANCE_LP: u8 = 0;
     pub const STAKE_POOL_OFF_DISCRIMINATOR: usize = 320;
+    /// v5 `StakePool::risk_mode`: the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS
+    /// pools only (their stake is deployed into this market's insurance and absorbs its losses
+    /// through `InsuranceUnitsV20`); a FEE_ONLY pool carries no risk and is owed nothing.
+    pub const STAKE_POOL_OFF_RISK_MODE: usize = 408;
+    pub const STAKE_POOL_RISK_MODE_FIRST_LOSS: u8 = 1;
     pub const STAKE_POOL_OFF_VERSION: usize = 328;
 
     // ── Sweep NET-NEW: KIND-byte futures guard ──────────────────────────────
@@ -21110,6 +21120,13 @@ pub mod processor {
             // carries no such exposure would be an unearned transfer.
             if data[crate::constants::STAKE_POOL_OFF_MODE]
                 != crate::constants::STAKE_POOL_MODE_INSURANCE_LP
+            {
+                return Err(PercolatorError::StakePoolModeMismatch.into());
+            }
+            // (8b) v5: FIRST_LOSS only (Phase 4 item 6: "the 16% staker fee leg is paid only to
+            // first-loss pools").
+            if data[crate::constants::STAKE_POOL_OFF_RISK_MODE]
+                != crate::constants::STAKE_POOL_RISK_MODE_FIRST_LOSS
             {
                 return Err(PercolatorError::StakePoolModeMismatch.into());
             }

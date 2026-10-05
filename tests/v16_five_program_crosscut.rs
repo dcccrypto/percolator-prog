@@ -1909,9 +1909,9 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
 // genuine version skew the whole time. #441 is the same skew one version later.
 // ════════════════════════════════════════════════════════════════════════════
 
-const STAKE_POOL_SIZE: usize = 408;
+const STAKE_POOL_SIZE: usize = 480; // v5 (Phase 4 item 6)
 const STAKE_POOL_DISCRIMINATOR: &[u8; 8] = b"SPOOL_V1";
-const STAKE_POOL_VERSION: u8 = 4;
+const STAKE_POOL_VERSION: u8 = 5;
 
 /// Hand-craft a v16 StakePool in insurance-LP mode (pool_mode=0), bound to
 /// `market` + `percolator_program`, with `vault` funded for flush. Mirrors the
@@ -1942,6 +1942,7 @@ fn craft_stake_pool_bytes(
                                                               // d[280] pool_mode = 0 (insurance LP) — already zero.
     d[320..328].copy_from_slice(STAKE_POOL_DISCRIMINATOR);
     d[328] = STAKE_POOL_VERSION;
+    d[408] = 1; // v5 risk_mode = FIRST_LOSS
     d
 }
 

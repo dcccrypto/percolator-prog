@@ -1818,3 +1818,360 @@ fn rescue_bound_refused_when_not_impaired() {
     assert!(has(&res, RESCUE_REFUSED_C), "{res:?}");
     assert_eq!(w.tok(&w.env.vault), vault0);
 }
+
+// ═══════════════════════ Phase 4 Wave D: cross-program stake v5 <-> wrapper ══════════════════════
+//
+// The REAL percolator-stake v5 `.so` (../percolator-stake/target/deploy, built with
+// `--features devnet`, i.e. at VmpVUArR, the id this wrapper's devnet build pins) runs against the
+// wrapper in the same LiteSVM. Stake pools are crafted at the exact v5 byte layout (480 B; the
+// wrapper test crate does not link percolator-stake), then driven through real stake
+// instructions: bind (19), burn (21), deposit with consent (1), sync (31), withdraw (2),
+// propose/commit target (32/33), the removed flush (3).
+
+const STAKE_PID: Pubkey = solana_sdk::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w");
+const ST_CONSENT_REQUIRED: u32 = 33;
+const ST_DEPRECATED_V5: u32 = 34;
+const ST_LIQUIDITY_BUFFER: u32 = 36;
+const ST_SYNC_COOLDOWN: u32 = 37;
+const ST_NOT_PROTOCOL_AUTHORITY: u32 = 39;
+
+fn stake_so() -> Vec<u8> {
+    let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../percolator-stake/target/deploy/percolator_stake.so");
+    std::fs::read(&p).unwrap_or_else(|e| panic!("stake v5 .so required at {} ({e}); build percolator-stake feat/v22-stake-v5 with --features devnet", p.display()))
+}
+
+struct Pool {
+    pda: Pubkey,
+    vault_auth: Pubkey,
+    vault: Pubkey,
+    lp_mint: Pubkey,
+}
+
+fn sm_mint_data(authority: Pubkey) -> Vec<u8> {
+    use solana_sdk::program_pack::Pack;
+    let mut d = vec![0u8; spl_token::state::Mint::LEN];
+    spl_token::state::Mint::pack(
+        spl_token::state::Mint {
+            mint_authority: solana_sdk::program_option::COption::Some(authority),
+            supply: 0,
+            decimals: 6,
+            is_initialized: true,
+            freeze_authority: solana_sdk::program_option::COption::None,
+        },
+        &mut d,
+    )
+    .unwrap();
+    d
+}
+
+/// A v5 StakePool for `w`'s market, crafted at the exact layout (state.rs const asserts:
+/// slab@8, vault@136, percolator_program@224, pool_mode@280, _reserved@320, risk_mode@408, 480 B).
+fn craft_pool(w: &mut P3, risk_mode: u8, cooldown_slots: u64) -> Pool {
+    w.env.svm.add_program(STAKE_PID, &stake_so());
+    let market = w.env.market;
+    let (pda, pool_bump) = Pubkey::find_program_address(&[b"stake_pool", market.as_ref()], &STAKE_PID);
+    let (vault_auth, va_bump) = Pubkey::find_program_address(&[b"vault_auth", pda.as_ref()], &STAKE_PID);
+    let vault = w.env.token_account_for_mint(w.env.mint, vault_auth, 0);
+    let lp_mint = Pubkey::new_unique();
+    w.env.svm.set_account(lp_mint, Account { lamports: 1_000_000_000, data: sm_mint_data(vault_auth), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    let mut d = vec![0u8; 480];
+    d[0] = 1;
+    d[1] = pool_bump;
+    d[2] = va_bump;
+    d[8..40].copy_from_slice(market.as_ref());
+    d[40..72].copy_from_slice(w.env.admin.pubkey().as_ref());
+    d[72..104].copy_from_slice(w.env.mint.as_ref());
+    d[104..136].copy_from_slice(lp_mint.as_ref());
+    d[136..168].copy_from_slice(vault.as_ref());
+    d[184..192].copy_from_slice(&cooldown_slots.to_le_bytes());
+    d[224..256].copy_from_slice(w.env.program_id.as_ref());
+    d[320..328].copy_from_slice(b"SPOOL_V1");
+    d[328] = 5;
+    d[408] = risk_mode;
+    d[409] = if risk_mode == 1 { 1 } else { 0 };
+    let target: u16 = if risk_mode == 1 { 5_000 } else { 0 };
+    d[410..412].copy_from_slice(&target.to_le_bytes());
+    d[412..414].copy_from_slice(&3_000u16.to_le_bytes());
+    d[414..416].copy_from_slice(&500u16.to_le_bytes());
+    d[440..448].copy_from_slice(&150u64.to_le_bytes());
+    w.env.svm.set_account(pda, Account { lamports: 1_000_000_000, data: d, owner: STAKE_PID, executable: false, rent_epoch: 0 }).unwrap();
+    Pool { pda, vault_auth, vault, lp_mint }
+}
+
+fn pool_u64(w: &P3, p: &Pool, off: usize) -> u64 {
+    u64::from_le_bytes(w.env.svm.get_account(&p.pda).unwrap().data[off..off + 8].try_into().unwrap())
+}
+
+fn stake_send(w: &mut P3, data: Vec<u8>, metas: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
+    w.env.svm.expire_blockhash();
+    let ix = Instruction { program_id: STAKE_PID, accounts: metas, data };
+    send_raw_tx(&mut w.env.svm, &w.env.payer.insecure_clone(), ix, signers)
+}
+
+/// Bind (19) then burn the asset admin (21): the secure-bind sequence, after which no admin key
+/// can rotate the insurance authority off the pool.
+fn bind_and_burn(w: &mut P3, p: &Pool) {
+    let admin = w.env.admin.insecure_clone();
+    let (m, pid) = (w.env.market, w.env.program_id);
+    stake_send(w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 19 bind");
+    stake_send(w, vec![21], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("stake 21 burn");
+}
+
+struct Staker {
+    k: Keypair,
+    ata: Pubkey,
+    lp_ata: Pubkey,
+}
+
+fn staker(w: &mut P3, p: &Pool, amount: u64) -> Staker {
+    let k = Keypair::new();
+    w.env.ensure_signer_account(k.pubkey());
+    let ata = w.token(k.pubkey(), amount);
+    let lp_ata = w.env.token_account_for_mint(p.lp_mint, k.pubkey(), 0);
+    Staker { k, ata, lp_ata }
+}
+
+fn stake_deposit(w: &mut P3, p: &Pool, s: &Staker, amount: u64, consent: Option<u8>) -> Result<u64, String> {
+    let mut data = vec![1u8];
+    data.extend_from_slice(&amount.to_le_bytes());
+    if let Some(c) = consent {
+        data.push(c);
+    }
+    let dep = Pubkey::find_program_address(&[b"stake_deposit", p.pda.as_ref(), s.k.pubkey().as_ref()], &STAKE_PID).0;
+    let (m, pid) = (w.env.market, w.env.program_id);
+    let units = units_pda(w);
+    let metas = vec![
+        AccountMeta::new(s.k.pubkey(), true),
+        AccountMeta::new(p.pda, false),
+        AccountMeta::new(s.ata, false),
+        AccountMeta::new(p.vault, false),
+        AccountMeta::new(p.lp_mint, false),
+        AccountMeta::new(s.lp_ata, false),
+        AccountMeta::new_readonly(p.vault_auth, false),
+        AccountMeta::new(dep, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(m, false),
+        AccountMeta::new(units, false),
+        AccountMeta::new_readonly(pid, false),
+    ];
+    let k = s.k.insecure_clone();
+    stake_send(w, data, metas, &[&k])
+}
+
+fn stake_withdraw(w: &mut P3, p: &Pool, s: &Staker, lp: u64) -> Result<u64, String> {
+    let mut data = vec![2u8];
+    data.extend_from_slice(&lp.to_le_bytes());
+    let dep = Pubkey::find_program_address(&[b"stake_deposit", p.pda.as_ref(), s.k.pubkey().as_ref()], &STAKE_PID).0;
+    let (m, pid) = (w.env.market, w.env.program_id);
+    let units = units_pda(w);
+    let metas = vec![
+        AccountMeta::new(s.k.pubkey(), true),
+        AccountMeta::new(p.pda, false),
+        AccountMeta::new(s.lp_ata, false),
+        AccountMeta::new(p.lp_mint, false),
+        AccountMeta::new(p.vault, false),
+        AccountMeta::new(s.ata, false),
+        AccountMeta::new_readonly(p.vault_auth, false),
+        AccountMeta::new(dep, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false),
+        AccountMeta::new(m, false),
+        AccountMeta::new(units, false),
+        AccountMeta::new_readonly(pid, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+    let k = s.k.insecure_clone();
+    stake_send(w, data, metas, &[&k])
+}
+
+fn stake_sync(w: &mut P3, p: &Pool) -> Result<u64, String> {
+    let caller = Keypair::new();
+    w.env.ensure_signer_account(caller.pubkey());
+    let (m, pid, wv, wva) = (w.env.market, w.env.program_id, w.env.vault, w.env.vault_authority);
+    let units = units_pda(w);
+    let metas = vec![
+        AccountMeta::new(caller.pubkey(), true),
+        AccountMeta::new(p.pda, false),
+        AccountMeta::new(p.vault, false),
+        AccountMeta::new_readonly(p.vault_auth, false),
+        AccountMeta::new(m, false),
+        AccountMeta::new(wv, false),
+        AccountMeta::new_readonly(wva, false),
+        AccountMeta::new(units, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(pid, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+    stake_send(w, vec![31], metas, &[&caller])
+}
+
+/// Stake-side valuation from chain state: (liquid, deployed at EXIT, LP supply).
+fn pool_view(w: &P3, p: &Pool) -> (u64, u64, u64) {
+    let deposited = pool_u64(w, p, 168);
+    let supply = pool_u64(w, p, 176);
+    let flushed = pool_u64(w, p, 200);
+    let returned = pool_u64(w, p, 208);
+    let withdrawn = pool_u64(w, p, 216);
+    let fees = pool_u64(w, p, 256);
+    let liquid = deposited + returned + fees - withdrawn - flushed;
+    let u = units(w).unwrap();
+    let deployed = if u.units_total == 0 { 0 } else { (u.units_stake * u.snap_insurance_free_atoms / u.units_total) as u64 };
+    (liquid, deployed, supply)
+}
+
+fn st_code(r: &Result<u64, String>, c: u32) -> bool {
+    r.as_ref().err().map_or(false, |e| code(e) == Some(c))
+}
+
+/// XP-1 (I-S1, I-S2, I-S4): consent is enforced on chain, the creator-admin flush is gone, and
+/// the permissionless sync deploys toward the target through the units ledger (stake class),
+/// never below the liquid buffer; it is rate-limited; a later depositor buys at the entry
+/// reading and a leaver redeems at the exit reading from liquidity; the admin can LOWER the
+/// target (timelocked) and the next sync RECOVERS the excess through tag 57 (units burned), but
+/// cannot RAISE it.
+#[test]
+fn xprog_consent_sync_recover_and_no_admin_flush() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 4_000_000);
+    // I-S2: no consent / stale consent refused; the current version accepted.
+    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, None), ST_CONSENT_REQUIRED), "deposit without consent");
+    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, Some(2)), ST_CONSENT_REQUIRED), "wrong consent version");
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)).expect("deposit with consent");
+    let lp_a = w.tok(&a.lp_ata);
+    assert!(lp_a > 0);
+    // I-S1: the creator-admin flush is removed.
+    let admin = w.env.admin.insecure_clone();
+    let (m, pid, wv) = (w.env.market, w.env.program_id, w.env.vault);
+    let mut fd = vec![3u8];
+    fd.extend_from_slice(&1_000u64.to_le_bytes());
+    let flush = stake_send(&mut w, fd, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(pid, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&admin]);
+    assert!(st_code(&flush, ST_DEPRECATED_V5), "admin flush must be gone: {flush:?}");
+    // Sync: target 50% of 4M = 2M, buffer ceil(30%) = 1.2M -> top up 2M, minted as STAKE units.
+    let u0 = units(&w).unwrap();
+    let ins0 = w.env.market_state().1.insurance;
+    stake_sync(&mut w, &p).expect("sync top-up");
+    let u1 = units(&w).unwrap();
+    let ins1 = w.env.market_state().1.insurance;
+    assert_eq!(ins1 - ins0, 2_000_000, "deployed exactly to the target");
+    assert_eq!(u1.units_stake, 2_000_000 * u0.units_total / u0.snap_insurance_mint_atoms, "stake-class units at the entry price");
+    assert_eq!(u1.units_creator, u0.units_creator, "creator units untouched");
+    assert_eq!(pool_u64(&w, &p, 200), 2_000_000, "total_flushed records the deployment");
+    let (liquid, deployed, _) = pool_view(&w, &p);
+    assert!(liquid as u128 * 10_000 >= 3_000 * (liquid + deployed) as u128, "liquid buffer kept: {liquid} vs {deployed}");
+    // Rate limit.
+    assert!(st_code(&stake_sync(&mut w, &p), ST_SYNC_COOLDOWN), "second sync in the cooldown");
+    // A later depositor buys at liquid + deployed(entry) and a leaver is paid from liquidity.
+    let b = staker(&mut w, &p, 2_000_000);
+    stake_deposit(&mut w, &p, &b, 2_000_000, Some(1)).expect("B deposit");
+    let lp_b = w.tok(&b.lp_ata);
+    // Pool value at the entry reading is still exactly 4M over 4M shares (A's genesis carve-out
+    // is dead supply): B pays 1 atom per share, never less.
+    assert!(lp_b <= 2_000_000 && lp_b + 2 >= 2_000_000, "B priced at the entry reading: {lp_b}");
+    let _ = lp_a;
+    let s = w.slot() + 3;
+    w.env.svm.warp_to_slot(s);
+    let before = w.tok(&b.ata);
+    stake_withdraw(&mut w, &p, &b, lp_b).expect("B withdraw");
+    let got = w.tok(&b.ata) - before;
+    assert!(got <= 2_000_000 && got + 2 >= 2_000_000, "B redeems its deposit (no gain, rounding only): {got}");
+    // Admin may LOWER the target (timelocked by the cooldown); may NOT raise it.
+    let raise = stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&6_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]);
+    assert!(st_code(&raise, ST_NOT_PROTOCOL_AUTHORITY), "admin raise refused: {raise:?}");
+    stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&2_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]).expect("admin lowers");
+    let s = w.slot() + 200;
+    w.env.svm.warp_to_slot(s);
+    let payer = w.env.payer.pubkey();
+    stake_send(&mut w, vec![33], vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], &[]).expect("commit");
+    let u2 = units(&w).unwrap();
+    let vault0 = w.tok(&p.vault);
+    let r = stake_sync(&mut w, &p);
+    eprintln!("XP-1 recover sync -> {:?}", r.as_ref().map_err(|e| code(e)));
+    r.expect("sync recovery");
+    let u3 = units(&w).unwrap();
+    let recovered = w.tok(&p.vault) - vault0;
+    assert!(recovered > 0, "vacuity: something recovered");
+    assert!(u3.units_stake < u2.units_stake && u3.units_creator == u2.units_creator, "only stake units burned");
+    assert_eq!(pool_u64(&w, &p, 208) as u128, recovered as u128, "total_returned records it");
+}
+
+/// XP-2 (I-S3, the point of item 6): a REAL insurance loss (the G9 backstop lends asset-0
+/// insurance to the exhausted vault LP) lands on every unit pro rata: the two stakers lose the
+/// same fraction of their stake, and the stake class and the creator class lose the same
+/// fraction of their insurance value. A staker can still exit from liquidity.
+#[test]
+fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
+    let (mut w, _s, _t) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    top_up_9(&mut w, 2_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 6_000_000);
+    let b = staker(&mut w, &p, 3_000_000);
+    stake_deposit(&mut w, &p, &a, 6_000_000, Some(1)).expect("A");
+    stake_deposit(&mut w, &p, &b, 3_000_000, Some(1)).expect("B");
+    let r = stake_sync(&mut w, &p);
+    eprintln!("XP-2 sync -> {:?}", r.as_ref().map_err(|e| code(e)));
+    r.expect("deploy");
+    init_units(&mut w).expect("refresh");
+    let (l0, d0, sup0) = pool_view(&w, &p);
+    let u0 = units(&w).unwrap();
+    let (lp_a, lp_b) = (w.tok(&a.lp_ata) as u128, w.tok(&b.lp_ata) as u128);
+    let val = |l: u64, d: u64, sup: u64, lp: u128| lp * (l + d) as u128 / sup as u128;
+    let (va0, vb0) = (val(l0, d0, sup0, lp_a), val(l0, d0, sup0, lp_b));
+    let creator0 = u0.units_creator * u0.snap_insurance_free_atoms / u0.units_total;
+    // The loss: G9 lends insurance to the exhausted vault LP.
+    backstop_111(&mut w, 0, 0, true).expect("G9");
+    let b_moved = backstop_st(&w) as u128;
+    assert!(b_moved > 0);
+    init_units(&mut w).expect("refresh");
+    let (l1, d1, sup1) = pool_view(&w, &p);
+    let u1 = units(&w).unwrap();
+    let (va1, vb1) = (val(l1, d1, sup1, lp_a), val(l1, d1, sup1, lp_b));
+    let creator1 = u1.units_creator * u1.snap_insurance_free_atoms / u1.units_total;
+    eprintln!("XP-2: moved {b_moved} | A {va0}->{va1} B {vb0}->{vb1} | creator {creator0}->{creator1} | deployed {d0}->{d1}");
+    assert!(va1 < va0 && vb1 < vb0 && creator1 < creator0, "everyone with units absorbs it");
+    // Same fraction for the two stakers (cross-multiplied, rounding tolerance).
+    assert!((va1 * vb0).abs_diff(vb1 * va0) <= va0 + vb0, "stakers pro rata: A {va1}/{va0} B {vb1}/{vb0}");
+    // Same fraction for the stake class (its deployed value) and the creator class.
+    assert!((d1 as u128 * creator0).abs_diff(creator1 * d0 as u128) <= creator0 + d0 as u128, "classes pro rata");
+    // The total loss across both classes is the moved amount (at the free reading).
+    let loss = (d0 as u128 - d1 as u128) + (creator0 - creator1);
+    assert!(loss.abs_diff(b_moved) <= 2, "loss {loss} vs moved {b_moved}");
+    // A withdrawal is paid from liquidity at the post-loss exit value.
+    let s = w.slot() + 3;
+    w.env.svm.warp_to_slot(s);
+    let before = w.tok(&b.ata);
+    let lp_b64 = lp_b as u64;
+    stake_withdraw(&mut w, &p, &b, lp_b64).expect("B exits from liquidity");
+    let got = (w.tok(&b.ata) - before) as u128;
+    assert!(got <= vb1 + 1 && got + 2 >= vb1, "B paid its post-loss value {vb1}, got {got}");
+    // A cannot pull more than the liquid value (the deployed part waits for a healthy sync).
+    let lp_a64 = lp_a as u64;
+    let too_much = stake_withdraw(&mut w, &p, &a, lp_a64);
+    let (l2, _, _) = pool_view(&w, &p);
+    if va1 > l2 as u128 {
+        assert!(st_code(&too_much, ST_LIQUIDITY_BUFFER), "beyond liquidity: {too_much:?}");
+    }
+}
+
+/// XP-3: the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS pools only; a FEE_ONLY pool
+/// (no deployment, no risk) is refused.
+#[test]
+fn xprog_fee_leg_refuses_fee_only_pool() {
+    let mut w = P3::new();
+    let p = craft_pool(&mut w, 2, 1);
+    let admin = w.env.admin.insecure_clone();
+    let (m, pid) = (w.env.market, w.env.program_id);
+    stake_send(&mut w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("bind");
+    let payer = w.env.payer.pubkey();
+    let (wv, wva) = (w.env.vault, w.env.vault_authority);
+    let r = w.send_raw(vec![87], vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(wva, false), AccountMeta::new_readonly(spl_token::ID, false)], &[]);
+    let want = percolator_prog::error::PercolatorError::StakePoolModeMismatch as u32;
+    assert!(r.as_ref().err().map_or(false, |e| code(e) == Some(want)), "fee-only pool must be refused the fee leg: {r:?}");
+}

@@ -529,7 +529,7 @@ fn craft_stake_pool_v4(
     percolator_program: &Pubkey,
     vault_authority_bump: u8,
 ) -> Vec<u8> {
-    let mut d = vec![0u8; 408];
+    let mut d = vec![0u8; 480]; // v5 (Phase 4 item 6): 408 -> 480
     d[0] = 1; // is_initialized
     d[1] = 255; // pool bump (informational)
     d[2] = vault_authority_bump;
@@ -543,7 +543,8 @@ fn craft_stake_pool_v4(
     d[224..256].copy_from_slice(percolator_program.as_ref()); // CPI target
                                                               // d[280] pool_mode = 0 (insurance LP) — already zero.
     d[320..328].copy_from_slice(b"SPOOL_V1"); // discriminator
-    d[328] = 4; // CURRENT_VERSION
+    d[328] = 5; // CURRENT_VERSION (v5)
+    d[408] = 1; // v5 risk_mode = FIRST_LOSS (tag 87 pays first-loss pools only)
     d
 }
 
