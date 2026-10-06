@@ -3454,39 +3454,45 @@ impl Replay {
     }
 }
 
+/// A5 exploration (corrected 2026-10-06, ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): a
+/// bust whose residual (~8.5 USDC) exceeds `public_b_chunk_atoms` (1 USDC). Prints the market MODE
+/// and the loss counters per crank and stops once the market is Resolved. Measured: crank 0 leaves
+/// the market Live with `negative_pnl_account_count = 1`; crank 1 declares permissionless Recovery
+/// (`ActiveBankruptCloseCannotProgress`); crank 2 finalises Recovery -> Resolved. Later Live-style
+/// cranks fail Custom(14) only because the market is TERMINAL; it is not a wedge (the first
+/// version of this test swallowed the crank errors and never printed the mode). Terminal close is
+/// `CloseResolved`, pinned by `wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes`.
 #[test]
-#[ignore = "exploration: prints the counters through a real chunked bankruptcy"]
 fn a5_explore_real_chunked_bankruptcy() {
     let mut r = Replay::new(chunked_b_market());
     let h = Keypair::new();
     let (_h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
     let q: i128 = 10 * percolator::POS_SCALE as i128;
-    let mut shorts = vec![];
     for _ in 0..3 {
         let (k, p) = r.new_trader(100_000_000);
         r.trade(&k, p, -q).expect("short");
-        shorts.push(p);
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
     let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
     let (bk, bp) = r.new_trader(20_000_000);
     r.trade(&bk, bp, qb).expect("levered long");
-    eprintln!("A5X open: {}", r.loss_snapshot());
+    let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
+    eprintln!("A5X open [{}]: {}", mode(&r), r.loss_snapshot());
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    eprintln!("A5X after walk: {}", r.loss_snapshot());
-    for i in 0..12 {
-        r.crank_pf(bp);
-        eprintln!("A5X bust crank {i}: {}", r.loss_snapshot());
-    }
+    eprintln!("A5X after walk [{}]: {}", mode(&r), r.loss_snapshot());
+    let mut modes = vec![];
     for i in 0..6 {
-        r.crank_pf(lp);
-        eprintln!("A5X lp crank {i}: {}", r.loss_snapshot());
-        for p in shorts.iter() {
-            r.crank_pf(*p);
+        r.crank_pf(bp);
+        let m = mode(&r);
+        eprintln!("A5X bust crank {i} [{m}]: {}", r.loss_snapshot());
+        modes.push(m.clone());
+        if m == "Resolved" {
+            break;
         }
-        eprintln!("A5X shorts crank {i}: {}", r.loss_snapshot());
     }
+    assert_eq!(modes, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery -> Resolved within 3 cranks: {modes:?}");
+    let _ = bk;
 }
 
 
@@ -3745,12 +3751,15 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 /// K/F-stale; the redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused
 /// with 118 and nothing moves.
 ///
-/// Why not `b_stale_account_count`: measured (`a5_explore_real_chunked_bankruptcy`, ignored), a
-/// residual > `public_b_chunk_atoms` never starts the multi-step close in this harness (every
-/// later crank fails EngineInvalidConfig = 14: an engine-side wedge, recorded in findings.md),
-/// and a residual <= the chunk is socialized through K at once, so every account settles its B
-/// share in one touch: per-account B-staleness is not reachable here. The pending state that IS
-/// reachable is the unabsorbed negative PnL, which the gate now includes.
+/// The exit is attempted after the bust's FIRST crank, while the market is still Live with the
+/// unabsorbed deficit pending (`a5_explore_real_chunked_bankruptcy` prints the sequence: the next
+/// crank declares Recovery, the one after resolves the market; corrected 2026-10-06, see
+/// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md -- there is NO wedge, the later Custom(14) is
+/// a terminal market). Why not `b_stale_account_count`: in LIVE mode it is not reachable in this
+/// harness -- a residual > `public_b_chunk_atoms` takes the market to Recovery -> Resolved (where
+/// B settlement is chunk-stepped by CloseResolved, outside the Live exit path), and a residual <=
+/// the chunk is socialised at once, so every account settles its B share in one touch. The
+/// pending Live state that IS reachable is the unabsorbed negative PnL, which the gate includes.
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     let mut lm = r2_market();
@@ -3774,6 +3783,7 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     eprintln!("A5 real: {}", r.loss_snapshot());
     let (_, g) = r.env.market_state();
     assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
+    assert_eq!(format!("{:?}", g.mode), "Live", "the exit is attempted while the market is still Live");
     assert!(!r.no_genuine_loss_now());
     let before = r.exit_state(&h.pubkey());
     let res = r.execute_77(&h, None, true);
