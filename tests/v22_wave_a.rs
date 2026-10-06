@@ -664,7 +664,7 @@ fn combined_tags_decode_to_distinct_variants() {
         ("SettleHoldingRent", 106u8), ("InitBondTranche", 107), ("BondDeposit", 108),
         ("BondRequestWithdraw", 109), ("BondExecuteWithdraw", 110), ("InsuranceBackstopDraw", 111),
         ("RescueDeposit", 112), ("InitInsuranceUnits", 116), ("SetG9FeedAllowlist", 117),
-        ("SweepBandDustLeg", 118),
+        ("SweepBandDustLeg", 118), ("EvictAndTradeCpi", 119),
     ] {
         assert_eq!(names.get(n), Some(&t), "{n} must be tag {t}");
     }

@@ -532,6 +532,12 @@ pub mod constants {
     /// v2.2 band (security re-review N-1): permissionless sweep of a DUST band leg (below half
     /// the market's minimum leg notional), freeing its per-side position slot.
     pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 118;
+    /// v2.2 band (round-2 re-review N-1b): replace-smallest eviction, atomic with the evicting
+    /// taker's own TradeCpi. Wire: `[119]` + the TradeCpi body; accounts: `[0] victim portfolio
+    /// (w)`, then exactly the TradeCpi accounts.
+    pub const TAG_EVICT_AND_TRADE_CPI: u8 = 119;
+    /// N-1b: the newcomer's fill must be at least this multiple of the evicted leg's notional.
+    pub const BAND_EVICT_NOTIONAL_MULTIPLE: u128 = 2;
     /// v2.2 band markets: default share of the liquidation penalty paid to a third-party
     /// cranker (design §1.2: liquidation must be paid to happen, a pending leg holds the epoch).
     pub const BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS: u16 = 2_000;
@@ -626,7 +632,7 @@ pub mod constants {
         TAG_LP_VAULT_CRANK_FEES, TAG_SET_LP_VAULT_PAUSED, TAG_CLOSE_LP_VAULT,
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
-        200, 201, 202, 203, 204, 205, 206, 207,
+        TAG_EVICT_AND_TRADE_CPI, 201, 202, 203, 204, 205, 206, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -8630,6 +8636,12 @@ pub mod ix {
         /// `P_last` (`rebalance_reduce_position_not_atomic`), so dust cannot hold one of the
         /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
         SweepBandDustLeg { asset_index: u16 },
+        /// v2.2 tag 119: on a band market whose target side is FULL, close `accounts[0]`'s
+        /// (smaller) leg bilaterally against the bound vault LP at `P_last` (fee 0) and then
+        /// run `trade` (a `TradeCpi`) for the taker on `accounts[1..]`. Refused unless the
+        /// taker ends with a leg of at least `BAND_EVICT_NOTIONAL_MULTIPLE` x the evicted
+        /// notional on that side.
+        EvictAndTradeCpi { trade: alloc::boxed::Box<Instruction> },
         /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
         /// starting leverage cap, written at bind on an asset whose growth block is on.
         InitVaultLpV19 {
@@ -9534,6 +9546,19 @@ pub mod ix {
                 crate::constants::TAG_SWEEP_BAND_DUST_LEG => Self::SweepBandDustLeg {
                     asset_index: read_u16(&mut rest)?,
                 },
+                crate::constants::TAG_EVICT_AND_TRADE_CPI => {
+                    // The body is exactly a TradeCpi body: decode it as one.
+                    let mut inner = alloc::vec::Vec::with_capacity(rest.len() + 1);
+                    inner.push(10u8);
+                    inner.extend_from_slice(rest);
+                    let trade = Self::decode(&inner)?;
+                    if !matches!(trade, Self::TradeCpi { .. }) {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    return Ok(Self::EvictAndTradeCpi {
+                        trade: alloc::boxed::Box::new(trade),
+                    });
+                }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -10440,6 +10465,10 @@ pub mod ix {
                 Self::SweepBandDustLeg { asset_index } => {
                     out.push(crate::constants::TAG_SWEEP_BAND_DUST_LEG);
                     push_u16(&mut out, asset_index);
+                }
+                Self::EvictAndTradeCpi { ref trade } => {
+                    out = trade.encode();
+                    out[0] = crate::constants::TAG_EVICT_AND_TRADE_CPI;
                 }
                 Self::SettleHoldingRent {
                     asset_index,
@@ -12500,7 +12529,7 @@ pub mod lag_policy {
             Instruction::ResolveMarket { .. } => entry("ResolveMarket", LagPolicy::MarkDriven, "settles at P_last by design (D-1 residual: terminal settlement at the last in-band price)"),
             Instruction::TopUpBackingBucket { .. } => entry("TopUpBackingBucket", LagPolicy::MarkFree, "adds backing; no payout"),
             Instruction::WithdrawBackingBucket { .. } => entry("WithdrawBackingBucket", LagPolicy::Gated, "custody domain-withdraw gate (live_domain_withdraw_health_or_shutdown_view)"),
-            Instruction::ConvertReleasedPnl { .. } => entry("ConvertReleasedPnl", LagPolicy::Gated, "tag 28: released PnL is valued at P_last, so it is refused while any leg asset lags"),
+            Instruction::ConvertReleasedPnl { .. } => entry("ConvertReleasedPnl", LagPolicy::Gated, "tag 28: released PnL is valued at P_last, so on a band market it is refused while any leg asset lags (off-band: the v2.1 engine rule alone)"),
             Instruction::CloseResolved { .. } => entry("CloseResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
             Instruction::UpdateAuthority { .. } => entry("UpdateAuthority", LagPolicy::MarkFree, "authority rotation"),
             Instruction::UpdateAssetAuthority { .. } => entry("UpdateAssetAuthority", LagPolicy::MarkFree, "authority rotation"),
@@ -12524,7 +12553,7 @@ pub mod lag_policy {
             Instruction::ForceCloseAbandonedAsset { .. } => entry("ForceCloseAbandonedAsset", LagPolicy::MarkDriven, "abandoned-asset close at P_last by design"),
             Instruction::RestartAssetOracle { .. } => entry("RestartAssetOracle", LagPolicy::MarkDriven, "re-arms the oracle (the band re-initialises at the restart price)"),
             Instruction::UpdateAssetLifecycle { .. } => entry("UpdateAssetLifecycle", LagPolicy::MarkFree, "lifecycle dial"),
-            Instruction::WithdrawInsurance { .. } => entry("WithdrawInsurance", LagPolicy::Gated, "insurance is the loss absorber: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawInsurance { .. } => entry("WithdrawInsurance", LagPolicy::Gated, "insurance is the loss absorber: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
             Instruction::WithdrawInsuranceAsset { .. } => entry("WithdrawInsuranceAsset", LagPolicy::Gated, "custody domain-withdraw gate"),
             Instruction::CureAndCancelClose { .. } => entry("CureAndCancelClose", LagPolicy::MarkDriven, "close-ledger cure at P_last (engine liquidation machinery)"),
             Instruction::ForfeitRecoveryLeg { .. } => entry("ForfeitRecoveryLeg", LagPolicy::MarkDriven, "recovery-mode forfeit (engine)"),
@@ -12537,7 +12566,7 @@ pub mod lag_policy {
             Instruction::SwapSecondaryForPrimary { .. } => entry("SwapSecondaryForPrimary", LagPolicy::MarkFree, "1:1 collateral swap"),
             Instruction::CreateLpVault { .. } => entry("CreateLpVault", LagPolicy::MarkFree, "creates a vault"),
             Instruction::DepositToLpVault { .. } => entry("DepositToLpVault", LagPolicy::Gated, "Earn entry priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
-            Instruction::RebalanceLpVaultBacking { .. } => entry("RebalanceLpVaultBacking", LagPolicy::Gated, "moves backing by pooled NAV: refused while any asset lags (re-review N-3)"),
+            Instruction::RebalanceLpVaultBacking { .. } => entry("RebalanceLpVaultBacking", LagPolicy::Gated, "moves backing by pooled NAV: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
             Instruction::RequestRedeemLpShares { .. } => entry("RequestRedeemLpShares", LagPolicy::MarkFree, "a request; the price is set at ExecuteRedemption"),
             Instruction::ExecuteRedemption { .. } => entry("ExecuteRedemption", LagPolicy::Gated, "Earn exit priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
             Instruction::LpVaultCrankFees { .. } => entry("LpVaultCrankFees", LagPolicy::MarkFree, "distributes realised fee atoms"),
@@ -12553,37 +12582,38 @@ pub mod lag_policy {
             Instruction::SetAssetRiskLimits { .. } => entry("SetAssetRiskLimits", LagPolicy::MarkFree, "risk dial"),
             Instruction::SetAssetRiskLimitsV19 { .. } => entry("SetAssetRiskLimitsV19", LagPolicy::MarkFree, "risk dial"),
             Instruction::UpdateFeeSplit { .. } => entry("UpdateFeeSplit", LagPolicy::MarkFree, "fee split dial"),
-            Instruction::WithdrawInsuranceReserveToStake => entry("WithdrawInsuranceReserveToStake", LagPolicy::Gated, "moves insurance-reserve atoms out: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawInsuranceReserveToStake => entry("WithdrawInsuranceReserveToStake", LagPolicy::Gated, "moves insurance-reserve atoms out: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
             Instruction::UpdateMaintenanceFeePerSlot { .. } => entry("UpdateMaintenanceFeePerSlot", LagPolicy::MarkFree, "fee dial"),
             Instruction::ExpireBackingBucket { .. } => entry("ExpireBackingBucket", LagPolicy::MarkFree, "expires a lapsed bucket"),
             Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
             Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::VaultLpSetMatcher { .. } => entry("VaultLpSetMatcher", LagPolicy::MarkFree, "matcher config"),
-            Instruction::DepositJuniorTranche { .. } => entry("DepositJuniorTranche", LagPolicy::Gated, "junior entry priced from pooled NAV: refused while any asset lags (re-review N-3)"),
-            Instruction::WithdrawJuniorTranche { .. } => entry("WithdrawJuniorTranche", LagPolicy::Gated, "junior exit (flat book) and refused while any asset lags (re-review N-3)"),
-            Instruction::VaultLpRecall { .. } => entry("VaultLpRecall", LagPolicy::Gated, "recall sized from the vault LP equity: refused while any asset lags (re-review N-3)"),
+            Instruction::DepositJuniorTranche { .. } => entry("DepositJuniorTranche", LagPolicy::Gated, "junior entry priced from pooled NAV: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
+            Instruction::WithdrawJuniorTranche { .. } => entry("WithdrawJuniorTranche", LagPolicy::Gated, "junior exit (flat book) and refused while any asset lags (band markets only; re-review N-3 / N-7)"),
+            Instruction::VaultLpRecall { .. } => entry("VaultLpRecall", LagPolicy::Gated, "recall sized from the vault LP equity: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
             Instruction::SetVaultLpRisk { .. } => entry("SetVaultLpRisk", LagPolicy::MarkFree, "tag 99, a risk dial: writes alpha / buffer; no value moves until tag 103"),
             Instruction::SetVaultLpRiskV19 { .. } => entry("SetVaultLpRiskV19", LagPolicy::MarkFree, "tag 99 V19 form, a risk dial"),
-            Instruction::VaultLpConvertPnl { .. } => entry("VaultLpConvertPnl", LagPolicy::Gated, "tag 100 (the review called it 99): vault-LP PnL valued at P_last, refused while lagged"),
+            Instruction::VaultLpConvertPnl { .. } => entry("VaultLpConvertPnl", LagPolicy::Gated, "tag 100 (the review called it 99): vault-LP PnL valued at P_last, refused while lagged (band markets only)"),
             Instruction::VaultLpSettleResolved { .. } => entry("VaultLpSettleResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
-            Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (re-review N-3)"),
+            Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (band markets only; re-review N-3 / N-7)"),
             Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
             Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
-            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 118: a forced close at P_last, refused while the asset lags"),
+            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 118: a forced bilateral close at P_last, refused while the asset lags (band markets only)"),
+            Instruction::EvictAndTradeCpi { .. } => entry("EvictAndTradeCpi", LagPolicy::Gated, "tag 119: a forced bilateral close at P_last plus a TradeCpi, refused while the asset lags (band markets only)"),
             Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
-            Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags"),
+            Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags (band markets only)"),
             // Wave A (tags 76 / 77 v2.2 wire forms): same classification as the legacy forms.
             Instruction::RequestRedeemLpSharesV22 { .. } => entry("RequestRedeemLpSharesV22", LagPolicy::MarkFree, "a request; the price is set at ExecuteRedemption"),
             Instruction::ExecuteRedemptionV22 { .. } => entry("ExecuteRedemptionV22", LagPolicy::Gated, "Earn exit priced at the worse lag bound (vault_lp_equity_lag_bounds_ro); the keeper path stays loss-current strict"),
             // Wave C (capacity bonds, tags 107-110).
             Instruction::InitBondTranche { .. } => entry("InitBondTranche", LagPolicy::MarkFree, "creates the tranche record; no value moves"),
-            Instruction::BondDeposit { .. } => entry("BondDeposit", LagPolicy::Gated, "tag 108: share price reads the vault LP equity at P_last, refused while any asset lags (combined release)"),
+            Instruction::BondDeposit { .. } => entry("BondDeposit", LagPolicy::Gated, "tag 108: share price reads the vault LP equity at P_last, refused while a band market's asset lags (band markets only; combined release)"),
             Instruction::BondRequestWithdraw { .. } => entry("BondRequestWithdraw", LagPolicy::MarkFree, "a request; the price is set at BondExecuteWithdraw"),
-            Instruction::BondExecuteWithdraw { .. } => entry("BondExecuteWithdraw", LagPolicy::Gated, "tag 110: Live exit priced from the vault LP equity, refused while any asset lags; Resolved has no live mark (combined release)"),
+            Instruction::BondExecuteWithdraw { .. } => entry("BondExecuteWithdraw", LagPolicy::Gated, "tag 110: Live exit priced from the vault LP equity, refused while a band market's asset lags; Resolved has no live mark (combined release)"),
             // Wave D (items 5 + 6, tags 111 / 112 / 116 / 117).
-            Instruction::InsuranceBackstopDraw { .. } => entry("InsuranceBackstopDraw", LagPolicy::Gated, "tag 111: G9 PROPOSE / DRAW / RESTORE size from vault LP equity and insurance, refused while any asset lags (combined release)"),
-            Instruction::RescueDeposit { .. } => entry("RescueDeposit", LagPolicy::Gated, "tag 112: priced from the certified vault value, refused while any asset lags (combined release)"),
+            Instruction::InsuranceBackstopDraw { .. } => entry("InsuranceBackstopDraw", LagPolicy::Gated, "tag 111: G9 PROPOSE / DRAW / RESTORE size from vault LP equity and insurance, refused while a band market's asset lags (band markets only; combined release)"),
+            Instruction::RescueDeposit { .. } => entry("RescueDeposit", LagPolicy::Gated, "tag 112: priced from the certified vault value, refused while a band market's asset lags (band markets only; combined release)"),
             Instruction::InitInsuranceUnits => entry("InitInsuranceUnits", LagPolicy::MarkFree, "creates the unit ledger at genesis 1:1 insurance; no mark-valued payout"),
             Instruction::SetG9FeedAllowlist { .. } => entry("SetG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config"),
         }
@@ -12951,6 +12981,13 @@ pub mod processor {
     pub(crate) fn reject_market_price_lagged_view(
         group: &state::MarketViewMutV16<'_>,
     ) -> ProgramResult {
+        // Round-2 re-review N-7: BAND markets only. The D-1 carve-out (the clock advancing on a
+        // lagged mark) only exists there; an off-band market keeps v2.1's behaviour exactly
+        // (on a 1 bp/slot-cap market ordinary staircase lag is the normal state, and gating on
+        // it refused these keeper paths most of the time).
+        if group.header.config.band_bps.get() == 0 {
+            return Ok(());
+        }
         let configured = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
         let mut i = 0usize;
         while i < configured {
@@ -12987,6 +13024,10 @@ pub mod processor {
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
     ) -> Result<bool, ProgramError> {
+        // Round-2 re-review N-7: band markets only (off-band = v2.1 behaviour, unchanged).
+        if group.header.config.band_bps.get() == 0 {
+            return Ok(false);
+        }
         let mut slot = 0usize;
         while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = portfolio.header.legs[slot]
@@ -14314,6 +14355,9 @@ pub mod processor {
             } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
             Instruction::SweepBandDustLeg { asset_index } => {
                 handle_sweep_band_dust_leg(program_id, accounts, asset_index)
+            }
+            Instruction::EvictAndTradeCpi { trade } => {
+                handle_evict_and_trade_cpi(program_id, accounts, &trade)
             }
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -15991,12 +16035,14 @@ pub mod processor {
             // the side that CHOSE the fill: the taker on the matcher route, both signers on
             // NoCpi. The passive LP of a CPI fill is the party the rule protects (a user closing
             // at a stale price is favourable to the LP), so it is never refused for it.
-            reject_band_favourable_close_view(
-                &group,
-                asset_index as usize,
-                account_a_position,
-                size_q,
-            )?;
+            if !roles.forced_close {
+                reject_band_favourable_close_view(
+                    &group,
+                    asset_index as usize,
+                    account_a_position,
+                    size_q,
+                )?;
+            }
             if !roles.cpi {
                 reject_band_favourable_close_view(
                     &group,
@@ -16019,15 +16065,31 @@ pub mod processor {
                 .asset
                 .effective_price
                 .get();
-            let base_fee_bps = hybrid_trade_fee_bps_view(
-                &cfg,
-                &oracle_profile,
-                &group,
-                asset_index as usize,
-                size_abs,
-                fee_basis_price,
-                fee_bps,
-            )?;
+            // v2.2 band: account_b is the asset's BOUND vault LP. It is the one standing
+            // counterparty the engine exempts from the band minimum-leg and position-cap rules
+            // (its leg is the net of its takers; `execute_trade_band_maker_exempt_not_atomic`).
+            let b_is_bound_vault_lp = {
+                let rec = read_asset_vault_lp_from_view(&group, asset_index as usize)?;
+                rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0
+                    && rec.vault_lp_portfolio == account_b_ai.key.to_bytes()
+            };
+            if roles.forced_close && !b_is_bound_vault_lp {
+                return Err(PercolatorError::VaultLpNotBound.into());
+            }
+            let base_fee_bps = if roles.forced_close {
+                // A forced close charges nothing: the closed account loses only its position.
+                0
+            } else {
+                hybrid_trade_fee_bps_view(
+                    &cfg,
+                    &oracle_profile,
+                    &group,
+                    asset_index as usize,
+                    size_abs,
+                    fee_basis_price,
+                    fee_bps,
+                )?
+            };
             let fee_bps = base_fee_bps
                 .checked_add(lp_requested_fee_bps)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
@@ -16101,25 +16163,33 @@ pub mod processor {
             // single-trade path reorders (a,b) by sign (§1A.3) -- so
             // `taker_is_long_account` must mirror that same reordering.
             let oi_before = side_oi_snapshot_view(&group, asset_index as usize)?;
-            let outcome = if size_q > 0 {
-                group
-                    .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                        &mut account_a,
-                        &mut account_b,
-                        req,
-                        true, // account_a (taker) is long_account here
-                    )
-                    .map_err(map_v16_error)?
-            } else {
-                group
-                    .execute_trade_with_fee_loss_stale_scoped_not_atomic(
-                        &mut account_b,
-                        &mut account_a,
-                        req,
-                        false, // account_a (taker) is short_account here
-                    )
-                    .map_err(map_v16_error)?
-            };
+            let outcome = match (size_q > 0, b_is_bound_vault_lp) {
+                (true, false) => group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                    &mut account_a,
+                    &mut account_b,
+                    req,
+                    true, // account_a (taker) is long_account here
+                ),
+                (false, false) => group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                    &mut account_b,
+                    &mut account_a,
+                    req,
+                    false, // account_a (taker) is short_account here
+                ),
+                (true, true) => group.execute_trade_band_maker_exempt_not_atomic(
+                    &mut account_a,
+                    &mut account_b,
+                    req,
+                    true,
+                ),
+                (false, true) => group.execute_trade_band_maker_exempt_not_atomic(
+                    &mut account_b,
+                    &mut account_a,
+                    req,
+                    false,
+                ),
+            }
+            .map_err(map_v16_error)?;
             // FIX (ADOPT upstream 3496acf0, "enforce side OI caps"): checked immediately
             // after the engine mutates OI on this trade, before any other post-trade
             // check, so an over-cap post-state aborts the instruction.
@@ -16714,14 +16784,30 @@ pub mod processor {
             for request in &requests {
                 oi_before_legs.push(side_oi_snapshot_view(&group, request.asset_index)?);
             }
-            let outcome = group
-                .execute_batch_with_fee_loss_stale_scoped_not_atomic(
+            // v2.2 band: the bound vault LP (account_b on every leg's asset) is exempt from the
+            // band minimum-leg and position-cap rules, as on the single-trade route.
+            let mut b_is_bound_vault_lp = !requests.is_empty();
+            for request in &requests {
+                let rec = read_asset_vault_lp_from_view(&group, request.asset_index)?;
+                b_is_bound_vault_lp &= rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0
+                    && rec.vault_lp_portfolio == account_b_ai.key.to_bytes();
+            }
+            let outcome = if b_is_bound_vault_lp {
+                group.execute_batch_band_maker_exempt_not_atomic(
                     &mut account_a,
                     &mut account_b,
                     &requests,
                     true,
                 )
-                .map_err(map_v16_error)?;
+            } else {
+                group.execute_batch_with_fee_loss_stale_scoped_not_atomic(
+                    &mut account_a,
+                    &mut account_b,
+                    &requests,
+                    true,
+                )
+            }
+            .map_err(map_v16_error)?;
             // FIX (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent"): for
             // BatchTradeCpi, the taker's signed `max_fee_atoms` is a hard ceiling on the
             // AGGREGATE engine fee charged to account_a across this batch (distinct from
@@ -23849,38 +23935,249 @@ pub mod processor {
         })
     }
 
-    /// v2.2 band (security re-review N-1), tag 118: permissionless dust sweep. The leg must be
-    /// dust (`band_leg_is_dust`: under HALF the market's minimum leg notional at `P_last`); the
-    /// asset must not lag its target (a forced close at a stale mark is refused, 21); the close
-    /// is the engine's unilateral reduce at `P_last` (the same primitive as RebalanceReduce,
-    /// no fee), after the canonical zero-move funding catch-up.
+    /// v2.2 band: close `victim_ai`'s WHOLE leg on `asset_index` against the asset's bound vault
+    /// LP (`lp_ai`) at `P_last`, with no fee, through the shared trade executor (so every
+    /// per-fill rule and the vault-LP bookkeeping run exactly as for a matcher fill). Bilateral:
+    /// open interest leaves both sides together, so `A` is untouched and nobody else's leg is
+    /// scaled (round-2 re-review N-6: the old unilateral reduce pushed the asset close-only).
+    /// The caller has already checked eligibility and that the asset does not lag.
+    #[inline(never)]
+    fn band_forced_close_against_vault_lp<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        victim_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        asset_index: u16,
+    ) -> ProgramResult {
+        if victim_ai.key == lp_ai.key {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_portfolio_storage_for_market_slots(victim_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        let (market_id, p_last, position) = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let mut victim_data = victim_ai.try_borrow_mut_data()?;
+            let victim =
+                state::portfolio_view_mut_for_market_slots(&mut victim_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&victim, victim_ai.key)?;
+            let asset = &group
+                .markets
+                .get(asset_index as usize)
+                .ok_or(PercolatorError::InvalidInstruction)?
+                .engine
+                .asset;
+            (
+                asset.market_id.get(),
+                asset.effective_price.get(),
+                signed_position_for_asset_view(&group, &victim, asset_index as usize)?,
+            )
+        };
+        if position == 0 {
+            return Err(PercolatorError::EngineInvalidLeg.into());
+        }
+        let (victim_owner, victim_id, victim_epoch) = {
+            let data = victim_ai.try_borrow_data()?;
+            (
+                Pubkey::new_from_array(state::read_portfolio_owner_preflight(&data)?.1),
+                state::read_portfolio_id(&data)?,
+                state::read_portfolio_position_epoch(&data)?,
+            )
+        };
+        let (lp_owner, lp_id, lp_epoch) = {
+            let data = lp_ai.try_borrow_data()?;
+            (
+                Pubkey::new_from_array(state::read_portfolio_owner_preflight(&data)?.1),
+                state::read_portfolio_id(&data)?,
+                state::read_portfolio_position_epoch(&data)?,
+            )
+        };
+        let vault_lp_pre =
+            vault_lp_capture_pre_fill(market_ai, victim_ai, lp_ai, &[asset_index], max_market_slots)?;
+        handle_trade_nocpi_zero_copy(
+            program_id,
+            &victim_owner,
+            &lp_owner,
+            market_ai,
+            victim_ai,
+            lp_ai,
+            victim_id,
+            victim_epoch,
+            lp_id,
+            lp_epoch,
+            asset_index,
+            market_id,
+            position.checked_neg().ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            p_last,
+            0,
+            Some(0),
+            Some(0),
+            max_market_slots,
+            P1TradeRoles { cpi: true, a_is_lp: false, b_is_lp: true, forced_close: true },
+            0,
+        )?;
+        vault_lp_post_fill(market_ai, victim_ai, lp_ai, &vault_lp_pre, max_market_slots)
+    }
+
+    /// v2.2 band (security re-review N-1; N-6 fixed in round 2), tag 118: permissionless dust
+    /// sweep. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`, `[3] the asset's
+    /// bound vault LP portfolio (w)`. The leg must be dust (`band_leg_is_dust`: under HALF the
+    /// market's minimum leg notional at `P_last`); the asset must not lag its target (21); the
+    /// close is BILATERAL against the bound vault LP at `P_last`, no fee
+    /// (`band_forced_close_against_vault_lp`), so `A` is unchanged and the market stays open.
     #[inline(never)]
     fn handle_sweep_band_dust_leg<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         asset_index: u16,
     ) -> ProgramResult {
-        with_one_portfolio_view(program_id, accounts, false, None, |group, portfolio, cfg| {
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_writable(lp_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        {
+            let (_, _, max_market_slots, _) =
+                state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+            ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
+            let portfolio =
+                state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             let a = asset_index as usize;
-            if group.header.mode != 0 || permissionless_resolve_matured_now_view(cfg, group) {
-                return Err(V16Error::LockActive);
+            if group.header.mode != 0 || permissionless_resolve_matured_now_view(&cfg, &group) {
+                return Err(PercolatorError::EngineLockActive.into());
             }
-            if asset_price_lagged_view(group, a).map_err(|_| V16Error::InvalidConfig)? {
-                return Err(V16Error::LockActive);
+            if asset_price_lagged_view(&group, a)? {
+                return Err(PercolatorError::EngineLockActive.into());
             }
-            if !group.band_leg_is_dust(&portfolio.as_view(), a)? {
-                return Err(V16Error::NonProgress);
+            if !group
+                .band_leg_is_dust(&portfolio.as_view(), a)
+                .map_err(map_v16_error)?
+            {
+                return Err(PercolatorError::EngineNonProgress.into());
             }
-            accrue_zero_move_funding_before_position_change_view(cfg, group, a, true)?;
-            // The whole leg: the engine clamps the request to the position (and to the
-            // unilateral close capacity), so no raw-basis read is needed here.
-            group
-                .rebalance_reduce_position_not_atomic(
-                    portfolio,
-                    RebalanceRequestV16 { asset_index: a, reduce_q: u128::MAX },
-                )
-                .map(|_| ())
-        })
+        }
+        band_forced_close_against_vault_lp(program_id, market_ai, portfolio_ai, lp_ai, asset_index)
+    }
+
+    /// v2.2 band (round-2 re-review N-1b), tag 119: replace-smallest eviction, atomic with the
+    /// evicting taker's own fill. Accounts: `[0] victim portfolio (w)`, then exactly the
+    /// TradeCpi accounts (`[1] taker (s)`, `[2] market (w)`, `[3] taker portfolio (w)`, `[4]
+    /// bound vault LP portfolio (w)`, matcher program, ctx, delegate, tail...).
+    ///
+    /// Eligibility (else `PriceBandPositionCap`, 111, or the named refusal):
+    /// * band market, the asset does not lag (21);
+    /// * the taker has NO leg on the asset and is opening on the victim's side;
+    /// * that side is full (`band_max_positions_per_side` positioned legs);
+    /// * the taker's requested notional at `P_last` is at least `BAND_EVICT_NOTIONAL_MULTIPLE`
+    ///   x the victim leg's notional.
+    ///
+    /// Then the victim's whole leg is closed against the bound vault LP at `P_last` with no fee
+    /// (it loses nothing but the position), the taker's `TradeCpi` runs unchanged on
+    /// `accounts[1..]`, and the taker must END with a leg on that side of at least the
+    /// multiple (a partial or failed fill reverts the eviction with it).
+    #[inline(never)]
+    fn handle_evict_and_trade_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        trade: &Instruction,
+    ) -> ProgramResult {
+        let Instruction::TradeCpi { asset_index, size_q, .. } = trade else {
+            return Err(ProgramError::InvalidInstructionData);
+        };
+        let (asset_index, size_q) = (*asset_index, *size_q);
+        let victim_ai = account(accounts, 0)?;
+        let market_ai = account(accounts, 2)?;
+        let taker_ai = account(accounts, 3)?;
+        let lp_ai = account(accounts, 4)?;
+        expect_writable(victim_ai)?;
+        expect_writable(market_ai)?;
+        expect_owner(victim_ai, program_id)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(taker_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        if victim_ai.key == taker_ai.key || victim_ai.key == lp_ai.key || size_q == 0 {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let a = asset_index as usize;
+        let need = {
+            let (_, _, max_market_slots, _) =
+                state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+            ensure_portfolio_storage_for_market_slots(victim_ai, max_market_slots)?;
+            ensure_portfolio_storage_for_market_slots(taker_ai, max_market_slots)?;
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            if group.header.config.band_bps.get() == 0 {
+                return Err(PercolatorError::PriceBandConfigInvalid.into());
+            }
+            if group.header.mode != 0 || permissionless_resolve_matured_now_view(&cfg, &group) {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            if asset_price_lagged_view(&group, a)? {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let mut victim_data = victim_ai.try_borrow_mut_data()?;
+            let victim =
+                state::portfolio_view_mut_for_market_slots(&mut victim_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&victim, victim_ai.key)?;
+            let mut taker_data = taker_ai.try_borrow_mut_data()?;
+            let taker =
+                state::portfolio_view_mut_for_market_slots(&mut taker_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&taker, taker_ai.key)?;
+            let side = if size_q > 0 { SideV16::Long } else { SideV16::Short };
+            let Some((victim_side, victim_notional)) = group
+                .band_leg_side_and_notional(&victim.as_view(), a)
+                .map_err(map_v16_error)?
+            else {
+                return Err(PercolatorError::EngineInvalidLeg.into());
+            };
+            let taker_has_leg = group
+                .band_leg_side_and_notional(&taker.as_view(), a)
+                .map_err(map_v16_error)?
+                .is_some();
+            let p_last = group.markets[a].engine.asset.effective_price.get() as u128;
+            let requested = size_q
+                .unsigned_abs()
+                .checked_mul(p_last)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                / percolator::POS_SCALE;
+            let need = victim_notional
+                .checked_mul(constants::BAND_EVICT_NOTIONAL_MULTIPLE)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            if victim_side != side
+                || taker_has_leg
+                || !group.band_side_is_full(a, side).map_err(map_v16_error)?
+                || requested < need
+            {
+                return Err(PercolatorError::PriceBandPositionCap.into());
+            }
+            (side, need)
+        };
+        band_forced_close_against_vault_lp(program_id, market_ai, victim_ai, lp_ai, asset_index)?;
+        process_instruction_dispatch(program_id, &accounts[1..], &trade.encode())?;
+        // The taker really took the slot, at the size that justified the eviction.
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let mut taker_data = taker_ai.try_borrow_mut_data()?;
+        let taker = state::portfolio_view_mut_for_market_slots(&mut taker_data, max_market_slots)?;
+        match group
+            .band_leg_side_and_notional(&taker.as_view(), a)
+            .map_err(map_v16_error)?
+        {
+            Some((side, notional)) if side == need.0 && notional >= need.1 => Ok(()),
+            _ => Err(PercolatorError::PriceBandPositionCap.into()),
+        }
     }
 
     #[inline(never)]
@@ -34860,7 +35157,8 @@ pub mod processor {
         let d_odd_pre = p2b_alloc_drawable(group, cfg, &registry_pda, odd, odd_present)?;
         // v2.2 D-1 (re-review N-3): the allocation is sized from the LP's certificate at
         // P_last; during an adverse lag that overstates the LP, so senior capital waits (21).
-        if asset_price_lagged_view(group, a)? {
+        // Band markets only (round-2 re-review N-7): off-band allocation is v2.1's, unchanged.
+        if group.header.config.band_bps.get() != 0 && asset_price_lagged_view(group, a)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         // Certificate on the engine's current state: a stale certificate can never value the
@@ -39652,6 +39950,11 @@ pub mod processor {
         pub cpi: bool,
         pub a_is_lp: bool,
         pub b_is_lp: bool,
+        /// v2.2 band (round-2 re-review N-6 / N-1b): a FORCED bilateral close of account_a's
+        /// whole leg against the asset's bound vault LP (account_b) at `P_last`: the dust sweep
+        /// (tag 118) and the slot eviction (tag 119). No signer, no matcher, no fee of any
+        /// kind; the caller has already refused a lagged mark.
+        pub forced_close: bool,
     }
 
     impl P1TradeRoles {
@@ -39660,6 +39963,7 @@ pub mod processor {
                 cpi: true,
                 a_is_lp: portfolio_is_matcher_lp(account_a_ai)?,
                 b_is_lp: true,
+                forced_close: false,
             })
         }
         fn for_nocpi(
@@ -39670,6 +39974,7 @@ pub mod processor {
                 cpi: false,
                 a_is_lp: portfolio_is_matcher_lp(account_a_ai)?,
                 b_is_lp: portfolio_is_matcher_lp(account_b_ai)?,
+                forced_close: false,
             })
         }
     }
@@ -41495,10 +41800,13 @@ pub mod processor {
         Ok((price, funding_rate_e9, rent_long, rent_short))
     }
 
-    /// v2.2 band (re-review N-2): the asset's price can no longer move toward its target: the
-    /// band around `P_last` is narrower than `MIN_BAND_WIDTH_TICKS` (the engine refuses to
-    /// re-anchor there, `band_prepare_accrual`), or the cap law's per-accrual step at `P_last`
-    /// rounds to 0 ticks (spec §9.6's `max_delta == 0`).
+    /// v2.2 band (re-review N-2, tightened in round 2): the asset's price can no longer move
+    /// toward its target. Exactly one of:
+    /// * the cap law's per-accrual step at `P_last` rounds to 0 ticks (spec §9.6's
+    ///   `max_delta == 0`: no movement in either direction);
+    /// * the asset is PINNED (`band_pin_since_slot != 0`) and the band around `P_last` is
+    ///   narrower than `MIN_BAND_WIDTH_TICKS`, which is exactly the condition on which the
+    ///   engine refuses to re-anchor (`band_prepare_accrual`).
     pub(crate) fn band_floor_stuck_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -41519,9 +41827,17 @@ pub mod processor {
             .saturating_mul(group.header.config.max_price_move_bps_per_slot.get() as u128)
             .saturating_mul(group.header.config.max_accrual_dt_slots.get() as u128)
             / 10_000;
+        // (1) Cap dead zone: a 0-tick step cannot move the price in EITHER direction, pinned or
+        //     not (a certified book keeps re-anchoring at the same price there, which resets
+        //     the pin clock every epoch, so the pin cannot be required for this case).
+        // (2) Width floor (round-2 re-review tightening): the engine's pin clock must be running
+        //     as well, i.e. the price sits at the edge of the last wide band with the target
+        //     beyond it and the re-anchor refused. While a sub-threshold price can still move
+        //     inside an open window the refusal is NOT lifted.
         Ok(max_step == 0
-            || !percolator::band_rent::band_width_ok(p_last, band_bps)
-                .map_err(|_| PercolatorError::PriceBandConfigInvalid)?)
+            || (asset.band_pin_since_slot.get() != 0
+                && !percolator::band_rent::band_width_ok(p_last, band_bps)
+                    .map_err(|_| PercolatorError::PriceBandConfigInvalid)?))
     }
 
     /// v2.2 band (design §1.1 "Closes during a pin", spec §9.7; widened by review E-L2):

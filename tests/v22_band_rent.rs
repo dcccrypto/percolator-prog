@@ -1923,6 +1923,12 @@ fn v22_band_min_leg_notional_floor_and_dust_refusal() {
     let r = env.trade_cpi(&t.0, t.1, &lp, -25 * Q);
     assert_err(&r, &code(PercolatorError::PriceBandLegBelowMinNotional), "reduce to $5 dust");
     env.trade_cpi(&t.0, t.1, &lp, -20 * Q).expect("reduce to $10");
+    // The bound vault LP is exempt: its leg is the NET of its takers and may be any size. A
+    // second taker leaves the LP net short $5 (below the minimum) and the fill still lands.
+    let u = env.trader(1_000 * USD);
+    env.trade_cpi(&u.0, u.1, &lp, -15 * Q).expect("LP net position may be sub-minimum");
+    assert_eq!(env.pos(lp.account), 5 * Q, "the LP nets +$5 against a $10 long and a $15 short");
+    env.trade_cpi(&u.0, u.1, &lp, 15 * Q).expect("u closes");
     env.trade_cpi(&t.0, t.1, &lp, -10 * Q).expect("full close");
     assert_eq!(env.pos(t.1), 0);
     env.assert_conservation();
@@ -1987,6 +1993,7 @@ fn v22_band_floor_keeps_exits_open() {
     env.crank(lp.account).ok();
     env.trade_cpi(&long.0, long.1, &lp, 20_000 * POS_SCALE as i128).expect("open long ($33)");
     let mut refused_above_floor = false;
+    let mut refused_narrow_unpinned = false;
     for _ in 0..400 {
         env.warp(1);
         env.push(1);
@@ -1996,19 +2003,28 @@ fn v22_band_floor_keeps_exits_open() {
         if std::env::var("FLOOR_DBG").is_ok() {
             eprintln!("p={} t={} anchor={} e={} r1={:?} r2={:?}", a.effective_price, a.raw_oracle_target_price, a.band_anchor_price, a.band_epoch, r1.as_ref().map_err(|e| e.split(", meta").next().unwrap().to_string()), r2.as_ref().map_err(|e| e.split(", meta").next().unwrap().to_string()));
         }
-        let stuck = !percolator::band_rent::band_width_ok(a.effective_price, D).unwrap();
-        if !stuck && !refused_above_floor && a.raw_oracle_target_price < a.effective_price {
+        let narrow = !percolator::band_rent::band_width_ok(a.effective_price, D).unwrap();
+        let stuck = narrow && a.band_pin_since_slot != 0;
+        if !narrow && !refused_above_floor && a.raw_oracle_target_price < a.effective_price {
             let r = env.trade_cpi(&long.0, long.1, &lp, -10_000 * POS_SCALE as i128);
             assert_err(&r, &code(PercolatorError::PriceBandPinned), "lagged favourable close above the floor");
             refused_above_floor = true;
+        }
+        // Round-2 tightening: a sub-threshold price that can STILL MOVE (not pinned: the epoch
+        // window is open and the edge not reached) does not lift the refusal.
+        if narrow && !stuck && !refused_narrow_unpinned {
+            let r = env.trade_cpi(&long.0, long.1, &lp, -10_000 * Q);
+            assert_err(&r, &code(PercolatorError::PriceBandPinned), "narrow but not pinned: still refused");
+            refused_narrow_unpinned = true;
         }
         if stuck {
             break;
         }
     }
-    assert!(refused_above_floor, "control ran");
+    assert!(refused_above_floor && refused_narrow_unpinned, "both controls ran");
     let a = env.engine_asset();
     assert!(!percolator::band_rent::band_width_ok(a.effective_price, D).unwrap(), "reached the floor: {}", a.effective_price);
+    assert!(a.band_pin_since_slot != 0, "pinned at the edge of the last wide band");
     assert!(a.raw_oracle_target_price < a.effective_price, "still lagged");
     let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
     assert!(r.is_ok(), "exit at the floor lands: {r:?}");
@@ -2036,19 +2052,84 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let a = env.engine_asset();
     assert_eq!(a.effective_price, 1_660, "the cap law cannot move 1,660 at 4 bps/slot");
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
+    // A 0-tick cap step cannot move the price in either direction, pinned or not (a certified
+    // book keeps re-anchoring at the same price, so no pin clock can be required here).
     let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
     assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
     env.assert_conservation();
 }
 
 impl Env {
-    fn sweep_dust(&mut self, portfolio: Pubkey) -> Result<u64, String> {
+    fn sweep_dust(&mut self, portfolio: Pubkey, vault_lp: Pubkey) -> Result<u64, String> {
         let (payer, m) = (self.payer.pubkey(), self.market);
         self.send(
             ProgInstruction::SweepBandDustLeg { asset_index: 0 },
-            vec![AccountMeta::new(payer, false), AccountMeta::new(m, false), AccountMeta::new(portfolio, false)],
+            vec![
+                AccountMeta::new(payer, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(vault_lp, false),
+            ],
             &[],
         )
+    }
+
+    /// STATE POKE (test only): edit the engine config words of the market account.
+    fn poke_engine_config(&mut self, f: impl FnOnce(&mut percolator::V16ConfigAccount)) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acct.data).unwrap();
+            f(&mut g.header.config);
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+
+    /// Tag 119: evict `victim`, then the taker's TradeCpi of `size_q`.
+    fn evict_and_trade(
+        &mut self,
+        victim: Pubkey,
+        taker: &Keypair,
+        taker_account: Pubkey,
+        lp: &Lp,
+        size_q: i128,
+    ) -> Result<u64, String> {
+        let (a_id, _, a_epoch) = self.identity(taker_account);
+        let (b_id, b_seq, b_epoch) = self.identity(lp.account);
+        let market_id = self.market_id();
+        let (m, mp) = (self.market, self.matcher_program);
+        self.send(
+            ProgInstruction::EvictAndTradeCpi {
+                trade: Box::new(ProgInstruction::TradeCpi {
+                    account_a_portfolio_id: a_id,
+                    account_a_position_epoch: a_epoch,
+                    account_b_portfolio_id: b_id,
+                    account_b_position_epoch: b_epoch,
+                    market_id,
+                    account_b_matcher_sequence: b_seq,
+                    asset_index: 0,
+                    size_q,
+                    fee_bps: 10_000,
+                    limit_price: 0,
+                    backing_fee_cap_bps: 10_000,
+                }),
+            },
+            vec![
+                AccountMeta::new(victim, false),
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(lp.account, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new(lp.ctx, false),
+                AccountMeta::new_readonly(lp.delegate, false),
+            ],
+            &[taker],
+        )
+    }
+
+    fn equity(&self, p: Pubkey) -> i128 {
+        let s = self.portfolio_state(p);
+        s.capital as i128 + s.pnl
     }
 }
 
@@ -2065,11 +2146,93 @@ fn v22_tag118_dust_sweep_refusals() {
     assert_eq!(percolator_prog::constants::TAG_SWEEP_BAND_DUST_LEG, 118, "111 / 112 / 116 / 117 are Wave D's");
     let mut env = Env::new(band_cfg());
     let (lp, long, short) = band_book(&mut env);
-    let r = env.sweep_dust(long.1);
+    let r = env.sweep_dust(long.1, lp.account);
     assert_err(&r, &code(PercolatorError::EngineNonProgress), "a $200 leg is not dust");
+    // A dust leg can only be closed against the asset's BOUND vault LP.
+    env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(500 * USD as u64));
+    let r = env.sweep_dust(long.1, short.1);
+    assert_err(&r, &code(PercolatorError::VaultLpNotBound), "counterparty must be the bound vault LP");
+    env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(BAND_MIN_LEG));
     lagged_not_pinned(&mut env, short.1, lp.account);
-    let r = env.sweep_dust(long.1);
+    let r = env.sweep_dust(long.1, lp.account);
     assert_err(&r, &code(PercolatorError::EngineLockActive), "no sweep while lagged");
     assert_eq!(env.pos(long.1), 200 * Q, "untouched");
+    env.assert_conservation();
+}
+
+
+/// Round-2 re-review N-6 (fixed): tag 118 closes the dust leg BILATERALLY against the bound
+/// vault LP. `A` stays `ADL_ONE` on both sides, the swept account keeps its exact equity, and an
+/// honest open still lands afterwards (the old unilateral reduce scaled the opposite side's
+/// `A` and left the asset close-only, `AdlReduceOnly`).
+#[test]
+fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    // Test shortcut for a >50% fall: raise the market minimum so the $200 long is dust.
+    env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(500 * USD as u64));
+    env.crank_current(long.1);
+    env.crank_current(lp.account);
+    let equity_before = env.equity(long.1);
+    let short_leg_before = env.portfolio_state(short.1).legs.iter().find(|l| l.active).cloned().unwrap();
+    env.sweep_dust(long.1, lp.account).expect("bilateral dust sweep");
+    assert_eq!(env.pos(long.1), 0, "the dust leg is closed");
+    assert_eq!(env.equity(long.1), equity_before, "no fee, no value moved: exact equity kept");
+    let a = env.engine_asset();
+    assert_eq!((a.a_long, a.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "A unchanged");
+    assert_eq!(
+        env.portfolio_state(short.1).legs.iter().find(|l| l.active).cloned().unwrap(),
+        short_leg_before,
+        "nobody else's leg was scaled"
+    );
+    assert_eq!(env.pos(lp.account), 100 * Q, "the LP absorbed the leg (net of the short taker)");
+    // The market is still open: an honest newcomer's open lands.
+    env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(BAND_MIN_LEG));
+    let honest = env.trader(1_000 * USD);
+    env.trade_cpi(&honest.0, honest.1, &lp, 30 * Q).expect("honest open after the sweep");
+    env.assert_conservation();
+}
+
+/// Round-2 re-review N-1b: replace-smallest eviction (tag 119). With the long side full
+/// (cap poked to 2 for the test), an honest taker bringing >= 2x the smallest leg gets in: the
+/// evicted leg is closed against the bound vault LP at the mark with no fee (its account keeps
+/// its exact equity), then the taker's own TradeCpi lands. Too small a fill, a side that is
+/// not full, or a victim on the other side are refused (111) and nothing is evicted.
+#[test]
+fn v22_tag119_eviction_lets_an_honest_trader_into_a_full_side() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let a = env.trader(1_000 * USD);
+    let b = env.trader(1_000 * USD);
+    let honest = env.trader(1_000 * USD);
+    let short = env.trader(1_000 * USD);
+    env.trade_cpi(&a.0, a.1, &lp, 10 * Q).expect("filler a ($10, the minimum)");
+    env.trade_cpi(&b.0, b.1, &lp, 10 * Q).expect("filler b");
+    env.trade_cpi(&short.0, short.1, &lp, -10 * Q).expect("a short, for the wrong-side control");
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
+    // Locked out without eviction.
+    let r = env.trade_cpi(&honest.0, honest.1, &lp, 30 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "the long side is full");
+    // Refusals: under 2x the victim, and a victim on the other side.
+    let r = env.evict_and_trade(a.1, &honest.0, honest.1, &lp, 19 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "19 < 2 x 10");
+    let r = env.evict_and_trade(short.1, &honest.0, honest.1, &lp, 30 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "victim on the other side");
+    assert_eq!(env.pos(a.1), 10 * Q, "nothing was evicted by the refused attempts");
+    // The eviction.
+    let equity_before = env.equity(a.1);
+    env.evict_and_trade(a.1, &honest.0, honest.1, &lp, 30 * Q).expect("evict + open");
+    assert_eq!(env.pos(a.1), 0, "the smallest leg was closed");
+    assert_eq!(env.equity(a.1), equity_before, "the evicted account lost nothing but the position");
+    assert_eq!(env.pos(honest.1), 30 * Q, "the honest trader is in");
+    let asset = env.engine_asset();
+    assert_eq!((asset.a_long, asset.a_short), (percolator::ADL_ONE, percolator::ADL_ONE));
+    // Side not full: no eviction (b closes, then the same attempt is refused).
+    env.trade_cpi(&b.0, b.1, &lp, -10 * Q).expect("b leaves");
+    let late = env.trader(1_000 * USD);
+    let r = env.evict_and_trade(honest.1, &late.0, late.1, &lp, 80 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "the side is not full");
+    env.trade_cpi(&late.0, late.1, &lp, 80 * Q).expect("an ordinary open lands on a free slot");
     env.assert_conservation();
 }

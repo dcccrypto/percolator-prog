@@ -562,6 +562,62 @@ impl Env {
         v21_upgrade::upgrade_v21_account(&self.program_id, &account.owner, account.data)
     }
 
+    /// AuthMark on asset 0 (admin-configured), so a price target can be pushed.
+    fn auth_mark(&mut self) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::ConfigureAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                initial_mark_e6: PRICE,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    fn push_mark(&mut self, mark_e6: u64) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::PushAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                mark_e6,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    /// Tag 28 by the portfolio's owner.
+    fn convert_released_pnl(&mut self, owner: &Keypair, portfolio: Pubkey) -> Result<u64, String> {
+        let (portfolio_id, _, position_epoch) = self.identity(portfolio);
+        let m = self.market;
+        self.send(
+            ProgInstruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount: u64::MAX as u128 },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+    }
+
     fn identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
         let data = self.read(&portfolio);
         (

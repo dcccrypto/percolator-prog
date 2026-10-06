@@ -26,7 +26,13 @@ The wizard should display: "Forced recovery after N minutes of keeper absence" w
 | 113 `PriceBandLegBelowMinNotional` | A trade would leave a position below the market minimum | "Below the minimum position size: trade at least X, or close fully." |
 | 21 `EngineLockActive` | Earn / insurance / conversion paths while the mark lags | "Price catching up; try again in a few seconds." |
 
-Tag 118 `SweepBandDustLeg { asset_index }` (permissionless; accounts `[caller][market w][portfolio w]`) closes a band leg whose notional at the current mark is below HALF the market minimum, at the current mark, with no fee. Keepers should run it when a side is near the 256 cap. The app should warn a user whose position falls below half the minimum that it can be closed by anyone.
+Tag 118 `SweepBandDustLeg { asset_index }` (permissionless; accounts `[caller][market w][portfolio w][bound vault LP portfolio w]`) closes a band leg whose notional at the current mark is below HALF the market minimum, bilaterally against the bound vault LP at the current mark, with no fee. `A` is unchanged, so the market stays open. The app should warn a user whose position falls below half the minimum that it can be closed by anyone.
+
+**Keeper note:** keep the tag-118 sweep OFF on any live market whose deployed wrapper predates this fix (round-2 re-review N-6): the first version used a unilateral reduce, which scales the opposite side's `A` and pushes the asset close-only. Only enable it against a deployment that carries the bilateral sweep (accounts length 4).
+
+Tag 119 `EvictAndTradeCpi` (accounts `[victim portfolio w]` + the usual TradeCpi accounts; data `[119]` + the TradeCpi body): when the side a taker wants to open on is FULL (256 legs) the SDK should retry the open as tag 119, naming a leg on that side whose notional is at most half the taker's (the smallest positioned leg is the natural choice; an indexer query). The evicted leg is closed at the mark with no fee and the taker's fill follows atomically; if the fill fails nothing is evicted. Copy for the evicted user: "Your position was closed at the market price because this side was full and a larger position took the slot. Nothing else was charged."
+
+The bound vault LP is the one counterparty exempt from the position cap and the minimum leg size (its position is the net of its takers).
 
 ## The fast-crash behaviour (E-L2 trade-off)
 
