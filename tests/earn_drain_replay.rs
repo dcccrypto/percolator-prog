@@ -3489,6 +3489,91 @@ fn a5_explore_real_chunked_bankruptcy() {
     }
 }
 
+
+/// Wedge finding 2026-10-06 (ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): a bankruptcy
+/// residual larger than `public_b_chunk_atoms` is NOT a liveness wedge. The Live crank declares
+/// permissionless Recovery (`ActiveBankruptCloseCannotProgress`, committed through
+/// `kernel_commit_declared_liquidation_recovery`), the next crank finalises Recovery -> Resolved,
+/// and every later Live-style `PermissionlessCrank` fails Custom(14) BECAUSE the market is
+/// terminal (not because it is stuck). Terminal progress is `CloseResolved` (tag 30), one chunk
+/// of the residual per call, then the winners are paid.
+fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubkey)>) {
+    let mut lm = r2_market();
+    lm.params.public_b_chunk_atoms = chunk;
+    let mut r = Replay::new(lm);
+    let h = Keypair::new();
+    r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut shorts = vec![];
+    for _ in 0..3 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, -q).expect("short");
+        shorts.push((k, p));
+    }
+    let lp = r.lp;
+    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
+    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(20_000_000);
+    r.trade(&bk, bp, qb).expect("levered long");
+    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
+    (r, bp, bk, shorts)
+}
+
+#[test]
+fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
+    let (mut r, bp, bk, shorts) = chunk_bust_world(1_000_000);
+    let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
+    assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
+    let mut seen = vec![];
+    for _ in 0..3 {
+        r.crank_pf(bp);
+        seen.push(mode(&r));
+    }
+    assert_eq!(seen, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
+    // the Live-style crank is refused on a terminal market: this is the Custom(14) the Wave A
+    // exploration read as a wedge
+    let payer = r.env.payer.pubkey();
+    r.env.svm.expire_blockhash();
+    let res = r.env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+        },
+        vec![AccountMeta::new(payer, true), AccountMeta::new(r.env.market, false), AccountMeta::new(bp, false)],
+        &[],
+    );
+    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(14), "{res:?}");
+    // terminal progress: CloseResolved drains the residual one chunk per call (8.5 USDC / 1 USDC)
+    let mut owners: Vec<(Pubkey, Pubkey)> = vec![(bk.pubkey(), bp), (r.lp_owner.pubkey(), r.lp)];
+    owners.extend(shorts.iter().map(|(k, p)| (k.pubkey(), *p)));
+    for _pass in 0..2 {
+        for (o, p) in owners.iter() {
+            for _ in 0..10 {
+                r.close_resolved_any(*o, *p).expect("CloseResolved is permissionless progress");
+            }
+        }
+    }
+    let (_, g) = r.env.market_state();
+    assert_eq!(g.negative_pnl_account_count, 0);
+    assert_eq!(g.c_tot, 0, "every portfolio paid out and closed");
+    for (_, p) in owners.iter() {
+        let s = r.env.portfolio_state(*p);
+        assert_eq!((s.pnl, s.capital), (0, 0));
+    }
+}
+
+/// NEGATIVE CONTROL: the same bust with the default (huge) chunk is socialised at once; the
+/// market never leaves Live. Proves the Recovery above is caused by residual > chunk.
+#[test]
+fn wedge_negative_control_residual_below_chunk_stays_live() {
+    let (mut r, bp, _bk, _s) = chunk_bust_world(1_000_000_000_000);
+    for _ in 0..4 {
+        r.crank_pf(bp);
+        assert_eq!(format!("{:?}", r.env.market_state().1.mode), "Live", "residual <= chunk must not declare Recovery");
+    }
+    assert_eq!(r.env.market_state().1.negative_pnl_account_count, 0);
+}
+
 /// A6 round 2: two 14-leg portfolios that are LIQUIDATABLE after an asset-0 drop (a 100-token
 /// asset-0 long + 13 x 10-token legs on $25 capital, asset 0 down 15%). One inline refresh is
 /// one bounded crank, so each refresh liquidates (at most one leg) on top of re-certifying 14
