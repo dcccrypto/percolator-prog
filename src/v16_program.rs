@@ -1948,8 +1948,11 @@ pub mod state {
                 funding_rate_e9
                     .checked_mul(segment_dt as i128)
                     .and_then(|v| v.checked_mul(effective_price as i128))
-                    .map(|v| v / percolator::FUNDING_DEN as i128)
-                    .and_then(|v| v.checked_mul(percolator::ADL_ONE as i128))
+                    // fix/v21-funding-precision: exact, no pre-floor (ADL_ONE % FUNDING_DEN == 0;
+                    // this host mirror is flat-A, where the engine's per-side rounding is exact).
+                    .and_then(|v| {
+                        v.checked_mul((percolator::ADL_ONE / percolator::FUNDING_DEN) as i128)
+                    })
                     .ok_or(V16Error::ArithmeticOverflow)?
             } else {
                 0
@@ -11217,71 +11220,6 @@ pub mod processor {
         Clock::get().map(|c| c.slot).unwrap_or(fallback_slot)
     }
 
-    /// Warn, at creation time, when the configured price/rate/dt combination
-    /// makes the engine's funding accrual floor to zero on every crank.
-    ///
-    /// The engine books, per accrual segment:
-    ///
-    /// ```text
-    /// fund_num_total = floor(rate_e9 * segment_dt * effective_price / FUNDING_DEN)
-    /// ```
-    ///
-    /// with `FUNDING_DEN == 1e9`, `|rate_e9| <= max_abs_funding_e9_per_slot`
-    /// and `segment_dt <= max_accrual_dt_slots`. The best case this market can
-    /// reach at price `p` is `rate * dt * p`; when that is `< FUNDING_DEN` the
-    /// floor is 0 for every crank and the market has a funding *setting* with
-    /// no funding *mechanism* — silently, with no error at trade time.
-    ///
-    /// Equivalently, funding needs `price >= ceil(1e9 / (rate * dt))`. At the
-    /// engine's maximum legal rate (10_000) with `dt = 100` that is price 1000;
-    /// at `dt = 5` it is price 20_000. A market denominated in small integers
-    /// cannot fund.
-    ///
-    /// WHY THIS WARNS RATHER THAN REJECTS. The condition is a property of the
-    /// *current price*, and price is mutable: a market created at price 999 is
-    /// dead-funded at genesis but funds correctly once it trades above the
-    /// threshold, so rejecting on the genesis price would refuse markets that
-    /// are merely dead *now*, not *forever*. The one condition that IS
-    /// permanent — funding impossible at every legal price, i.e.
-    /// `rate * dt * MAX_ORACLE_PRICE < FUNDING_DEN` — is unreachable for any
-    /// integer `rate >= 1, dt >= 1` given `MAX_ORACLE_PRICE == 1e12`, so a
-    /// hard reject would either be dead code or would over-reject. The honest
-    /// program-side maximum is therefore a loud, specific creation-time log
-    /// naming the price the creator needs, for the SDK / launch wizard to
-    /// surface. This is a WARNING, not a repair: the arithmetic is in the
-    /// engine and is deliberately not changed.
-    ///
-    /// Markets that disable funding (`max_abs == 0`) are silent — they are not
-    /// broken, they are explicitly off. `dt == 0` is left to the engine's own
-    /// config validation rather than being re-judged here.
-    fn warn_if_funding_cannot_accrue(
-        max_abs_funding_e9_per_slot: u64,
-        max_accrual_dt_slots: u64,
-        initial_price: u64,
-    ) {
-        if max_abs_funding_e9_per_slot == 0 || max_accrual_dt_slots == 0 || initial_price == 0 {
-            return;
-        }
-        let rate_times_dt =
-            (max_abs_funding_e9_per_slot as u128).saturating_mul(max_accrual_dt_slots as u128);
-        let best_case = rate_times_dt.saturating_mul(initial_price as u128);
-        if best_case >= percolator::FUNDING_DEN {
-            return;
-        }
-        // ceil(FUNDING_DEN / (rate * dt)) — the lowest price at which a full
-        // accrual window at the maximum configured rate books one funding atom.
-        let threshold = percolator::FUNDING_DEN.div_ceil(rate_times_dt);
-        // `alloc::format!` (this crate is `no_std` + `extern crate alloc`), and
-        // only on the warn path, so the allocation costs nothing on the
-        // overwhelmingly common healthy configuration.
-        solana_program::log::sol_log(&alloc::format!(
-            "WARN funding-cannot-accrue: price {initial_price} < threshold {threshold} \
-             for rate {max_abs_funding_e9_per_slot} x dt {max_accrual_dt_slots}; \
-             floor(rate*dt*price/1e9) == 0 on every crank, so funding will never accrue \
-             until price reaches the threshold"
-        ));
-    }
-
     fn authenticated_market_slot_or_fallback_view(group: &state::MarketViewMutV16<'_>) -> u64 {
         core::cmp::max(
             Clock::get()
@@ -13729,15 +13667,9 @@ pub mod processor {
         if initial_price == 0 || initial_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        // WARNING (not a repair): say so loudly when this market's funding
-        // cannot accrue at its genesis price. See `warn_if_funding_cannot_accrue`
-        // for why this warns rather than rejects. The flooring itself lives in
-        // the engine and is NOT changed.
-        warn_if_funding_cannot_accrue(
-            max_abs_funding_e9_per_slot,
-            max_accrual_dt_slots,
-            initial_price,
-        );
+        // fix/v21-funding-precision: the engine now accrues funding exactly (no pre-floor to
+        // whole price units), so the former `warn_if_funding_cannot_accrue` creation-time warning
+        // ("funding floors to zero below a price threshold") is no longer true and was removed.
         let init_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
         let wrapper = WrapperConfigV16 {
             marketauth: admin.key.to_bytes(),
@@ -22854,21 +22786,6 @@ pub mod processor {
                     return Err(PercolatorError::VaultLpMultiAssetMarket.into());
                 }
             }
-        }
-        // Same funding warning as InitMarket: activating an asset is creating a
-        // market, and an asset priced below the funding threshold has the
-        // identical silent-dead-funding failure. `max_abs_funding_e9_per_slot`
-        // and `max_accrual_dt_slots` are market-wide; only `initial_price` varies
-        // per asset, so a market can be perfectly fundable at asset 0's price and
-        // dead-funded at asset 5's.
-        if action == ASSET_ACTION_ACTIVATE {
-            let (max_abs_funding_e9_per_slot, max_accrual_dt_slots) =
-                state::read_engine_funding_bounds(&market_ai.try_borrow_data()?)?;
-            warn_if_funding_cannot_accrue(
-                max_abs_funding_e9_per_slot,
-                max_accrual_dt_slots,
-                initial_price,
-            );
         }
         let is_asset_authority =
             cfg_pre.marketauth != [0u8; 32] && cfg_pre.marketauth == authority.key.to_bytes();
