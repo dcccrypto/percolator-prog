@@ -1513,8 +1513,8 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
 }
 
 /// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth
-/// mark at setup and moves it 4 bp before a crank, so K changes and the LP and a trader are left
-/// STALE: the risk-increasing steps after it are refused identically by both layouts (no
+/// mark, then (positions open) pushes it 4 bp up and lets a risk-reducing TradeCpi accrue, so K
+/// changes and trader y is left STALE: the risk-increasing steps after it are refused identically by both layouts (no
 /// insurance, so no insured admission), and only the drift tail differs.
 fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
     let cfg = MarketCfg { funding: 0, ..MarketCfg::legacy() };
@@ -1560,21 +1560,30 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
         ("cpi_crowd_5x", env.trade_cpi(&y, yp, &lp, units(100))),
     ];
     if with_cohort {
+        // New slot, auth mark 4 bp above the effective price, then a risk-REDUCING TradeCpi by x
+        // performs the canonical accrual: K moves with positions open and y is left STALE (the
+        // LP and x are settled by their own trade).
         let slot = env.svm.get_sysvar::<Clock>().slot + 1;
         env.svm.warp_to_slot(slot);
         let s = seq(&env);
+        let eff = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0].effective_price;
         steps.push((
             "push_mark_4bp",
             env.send(
-                ProgInstruction::PushAuthMark { asset_index: 0, market_id: mid, now_slot: slot, mark_e6: PRICE + PRICE * 4 / 10_000, observation_sequence: s },
+                ProgInstruction::PushAuthMark { asset_index: 0, market_id: mid, now_slot: slot, mark_e6: eff + eff * 4 / 10_000, observation_sequence: s },
                 vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
                 &[&admin],
             ),
         ));
-        steps.push(("crank_x_accrues", env.crank(xp)));
+        steps.push(("cpi_reduce_x_accrues", env.trade_cpi(&x, xp, &lp, -units(10))));
     }
     steps.push(("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))));
-    steps.push(("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))));
+    if !with_cohort {
+        // Risk increase. In the cohort case it is deliberately omitted: with a stale cohort an
+        // INSURED risk increase is admitted by #277 and refused by the baseline -- the intended
+        // behaviour change, covered by tests/v21_funding_scale*.rs, not a legacy-parity property.
+        steps.push(("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))));
+    }
     steps.push(("crank", env.crank(xp)));
     steps.push(("cpi_close", env.trade_cpi(&x, xp, &lp, -units(610))));
     for (what, r) in steps {
@@ -1594,8 +1603,11 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
 /// from c493bbc0 in an old-layout tree (`GROWTH_PARITY_FIXTURE_WRITE=<path>`), because a program
 /// of the previous layout cannot run on accounts sized by this build. Two cases:
 /// - zero cohort: nothing ever goes stale, the drift tail stays zero;
-/// - live cohort: a 4 bp mark move leaves positions stale; every outcome (including the refused
-///   risk increases) and every byte outside the tail still match, and the tail is non-zero.
+/// - live cohort: an auth-mark move leaves a position stale for the rest of the run; every
+///   outcome of the reduces / closes / cranks and every byte outside the tail still match, and the
+///   tail is non-zero. (Risk increases under a stale cohort are the intended #277 change and are
+///   tested in tests/v21_funding_scale.rs, so they are not part of this parity sequence.)
+///   (Regenerate the fixture whenever the sequence changes.)
 #[test]
 fn growth_off_is_byte_for_byte_legacy() {
     let (zero, zero_tail, zero_stale) = legacy_parity_run(false);
