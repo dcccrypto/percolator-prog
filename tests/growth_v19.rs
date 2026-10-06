@@ -41,7 +41,11 @@ use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
 const MATCHER_CONTEXT_LEN: usize = 320;
-const PRICE: u64 = 1_000_000;
+/// v2.2 Wave A item 7: a growth market must open at >= 10^7 e6 per LOT (precision floor), so
+/// this fixture is priced per lot of 10 tokens: $10 per lot, and `units(n)` (n USD of
+/// notional, n tokens at $1) is n/10 lots. Every notional, margin and fee below is unchanged
+/// (`units(n) * PRICE / POS_SCALE == n * 1e6` exactly).
+const PRICE: u64 = 10_000_000;
 const Q: i128 = POS_SCALE as i128;
 const USD: u128 = 1_000_000;
 
@@ -915,7 +919,7 @@ fn seeded_keypair(tag: u8) -> Keypair {
 }
 
 fn units(n: i128) -> i128 {
-    n * Q
+    n * Q / 10
 }
 
 /// The vault LP's N_cap (Q) at its CURRENT conservative equity (lambda 1x, $1). N-2: the
@@ -1547,7 +1551,23 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
     let mut max_stale = 0u64;
     let mut snap = |env: &Env, what: &str, out: &mut Vec<String>| {
         for (k, n) in keys.iter().zip(names) {
-            let (bytes, tail) = strip_drift_tail(&env.svm.get_account(k).unwrap().data, n == "market");
+            let mut raw = env.svm.get_account(k).unwrap().data.clone();
+            if n == "market" {
+                // v2.2 Wave A, the ONE deliberate divergence from the c493bbc0 legacy run: every
+                // profile a v2.2 program creates carries p4_flags bit2 EXIT_REQUIRES_LOSS_CURRENT
+                // (asset profile byte +20). Assert it is exactly that byte and bit in every asset
+                // slot, then mask it (on the unstripped bytes); every other byte stays identical
+                // to the legacy fixture.
+                let slots = state::market_slot_capacity(&raw).unwrap();
+                for i in 0..slots {
+                    let at = state::asset_growth_range(&raw, i).unwrap().start
+                        - percolator_prog::constants::ASSET_GROWTH_OFF
+                        + 20;
+                    assert_eq!(raw[at], percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
+                    raw[at] = 0;
+                }
+            }
+            let (bytes, tail) = strip_drift_tail(&raw, n == "market");
             tail_seen |= tail;
             out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
         }

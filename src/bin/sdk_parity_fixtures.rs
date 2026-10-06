@@ -69,7 +69,9 @@ const MAX_PAYLOAD: usize = 512;
 fn variant_name(ix: &Instruction) -> &'static str {
     match ix {
         // growth-v19: the optional-trailer forms are the SAME tags (0 / 94), same names.
-        Instruction::InitMarket { .. } | Instruction::InitMarketV19 { .. } => "InitMarket",
+        Instruction::InitMarket { .. }
+        | Instruction::InitMarketV19 { .. }
+        | Instruction::InitMarketLotV22 { .. } => "InitMarket",
         Instruction::InitPortfolio { .. } => "InitPortfolio",
         Instruction::Deposit { .. } => "DepositCollateral",
         Instruction::Withdraw { .. } => "WithdrawCollateral",
@@ -124,8 +126,10 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::CreateLpVault { .. } => "CreateLpVault",
         Instruction::DepositToLpVault { .. } => "DepositToLpVault",
         Instruction::RebalanceLpVaultBacking { .. } => "RebalanceLpVaultBacking",
-        Instruction::RequestRedeemLpShares { .. } => "RequestRedeemLpShares",
-        Instruction::ExecuteRedemption { .. } => "ExecuteRedemption",
+        Instruction::RequestRedeemLpShares { .. }
+        | Instruction::RequestRedeemLpSharesV22 { .. } => "RequestRedeemLpShares",
+        Instruction::ExecuteRedemption { .. }
+        | Instruction::ExecuteRedemptionV22 { .. } => "ExecuteRedemption",
         Instruction::LpVaultCrankFees { .. } => "LpVaultCrankFees",
         Instruction::SetLpVaultPaused { .. } => "SetLpVaultPaused",
         Instruction::CloseLpVault { .. } => "CloseLpVault",

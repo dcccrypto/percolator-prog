@@ -448,6 +448,31 @@ impl V16CuEnv {
     }
 
     fn new_with_init_params(params: V16CuMarketParams) -> Self {
+        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`; sub-floor
+        // chunk fixtures init at the floor, then a test-only STATE POKE sets the requested chunk.
+        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+        if params.public_b_chunk_atoms < floor {
+            let env = Self::new_with_init_params(V16CuMarketParams {
+                public_b_chunk_atoms: floor,
+                ..params
+            });
+            let original = env.svm.get_account(&env.market).expect("market");
+            let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+            let mut noop = original.data.clone();
+            state::write_market(&mut noop, &cfg, &g).unwrap();
+            g.config.public_b_chunk_atoms = params.public_b_chunk_atoms;
+            let mut mutated = original.data.clone();
+            state::write_market(&mut mutated, &cfg, &g).unwrap();
+            let mut acct = original;
+            for i in 0..acct.data.len() {
+                if mutated[i] != noop[i] {
+                    acct.data[i] = mutated[i];
+                }
+            }
+            let mut env = env;
+            env.svm.set_account(env.market, acct).unwrap();
+            return env;
+        }
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
