@@ -940,3 +940,4 @@ fn p2b_fork_percolator_earn_raises_ncap() {
         assert!(grew + 1 >= expect && grew <= expect + 1, "N_cap grew {grew}, expected ~{expect}");
     }
 }
+

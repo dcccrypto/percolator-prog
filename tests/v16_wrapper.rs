@@ -5836,6 +5836,8 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
@@ -6414,6 +6416,8 @@ Instruction::PermissionlessCrank {
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
@@ -6555,6 +6559,8 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: POS_SCALE,
@@ -6956,13 +6962,13 @@ fn v16_wrapper_account_layout_constants_match_serialized_state() {
     // slots grew by 33 B (band_epoch_snap u64, band_liq_pending u8, rent_snap u128,
     // rent_carry u64): 9563 + 16 * 33 = 10091.
     assert_eq!(
-        PORTFOLIO_ACCOUNT_LEN, 10091,
-        "v2.2: canonical portfolio account length is now 10091 (was 9563, TB-1a)"
+        PORTFOLIO_ACCOUNT_LEN, 10603,
+        "v2.2 combined (-rem): canonical portfolio account length is 10603 (9563 TB-1a + 528 band/rent + 512 K/F remainders)"
     );
     assert_eq!(
         PORTFOLIO_ACCOUNT_LEN,
-        9563 + percolator::V16_MAX_PORTFOLIO_ASSETS_N * 33,
-        "the whole v2.2 growth is the per-leg band/rent words"
+        9563 + percolator::V16_MAX_PORTFOLIO_ASSETS_N * (33 + 32),
+        "the whole v2.2 growth is the per-leg band/rent words and the K/F remainders"
     );
     // portfolio_account_len_for_market_slots returns PORTFOLIO_ACCOUNT_LEN regardless of slots.
     assert_eq!(
@@ -24357,12 +24363,12 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
     // the wrapper creates, which is why a PARTIAL re-seed hard-fails.
     assert_eq!(
         f01_w19_read_header_version(&market.data),
-        19,
+        percolator_prog::constants::VERSION,
         "KIND_MARKET header stamped with the new VERSION"
     );
     assert_eq!(
         f01_w19_read_header_version(&portfolio.data),
-        19,
+        percolator_prog::constants::VERSION,
         "KIND_PORTFOLIO header stamped with the new VERSION"
     );
     assert_eq!(market.data[10], percolator_prog::constants::KIND_MARKET);
@@ -24370,7 +24376,7 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
         portfolio.data[10],
         percolator_prog::constants::KIND_PORTFOLIO
     );
-    assert_eq!(f01_w19_read_disc(&portfolio.data), 19);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), percolator::V16_LAYOUT_DISCRIMINATOR);
     println!(
         "[w19] fresh accounts: market version={} kind={} | portfolio version={} kind={} disc={}",
         f01_w19_read_header_version(&market.data),
@@ -24531,7 +24537,7 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     //     can object, and it does. At VERSION 17 this image was fully accepted.
     portfolio.data = healthy.clone();
     f01_w19_set_header_version(&mut portfolio.data, F01W19_PRE18_WRAPPER_VERSION);
-    assert_eq!(f01_w19_read_disc(&portfolio.data), 19);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), percolator::V16_LAYOUT_DISCRIMINATOR);
     let a = run_ix_no_rollback(
         Instruction::ClosePortfolio {
             portfolio_id,
@@ -24553,7 +24559,8 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     //     satisfied and the refusal is the ENGINE's provenance check, Custom(16).
     portfolio.data = healthy.clone();
     f01_w19_set_disc(&mut portfolio.data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
-    assert_eq!(f01_w19_read_header_version(&portfolio.data), 19);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), percolator_prog::constants::VERSION);
+    assert_eq!(percolator_prog::constants::VERSION, 19);
     assert_eq!(
         state::check_portfolio_kind(&portfolio.data),
         Ok(()),

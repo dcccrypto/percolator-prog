@@ -1579,8 +1579,8 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
     );
 }
 
-/// Engine slot length of the previous (v2.1 pre-#277) layout. On this layout the engine appends
-/// `kf_drift_long/short` (160 B); on the old layout the strip below is a no-op.
+/// Lengths of the layout the parity fixture was generated on (c493bbc0, v2.1 pre-#277). They are
+/// CHECKS on the strip below, not its mechanism: the strip removes fields by name.
 const LEGACY_ENGINE_SLOT_LEN: usize = 1301;
 
 /// Account bytes with the appended K/F drift tail removed from every engine asset slot.
@@ -1605,7 +1605,6 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
         out.extend_from_slice(&data[s..cut]);
         tail_nonzero |= data[cut..s + stride].iter().any(|b| *b != 0);
     }
-    (out, tail_nonzero)
 }
 
 /// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth

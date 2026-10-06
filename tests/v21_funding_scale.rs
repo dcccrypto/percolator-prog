@@ -331,6 +331,10 @@ impl W {
 /// v2.1 production shape: bound vault LP (seniors + junior), skew funding on, `n` traders each
 /// long one unit against the LP, then one more slot so funding opens a cohort over everyone.
 fn positioned_market(n: usize, insurance: u128) -> (W, Vec<(Keypair, Pubkey)>) {
+    positioned_market_with(n, insurance, 1_000, 1_000)
+}
+
+fn positioned_market_with(n: usize, insurance: u128, slope_e9: u64, max_e9: u64) -> (W, Vec<(Keypair, Pubkey)>) {
     let mut w = W::new();
     w.create_vault();
     let seniors: Vec<Keypair> = (0..2).map(|_| Keypair::new()).collect();
@@ -338,7 +342,7 @@ fn positioned_market(n: usize, insurance: u128) -> (W, Vec<(Keypair, Pubkey)>) {
         w.earn_deposit(s, 200_000_000_000);
     }
     w.init_vault_lp();
-    w.set_risk_with_skew(1_000, 1_000);
+    w.set_risk_with_skew(slope_e9, max_e9);
     w.junior_deposit(50_000_000_000);
     if insurance != 0 {
         w.env.top_up_insurance(insurance);
@@ -458,4 +462,78 @@ fn v21_refresh_cost_and_baseline_bundle_ceiling() {
         per.push(w.bundle(vec![w.refresh_ix(*p)], &[]).expect("refresh"));
     }
     eprintln!("v21_funding_scale: refresh crank CU per positioned portfolio = {per:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v2.2: per-leg K/F settlement remainders (upstream a74b81b2) -- cadence invariance
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn equity(w: &W, p: Pubkey) -> i128 {
+    let a = w.env.portfolio_state(p);
+    a.capital as i128 + a.pnl
+}
+
+fn leg0(w: &W, p: Pubkey) -> percolator::PortfolioLegV16 {
+    w.env.portfolio_state(p).legs[0]
+}
+
+/// Two identical longs on the production shape (bound vault LP, skew funding > 0). Funding accrues
+/// one slot at a time for 30 slots. Portfolio A is refreshed by the permissionless crank after
+/// EVERY slot (30 one-slot settles); portfolio B once at the end. Each one-slot funding charge is a
+/// fraction of an atom, so before the per-leg remainders A paid a whole atom on every settle and
+/// B paid only the true total. Now both pay the same and end with the same remainder.
+#[test]
+fn v22_many_one_slot_settles_equal_one_settle() {
+    const SLOTS: usize = 30;
+    let (mut w, t) = positioned_market_with(2, 10_000_000, 1_000, 333);
+    let (a, b) = (t[0].1, t[1].1);
+    let ixs = vec![w.refresh_ix(a), w.refresh_ix(b)];
+    w.bundle(ixs, &[]).expect("settle both to a common start");
+    let (ea0, eb0) = (equity(&w, a), equity(&w, b));
+    let (la0, lb0) = (leg0(&w, a), leg0(&w, b));
+    assert_eq!(ea0, eb0);
+    assert_eq!((la0.basis_pos_q, la0.a_basis, la0.f_snap, la0.k_snap, la0.k_rem_num, la0.f_rem_num),
+               (lb0.basis_pos_q, lb0.a_basis, lb0.f_snap, lb0.k_snap, lb0.k_rem_num, lb0.f_rem_num));
+
+    let f = |w: &W| w.env.market_state().1.assets[0].f_long_num;
+    let mut f_prev = f(&w);
+    assert_eq!(f_prev, la0.f_snap);
+    let mut deltas = Vec::with_capacity(SLOTS);
+    for _ in 0..SLOTS {
+        w.tick();
+        let f_now = f(&w);
+        deltas.push(f_now - f_prev);
+        f_prev = f_now;
+        let ix = w.refresh_ix(a);
+        w.bundle(vec![ix], &[]).expect("one-slot refresh of A");
+        assert_eq!(leg0(&w, a).f_snap, f_now, "A settled this slot");
+        assert_eq!(leg0(&w, b).f_snap, lb0.f_snap, "B not settled yet");
+    }
+    let ix = w.refresh_ix(b);
+    w.bundle(vec![ix], &[]).expect("single refresh of B");
+
+    let (ea, eb) = (equity(&w, a), equity(&w, b));
+    let (la, lb) = (leg0(&w, a), leg0(&w, b));
+    assert_eq!(ea - ea0, eb - eb0, "30 one-slot settles == one 30-slot settle");
+    assert_eq!((la.k_rem_num, la.f_rem_num, la.f_snap, la.k_snap), (lb.k_rem_num, lb.f_rem_num, lb.f_snap, lb.k_snap));
+
+    // The exact value: floor((rem0 + basis * dF_total) / (a_basis * POS_SCALE)), remainder carried.
+    let basis = la0.basis_pos_q.unsigned_abs() as i128;
+    let den = (la0.a_basis * POS_SCALE) as i128;
+    let total: i128 = deltas.iter().sum();
+    let num = la0.f_rem_num as i128 + basis * total;
+    assert_eq!(la0.k_snap, la.k_snap, "price never moved: funding only");
+    assert_eq!(ea - ea0, num.div_euclid(den));
+    assert_eq!(la.f_rem_num as i128, num.rem_euclid(den));
+
+    // Negative control (non-vacuity): on these exact per-slot index moves the OLD rule -- floor
+    // each settle, drop the fraction -- charges A more than B. Every slot is a fractional charge.
+    assert!(deltas.iter().all(|d| *d != 0 && (basis * d).rem_euclid(den) != 0), "every slot is fractional: {deltas:?}");
+    let old_many: i128 = deltas.iter().map(|d| (basis * d).div_euclid(den)).sum();
+    let old_once = (basis * total).div_euclid(den);
+    assert!(old_many < old_once, "old rule: A {old_many} vs B {old_once}");
+    eprintln!(
+        "v22_kf_leg_remainders: {SLOTS} one-slot settles = one settle = {} atoms (old rule: {old_many} vs {old_once}); f_rem {}",
+        ea - ea0, la.f_rem_num
+    );
 }

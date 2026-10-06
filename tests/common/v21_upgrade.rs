@@ -27,6 +27,8 @@ pub const V21_LAYOUT_DISCRIMINATOR: u16 = 18;
 pub const V22_CONFIG_EXTRA: usize = 6 * 8;
 pub const V22_ASSET_EXTRA: usize = 8 * 8 + 3 * 16;
 const V22_LEG_EXTRA: usize = 8 + 1 + 16 + 8;
+/// -rem variant: per-leg K/F remainders (`k_rem_num`, `f_rem_num`), 32 B inserted after `f_snap`.
+pub const V22_LEG_REM_EXTRA: usize = 32;
 /// fix/v21-funding-scale appended this many bytes of K/F drift-generation state to the END of
 /// every engine asset slot. A live-captured DEPLOYED slab (7c906e45 / ff65ec50 layout) lacks it:
 /// `upgrade_slab` appends the zero tail (what a fresh slab starts with) while widening the slot.
@@ -72,13 +74,17 @@ fn upgrade_slab(old: &[u8]) -> Vec<u8> {
 
 fn upgrade_portfolio(old: &[u8]) -> Vec<u8> {
     let legs_off = core::mem::offset_of!(PortfolioAccountV16Account, legs);
-    let old_leg_len = core::mem::size_of::<PortfolioLegV16Account>() - V22_LEG_EXTRA;
+    let rem_cut = core::mem::offset_of!(PortfolioLegV16Account, k_rem_num);
+    let old_leg_len = core::mem::size_of::<PortfolioLegV16Account>() - V22_LEG_EXTRA - V22_LEG_REM_EXTRA;
     let state = &old[HEADER_LEN..];
     let mut out = Vec::with_capacity(old.len() + V16_MAX_PORTFOLIO_ASSETS_N * V22_LEG_EXTRA);
     out.extend_from_slice(&old[..HEADER_LEN]);
     out.extend_from_slice(&state[..legs_off]);
     for i in 0..V16_MAX_PORTFOLIO_ASSETS_N {
-        out.extend_from_slice(&state[legs_off + i * old_leg_len..legs_off + (i + 1) * old_leg_len]);
+        let leg = &state[legs_off + i * old_leg_len..legs_off + (i + 1) * old_leg_len];
+        out.extend_from_slice(&leg[..rem_cut]);
+        out.extend_from_slice(&[0u8; V22_LEG_REM_EXTRA]);
+        out.extend_from_slice(&leg[rem_cut..]);
         out.extend_from_slice(&[0u8; V22_LEG_EXTRA]);
     }
     out.extend_from_slice(&state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * old_leg_len..]);
@@ -172,7 +178,10 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
             out.extend_from_slice(&state[..legs_off]);
             for i in 0..V16_MAX_PORTFOLIO_ASSETS_N {
                 let leg = &state[legs_off + i * leg_len..legs_off + (i + 1) * leg_len];
-                out.extend_from_slice(&leg[..leg_len - V22_LEG_EXTRA]);
+                let rem_cut = core::mem::offset_of!(PortfolioLegV16Account, k_rem_num);
+                out.extend_from_slice(&leg[..rem_cut]);
+                zero(&leg[rem_cut..rem_cut + V22_LEG_REM_EXTRA], "leg K/F remainder");
+                out.extend_from_slice(&leg[rem_cut + V22_LEG_REM_EXTRA..leg_len - V22_LEG_EXTRA]);
                 zero(&leg[leg_len - V22_LEG_EXTRA..], "leg");
             }
             out.extend_from_slice(&state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * leg_len..]);
@@ -197,7 +206,7 @@ pub fn v21_market_len(v22_len: usize, slots: usize) -> usize {
 }
 
 pub fn v21_portfolio_len(v22_len: usize) -> usize {
-    v22_len - V16_MAX_PORTFOLIO_ASSETS_N * V22_LEG_EXTRA
+    v22_len - V16_MAX_PORTFOLIO_ASSETS_N * (V22_LEG_EXTRA + V22_LEG_REM_EXTRA)
 }
 
 pub fn deployed_market_len(v22_len: usize, slots: usize) -> usize {
