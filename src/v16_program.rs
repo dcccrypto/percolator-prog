@@ -29076,21 +29076,19 @@ pub mod processor {
             == MarketModeV16::Live;
         // M-1 (security review 2026-10-05): the coupon accrues on min(C_b, bond value) and is
         // forfeited while the tranche is impaired. The bond value is its layer of V BEFORE this
-        // crank's leg. If the vault LP cannot be valued now (stale certificate with inventory) the
-        // coupon is DEFERRED: nothing is paid and the checkpoint does not move, so a crank timed on
-        // a stale LP cannot strip the bonds' coupon; a deferral never pays more than the fresh
-        // cranks would have (the next crank's coupon is still capped by its own leg, M-2).
+        // crank's leg.
+        // N-1 (re-review 2026-10-06): if the vault LP cannot be valued now (stale certificate with
+        // inventory) the crank FAILS CLOSED (`VaultLpValuationStale`) instead of harvesting the leg
+        // with the coupon deferred: a deferral let anyone time 78 ahead of the keeper's LP refresh
+        // and starve the bonds. The vault-LP crank is permissionless; bundle it before 78.
         let pre_open = live && t.c_b_atoms > 0 && st.senior_draw_outstanding_atoms == 0;
-        let (bond_value, defer) = if pre_open {
-            match bond_value_before_leg(program_id, accounts, st, registry, t.c_b_atoms, available) {
-                Ok(v) => (v, false),
-                Err(_) => (0, true),
-            }
+        let bond_value = if pre_open {
+            bond_value_before_leg(program_id, accounts, st, registry, t.c_b_atoms, available)?
         } else {
-            (0, false)
+            0
         };
-        let open = !defer
-            && bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms, bond_value);
+        let open =
+            bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms, bond_value);
         let u_now = if open && t.coupon_util_bonus_bps != 0 {
             bond_util_now_bps(program_id, accounts, st).unwrap_or(0)
         } else {
@@ -29115,14 +29113,14 @@ pub mod processor {
         t.coupon_paid_total_atoms = t
             .coupon_paid_total_atoms
             .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
-        if !defer && now > t.last_coupon_slot {
+        if now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
         t.last_util_bps = u_now;
         state::write_bond_tranche(&mut t_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_coupon available={} due={} coupon={} c_b={} bond_value={} open={} defer={}",
-            available, due, coupon, t.c_b_atoms, bond_value, open, defer
+            "bond_coupon available={} due={} coupon={} c_b={} bond_value={} open={}",
+            available, due, coupon, t.c_b_atoms, bond_value, open
         ));
         Ok((coupon, rest, t.c_b_atoms))
     }
@@ -29130,7 +29128,14 @@ pub mod processor {
     /// M-1: the bonds' layer of the vault value BEFORE the fee leg `available` that tag 78 just
     /// harvested into the pots: `tranche_split3(V - available, C_eff, C_b).bond` with
     /// `V = nav + harvestable + vault-LP value`. [3]/[4] are 78's key-checked pot ledgers, [8] the
-    /// bound vault LP. Errors (e.g. a stale vault-LP certificate) make the caller defer the coupon.
+    /// bound vault LP, which must be WRITABLE here.
+    ///
+    /// N-1 (re-review 2026-10-06): the vault LP is RE-CERTIFIED on the engine's current state
+    /// (`full_account_refresh_not_atomic`, exactly what permissionless tag 5 and tag 103 do) before
+    /// it is valued. Measured: tag 78's own harvest advances `risk_epoch`, so a certificate taken
+    /// before the instruction is ALWAYS stale here once the vault LP holds inventory; reading it
+    /// would defer (old code: bonds starved on every such crank) or fail closed (brick 78). Any
+    /// error (read-only [8], refresh failure) fails tag 78 closed; nothing is deferred.
     #[inline(never)]
     fn bond_value_before_leg<'a>(
         program_id: &Pubkey,
@@ -29148,9 +29153,24 @@ pub mod processor {
         if lp_ai.key.to_bytes() != st.lp_portfolio || lp_ai.owner != program_id {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
+        expect_writable(lp_ai)?;
+        let max_market_slots =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.2;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
         let mut market_data = market_ai.try_borrow_mut_data()?;
-        let (cfg, group) = state::market_view_mut(&mut market_data)?;
-        let lp_value = with_portfolio_header_ro(lp_ai, |h| vault_lp_value_atoms(&group, h))?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        // Signed: an undrawn deficit of the refreshed vault LP comes OFF the pots' value (the draw
+        // will take it), so an LP loss can never make an impaired tranche look whole.
+        let lp_equity = {
+            let mut lp_data = lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+            group
+                .full_account_refresh_not_atomic(&mut lp)
+                .map_err(map_v16_error)?
+                .certified_equity
+        };
+        group.validate_shape().map_err(map_v16_error)?;
         let nav = {
             let own = own_ledger_ai.try_borrow_data()?;
             let sib = sibling_ledger_ai.try_borrow_data()?;
@@ -29172,9 +29192,11 @@ pub mod processor {
             st.senior_fee_share_bps,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let v = vault_lp_v18::vault_value(nav, harvestable, lp_value)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?
-            .saturating_sub(available);
+        let nav_h = nav
+            .checked_add(harvestable)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let lp_pos = if lp_equity > 0 { lp_equity as u128 } else { 0 };
+        let v = bond_v20::vault_value_worse(nav_h, lp_pos, lp_equity).saturating_sub(available);
         Ok(bond_v20::tranche_split3(v, c_eff, bond_claim).bond)
     }
 

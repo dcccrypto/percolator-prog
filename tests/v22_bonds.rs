@@ -372,6 +372,147 @@ impl Env {
         env
     }
 
+    /// N-2 test helper: the harness constructor WITHOUT tag 69 CreateLpVault (so a launch can
+    /// create the LP vault, bind it and create the bond tranche in ONE transaction).
+    fn new_bare(p: Params, matcher_so: PathBuf) -> Env {
+        let mut svm = LiteSVM::new();
+        let pid = percolator_prog::id();
+        svm.add_program(pid, &std::fs::read(program_path()).unwrap());
+        svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).unwrap());
+        // P3 auto-pin: tag 94 accepts only the protocol's canonical matcher program id.
+        let matcher = CANONICAL_MATCHER;
+        svm.add_program(matcher, &std::fs::read(&matcher_so).unwrap());
+        let payer = Keypair::new();
+        let admin = Keypair::new();
+        let market = Pubkey::new_unique();
+        let mint = Pubkey::new_unique();
+        svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
+        svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
+        svm.set_account(
+            mint,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_mint_data(),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        svm.set_account(
+            market,
+            Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; state::market_account_len_for_capacity(p.assets as usize).unwrap()],
+                owner: pid,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let vault_authority = Pubkey::find_program_address(&[b"vault", market.as_ref()], &pid).0;
+        let vault_token = canonical_vault_ata(&vault_authority, &mint);
+        svm.set_account(
+            vault_token,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(mint, vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+        let (registry, _) = derive_lp_vault_registry(&pid, &market);
+        let (lp_mint, _) = derive_lp_vault_mint(&pid, &market);
+        let (escrow, _) = derive_lp_escrow(&pid, &market);
+        let (ledger, _) = derive_lp_backing_ledger(&pid, &market, DOMAIN);
+        let (sibling, _) = derive_lp_backing_ledger(&pid, &market, DOMAIN ^ 1);
+        let (vault_lp, _) = derive_vault_lp_state(&pid, &market);
+        let mut env = Env {
+            svm,
+            pid,
+            payer,
+            admin,
+            market,
+            mint,
+            vault_token,
+            vault_authority,
+            registry,
+            lp_mint,
+            escrow,
+            ledger,
+            sibling,
+            vault_lp,
+            matcher,
+            plen: state::portfolio_account_len_for_market_slots(p.assets as usize).unwrap(),
+            slot: 1,
+            paid_in: 0,
+            paid_out: 0,
+        };
+        env.svm.warp_to_slot(1);
+        let admin = env.admin.insecure_clone();
+        let init = ProgInstruction::InitMarket {
+                max_portfolio_assets: p.assets,
+                h_min: 0,
+                h_max: 10,
+                initial_price: PRICE,
+                min_nonzero_mm_req: 1,
+                min_nonzero_im_req: 2,
+                maintenance_margin_bps: p.mm_bps,
+                initial_margin_bps: p.im_bps,
+                max_trading_fee_bps: 10_000,
+                trade_fee_base_bps: p.fee_bps,
+                liquidation_fee_bps: 0,
+                liquidation_fee_cap: 0,
+                min_liquidation_abs: 0,
+                max_price_move_bps_per_slot: p.move_bps,
+                max_accrual_dt_slots: 1,
+                max_abs_funding_e9_per_slot: p.funding,
+                min_funding_lifetime_slots: 1,
+                max_account_b_settlement_chunks: 1,
+                max_bankrupt_close_chunks: 1,
+                max_bankrupt_close_lifetime_slots: 100,
+                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                maintenance_fee_per_slot: p.maint_fee,
+            };
+        let init = match p.growth {
+            None => init,
+            Some((r, l)) => ProgInstruction::InitMarketV19 {
+                market: Box::new(init),
+                growth_r_gap_bps: r,
+                growth_l_launch_x100: l,
+            },
+        };
+        env.send(
+            init,
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+                AccountMeta::new_readonly(mint, false),
+            ],
+            &[&admin],
+        )
+        .expect("init market");
+        let seq = env.oracle_seq() + 1;
+        env.send(
+            ProgInstruction::ConfigureAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: 1,
+                initial_mark_e6: PRICE,
+                observation_sequence: seq,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .expect("configure auth mark");
+        env
+    }
+
     fn send(
         &mut self,
         ix: ProgInstruction,
@@ -1792,9 +1933,15 @@ impl Env {
         Ok(paid)
     }
 
-    /// Tag 78 on a bound vault with the Phase 4 tail ([7] ext, [8] vault LP, [9] tranche).
+    /// Tag 78 on a bound vault with the Phase 4 tail ([7] ext, [8] vault LP WRITABLE -- N-1:
+    /// 78 re-certifies it before valuing the bonds -- and [9] tranche).
     fn crank_fees_bond(&mut self, lp: Pubkey) -> Result<(), String> {
+        self.crank_fees_bond_lp(lp, true)
+    }
+
+    fn crank_fees_bond_lp(&mut self, lp: Pubkey, lp_writable: bool) -> Result<(), String> {
         let (ext, tranche) = (self.ext_key(), self.tranche_key());
+        let lp_meta = if lp_writable { AccountMeta::new(lp, false) } else { AccountMeta::new_readonly(lp, false) };
         self.send(
             ProgInstruction::LpVaultCrankFees { domain: DOMAIN },
             vec![
@@ -1806,7 +1953,7 @@ impl Env {
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new(self.vault_lp, false),
                 AccountMeta::new(ext, false),
-                AccountMeta::new_readonly(lp, false),
+                lp_meta,
                 AccountMeta::new(tranche, false),
             ],
             &[],
@@ -2676,3 +2823,148 @@ fn sec_l1_junior_ahead_of_the_coupon_crank_cannot_reach_bonds() {
         env.assert_conserved("sec_l1");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Re-review of #530 @ e2e5653f (2026-10-06): N-1 and N-2.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// N-1 (ported from sec_v22c_adv2.rs::sec2_deferral_on_stale_lp). MEASURED ROOT CAUSE: tag 78's
+/// own harvest advances `risk_epoch`, so once the vault LP holds inventory a certificate taken
+/// before 78 is ALWAYS stale inside it. The pre-fix code then DEFERRED the coupon (the bonds got
+/// nothing on every such crank, and anyone could force it by cranking 78 ahead of the keeper);
+/// failing closed on it would have bricked 78. Fix: 78 RE-CERTIFIES the vault LP
+/// (`full_account_refresh_not_atomic`, as tag 5 / 103 do) before valuing the bonds; any failure
+/// fails 78 closed, nothing is deferred.
+/// (a) the stale-timed crank (inventory, mark moved, NOTHING cranked) pays the full coupon
+///     `min(due, leg / 2)` and moves the checkpoint -- the bonds cannot be starved by timing;
+/// (b) with the vault LP passed read-only (no refresh possible) 78 FAILS CLOSED: nothing
+///     harvested, tranche and Earn untouched.
+/// Negative control: mutant MB9 (no in-instruction refresh) fails (a).
+#[test]
+fn sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed() {
+    let setup = || {
+        let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+        let t = env.new_trader(10_000 * U);
+        env.slot += 500_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        env.trade(&t, &lp, 500 * UQ).expect("open: the vault LP holds inventory");
+        env.hold(1, &[]); // mark re-pushed one slot later, NOTHING cranked
+        (env, lp, d, h, t)
+    };
+    // (b) read-only vault LP: fail closed
+    let (mut env, lp, _d, _h, _t) = setup();
+    let (tr0, c0) = (env.tranche(), env.vlp().senior_claim_atoms);
+    let w0 = env.market_state().0.lp_fee_withdrawn_atoms;
+    assert!(env.crank_fees_bond_lp(lp.portfolio, false).is_err(), "N-1: no valuation, no harvest");
+    assert_eq!(env.tranche(), tr0);
+    assert_eq!(env.vlp().senior_claim_atoms, c0);
+    assert_eq!(env.market_state().0.lp_fee_withdrawn_atoms, w0, "leg not harvested");
+    // (a) the stale-timed crank pays in full
+    let (mut env, lp, _d, _h, _t) = setup();
+    let tr0 = env.tranche();
+    let (cfg, _) = env.market_state();
+    let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+    let due = bond_v20::coupon_due(tr0.c_b_atoms, 2_000, env.slot - tr0.last_coupon_slot).unwrap();
+    let c0 = env.vlp().senior_claim_atoms;
+    env.crank_fees_bond(lp.portfolio).expect("78 re-certifies the vault LP and harvests");
+    let tr1 = env.tranche();
+    let coupon = tr1.c_b_atoms - tr0.c_b_atoms;
+    eprintln!("N-1 stale-timed crank: leg {leg} due {due} coupon {coupon}");
+    assert!(leg > 0 && due > 0, "vacuity");
+    assert_eq!(coupon, due.min(leg / 2), "full coupon, not deferred");
+    assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
+    assert_eq!(tr1.last_coupon_slot, env.slot, "checkpoint moved");
+}
+
+/// N-2: a dust Earn deposit made before tag 107 permanently disables bonds on that market (107
+/// is refused once any Earn exists, M-2). The SAFE LAUNCH is atomic: create the LP vault (69),
+/// bind it (94) and create the bond tranche (107) in ONE transaction, which leaves no window for
+/// any Earn deposit. This test (a) shows the grief on the unbundled path, (b) builds the bundle
+/// as a real transaction (the two program-owned accounts tag 94 needs are created by system
+/// create_account inside it), checks it fits one packet, and (c) that the market then takes Earn
+/// and bonds normally.
+#[test]
+fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
+    // (a) unbundled: anyone's dust Earn deposit between 69 and 107 disables bonds for good
+    let mut env = Env::new(Params::default());
+    let griefer = env.new_depositor();
+    env.earn_deposit(&griefer, U, None).expect("minimum-size Earn deposit before the bind");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    err_has(&env.init_bond_tranche_as(&admin, (800, 0, COOLDOWN, 5_000)), PercolatorError::BondConfigInvalid);
+    let _ = lp;
+
+    // (b) the atomic launch bundle
+    let mut env = Env::new_bare(Params::default(), matcher_program_path());
+    let admin = env.admin.insecure_clone();
+    let a = admin.pubkey();
+    env.set_program_data_authority(&a);
+    let lp_kp = Keypair::new();
+    let ctx_kp = Keypair::new();
+    let (lp, ctx) = (lp_kp.pubkey(), ctx_kp.pubkey());
+    let delegate = Pubkey::find_program_address(
+        &[b"matcher", env.market.as_ref(), lp.as_ref(), env.registry.as_ref(), env.matcher.as_ref(), ctx.as_ref()],
+        &env.pid,
+    )
+    .0;
+    let rent = |n: usize| env.svm.minimum_balance_for_rent_exemption(n);
+    let (plen, plen_rent, ctx_rent) = (env.plen, rent(env.plen), rent(MATCHER_CONTEXT_LEN));
+    let ix = |pid: Pubkey, ix: ProgInstruction, accounts: Vec<AccountMeta>| Instruction { program_id: pid, accounts, data: ix.encode() };
+    let pd = env.program_data_key();
+    let instructions = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+        solana_sdk::system_instruction::create_account(&admin.pubkey(), &lp, plen_rent, plen as u64, &env.pid),
+        solana_sdk::system_instruction::create_account(&admin.pubkey(), &ctx, ctx_rent, MATCHER_CONTEXT_LEN as u64, &env.matcher),
+        ix(env.pid, ProgInstruction::CreateLpVault { fee_share_bps: 5_000, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: DOMAIN }, vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.registry, false),
+            AccountMeta::new(env.lp_mint, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ]),
+        ix(env.pid, ProgInstruction::InitVaultLp { junior_floor_bps: 2_000 }, vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(env.ledger, false),
+            AccountMeta::new_readonly(env.sibling, false),
+            AccountMeta::new_readonly(env.matcher, false),
+            AccountMeta::new(ctx, false),
+            AccountMeta::new_readonly(delegate, false),
+        ]),
+        ix(env.pid, ProgInstruction::InitBondTranche { coupon_bps: 800, util_bonus_bps: 0, cooldown_slots: COOLDOWN, cap_bps: 5_000 }, vec![
+            AccountMeta::new_readonly(admin.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(env.registry, false),
+            AccountMeta::new_readonly(env.vault_lp, false),
+            AccountMeta::new(env.ext_key(), false),
+            AccountMeta::new(env.tranche_key(), false),
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new_readonly(pd, false),
+        ]),
+    ];
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(&instructions, Some(&admin.pubkey()), &[&admin, &lp_kp, &ctx_kp], env.svm.latest_blockhash());
+    let size = bincode::serialize(&tx).unwrap().len();
+    eprintln!("N-2 launch bundle (69 + 94 + 107 + 2 create_account): {size} bytes");
+    assert!(size <= 1_232, "the launch bundle must fit one packet: {size} B");
+    env.svm.send_transaction(tx).map_err(|e| format!("{e:?}")).expect("atomic launch bundle");
+    assert_eq!(env.registry_state()._reserved[0], 1, "bound");
+    assert_eq!(env.registry_state()._reserved[2], 1, "bond tranche exists");
+    // (c) the market then takes Earn and bonds normally
+    let lpv = Lp { portfolio: lp, owner_key: env.registry, ctx, delegate };
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, Some(lpv.portfolio)).expect("Earn after the launch");
+    env.junior_deposit_as(&admin, lpv.portfolio, 2_000 * U).expect("junior");
+    let h = env.new_bond_holder();
+    env.bond_deposit(&h, lpv.portfolio, 1_000 * U, 1).expect("bond");
+    assert_eq!(env.tranche().c_b_atoms, 1_000 * U as u128);
+    env.assert_conserved("launch bundle");
+}
+
