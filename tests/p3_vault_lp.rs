@@ -1154,6 +1154,26 @@ fn p3_init_vault_lp_binds_a_registry_owned_lp_and_seeds_senior_claim_at_nav() {
     err_has(&env.init_vault_lp_as(&admin, 1_000), PercolatorError::VaultLpAlreadyBound);
 }
 
+/// v2.2 (10,603 B portfolios): InitVaultLp REFUSES a pre-created lp portfolio whose length is not
+/// exactly `PORTFOLIO_ACCOUNT_LEN` (InvalidAccountLen) instead of attempting a realloc that the
+/// program's entrypoint bridge cannot perform above 10,240 B; the exact length binds. The
+/// refused account is untouched (no silent resize).
+#[test]
+fn v22_init_vault_lp_refuses_a_wrong_portfolio_length_and_never_reallocs() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 5_000_000, None).expect("pre-bind earn deposit");
+    let admin = env.admin.insecure_clone();
+    let exact = env.plen;
+    for bad in [0usize, 10_240, exact - 1, exact + 1, exact + 10_240] {
+        env.plen = bad;
+        let r = env.init_vault_lp_as(&admin, 1_000);
+        err_has(&r, PercolatorError::InvalidAccountLen);
+    }
+    env.plen = exact;
+    env.init_vault_lp_as(&admin, 1_000).expect("the exact length binds");
+}
+
 #[test]
 fn p3_init_vault_lp_refuses_non_marketauth_and_thin_floor() {
     let mut env = Env::new(Params::default());

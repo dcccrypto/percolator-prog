@@ -3155,6 +3155,47 @@ fn a4_keeper_ok_without_a_floor_is_refused() {
     w.r.request_76(&w.h, w.h_ata, Some((1, 1))).expect("with a floor");
 }
 
+/// A4 pin (SDK finding 6): the tag 77 decoder accepts `min_payout = 0` with `n_refresh > 0` (only
+/// the ALL-ZERO v2.2 trailer is refused). That cannot bypass the A4 rule:
+///  * A4 is enforced at REQUEST time (tag 76 refuses `keeper_ok = 1` with `min_payout = 0`), so
+///    every keeper_ok request carries a non-zero stored floor;
+///  * the executed floor is `max(wire, stored)`, so a keeper's wire 0 still executes at the stored
+///    floor, never below it;
+///  * a legacy (non keeper_ok) request cannot be executed by anyone but the redeemer's signature,
+///    whatever the wire floor and refresh count.
+#[test]
+fn a4_wire_zero_floor_with_refresh_cannot_bypass_the_stored_floor() {
+    use percolator_prog::ix::Instruction as ProgInstruction;
+    // decoder shape: min_payout = 0 with n_refresh = 1 decodes; the all-zero trailer does not
+    let mut ok = vec![77u8];
+    ok.extend_from_slice(&0u16.to_le_bytes());
+    ok.extend_from_slice(&0u64.to_le_bytes());
+    ok.push(1);
+    assert!(matches!(ProgInstruction::decode(&ok), Ok(ProgInstruction::ExecuteRedemptionV22 { min_payout_atoms: 0, n_refresh: 1, .. })));
+    let mut zero = vec![77u8];
+    zero.extend_from_slice(&0u16.to_le_bytes());
+    zero.extend_from_slice(&0u64.to_le_bytes());
+    zero.push(0);
+    assert!(ProgInstruction::decode(&zero).is_err(), "the all-zero trailer is refused");
+
+    let mut w = r3m1_world();
+    let lp = w.r.lp;
+    // legacy request (no keeper_ok): an unsigned 77 is refused whatever the wire floor / refresh count
+    w.r.request_76(&w.m, w.m_ata, None).expect("M 76 legacy");
+    // keeper_ok request with a non-zero stored floor (A4 makes a zero floor impossible here)
+    assert!(w.r.request_76(&w.h, w.h_ata, Some((0, 1))).is_err(), "A4 at request time");
+    w.r.request_76(&w.h, w.h_ata, Some((R3M1_DEPOSIT - 2, 1))).expect("H 76 keeper_ok with a floor");
+    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
+    let legacy = w.r.execute_77(&w.m, Some((0, vec![w.a1, w.a2, lp])), false);
+    assert_eq!(code(&legacy), Some(ERR_EXPECTED_SIGNER), "legacy + wire 0 + refresh, unsigned: {legacy:?}");
+    // keeper with wire floor 0 and refresh accounts: executes only at >= the STORED floor
+    let (paid, _) = w
+        .r
+        .execute_77(&w.h, Some((0, vec![w.a1, w.a2, lp])), false)
+        .expect("keeper 77 with wire 0 on a keeper_ok request");
+    assert!(paid >= R3M1_DEPOSIT - 2, "wire 0 did not lower the stored floor: paid {paid}");
+}
+
 /// A6 (security review): 14-leg portfolios. One inline refresh of a 14-leg portfolio costs
 /// ~530k CU, so 8 of them (or even 3) would exhaust the 1.4M meter. The leg-weighted budget
 /// (3 + legs per refresh, <= 38) refuses 3 x 14-leg up front (InvalidInstruction, not a CU

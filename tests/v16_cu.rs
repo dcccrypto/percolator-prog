@@ -379,6 +379,9 @@ struct V16CuMarketParams {
     max_bankrupt_close_lifetime_slots: u64,
     public_b_chunk_atoms: u128,
     maintenance_fee_per_slot: u128,
+    /// v2.2: create the market account with a REAL top-level system `createAccount` (client path)
+    /// instead of injecting it with `svm.set_account`.
+    system_created_market: bool,
 }
 
 impl Default for V16CuMarketParams {
@@ -406,6 +409,7 @@ impl Default for V16CuMarketParams {
             max_bankrupt_close_lifetime_slots: 100,
             public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
+            system_created_market: false,
         }
     }
 }
@@ -482,7 +486,8 @@ impl V16CuEnv {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new();
+        let market = if params.system_created_market { market_kp.pubkey() } else { Pubkey::new_unique() };
         let mint = Pubkey::new_unique();
         let vault_authority =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id).0;
@@ -511,23 +516,38 @@ impl V16CuEnv {
             },
         )
         .unwrap();
-        svm.set_account(
-            market,
-            Account {
-                lamports: 1_000_000_000,
-                data: vec![
-                    0u8;
-                    state::market_account_len_for_capacity(
-                        params.max_portfolio_assets as usize
-                    )
-                    .unwrap()
-                ],
-                owner: program_id,
-                executable: false,
-                rent_epoch: 0,
-            },
-        )
-        .unwrap();
+        let market_len =
+            state::market_account_len_for_capacity(params.max_portfolio_assets as usize).unwrap();
+        if params.system_created_market {
+            // client path: a real top-level system `createAccount` of the full market length, owned
+            // by the program, before InitMarket (the account is NOT injected with `set_account`).
+            let ix = solana_sdk::system_instruction::create_account(
+                &payer.pubkey(),
+                &market,
+                svm.minimum_balance_for_rent_exemption(market_len.max(16_000)), // over-funded so a later realloc stays rent-exempt
+                market_len as u64,
+                &program_id,
+            );
+            let tx = Transaction::new_signed_with_payer(
+                &[ix],
+                Some(&payer.pubkey()),
+                &[&payer, &market_kp],
+                svm.latest_blockhash(),
+            );
+            svm.send_transaction(tx).expect("system createAccount of the market");
+        } else {
+            svm.set_account(
+                market,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; market_len],
+                    owner: program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        }
 
         send_tx(
             &mut svm,
@@ -614,6 +634,37 @@ impl V16CuEnv {
         (portfolio, cu)
     }
 
+    /// v2.2 client path: a REAL top-level system `createAccount` of exactly `len` bytes (owned by the
+    /// program) followed by `InitPortfolio`, in one transaction. Returns the account key.
+    fn create_portfolio_via_system(&mut self, owner: &Keypair, len: usize) -> Result<Pubkey, String> {
+        self.ensure_signer_account(owner.pubkey());
+        let account = Keypair::new();
+        let create = solana_sdk::system_instruction::create_account(
+            &self.payer.pubkey(),
+            &account.pubkey(),
+            self.svm.minimum_balance_for_rent_exemption(len),
+            len as u64,
+            &self.program_id,
+        );
+        let init = Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(account.pubkey(), false),
+            ],
+            data: ProgInstruction::InitPortfolio.encode(),
+        };
+        let tx = Transaction::new_signed_with_payer(
+            &[heap_ix(), cu_ix(), create, init],
+            Some(&self.payer.pubkey()),
+            &[&self.payer, &account, owner],
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).map_err(|e| format!("{e:?}"))?;
+        Ok(account.pubkey())
+    }
+
     /// TB-1b: read the account's CURRENT portfolio_id/sequence/position_epoch
     /// directly off the live SVM account bytes, right before building an
     /// instruction that binds to them. Always correct regardless of how many
@@ -654,6 +705,28 @@ impl V16CuEnv {
         backing_bucket_authority: Pubkey,
         oracle_authority: Pubkey,
     ) -> u64 {
+        self.try_activate_asset_with_authorities(
+            asset_index,
+            now_slot,
+            initial_price,
+            insurance_authority,
+            insurance_operator,
+            backing_bucket_authority,
+            oracle_authority,
+        )
+        .expect("activate asset")
+    }
+
+    fn try_activate_asset_with_authorities(
+        &mut self,
+        asset_index: u16,
+        now_slot: u64,
+        initial_price: u64,
+        insurance_authority: Pubkey,
+        insurance_operator: Pubkey,
+        backing_bucket_authority: Pubkey,
+        oracle_authority: Pubkey,
+    ) -> Result<u64, String> {
         let clock = self.svm.get_sysvar::<Clock>();
         if clock.slot < now_slot {
             self.svm.warp_to_slot(now_slot);
@@ -696,7 +769,6 @@ impl V16CuEnv {
             ],
             &[&self.admin],
         )
-        .expect("activate asset")
     }
 
     /// TB-2b: reads the LIVE `AssetControlSequencesV16` lanes for `asset_index`
@@ -1155,18 +1227,18 @@ impl V16CuEnv {
         self.svm.set_account(self.market, account).unwrap();
     }
 
-    // Test-harness-only workaround for a LiteSVM/solana-bpf-loader-program realloc
-    // limitation on accounts injected directly via `svm.set_account()` (rather than a
-    // real on-chain `CreateAccount`): such accounts cannot be grown past roughly
-    // `MAX_PERMITTED_DATA_INCREASE` (10,240) total bytes through the BPF program's own
-    // `AccountInfo::realloc()` call, no matter how small the requested delta is or
-    // whether the growth is a single jump or a sequence of smaller steps -- this is an
-    // absolute ceiling on the resulting length for THIS test environment, not a real
-    // Solana/mainnet constraint (a genuinely-created account gets the runtime's usual
-    // realloc headroom). `ActivateAsset`'s own on-chain realloc (`market_ai.realloc`,
-    // used only when `asset_index >= capacity_pre`) hits exactly this wall once a
-    // market's total account size crosses that threshold, which any market with more
-    // than a handful of assets already does.
+    // Test-harness-only workaround for the realloc ceiling of THIS PROGRAM. It is NOT a LiteSVM
+    // artifact (corrected in the v2.2 combined release; see
+    // `v22_market_realloc_ceiling_is_absolute_on_a_system_created_account`, which reproduces it on a
+    // market created by a REAL system `createAccount`): `AccountInfo::realloc()` inside the program
+    // refuses any target length above `MAX_PERMITTED_DATA_INCREASE` (10,240) no matter how small the
+    // real delta is, because the u32 the BPF loader fills with the original data length is
+    // Pinocchio's `resize_delta` (reset to 0 by its entrypoint) and the legacy-AccountInfo bridge
+    // reads it as `original_data_len`. So on mainnet too a market can be grown by `ActivateAsset`'s
+    // `market_ai.realloc` only while the new total stays <= 10,240 B (capacity <= 3 in the v2.2
+    // layout); larger markets must be created at their full capacity. `ActivateAsset`'s own realloc
+    // (`market_ai.realloc`, used only when `asset_index >= capacity_pre`) hits this wall once a
+    // market's total account size crosses that threshold.
     //
     // This helper grows the market account's raw byte buffer directly through the test
     // harness's own account-injection path (no on-chain realloc involved, so the
@@ -20929,9 +21001,8 @@ fn v16_bpf_nonzero_garbage_insurance_ledger_account_is_rejected() {
 //
 // This ports only the LENGTH-equality tightening: an explicit `> required`
 // guard ahead of the existing grow branch in the shared realloc helper
-// (`handle_init_portfolio` remains the one caller allowed to
-// canonicalize/shrink a still-uninitialized System-Program-created account,
-// via its own `!=` realloc gate), plus `!=`/upper-bound checks on the
+// (v2.2: `handle_init_portfolio` and InitVaultLp no longer canonicalize
+// with realloc either: any length other than PORTFOLIO_ACCOUNT_LEN is refused), plus `!=`/upper-bound checks on the
 // init/view helpers. The portfolio-IDENTITY half of upstream's 2c8c5ba3
 // (portfolio_id threading) is Track-B and is NOT part of this port — our fork
 // lacks that infra.
@@ -26050,4 +26121,103 @@ fn p2b_privileged_reactivation_of_a_retired_slot_clears_the_adl_episode_record()
     assert_eq!(after.adl_episode_since_slot, 0, "old episode start must not survive re-activation");
     assert_eq!(after.adl_max_episode_slots, 0, "old N override must not survive re-activation");
     assert_eq!(after.adl_episode_epoch_long, 0);
+}
+
+
+// ---------------------------------------------------------------------------
+// v2.2 combined release: portfolio account length and the realloc ceiling.
+//
+// REAL on-chain behaviour (settled by source reasoning + these tests, which use the real BPF
+// program under LiteSVM's real loader serialization, and accounts created by a REAL system
+// `createAccount`, not injected):
+//  * a top-level system `createAccount` of any length up to 10 MiB works, so a 10,603 B portfolio
+//    is fine IF the client creates it at exactly `PORTFOLIO_ACCOUNT_LEN`;
+//  * `AccountInfo::realloc` inside this program refuses any target above 10,240 B regardless of
+//    the account's real prior length: the BPF loader's `original_data_len` u32 is Pinocchio's
+//    `resize_delta` (reset to 0 by its entrypoint), and the legacy-AccountInfo bridge reads it as
+//    the original length. So the ceiling is absolute for EVERY account, system-created or not.
+//  * InitPortfolio / InitVaultLp therefore REFUSE a pre-created account of the wrong length
+//    (InvalidAccountLen) instead of attempting a realloc.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn v22_portfolio_created_by_system_create_account_at_exact_len_inits_and_trades() {
+    let mut env = V16CuEnv::new();
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let len = percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN;
+    let pa = env.create_portfolio_via_system(&a, len).expect("client path: createAccount + InitPortfolio at the exact length");
+    let pb = env.create_portfolio_via_system(&b, len).expect("second portfolio");
+    assert_eq!(env.svm.get_account(&pa).unwrap().data.len(), len, "no resize happened");
+    env.deposit(&a, pa, 1_000_000);
+    env.deposit(&b, pb, 1_000_000);
+    env.trade_with_cu(&a, pa, &b, pb, (10 * POS_SCALE) as i128, 150, 100);
+    let da = env.svm.get_account(&pa).unwrap().data;
+    assert_eq!(da.len(), len, "still the exact length after trading");
+    let p = state::read_portfolio(&da).unwrap();
+    assert!(p.legs.iter().any(|l| l.active), "the trade opened a leg on a system-created portfolio");
+}
+
+#[test]
+fn v22_init_portfolio_refuses_a_wrong_length_and_never_reallocs() {
+    let mut env = V16CuEnv::new();
+    let required = percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN;
+    let code = percolator_prog::error::PercolatorError::InvalidAccountLen as u32;
+    for bad in [0usize, 1_000, 10_240, required - 1, required + 1, required + 10_240, 2 * required] {
+        let owner = Keypair::new();
+        // a real createAccount at `bad` bytes, then InitPortfolio in the same transaction
+        let r = env.create_portfolio_via_system(&owner, bad);
+        let e = r.expect_err(&format!("length {bad} must be refused"));
+        assert!(e.contains(&format!("Custom({code})")), "len {bad}: expected InvalidAccountLen ({code}), got {e}");
+    }
+    // Injected accounts (the shape of every older test harness) are refused the same way, and the
+    // refusal leaves the account untouched: same length, still uninitialised.
+    for bad in [required - 1, required + 1, 10_240] {
+        let owner = Keypair::new();
+        env.ensure_signer_account(owner.pubkey());
+        let key = Pubkey::new_unique();
+        env.svm
+            .set_account(key, Account { lamports: 1_000_000_000, data: vec![0u8; bad], owner: env.program_id, executable: false, rent_epoch: 0 })
+            .unwrap();
+        let r = env.send(
+            ProgInstruction::InitPortfolio,
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(key, false)],
+            &[&owner],
+        );
+        let e = r.expect_err("wrong length refused");
+        assert!(e.contains(&format!("Custom({code})")), "injected len {bad}: {e}");
+        let after = env.svm.get_account(&key).unwrap().data;
+        assert_eq!(after.len(), bad, "no silent realloc");
+        assert!(after.iter().all(|b| *b == 0), "account left uninitialised");
+    }
+    // control: the exact length is accepted
+    let owner = Keypair::new();
+    env.create_portfolio_via_system(&owner, required).expect("exact length accepted");
+}
+
+#[test]
+fn v22_market_realloc_ceiling_is_absolute_on_a_system_created_account() {
+    // A market created by a REAL system `createAccount` at capacity 1. ActivateAsset appends by
+    // `realloc`: indexes 1 and 2 (new lengths 6,656 / 9,285 B in the -rem layout) succeed; index 3
+    // needs 11,914 B, an INCREASE of only ~2.6 kB over the real prior length -- far inside
+    // MAX_PERMITTED_DATA_INCREASE if the runtime's incremental rule applied -- yet it is refused,
+    // because the program's `realloc` measures against `original_data_len == 0`.
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        system_created_market: true,
+        ..V16CuMarketParams::default()
+    });
+    let cap3 = state::market_account_len_for_capacity(3).unwrap();
+    let cap4 = state::market_account_len_for_capacity(4).unwrap();
+    assert!(cap3 <= 10_240 && cap4 > 10_240, "cap3 {cap3}, cap4 {cap4}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data.len(), state::market_account_len_for_capacity(1).unwrap());
+    let admin = env.admin.pubkey();
+    for (i, slot) in [(1u16, 5u64), (2, 6)] {
+        env.try_activate_asset_with_authorities(i, slot, 100, admin, admin, admin, admin)
+            .unwrap_or_else(|e| panic!("append to capacity {} must work: {e}", i + 1));
+    }
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data.len(), cap3);
+    let r = env.try_activate_asset_with_authorities(3, 7, 100, admin, admin, admin, admin);
+    let e = r.expect_err("capacity 4 (> 10,240 B) is refused although the real delta is small");
+    assert!(e.contains("InvalidRealloc"), "expected InvalidRealloc, got {e}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data.len(), cap3, "no partial growth");
 }

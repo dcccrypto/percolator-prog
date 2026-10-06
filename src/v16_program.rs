@@ -253,6 +253,13 @@ pub mod constants {
     //     compute the TRUE incremental delta -- reads back `0` for this
     //     program's accounts under its Anchor-v2/Pinocchio entrypoint
     //     bridge, instead of the account's real pre-instruction length.
+    //     (v2.2 combined release, settled by reasoning + test: the u32 that the
+    //     BPF loader fills with the original length is, in Pinocchio's
+    //     `RuntimeAccount`, the `resize_delta` field, which the Pinocchio
+    //     entrypoint resets to 0; the bridge then builds a legacy `AccountInfo`
+    //     over the same bytes. This is the REAL on-chain behaviour, not a LiteSVM
+    //     artifact: LiteSVM runs the same loader serialization and the same
+    //     entrypoint. Test: `tests/v22_portfolio_len.rs`.)
     //     With that field reading 0, `realloc`'s internal check degenerates
     //     from "reject a >10_240-byte INCREASE" to "reject a >10_240-byte
     //     ABSOLUTE new length", a much tighter, non-obvious ceiling. This is
@@ -1730,8 +1737,11 @@ VaultLpMultiAssetMarket,
         // 104..=119 block (ledger v22-allocations.md). Never folded into 21 (the E7 lesson).
         /// v2.2 band: the asset's price is pinned to its band (edge or epoch window) or an
         /// accrual fed a price outside the band; also a favourable-side close refused while
-        /// pinned. Engine `V16Error::BandOutOfRange` / `V16Error::BandPinned`. Custom(104).
-        /// SDK/app: "Price catching up. New positions resume in a few seconds."
+        /// lagged (any lag on a band market, not only a pin). Engine `V16Error::BandOutOfRange` /
+        /// `V16Error::BandPinned`. Custom(104). What it blocks is the FAVOURABLE-side close (and an
+        /// accrual at an out-of-band price); new risk-increasing positions are refused by other codes
+        /// (21 while the mark lags, 112 close-only at the band floor). Agreed copy (Rust doc = product-copy
+        /// doc): "Price catching up; this action resumes in a few seconds."
         PriceBandPinned = 104,
         /// v2.2 band: the InitMarket band block is malformed or violates the Band Safety Law
         /// (or a band market is not single-asset). Custom(105).
@@ -8656,7 +8666,10 @@ pub mod ix {
         /// v2.2 tag 118 (permissionless): close a band leg whose notional at `P_last` is below
         /// half of `band_min_leg_notional` (engine `band_leg_is_dust`), unilaterally at
         /// `P_last` (`rebalance_reduce_position_not_atomic`), so dust cannot hold one of the
-        /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
+        /// 256 per-side slots. Accounts: `[0]` UNUSED (never read, not required to sign: the transaction
+        /// fee payer is the only caller identity; kept so the shape matches the other permissionless
+        /// cranks), `[1] market (w)`, `[2] portfolio (w)`, `[3] bound vault LP portfolio (w)` (bilateral
+        /// close, N-6).
         SweepBandDustLeg { asset_index: u16 },
         /// v2.2 tag 119: on a band market whose target side is FULL, close `accounts[0]`'s
         /// SMALL leg (at most 4x the market minimum, and at most half the taker's size) bilaterally against the bound vault LP at `P_last` (fee 0) and then
@@ -8766,6 +8779,8 @@ pub mod ix {
         VaultLpAllocate { amount: u128 },
         /// Tag 107 (Phase 4 item 3). Market authority (or the upgrade authority) creates the
         /// market's `BondTrancheV20` with immutable, protocol-bounded dials. 11 B.
+        /// LAUNCH BUNDLE: tag 74 CreateLpVault + tag 94 InitVaultLp + tag 107 in ONE transaction
+        /// (see `handle_init_bond_tranche`). Tag 69 is RestartAssetOracle, not part of the bundle.
         InitBondTranche {
             coupon_bps: u16,
             util_bonus_bps: u16,
@@ -8799,8 +8814,12 @@ pub mod ix {
         /// PDA (w) · `[3]` system program.
         SetG9FeedAllowlist { keys: Vec<[u8; 32]> },
         /// Tag 112 (Phase 4 item 5). The rescuer buys senior shares at the certified IMPAIRED
-        /// value, never par. `tranche` 0 = senior (the only tranche on this branch; 1 = bond,
-        /// item 3, refused until bonds ship). Refuses unless `minted >= min_shares`.
+        /// value, never par. `tranche` 0 = senior (the only supported tranche). `tranche` 1 (the
+        /// bond tranche) is REFUSED (`RescueRefused`, Custom 114): bond-tranche rescue is NOT
+        /// SUPPORTED in the combined release even though bonds (107-110) exist; an impaired bond
+        /// tranche is repaired by the pots / junior inflows, and a bond rescue would need its own
+        /// no-dilution pricing and security review (founder option, see the ledger).
+        /// Refuses unless `minted >= min_shares`.
         RescueDeposit { tranche: u8, amount: u64, min_shares: u128 },
         /// Tag 116, PERMISSIONLESS (Phase 4 item 6). Creates `InsuranceUnitsV20` (genesis:
         /// existing asset-0 insurance becomes creator-class units 1:1) and sets the profile's
@@ -15673,13 +15692,15 @@ pub mod processor {
             v16_domain_count_for_market_slots(max_market_slots as u32).map_err(map_v16_error)?;
         let required_portfolio_len =
             state::portfolio_account_len_for_market_slots(max_market_slots)?;
-        // ADOPT upstream 2c8c5ba3 (LENGTH half only): InitPortfolio is the one
-        // instruction allowed to canonicalize storage -- an oversized, still-
-        // uninitialized System-Program-created account is shrunk to the exact
-        // canonical length here (realloc both grows AND shrinks), rather than
-        // being left oversized to accumulate ambiguous trailing bytes.
+        // v2.2 (10,603 B portfolios): the client MUST pre-create the account at EXACTLY
+        // `PORTFOLIO_ACCOUNT_LEN` (a top-level system `createAccount`, limit 10 MiB). The program no
+        // longer canonicalises the length with `realloc`: under this program's entrypoint bridge
+        // `AccountInfo::realloc` sees `original_data_len == 0` (the Pinocchio account view reuses that
+        // u32 as its `resize_delta`), so ANY target above `MAX_PERMITTED_DATA_INCREASE` (10,240 B)
+        // fails with `InvalidRealloc`, which is where a 10,603 B portfolio sits. Refuse with a clear
+        // error instead of attempting it (the former behaviour also shrank oversized accounts).
         if portfolio_ai.data_len() != required_portfolio_len {
-            portfolio_ai.realloc(required_portfolio_len, true)?;
+            return Err(PercolatorError::InvalidAccountLen.into());
         }
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -33972,8 +33993,9 @@ pub mod processor {
         }
         let required_portfolio_len =
             state::portfolio_account_len_for_market_slots(max_market_slots)?;
+        // exact pre-created length only (no realloc past 10,240 B; see `handle_init_portfolio`)
         if lp_portfolio_ai.data_len() != required_portfolio_len {
-            lp_portfolio_ai.realloc(required_portfolio_len, true)?;
+            return Err(PercolatorError::InvalidAccountLen.into());
         }
 
         let senior_claim = {
@@ -36528,7 +36550,8 @@ pub mod processor {
         if system_program_ai.key != &system_program::ID {
             return Err(PercolatorError::InvalidInstruction.into());
         }
-        // Bond rescue (tranche 1) needs item 3's tranche; refused until it ships.
+        // Bond-tranche rescue (tranche 1) is NOT SUPPORTED (bonds exist in the combined release, but a
+        // rescue of that tranche needs its own no-dilution pricing and review): refused.
         if tranche != 0 || amount_u64 == 0 {
             return Err(PercolatorError::RescueRefused.into());
         }
@@ -38037,7 +38060,7 @@ pub mod processor {
     /// fee terms are fixed before the first senior arrives (security review M-2).
     /// Sets registry flag 2: from then on 78/97/102(Resolved)/103 REQUIRE the tranche.
     ///
-    /// LAUNCH MUST BE ATOMIC (re-review N-2): send 69 CreateLpVault + 94 InitVaultLp + 107 in ONE
+    /// LAUNCH MUST BE ATOMIC (re-review N-2): send 74 CreateLpVault + 94 InitVaultLp + 107 in ONE
     /// transaction (with the two create_account calls 94 needs; measured 992 B, inside even the
     /// 1,232 B legacy packet). Any split -- e.g. a multisig market authority approving the three
     /// steps as separate transactions -- reopens the window in which a minimum-size Earn deposit
@@ -41175,11 +41198,12 @@ pub mod processor {
         // financial state. The pre-existing grow branch (undersized -> realloc up)
         // is untouched: it still carries forward older, pre-matcher-tail-schema
         // portfolios that predate a canonical length bump.
-        if portfolio_ai.data_len() > required {
+        // v2.2: exact length only. The former "grow an undersized legacy portfolio with realloc" branch
+        // is gone: a v2.2 portfolio is 10,603 B (variant -rem) and `realloc` of anything above
+        // 10,240 B is refused under this entrypoint bridge (`original_data_len` reads 0), so the
+        // branch could never succeed; a fresh re-seed has no legacy portfolios.
+        if portfolio_ai.data_len() != required {
             return Err(PercolatorError::InvalidAccountLen.into());
-        }
-        if portfolio_ai.data_len() < required {
-            portfolio_ai.realloc(required, true)?;
         }
         Ok(())
     }

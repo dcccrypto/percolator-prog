@@ -374,7 +374,7 @@ impl Env {
         env
     }
 
-    /// N-2 test helper: the harness constructor WITHOUT tag 69 CreateLpVault (so a launch can
+    /// N-2 test helper: the harness constructor WITHOUT tag 74 CreateLpVault (so a launch can
     /// create the LP vault, bind it and create the bond tranche in ONE transaction).
     fn new_bare(p: Params, matcher_so: PathBuf) -> Env {
         let mut svm = LiteSVM::new();
@@ -2880,7 +2880,7 @@ fn sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed() {
 }
 
 /// N-2: a dust Earn deposit made before tag 107 permanently disables bonds on that market (107
-/// is refused once any Earn exists, M-2). The SAFE LAUNCH is atomic: create the LP vault (69),
+/// is refused once any Earn exists, M-2). The SAFE LAUNCH is atomic: create the LP vault (74),
 /// bind it (94) and create the bond tranche (107) in ONE transaction, which leaves no window for
 /// any Earn deposit. This test (a) shows the grief on the unbundled path, (b) builds the bundle
 /// as a real transaction (the two program-owned accounts tag 94 needs are created by system
@@ -2954,7 +2954,7 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
     env.svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(&instructions, Some(&admin.pubkey()), &[&admin, &lp_kp, &ctx_kp], env.svm.latest_blockhash());
     let size = bincode::serialize(&tx).unwrap().len();
-    eprintln!("N-2 launch bundle (69 + 94 + 107 + 2 create_account): {size} bytes");
+    eprintln!("N-2 launch bundle (74 + 94 + 107 + 2 create_account): {size} bytes");
     assert!(size <= 1_232, "the launch bundle must fit one packet: {size} B");
     env.svm.send_transaction(tx).map_err(|e| format!("{e:?}")).expect("atomic launch bundle");
     assert_eq!(env.registry_state()._reserved[0], 1, "bound");
