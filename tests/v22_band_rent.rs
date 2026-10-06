@@ -1236,7 +1236,7 @@ fn sec_pinned_close_flip_and_open_variants() {
     let pin = code(PercolatorError::PriceBandPinned);
     // short = -100. Full close, partial, and FLIP (close + open long at the stale-low price) are all
     // favourable for the short side (target above P_last): refused.
-    for q in [100 * Q, 50 * Q, 150 * Q, 1 * Q] {
+    for q in [100 * Q, 50 * Q, 150 * Q, Q] {
         let r = env.trade_cpi(&short.0, short.1, &lp, q);
         eprintln!("SEC pinned short buys {q}: {r:?}");
         assert!(r.is_err(), "favourable-side exit/flip landed at the stale price: q={q}");

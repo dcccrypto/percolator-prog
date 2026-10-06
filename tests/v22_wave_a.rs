@@ -651,7 +651,7 @@ fn combined_tags_decode_to_distinct_variants() {
                 let n = n.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap().to_string();
                 // tag 0 / 76 / 77 have several wire forms: they share one tag by design
                 if !matches!(tag, 0 | 76 | 77) {
-                    assert!(names.insert(n.clone(), tag).is_none() || true);
+                    let _ = names.insert(n.clone(), tag);
                 }
                 if let Some(prev) = names.get(&n) {
                     assert!(*prev == tag || matches!(tag, 0 | 76 | 77), "{n} decodes under tags {prev} and {tag}");
