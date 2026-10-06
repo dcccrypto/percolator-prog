@@ -1562,7 +1562,7 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 *max_account_b_settlement_chunks = 3;
                 *max_bankrupt_close_chunks = 4;
                 *max_bankrupt_close_lifetime_slots = 50;
-                *public_b_chunk_atoms = 12_345;
+                *public_b_chunk_atoms = 1_000_012_345; // >= PUBLIC_B_CHUNK_ATOMS_MIN (v2.2)
                 *maintenance_fee_per_slot = 7;
             }
         }),
@@ -1589,7 +1589,7 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
     assert_eq!(group.config.max_account_b_settlement_chunks, 3);
     assert_eq!(group.config.max_bankrupt_close_chunks, 4);
     assert_eq!(group.config.max_bankrupt_close_lifetime_slots, 50);
-    assert_eq!(group.config.public_b_chunk_atoms, 12_345);
+    assert_eq!(group.config.public_b_chunk_atoms, 1_000_012_345);
 }
 
 #[test]

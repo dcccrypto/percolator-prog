@@ -44,6 +44,10 @@ pub mod vault_lp_v18;
 /// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
 pub mod growth_v19;
 
+/// v2.2 Phase 4 Wave A (2026-10-05): pure rules for lot pricing (item 7) and the R3-M1 exit
+/// fix (item 8). See `~/percolator-ops/ledger/phase4-design-2026-10-05.md`.
+pub mod wave_a_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -617,6 +621,51 @@ pub mod constants {
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG2: u8 = 1 << 0;
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG3: u8 = 1 << 1;
     pub const ORACLE_LEG_FLAGS_MASK: u8 = ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    // ── v2.2 Phase 4 Wave A (items 7 + 8; allocations in ledger/v22-allocations.md). ──────
+    /// Item 7: `AssetOracleProfileV16::_padding0[0]` (profile byte +19) holds `lot_exp`: the
+    /// market's base unit is a LOT of `10^lot_exp` tokens and every mark / position is per
+    /// lot. Engine and matcher are unit-agnostic, so this is metadata the program only
+    /// validates and keeps immutable; the SDK / keeper / indexer do the unit conversion.
+    pub const PROFILE_LOT_EXP_IDX: usize = 0;
+    /// Item 7: the largest lot exponent (a lot of 10^15 tokens).
+    pub const LOT_EXP_MAX: u8 = 15;
+    /// Item 7 precision floor: a growth market's initial (per-lot) mark must be at least
+    /// $10 = 10^7 e6, so a 99.9% fall still leaves a mark of 10^4 and a 1 bps tick (the
+    /// spec §1.7 per-slot cap `floor(P·cap·dt/10^4)` stays >= 1 for every cap >= 1 bps).
+    pub const LOT_PRICE_FLOOR_E6: u64 = 10_000_000;
+    /// Phase 4: `AssetOracleProfileV16::_padding0[1]` (profile byte +20) holds `p4_flags`.
+    pub const PROFILE_P4_FLAGS_IDX: usize = 1;
+    /// p4_flags bit0 = INS_UNITS_REQUIRED (item 6) and bit1 = ORACLE_GRAD_ARMED (item 4)
+    /// are reserved for their builders and stay refused by the validator until they land.
+    /// Item 8: bit2 = EXIT_REQUIRES_LOSS_CURRENT. A Live NON-bound ExecuteRedemption
+    /// (tag 77) then requires the vault's asset to be loss-current (both stale-account
+    /// cohorts and both domain loss barriers zero) after its inline refresh, so the E3
+    /// price is exact (no touch-order dip; R3-M1). Set on every profile this program
+    /// creates (new v2.2 markets and assets); forced on in mainnet builds.
+    pub const P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT: u8 = 1 << 2;
+    /// Bits the validator accepts today (append item 4 / 6 bits when they land).
+    pub const P4_FLAGS_KNOWN_MASK: u8 = P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT;
+    /// Item 8: the most stale positioned portfolios one ExecuteRedemption may refresh
+    /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
+    /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
+    pub const REDEMPTION_REFRESH_MAX: u8 = 8;
+    /// Security review A6: the inline refresh is also LEG-weighted. One refresh costs ~85k CU
+    /// fixed plus ~32k CU per active leg it re-certifies (measured: 1 leg ~117k, 14 legs ~530k;
+    /// the 77 itself ~60k). Weight of a refreshed portfolio = `REDEMPTION_REFRESH_BASE_WEIGHT +
+    /// legs`, and the sum must be <= `REDEMPTION_REFRESH_WEIGHT_BUDGET` (34 units), so a 77 stays
+    /// under ~1.3M CU and never exhausts the 1.4M meter. Measured with the budget check included:
+    /// 8 single-leg (32 units) 1,016,434 CU; 2 x 14-leg (34 units) 1,204,159 CU; 3 x 14-leg (51)
+    /// is refused up front (InvalidInstruction).
+    pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
+    /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
+    /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
+    /// MARKET-KILL threshold -- a single bankruptcy whose residual exceeds it takes the whole
+    /// market Live -> Recovery -> Resolved (permissionlessly). InitMarket refuses a chunk below
+    /// 1e9 atoms (1,000 USDC at 6 dp), so no creator can pick a chunk any small bust resolves.
+    /// The seed default is 1e12. Refused with EngineInvalidConfig (Custom 14), like the other
+    /// InitMarket config bounds.
+    pub const PUBLIC_B_CHUNK_ATOMS_MIN: u128 = 1_000_000_000;
+    pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
     pub const MAX_DYNAMIC_TRADE_FEE_BPS: u64 = 10_000;
@@ -1493,7 +1542,27 @@ VaultLpMultiAssetMarket,
         /// Custom(103). SDK/app: "This side is paused while the market's first-loss capital is
         /// rebuilt; closing is always allowed".
         VaultLpSeniorCapitalHalt = 103,
+        // ── v2.2 Phase 4 Wave A: reserved block 104..=119 (design §0.2), explicit
+        // discriminants, pinned below. 104..=116 belong to other Phase 4 items.
+        /// Item 8: an ExecuteRedemption would pay less than the redeemer's signed
+        /// `min_payout_atoms` (the larger of the tag 77 wire value and the value stored at
+        /// tag 76). Nothing moves; the shares stay escrowed. Custom(117).
+        /// SDK/app: "The exit price moved below your minimum; retry or lower the minimum".
+        RedemptionBelowMinPayout = 117,
+        /// Item 8: a Live non-bound ExecuteRedemption on a market that requires a
+        /// loss-current book (p4_flags bit2, or any mainnet build, or an unsigned keeper
+        /// execution) found stale positioned portfolios or a pending domain loss barrier on
+        /// the vault's asset after its inline refresh. Custom(118).
+        /// SDK/app: "Refreshing positions before your exit; retry shortly".
+        ExitRequiresLossCurrent = 118,
+        /// Item 7: lot configuration refused: `lot_exp > 15`, a lot exponent on an oracle mode
+        /// that cannot carry one, an attempt to change it, or a growth market's initial mark
+        /// below the 10^7 precision floor. Custom(119).
+        LotConfigInvalid = 119,
     }
+    const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
+    const _: () = assert!(PercolatorError::ExitRequiresLossCurrent as u32 == 118);
+    const _: () = assert!(PercolatorError::LotConfigInvalid as u32 == 119);
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
     // block. Pinned here and in tests/p3_vault_lp.rs (p2b_error_codes_are_pinned).
@@ -4041,6 +4110,62 @@ pub mod state {
         price != 0 && price <= percolator::MAX_ORACLE_PRICE
     }
 
+    /// Item 7: the profile's lot exponent (profile byte +19). 0 = one token per unit.
+    #[inline]
+    pub fn profile_lot_exp(profile: &AssetOracleProfileV16) -> u8 {
+        profile._padding0[crate::constants::PROFILE_LOT_EXP_IDX]
+    }
+
+    /// Phase 4: the profile's p4_flags byte (profile byte +20).
+    #[inline]
+    pub fn profile_p4_flags(profile: &AssetOracleProfileV16) -> u8 {
+        profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX]
+    }
+
+    /// Item 8: whether a Live non-bound ExecuteRedemption on this asset requires a
+    /// loss-current book. Mainnet builds force it on regardless of the stored bit.
+    #[inline]
+    pub fn profile_exit_requires_loss_current(profile: &AssetOracleProfileV16) -> bool {
+        cfg!(not(feature = "devnet"))
+            || profile_p4_flags(profile) & crate::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT != 0
+    }
+
+    /// Shape of profile bytes +19..+24 (pure; Kani `kani_lot_profile_shape`).
+    #[inline]
+    pub fn profile_lot_and_p4_bytes_ok(profile: &AssetOracleProfileV16) -> bool {
+        let lot_exp = profile_lot_exp(profile);
+        let lot_mode_ok = lot_exp == 0
+            || profile.oracle_mode == ORACLE_MODE_AUTH_MARK
+            || profile.oracle_mode == ORACLE_MODE_MANUAL;
+        lot_exp <= crate::constants::LOT_EXP_MAX
+            && lot_mode_ok
+            && profile_p4_flags(profile) & !crate::constants::P4_FLAGS_KNOWN_MASK == 0
+            && profile._padding0[2..] == [0u8; 3]
+    }
+
+    /// Phase 4 profile bytes every NEW profile starts with: lot 0, EXIT_REQUIRES_LOSS_CURRENT
+    /// on (item 8: "on by default for new v2.2 markets").
+    pub const NEW_PROFILE_PADDING0: [u8; 5] =
+        [0, crate::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT, 0, 0, 0];
+
+    /// The `_padding0` a profile REBUILD (oracle reconfiguration) must carry: the existing
+    /// lot exponent and p4 flags are immutable through reconfiguration (I-P1; an oracle
+    /// re-anchor must never be a way to clear EXIT_REQUIRES_LOSS_CURRENT). A non-zero lot
+    /// exponent cannot move to a mode that refuses one (Hybrid / EwmaMark): 119.
+    pub fn carried_profile_padding0(
+        existing: &AssetOracleProfileV16,
+        new_mode: u8,
+    ) -> Result<[u8; 5], ProgramError> {
+        let lot_exp = profile_lot_exp(existing);
+        if lot_exp != 0 && new_mode != ORACLE_MODE_AUTH_MARK && new_mode != ORACLE_MODE_MANUAL {
+            return Err(PercolatorError::LotConfigInvalid.into());
+        }
+        let mut out = [0u8; 5];
+        out[crate::constants::PROFILE_LOT_EXP_IDX] = lot_exp;
+        out[crate::constants::PROFILE_P4_FLAGS_IDX] = profile_p4_flags(existing);
+        Ok(out)
+    }
+
     #[inline]
     pub fn validate_asset_oracle_profile(
         profile: &AssetOracleProfileV16,
@@ -4066,7 +4191,11 @@ pub mod state {
             || (profile.oracle_mode != ORACLE_MODE_HYBRID_AFTER_HOURS
                 && profile.oracle_mode != ORACLE_MODE_EWMA_MARK
                 && profile.effective_price_provenance != EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED)
-            || profile._padding0 != [0u8; 5]
+            // v2.2 Wave A: byte +19 = lot_exp (item 7), byte +20 = p4_flags (item 8 bit2);
+            // bytes +21..+24 stay zero. A lot exponent is only meaningful where the program
+            // never rescales an external price: AuthMark (and the Manual placeholder every
+            // asset starts in before ConfigureAuthMark). Hybrid / EwmaMark refuse it.
+            || !profile_lot_and_p4_bytes_ok(profile)
             || profile._padding1 != [0u8; 6]
             // FIX (ADOPT upstream 18f3ae94/2669bf1b, adapted): the carried
             // price-move-cap numerator remainder is a bps-of-10,000 fraction and
@@ -4209,7 +4338,7 @@ pub mod state {
             backing_trade_fee_insurance_share_bps_long: 0,
             backing_trade_fee_insurance_share_bps_short: 0,
             effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-            _padding0: [0u8; 5],
+            _padding0: NEW_PROFILE_PADDING0,
             insurance_authority: [0u8; 32],
             insurance_operator: [0u8; 32],
             backing_bucket_authority: [0u8; 32],
@@ -4261,7 +4390,7 @@ pub mod state {
             backing_trade_fee_insurance_share_bps_short: config
                 .backing_trade_fee_insurance_share_bps_short,
             effective_price_provenance: EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-            _padding0: [0u8; 5],
+            _padding0: NEW_PROFILE_PADDING0,
             // At InitMarket the market key bootstraps asset 0 exactly like an activator bootstraps a
             // permissionless asset 1..N: it is asset 0's cold-storage admin and all its sub-authorities.
             insurance_authority: config.marketauth,
@@ -6019,6 +6148,59 @@ pub mod state {
         Ok(bytemuck::pod_read_unaligned(bytes))
     }
 
+    /// v2.2 Wave A item 8, rule 4: the redemption-request extension. `LpRedemptionV16` has
+    /// only 6 spare bytes (90..96) and the request needs 9 (`min_payout u64` + `keeper_ok u8`),
+    /// so a request made with the extended tag 76 wire is created 16 bytes LONGER and carries
+    /// this record at body offset 96 (account offset `HEADER_LEN + 96`). A legacy request
+    /// keeps the exact legacy 96-byte body and reads as all-zero (no floor, redeemer-only).
+    /// It is a per-request PDA: no slab or registry impact.
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+    pub struct LpRedemptionExtV22 {
+        /// The redeemer's own payout floor, in collateral atoms (0 = none).
+        pub min_payout_atoms: u64, // 96..104
+        /// 1 = the redeemer allows an unsigned (keeper) ExecuteRedemption, which is then
+        /// only allowed on a loss-current book and at a payout >= the stored floor.
+        pub keeper_ok: u8, // 104
+        pub _reserved: [u8; 7], // 105..112
+    }
+    const _: () = assert!(core::mem::size_of::<LpRedemptionExtV22>() == 16);
+
+    pub const fn lp_redemption_v22_account_len() -> usize {
+        lp_redemption_account_len() + core::mem::size_of::<LpRedemptionExtV22>()
+    }
+
+    /// The request's extension, or the all-zero legacy value for a 96-byte-body request.
+    /// Fails closed on a malformed extension (keeper_ok > 1, non-zero reserved bytes).
+    pub fn read_lp_redemption_ext(data: &[u8]) -> Result<LpRedemptionExtV22, ProgramError> {
+        if data.len() < lp_redemption_v22_account_len() {
+            return Ok(LpRedemptionExtV22::default());
+        }
+        check_header(data, KIND_LP_REDEMPTION)?;
+        let bytes = data
+            .get(lp_redemption_account_len()..lp_redemption_v22_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let ext: LpRedemptionExtV22 = bytemuck::pod_read_unaligned(bytes);
+        if ext.keeper_ok > 1 || ext._reserved != [0u8; 7] {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        Ok(ext)
+    }
+
+    pub fn write_lp_redemption_ext(
+        data: &mut [u8],
+        ext: &LpRedemptionExtV22,
+    ) -> Result<(), ProgramError> {
+        if data.len() < lp_redemption_v22_account_len() || ext.keeper_ok > 1 {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, KIND_LP_REDEMPTION)?;
+        data.get_mut(lp_redemption_account_len()..lp_redemption_v22_account_len())
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(ext));
+        Ok(())
+    }
+
     pub fn write_lp_redemption(
         data: &mut [u8],
         redemption: &LpRedemptionV16,
@@ -7404,6 +7586,25 @@ pub mod ix {
         RequestRedeemLpShares {
             shares: u128,
         },
+        /// v2.2 Wave A item 8, rule 4: tag 76 with a 9-byte trailer `[min_payout_atoms u64]
+        /// [keeper_ok u8]` (`keeper_ok` in {0, 1}; `min_payout_atoms` must be non-zero, A4 --
+        /// a request without a floor uses the legacy 17-byte form). Stored in the request's 16-byte extension
+        /// (`state::LpRedemptionExtV22`).
+        RequestRedeemLpSharesV22 {
+            shares: u128,
+            min_payout_atoms: u64,
+            keeper_ok: u8,
+        },
+        /// v2.2 Wave A item 8, rules 1-3: tag 77 with a 9-byte trailer `[min_payout_atoms u64]
+        /// [n_refresh u8]` (`n_refresh <= REDEMPTION_REFRESH_MAX`; canonical: not both zero).
+        /// Accounts [13 .. 13+n_refresh) are stale positioned portfolios refreshed inline (the
+        /// permissionless crank primitive, non-bound Live exits only); any accounts after them
+        /// are the vault asset's oracle accounts for that refresh.
+        ExecuteRedemptionV22 {
+            domain: u16,
+            min_payout_atoms: u64,
+            n_refresh: u8,
+        },
         ExecuteRedemption {
             /// Which pot of the vault's asset the payout is physically drawn
             /// from. NAV and available-principal stay COMBINED across both pots,
@@ -7667,6 +7868,17 @@ pub mod ix {
             growth_r_gap_bps: u16,
             growth_l_launch_x100: u16,
         },
+        /// v2.2 Wave A item 7: tag 0 with a 5-byte trailer `[r_gap_bps u16][l_launch_x100 u16]
+        /// [lot_exp u8]` -- the growth block plus the market's lot exponent (non-zero; a lot of
+        /// `10^lot_exp` tokens, `<= 15`, immutable). A 5-byte trailer with `lot_exp == 0` is
+        /// non-canonical and refused (use the 4-byte growth form). Every growth form also
+        /// enforces the 10^7 e6 precision floor on `initial_price` (Custom 119).
+        InitMarketLotV22 {
+            market: alloc::boxed::Box<Instruction>,
+            growth_r_gap_bps: u16,
+            growth_l_launch_x100: u16,
+            lot_exp: u8,
+        },
         /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
         /// starting leverage cap, written at bind on an asset whose growth block is on.
         InitVaultLpV19 {
@@ -7808,10 +8020,24 @@ pub mod ix {
                         if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
                             return Err(ProgramError::InvalidInstructionData);
                         }
-                        Self::InitMarketV19 {
-                            market: alloc::boxed::Box::new(base),
-                            growth_r_gap_bps,
-                            growth_l_launch_x100,
+                        if rest.is_empty() {
+                            Self::InitMarketV19 {
+                                market: alloc::boxed::Box::new(base),
+                                growth_r_gap_bps,
+                                growth_l_launch_x100,
+                            }
+                        } else {
+                            // v2.2 Wave A: one more byte, the lot exponent (canonical: != 0).
+                            let lot_exp = read_u8(&mut rest)?;
+                            if lot_exp == 0 {
+                                return Err(ProgramError::InvalidInstructionData);
+                            }
+                            Self::InitMarketLotV22 {
+                                market: alloc::boxed::Box::new(base),
+                                growth_r_gap_bps,
+                                growth_l_launch_x100,
+                                lot_exp,
+                            }
                         }
                     }
                 }
@@ -8174,12 +8400,46 @@ pub mod ix {
                     to_domain: read_u16(&mut rest)?,
                     amount: read_u128(&mut rest)?,
                 },
-                76 => Self::RequestRedeemLpShares {
-                    shares: read_u128(&mut rest)?,
-                },
-                77 => Self::ExecuteRedemption {
-                    domain: read_u16(&mut rest)?,
-                },
+                76 => {
+                    let shares = read_u128(&mut rest)?;
+                    if rest.is_empty() {
+                        Self::RequestRedeemLpShares { shares }
+                    } else {
+                        let min_payout_atoms = read_u64(&mut rest)?;
+                        let keeper_ok = read_u8(&mut rest)?;
+                        // Security review A4: a v2.2 request ALWAYS carries a non-zero floor.
+                        // `keeper_ok = 1` with no floor would let any third party execute at any
+                        // (exact) moment with no payout bound; `(0, 0)` is the non-canonical
+                        // legacy form.
+                        if keeper_ok > 1 || min_payout_atoms == 0 {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::RequestRedeemLpSharesV22 {
+                            shares,
+                            min_payout_atoms,
+                            keeper_ok,
+                        }
+                    }
+                }
+                77 => {
+                    let domain = read_u16(&mut rest)?;
+                    if rest.is_empty() {
+                        Self::ExecuteRedemption { domain }
+                    } else {
+                        let min_payout_atoms = read_u64(&mut rest)?;
+                        let n_refresh = read_u8(&mut rest)?;
+                        if n_refresh > crate::constants::REDEMPTION_REFRESH_MAX
+                            || (min_payout_atoms == 0 && n_refresh == 0)
+                        {
+                            return Err(ProgramError::InvalidInstructionData);
+                        }
+                        Self::ExecuteRedemptionV22 {
+                            domain,
+                            min_payout_atoms,
+                            n_refresh,
+                        }
+                    }
+                }
                 78 => Self::LpVaultCrankFees {
                     domain: read_u16(&mut rest)?,
                 },
@@ -9069,6 +9329,26 @@ pub mod ix {
                     out.push(77);
                     push_u16(&mut out, domain);
                 }
+                Self::RequestRedeemLpSharesV22 {
+                    shares,
+                    min_payout_atoms,
+                    keeper_ok,
+                } => {
+                    out.push(76);
+                    push_u128(&mut out, shares);
+                    push_u64(&mut out, min_payout_atoms);
+                    out.push(keeper_ok);
+                }
+                Self::ExecuteRedemptionV22 {
+                    domain,
+                    min_payout_atoms,
+                    n_refresh,
+                } => {
+                    out.push(77);
+                    push_u16(&mut out, domain);
+                    push_u64(&mut out, min_payout_atoms);
+                    out.push(n_refresh);
+                }
                 Self::LpVaultCrankFees { domain } => {
                     out.push(78);
                     push_u16(&mut out, domain);
@@ -9239,6 +9519,17 @@ pub mod ix {
                     out = market.encode();
                     push_u16(&mut out, growth_r_gap_bps);
                     push_u16(&mut out, growth_l_launch_x100);
+                }
+                Self::InitMarketLotV22 {
+                    ref market,
+                    growth_r_gap_bps,
+                    growth_l_launch_x100,
+                    lot_exp,
+                } => {
+                    out = market.encode();
+                    push_u16(&mut out, growth_r_gap_bps);
+                    push_u16(&mut out, growth_l_launch_x100);
+                    out.push(lot_exp);
                 }
                 Self::VaultLpSetMatcher {
                     expected_sequence,
@@ -12560,6 +12851,23 @@ pub mod processor {
         collect_maintenance_fee_before_value_debit_view(cfg, group, portfolio)
     }
 
+    /// Item 7 precision floor on EVERY ConfigureAuthMark of a growth asset (security review
+    /// R2-1: a "launch only" proxy was bypassable by one permissionless InitPortfolio, after which
+    /// the oracle authority could re-anchor to an untrackable micro-price). Only
+    /// RestartAssetOracle -- the exit from asset Recovery -- is exempt (A2), so a crashed asset can
+    /// still be revived at its true price. Non-growth assets are unchanged. Custom(119).
+    fn require_lot_reanchor_floor_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        mark_e6: u64,
+    ) -> ProgramResult {
+        let growth = asset_growth_view(group, asset_index)?.is_some();
+        if crate::wave_a_v22::lot_price_below_floor(growth, mark_e6) {
+            return Err(PercolatorError::LotConfigInvalid.into());
+        }
+        Ok(())
+    }
+
     fn require_asset_active_for_oracle_reconfiguration_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
@@ -12749,6 +13057,7 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         ix: &Instruction,
         growth: Option<(u16, u16)>,
+        lot_exp: u8,
     ) -> ProgramResult {
         match *ix {
             Instruction::InitMarket {
@@ -12800,6 +13109,7 @@ pub mod processor {
                 public_b_chunk_atoms,
                 maintenance_fee_per_slot,
                 growth,
+                lot_exp,
             ),
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -12813,7 +13123,7 @@ pub mod processor {
     ) -> ProgramResult {
         match Instruction::decode(instruction_data)? {
             ix @ Instruction::InitMarket { .. } => {
-                dispatch_init_market(program_id, accounts, &ix, None)
+                dispatch_init_market(program_id, accounts, &ix, None, 0)
             }
             Instruction::InitMarketV19 {
                 market,
@@ -12824,6 +13134,19 @@ pub mod processor {
                 accounts,
                 &market,
                 Some((growth_r_gap_bps, growth_l_launch_x100)),
+                0,
+            ),
+            Instruction::InitMarketLotV22 {
+                market,
+                growth_r_gap_bps,
+                growth_l_launch_x100,
+                lot_exp,
+            } => dispatch_init_market(
+                program_id,
+                accounts,
+                &market,
+                Some((growth_r_gap_bps, growth_l_launch_x100)),
+                lot_exp,
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -13426,11 +13749,27 @@ pub mod processor {
                 amount,
             ),
             Instruction::RequestRedeemLpShares { shares } => {
-                handle_request_redeem_lp_shares(program_id, accounts, shares)
+                handle_request_redeem_lp_shares(program_id, accounts, shares, 0, 0)
             }
+            Instruction::RequestRedeemLpSharesV22 {
+                shares,
+                min_payout_atoms,
+                keeper_ok,
+            } => handle_request_redeem_lp_shares(
+                program_id,
+                accounts,
+                shares,
+                min_payout_atoms,
+                keeper_ok,
+            ),
             Instruction::ExecuteRedemption { domain } => {
-                handle_execute_redemption(program_id, accounts, domain)
+                handle_execute_redemption(program_id, accounts, domain, 0, 0)
             }
+            Instruction::ExecuteRedemptionV22 {
+                domain,
+                min_payout_atoms,
+                n_refresh,
+            } => handle_execute_redemption(program_id, accounts, domain, min_payout_atoms, n_refresh),
             Instruction::LpVaultCrankFees { domain } => {
                 handle_lp_vault_crank_fees(program_id, accounts, domain)
             }
@@ -13693,6 +14032,8 @@ pub mod processor {
         maintenance_fee_per_slot: u128,
         // growth-v19: `(r_gap_bps, l_launch_x100)` from the optional trailing block.
         growth: Option<(u16, u16)>,
+        // v2.2 Wave A item 7: the lot exponent (0 unless the 5-byte growth+lot trailer).
+        lot_exp: u8,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -13702,6 +14043,7 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
+            || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
@@ -13728,6 +14070,14 @@ pub mod processor {
         cfg.public_b_chunk_atoms = public_b_chunk_atoms;
         if initial_price == 0 || initial_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::EngineInvalidConfig.into());
+        }
+        // v2.2 Wave A item 7: a growth market (every creator-launched v2.2 market) is priced
+        // per lot and must start at or above the 10^7 e6 precision floor; the lot exponent is
+        // bounded. A lot exponent without a growth block cannot be expressed on the wire.
+        if !crate::wave_a_v22::lot_exp_ok(lot_exp)
+            || crate::wave_a_v22::lot_price_below_floor(growth.is_some(), initial_price)
+        {
+            return Err(PercolatorError::LotConfigInvalid.into());
         }
         // WARNING (not a repair): say so loudly when this market's funding
         // cannot accrue at its genesis price. See `warn_if_funding_cannot_accrue`
@@ -13834,7 +14184,22 @@ pub mod processor {
                 init_slot,
             )?;
         }
+        if lot_exp != 0 {
+            init_market_lot_exp(market_ai, lot_exp)?;
+        }
         Ok(())
+    }
+
+    /// v2.2 Wave A item 7: write asset 0's lot exponent (profile byte +19) once, at InitMarket.
+    /// Asset 0 starts in the Manual placeholder mode, which (like AuthMark) may carry one;
+    /// ConfigureAuthMark / RestartAssetOracle carry it forward and no instruction rewrites it.
+    #[inline(never)]
+    fn init_market_lot_exp(market_ai: &AccountInfo<'_>, lot_exp: u8) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let mut profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
+        profile._padding0[constants::PROFILE_LOT_EXP_IDX] = lot_exp;
+        write_oracle_profile_to_view(&mut group, 0, &profile)
     }
 
     /// growth-v19: InitMarket's optional growth block (creator == InitMarket admin, at
@@ -22777,6 +23142,9 @@ pub mod processor {
             // function is not stack-tight, so an owned copy is fine here.
             let mut profile = *state::manual_asset_oracle_profile(initial_price, authenticated_slot);
             preserve_backing_fee_policy(&mut profile, &existing_profile);
+            // v2.2 Wave A (I-P1): a restart keeps the market's lot exponent and p4 flags.
+            profile._padding0 =
+                state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_MANUAL)?;
             profile.asset_admin = existing_profile.asset_admin;
             profile.insurance_authority = existing_profile.insurance_authority;
             profile.insurance_operator = existing_profile.insurance_operator;
@@ -23360,6 +23728,12 @@ pub mod processor {
                     let mut profile =
                         state::manual_asset_oracle_profile(initial_price, authenticated_slot);
                     preserve_backing_fee_policy(&mut profile, &existing_profile);
+                    // v2.2 Wave A (I-P1): an oracle reset keeps the lot exponent and p4 flags
+                    // (a retired slot was already rewritten to a fresh profile by RETIRE).
+                    profile._padding0 = state::carried_profile_padding0(
+                        &existing_profile,
+                        constants::ORACLE_MODE_MANUAL,
+                    )?;
                     profile.insurance_authority = insurance_authority;
                     profile.insurance_operator = insurance_operator;
                     profile.backing_bucket_authority = backing_bucket_authority;
@@ -24165,7 +24539,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_HYBRID_AFTER_HOURS)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24337,7 +24711,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_EWMA_MARK)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -24456,6 +24830,7 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
+            require_lot_reanchor_floor_view(&group, asset_index_usize, initial_mark_e6)?;
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
@@ -24481,7 +24856,7 @@ pub mod processor {
                 backing_trade_fee_insurance_share_bps_short: existing_profile
                     .backing_trade_fee_insurance_share_bps_short,
                 effective_price_provenance: constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED,
-                _padding0: [0u8; 5],
+                _padding0: state::carried_profile_padding0(&existing_profile, constants::ORACLE_MODE_AUTH_MARK)?,
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
@@ -26509,7 +26884,11 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         shares: u128,
+        // v2.2 Wave A item 8, rule 4 (extended wire only; both 0 on the legacy wire).
+        min_payout_atoms: u64,
+        keeper_ok: u8,
     ) -> ProgramResult {
+        let extended = min_payout_atoms != 0 || keeper_ok != 0;
         let redeemer = account(accounts, 0)?;
         let registry_ai = account(accounts, 1)?;
         let lp_mint = account(accounts, 2)?;
@@ -26591,7 +26970,12 @@ pub mod processor {
             return Err(PercolatorError::AlreadyInitialized.into());
         }
         {
-            let rlen = state::lp_redemption_account_len();
+            // v2.2: an extended request carries a 16-byte extension after the legacy body.
+            let rlen = if extended {
+                state::lp_redemption_v22_account_len()
+            } else {
+                state::lp_redemption_account_len()
+            };
             let redemption_bump_bytes = [redemption_bump];
             let redemption_seeds: &[&[u8]] = &[
                 crate::constants::LP_REDEMPTION_SEED,
@@ -26631,6 +27015,307 @@ pub mod processor {
             _padding: [0u8; 6],
         };
         state::init_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?, &redemption)?;
+        if extended {
+            state::write_lp_redemption_ext(
+                &mut redemption_ai.try_borrow_mut_data()?,
+                &state::LpRedemptionExtV22 {
+                    min_payout_atoms,
+                    keeper_ok,
+                    _reserved: [0u8; 7],
+                },
+            )?;
+        }
+        Ok(())
+    }
+
+    /// v2.2 Wave A item 8 (R3-M1), the exit-side touch-order fix. Runs after the 77 bindings
+    /// and before any pricing read. Returns the effective payout floor.
+    ///
+    /// 1. Gate (`wave_a_v22::exit_gate`): a Live non-bound exit needs the redeemer's signature
+    ///    ([12], H-1(b)) unless the request stored `keeper_ok`; an unsigned keeper execution is
+    ///    then always loss-gated. Bound and Resolved exits are unchanged.
+    /// 2. Inline settle-all: accounts [13 .. 13+n_refresh) are positioned portfolios, refreshed
+    ///    with the SAME permissionless crank primitive as tag 5 (one market accrual at most, in
+    ///    the first call; later calls in the slot have dt = 0). A portfolio with nothing to do
+    ///    is skipped (NonProgress). Any accounts after them are the vault asset's oracle
+    ///    accounts, passed to every refresh. Non-bound Live exits only.
+    /// 3. Loss-current: when gated, the vault's asset must have both stale-account cohorts and
+    ///    both domain loss barriers at zero after the refresh: every positioned leg is current
+    ///    at the present K/F, so every winner claim is registered and every loss routed, and E3
+    ///    has no touch-order dip. Otherwise Custom(118).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn execute_redemption_v22_preflight<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        cranker: &'a AccountInfo<'a>,
+        market_ai: &'a AccountInfo<'a>,
+        redemption_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        bound: bool,
+        live: bool,
+        redeemer_signed: bool,
+        wire_min_payout_atoms: u64,
+        n_refresh: u8,
+    ) -> Result<(u64, bool), ProgramError> {
+        let ext = state::read_lp_redemption_ext(&redemption_ai.try_borrow_data()?)?;
+        let asset_index = registry.domain as usize / 2;
+        let market_requires = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
+            state::profile_exit_requires_loss_current(&profile)
+        };
+        let require_loss_current = match crate::wave_a_v22::exit_gate(
+            bound,
+            live,
+            redeemer_signed,
+            ext.keeper_ok == 1,
+            market_requires,
+        ) {
+            crate::wave_a_v22::ExitGate::NeedsRedeemerSignature => {
+                return Err(PercolatorError::ExpectedSigner.into());
+            }
+            crate::wave_a_v22::ExitGate::Allow {
+                require_loss_current,
+            } => require_loss_current,
+        };
+        if n_refresh != 0 {
+            if bound || !live {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            let n = n_refresh as usize;
+            let refresh = accounts
+                .get(13..13 + n)
+                .ok_or(ProgramError::NotEnoughAccountKeys)?;
+            let oracle_tail = accounts.get(13 + n..).unwrap_or(&[]);
+            let oracle_accounts =
+                u8::try_from(oracle_tail.len()).map_err(|_| PercolatorError::InvalidInstruction)?;
+            let hint = [CrankObservationHint {
+                asset_index: registry.domain / 2,
+                oracle_accounts,
+            }];
+            let (_, _, max_market_slots, _) =
+                state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+            // A6: leg-weighted refresh budget, checked before any refresh runs.
+            let mut weight: u32 = 0;
+            for portfolio_ai in refresh.iter() {
+                expect_writable(portfolio_ai)?;
+                expect_owner(portfolio_ai, program_id)?;
+                let legs = {
+                    let mut data = portfolio_ai.try_borrow_mut_data()?;
+                    let view = state::portfolio_view_mut_for_market_slots(&mut data, max_market_slots)?;
+                    percolator::active_bitmap_count_ones(
+                        view.header.active_bitmap.map(percolator::V16PodU64::get),
+                    )
+                };
+                weight = weight
+                    .checked_add(crate::wave_a_v22::refresh_weight(legs))
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+            if weight > constants::REDEMPTION_REFRESH_WEIGHT_BUDGET {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            for portfolio_ai in refresh.iter() {
+                match handle_permissionless_crank_zero_copy(
+                    program_id,
+                    cranker,
+                    market_ai,
+                    portfolio_ai,
+                    oracle_tail,
+                    0,
+                    &hint,
+                    max_market_slots,
+                ) {
+                    Ok(()) => {}
+                    Err(e) if e == ProgramError::from(PercolatorError::EngineNonProgress) => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        let mut dip_floor = false;
+        if require_loss_current {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::ExitRequiresLossCurrent.into());
+            }
+            let slot = &group
+                .markets
+                .get(asset_index)
+                .ok_or(PercolatorError::InvalidInstruction)?
+                .engine;
+            let counters = crate::wave_a_v22::LossCounters {
+                stale_long: slot.asset.stale_account_count_long.get(),
+                stale_short: slot.asset.stale_account_count_short.get(),
+                barrier_long: slot.pending_domain_loss_barrier_long.get(),
+                barrier_short: slot.pending_domain_loss_barrier_short.get(),
+                obligation_long: slot.asset.pending_obligation_count_long.get(),
+                obligation_short: slot.asset.pending_obligation_count_short.get(),
+                b_stale_accounts: group.header.b_stale_account_count.get(),
+                negative_pnl_accounts: group.header.negative_pnl_account_count.get(),
+                stale_certificates: group.header.stale_certificate_count.get(),
+            };
+            // A1: a redeemer-signed exit on a book that is only K/F-stale may proceed under
+            // the bounded-dip floor (checked once the payout is priced); a keeper exit, or any
+            // exit while a genuine loss is pending (A5), is refused.
+            match crate::wave_a_v22::loss_gate(true, &counters, redeemer_signed) {
+                crate::wave_a_v22::LossGate::Pass => {}
+                crate::wave_a_v22::LossGate::DipFloor => dip_floor = true,
+                crate::wave_a_v22::LossGate::Refuse => {
+                    return Err(PercolatorError::ExitRequiresLossCurrent.into());
+                }
+            }
+            // Security review round 2 (multi-asset residual): an UNSIGNED keeper exit needs EVERY
+            // configured asset loss-current, not only the vault's, so a cross-margined loser
+            // whose solvency rests on a stale leg elsewhere cannot leave the vault's pot
+            // under-routed at a third party's chosen moment.
+            if !redeemer_signed && !all_assets_loss_current_view(&group, &counters)? {
+                return Err(PercolatorError::ExitRequiresLossCurrent.into());
+            }
+        }
+        Ok((
+            crate::wave_a_v22::effective_min_payout(wire_min_payout_atoms, ext.min_payout_atoms),
+            dip_floor,
+        ))
+    }
+
+    /// Round 2 (multi-asset): every configured, in-service asset is loss-current (per-asset
+    /// cohorts, barriers and obligations zero; the header-wide counters are in `vault`).
+    fn all_assets_loss_current_view(
+        group: &state::MarketViewMutV16<'_>,
+        vault: &crate::wave_a_v22::LossCounters,
+    ) -> Result<bool, ProgramError> {
+        let n = core::cmp::min(group.markets.len(), group.header.config.max_market_slots.get() as usize);
+        let mut i = 0usize;
+        while i < n {
+            let slot = &group.markets[i].engine;
+            let c = crate::wave_a_v22::LossCounters {
+                stale_long: slot.asset.stale_account_count_long.get(),
+                stale_short: slot.asset.stale_account_count_short.get(),
+                barrier_long: slot.pending_domain_loss_barrier_long.get(),
+                barrier_short: slot.pending_domain_loss_barrier_short.get(),
+                obligation_long: slot.asset.pending_obligation_count_long.get(),
+                obligation_short: slot.asset.pending_obligation_count_short.get(),
+                ..*vault
+            };
+            if !crate::wave_a_v22::loss_current(&c) {
+                return Ok(false);
+            }
+            i += 1;
+        }
+        Ok(true)
+    }
+
+    /// Security review A1: the bounded-dip floor for a redeemer-signed exit that is not
+    /// loss-current: `atoms >= ceil(par * (10_000 - EXIT_DIP_BPS) / 10_000)` with
+    /// `par = floor(shares * (P_own + P_sibling) / S)` (both pots' ledger principal, after the
+    /// A3 netting, which leaves the sum unchanged). Otherwise 118 (wait for a refreshed book).
+    #[inline(never)]
+    fn execute_redemption_dip_floor_check(
+        ledger_ai: &AccountInfo<'_>,
+        sibling_ledger_ai: &AccountInfo<'_>,
+        shares: u128,
+        total_shares: u128,
+        atoms: u128,
+    ) -> ProgramResult {
+        let principal = |ai: &AccountInfo<'_>| -> Result<u128, ProgramError> {
+            let data = ai.try_borrow_data()?;
+            if data.is_empty() || !state::is_initialized(&data) {
+                return Ok(0);
+            }
+            Ok(state::read_backing_domain_ledger(&data)?.total_principal_atoms)
+        };
+        let total = principal(ledger_ai)?
+            .checked_add(principal(sibling_ledger_ai)?)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let par = crate::wave_a_v22::par_atoms(shares, total, total_shares)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        if !crate::wave_a_v22::dip_floor_ok(atoms, par) {
+            return Err(PercolatorError::ExitRequiresLossCurrent.into());
+        }
+        Ok(())
+    }
+
+    /// Security review A3 (combined-pot E3 for exits): net a non-bound vault's cross-pot
+    /// surplus against its cross-pot deficit by relabelling LEDGER principal (no backing moves,
+    /// so the per-pot claim coverage and `EarnExitWouldUnderBackClaims` are untouched, and ΣP --
+    /// the entry par -- is unchanged). Per-pot E3 then sums to `min(ΣP, Σ phys)` exactly
+    /// (`wave_a_v22::cross_pot_netting`). Both pots must be initialised, Fresh and unlapsed, and
+    /// both ledgers writable; otherwise nothing is netted (the per-pot reading is the
+    /// conservative one).
+    #[inline(never)]
+    fn nonbound_exit_cross_pot_netting(
+        market_ai: &AccountInfo<'_>,
+        registry_pda: [u8; 32],
+        domain: u16,
+        own_ai: &AccountInfo<'_>,
+        sib_ai: &AccountInfo<'_>,
+    ) -> ProgramResult {
+        if !own_ai.is_writable
+            || !sib_ai.is_writable
+            || own_ai.data_is_empty()
+            || sib_ai.data_is_empty()
+        {
+            return Ok(());
+        }
+        let market_key = market_ai.key.to_bytes();
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let now = authenticated_market_slot_or_fallback_view(&group);
+        let sib_domain = sibling_domain(domain);
+        let (s_own, b_own) = backing_domain_parts_view(&group, domain as usize)?;
+        let (s_sib, b_sib) = backing_domain_parts_view(&group, sib_domain as usize)?;
+        for b in [&b_own, &b_sib] {
+            if b.status != BackingBucketStatusV16::Fresh
+                || !policy_v16::backing_principal_withdrawal_is_fresh(b.expiry_slot, now)
+            {
+                return Ok(());
+            }
+        }
+        let (mut l_own, own_init) = read_or_new_backing_domain_ledger(
+            &own_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            domain,
+            &b_own,
+        )?;
+        let (mut l_sib, sib_init) = read_or_new_backing_domain_ledger(
+            &sib_ai.try_borrow_data()?,
+            market_key,
+            registry_pda,
+            sib_domain,
+            &b_sib,
+        )?;
+        if !own_init || !sib_init {
+            return Ok(());
+        }
+        sync_backing_domain_ledger(&mut l_own, &b_own)?;
+        sync_backing_domain_ledger(&mut l_sib, &b_sib)?;
+        let (m, from_own) = crate::wave_a_v22::cross_pot_netting(
+            l_own.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_own, &b_own),
+            l_sib.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_sib, &b_sib),
+        );
+        if m == 0 {
+            return Ok(());
+        }
+        let (from, to) = if from_own { (&mut l_own, &mut l_sib) } else { (&mut l_sib, &mut l_own) };
+        from.total_principal_atoms = from
+            .total_principal_atoms
+            .checked_sub(m)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        to.total_principal_atoms = to
+            .total_principal_atoms
+            .checked_add(m)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        write_or_init_backing_domain_ledger(&mut own_ai.try_borrow_mut_data()?, &l_own, true)?;
+        write_or_init_backing_domain_ledger(&mut sib_ai.try_borrow_mut_data()?, &l_sib, true)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "v22_exit_pot_netting domain={} from_own={} atoms={}",
+            domain, from_own, m
+        ));
         Ok(())
     }
 
@@ -27151,6 +27836,9 @@ pub mod processor {
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         source_domain: u16,
+        // v2.2 Wave A item 8 (both 0 on the legacy 3-byte wire).
+        wire_min_payout_atoms: u64,
+        n_refresh: u8,
     ) -> ProgramResult {
         let cranker = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
@@ -27324,14 +28012,37 @@ pub mod processor {
         // third party must not choose WHEN someone else's redemption executes, so the redeemer
         // ([12], pinned to `redemption.redeemer` below) must sign. Bound vaults price without a
         // claim term and Resolved exits after the terminal harvest: unchanged there.
-        if bound_tail.is_none() && mode == MarketModeV16::Live && !redeemer_rent_dest.is_signer {
-            return Err(PercolatorError::ExpectedSigner.into());
-        }
+        // v2.2 Wave A item 8 (R3-M1): the H-1(b) signature rule now lives in
+        // `execute_redemption_v22_preflight` (with the keeper_ok carve-out, the inline refresh
+        // and the loss-current rule). Out of line: tag 77 sits at the SBF frame edge.
+        let (min_payout_atoms, dip_floor) = execute_redemption_v22_preflight(
+            program_id,
+            accounts,
+            cranker,
+            market_ai,
+            redemption_ai,
+            &registry,
+            bound_tail.is_some(),
+            mode == MarketModeV16::Live,
+            redeemer_rent_dest.is_signer,
+            wire_min_payout_atoms,
+            n_refresh,
+        )?;
         if bound_tail.is_none() && mode == MarketModeV16::Resolved {
             nonbound_terminal_absorb_both_pots(
                 program_id,
                 market_ai,
                 &registry_pda,
+                registry.domain,
+                ledger_ai,
+                sibling_ledger_ai,
+            )?;
+        }
+        // v2.2 security review A3: combined-pot E3 for a non-bound exit (ledger netting).
+        if bound_tail.is_none() {
+            nonbound_exit_cross_pot_netting(
+                market_ai,
+                registry_pda.to_bytes(),
                 registry.domain,
                 ledger_ai,
                 sibling_ledger_ai,
@@ -27450,6 +28161,21 @@ pub mod processor {
         // payout — reject.
         if atoms == 0 {
             return Err(PercolatorError::LpVaultZeroAmount.into());
+        }
+        // v2.2 Wave A item 8 rule 1 (I-X1): never pay below the redeemer's signed floor.
+        // Checked before any write; the shares stay escrowed.
+        if !crate::wave_a_v22::payout_meets_min(atoms, min_payout_atoms) {
+            return Err(PercolatorError::RedemptionBelowMinPayout.into());
+        }
+        // v2.2 security review A1: the bounded-dip floor (signed exit on a K/F-stale book).
+        if dip_floor {
+            execute_redemption_dip_floor_check(
+                ledger_ai,
+                sibling_ledger_ai,
+                redemption.shares,
+                registry.total_lp_shares_outstanding,
+                atoms,
+            )?;
         }
         let atoms_u64 = amount_to_u64(atoms)?;
         // backing_num is derived from principal_portion only (the fresh-unliened
