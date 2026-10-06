@@ -77,7 +77,15 @@ pub mod constants {
                                                   // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
                                                   // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
                                                   // so the nft MUST bump to 18 and redeploy in the same flag day.
-    pub const VERSION: u16 = 18;
+                                                  //
+                                                  // 18 -> 20 (v2.2 per-leg K/F remainders). Same policy: the engine layout
+                                                  // moved (`V16_LAYOUT_DISCRIMINATOR` 18 -> 20, `PortfolioLegV16Account`
+                                                  // 152 -> 184 B, portfolio account 9563 -> 10075 B), so the wrapper's own
+                                                  // gate refuses every pre-existing account first. 19 is reserved for the
+                                                  // v2.2 Wave B layout (ledger/v22-allocations.md); a release that carries
+                                                  // both waves ships ONE number for the combined layout. percolator-nft
+                                                  // vendors this constant and must move with it (full re-seed, flag day).
+    pub const VERSION: u16 = 20;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
@@ -596,7 +604,8 @@ pub mod constants {
         assert!(PORTFOLIO_MATCHER_SEQUENCE_OFF == PORTFOLIO_ID_OFF + 8);
     const _ASSERT_PORTFOLIO_MATCHER_EXPIRY_OFF: () =
         assert!(PORTFOLIO_MATCHER_EXPIRY_OFF == PORTFOLIO_MATCHER_SEQUENCE_OFF + 8);
-    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_9563: () = assert!(PORTFOLIO_ACCOUNT_LEN == 9563);
+    // v2.2 per-leg K/F remainders: +32 B/leg * 16 legs = +512 B (9563 -> 10075).
+    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_10075: () = assert!(PORTFOLIO_ACCOUNT_LEN == 10075);
     // Bit-layout non-collision (6b627b43's ENABLED_MASK bit0 / TRADE_FEE_CAP bits
     // 50..63 vs this unit's position_epoch bits 1..49): checked against the
     // struct's own consts below (`_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` in the
@@ -3279,7 +3288,7 @@ pub mod state {
     // Compile-time guard (TB-1a): ENABLED_MASK (bit0) / POSITION_EPOCH_MASK
     // (bits1..49) / TRADE_FEE_CAP_MASK (bits50..63) must partition `control`'s
     // 64 bits with zero overlap and zero gap -- referenced from
-    // `constants::_ASSERT_PORTFOLIO_ACCOUNT_LEN_9563`'s neighbouring comment.
+    // `constants::_ASSERT_PORTFOLIO_ACCOUNT_LEN_10075`'s neighbouring comment.
     const _ASSERT_POSITION_EPOCH_BIT_LAYOUT_NO_OVERLAP_WITH_ENABLED: () = assert!(
         PortfolioMatcherConfigV16::POSITION_EPOCH_MASK & PortfolioMatcherConfigV16::ENABLED_MASK
             == 0
@@ -38685,14 +38694,14 @@ pub mod processor {
         }
 
         #[test]
-        fn portfolio_account_len_is_9563_with_full_identity_trailer() {
+        fn portfolio_account_len_is_10075_with_full_identity_trailer() {
             let data = init_test_portfolio(7);
             assert_eq!(
                 data.len(),
                 constants::PORTFOLIO_ACCOUNT_LEN,
                 "the wrapper tail contains matcher config, portfolio ID, sequence, and expiry"
             );
-            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 9563);
+            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 10075);
             assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
             assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);

@@ -1487,29 +1487,128 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
     );
 }
 
-/// Engine slot length of the previous (v2.1 pre-#277) layout. On this layout the engine appends
-/// `kf_drift_long/short` (160 B); on the old layout the strip below is a no-op.
+/// Lengths of the layout the parity fixture was generated on (c493bbc0, v2.1 pre-#277). They are
+/// CHECKS on the strip below, not its mechanism: the strip removes fields by name.
 const LEGACY_ENGINE_SLOT_LEN: usize = 1301;
+const LEGACY_PORTFOLIO_ACCOUNT_LEN: usize = 9563;
+const LEGACY_WRAPPER_VERSION: u16 = 18;
+const LEGACY_ENGINE_LAYOUT_DISCRIMINATOR: u16 = 18;
+/// Wrapper account header: magic (8) then VERSION (u16).
+const HEADER_VERSION_OFF: usize = 8;
 const PARITY_FIXTURE: &str = "tests/fixtures/growth_legacy_parity_v21.txt";
 
-/// Account bytes with the appended K/F drift tail removed from every engine asset slot.
-fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
+/// Byte ranges appended to the engine layouts since the fixture's, located by field name:
+/// `(ranges inside one engine asset slot, ranges inside one portfolio account)`, keyed by the
+/// engine layout discriminator. A layout this table does not know PANICS: growing the slot or the
+/// leg (Wave B does both) must add its fields here, never be silently mis-stripped as "the tail".
+fn legacy_strip_ranges() -> (Vec<(usize, usize)>, Vec<(usize, usize)>) {
+    use core::mem::{offset_of, size_of};
+    use percolator::{EngineAssetSlotV16Account, KfDriftSideV16Account, PortfolioAccountV16Account, PortfolioLegV16Account};
+    let drift = vec![
+        (offset_of!(EngineAssetSlotV16Account, kf_drift_long), size_of::<KfDriftSideV16Account>()),
+        (offset_of!(EngineAssetSlotV16Account, kf_drift_short), size_of::<KfDriftSideV16Account>()),
+    ];
+    let leg_remainders = || -> Vec<(usize, usize)> {
+        let legs = percolator_prog::constants::HEADER_LEN + offset_of!(PortfolioAccountV16Account, legs);
+        (0..percolator::V16_MAX_PORTFOLIO_ASSETS_N)
+            .flat_map(|i| {
+                let leg = legs + i * size_of::<PortfolioLegV16Account>();
+                [
+                    (leg + offset_of!(PortfolioLegV16Account, k_rem_num), 16),
+                    (leg + offset_of!(PortfolioLegV16Account, f_rem_num), 16),
+                ]
+            })
+            .collect()
+    };
+    let (slot, portfolio) = match percolator::V16_LAYOUT_DISCRIMINATOR {
+        // #277 / F6: K/F drift tail on the engine asset slot.
+        18 => (drift, vec![]),
+        // + per-leg K/F settlement remainders (upstream a74b81b2).
+        20 => (drift, leg_remainders()),
+        other => panic!(
+            "legacy parity: no strip table for engine layout discriminator {other}; list the fields \
+             appended since c493bbc0 (by name) in legacy_strip_ranges()"
+        ),
+    };
+    // The named fields must account for the WHOLE growth since the fixture layout.
+    let cut = |r: &[(usize, usize)]| r.iter().map(|x| x.1).sum::<usize>();
+    assert_eq!(size_of::<EngineAssetSlotV16Account>() - cut(&slot), LEGACY_ENGINE_SLOT_LEN, "engine slot grew by a field the strip table does not list");
+    assert_eq!(
+        percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN - cut(&portfolio),
+        LEGACY_PORTFOLIO_ACCOUNT_LEN,
+        "portfolio account grew by a field the strip table does not list"
+    );
+    (slot, portfolio)
+}
+
+fn cut_ranges(out: &mut Vec<u8>, chunk: &[u8], ranges: &[(usize, usize)]) -> bool {
+    let mut sorted = ranges.to_vec();
+    sorted.sort();
+    let (mut at, mut nonzero) = (0usize, false);
+    for (off, len) in sorted {
+        assert!(off >= at && off + len <= chunk.len());
+        out.extend_from_slice(&chunk[at..off]);
+        nonzero |= chunk[off..off + len].iter().any(|b| *b != 0);
+        at = off + len;
+    }
+    out.extend_from_slice(&chunk[at..]);
+    nonzero
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ParityAccount {
+    Market,
+    Portfolio,
+    Other,
+}
+
+/// Account bytes with every field appended since the fixture layout removed. Returns the legacy-
+/// shaped bytes and whether any removed MARKET (drift) / PORTFOLIO (remainder) byte was non-zero.
+fn strip_to_legacy_layout(data: &[u8], kind: ParityAccount) -> (Vec<u8>, bool) {
     use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
-    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
-    if !is_market || appended == 0 {
-        return (data.to_vec(), false);
+    let (slot_ranges, portfolio_ranges) = legacy_strip_ranges();
+    let mut out = Vec::with_capacity(data.len());
+    // Version stamps name the layout, so they differ by construction: check each carries THIS
+    // build's value, then rewrite it to the fixture layout's before hashing.
+    let mut data = data.to_vec();
+    if kind != ParityAccount::Other {
+        let v = HEADER_VERSION_OFF;
+        assert_eq!(u16::from_le_bytes([data[v], data[v + 1]]), percolator_prog::constants::VERSION, "wrapper header VERSION");
+        data[v..v + 2].copy_from_slice(&LEGACY_WRAPPER_VERSION.to_le_bytes());
     }
-    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
-    assert_eq!((data.len() - head) % MARKET_ASSET_SLOT_LEN, 0);
-    let mut out = data[..head].to_vec();
-    let mut tail_nonzero = false;
-    for k in 0..(data.len() - head) / MARKET_ASSET_SLOT_LEN {
-        let s = head + k * MARKET_ASSET_SLOT_LEN;
-        let cut = s + MARKET_ASSET_SLOT_LEN - appended;
-        out.extend_from_slice(&data[s..cut]);
-        tail_nonzero |= data[cut..s + MARKET_ASSET_SLOT_LEN].iter().any(|b| *b != 0);
+    if kind == ParityAccount::Portfolio {
+        let d = percolator_prog::constants::HEADER_LEN
+            + core::mem::offset_of!(percolator::PortfolioAccountV16Account, provenance_header)
+            + core::mem::offset_of!(percolator::ProvenanceHeaderV16Account, layout_discriminator);
+        assert_eq!(u16::from_le_bytes([data[d], data[d + 1]]), percolator::V16_LAYOUT_DISCRIMINATOR, "engine layout discriminator");
+        data[d..d + 2].copy_from_slice(&LEGACY_ENGINE_LAYOUT_DISCRIMINATOR.to_le_bytes());
     }
-    (out, tail_nonzero)
+    let data = &data[..];
+    match kind {
+        ParityAccount::Other => (data.to_vec(), false),
+        ParityAccount::Portfolio => {
+            assert_eq!(data.len(), percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN);
+            let nonzero = cut_ranges(&mut out, data, &portfolio_ranges);
+            assert_eq!(out.len(), LEGACY_PORTFOLIO_ACCOUNT_LEN);
+            (out, nonzero)
+        }
+        ParityAccount::Market => {
+            let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
+            assert_eq!((data.len() - head) % MARKET_ASSET_SLOT_LEN, 0);
+            // the engine slot's position inside one wrapper asset slot
+            let engine_off = core::mem::offset_of!(percolator::Market<[u8; percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN]>, engine);
+            let engine_len = core::mem::size_of::<percolator::EngineAssetSlotV16Account>();
+            out.extend_from_slice(&data[..head]);
+            let mut nonzero = false;
+            for k in 0..(data.len() - head) / MARKET_ASSET_SLOT_LEN {
+                let s = head + k * MARKET_ASSET_SLOT_LEN;
+                out.extend_from_slice(&data[s..s + engine_off]);
+                nonzero |= cut_ranges(&mut out, &data[s + engine_off..s + engine_off + engine_len], &slot_ranges);
+                out.extend_from_slice(&data[s + engine_off + engine_len..s + MARKET_ASSET_SLOT_LEN]);
+            }
+            (out, nonzero)
+        }
+    }
 }
 
 /// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth
@@ -1547,8 +1646,16 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
     let mut max_stale = 0u64;
     let mut snap = |env: &Env, what: &str, out: &mut Vec<String>| {
         for (k, n) in keys.iter().zip(names) {
-            let (bytes, tail) = strip_drift_tail(&env.svm.get_account(k).unwrap().data, n == "market");
-            tail_seen |= tail;
+            let kind = match n {
+                "market" => ParityAccount::Market,
+                "lp" | "x" | "y" => ParityAccount::Portfolio,
+                _ => ParityAccount::Other,
+            };
+            let (bytes, nonzero) = strip_to_legacy_layout(&env.svm.get_account(k).unwrap().data, kind);
+            // Remainders are sub-atom fractions the legacy layout dropped: on this whole-atom
+            // sequence they must stay zero, or the settled values would legitimately differ.
+            assert!(kind != ParityAccount::Portfolio || !nonzero, "{what} {n}: a leg remainder is non-zero on the legacy sequence");
+            tail_seen |= kind == ParityAccount::Market && nonzero;
             out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
         }
         let a = &state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0];
@@ -1629,8 +1736,8 @@ fn growth_off_is_byte_for_byte_legacy() {
     assert_eq!(zero_stale, 0, "zero-cohort case never goes stale");
     assert!(!zero_tail, "zero-cohort case leaves the drift tail zero");
     assert!(cohort_stale > 0, "cohort case really leaves stale positions");
-    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
-    assert_eq!(appended, 160);
+    let (slot_ranges, _) = legacy_strip_ranges();
+    assert_eq!(slot_ranges.iter().map(|r| r.1).sum::<usize>(), 160, "K/F drift fields");
     assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
     eprintln!("legacy parity: {} lines identical to c493bbc0 (zero + live cohort)", lines.len());
 }
