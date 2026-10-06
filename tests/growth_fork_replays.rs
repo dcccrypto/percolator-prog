@@ -125,6 +125,11 @@ fn load(name: &str) -> Fixture {
                 a.lamports += 7_000 * (grown.len() - a.data.len()) as u64;
                 a.data = grown;
             }
+            if a.owner == WRAPPER_ID {
+                let grown = legacy_wrapper_account_to_current_layout(&a.data);
+                a.lamports += 7_000 * (grown.len() - a.data.len()) as u64;
+                a.data = grown;
+            }
             (k, a)
         })
         .collect();
@@ -959,4 +964,47 @@ fn p2b_fork_percolator_earn_raises_ncap() {
         let expect = growth_v19::n_cap_q(moved, growth_v19::DEFAULT_LAMBDA_BPS, lv.price, POS_SCALE).unwrap();
         assert!(grew + 1 >= expect && grew <= expect + 1, "N_cap grew {grew}, expected ~{expect}");
     }
+}
+
+/// v2.2 per-leg K/F remainders: a live v2.1 wrapper account -> this layout. Every wrapper account
+/// is re-stamped with this build's header VERSION; a portfolio additionally gets the two zero
+/// remainder fields (32 B) after `f_snap` in each of its 16 legs and this build's engine layout
+/// discriminator (a leg that never carried a fraction has zero remainders, which is what a fresh
+/// account holds). Test-only: the program never loads an old account in place (full re-seed).
+fn legacy_wrapper_account_to_current_layout(old: &[u8]) -> Vec<u8> {
+    use core::mem::{offset_of, size_of};
+    use percolator::{PortfolioAccountV16Account, PortfolioLegV16Account, ProvenanceHeaderV16Account};
+    use percolator_prog::constants::{HEADER_LEN, PORTFOLIO_ACCOUNT_LEN, VERSION};
+    const V21_VERSION: u16 = 18;
+    const V21_PORTFOLIO_ACCOUNT_LEN: usize = 9563;
+    const V21_LEG_LEN: usize = 152;
+    const LEGS: usize = percolator::V16_MAX_PORTFOLIO_ASSETS_N;
+    if old.len() < HEADER_LEN || u16::from_le_bytes([old[8], old[9]]) != V21_VERSION {
+        return old.to_vec();
+    }
+    let mut out = old.to_vec();
+    if old[10] == KIND_PORTFOLIO {
+        assert_eq!(old.len(), V21_PORTFOLIO_ACCOUNT_LEN, "v2.1 portfolio length");
+        let inserted = size_of::<PortfolioLegV16Account>() - V21_LEG_LEN;
+        assert_eq!(inserted, 32, "this upgrade knows exactly the two remainder fields");
+        assert_eq!(PORTFOLIO_ACCOUNT_LEN, V21_PORTFOLIO_ACCOUNT_LEN + inserted * LEGS);
+        let cut = offset_of!(PortfolioLegV16Account, k_rem_num);
+        let legs = HEADER_LEN + offset_of!(PortfolioAccountV16Account, legs);
+        out = old[..legs].to_vec();
+        for i in 0..LEGS {
+            let leg = &old[legs + i * V21_LEG_LEN..legs + (i + 1) * V21_LEG_LEN];
+            out.extend_from_slice(&leg[..cut]);
+            out.extend_from_slice(&[0u8; 32]);
+            out.extend_from_slice(&leg[cut..]);
+        }
+        out.extend_from_slice(&old[legs + LEGS * V21_LEG_LEN..]);
+        assert_eq!(out.len(), PORTFOLIO_ACCOUNT_LEN);
+        let disc = HEADER_LEN
+            + offset_of!(PortfolioAccountV16Account, provenance_header)
+            + offset_of!(ProvenanceHeaderV16Account, layout_discriminator);
+        assert_eq!(u16::from_le_bytes([out[disc], out[disc + 1]]), 18, "v2.1 engine layout");
+        out[disc..disc + 2].copy_from_slice(&percolator::V16_LAYOUT_DISCRIMINATOR.to_le_bytes());
+    }
+    out[8..10].copy_from_slice(&VERSION.to_le_bytes());
+    out
 }
