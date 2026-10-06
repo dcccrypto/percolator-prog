@@ -26,6 +26,8 @@ The wizard should display: "Forced recovery after N minutes of keeper absence" w
 | 113 `PriceBandLegBelowMinNotional` | A trade would leave a position below the market minimum | "Below the minimum position size: trade at least X, or close fully." |
 | 21 `EngineLockActive` | Earn / insurance / conversion paths while the mark lags | "Price catching up; try again in a few seconds." |
 
+Tag 111 `SweepBandDustLeg { asset_index }` (permissionless; accounts `[caller][market w][portfolio w]`) closes a band leg whose notional at the current mark is below HALF the market minimum, at the current mark, with no fee. Keepers should run it when a side is near the 256 cap. The app should warn a user whose position falls below half the minimum that it can be closed by anyone.
+
 ## The fast-crash behaviour (E-L2 trade-off)
 
 On a band market the favourable-side close is refused whenever the mark lags the oracle. In a

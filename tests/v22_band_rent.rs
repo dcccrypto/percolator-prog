@@ -2030,3 +2030,35 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
     env.assert_conservation();
 }
+
+impl Env {
+    fn sweep_dust(&mut self, portfolio: Pubkey) -> Result<u64, String> {
+        let (payer, m) = (self.payer.pubkey(), self.market);
+        self.send(
+            ProgInstruction::SweepBandDustLeg { asset_index: 0 },
+            vec![AccountMeta::new(payer, false), AccountMeta::new(m, false), AccountMeta::new(portfolio, false)],
+            &[],
+        )
+    }
+}
+
+/// N-1 dust sweep, tag 111 (wrapper): permissionless, but a leg at or above half the minimum
+/// is not sweepable (NonProgress), and nothing is swept while the asset lags (21). The
+/// positive case (a dust leg closed, slot freed) is the engine test
+/// `band_dust_leg_becomes_sweepable_only_below_half_the_minimum`; the BPF fixture cannot reach
+/// a >50% price fall in reasonable time at 4 bps/slot.
+#[test]
+fn v22_tag111_dust_sweep_refusals() {
+    let ix = ProgInstruction::SweepBandDustLeg { asset_index: 3 };
+    assert_eq!(ProgInstruction::decode(&ix.encode()).unwrap(), ix, "wire roundtrip");
+    assert_eq!(ix.encode(), vec![111, 3, 0]);
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    let r = env.sweep_dust(long.1);
+    assert_err(&r, &code(PercolatorError::EngineNonProgress), "a $200 leg is not dust");
+    lagged_not_pinned(&mut env, short.1, lp.account);
+    let r = env.sweep_dust(long.1);
+    assert_err(&r, &code(PercolatorError::EngineLockActive), "no sweep while lagged");
+    assert_eq!(env.pos(long.1), 200 * Q, "untouched");
+    env.assert_conservation();
+}

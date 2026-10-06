@@ -518,6 +518,9 @@ pub mod constants {
     /// v2.2 Phase 4 item 2 (ledger v22-allocations.md): permissionless holding-fee rent
     /// settle + route to the bound vault LP.
     pub const TAG_SETTLE_HOLDING_RENT: u8 = 106;
+    /// v2.2 band (security re-review N-1): permissionless sweep of a DUST band leg (below half
+    /// the market's minimum leg notional), freeing its per-side position slot.
+    pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 111;
     /// v2.2 band markets: default share of the liquidation penalty paid to a third-party
     /// cranker (design §1.2: liquidation must be paid to happen, a pending leg holds the epoch).
     pub const BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS: u16 = 2_000;
@@ -7770,6 +7773,11 @@ pub mod ix {
         /// rent to the bound vault LP. Accounts: `[0] caller (s)`, `[1] market (w)`,
         /// `[2] portfolio (w)`, `[3] vault_lp_portfolio (w)`, `[4..] oracle accounts`.
         SettleHoldingRent { asset_index: u16, now_slot: u64 },
+        /// v2.2 tag 111 (permissionless): close a band leg whose notional at `P_last` is below
+        /// half of `band_min_leg_notional` (engine `band_leg_is_dust`), unilaterally at
+        /// `P_last` (`rebalance_reduce_position_not_atomic`), so dust cannot hold one of the
+        /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
+        SweepBandDustLeg { asset_index: u16 },
         /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
         /// starting leverage cap, written at bind on an asset whose growth block is on.
         InitVaultLpV19 {
@@ -8526,6 +8534,9 @@ pub mod ix {
                 crate::constants::TAG_SETTLE_HOLDING_RENT => Self::SettleHoldingRent {
                     asset_index: read_u16(&mut rest)?,
                     now_slot: read_u64(&mut rest)?,
+                },
+                crate::constants::TAG_SWEEP_BAND_DUST_LEG => Self::SweepBandDustLeg {
+                    asset_index: read_u16(&mut rest)?,
                 },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
@@ -9394,6 +9405,10 @@ pub mod ix {
                         push_u32(&mut out, phase4.band_max_pin_slots);
                         push_u64(&mut out, phase4.band_min_leg_notional);
                     }
+                }
+                Self::SweepBandDustLeg { asset_index } => {
+                    out.push(crate::constants::TAG_SWEEP_BAND_DUST_LEG);
+                    push_u16(&mut out, asset_index);
                 }
                 Self::SettleHoldingRent {
                     asset_index,
@@ -11474,6 +11489,7 @@ pub mod lag_policy {
             Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (re-review N-3)"),
             Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
             Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
+            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 111: a forced close at P_last, refused while the asset lags"),
             Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
             Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags"),
         }
@@ -13201,6 +13217,9 @@ pub mod processor {
                 asset_index,
                 now_slot,
             } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
+            Instruction::SweepBandDustLeg { asset_index } => {
+                handle_sweep_band_dust_leg(program_id, accounts, asset_index)
+            }
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
                 portfolio_id,
@@ -22610,6 +22629,48 @@ pub mod processor {
                         asset_index: asset_index as usize,
                         reduce_q,
                     },
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// v2.2 band (security re-review N-1), tag 111: permissionless dust sweep. The leg must be
+    /// dust (`band_leg_is_dust`: under HALF the market's minimum leg notional at `P_last`); the
+    /// asset must not lag its target (a forced close at a stale mark is refused, 21); the close
+    /// is the engine's unilateral reduce at `P_last` (the same primitive as RebalanceReduce,
+    /// no fee), after the canonical zero-move funding catch-up.
+    #[inline(never)]
+    fn handle_sweep_band_dust_leg<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+    ) -> ProgramResult {
+        with_one_portfolio_view(program_id, accounts, false, None, |group, portfolio, cfg| {
+            let a = asset_index as usize;
+            if group.header.mode != 0 || permissionless_resolve_matured_now_view(cfg, group) {
+                return Err(V16Error::LockActive);
+            }
+            if asset_price_lagged_view(group, a).map_err(|_| V16Error::InvalidConfig)? {
+                return Err(V16Error::LockActive);
+            }
+            if !group.band_leg_is_dust(&portfolio.as_view(), a)? {
+                return Err(V16Error::NonProgress);
+            }
+            accrue_zero_move_funding_before_position_change_view(cfg, group, a, true)?;
+            let mut reduce_q = 0u128;
+            for pod in portfolio.header.legs.iter() {
+                let leg = pod.try_to_runtime()?;
+                if leg.active && leg.asset_index as usize == a {
+                    reduce_q = leg.basis_pos_q.unsigned_abs();
+                }
+            }
+            if reduce_q == 0 {
+                return Err(V16Error::InvalidLeg);
+            }
+            group
+                .rebalance_reduce_position_not_atomic(
+                    portfolio,
+                    RebalanceRequestV16 { asset_index: a, reduce_q },
                 )
                 .map(|_| ())
         })

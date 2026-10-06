@@ -163,6 +163,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
         // v2.2 Phase 4 item 2, tag 106.
         Instruction::SettleHoldingRent { .. } => "SettleHoldingRent",
+        Instruction::SweepBandDustLeg { .. } => "SweepBandDustLeg",
     }
 }
 
