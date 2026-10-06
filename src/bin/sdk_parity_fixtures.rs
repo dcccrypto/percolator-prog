@@ -167,6 +167,10 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::BondDeposit { .. } => "BondDeposit",
         Instruction::BondRequestWithdraw { .. } => "BondRequestWithdraw",
         Instruction::BondExecuteWithdraw { .. } => "BondExecuteWithdraw",
+        Instruction::InsuranceBackstopDraw { .. } => "InsuranceBackstopDraw",
+        Instruction::RescueDeposit { .. } => "RescueDeposit",
+        Instruction::InitInsuranceUnits => "InitInsuranceUnits",
+        Instruction::SetG9FeedAllowlist { .. } => "SetG9FeedAllowlist",
     }
 }
 
