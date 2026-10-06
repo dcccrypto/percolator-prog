@@ -1577,6 +1577,15 @@ fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Res
     w.send(ProgInstruction::InsuranceBackstopDraw { mode, max_amount }, metas, &[])
 }
 
+/// The G9 world: seniors (2,500,000 over both pots) large enough that, under R-1 (2), the
+/// insurance they unlock (`senior_drawn - outstanding`) covers the deficit left after they are
+/// exhausted (round 1 used 150,000 of seniors, i.e. the dust-senior case the re-review flagged).
+fn g9_world() -> (P3, Vec<(Keypair, Pubkey)>, (Keypair, Pubkey)) {
+    let (d0, d1, pushes) = G9W.with(|c| c.get());
+    underwater_world(d0, d1, 1_000_000, pushes)
+}
+thread_local! { static G9W: std::cell::Cell<(u64, u64, usize)> = const { std::cell::Cell::new((1_500_000, 1_000_000, 8)) }; }
+
 /// W-2: wait out the G9 delay with the book kept current (mark re-pushed, ports cranked).
 fn g9_wait(w: &mut P3, ports: &[Pubkey], slots: u64) {
     let mark = MARK.with(|c| c.get());
@@ -1740,7 +1749,7 @@ fn g9_refused_while_seniors_can_fund() {
 /// halted while the backstop is outstanding; the dead vault cannot be rescued (115).
 #[test]
 fn g9_draws_after_exhaustion_bounded_pro_rata() {
-    let (mut w, _s, (_tk, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_tk, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     // Without the ledger on a units market: refused before anything moves.
     let r0 = backstop_111(&mut w, 0, 0, false);
@@ -1787,7 +1796,7 @@ fn g9_draws_after_exhaustion_bounded_pro_rata() {
 /// insurance; unit value recovers; the receivable falls on both ledgers.
 #[test]
 fn g9_restore_repays_backstop_first() {
-    let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (t, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     g9(&mut w, &[tp]).expect("draw");
     let b0 = backstop_st(&w) as u128;
@@ -2165,7 +2174,7 @@ fn xprog_consent_sync_recover_and_no_admin_flush() {
 /// fraction of their insurance value. A staker can still exit from liquidity.
 #[test]
 fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
-    let (mut w, _s, (_tk, tp_xp2)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_tk, tp_xp2)) = g9_world();
     top_up_9(&mut w, 2_000_000, false).expect("creator seed");
     init_units(&mut w).expect("116");
     let p = craft_pool(&mut w, 1, 1);
@@ -2262,7 +2271,7 @@ fn settle_resolved_units(w: &mut P3, junior_owner: Pubkey, topup: u8) -> Result<
 /// writes anything off early; both ledgers keep the same receivable; tokens are conserved.
 #[test]
 fn g9_resolved_settle_repays_backstop_first() {
-    let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (t, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     g9(&mut w, &[tp]).expect("draw");
     let b0 = backstop_st(&w) as u128;
@@ -2509,7 +2518,7 @@ fn sec_d7_junior_only_vault_never_g9() {
 #[test]
 fn w2_g9_two_step_window_and_epoch_cap() {
     use percolator_prog::p4_rescue_ins::{G9_DELAY_SLOTS, G9_EXEC_WINDOW_SLOTS};
-    let (mut w, _s, (_tk, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_tk, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     let ins0 = w.env.market_state().1.insurance;
     let r = backstop_111(&mut w, 0, 0, true);
@@ -2556,7 +2565,7 @@ fn w2_g9_two_step_window_and_epoch_cap() {
 /// draw halt.
 #[test]
 fn sec_d6_fill_halt_counts_the_backstop() {
-    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_t, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     g9(&mut w, &[tp]).expect("G9 draw");
     let b = backstop_st(&w) as u128;
@@ -2594,7 +2603,7 @@ fn sec_d6_fill_halt_counts_the_backstop() {
 /// margin) in Live, not only once it is flat.
 #[test]
 fn w4_restore_from_positioned_lp() {
-    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_t, tp)) = g9_world();
     seed_units(&mut w, 20_000_000);
     g9(&mut w, &[tp]).expect("draw");
     let b0 = backstop_st(&w) as u128;
@@ -2685,4 +2694,176 @@ fn s6_protocol_raise_not_overwritable_and_consent_binds_pending() {
     let r = stake_deposit(&mut w, &p, &a, 1_000_000, Some(CONSENT));
     assert!(st_code(&r, ST_CONSENT_REQUIRED), "consent to the old target refused while a raise is pending: {r:?}");
     stake_deposit_consent(&mut w, &p, &a, 1_000_000, Some((CONSENT, 6_000, 3_000, 500))).expect("consent to the pending target");
+}
+
+// ═══════════ Re-review (2026-10-06) items R-1, R-2, R-6 + the reviewer's sec2 tests ═══════════
+
+/// SEC2 (ported): dust (< 1e6) donated into the fund before genesis blocks 116 (liveness only,
+/// R-3: the creator tops up to 1e6); exactly 1e6 passes.
+#[test]
+fn sec2_genesis_after_dust_donation() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 999_999, false).expect("dust");
+    let r = init_units(&mut w);
+    assert!(has(&r, INS_REFUSED), "999,999 in the fund: 116 refused: {r:?}");
+    top_up_9(&mut w, 1, false).expect("1 more atom (no units yet)");
+    init_units(&mut w).expect("exactly 1e6 passes");
+    let u = units(&w).unwrap();
+    assert_eq!((u.units_total, u.units_creator), (1_000_000, 1_000_000));
+}
+
+/// SEC2 (ported): on an empty-fund ledger the first top-up is the genesis and needs >= 1e6.
+#[test]
+fn sec2_first_topup_is_genesis_min() {
+    let mut w = P3::new();
+    init_units(&mut w).expect("116 on an empty fund");
+    assert!(has(&top_up_9(&mut w, 999_999, true), INS_REFUSED));
+    top_up_9(&mut w, 1_000_000, true).expect("1e6");
+}
+
+fn sec2_pool_world(seed: u64) -> (P3, Pool) {
+    let mut w = P3::new();
+    top_up_9(&mut w, seed, false).expect("seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    (w, p)
+}
+
+/// SEC2 (ported): an inflated unit price. At price 3 (`U = 1e6, I = 3e6`) a 2e6 sync mints
+/// 666,666 stake units (2 atoms of rounding, within 1 bp): accepted. At price 428,571 (`U = 7`)
+/// the same sync would mint 4 units worth 1,714,284: refused.
+#[test]
+fn sec2_inflated_price_mint_bound() {
+    let (mut w, p) = sec2_pool_world(3_000_000);
+    set_units(&mut w, |u| { u.units_total = 1_000_000; u.units_creator = 1_000_000; u.units_stake = 0; });
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("dep");
+    stake_sync(&mut w, &p).expect("sync at price 3 accepted");
+    assert_eq!(units(&w).unwrap().units_stake, 666_666);
+    let (mut w, p) = sec2_pool_world(3_000_000);
+    set_units(&mut w, |u| { u.units_total = 7; u.units_creator = 7; u.units_stake = 0; });
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("dep");
+    assert!(stake_sync(&mut w, &p).is_err(), "lossy mint refused");
+    assert_eq!(units(&w).unwrap().units_stake, 0);
+}
+
+/// R-2: the burn side of the rounding bound. At price 428,571 (`U = 7`, I = 3e6) a 1-atom
+/// creator withdrawal would burn a whole unit (428,571 atoms): refused. Controls: a withdrawal of
+/// exactly one unit's value is admitted, and a full-class exit is always admitted.
+#[test]
+fn r2_lossy_burn_refused() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 3_000_000, false).unwrap();
+    init_units(&mut w).unwrap();
+    set_units(&mut w, |u| { u.units_total = 7; u.units_creator = 7; u.units_stake = 0; });
+    init_units(&mut w).unwrap();
+    let u = units(&w).unwrap();
+    let free = u.snap_insurance_free_atoms;
+    let (_, r) = withdraw_57(&mut w, 1, true);
+    assert!(has(&r, INS_REFUSED), "1 atom for a whole unit refused: {r:?}");
+    assert!(r.unwrap_err().contains("p4_ins_units_burn_lossy"), "refused by the burn bound");
+    let one_unit = free / 7;
+    let (_, ok) = withdraw_57(&mut w, one_unit, true);
+    ok.expect("exactly one unit's value admitted");
+    assert_eq!(units(&w).unwrap().units_total, 6);
+    let u = units(&w).unwrap();
+    let all = u.snap_insurance_free_atoms;
+    let (_, full) = withdraw_57(&mut w, all, true);
+    full.expect("full-class exit admitted");
+    assert_eq!(units(&w).unwrap().units_creator, 0);
+}
+
+/// R-1 (2) + the reviewer's `sec2_g9_dust_seniors_epochs`: with DUST seniors (150,000 against a
+/// 20,000,000 fund) on a creator-pushed mark, G9 can lend at most what the seniors have lost to
+/// booked draws, in total, over any number of epochs (before: 50% of the fund in 4 epochs).
+#[test]
+fn sec2_g9_dust_seniors_epochs() {
+    use percolator_prog::p4_rescue_ins::G9_EPOCH_SLOTS;
+    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    let fund0 = w.env.market_state().1.insurance;
+    for epoch in 0..4 {
+        let r = g9(&mut w, &[tp]);
+        let b = backstop_st(&w) as u128;
+        eprintln!("SEC2 epoch {epoch}: g9 -> {:?}; outstanding {b} of fund {fund0}; senior drawn {}", r.as_ref().map_err(|e| code(e)), drawn(&w));
+        if epoch == 0 {
+            r.expect("the first draw goes through (vacuity)");
+            assert!(b > 0);
+        }
+        assert!(b <= drawn(&w), "R-1 (2): outstanding {b} <= senior drawn {}", drawn(&w));
+        assert!(b <= 150_000, "dust seniors unlock only dust: {b}");
+        g9_wait(&mut w, &[tp], G9_EPOCH_SLOTS);
+        for _ in 0..4 {
+            let m = MARK.with(|c| c.get()) * 124 / 100;
+            MARK.with(|c| c.set(m));
+            w.push(m);
+            let lp = w.lp;
+            w.catch_up(&[tp, lp], 30);
+        }
+    }
+}
+
+/// R-1 (1), both build flavours. The P3 market is AuthMark (creator-pushed). On a MAINNET build
+/// (no `devnet` feature; run with `R1_FLAVOUR=mainnet` and that `.so` as `INDEP_WRAPPER_SO`)
+/// propose (2) and draw (0) are refused by the oracle gate before any account is read, and
+/// restore (1) is not. On the devnet build (default) the override keeps G9 testable: propose is
+/// admitted on the same AuthMark market.
+#[test]
+fn r1_g9_oracle_gate_by_build_flavour() {
+    let mainnet = std::env::var("R1_FLAVOUR").map_or(false, |v| v == "mainnet");
+    if mainnet {
+        let mut w = P3::new();
+        w.lp = Pubkey::new_unique(); // no vault on this build (the bind needs the devnet pins)
+        for mode in [2u8, 0] {
+            let r = backstop_111(&mut w, mode, 0, false);
+            eprintln!("R-1 mainnet 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
+            assert!(has(&r, INS_REFUSED), "mainnet: refused: {r:?}");
+            assert!(r.unwrap_err().contains("p4_backstop_oracle_refused mode=3"), "by the oracle gate");
+        }
+        let r = backstop_111(&mut w, 1, 0, false);
+        assert!(!r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused")), "restore is never oracle-gated: {r:?}");
+    } else {
+        let (mut w, _s, (_t, _tp)) = g9_world();
+        seed_units(&mut w, 20_000_000);
+        backstop_111(&mut w, 2, 0, true).expect("devnet override: propose admitted on AuthMark");
+    }
+}
+
+/// R-6: RESTORE leaves the vault LP at least 10% of IM above its initial margin. After a
+/// repayment from a positioned LP, a second restore finds nothing more to repay and its log
+/// shows equity >= IM + ceil(IM / 10) (the buffer binds, not the IM floor).
+#[test]
+fn r6_restore_leaves_im_buffer() {
+    let (mut w, _s, (_t, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+    g9(&mut w, &[tp]).expect("draw");
+    for _ in 0..4 {
+        let m = MARK.with(|c| c.get()) * 80 / 100;
+        MARK.with(|c| c.set(m.max(PRICE / 4)));
+        w.push(m.max(PRICE / 4));
+        let lp = w.lp;
+        w.catch_up(&[tp, lp], 30);
+    }
+    let admin = w.env.admin.insecure_clone();
+    w.junior_deposit(&admin, 3_000_000).expect("junior");
+    let lpk = w.lp;
+    let _ = w.crank(lpk);
+    let b0 = backstop_st(&w);
+    backstop_111(&mut w, 1, 0, true).expect("restore");
+    let b1 = backstop_st(&w);
+    assert!(b1 < b0, "vacuity: repaid");
+    assert!(b1 > 0, "vacuity: the buffer, not the outstanding, limited the repayment");
+    let r = backstop_111(&mut w, 1, 0, true);
+    let e = r.expect_err("nothing more repayable");
+    let i = e.find("p4_backstop_restore_nothing").expect("restore_nothing log");
+    let field = |k: &str| -> u128 {
+        let j = e[i..].find(k).unwrap() + i + k.len();
+        e[j..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
+    };
+    let (equity, im) = (field("equity="), field("im="));
+    eprintln!("R-6: backstop {b0} -> {b1}; LP equity {equity} IM {im}");
+    assert!(im > 0, "vacuity: positioned");
+    assert!(equity >= im + im.div_ceil(10), "R-6: >= 10% of IM above the floor: {equity} vs {im}");
 }

@@ -117,6 +117,32 @@ pub fn ins_mint_admissible(x: u128, minted: u128, units_total: u128, insurance_m
     loss <= x / 10_000 + 1
 }
 
+/// R-2 (re-review 2026-10-06): the burn side of `ins_mint_admissible`. A withdrawal of `a` atoms
+/// that burns `burned` units against `(U, I_free)` (pre-withdrawal) is admitted only if the burned
+/// units are worth at most 1 bp (+1 atom) more than `a`: `floor(burned * I / U) - a <=
+/// floor(a / 10_000) + 1`, unless the caller burns its WHOLE class (`burned == class_units`, a full
+/// exit: there is nothing of its own left to protect, and refusing would strand its last value).
+/// Without it, `ceil(a*U/I)` can burn a whole unit (`I/U` atoms) for a 1-atom withdrawal.
+pub fn ins_burn_admissible(
+    a: u128,
+    burned: u128,
+    units_total: u128,
+    insurance_free: u128,
+    class_units: u128,
+) -> bool {
+    if a == 0 || burned == class_units {
+        return true;
+    }
+    if units_total == 0 {
+        return false;
+    }
+    let value = match burned.checked_mul(insurance_free) {
+        Some(p) => p / units_total,
+        None => return false,
+    };
+    value.saturating_sub(a) <= a / 10_000 + 1
+}
+
 /// Mint no-dilution, cross-multiplied (no division): the per-unit value after a top-up of `x`
 /// minting `minted` is at least the value before.
 pub fn ins_mint_no_dilution(insurance: u128, units_total: u128, x: u128, minted: u128) -> bool {
@@ -219,6 +245,41 @@ pub fn g9_epoch_room(base: u128, drawn_this_epoch: u128, cap_bps: u16) -> u128 {
 /// (possibly self-dealing) winner straight from insurance.
 pub fn g9_vault_eligible(senior_shares: u128, senior_drawn: u128) -> bool {
     senior_shares > 0 && senior_drawn > 0
+}
+
+/// R-1 (re-review 2026-10-06, mainnet blocker): G9 lends insurance only on a market whose asset-0
+/// price is EXTERNALLY sourced: Hybrid (oracle legs) or an EWMA mark with an external leg. Manual
+/// and AuthMark are creator-pushed (and a leg-less EWMA mark follows the market's own trades), so a
+/// creator could manufacture the deficit G9 pays. `allow_creator_oracle` is the devnet-only
+/// override (`cfg!(feature = "devnet")` at the call site; never on a mainnet build).
+pub fn g9_oracle_allowed(oracle_mode: u8, oracle_leg_count: u8, allow_creator_oracle: bool) -> bool {
+    const HYBRID: u8 = 1;
+    const EWMA: u8 = 2;
+    let external = (oracle_mode == HYBRID || oracle_mode == EWMA) && oracle_leg_count > 0;
+    external || allow_creator_oracle
+}
+
+/// R-1 (2): insurance never lends more, in total, than the Earn seniors have already lost to
+/// booked draws: the room is `senior_drawn - outstanding`. Dust seniors therefore unlock dust.
+pub fn g9_senior_drawn_room(senior_drawn: u128, outstanding: u128) -> u128 {
+    senior_drawn.saturating_sub(outstanding)
+}
+
+/// R-6 (re-review 2026-10-06): the permissionless RESTORE leaves the vault LP this much above its
+/// initial margin (bps of IM), so a repayment never parks the LP exactly on its margin floor.
+pub const RESTORE_IM_BUFFER_BPS: u16 = 1_000;
+
+/// R-6: the LP's capital that RESTORE may repay: `min(capital, equity - IM - buffer)`, with
+/// `buffer = ceil(IM * RESTORE_IM_BUFFER_BPS / 10_000)`. 0 on overflow (fail closed).
+pub fn backstop_restore_free(equity: u128, initial_req: u128, capital: u128) -> u128 {
+    let buffer = match initial_req.checked_mul(RESTORE_IM_BUFFER_BPS as u128) {
+        Some(p) => p.div_ceil(10_000),
+        None => return 0,
+    };
+    match initial_req.checked_add(buffer) {
+        Some(floor) => equity.saturating_sub(floor).min(capital),
+        None => 0,
+    }
 }
 
 /// Repayment of the backstop from the vault LP's free equity, FIRST on recovery:
@@ -427,6 +488,40 @@ mod tests {
         assert!(!ins_mint_admissible(999_999, 999_999, 0, 0), "genesis below minimum");
         assert!(ins_mint_admissible(1_000_000, 1_000_000, 0, 0));
         assert!(ins_mint_admissible(0, 0, 5, 5));
+    }
+
+    #[test]
+    fn r1_r2_r6_rules() {
+        // R-1: only externally sourced asset-0 prices, unless the devnet override.
+        assert!(!g9_oracle_allowed(0, 0, false), "Manual refused");
+        assert!(!g9_oracle_allowed(3, 0, false), "AuthMark refused");
+        assert!(!g9_oracle_allowed(2, 0, false), "leg-less EWMA refused");
+        assert!(g9_oracle_allowed(1, 1, false), "Hybrid with a leg allowed");
+        assert!(g9_oracle_allowed(2, 1, false), "EWMA with an external leg allowed");
+        assert!(!g9_oracle_allowed(1, 0, false));
+        assert!(g9_oracle_allowed(3, 0, true), "devnet override");
+        assert_eq!(g9_senior_drawn_room(150, 100), 50);
+        assert_eq!(g9_senior_drawn_room(100, 150), 0);
+        // R-2: 1 atom that burns 1 unit worth 428,571 atoms is refused; a full-class exit is not.
+        assert!(!ins_burn_admissible(1, 1, 7, 3_000_000, 7));
+        assert!(ins_burn_admissible(1, 7, 7, 3_000_000, 7), "full-class exit");
+        assert!(ins_burn_admissible(1_000_000, 1_000_000, 1_000_000, 1_000_000, 2_000_000));
+        assert!(ins_burn_admissible(0, 0, 0, 0, 0));
+        // R-6: 10% of IM stays above the floor.
+        assert_eq!(backstop_restore_free(1_600_000, 1_000_000, 5_000_000), 500_000);
+        assert_eq!(backstop_restore_free(1_050_000, 1_000_000, 5_000_000), 0);
+        assert_eq!(backstop_restore_free(3_000_000, 0, 400_000), 400_000, "flat LP: capital");
+        assert_eq!(backstop_restore_free(1_000, 1, 5_000), 998, "buffer rounds up");
+    }
+
+    /// R-1, both build flavours: the handler's gate is `g9_oracle_allowed(.., cfg!(devnet))`, so a
+    /// mainnet build (no `devnet`) has NO override and a creator-pushed oracle is always refused.
+    #[test]
+    fn r1_build_flavour() {
+        let devnet = cfg!(feature = "devnet");
+        assert_eq!(g9_oracle_allowed(3, 0, devnet), devnet, "AuthMark: devnet only");
+        assert_eq!(g9_oracle_allowed(0, 0, devnet), devnet, "Manual: devnet only");
+        assert!(g9_oracle_allowed(1, 1, devnet), "Hybrid: both flavours");
     }
 
     #[test]

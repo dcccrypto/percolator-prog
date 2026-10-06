@@ -992,3 +992,29 @@ fn rescue_then_redeem_extracts_nothing_and_incumbents_whole() {
     let inc_value_after = floor_mul_div(inc_shares, v1, s1);
     assert!(inc_value_after >= inc_value_before, "incumbent {inc_value_after} < {inc_value_before}");
 }
+
+/// R-5 (re-review 2026-10-06): the W-6 predicate (Wave A's `loss_current()`) on tag 112. A pending
+/// socialized-loss obligation, a pending B-index settlement, or a domain loss barrier on the
+/// vault's asset each refuses a non-bound rescue (114) on their own (the harness cannot reach
+/// these states organically, so they are patched into the slab). Control: the same rescue is
+/// admitted once every counter is clear. Mutant control: with `rescue_nonbound_loss_current_view`
+/// forced true, the patched cases are admitted (MR5).
+#[test]
+fn rescue_refused_on_pending_obligation_b_stale_or_barrier() {
+    let a = APPEND_ASSET_INDEX as usize;
+    let patches: [(&str, fn(&mut state::MarketGroupV16, usize, u64)); 3] = [
+        ("pending_obligation_count_long", |g, a, v| g.assets[a].pending_obligation_count_long = v),
+        ("b_stale_account_count", |g, _a, v| g.b_stale_account_count = v),
+        ("pending_domain_loss_barrier (asset's long domain)", |g, a, v| g.pending_domain_loss_barriers[2 * a] = v),
+    ];
+    for (name, patch) in patches {
+        let (mut env, v) = impaired(300_000_000);
+        let r = new_actor(&mut env, &v);
+        with_market(&mut env, |g| patch(g, a, 1));
+        let res = try_rescue(&mut env, &r, 200_000_000, 1);
+        eprintln!("R-5 {name} = 1 -> {:?}", res.as_ref().err().map(|e| code_of(e)));
+        assert!(res.as_ref().err().map_or(false, |e| has_code(e, RESCUE_REFUSED)), "{name}: refused 114: {res:?}");
+        with_market(&mut env, |g| patch(g, a, 0));
+        try_rescue(&mut env, &r, 200_000_000, 1).unwrap_or_else(|e| panic!("{name}: control admitted once clear: {e}"));
+    }
+}

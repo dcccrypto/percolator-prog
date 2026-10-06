@@ -33032,6 +33032,14 @@ pub mod processor {
             ));
             return Err(PercolatorError::InsuranceBackstopRefused.into());
         }
+        // R-2 (re-review 2026-10-06): the burn side of the W-1 rounding bound.
+        if !crate::p4_rescue_ins::ins_burn_admissible(a, burned, u.units_total, free, *held) {
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_ins_units_burn_lossy class={} a={} burn={} U={} I_free={}",
+                class, a, burned, u.units_total, free
+            ));
+            return Err(PercolatorError::InsuranceBackstopRefused.into());
+        }
         *held -= burned;
         u.units_total -= burned;
         solana_program::log::sol_log(&alloc::format!(
@@ -33274,7 +33282,10 @@ pub mod processor {
     /// RESTORE (`mode` 1). Repays `min(outstanding, capital, certified equity - IM, max_amount)`
     /// from the vault LP's capital (W-4: the engine's capital-to-insurance charge, which works on
     /// a POSITIONED LP and refuses to cut equity below IM; after the maintenance fee, A4-checked)
-    /// back into asset-0 insurance. Repayment never moves a senior's or the junior's value: both price on
+    /// back into asset-0 insurance. R-6: the repayment leaves the LP at least
+    /// `RESTORE_IM_BUFFER_BPS` (10%) of IM above its initial margin. UI NOTE: a junior deposit
+    /// (tag 96) made while a backstop is owed adds LP capital that any keeper can then sweep into
+    /// this repayment (repay-first by design): the junior-deposit screen must say so. Repayment never moves a senior's or the junior's value: both price on
     /// the vault value NET of the receivable, so `V - b` is unchanged by it.
     #[inline(never)]
     fn handle_insurance_backstop_draw<'a>(
@@ -33297,11 +33308,31 @@ pub mod processor {
         expect_writable(own_ledger_ai)?;
         expect_writable(sibling_ledger_ai)?;
         expect_owner(market_ai, program_id)?;
-        expect_owner(registry_ai, program_id)?;
-        expect_owner(lp_ai, program_id)?;
         if mode > 2 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // R-1 (re-review 2026-10-06, mainnet blocker): PROPOSE and DRAW only on a market whose
+        // asset-0 price is externally sourced. On a creator-pushed oracle (Manual / AuthMark) the
+        // creator could manufacture the deficit G9 pays. Devnet builds keep an override for
+        // testing; a mainnet build has none. RESTORE (mode 1) is always allowed.
+        if mode != 1 {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg0, group0) = state::market_view_mut(&mut market_data)?;
+            let profile0 = read_oracle_profile_from_view(&group0, &cfg0, 0)?;
+            if !crate::p4_rescue_ins::g9_oracle_allowed(
+                profile0.oracle_mode,
+                profile0.oracle_leg_count,
+                cfg!(feature = "devnet"),
+            ) {
+                solana_program::log::sol_log(&alloc::format!(
+                    "p4_backstop_oracle_refused mode={} legs={}",
+                    profile0.oracle_mode, profile0.oracle_leg_count
+                ));
+                return Err(PercolatorError::InsuranceBackstopRefused.into());
+            }
+        }
+        expect_owner(registry_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
         let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
         if lp_ai.key.to_bytes() != st.lp_portfolio {
             return Err(PercolatorError::VaultLpNotBound.into());
@@ -33449,6 +33480,12 @@ pub mod processor {
                         outstanding,
                         crate::p4_rescue_ins::BACKSTOP_CAP_BPS,
                     );
+                    // R-1 (2): never more in total than the seniors have already lost to booked
+                    // draws, so dust seniors unlock only dust.
+                    amt = amt.min(crate::p4_rescue_ins::g9_senior_drawn_room(
+                        st.senior_drawn_atoms,
+                        outstanding,
+                    ));
                     // W-2 (c): per-epoch cap on top of the cumulative one.
                     let epoch = now / crate::p4_rescue_ins::G9_EPOCH_SLOTS;
                     if u.g9_epoch != epoch {
@@ -33517,9 +33554,12 @@ pub mod processor {
                 // its surplus over IM in Live; it is no longer repayable only when flat. Positive
                 // PnL counts only once converted (tag 100; the engine refuses Live conversion
                 // while source-claim exposure is open), so free = min(capital, equity - IM).
-                let free = equity
-                    .saturating_sub(cert.certified_initial_req)
-                    .min(lp.header.capital.get());
+                // R-6: leave a buffer of `RESTORE_IM_BUFFER_BPS` of IM above the margin floor.
+                let free = crate::p4_rescue_ins::backstop_restore_free(
+                    equity,
+                    cert.certified_initial_req,
+                    lp.header.capital.get(),
+                );
                 let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, free, max_amount);
                 if amt == 0 {
                     solana_program::log::sol_log(&alloc::format!(
@@ -33548,8 +33588,8 @@ pub mod processor {
                 st.backstop_outstanding_atoms =
                     u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
                 solana_program::log::sol_log(&alloc::format!(
-                    "p4_backstop_restore repaid={} outstanding={}",
-                    amt, next
+                    "p4_backstop_restore repaid={} outstanding={} equity_before={} im={}",
+                    amt, next, equity, cert.certified_initial_req
                 ));
                 amt
             };
