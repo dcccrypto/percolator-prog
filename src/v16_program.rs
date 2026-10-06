@@ -5841,6 +5841,40 @@ pub mod state {
         Ok(PortfolioV16ViewMut::new(header))
     }
 
+    /// One genesis asset slot of `init_market_account_zero_copy`, in its OWN frame (v2.2 combined
+    /// release: the 806 B engine header plus the 2.3 KB asset/slot temporaries in one frame took
+    /// `init_market_account_zero_copy` to 3,968 B, over the 3,840 B budget of the SBF frame gate).
+    #[inline(never)]
+    fn init_market_asset_slot_zero_copy(
+        data: &mut [u8],
+        i: usize,
+        initial_price: u64,
+        init_slot: u64,
+        band_bps: u64,
+    ) -> Result<(), ProgramError> {
+        let market_id = (i as u64)
+            .checked_add(1)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let mut asset = AssetStateV16::default();
+        asset.market_id = market_id;
+        asset.raw_oracle_target_price = initial_price;
+        asset.effective_price = initial_price;
+        asset.fund_px_last = initial_price;
+        asset.slot_last = init_slot;
+        // v2.2 band: arm the per-epoch band at genesis exactly as the engine's own
+        // activation does (epoch 1, anchored at the genesis price).
+        percolator::band_initialize_asset(&mut asset, band_bps, initial_price, init_slot)
+            .map_err(crate::error::map_v16_error)?;
+        let mut slot = EngineAssetSlotV16Account::empty_for_market(market_id);
+        slot.asset = percolator::AssetStateV16Account::from_runtime(&asset);
+        slot.insurance_domain_budget_long = percolator::V16PodU128::new(0);
+        slot.insurance_domain_budget_short = percolator::V16PodU128::new(0);
+        slot.insurance_domain_spent_long = percolator::V16PodU128::new(0);
+        slot.insurance_domain_spent_short = percolator::V16PodU128::new(0);
+        *asset_slot_wire_mut(data, i)? = slot;
+        Ok(())
+    }
+
     pub fn init_market_account_zero_copy(
         data: &mut [u8],
         config: &WrapperConfigV16,
@@ -5901,26 +5935,7 @@ pub mod state {
 
         let mut i = 0usize;
         while i < configured {
-            let market_id = (i as u64)
-                .checked_add(1)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            let mut asset = AssetStateV16::default();
-            asset.market_id = market_id;
-            asset.raw_oracle_target_price = initial_price;
-            asset.effective_price = initial_price;
-            asset.fund_px_last = initial_price;
-            asset.slot_last = init_slot;
-            // v2.2 band: arm the per-epoch band at genesis exactly as the engine's own
-            // activation does (epoch 1, anchored at the genesis price).
-            percolator::band_initialize_asset(&mut asset, engine_config.band_bps, initial_price, init_slot)
-                .map_err(crate::error::map_v16_error)?;
-            let mut slot = EngineAssetSlotV16Account::empty_for_market(market_id);
-            slot.asset = percolator::AssetStateV16Account::from_runtime(&asset);
-            slot.insurance_domain_budget_long = percolator::V16PodU128::new(0);
-            slot.insurance_domain_budget_short = percolator::V16PodU128::new(0);
-            slot.insurance_domain_spent_long = percolator::V16PodU128::new(0);
-            slot.insurance_domain_spent_short = percolator::V16PodU128::new(0);
-            *asset_slot_wire_mut(data, i)? = slot;
+            init_market_asset_slot_zero_copy(data, i, initial_price, init_slot, engine_config.band_bps)?;
             i += 1;
         }
 
