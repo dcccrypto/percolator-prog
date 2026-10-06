@@ -6564,7 +6564,7 @@ pub mod state {
         if x.version != crate::constants::G9_FEED_ALLOWLIST_VERSION
             || n > crate::constants::G9_FEED_ALLOWLIST_CAP
             || x._pad != [0u8; 5]
-            || x.keys[..n].iter().any(|k| *k == [0u8; 32])
+            || x.keys[..n].contains(&[0u8; 32])
             || x.keys[n..].iter().any(|k| *k != [0u8; 32])
             || (0..n).any(|i| (i + 1..n).any(|j| x.keys[i] == x.keys[j]))
         {
