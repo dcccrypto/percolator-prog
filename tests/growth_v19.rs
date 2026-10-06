@@ -1605,6 +1605,7 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
         out.extend_from_slice(&data[s..cut]);
         tail_nonzero |= data[cut..s + stride].iter().any(|b| *b != 0);
     }
+    (out, tail_nonzero)
 }
 
 /// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth
