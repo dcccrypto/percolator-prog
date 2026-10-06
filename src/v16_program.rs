@@ -1526,6 +1526,10 @@ VaultLpMultiAssetMarket,
         /// v2.2 band (review E-L1): the band around the current anchor is narrower than the
         /// minimum width, so no new exposure may attach. Engine `BandTooNarrow`. Custom(112).
         PriceBandTooNarrow = 112,
+        /// v2.2 band (security re-review N-1): a trade would leave a positioned leg below the
+        /// market's minimum leg notional (`band_min_leg_notional`). Open bigger or close the
+        /// leg fully. Engine `BandLegBelowMinNotional`. Custom(113).
+        PriceBandLegBelowMinNotional = 113,
     }
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
@@ -1540,6 +1544,7 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::HoldingRentConfigInvalid as u32 == 106);
     const _: () = assert!(PercolatorError::PriceBandPositionCap as u32 == 111);
     const _: () = assert!(PercolatorError::PriceBandTooNarrow as u32 == 112);
+    const _: () = assert!(PercolatorError::PriceBandLegBelowMinNotional as u32 == 113);
 
     impl From<PercolatorError> for ProgramError {
         fn from(value: PercolatorError) -> Self {
@@ -1579,6 +1584,7 @@ VaultLpMultiAssetMarket,
             V16Error::BandOutOfRange | V16Error::BandPinned => PercolatorError::PriceBandPinned,
             V16Error::BandPositionCap => PercolatorError::PriceBandPositionCap,
             V16Error::BandTooNarrow => PercolatorError::PriceBandTooNarrow,
+            V16Error::BandLegBelowMinNotional => PercolatorError::PriceBandLegBelowMinNotional,
         };
         mapped.into()
     }
@@ -6891,7 +6897,9 @@ pub mod ix {
 
     /// v2.2 Phase 4 (items 1 + 2): the InitMarket trailer after the 4-byte growth block.
     /// Wire: `[rent_max_e9_per_slot u32][rent_kink_bps u16]` (6 B), optionally followed by the
-    /// band block `[band_bps u16][band_max_epoch_slots u32][band_max_pin_slots u32]` (10 B).
+    /// band block `[band_bps u16][band_max_epoch_slots u32][band_max_pin_slots u32]
+    /// [band_min_leg_notional u64]` (18 B; the last field is the security re-review N-1 minimum
+    /// leg notional in collateral atoms, floored by the program at 10 whole tokens).
     /// The rent fields go to the engine config (`rent_max_e9_per_slot`) and the asset's growth
     /// record (`rent_kink_bps`); the band fields to the engine config (immutable, no setter).
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -6901,6 +6909,7 @@ pub mod ix {
         pub band_bps: u16,
         pub band_max_epoch_slots: u32,
         pub band_max_pin_slots: u32,
+        pub band_min_leg_notional: u64,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -7909,7 +7918,7 @@ pub mod ix {
                                 growth_l_launch_x100,
                             }
                         } else {
-                            // v2.2: rent block (6 B), then an optional band block (10 B).
+                            // v2.2: rent block (6 B), then an optional band block (18 B).
                             let mut phase4 = InitMarketPhase4 {
                                 rent_max_e9_per_slot: read_u32(&mut rest)?,
                                 rent_kink_bps: read_u16(&mut rest)?,
@@ -7919,6 +7928,7 @@ pub mod ix {
                                 phase4.band_bps = read_u16(&mut rest)?;
                                 phase4.band_max_epoch_slots = read_u32(&mut rest)?;
                                 phase4.band_max_pin_slots = read_u32(&mut rest)?;
+                                phase4.band_min_leg_notional = read_u64(&mut rest)?;
                                 if phase4.band_bps == 0 {
                                     return Err(ProgramError::InvalidInstructionData);
                                 }
@@ -9382,6 +9392,7 @@ pub mod ix {
                         push_u16(&mut out, phase4.band_bps);
                         push_u32(&mut out, phase4.band_max_epoch_slots);
                         push_u32(&mut out, phase4.band_max_pin_slots);
+                        push_u64(&mut out, phase4.band_min_leg_notional);
                     }
                 }
                 Self::SettleHoldingRent {
@@ -11338,6 +11349,146 @@ pub mod risk_limits_v17 {
     }
 }
 
+/// v2.2 D-1 (security re-review N-3): how every instruction relates to a LAGGED mark
+/// (`target != P_last` while `slot_last` keeps advancing under the band). The `match` is
+/// EXHAUSTIVE: a new instruction does not compile until it is classified here, and
+/// `tests/v22_band_rent.rs::v22_d1_lag_policy_is_complete_and_gated_handlers_reach_the_predicate`
+/// proves (static call graph over this file) that every `Gated` handler reaches the shared
+/// predicate. Host-only (never in the SBF image).
+#[cfg(not(target_os = "solana"))]
+pub mod lag_policy {
+    use crate::ix::Instruction;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LagPolicy {
+        /// Refused or repriced while lagged, via `asset_price_lagged_view`.
+        Gated,
+        /// Pays out only from a flat account / a resolved market: no live mark involved.
+        FlatOnly,
+        /// No value depends on the mark (config, deposits, realised fee atoms, target pushes).
+        MarkFree,
+        /// Accrues / liquidates / settles AT `P_last` by design (the Band Safety Law and the
+        /// D-1 residuals are the guarantee).
+        MarkDriven,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LagPolicyEntry {
+        pub variant: &'static str,
+        pub policy: LagPolicy,
+        pub reason: &'static str,
+    }
+
+    const fn entry(variant: &'static str, policy: LagPolicy, reason: &'static str) -> LagPolicyEntry {
+        LagPolicyEntry { variant, policy, reason }
+    }
+
+    pub fn lag_policy(ix: &Instruction) -> LagPolicyEntry {
+        match ix {
+            Instruction::InitMarket { .. } => entry("InitMarket", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitMarketV19 { .. } => entry("InitMarketV19", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitMarketV22 { .. } => entry("InitMarketV22", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitPortfolio => entry("InitPortfolio", LagPolicy::MarkFree, "creates an empty portfolio"),
+            Instruction::Deposit { .. } => entry("Deposit", LagPolicy::MarkFree, "adds capital; no payout"),
+            Instruction::Withdraw { .. } => entry("Withdraw", LagPolicy::FlatOnly, "engine withdraw_not_atomic refuses any active leg: the payout never depends on a mark"),
+            Instruction::PermissionlessCrank { .. } => entry("PermissionlessCrank", LagPolicy::MarkDriven, "accrues / certifies / liquidates at P_last: the Band Safety Law is the guarantee"),
+            Instruction::TradeNoCpi { .. } => entry("TradeNoCpi", LagPolicy::Gated, "favourable-side close refused while lagged (band markets); engine refuses risk-increasing fills while lagged"),
+            Instruction::TradeCpi { .. } => entry("TradeCpi", LagPolicy::Gated, "favourable-side close refused while lagged (band markets); engine refuses risk-increasing fills while lagged"),
+            Instruction::BatchTradeNoCpi { .. } => entry("BatchTradeNoCpi", LagPolicy::Gated, "per leg, as TradeNoCpi"),
+            Instruction::BatchTradeCpi { .. } => entry("BatchTradeCpi", LagPolicy::Gated, "per leg, as TradeCpi"),
+            Instruction::SetMatcherConfig { .. } => entry("SetMatcherConfig", LagPolicy::MarkFree, "matcher config only"),
+            Instruction::ClosePortfolio { .. } => entry("ClosePortfolio", LagPolicy::FlatOnly, "only an empty, flat portfolio closes"),
+            Instruction::TopUpInsurance { .. } => entry("TopUpInsurance", LagPolicy::MarkFree, "adds insurance; no payout"),
+            Instruction::TopUpInsuranceDomain { .. } => entry("TopUpInsuranceDomain", LagPolicy::MarkFree, "adds insurance; no payout"),
+            Instruction::CloseSlab { .. } => entry("CloseSlab", LagPolicy::FlatOnly, "resolved, empty market only"),
+            Instruction::ResolveMarket { .. } => entry("ResolveMarket", LagPolicy::MarkDriven, "settles at P_last by design (D-1 residual: terminal settlement at the last in-band price)"),
+            Instruction::TopUpBackingBucket { .. } => entry("TopUpBackingBucket", LagPolicy::MarkFree, "adds backing; no payout"),
+            Instruction::WithdrawBackingBucket { .. } => entry("WithdrawBackingBucket", LagPolicy::Gated, "custody domain-withdraw gate (live_domain_withdraw_health_or_shutdown_view)"),
+            Instruction::ConvertReleasedPnl { .. } => entry("ConvertReleasedPnl", LagPolicy::Gated, "tag 28: released PnL is valued at P_last, so it is refused while any leg asset lags"),
+            Instruction::CloseResolved { .. } => entry("CloseResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::UpdateAuthority { .. } => entry("UpdateAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::UpdateAssetAuthority { .. } => entry("UpdateAssetAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::UpdateLiquidationFeePolicy { .. } => entry("UpdateLiquidationFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateMaintenanceFeePolicy { .. } => entry("UpdateMaintenanceFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateBackingFeePolicy { .. } => entry("UpdateBackingFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateTradeFeePolicy { .. } => entry("UpdateTradeFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateFeeRedirectPolicy { .. } => entry("UpdateFeeRedirectPolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateInsuranceWithdrawPolicy { .. } => entry("UpdateInsuranceWithdrawPolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateMarketInitFeePolicy { .. } => entry("UpdateMarketInitFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::WithdrawBackingBucketEarnings { .. } => entry("WithdrawBackingBucketEarnings", LagPolicy::Gated, "custody domain-withdraw gate"),
+            Instruction::SyncBackingDomainLedger { .. } => entry("SyncBackingDomainLedger", LagPolicy::MarkFree, "ledger bookkeeping of realised amounts"),
+            Instruction::SyncInsuranceLedger => entry("SyncInsuranceLedger", LagPolicy::MarkFree, "ledger bookkeeping of realised amounts"),
+            Instruction::ConfigurePermissionlessResolve { .. } => entry("ConfigurePermissionlessResolve", LagPolicy::MarkFree, "config"),
+            Instruction::ResolveStalePermissionless { .. } => entry("ResolveStalePermissionless", LagPolicy::MarkDriven, "stale-oracle resolution at P_last by design"),
+            Instruction::ConfigureHybridOracle { .. } => entry("ConfigureHybridOracle", LagPolicy::MarkFree, "oracle config"),
+            Instruction::ConfigureEwmaMark { .. } => entry("ConfigureEwmaMark", LagPolicy::MarkFree, "oracle config"),
+            Instruction::PushEwmaMark { .. } => entry("PushEwmaMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
+            Instruction::ConfigureAuthMark { .. } => entry("ConfigureAuthMark", LagPolicy::MarkFree, "oracle config"),
+            Instruction::PushAuthMark { .. } => entry("PushAuthMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
+            Instruction::ForceCloseAbandonedAsset { .. } => entry("ForceCloseAbandonedAsset", LagPolicy::MarkDriven, "abandoned-asset close at P_last by design"),
+            Instruction::RestartAssetOracle { .. } => entry("RestartAssetOracle", LagPolicy::MarkDriven, "re-arms the oracle (the band re-initialises at the restart price)"),
+            Instruction::UpdateAssetLifecycle { .. } => entry("UpdateAssetLifecycle", LagPolicy::MarkFree, "lifecycle dial"),
+            Instruction::WithdrawInsurance { .. } => entry("WithdrawInsurance", LagPolicy::Gated, "insurance is the loss absorber: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawInsuranceAsset { .. } => entry("WithdrawInsuranceAsset", LagPolicy::Gated, "custody domain-withdraw gate"),
+            Instruction::CureAndCancelClose { .. } => entry("CureAndCancelClose", LagPolicy::MarkDriven, "close-ledger cure at P_last (engine liquidation machinery)"),
+            Instruction::ForfeitRecoveryLeg { .. } => entry("ForfeitRecoveryLeg", LagPolicy::MarkDriven, "recovery-mode forfeit (engine)"),
+            Instruction::RebalanceReduce { .. } => entry("RebalanceReduce", LagPolicy::MarkDriven, "engine-driven reduction"),
+            Instruction::FinalizeResetSide { .. } => entry("FinalizeResetSide", LagPolicy::MarkDriven, "engine side reset"),
+            Instruction::ClaimResolvedPayoutTopup => entry("ClaimResolvedPayoutTopup", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::RefineResolvedUnreceiptedBound { .. } => entry("RefineResolvedUnreceiptedBound", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::SyncMaintenanceFee { .. } => entry("SyncMaintenanceFee", LagPolicy::Gated, "pending price-managed mark gate (reject_portfolio_pending_price_managed_mark_view)"),
+            Instruction::UpdateBaseUnitMints { .. } => entry("UpdateBaseUnitMints", LagPolicy::MarkFree, "mint config"),
+            Instruction::SwapSecondaryForPrimary { .. } => entry("SwapSecondaryForPrimary", LagPolicy::MarkFree, "1:1 collateral swap"),
+            Instruction::CreateLpVault { .. } => entry("CreateLpVault", LagPolicy::MarkFree, "creates a vault"),
+            Instruction::DepositToLpVault { .. } => entry("DepositToLpVault", LagPolicy::Gated, "Earn entry priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
+            Instruction::RebalanceLpVaultBacking { .. } => entry("RebalanceLpVaultBacking", LagPolicy::Gated, "moves backing by pooled NAV: refused while any asset lags (re-review N-3)"),
+            Instruction::RequestRedeemLpShares { .. } => entry("RequestRedeemLpShares", LagPolicy::MarkFree, "a request; the price is set at ExecuteRedemption"),
+            Instruction::ExecuteRedemption { .. } => entry("ExecuteRedemption", LagPolicy::Gated, "Earn exit priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
+            Instruction::LpVaultCrankFees { .. } => entry("LpVaultCrankFees", LagPolicy::MarkFree, "distributes realised fee atoms"),
+            Instruction::SetLpVaultPaused { .. } => entry("SetLpVaultPaused", LagPolicy::MarkFree, "pause dial"),
+            Instruction::CloseLpVault => entry("CloseLpVault", LagPolicy::MarkFree, "empty vault only"),
+            Instruction::CancelRedemption => entry("CancelRedemption", LagPolicy::MarkFree, "returns escrowed shares"),
+            Instruction::TransferPortfolioOwnership { .. } => entry("TransferPortfolioOwnership", LagPolicy::MarkFree, "ownership transfer, no value movement"),
+            Instruction::SetNftProgramId { .. } => entry("SetNftProgramId", LagPolicy::MarkFree, "config"),
+            Instruction::UnwrapEscrowedPortfolio { .. } => entry("UnwrapEscrowedPortfolio", LagPolicy::MarkFree, "ownership transfer"),
+            Instruction::InitMatcherCtx { .. } => entry("InitMatcherCtx", LagPolicy::MarkFree, "matcher context init"),
+            Instruction::WithdrawProtocolFee { .. } => entry("WithdrawProtocolFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::SetProtocolFeeAuthority { .. } => entry("SetProtocolFeeAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::SetAssetRiskLimits { .. } => entry("SetAssetRiskLimits", LagPolicy::MarkFree, "risk dial"),
+            Instruction::SetAssetRiskLimitsV19 { .. } => entry("SetAssetRiskLimitsV19", LagPolicy::MarkFree, "risk dial"),
+            Instruction::UpdateFeeSplit { .. } => entry("UpdateFeeSplit", LagPolicy::MarkFree, "fee split dial"),
+            Instruction::WithdrawInsuranceReserveToStake => entry("WithdrawInsuranceReserveToStake", LagPolicy::Gated, "moves insurance-reserve atoms out: refused while any asset lags (re-review N-3)"),
+            Instruction::UpdateMaintenanceFeePerSlot { .. } => entry("UpdateMaintenanceFeePerSlot", LagPolicy::MarkFree, "fee dial"),
+            Instruction::ExpireBackingBucket { .. } => entry("ExpireBackingBucket", LagPolicy::MarkFree, "expires a lapsed bucket"),
+            Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
+            Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
+            Instruction::VaultLpSetMatcher { .. } => entry("VaultLpSetMatcher", LagPolicy::MarkFree, "matcher config"),
+            Instruction::DepositJuniorTranche { .. } => entry("DepositJuniorTranche", LagPolicy::Gated, "junior entry priced from pooled NAV: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawJuniorTranche { .. } => entry("WithdrawJuniorTranche", LagPolicy::Gated, "junior exit (flat book) and refused while any asset lags (re-review N-3)"),
+            Instruction::VaultLpRecall { .. } => entry("VaultLpRecall", LagPolicy::Gated, "recall sized from the vault LP equity: refused while any asset lags (re-review N-3)"),
+            Instruction::SetVaultLpRisk { .. } => entry("SetVaultLpRisk", LagPolicy::MarkFree, "tag 99, a risk dial: writes alpha / buffer; no value moves until tag 103"),
+            Instruction::SetVaultLpRiskV19 { .. } => entry("SetVaultLpRiskV19", LagPolicy::MarkFree, "tag 99 V19 form, a risk dial"),
+            Instruction::VaultLpConvertPnl { .. } => entry("VaultLpConvertPnl", LagPolicy::Gated, "tag 100 (the review called it 99): vault-LP PnL valued at P_last, refused while lagged"),
+            Instruction::VaultLpSettleResolved { .. } => entry("VaultLpSettleResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (re-review N-3)"),
+            Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
+            Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
+            Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
+            Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags"),
+        }
+    }
+}
+
+/// Release check marker (security re-review, mainnet build): the SBF image carries which
+/// feature set built it, so `scripts/check-mainnet-sbf.sh` can refuse a devnet artifact
+/// (whose band caps are 10x lambda / 70% alpha instead of 3x / 60%). Logged once by
+/// InitMarket, which keeps the bytes in the image (an exported static breaks the loader).
+#[cfg(feature = "devnet")]
+pub const PERCOLATOR_BUILD_FLAVOR: &str = "PERCOLATOR_BUILD_FLAVOR=devnet..";
+#[cfg(not(feature = "devnet"))]
+pub const PERCOLATOR_BUILD_FLAVOR: &str = "PERCOLATOR_BUILD_FLAVOR=mainnet.";
+
 pub mod processor {
     use super::*;
     use crate::{
@@ -11747,6 +11898,41 @@ pub mod processor {
     /// `tests/v22_band_rent.rs::v22_d1_every_lag_consumer_uses_the_shared_predicate`.
     pub(crate) fn asset_target_differs_view(asset: &percolator::AssetStateV16Account) -> bool {
         asset.raw_oracle_target_price.get() != asset.effective_price.get()
+    }
+
+    /// v2.2 D-1 (re-review N-3): refuse (21) while ANY configured asset's mark lags (the
+    /// market-level form of `asset_price_lagged_view`, for paths valued from pooled equity:
+    /// insurance, the vault LP, junior / senior tranches).
+    pub(crate) fn reject_market_price_lagged_view(
+        group: &state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        let configured = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        let mut i = 0usize;
+        while i < configured {
+            if asset_price_lagged_view(group, i)? {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// v2.2 D-1 (re-review N-3): any of `portfolio`'s active legs sits on a lagged asset.
+    pub(crate) fn portfolio_has_lagged_asset_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<bool, ProgramError> {
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            if leg.active && asset_price_lagged_view(group, leg.asset_index as usize)? {
+                return Ok(true);
+            }
+            slot += 1;
+        }
+        Ok(false)
     }
 
     /// v2.2 D-1: the asset is EXPOSED (open interest on either side) and its mark lags its
@@ -13889,6 +14075,7 @@ pub mod processor {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
         let mint_ai = account(accounts, 2)?;
+        solana_program::log::sol_log(crate::PERCOLATOR_BUILD_FLAVOR);
         expect_signer(admin)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -13932,11 +14119,20 @@ pub mod processor {
         if band_on && maintenance_fee_per_slot != 0 {
             return Err(PercolatorError::PriceBandConfigInvalid.into());
         }
-        // Review E-L1: the band at the genesis price must be at least MIN_BAND_WIDTH_TICKS
-        // wide (a micro-priced band market would otherwise be frozen at InitMarket).
+        // Review E-L1 / re-review N-2: a band market launches at >= 100x the smallest anchor
+        // whose band is MIN_BAND_WIDTH_TICKS wide, so the narrow-band floor (where re-anchoring
+        // stops) needs a >99% collapse to reach.
         if band_on
-            && !percolator::band_rent::band_width_ok(initial_price, cfg.band_bps)
+            && !percolator::band_rent::band_genesis_price_ok(initial_price, cfg.band_bps)
                 .map_err(|_| PercolatorError::PriceBandConfigInvalid)?
+        {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
+        // Re-review N-1: the minimum leg notional is at least 10 whole collateral tokens, so
+        // filling the 256-per-side position cap locks real margin.
+        if band_on
+            && cfg.band_min_leg_notional
+                < growth_v19::band_min_leg_notional_floor(unpack_mint(mint_ai)?.decimals)
         {
             return Err(PercolatorError::PriceBandConfigInvalid.into());
         }
@@ -14106,6 +14302,7 @@ pub mod processor {
             cfg.band_max_pin_slots = p.band_max_pin_slots as u64;
             // Review E-M1: the design's per-side position cap (the keeper's sweep bound).
             cfg.band_max_positions_per_side = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
+            cfg.band_min_leg_notional = p.band_min_leg_notional;
             if rent_ok && cfg.validate_public_user_fund().is_err() {
                 return Err(PercolatorError::PriceBandConfigInvalid.into());
             }
@@ -19780,6 +19977,9 @@ pub mod processor {
         let (cfg_pre, policy_dirty) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -21341,6 +21541,9 @@ pub mod processor {
         let (transfer_amount_u64, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             // MODE GATE — see the doc comment. Live-only, plus matured-Live.
             //
             // P1 F4 exception: a RESOLVED market with NO portfolio left
@@ -22179,6 +22382,13 @@ pub mod processor {
             if vault_lp_relabel_residual_to_claims(group).map_err(|_| V16Error::InvalidConfig)? != 0 {
                 // The relabel moved the pot's credit epoch: re-certify before converting.
                 group.full_account_refresh_not_atomic(portfolio)?;
+            }
+            // v2.2 D-1 (re-review N-3): released PnL is valued at P_last; while the mark lags
+            // that is a stale value, so the conversion waits for the staircase (21).
+            if portfolio_has_lagged_asset_view(group, portfolio)
+                .map_err(|_| V16Error::InvalidConfig)?
+            {
+                return Err(V16Error::LockActive);
             }
             let converted = group.convert_released_pnl_to_capital_not_atomic(portfolio)?;
             if converted == 0 || converted > amount {
@@ -27160,6 +27370,9 @@ pub mod processor {
         if state::registry_vault_lp_bound(&registry)? {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_, group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             let draw = read_vault_lp_draw_from_view(&group, registry.domain as usize / 2)?;
             if draw.pending_moved_atoms != 0
                 || draw.pending_out_even_atoms != 0
@@ -32087,6 +32300,9 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -32233,6 +32449,9 @@ pub mod processor {
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -32403,6 +32622,9 @@ pub mod processor {
         let draw_pending_before = {
             let mut md = market_ai.try_borrow_mut_data()?;
             let (_, g) = state::market_view_mut(&mut md)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&g)?;
             let a = st.asset_index as usize;
             let r = read_vault_lp_draw_from_view(&g, a)?;
             r.pending_moved_atoms != 0 || r.pending_out_even_atoms != 0 || r.pending_out_odd_atoms != 0
@@ -32783,6 +33005,11 @@ pub mod processor {
         // route the vault LP's settled loss into a pot for its winners; that is never Earn's.
         let d_even_pre = p2b_alloc_drawable(group, cfg, &registry_pda, even, even_present)?;
         let d_odd_pre = p2b_alloc_drawable(group, cfg, &registry_pda, odd, odd_present)?;
+        // v2.2 D-1 (re-review N-3): the allocation is sized from the LP's certificate at
+        // P_last; during an adverse lag that overstates the LP, so senior capital waits (21).
+        if asset_price_lagged_view(group, a)? {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         // Certificate on the engine's current state: a stale certificate can never value the
         // vault LP (fail closed on any refresh error).
         let cert = group
@@ -33516,6 +33743,9 @@ pub mod processor {
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if resolved {
                 // Terminal-flat only: no portfolio (and so no pending resolved payout) can still
                 // draw on the pots after the junior takes the surplus.
@@ -33756,6 +33986,10 @@ pub mod processor {
         let mut lp_data = lp_ai.try_borrow_mut_data()?;
         let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
         expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        // v2.2 D-1 (re-review N-3): no conversion of PnL valued at a lagged mark (21).
+        if portfolio_has_lagged_asset_view(&group, &lp)? {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         let converted = group
             .convert_released_pnl_to_capital_not_atomic(&mut lp)
             .map_err(map_v16_error)?;
@@ -37072,6 +37306,35 @@ pub mod processor {
         Ok((price, funding_rate_e9, rent_long, rent_short))
     }
 
+    /// v2.2 band (re-review N-2): the asset's price can no longer move toward its target: the
+    /// band around `P_last` is narrower than `MIN_BAND_WIDTH_TICKS` (the engine refuses to
+    /// re-anchor there, `band_prepare_accrual`), or the cap law's per-accrual step at `P_last`
+    /// rounds to 0 ticks (spec §9.6's `max_delta == 0`).
+    pub(crate) fn band_floor_stuck_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        let band_bps = group.header.config.band_bps.get();
+        if band_bps == 0 {
+            return Ok(false);
+        }
+        let asset = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        let p_last = asset.effective_price.get();
+        // The cap law's own dead zone: `floor(P * cap * dt / 1e4) == 0` cannot move either.
+        let max_step = (p_last as u128)
+            .saturating_mul(group.header.config.max_price_move_bps_per_slot.get() as u128)
+            .saturating_mul(group.header.config.max_accrual_dt_slots.get() as u128)
+            / 10_000;
+        Ok(max_step == 0
+            || !percolator::band_rent::band_width_ok(p_last, band_bps)
+                .map_err(|_| PercolatorError::PriceBandConfigInvalid)?)
+    }
+
     /// v2.2 band (design §1.1 "Closes during a pin", spec §9.7; widened by review E-L2):
     /// while the asset's mark LAGS its target (`asset_price_lagged_view`: a pin, or plain
     /// cap-law lag between a target move and the staircase catching up), a close may land at
@@ -37098,6 +37361,13 @@ pub mod processor {
                 || (after > 0) != (position_before > 0)
                 || after.unsigned_abs() < position_before.unsigned_abs());
         if !reduces || !asset_price_lagged_view(group, asset_index)? {
+            return Ok(());
+        }
+        // Re-review N-2: at the narrow-band floor the anchor can no longer advance, so the lag
+        // never resolves before BandPinExpired settles everyone at P_last anyway. Exits stay
+        // open at P_last (reduce-only: attaches are refused by the engine there) instead of
+        // trapping the favourable side until the forced resolution at the same price.
+        if band_floor_stuck_view(group, asset_index)? {
             return Ok(());
         }
         let asset = &group.markets[asset_index].engine.asset;

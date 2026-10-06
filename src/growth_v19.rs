@@ -880,6 +880,16 @@ pub fn c_launch_atoms_for(c_m: u128) -> u128 {
 /// a toll, prices a held lock-out).
 pub const RENT_ENTRY_FLOOR_BPS: u16 = 25;
 
+/// Security re-review N-1: the program floor on a band market's minimum leg notional, in
+/// whole collateral tokens (the creator may set more; the SDK default is 100). With 256 legs
+/// per side, filling the cap locks at least `512 x 10 tokens x IMR` of margin.
+pub const BAND_MIN_LEG_NOTIONAL_TOKENS: u128 = 10;
+pub fn band_min_leg_notional_floor(collateral_decimals: u8) -> u64 {
+    let atoms = BAND_MIN_LEG_NOTIONAL_TOKENS
+        .saturating_mul(10u128.saturating_pow(u32::from(collateral_decimals.min(30))));
+    u64::try_from(atoms).unwrap_or(u64::MAX)
+}
+
 /// Review W-M1: on a rent market (`rent_max != 0`) the rent ceiling is at least
 /// `RENT_MIN_E9_PER_SLOT` and the kink at most `RENT_MAX_KINK_BPS`, so the rent that replaces
 /// the 500 bps N-2 toll actually bites. `rent_max == 0` (no rent) is always shape-valid here.

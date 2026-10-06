@@ -1,7 +1,7 @@
 //! v2.1 -> v2.2 fixture upgrader for the live-captured replay fixtures.
 //!
 //! v2.2 Wave B (engine layout discriminator 18 -> 19, wrapper VERSION 18 -> 19) appended
-//! band/rent words to three engine structs: `V16ConfigAccount` (5 x u64, incl. the review E-M1 position cap),
+//! band/rent words to three engine structs: `V16ConfigAccount` (6 x u64, incl. the review position cap and min leg notional),
 //! `AssetStateV16Account` (8 x u64 + 3 x u128) and `PortfolioLegV16Account`
 //! (u64 + u8 + u128 + u64). The fixtures are v2.1 bytes from band-off markets, whose exact v2.2
 //! encoding is the same bytes with the new words zeroed (I-B7: band off <=> band_epoch == 0,
@@ -24,7 +24,7 @@ use solana_sdk::pubkey::Pubkey;
 
 pub const V21_WRAPPER_VERSION: u16 = 18;
 pub const V21_LAYOUT_DISCRIMINATOR: u16 = 18;
-const V22_CONFIG_EXTRA: usize = 5 * 8;
+const V22_CONFIG_EXTRA: usize = 6 * 8;
 const V22_ASSET_EXTRA: usize = 8 * 8 + 3 * 16;
 const V22_LEG_EXTRA: usize = 8 + 1 + 16 + 8;
 

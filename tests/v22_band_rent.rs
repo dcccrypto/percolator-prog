@@ -47,6 +47,8 @@ const BAND_E: u32 = 600;
 const BAND_PMAX: u32 = 9_000;
 const RENT_MAX: u32 = 23;
 const RENT_KINK: u16 = 5_000;
+/// Re-review N-1: the program floor for a 6-decimal collateral (10 whole tokens).
+const BAND_MIN_LEG: u64 = 10_000_000;
 
 thread_local! {
     /// Genesis price of the next `Env::new` on this thread (E-L1 tests override it).
@@ -183,6 +185,7 @@ fn phase4(band_bps: u16, rent_max: u32) -> InitMarketPhase4 {
         band_bps,
         band_max_epoch_slots: if band_bps != 0 { BAND_E } else { 0 },
         band_max_pin_slots: if band_bps != 0 { BAND_PMAX } else { 0 },
+        band_min_leg_notional: if band_bps != 0 { BAND_MIN_LEG } else { 0 },
     }
 }
 
@@ -797,7 +800,7 @@ fn v22_init_market_wire_roundtrip_and_strictness() {
         };
         let bytes = ix.encode();
         let legacy_len = market.encode().len();
-        assert_eq!(bytes.len(), legacy_len + if p.band_bps == 0 { 10 } else { 20 });
+        assert_eq!(bytes.len(), legacy_len + if p.band_bps == 0 { 10 } else { 28 });
         assert_eq!(ProgInstruction::decode(&bytes).unwrap(), ix, "roundtrip");
     }
     // The 4-byte growth-1 form is unchanged.
@@ -1530,7 +1533,7 @@ fn v22_band_market_refuses_a_too_narrow_genesis_band() {
     // d = 100 bps: width = floor(1.01 p) - ceil(0.99 p) >= 32 from p ~ 1,600.
     let r = at(1_000, band_cfg());
     assert!(r.as_ref().is_err_and(|e| e.contains(&code(PercolatorError::PriceBandConfigInvalid))), "{r:?}");
-    assert!(at(2_000, band_cfg()).is_ok(), "a 40-tick band is accepted");
+    assert!(at(PRICE, band_cfg()).is_ok(), "a launch far above the floor is accepted");
     assert!(at(1_000, Cfg { slots: 1, phase4: Some(phase4(0, RENT_MAX)), r_gap: 400 }).is_ok(), "band off: no width rule");
 }
 
@@ -1583,4 +1586,447 @@ fn v22_band_lambda_and_alpha_caps_follow_the_build() {
     assert!(gv::band_lambda_max_bps(500, 1).unwrap() <= gv::BAND_LAMBDA_CAP_BPS);
     assert_eq!(gv::alloc_alpha_max_bps(true), gv::ALLOC_ALPHA_MAX_BAND_BPS);
     assert!(!gv::graduation_allowed(100, 0), "graduation stays closed until depth tiers exist");
+}
+
+// ---------------------------------------------------------------------------
+// D-1 completeness (security re-review N-3): every instruction is classified by the
+// EXHAUSTIVE `lag_policy::lag_policy` match (a new instruction does not compile until it is),
+// and every `Gated` instruction's handler reaches the shared lag predicate in the static call
+// graph of `src/v16_program.rs`. Stronger than the earlier per-consumer text check: removing
+// the predicate call from any gated handler (or from any helper it relies on) turns this red.
+// ---------------------------------------------------------------------------
+
+/// Blank out comments, string and char literals (keeps lifetimes and newlines).
+fn strip_rust(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = String::with_capacity(s.len());
+    let mut i = 0usize;
+    let n = b.len();
+    let word = |i: usize| i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
+    while i < n {
+        let c = b[i];
+        if c == b'/' && i + 1 < n && b[i + 1] == b'/' {
+            while i < n && b[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'/' && i + 1 < n && b[i + 1] == b'*' {
+            let mut d = 0i32;
+            while i < n {
+                if b[i] == b'/' && i + 1 < n && b[i + 1] == b'*' {
+                    d += 1;
+                    i += 2;
+                    continue;
+                }
+                if b[i] == b'*' && i + 1 < n && b[i + 1] == b'/' {
+                    d -= 1;
+                    i += 2;
+                    if d == 0 {
+                        break;
+                    }
+                    continue;
+                }
+                if b[i] == b'\n' {
+                    out.push('\n');
+                }
+                i += 1;
+            }
+            continue;
+        }
+        if c == b'r' && i + 1 < n && (b[i + 1] == b'#' || b[i + 1] == b'"') && !word(i) {
+            let mut j = i + 1;
+            let mut h = 0usize;
+            while j < n && b[j] == b'#' {
+                h += 1;
+                j += 1;
+            }
+            if j < n && b[j] == b'"' {
+                let end: String = std::iter::once('"').chain(std::iter::repeat('#').take(h)).collect();
+                let k = s[j + 1..].find(&end).map(|k| j + 1 + k).unwrap();
+                out.push_str("\"\"");
+                i = k + end.len();
+                continue;
+            }
+        }
+        let (c, i0) = if c == b'b' && i + 1 < n && (b[i + 1] == b'"' || b[i + 1] == b'\'') && !word(i) {
+            (b[i + 1], i + 1)
+        } else {
+            (c, i)
+        };
+        i = i0;
+        if c == b'"' {
+            let mut j = i + 1;
+            while j < n && b[j] != b'"' {
+                j += if b[j] == b'\\' { 2 } else { 1 };
+            }
+            out.push_str("\"\"");
+            i = j + 1;
+            continue;
+        }
+        if c == b'\'' {
+            if i + 2 < n && b[i + 1] == b'\\' {
+                let k = s[i + 2..].find('\'').map(|k| i + 2 + k).unwrap();
+                out.push_str("' '");
+                i = k + 1;
+                continue;
+            }
+            if i + 2 < n && b[i + 2] == b'\'' {
+                out.push_str("' '");
+                i += 3;
+                continue;
+            }
+        }
+        out.push(b[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// `fn name` -> body, and the set of local fns each body calls.
+fn call_graph(src: &str) -> (std::collections::HashMap<String, String>, std::collections::HashMap<String, std::collections::BTreeSet<String>>) {
+    let b = src.as_bytes();
+    let mut bodies: std::collections::HashMap<String, String> = Default::default();
+    let mut i = 0usize;
+    while let Some(off) = src[i..].find("fn ") {
+        let at = i + off;
+        i = at + 3;
+        if at > 0 && (b[at - 1].is_ascii_alphanumeric() || b[at - 1] == b'_') {
+            continue;
+        }
+        let name: String = src[i..].chars().take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_').collect();
+        if name.is_empty() {
+            continue;
+        }
+        let mut j = i + name.len();
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j < b.len() && b[j] == b'<' {
+            let mut d = 0i32;
+            while j < b.len() {
+                if b[j] == b'<' { d += 1 } else if b[j] == b'>' { d -= 1; if d == 0 { j += 1; break } }
+                j += 1;
+            }
+        }
+        while j < b.len() && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if j >= b.len() || b[j] != b'(' {
+            continue;
+        }
+        // params
+        let mut d = 0i32;
+        while j < b.len() {
+            match b[j] { b'(' | b'[' => d += 1, b')' | b']' => { d -= 1; if d == 0 { j += 1; break } } _ => {} }
+            j += 1;
+        }
+        // return type up to '{' or ';' at bracket depth <= 0
+        let mut d = 0i32;
+        while j < b.len() {
+            match b[j] {
+                b'(' | b'[' | b'<' => d += 1,
+                b')' | b']' | b'>' => d -= 1,
+                b'{' | b';' if d <= 0 => break,
+                _ => {}
+            }
+            j += 1;
+        }
+        if j >= b.len() || b[j] == b';' {
+            continue;
+        }
+        let k = j;
+        let mut d = 0i32;
+        while j < b.len() {
+            if b[j] == b'{' { d += 1 } else if b[j] == b'}' { d -= 1; if d == 0 { break } }
+            j += 1;
+        }
+        bodies.entry(name).or_default().push_str(&src[k..j]);
+    }
+    let names: std::collections::BTreeSet<String> = bodies.keys().cloned().collect();
+    let mut calls: std::collections::HashMap<String, std::collections::BTreeSet<String>> = Default::default();
+    for (n, body) in &bodies {
+        let bb = body.as_bytes();
+        let mut set = std::collections::BTreeSet::new();
+        let mut p = 0usize;
+        while p < bb.len() {
+            if (bb[p].is_ascii_lowercase() || bb[p] == b'_') && (p == 0 || !(bb[p - 1].is_ascii_alphanumeric() || bb[p - 1] == b'_')) {
+                let start = p;
+                while p < bb.len() && (bb[p].is_ascii_lowercase() || bb[p].is_ascii_digit() || bb[p] == b'_') {
+                    p += 1;
+                }
+                let w = &body[start..p];
+                let mut q = p;
+                if body[q..].starts_with("::<") {
+                    let mut d = 0i32;
+                    q += 2;
+                    while q < bb.len() {
+                        if bb[q] == b'<' { d += 1 } else if bb[q] == b'>' { d -= 1; if d == 0 { q += 1; break } }
+                        q += 1;
+                    }
+                }
+                while q < bb.len() && bb[q] == b' ' {
+                    q += 1;
+                }
+                if q < bb.len() && bb[q] == b'(' && names.contains(w) {
+                    set.insert(w.to_string());
+                }
+                continue;
+            }
+            p += 1;
+        }
+        calls.insert(n.clone(), set);
+    }
+    (bodies, calls)
+}
+
+#[test]
+fn v22_d1_lag_policy_is_complete_and_gated_handlers_reach_the_predicate() {
+    use percolator_prog::lag_policy::LagPolicy;
+    let raw = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/v16_program.rs")).unwrap();
+    let src = strip_rust(&raw);
+    // 1. The instruction enum's variants.
+    let e = src.find("pub enum Instruction {").unwrap();
+    let body_start = e + "pub enum Instruction ".len();
+    let mut d = 0i32;
+    let mut end = body_start;
+    for (k, ch) in src[body_start..].char_indices() {
+        if ch == '{' { d += 1 } else if ch == '}' { d -= 1; if d == 0 { end = body_start + k; break } }
+    }
+    let mut variants = std::collections::BTreeSet::new();
+    let mut depth = 0i32;
+    for line in src[body_start + 1..end].lines() {
+        let t = line.trim();
+        if depth == 0 {
+            let name: String = t.chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if name.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+                variants.insert(name);
+            }
+        }
+        depth += line.matches(['{', '(']).count() as i32 - line.matches(['}', ')']).count() as i32;
+    }
+    assert!(variants.len() >= 90, "parsed {} variants", variants.len());
+    // 2. The exhaustive classification names each exactly once.
+    let lp = &raw[raw.find("pub mod lag_policy").unwrap()..];
+    let mut classified = std::collections::BTreeMap::new();
+    for cap in lp.split("=> entry(\"").skip(1) {
+        let name = &cap[..cap.find('"').unwrap()];
+        let rest = &cap[cap.find("LagPolicy::").unwrap() + 11..];
+        let pol = match &rest[..rest.find(',').unwrap()] {
+            "Gated" => LagPolicy::Gated,
+            "FlatOnly" => LagPolicy::FlatOnly,
+            "MarkDriven" => LagPolicy::MarkDriven,
+            "MarkFree" => LagPolicy::MarkFree,
+            other => panic!("unknown policy {other}"),
+        };
+        assert!(classified.insert(name.to_string(), pol).is_none(), "{name} classified twice");
+    }
+    let names: std::collections::BTreeSet<String> = classified.keys().cloned().collect();
+    assert_eq!(names, variants, "lag_policy classifies exactly the instruction set");
+    // 3. Dispatch: variant -> handler.
+    let disp = &src[src.find("ix @ Instruction::InitMarket { .. } =>").unwrap()..];
+    let mut handler = std::collections::BTreeMap::new();
+    let mut cur: Option<String> = None;
+    for line in disp.lines().take(1200) {
+        if let Some(p) = line.find("Instruction::") {
+            let v: String = line[p + 13..].chars().take_while(|c| c.is_ascii_alphanumeric()).collect();
+            if variants.contains(&v) {
+                cur = Some(v);
+            }
+        }
+        if let (Some(v), Some(p)) = (cur.as_ref(), line.find("handle_")) {
+            let h: String = line[p..].chars().take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_').collect();
+            handler.entry(v.clone()).or_insert(h);
+        }
+    }
+    // 4. Reachability of the shared predicate (fixed point over the call graph).
+    let (bodies, calls) = call_graph(&src);
+    let mut reach: std::collections::BTreeSet<String> =
+        ["asset_price_lagged_view", "asset_target_differs_view"].iter().map(|s| s.to_string()).collect();
+    loop {
+        let before = reach.len();
+        for (n, cs) in &calls {
+            if !reach.contains(n) && cs.iter().any(|c| reach.contains(c)) {
+                reach.insert(n.clone());
+            }
+        }
+        if reach.len() == before {
+            break;
+        }
+    }
+    let mut gated = 0;
+    for (v, pol) in &classified {
+        if *pol != LagPolicy::Gated {
+            continue;
+        }
+        gated += 1;
+        let h = handler.get(v).unwrap_or_else(|| panic!("no handler found for gated {v}"));
+        assert!(bodies.contains_key(h), "handler {h} parsed");
+        assert!(reach.contains(h), "{v}: handler {h} does not reach the shared lag predicate");
+    }
+    assert!(gated >= 21, "gated instructions: {gated}");
+}
+
+// ---------------------------------------------------------------------------
+// Security re-review N-1 / N-2 (wrapper side).
+// ---------------------------------------------------------------------------
+
+impl Env {
+    /// STATE POKE (test only): move the still-flat asset's engine price, anchor and funding
+    /// reference to `price`, then push the auth mark there, so a book can be opened near the
+    /// narrow-band floor without walking a launch price down for hundreds of epochs.
+    fn poke_flat_asset_price(&mut self, price: u64) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acct.data).unwrap();
+            let a = &mut g.markets[0].engine.asset;
+            assert_eq!(a.oi_eff_long_q.get() + a.oi_eff_short_q.get(), 0, "flat asset only");
+            a.effective_price = percolator::V16PodU64::new(price);
+            a.raw_oracle_target_price = percolator::V16PodU64::new(price);
+            a.fund_px_last = percolator::V16PodU64::new(price);
+            a.band_anchor_price = percolator::V16PodU64::new(price);
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+        self.warp(1);
+        self.push(price);
+    }
+}
+
+/// N-1: the band block's minimum leg notional is floored at 10 whole collateral tokens (105),
+/// and a trade that would leave a sub-floor leg is refused (113) while the full close lands.
+#[test]
+fn v22_band_min_leg_notional_floor_and_dust_refusal() {
+    let mk = |min: u64| {
+        let mut p = phase4(BAND_BPS, RENT_MAX);
+        p.band_min_leg_notional = min;
+        Env::try_new(Cfg { slots: 1, phase4: Some(p), r_gap: 0 }).map(|_| ())
+    };
+    let cfg_err = code(PercolatorError::PriceBandConfigInvalid);
+    assert!(mk(BAND_MIN_LEG - 1).is_err_and(|e| e.contains(&cfg_err)), "below the 10-token floor");
+    assert!(mk(BAND_MIN_LEG).is_ok());
+    assert_eq!(percolator_prog::growth_v19::band_min_leg_notional_floor(6), BAND_MIN_LEG);
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let t = env.trader(1_000 * USD);
+    // $5 open: below the $10 floor.
+    let r = env.trade_cpi(&t.0, t.1, &lp, 5 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandLegBelowMinNotional), "dust open");
+    env.trade_cpi(&t.0, t.1, &lp, 30 * Q).expect("$30 open");
+    let r = env.trade_cpi(&t.0, t.1, &lp, -25 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandLegBelowMinNotional), "reduce to $5 dust");
+    env.trade_cpi(&t.0, t.1, &lp, -20 * Q).expect("reduce to $10");
+    env.trade_cpi(&t.0, t.1, &lp, -10 * Q).expect("full close");
+    assert_eq!(env.pos(t.1), 0);
+    env.assert_conservation();
+}
+
+/// N-2: genesis must be >= 100x the smallest anchor with a 32-tick band (105 below it).
+#[test]
+fn v22_band_genesis_needs_100x_the_width_floor() {
+    let min = percolator::band_rent::band_min_wide_anchor(BAND_BPS as u64).unwrap().unwrap();
+    assert_eq!(min, 1_600);
+    let at = |price: u64| {
+        INIT_PRICE.with(|p| p.set(price));
+        let r = Env::try_new(band_cfg()).map(|_| ());
+        INIT_PRICE.with(|p| p.set(PRICE));
+        r
+    };
+    let cfg_err = code(PercolatorError::PriceBandConfigInvalid);
+    assert!(at(min * 100 - 1).is_err_and(|e| e.contains(&cfg_err)));
+    assert!(at(min * 100).is_ok());
+}
+
+/// N-2: Wave A's launch floor (`LOT_PRICE_FLOOR_E6` = 1e7, feat/v22-wave-a) applies to every
+/// GROWTH market, and every band market is a growth market (the band block only exists inside
+/// `InitMarketV22`, which carries the growth block). At 1e7 the 100x rule above is implied
+/// for every d >= 2 bps; at d = 1 this branch's own rule is the binding one, so the check
+/// lives here regardless of the merge order.
+#[test]
+fn v22_band_markets_are_growth_markets_so_wave_a_floor_binds() {
+    use percolator::band_rent::{band_min_wide_anchor, BAND_GENESIS_FLOOR_MULTIPLE};
+    // Structural: there is no wire form of a band block outside the growth trailer.
+    let ProgInstruction::InitMarketV19 { market, .. } = init_market_ix(&Cfg { slots: 1, phase4: None, r_gap: 400 }) else { panic!() };
+    let mut legacy_with_band = market.encode();
+    legacy_with_band.extend_from_slice(&[0u8; 18]);
+    assert!(ProgInstruction::decode(&legacy_with_band).is_err(), "no band without growth");
+    // Numeric: Wave A's 1e7 floor vs this branch's genesis rule.
+    const WAVE_A_LOT_PRICE_FLOOR_E6: u64 = 10_000_000;
+    for d in 2u64..=percolator::band_rent::MAX_BAND_BPS {
+        let need = band_min_wide_anchor(d).unwrap().unwrap() * BAND_GENESIS_FLOOR_MULTIPLE;
+        assert!(need <= WAVE_A_LOT_PRICE_FLOOR_E6, "d={d}: rule {need} above Wave A's floor");
+    }
+    let need = band_min_wide_anchor(1).unwrap().unwrap() * BAND_GENESIS_FLOOR_MULTIPLE;
+    assert!(need > WAVE_A_LOT_PRICE_FLOOR_E6, "at d = 1 bps this branch's rule binds ({need})");
+}
+
+/// N-2: at the narrow-band floor (re-anchoring refused, the price can no longer catch up),
+/// existing positions can still EXIT at P_last instead of waiting for BandPinExpired. Above the
+/// floor, the same lagged favourable close is refused (104).
+#[test]
+fn v22_band_floor_keeps_exits_open() {
+    // d = 50 bps: the width floor sits at 3,200 ticks, where the 4 bps/slot cap still moves
+    // >= 1 tick per slot (at d = 100 the floor, 1,600, is below the cap's own 2,500-tick
+    // dead zone and nothing would move at all).
+    const D: u64 = 50;
+    let mut env = Env::new(Cfg { slots: 1, phase4: Some(phase4(D as u16, RENT_MAX)), r_gap: 0 });
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let long = env.trader(1_000 * USD);
+    env.poke_flat_asset_price(3_300);
+    env.crank(lp.account).ok();
+    env.trade_cpi(&long.0, long.1, &lp, 20_000 * Q).expect("open long ($33)");
+    let mut refused_above_floor = false;
+    for _ in 0..400 {
+        env.warp(1);
+        env.push(1);
+        let r1 = env.crank(long.1);
+        let r2 = env.crank(lp.account);
+        let a = env.engine_asset();
+        if std::env::var("FLOOR_DBG").is_ok() {
+            eprintln!("p={} t={} anchor={} e={} r1={:?} r2={:?}", a.effective_price, a.raw_oracle_target_price, a.band_anchor_price, a.band_epoch, r1.as_ref().map_err(|e| e.split(", meta").next().unwrap().to_string()), r2.as_ref().map_err(|e| e.split(", meta").next().unwrap().to_string()));
+        }
+        let stuck = !percolator::band_rent::band_width_ok(a.effective_price, D).unwrap();
+        if !stuck && !refused_above_floor && a.raw_oracle_target_price < a.effective_price {
+            let r = env.trade_cpi(&long.0, long.1, &lp, -10_000 * Q);
+            assert_err(&r, &code(PercolatorError::PriceBandPinned), "lagged favourable close above the floor");
+            refused_above_floor = true;
+        }
+        if stuck {
+            break;
+        }
+    }
+    assert!(refused_above_floor, "control ran");
+    let a = env.engine_asset();
+    assert!(!percolator::band_rent::band_width_ok(a.effective_price, D).unwrap(), "reached the floor: {}", a.effective_price);
+    assert!(a.raw_oracle_target_price < a.effective_price, "still lagged");
+    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * Q);
+    assert!(r.is_ok(), "exit at the floor lands: {r:?}");
+    assert_eq!(env.pos(long.1), 0);
+    env.assert_conservation();
+}
+
+
+/// N-2 companion: at d = 100 the width floor (1,600) is below the cap law's own dead zone
+/// (4 bps/slot moves 0 ticks under 2,500), so the price stops there instead; exits must stay
+/// open there too. Control: the same favourable close is refused at a price that can move.
+#[test]
+fn v22_band_cap_dead_zone_keeps_exits_open() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let long = env.trader(1_000 * USD);
+    env.poke_flat_asset_price(1_660);
+    env.crank(lp.account).ok();
+    env.trade_cpi(&long.0, long.1, &lp, 20_000 * Q).expect("open long ($33)");
+    env.warp(1);
+    env.push(1);
+    let _ = env.crank(long.1);
+    let _ = env.crank(lp.account);
+    let a = env.engine_asset();
+    assert_eq!(a.effective_price, 1_660, "the cap law cannot move 1,660 at 4 bps/slot");
+    assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
+    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * Q);
+    assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
+    env.assert_conservation();
 }
