@@ -558,6 +558,62 @@ impl Env {
         v21_upgrade::upgrade_v21_account(&self.program_id, &account.owner, account.data)
     }
 
+    /// AuthMark on asset 0 (admin-configured), so a price target can be pushed.
+    fn auth_mark(&mut self) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::ConfigureAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                initial_mark_e6: PRICE,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    fn push_mark(&mut self, mark_e6: u64) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::PushAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                mark_e6,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    /// Tag 28 by the portfolio's owner.
+    fn convert_released_pnl(&mut self, owner: &Keypair, portfolio: Pubkey) -> Result<u64, String> {
+        let (portfolio_id, _, position_epoch) = self.identity(portfolio);
+        let m = self.market;
+        self.send(
+            ProgInstruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount: u64::MAX as u128 },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+    }
+
     fn identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
         let data = self.read(&portfolio);
         (
@@ -1526,8 +1582,12 @@ fn growth_off_is_byte_for_byte_legacy() {
     // v2.2: the deployed base program is v2.1-layout, so it runs on v2.1-sized accounts and the
     // candidate's bytes are compared through the v2.1 projection, which also ASSERTS every
     // appended band/rent word stayed zero on this band-off, rent-off market.
-    fn run(so: &PathBuf, v21_layout: bool) -> Vec<(String, Vec<Vec<u8>>)> {
+    fn run(so: &PathBuf, v21_layout: bool, lag_phase: bool) -> Vec<(String, Vec<Vec<u8>>)> {
         let mut env = Env::try_new_with_layout(so, MarketCfg::legacy(), v21_layout).expect("init");
+        if lag_phase {
+            // AuthMark must be configured on the still-flat asset.
+            env.auth_mark().expect("configure auth mark");
+        }
         let mut out = Vec::new();
         let lp = env.lp(1_000 * USD);
         let (x, xp) = env.trader(200 * USD);
@@ -1549,14 +1609,33 @@ fn growth_off_is_byte_for_byte_legacy() {
             ));
         };
         snap(&env, "setup", &mut out);
-        let steps: Vec<(&str, Result<u64, String>)> = vec![
+        let steps: Vec<(&str, Result<u64, String>)> = if lag_phase {
+            // Round-2 re-review N-7: a LAGGED mark on this band-off market. The paths v2.2
+            // gates on a band market (tag 28 here, and a close on the favourable side) must
+            // behave byte-for-byte like the deployed v2.1 program: a +5% target is pushed, one
+            // crank per account moves the mark only by the cap, and outcomes + bytes are compared.
+            vec![
+                ("cpi open", env.trade_cpi(&x, xp, &lp, units(100))),
+                ("cpi short", env.trade_cpi(&y, yp, &lp, -units(40))),
+                ("push +5%", env.push_mark(PRICE * 105 / 100)),
+                ("crank lagged", env.crank(xp)),
+                ("crank lp lagged", env.crank(lp.account)),
+                ("convert while lagged", env.convert_released_pnl(&x, xp)),
+                ("favourable close while lagged", env.trade_cpi(&y, yp, &lp, units(20))),
+                ("worse close while lagged", env.trade_cpi(&x, xp, &lp, -units(40))),
+                ("crank y lagged", env.crank(yp)),
+                ("convert y while lagged", env.convert_released_pnl(&y, yp)),
+            ]
+        } else {
+            vec![
             ("cpi open", env.trade_cpi(&x, xp, &lp, units(600))),
             ("cpi crowd 5x", env.trade_cpi(&y, yp, &lp, units(100))),
             ("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))),
             ("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))),
             ("crank", env.crank(xp)),
             ("cpi close", env.trade_cpi(&x, xp, &lp, -units(610))),
-        ];
+            ]
+        };
         for (what, r) in steps {
             // Outcome only (Ok / the instruction error), never logs: CU differ by design.
             let outcome = match r {
@@ -1568,8 +1647,41 @@ fn growth_off_is_byte_for_byte_legacy() {
         }
         out
     }
-    let base = run(&base_program_path(), true);
-    let cand = run(&program_path(), false);
+    let mut base = run(&base_program_path(), true, false);
+    let mut cand = run(&program_path(), false, false);
+    let base_lag = run(&base_program_path(), true, true);
+    let cand_lag = run(&program_path(), false, true);
+    for (what, r) in cand_lag.iter().filter(|s| s.1.is_empty()).map(|s| s.0.split_once(": ").unwrap()) {
+        if matches!(what, "cpi open" | "cpi short" | "push +5%" | "crank lagged" | "crank lp lagged") {
+            assert_eq!(r, "ok", "lag-phase setup step `{what}` must land");
+        }
+    }
+    let cand = {
+        cand.extend(cand_lag.iter().cloned());
+        base.extend(base_lag);
+        cand
+    };
+    // The lag phase really was lagged on the candidate (else the N-7 comparison is vacuous).
+    if std::env::var("PARITY_DBG").is_ok() {
+        for s in cand_lag.iter().filter(|s| s.1.is_empty()) {
+            eprintln!("STEP {}", s.0);
+        }
+    }
+    {
+        let i = cand_lag.iter().position(|s| s.0 == "crank lp lagged").expect("lag step snapshot");
+        let cand = &cand_lag;
+        let (_, g) = state::read_market(&v21_upgrade::upgrade_v21_account(
+            &percolator_prog::id(),
+            &percolator_prog::id(),
+            cand[i].1[0].clone(),
+        ))
+        .unwrap();
+        assert_ne!(
+            g.assets[0].raw_oracle_target_price, g.assets[0].effective_price,
+            "the mark lags its target during the lag phase"
+        );
+        assert!(g.assets[0].oi_eff_long_q != 0, "and the asset is exposed");
+    }
     assert_eq!(base.len(), cand.len());
     let mut compared = 0;
     for (b, c) in base.iter().zip(cand.iter()) {

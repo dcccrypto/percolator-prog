@@ -101,3 +101,34 @@ fn sec_band_caps_by_build() {
         "hard cap"
     );
 }
+
+#[test]
+fn sec3_init_market_trailer_lengths_decode_only_on_the_grammar() {
+    use percolator_prog::ix::{Instruction, InitMarketPhase4};
+    // base InitMarket bytes (no trailer) from a V19 encode with the growth block stripped.
+    let base_ix = Instruction::InitMarketV22 {
+        market: Box::new(Instruction::InitMarket {
+            max_portfolio_assets: 1, h_min: 1, h_max: 10, initial_price: 1_000_000,
+            min_nonzero_mm_req: 1, min_nonzero_im_req: 2, maintenance_margin_bps: 500, initial_margin_bps: 1000,
+            max_trading_fee_bps: 100, trade_fee_base_bps: 10, liquidation_fee_bps: 50, liquidation_fee_cap: 1_000_000,
+            min_liquidation_abs: 0, max_price_move_bps_per_slot: 4, max_accrual_dt_slots: 1,
+            max_abs_funding_e9_per_slot: 1, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
+            max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 10, public_b_chunk_atoms: 1_000, maintenance_fee_per_slot: 0,
+        }),
+        growth_r_gap_bps: 400, growth_l_launch_x100: 1000,
+        phase4: InitMarketPhase4 { rent_max_e9_per_slot: 23, rent_kink_bps: 5000, band_bps: 0, ..Default::default() },
+    };
+    let full = base_ix.encode();
+    let Instruction::InitMarketV22 { market, .. } = &base_ix else { unreachable!() };
+    let base_len = market.encode().len();
+    let mut ok = vec![];
+    for tl in 0..=34usize {
+        let mut b = market.encode();
+        // nonzero filler so a field of zero cannot hide an alias; band_bps byte pair = 130
+        let filler: Vec<u8> = (0..tl).map(|i| match i { 0|1 => if i == 0 { 144 } else { 1 } , _ => 7 }).collect();
+        b.extend_from_slice(&filler);
+        if Instruction::decode(&b).is_ok() { ok.push(tl); }
+    }
+    eprintln!("SEC3 decodable trailer lengths (growth+rent+band, no lot on this branch): {ok:?}; base_len {base_len}, full {}", full.len());
+    assert!(ok.iter().all(|l| [0usize, 4, 10, 28].contains(l)), "only the grammar decodes: {ok:?}");
+}
