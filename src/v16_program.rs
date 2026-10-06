@@ -33521,6 +33521,10 @@ pub mod processor {
     /// credited (vault in), so `header.vault` nets to zero and no SPL moves. Every insurance unit
     /// loses pro rata (I falls, U unchanged); the receivable is booked on both ledgers.
     ///
+    /// RESTORE-FROM-PNL (`mode` 3, W-4 residual). As mode 1, but the vault LP's unconverted,
+    /// unliened, source-backed profit is repaid FIRST (the engine routes it support -> insurance in
+    /// one call, never through withdrawable capital) and capital only for the remainder; same
+    /// equity room (IM + R-6 buffer), same repay-first rule, same ungated permissionless access.
     /// RESTORE (`mode` 1). Repays `min(outstanding, capital, certified equity - IM, max_amount)`
     /// from the vault LP's capital (W-4: the engine's capital-to-insurance charge, which works on
     /// a POSITIONED LP and refuses to cut equity below IM; after the maintenance fee, A4-checked)
@@ -33550,14 +33554,15 @@ pub mod processor {
         expect_writable(own_ledger_ai)?;
         expect_writable(sibling_ledger_ai)?;
         expect_owner(market_ai, program_id)?;
-        if mode > 2 {
+        if mode > 3 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         // R-1 / R-7 / R-8 (re-reviews 2026-10-06, mainnet blocker): PROPOSE and DRAW only on an
         // authenticated Hybrid whose every leg is a Chainlink store feed or an allowlisted
         // Switchboard feed (the leg accounts ride in the tail). Devnet builds keep an override for
-        // testing; a mainnet build has none. RESTORE (mode 1) is never gated.
-        if mode != 1 {
+        // testing; a mainnet build has none. RESTORE (modes 1 and 3) is never gated: it moves
+        // value INTO insurance only.
+        if mode != 1 && mode != 3 {
             g9_oracle_gate(program_id, market_ai, accounts, 7)?;
         }
         expect_owner(registry_ai, program_id)?;
@@ -33782,45 +33787,80 @@ pub mod processor {
                 // insurance leg only) debits capital and credits the asset-0 domain budgets with
                 // `header.vault` unchanged, and refuses (LockActive) any debit that would leave
                 // certified equity below the INITIAL margin requirement. So a positioned LP repays
-                // its surplus over IM in Live; it is no longer repayable only when flat. Positive
-                // PnL counts only once converted (tag 100; the engine refuses Live conversion
-                // while source-claim exposure is open), so free = min(capital, equity - IM).
+                // its surplus over IM in Live; it is no longer repayable only when flat.
                 // R-6: leave a buffer of `RESTORE_IM_BUFFER_BPS` of IM above the margin floor.
-                let free = crate::p4_rescue_ins::backstop_restore_free(
+                //
+                // W-4 residual (mode 3, RESTORE-FROM-PNL): the LP's UNCONVERTED, unliened,
+                // source-backed profit is repaid FIRST, through the engine's
+                // `repay_insurance_from_released_pnl_not_atomic` (value goes support -> insurance
+                // inside one call and never rests in the LP's withdrawable capital; the engine
+                // capacity is 0 whenever a precondition fails, so mode 3 then equals mode 1), and
+                // capital only for the remainder. Mode 1 is unchanged.
+                let pnl_cap = if mode == 3 {
+                    group
+                        .released_pnl_insurance_repay_capacity(&lp.as_view())
+                        .map_err(map_v16_error)?
+                } else {
+                    0
+                };
+                let floor_room = crate::p4_rescue_ins::backstop_restore_equity_room(
                     equity,
                     cert.certified_initial_req,
+                );
+                let (from_pnl, from_cap) = crate::p4_rescue_ins::backstop_restore_split(
+                    outstanding,
+                    floor_room,
+                    max_amount,
+                    pnl_cap,
                     lp.header.capital.get(),
                 );
-                let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, free, max_amount);
+                let amt = from_pnl + from_cap;
                 if amt == 0 {
                     solana_program::log::sol_log(&alloc::format!(
-                        "p4_backstop_restore_nothing equity={} im={} capital={}",
+                        "p4_backstop_restore_nothing equity={} im={} capital={} pnl_cap={} pnl={} reserved={}",
                         equity,
                         cert.certified_initial_req,
-                        lp.header.capital.get()
+                        lp.header.capital.get(),
+                        pnl_cap,
+                        lp.header.pnl.get(),
+                        lp.header.reserved_pnl.get()
                     ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
                 let c_m_before = p2b_c_m(&lp)?;
-                // Capital -> asset-0 insurance (long half, short remainder, as
+                // Insurance is credited to asset-0 (long half, short remainder, as
                 // `deposit_market_zero_insurance_view`); `header.vault` is unchanged.
-                let long_amount = amt / 2;
-                let short_amount = amt - long_amount;
-                if long_amount != 0 {
+                if from_pnl != 0 {
+                    let long_pnl = from_pnl / 2;
                     group
-                        .charge_account_backing_fee_not_atomic(&mut lp, 0, 0, 0, long_amount)
+                        .repay_insurance_from_released_pnl_not_atomic(
+                            &mut lp,
+                            0,
+                            long_pnl,
+                            1,
+                            from_pnl - long_pnl,
+                        )
                         .map_err(map_v16_error)?;
                 }
-                group
-                    .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
-                    .map_err(map_v16_error)?;
+                if from_cap != 0 {
+                    let long_amount = from_cap / 2;
+                    let short_amount = from_cap - long_amount;
+                    if long_amount != 0 {
+                        group
+                            .charge_account_backing_fee_not_atomic(&mut lp, 0, 0, 0, long_amount)
+                            .map_err(map_v16_error)?;
+                    }
+                    group
+                        .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
+                        .map_err(map_v16_error)?;
+                }
                 p2b_a4_capacity_check(&group, &lp, 0, c_m_before)?;
                 let next = outstanding - amt;
                 st.backstop_outstanding_atoms =
                     u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
                 solana_program::log::sol_log(&alloc::format!(
-                    "p4_backstop_restore repaid={} outstanding={} equity_before={} im={}",
-                    amt, next, equity, cert.certified_initial_req
+                    "p4_backstop_restore repaid={} from_pnl={} outstanding={} equity_before={} im={}",
+                    amt, from_pnl, next, equity, cert.certified_initial_req
                 ));
                 amt
             };

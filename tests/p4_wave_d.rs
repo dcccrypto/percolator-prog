@@ -2645,6 +2645,94 @@ fn w4_restore_from_positioned_lp() {
     conserved(&w, "after positioned restore");
 }
 
+/// W-4 residual world: the vault LP is SHORT against a long trader, the market falls 1% a step
+/// (the trader loses, the LP wins), the trader stays OPEN, and a backstop of `owed` atoms is
+/// outstanding (booked on the state, the halt mirror and the units ledger exactly as G9 books it,
+/// so the restore path reads real state; the receivable's origin is irrelevant to the repayment
+/// mechanics under test).
+fn w4_profit_world(owed: u64, drops: usize) -> (P3, Pubkey) {
+    let mut w = P3::new();
+    w.create_vault();
+    let s0 = Keypair::new();
+    let s1 = Keypair::new();
+    w.earn_deposit_domain(&s0, 1_500_000, false, 0).expect("75 d0");
+    w.earn_deposit_domain(&s1, 1_000_000, false, 1).expect("75 d1");
+    let admin = w.env.admin.insecure_clone();
+    w.init_vault_lp(&admin, 1_000).unwrap();
+    let up = w.upgrade.insecure_clone();
+    w.set_risk(&up, 0).unwrap();
+    w.junior_deposit(&admin, 1_000_000).unwrap();
+    let (t, tp) = w.trader(50_000_000);
+    w.trade_vs_lp(&t, tp, 3 * U).unwrap();
+    MARK.with(|c| c.set(PRICE));
+    for _ in 0..drops {
+        let m = MARK.with(|c| c.get()) * 99 / 100;
+        MARK.with(|c| c.set(m));
+        w.push(m);
+        let lp = w.lp;
+        w.catch_up(&[tp, lp], 30);
+    }
+    seed_units(&mut w, 20_000_000);
+    {
+        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
+        st.data[16 + 216..16 + 224].copy_from_slice(&owed.to_le_bytes());
+        w.env.svm.set_account(w.state_pda, st).unwrap();
+        let mut m = w.env.svm.get_account(&w.env.market).unwrap();
+        {
+            let (_, mut g) = state::market_view_mut(&mut m.data).unwrap();
+            let mut rec = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
+            rec.outstanding_mirror_atoms = owed as u128;
+            state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
+        }
+        w.env.svm.set_account(w.env.market, m).unwrap();
+    }
+    set_units(&mut w, |u| u.backstop_receivable_atoms = owed as u128);
+    (w, tp)
+}
+
+/// W-4 residual, wiring + no-regression (tag 111 mode 3, RESTORE-FROM-PNL). In a live book the
+/// engine's favorable-action gate refuses a PnL conversion-like action while ANY account on the
+/// asset is loss-stale (every K/F tick leaves the counterparties stale until they settle), exactly
+/// as it does for a winner's own ConvertReleasedPnl. Mode 3 must then behave EXACTLY like mode 1:
+/// the capacity is 0 (not an error), capital is repaid, and the same IM + buffer floor binds. The
+/// engine-level tests (`w4_repay_from_released_pnl_*` in the engine repo's `v16_spec_tests`) prove
+/// the PnL path itself against a current book.
+#[test]
+fn w4_mode3_equals_mode1_when_the_engine_refuses_pnl_repay() {
+    let owed = 1_300_000u64;
+    let run = |mode: u8| {
+        let (mut w, _tp) = w4_profit_world(owed, 15);
+        let ins0 = w.env.market_state().1.insurance;
+        let vault0 = w.tok(&w.env.vault);
+        let r = backstop_111(&mut w, mode, 0, true);
+        assert!(r.is_ok(), "mode {mode}: {r:?}");
+        let repaid = owed as u128 - backstop_st(&w) as u128;
+        assert!(repaid > 0, "vacuity: capital repaid in mode {mode}");
+        assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "mode {mode}: insurance +repaid");
+        assert_eq!(w.tok(&w.env.vault), vault0, "mode {mode}: no SPL moved");
+        assert_eq!(units(&w).unwrap().backstop_receivable_atoms, backstop_st(&w) as u128);
+        assert_eq!(halt_mirror(&w), outstanding(&w) + backstop_st(&w) as u128, "mode {mode}: W-9 mirror");
+        conserved(&w, "after restore");
+        (repaid, w.lp_state().capital)
+    };
+    let m1 = run(1);
+    let m3 = run(3);
+    assert_eq!(m1, m3, "mode 3 repays exactly what mode 1 repays when the PnL path is unavailable");
+}
+
+/// Mode 4 (and above) is still an invalid instruction; mode 3 is permissionless and ungated like
+/// mode 1 (it only moves value INTO insurance), but still refuses with nothing owed.
+#[test]
+fn w4_mode_range_and_nothing_owed() {
+    let (mut w, _tp) = w4_profit_world(0, 2);
+    let bad = backstop_111(&mut w, 4, 0, true);
+    assert!(bad.is_err(), "mode 4 is invalid: {bad:?}");
+    let none = backstop_111(&mut w, 3, 0, true);
+    assert!(has(&none, INS_REFUSED), "mode 3 with nothing owed is refused: {none:?}");
+    let none1 = backstop_111(&mut w, 1, 0, true);
+    assert!(has(&none1, INS_REFUSED), "mode 1 with nothing owed is refused: {none1:?}");
+}
+
 /// W-10: units only on a single-asset market: 116 refuses a market configured with a second
 /// asset, and a unitised market refuses activating a second asset. Control: capacity-1 116 ok.
 #[test]
