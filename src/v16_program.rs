@@ -12,7 +12,7 @@ extern crate std;
 
 use alloc::vec::Vec;
 use percolator::{
-    canonical_accrual_price_step_v16, v16_domain_count_for_market_slots, AccrualStepV16,
+    v16_domain_count_for_market_slots, AccrualStepV16,
     AutoCrankObservationV16, AutoCrankOutcomeV16, AutoCrankPlanV16, AutoCrankWorkV16,
     BackingBucketStatusV16, MarketModeV16, RebalanceRequestV16, SideV16, SourceCreditStateV16,
     TerminalSlabOutcomeV16, TradeRequestV16, V16Config, V16Error, BOUND_SCALE,
@@ -88,7 +88,12 @@ pub mod constants {
                                                   // (`src/slab_types_v16.rs:83`) and compares it for EXACT equality, and
                                                   // `scripts/parity-check.sh` row `nft.header_version` asserts the two agree,
                                                   // so the nft MUST bump to 18 and redeploy in the same flag day.
-    pub const VERSION: u16 = 18;
+    // 18 -> 19 (v2.2 Wave B): the same policy for the v2.2 engine layout bump
+    // (`V16_LAYOUT_DISCRIMINATOR` 18 -> 19; band/rent fields grow `AssetStateV16`,
+    // `PortfolioLegV16` and `V16Config`; PORTFOLIO_ACCOUNT_LEN 9563 -> 10091), so a
+    // v2.1 image is refused by the wrapper's own gate (Custom(1)) on every KIND_*.
+    // percolator-nft vendors this constant: it must bump to 19 in the same flag day.
+    pub const VERSION: u16 = 19;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
     pub const KIND_BACKING_DOMAIN_LEDGER: u8 = 3;
@@ -521,6 +526,15 @@ pub mod constants {
     pub const TAG_ADL_WIND_DOWN: u8 = 104;
     /// P2b L2: upgrade-authority setter for the ADL episode bound; tighten-only.
     pub const TAG_SET_ADL_WIND_DOWN_MAX_SLOTS: u8 = 105;
+    /// v2.2 Phase 4 item 2 (ledger v22-allocations.md): permissionless holding-fee rent
+    /// settle + route to the bound vault LP.
+    pub const TAG_SETTLE_HOLDING_RENT: u8 = 106;
+    /// v2.2 band (security re-review N-1): permissionless sweep of a DUST band leg (below half
+    /// the market's minimum leg notional), freeing its per-side position slot.
+    pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 118;
+    /// v2.2 band markets: default share of the liquidation penalty paid to a third-party
+    /// cranker (design §1.2: liquidation must be paid to happen, a pending leg holds the epoch).
+    pub const BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS: u16 = 2_000;
     /// Phase 2b (2026-10-05): permissionless senior allocation, the inverse of tag 98.
     pub const TAG_VAULT_LP_ALLOCATE: u8 = 103;
 
@@ -651,7 +665,9 @@ pub mod constants {
         assert!(PORTFOLIO_MATCHER_SEQUENCE_OFF == PORTFOLIO_ID_OFF + 8);
     const _ASSERT_PORTFOLIO_MATCHER_EXPIRY_OFF: () =
         assert!(PORTFOLIO_MATCHER_EXPIRY_OFF == PORTFOLIO_MATCHER_SEQUENCE_OFF + 8);
-    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_9563: () = assert!(PORTFOLIO_ACCOUNT_LEN == 9563);
+    // v2.2: +33 B per engine leg (band_epoch_snap, band_liq_pending, rent_snap, rent_carry)
+    // x 16 legs = +528 B. A v2.2 re-seed; old portfolios fail closed on the discriminator.
+    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_10091: () = assert!(PORTFOLIO_ACCOUNT_LEN == 10091);
     // Bit-layout non-collision (6b627b43's ENABLED_MASK bit0 / TRADE_FEE_CAP bits
     // 50..63 vs this unit's position_epoch bits 1..49): checked against the
     // struct's own consts below (`_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` in the
@@ -1664,6 +1680,30 @@ VaultLpMultiAssetMarket,
         /// path on a units market was called without the `InsuranceUnitsV20` account, or would
         /// burn more units than the caller's class holds. Custom(116).
         InsuranceBackstopRefused = 116,
+        // ── v2.2 Phase 4 Wave B (items 1 + 2): explicit discriminants in the reserved
+        // 104..=119 block (ledger v22-allocations.md). Never folded into 21 (the E7 lesson).
+        /// v2.2 band: the asset's price is pinned to its band (edge or epoch window) or an
+        /// accrual fed a price outside the band; also a favourable-side close refused while
+        /// pinned. Engine `V16Error::BandOutOfRange` / `V16Error::BandPinned`. Custom(104).
+        /// SDK/app: "Price catching up. New positions resume in a few seconds."
+        PriceBandPinned = 104,
+        /// v2.2 band: the InitMarket band block is malformed or violates the Band Safety Law
+        /// (or a band market is not single-asset). Custom(105).
+        PriceBandConfigInvalid = 105,
+        /// v2.2 rent: the growth block's holding-fee rent fields are malformed (rate above the
+        /// ceiling, kink out of range, or missing on a mainnet growth-v2 market). Custom(106).
+        HoldingRentConfigInvalid = 106,
+        /// v2.2 band (review E-M1): a new position would exceed the band market's per-side
+        /// position cap (`band_max_positions_per_side`, 256). Engine `BandPositionCap`.
+        /// Custom(111). SDK/app: "This market is full on this side; try again later."
+        PriceBandPositionCap = 111,
+        /// v2.2 band (review E-L1): the band around the current anchor is narrower than the
+        /// minimum width, so no new exposure may attach. Engine `BandTooNarrow`. Custom(112).
+        PriceBandTooNarrow = 112,
+        /// v2.2 band (security re-review N-1): a trade would leave a positioned leg below the
+        /// market's minimum leg notional (`band_min_leg_notional`). Open bigger or close the
+        /// leg fully. Engine `BandLegBelowMinNotional`. Custom(113).
+        PriceBandLegBelowMinNotional = 113,
     }
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
     const _: () = assert!(PercolatorError::ExitRequiresLossCurrent as u32 == 118);
@@ -1685,6 +1725,12 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::VaultLpCapacityLocked as u32 == 101);
     const _: () = assert!(PercolatorError::VaultLpCreatorFeeVesting as u32 == 102);
     const _: () = assert!(PercolatorError::VaultLpSeniorCapitalHalt as u32 == 103);
+    const _: () = assert!(PercolatorError::PriceBandPinned as u32 == 104);
+    const _: () = assert!(PercolatorError::PriceBandConfigInvalid as u32 == 105);
+    const _: () = assert!(PercolatorError::HoldingRentConfigInvalid as u32 == 106);
+    const _: () = assert!(PercolatorError::PriceBandPositionCap as u32 == 111);
+    const _: () = assert!(PercolatorError::PriceBandTooNarrow as u32 == 112);
+    const _: () = assert!(PercolatorError::PriceBandLegBelowMinNotional as u32 == 113);
 
     impl From<PercolatorError> for ProgramError {
         fn from(value: PercolatorError) -> Self {
@@ -1720,6 +1766,11 @@ VaultLpMultiAssetMarket,
             // P2b E7 (engine feat/p2b-lock-exits).
             V16Error::AdlReduceOnly => PercolatorError::EngineAdlReduceOnly,
             V16Error::LossStale => PercolatorError::EngineLossStale,
+            // v2.2 band (Phase 4 item 1): both engine band refusals surface as 104.
+            V16Error::BandOutOfRange | V16Error::BandPinned => PercolatorError::PriceBandPinned,
+            V16Error::BandPositionCap => PercolatorError::PriceBandPositionCap,
+            V16Error::BandTooNarrow => PercolatorError::PriceBandTooNarrow,
+            V16Error::BandLegBelowMinNotional => PercolatorError::PriceBandLegBelowMinNotional,
         };
         mapped.into()
     }
@@ -4663,6 +4714,12 @@ pub mod state {
         ))
     }
 
+    /// v2.2: the market's per-epoch band half-width `d` (0 = band off), a header-only read.
+    pub fn market_band_bps(data: &[u8]) -> Result<u64, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        Ok(market_header(data)?.config.band_bps.get())
+    }
+
     /// Lightweight read of the market-wide asset-generation frontier (`header.next_market_id`),
     /// for handlers that don't otherwise need a full `market_view_mut` (e.g.
     /// `ConfigurePermissionlessResolve`). Wave-2 TB-4 (adopts upstream `4c100ca6`).
@@ -5766,6 +5823,10 @@ pub mod state {
             asset.effective_price = initial_price;
             asset.fund_px_last = initial_price;
             asset.slot_last = init_slot;
+            // v2.2 band: arm the per-epoch band at genesis exactly as the engine's own
+            // activation does (epoch 1, anchored at the genesis price).
+            percolator::band_initialize_asset(&mut asset, engine_config.band_bps, initial_price, init_slot)
+                .map_err(crate::error::map_v16_error)?;
             let mut slot = EngineAssetSlotV16Account::empty_for_market(market_id);
             slot.asset = percolator::AssetStateV16Account::from_runtime(&asset);
             slot.insurance_domain_budget_long = percolator::V16PodU128::new(0);
@@ -6560,7 +6621,9 @@ pub mod state {
     pub fn validate_vault_lp_ext(x: &VaultLpExtV19) -> Result<(), ProgramError> {
         if x.version != crate::constants::VAULT_LP_EXT_VERSION
             || x.market_group == [0u8; 32]
-            || x.alloc_alpha_bps > crate::vault_lp_v18::ALLOC_ALPHA_MAX_BPS
+            // v2.2: the hard ceiling is the band-market maximum; the per-market cap (50% off-band)
+            // is enforced where alpha is written (`p2b_set_vault_lp_dials`).
+            || x.alloc_alpha_bps > crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS
             || x.alloc_buffer_bps < crate::vault_lp_v18::ALLOC_BUFFER_MIN_BPS
             || x.alloc_buffer_bps > 10_000
             || x.cushion_target_bps > 10_000
@@ -7187,7 +7250,17 @@ pub mod state {
         /// N-2 (security round 3): the per-side utilisation fee at `u = 1` (bps of the opening
         /// notional, paid to the vault LP). 0 = `growth_v19::GROWTH_UTIL_FEE_DEFAULT_BPS`.
         pub util_fee_max_bps: u16, // 40..42
-        pub _reserved0: [u8; 30],    // 42..72
+        /// v2.2 item 2: the holding-fee rent kink u_k (bps). The rent rate is 0 at or below
+        /// it and climbs to the engine's `rent_max_e9_per_slot` at `u = 1`. 0 with
+        /// `rent_max == 0` on a market without rent.
+        pub rent_kink_bps: u16, // 42..44
+        pub _reserved0: [u8; 4], // 44..48
+        /// v2.2 item 2: snapshot of the bound vault LP's `N_cap` (engine Q, clamped to the
+        /// engine position limit), refreshed wherever the LP's equity is in hand (post-fill,
+        /// tags 78 / 103 / 106, bind). The rent rate's denominator at every accrual, so a
+        /// crank needs no extra account. 0 = not measured yet (rent rate 0).
+        pub rent_n_cap_q: u64, // 48..56
+        pub _reserved0b: [u8; 16], // 56..72
         pub _reserved1: [u8; 32],    // 72..104
         pub _reserved2: [u8; 16],    // 104..120
     }
@@ -7216,7 +7289,9 @@ pub mod state {
             .ok_or(ProgramError::InvalidAccountData)?;
         if g.version != crate::growth_v19::GROWTH_VERSION
             || g.flags != 0
-            || g._reserved0 != [0u8; 30]
+            || g._reserved0 != [0u8; 4]
+            || g._reserved0b != [0u8; 16]
+            || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
             || g._reserved1 != [0u8; 32]
             || g._reserved2 != [0u8; 16]
@@ -7565,6 +7640,23 @@ pub mod ix {
     /// (16) -- a portfolio can never have more active legs than that, so no honest caller needs
     /// more hints than this in one call.
     const CRANK_OBSERVATION_DECODE_MAX: usize = 16;
+
+    /// v2.2 Phase 4 (items 1 + 2): the InitMarket trailer after the 4-byte growth block.
+    /// Wire: `[rent_max_e9_per_slot u32][rent_kink_bps u16]` (6 B), optionally followed by the
+    /// band block `[band_bps u16][band_max_epoch_slots u32][band_max_pin_slots u32]
+    /// [band_min_leg_notional u64]` (18 B; the last field is the security re-review N-1 minimum
+    /// leg notional in collateral atoms, floored by the program at 10 whole tokens).
+    /// The rent fields go to the engine config (`rent_max_e9_per_slot`) and the asset's growth
+    /// record (`rent_kink_bps`); the band fields to the engine config (immutable, no setter).
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct InitMarketPhase4 {
+        pub rent_max_e9_per_slot: u32,
+        pub rent_kink_bps: u16,
+        pub band_bps: u16,
+        pub band_max_epoch_slots: u32,
+        pub band_max_pin_slots: u32,
+        pub band_min_leg_notional: u64,
+    }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
     pub enum Instruction {
@@ -8440,6 +8532,30 @@ pub mod ix {
             growth_l_launch_x100: u16,
             lot_exp: u8,
         },
+        /// v2.2 Phase 4: tag 0 with the growth block followed by an optional lot byte, the rent
+        /// block and optionally the band block. Combined trailer grammar (Wave A + Wave B):
+        /// `growth(4) [lot(1)] [rent(6) [band(18)]]`; the lot byte is present iff the remainder
+        /// after the growth block is ODD, so it is read FIRST. Valid trailer lengths are
+        /// {4, 5, 10, 11, 28, 29}. With the band block, `growth_r_gap_bps`
+        /// may be 0: a band market's `r_gap` is derived (`G(d)`), never creator-declared.
+        InitMarketV22 {
+            market: alloc::boxed::Box<Instruction>,
+            growth_r_gap_bps: u16,
+            growth_l_launch_x100: u16,
+            /// v2.2 combined grammar: the optional lot byte (0 = absent), read FIRST.
+            lot_exp: u8,
+            phase4: InitMarketPhase4,
+        },
+        /// v2.2 item 2, tag 106 (permissionless): touch `portfolio` on `asset_index` (accrue,
+        /// settle its holding-fee rent and band certification) and route the asset's unrouted
+        /// rent to the bound vault LP. Accounts: `[0] caller (s)`, `[1] market (w)`,
+        /// `[2] portfolio (w)`, `[3] vault_lp_portfolio (w)`, `[4..] oracle accounts`.
+        SettleHoldingRent { asset_index: u16, now_slot: u64 },
+        /// v2.2 tag 118 (permissionless): close a band leg whose notional at `P_last` is below
+        /// half of `band_min_leg_notional` (engine `band_leg_is_dust`), unilaterally at
+        /// `P_last` (`rebalance_reduce_position_not_atomic`), so dust cannot hold one of the
+        /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
+        SweepBandDustLeg { asset_index: u16 },
         /// growth-v19: tag 94 with a 2-byte trailing `l_launch_x100` (non-zero): the creator's
         /// starting leverage cap, written at bind on an asset whose growth block is on.
         InitVaultLpV19 {
@@ -8620,26 +8736,72 @@ pub mod ix {
                     } else {
                         let growth_r_gap_bps = read_u16(&mut rest)?;
                         let growth_l_launch_x100 = read_u16(&mut rest)?;
-                        if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
-                            return Err(ProgramError::InvalidInstructionData);
-                        }
                         if rest.is_empty() {
+                            if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
+                                return Err(ProgramError::InvalidInstructionData);
+                            }
                             Self::InitMarketV19 {
                                 market: alloc::boxed::Box::new(base),
                                 growth_r_gap_bps,
                                 growth_l_launch_x100,
                             }
                         } else {
-                            // v2.2 Wave A: one more byte, the lot exponent (canonical: != 0).
-                            let lot_exp = read_u8(&mut rest)?;
-                            if lot_exp == 0 {
-                                return Err(ProgramError::InvalidInstructionData);
-                            }
-                            Self::InitMarketLotV22 {
-                                market: alloc::boxed::Box::new(base),
-                                growth_r_gap_bps,
-                                growth_l_launch_x100,
-                                lot_exp,
+                            // v2.2 combined grammar `growth(4) [lot(1)] [rent(6) [band(18)]]`.
+                            // The lot byte is present iff the post-growth remainder is ODD
+                            // (rent = 6 B and band = 18 B are even), so it is read FIRST and a
+                            // rent-first read can never mistake it for a rent byte (the
+                            // naive-merge hazard in the Wave B security review, section 6).
+                            let lot_exp = if rest.len() % 2 == 1 {
+                                let l = read_u8(&mut rest)?;
+                                // canonical: a lot byte of 0 is the 4-byte form, refused here.
+                                if l == 0 {
+                                    return Err(ProgramError::InvalidInstructionData);
+                                }
+                                l
+                            } else {
+                                0
+                            };
+                            if rest.is_empty() {
+                                // growth + lot only (Wave A's 5-byte trailer).
+                                if growth_r_gap_bps == 0 || growth_l_launch_x100 == 0 {
+                                    return Err(ProgramError::InvalidInstructionData);
+                                }
+                                Self::InitMarketLotV22 {
+                                    market: alloc::boxed::Box::new(base),
+                                    growth_r_gap_bps,
+                                    growth_l_launch_x100,
+                                    lot_exp,
+                                }
+                            } else {
+                                // rent block (6 B), then an optional band block (18 B). Any other
+                                // remainder length fails the reads below or the trailing-byte check.
+                                let mut phase4 = InitMarketPhase4 {
+                                    rent_max_e9_per_slot: read_u32(&mut rest)?,
+                                    rent_kink_bps: read_u16(&mut rest)?,
+                                    ..Default::default()
+                                };
+                                if !rest.is_empty() {
+                                    phase4.band_bps = read_u16(&mut rest)?;
+                                    phase4.band_max_epoch_slots = read_u32(&mut rest)?;
+                                    phase4.band_max_pin_slots = read_u32(&mut rest)?;
+                                    phase4.band_min_leg_notional = read_u64(&mut rest)?;
+                                    if phase4.band_bps == 0 {
+                                        return Err(ProgramError::InvalidInstructionData);
+                                    }
+                                }
+                                // r_gap is derived on a band market (may be 0); required otherwise.
+                                if growth_l_launch_x100 == 0
+                                    || (growth_r_gap_bps == 0 && phase4.band_bps == 0)
+                                {
+                                    return Err(ProgramError::InvalidInstructionData);
+                                }
+                                Self::InitMarketV22 {
+                                    market: alloc::boxed::Box::new(base),
+                                    growth_r_gap_bps,
+                                    growth_l_launch_x100,
+                                    lot_exp,
+                                    phase4,
+                                }
                             }
                         }
                     }
@@ -9291,6 +9453,13 @@ pub mod ix {
                     }
                     Self::SetG9FeedAllowlist { keys }
                 }
+                crate::constants::TAG_SETTLE_HOLDING_RENT => Self::SettleHoldingRent {
+                    asset_index: read_u16(&mut rest)?,
+                    now_slot: read_u64(&mut rest)?,
+                },
+                crate::constants::TAG_SWEEP_BAND_DUST_LEG => Self::SweepBandDustLeg {
+                    asset_index: read_u16(&mut rest)?,
+                },
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -10171,6 +10340,40 @@ pub mod ix {
                     push_u16(&mut out, growth_r_gap_bps);
                     push_u16(&mut out, growth_l_launch_x100);
                     out.push(lot_exp);
+                }
+                Self::InitMarketV22 {
+                    ref market,
+                    growth_r_gap_bps,
+                    growth_l_launch_x100,
+                    lot_exp,
+                    phase4,
+                } => {
+                    out = market.encode();
+                    push_u16(&mut out, growth_r_gap_bps);
+                    push_u16(&mut out, growth_l_launch_x100);
+                    if lot_exp != 0 {
+                        out.push(lot_exp);
+                    }
+                    push_u32(&mut out, phase4.rent_max_e9_per_slot);
+                    push_u16(&mut out, phase4.rent_kink_bps);
+                    if phase4.band_bps != 0 {
+                        push_u16(&mut out, phase4.band_bps);
+                        push_u32(&mut out, phase4.band_max_epoch_slots);
+                        push_u32(&mut out, phase4.band_max_pin_slots);
+                        push_u64(&mut out, phase4.band_min_leg_notional);
+                    }
+                }
+                Self::SweepBandDustLeg { asset_index } => {
+                    out.push(crate::constants::TAG_SWEEP_BAND_DUST_LEG);
+                    push_u16(&mut out, asset_index);
+                }
+                Self::SettleHoldingRent {
+                    asset_index,
+                    now_slot,
+                } => {
+                    out.push(106);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, now_slot);
                 }
                 Self::VaultLpSetMatcher {
                     expected_sequence,
@@ -12167,6 +12370,161 @@ pub mod risk_limits_v17 {
     }
 }
 
+/// v2.2 D-1 (security re-review N-3): how every instruction relates to a LAGGED mark
+/// (`target != P_last` while `slot_last` keeps advancing under the band). The `match` is
+/// EXHAUSTIVE: a new instruction does not compile until it is classified here, and
+/// `tests/v22_band_rent.rs::v22_d1_lag_policy_is_complete_and_gated_handlers_reach_the_predicate`
+/// proves (static call graph over this file) that every `Gated` handler reaches the shared
+/// predicate. Host-only (never in the SBF image).
+#[cfg(not(target_os = "solana"))]
+pub mod lag_policy {
+    use crate::ix::Instruction;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum LagPolicy {
+        /// Refused or repriced while lagged, via `asset_price_lagged_view`.
+        Gated,
+        /// Pays out only from a flat account / a resolved market: no live mark involved.
+        FlatOnly,
+        /// No value depends on the mark (config, deposits, realised fee atoms, target pushes).
+        MarkFree,
+        /// Accrues / liquidates / settles AT `P_last` by design (the Band Safety Law and the
+        /// D-1 residuals are the guarantee).
+        MarkDriven,
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct LagPolicyEntry {
+        pub variant: &'static str,
+        pub policy: LagPolicy,
+        pub reason: &'static str,
+    }
+
+    const fn entry(variant: &'static str, policy: LagPolicy, reason: &'static str) -> LagPolicyEntry {
+        LagPolicyEntry { variant, policy, reason }
+    }
+
+    pub fn lag_policy(ix: &Instruction) -> LagPolicyEntry {
+        match ix {
+            Instruction::InitMarket { .. } => entry("InitMarket", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitMarketV19 { .. } => entry("InitMarketV19", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitMarketV22 { .. } => entry("InitMarketV22", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitMarketLotV22 { .. } => entry("InitMarketLotV22", LagPolicy::MarkFree, "creates a market; no positions exist"),
+            Instruction::InitPortfolio => entry("InitPortfolio", LagPolicy::MarkFree, "creates an empty portfolio"),
+            Instruction::Deposit { .. } => entry("Deposit", LagPolicy::MarkFree, "adds capital; no payout"),
+            Instruction::Withdraw { .. } => entry("Withdraw", LagPolicy::FlatOnly, "engine withdraw_not_atomic refuses any active leg: the payout never depends on a mark"),
+            Instruction::PermissionlessCrank { .. } => entry("PermissionlessCrank", LagPolicy::MarkDriven, "accrues / certifies / liquidates at P_last: the Band Safety Law is the guarantee"),
+            Instruction::TradeNoCpi { .. } => entry("TradeNoCpi", LagPolicy::Gated, "favourable-side close refused while lagged (band markets); engine refuses risk-increasing fills while lagged"),
+            Instruction::TradeCpi { .. } => entry("TradeCpi", LagPolicy::Gated, "favourable-side close refused while lagged (band markets); engine refuses risk-increasing fills while lagged"),
+            Instruction::BatchTradeNoCpi { .. } => entry("BatchTradeNoCpi", LagPolicy::Gated, "per leg, as TradeNoCpi"),
+            Instruction::BatchTradeCpi { .. } => entry("BatchTradeCpi", LagPolicy::Gated, "per leg, as TradeCpi"),
+            Instruction::SetMatcherConfig { .. } => entry("SetMatcherConfig", LagPolicy::MarkFree, "matcher config only"),
+            Instruction::ClosePortfolio { .. } => entry("ClosePortfolio", LagPolicy::FlatOnly, "only an empty, flat portfolio closes"),
+            Instruction::TopUpInsurance { .. } => entry("TopUpInsurance", LagPolicy::MarkFree, "adds insurance; no payout"),
+            Instruction::TopUpInsuranceDomain { .. } => entry("TopUpInsuranceDomain", LagPolicy::MarkFree, "adds insurance; no payout"),
+            Instruction::CloseSlab { .. } => entry("CloseSlab", LagPolicy::FlatOnly, "resolved, empty market only"),
+            Instruction::ResolveMarket { .. } => entry("ResolveMarket", LagPolicy::MarkDriven, "settles at P_last by design (D-1 residual: terminal settlement at the last in-band price)"),
+            Instruction::TopUpBackingBucket { .. } => entry("TopUpBackingBucket", LagPolicy::MarkFree, "adds backing; no payout"),
+            Instruction::WithdrawBackingBucket { .. } => entry("WithdrawBackingBucket", LagPolicy::Gated, "custody domain-withdraw gate (live_domain_withdraw_health_or_shutdown_view)"),
+            Instruction::ConvertReleasedPnl { .. } => entry("ConvertReleasedPnl", LagPolicy::Gated, "tag 28: released PnL is valued at P_last, so it is refused while any leg asset lags"),
+            Instruction::CloseResolved { .. } => entry("CloseResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::UpdateAuthority { .. } => entry("UpdateAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::UpdateAssetAuthority { .. } => entry("UpdateAssetAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::UpdateLiquidationFeePolicy { .. } => entry("UpdateLiquidationFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateMaintenanceFeePolicy { .. } => entry("UpdateMaintenanceFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateBackingFeePolicy { .. } => entry("UpdateBackingFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateTradeFeePolicy { .. } => entry("UpdateTradeFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateFeeRedirectPolicy { .. } => entry("UpdateFeeRedirectPolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateInsuranceWithdrawPolicy { .. } => entry("UpdateInsuranceWithdrawPolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::UpdateMarketInitFeePolicy { .. } => entry("UpdateMarketInitFeePolicy", LagPolicy::MarkFree, "policy dial"),
+            Instruction::WithdrawBackingBucketEarnings { .. } => entry("WithdrawBackingBucketEarnings", LagPolicy::Gated, "custody domain-withdraw gate"),
+            Instruction::SyncBackingDomainLedger { .. } => entry("SyncBackingDomainLedger", LagPolicy::MarkFree, "ledger bookkeeping of realised amounts"),
+            Instruction::SyncInsuranceLedger => entry("SyncInsuranceLedger", LagPolicy::MarkFree, "ledger bookkeeping of realised amounts"),
+            Instruction::ConfigurePermissionlessResolve { .. } => entry("ConfigurePermissionlessResolve", LagPolicy::MarkFree, "config"),
+            Instruction::ResolveStalePermissionless { .. } => entry("ResolveStalePermissionless", LagPolicy::MarkDriven, "stale-oracle resolution at P_last by design"),
+            Instruction::ConfigureHybridOracle { .. } => entry("ConfigureHybridOracle", LagPolicy::MarkFree, "oracle config"),
+            Instruction::ConfigureEwmaMark { .. } => entry("ConfigureEwmaMark", LagPolicy::MarkFree, "oracle config"),
+            Instruction::PushEwmaMark { .. } => entry("PushEwmaMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
+            Instruction::ConfigureAuthMark { .. } => entry("ConfigureAuthMark", LagPolicy::MarkFree, "oracle config"),
+            Instruction::PushAuthMark { .. } => entry("PushAuthMark", LagPolicy::MarkFree, "moves the TARGET, never a payout"),
+            Instruction::ForceCloseAbandonedAsset { .. } => entry("ForceCloseAbandonedAsset", LagPolicy::MarkDriven, "abandoned-asset close at P_last by design"),
+            Instruction::RestartAssetOracle { .. } => entry("RestartAssetOracle", LagPolicy::MarkDriven, "re-arms the oracle (the band re-initialises at the restart price)"),
+            Instruction::UpdateAssetLifecycle { .. } => entry("UpdateAssetLifecycle", LagPolicy::MarkFree, "lifecycle dial"),
+            Instruction::WithdrawInsurance { .. } => entry("WithdrawInsurance", LagPolicy::Gated, "insurance is the loss absorber: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawInsuranceAsset { .. } => entry("WithdrawInsuranceAsset", LagPolicy::Gated, "custody domain-withdraw gate"),
+            Instruction::CureAndCancelClose { .. } => entry("CureAndCancelClose", LagPolicy::MarkDriven, "close-ledger cure at P_last (engine liquidation machinery)"),
+            Instruction::ForfeitRecoveryLeg { .. } => entry("ForfeitRecoveryLeg", LagPolicy::MarkDriven, "recovery-mode forfeit (engine)"),
+            Instruction::RebalanceReduce { .. } => entry("RebalanceReduce", LagPolicy::MarkDriven, "engine-driven reduction"),
+            Instruction::FinalizeResetSide { .. } => entry("FinalizeResetSide", LagPolicy::MarkDriven, "engine side reset"),
+            Instruction::ClaimResolvedPayoutTopup => entry("ClaimResolvedPayoutTopup", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::RefineResolvedUnreceiptedBound { .. } => entry("RefineResolvedUnreceiptedBound", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::SyncMaintenanceFee { .. } => entry("SyncMaintenanceFee", LagPolicy::Gated, "pending price-managed mark gate (reject_portfolio_pending_price_managed_mark_view)"),
+            Instruction::UpdateBaseUnitMints { .. } => entry("UpdateBaseUnitMints", LagPolicy::MarkFree, "mint config"),
+            Instruction::SwapSecondaryForPrimary { .. } => entry("SwapSecondaryForPrimary", LagPolicy::MarkFree, "1:1 collateral swap"),
+            Instruction::CreateLpVault { .. } => entry("CreateLpVault", LagPolicy::MarkFree, "creates a vault"),
+            Instruction::DepositToLpVault { .. } => entry("DepositToLpVault", LagPolicy::Gated, "Earn entry priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
+            Instruction::RebalanceLpVaultBacking { .. } => entry("RebalanceLpVaultBacking", LagPolicy::Gated, "moves backing by pooled NAV: refused while any asset lags (re-review N-3)"),
+            Instruction::RequestRedeemLpShares { .. } => entry("RequestRedeemLpShares", LagPolicy::MarkFree, "a request; the price is set at ExecuteRedemption"),
+            Instruction::ExecuteRedemption { .. } => entry("ExecuteRedemption", LagPolicy::Gated, "Earn exit priced at the worse lag bound (vault_lp_equity_lag_bounds_ro)"),
+            Instruction::LpVaultCrankFees { .. } => entry("LpVaultCrankFees", LagPolicy::MarkFree, "distributes realised fee atoms"),
+            Instruction::SetLpVaultPaused { .. } => entry("SetLpVaultPaused", LagPolicy::MarkFree, "pause dial"),
+            Instruction::CloseLpVault => entry("CloseLpVault", LagPolicy::MarkFree, "empty vault only"),
+            Instruction::CancelRedemption => entry("CancelRedemption", LagPolicy::MarkFree, "returns escrowed shares"),
+            Instruction::TransferPortfolioOwnership { .. } => entry("TransferPortfolioOwnership", LagPolicy::MarkFree, "ownership transfer, no value movement"),
+            Instruction::SetNftProgramId { .. } => entry("SetNftProgramId", LagPolicy::MarkFree, "config"),
+            Instruction::UnwrapEscrowedPortfolio { .. } => entry("UnwrapEscrowedPortfolio", LagPolicy::MarkFree, "ownership transfer"),
+            Instruction::InitMatcherCtx { .. } => entry("InitMatcherCtx", LagPolicy::MarkFree, "matcher context init"),
+            Instruction::WithdrawProtocolFee { .. } => entry("WithdrawProtocolFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::SetProtocolFeeAuthority { .. } => entry("SetProtocolFeeAuthority", LagPolicy::MarkFree, "authority rotation"),
+            Instruction::SetAssetRiskLimits { .. } => entry("SetAssetRiskLimits", LagPolicy::MarkFree, "risk dial"),
+            Instruction::SetAssetRiskLimitsV19 { .. } => entry("SetAssetRiskLimitsV19", LagPolicy::MarkFree, "risk dial"),
+            Instruction::UpdateFeeSplit { .. } => entry("UpdateFeeSplit", LagPolicy::MarkFree, "fee split dial"),
+            Instruction::WithdrawInsuranceReserveToStake => entry("WithdrawInsuranceReserveToStake", LagPolicy::Gated, "moves insurance-reserve atoms out: refused while any asset lags (re-review N-3)"),
+            Instruction::UpdateMaintenanceFeePerSlot { .. } => entry("UpdateMaintenanceFeePerSlot", LagPolicy::MarkFree, "fee dial"),
+            Instruction::ExpireBackingBucket { .. } => entry("ExpireBackingBucket", LagPolicy::MarkFree, "expires a lapsed bucket"),
+            Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
+            Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
+            Instruction::VaultLpSetMatcher { .. } => entry("VaultLpSetMatcher", LagPolicy::MarkFree, "matcher config"),
+            Instruction::DepositJuniorTranche { .. } => entry("DepositJuniorTranche", LagPolicy::Gated, "junior entry priced from pooled NAV: refused while any asset lags (re-review N-3)"),
+            Instruction::WithdrawJuniorTranche { .. } => entry("WithdrawJuniorTranche", LagPolicy::Gated, "junior exit (flat book) and refused while any asset lags (re-review N-3)"),
+            Instruction::VaultLpRecall { .. } => entry("VaultLpRecall", LagPolicy::Gated, "recall sized from the vault LP equity: refused while any asset lags (re-review N-3)"),
+            Instruction::SetVaultLpRisk { .. } => entry("SetVaultLpRisk", LagPolicy::MarkFree, "tag 99, a risk dial: writes alpha / buffer; no value moves until tag 103"),
+            Instruction::SetVaultLpRiskV19 { .. } => entry("SetVaultLpRiskV19", LagPolicy::MarkFree, "tag 99 V19 form, a risk dial"),
+            Instruction::VaultLpConvertPnl { .. } => entry("VaultLpConvertPnl", LagPolicy::Gated, "tag 100 (the review called it 99): vault-LP PnL valued at P_last, refused while lagged"),
+            Instruction::VaultLpSettleResolved { .. } => entry("VaultLpSettleResolved", LagPolicy::FlatOnly, "resolved market: no live mark"),
+            Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (re-review N-3)"),
+            Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
+            Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
+            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 118: a forced close at P_last, refused while the asset lags"),
+            Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
+            Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags"),
+            // Wave A (tags 76 / 77 v2.2 wire forms): same classification as the legacy forms.
+            Instruction::RequestRedeemLpSharesV22 { .. } => entry("RequestRedeemLpSharesV22", LagPolicy::MarkFree, "a request; the price is set at ExecuteRedemption"),
+            Instruction::ExecuteRedemptionV22 { .. } => entry("ExecuteRedemptionV22", LagPolicy::Gated, "Earn exit priced at the worse lag bound (vault_lp_equity_lag_bounds_ro); the keeper path stays loss-current strict"),
+            // Wave C (capacity bonds, tags 107-110).
+            Instruction::InitBondTranche { .. } => entry("InitBondTranche", LagPolicy::MarkFree, "creates the tranche record; no value moves"),
+            Instruction::BondDeposit { .. } => entry("BondDeposit", LagPolicy::Gated, "tag 108: share price reads the vault LP equity at P_last, refused while any asset lags (combined release)"),
+            Instruction::BondRequestWithdraw { .. } => entry("BondRequestWithdraw", LagPolicy::MarkFree, "a request; the price is set at BondExecuteWithdraw"),
+            Instruction::BondExecuteWithdraw { .. } => entry("BondExecuteWithdraw", LagPolicy::Gated, "tag 110: Live exit priced from the vault LP equity, refused while any asset lags; Resolved has no live mark (combined release)"),
+            // Wave D (items 5 + 6, tags 111 / 112 / 116 / 117).
+            Instruction::InsuranceBackstopDraw { .. } => entry("InsuranceBackstopDraw", LagPolicy::Gated, "tag 111: G9 PROPOSE / DRAW / RESTORE size from vault LP equity and insurance, refused while any asset lags (combined release)"),
+            Instruction::RescueDeposit { .. } => entry("RescueDeposit", LagPolicy::Gated, "tag 112: priced from the certified vault value, refused while any asset lags (combined release)"),
+            Instruction::InitInsuranceUnits => entry("InitInsuranceUnits", LagPolicy::MarkFree, "creates the unit ledger at genesis 1:1 insurance; no mark-valued payout"),
+            Instruction::SetG9FeedAllowlist { .. } => entry("SetG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config"),
+        }
+    }
+}
+
+/// Release check marker (security re-review, mainnet build): the SBF image carries which
+/// feature set built it, so `scripts/check-mainnet-sbf.sh` can refuse a devnet artifact
+/// (whose band caps are 10x lambda / 70% alpha instead of 3x / 60%). Logged once by
+/// InitMarket, which keeps the bytes in the image (an exported static breaks the loader).
+#[cfg(feature = "devnet")]
+pub const PERCOLATOR_BUILD_FLAVOR: &str = "PERCOLATOR_BUILD_FLAVOR=devnet..";
+#[cfg(not(feature = "devnet"))]
+pub const PERCOLATOR_BUILD_FLAVOR: &str = "PERCOLATOR_BUILD_FLAVOR=mainnet.";
+
 pub mod processor {
     use super::*;
     use crate::{
@@ -12502,7 +12860,62 @@ pub mod processor {
             && asset_local_has_position_or_loss_state_view(group, asset_index)
     }
 
-    fn asset_has_exposed_target_effective_lag_view(
+    /// v2.2 D-1 (review): THE price-lag predicate. The asset's committed mark `P_last`
+    /// (`effective_price`) differs from the engine's raw oracle target. Under the band's D-1
+    /// carve-out (`docs/v22-d1-spec-9-6-carve-out.md` in the engine) `slot_last` keeps advancing
+    /// while this holds, so "the clock is current" no longer implies "the price is current":
+    /// every payout-bearing path that depends on the mark reads THIS predicate (directly or via
+    /// `asset_price_lagged_view`), never its own comparison. Pinned by
+    /// `tests/v22_band_rent.rs::v22_d1_every_lag_consumer_uses_the_shared_predicate`.
+    pub(crate) fn asset_target_differs_view(asset: &percolator::AssetStateV16Account) -> bool {
+        asset.raw_oracle_target_price.get() != asset.effective_price.get()
+    }
+
+    /// v2.2 D-1 (re-review N-3): refuse (21) while ANY configured asset's mark lags (the
+    /// market-level form of `asset_price_lagged_view`, for paths valued from pooled equity:
+    /// insurance, the vault LP, junior / senior tranches).
+    pub(crate) fn reject_market_price_lagged_view(
+        group: &state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        let configured = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
+        let mut i = 0usize;
+        while i < configured {
+            if asset_price_lagged_view(group, i)? {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            i += 1;
+        }
+        Ok(())
+    }
+
+    /// `reject_market_price_lagged_view` for a handler that only holds the market account.
+    pub(crate) fn reject_market_price_lagged_ai(market_ai: &AccountInfo<'_>) -> ProgramResult {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        reject_market_price_lagged_view(&group)
+    }
+
+    /// v2.2 D-1 (re-review N-3): any of `portfolio`'s active legs sits on a lagged asset.
+    pub(crate) fn portfolio_has_lagged_asset_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<bool, ProgramError> {
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = portfolio.header.legs[slot]
+                .try_to_runtime()
+                .map_err(map_v16_error)?;
+            if leg.active && asset_price_lagged_view(group, leg.asset_index as usize)? {
+                return Ok(true);
+            }
+            slot += 1;
+        }
+        Ok(false)
+    }
+
+    /// v2.2 D-1: the asset is EXPOSED (open interest on either side) and its mark lags its
+    /// target (`asset_target_differs_view`). An unexposed asset has no lagged payout.
+    pub(crate) fn asset_price_lagged_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
     ) -> Result<bool, ProgramError> {
@@ -12512,14 +12925,14 @@ pub mod processor {
             .ok_or(PercolatorError::InvalidInstruction)?;
         let asset = &slot.engine.asset;
         let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-        Ok(exposed && asset.raw_oracle_target_price.get() != asset.effective_price.get())
+        Ok(exposed && asset_target_differs_view(asset))
     }
 
     fn reject_exposed_target_effective_lag_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
     ) -> ProgramResult {
-        if asset_has_exposed_target_effective_lag_view(group, asset_index)? {
+        if asset_price_lagged_view(group, asset_index)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         Ok(())
@@ -12563,7 +12976,7 @@ pub mod processor {
                 let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
                 if oracle_v16::profile_is_price_managed(&profile) {
                     let effective_price = asset.effective_price.get();
-                    if asset.raw_oracle_target_price.get() != effective_price
+                    if asset_target_differs_view(&asset)
                         || profile.mark_ewma_e6 != effective_price
                         || profile.oracle_target_price_e6 != effective_price
                     {
@@ -12689,12 +13102,18 @@ pub mod processor {
             dt,
             exposed,
         );
+        // v2.2 band: the price the accrual would actually feed (a pinned asset is not pending
+        // a price move it cannot make).
+        let (next, band_pinned) = band_shape_price_view(group, asset_index, now_slot, next)?;
         // d63c4dc9's contribution beyond the price check: a pending nonzero funding rate is ALSO
         // pending progress, even when the price itself has already fully caught up (next ==
         // current) -- a caller cannot skip supplying an observation just because the price
         // happens to be stationary this slot while funding still owes an update.
-        let funding_rate =
-            permissionless_funding_rate_e9_view(&profile, group, asset_index, now_slot, next)?;
+        let funding_rate = if band_pinned {
+            0
+        } else {
+            permissionless_funding_rate_e9_view(&profile, group, asset_index, now_slot, next)?
+        };
         if next != current || funding_rate != 0 {
             return Err(PercolatorError::EngineNonProgress.into());
         }
@@ -13685,6 +14104,7 @@ pub mod processor {
         ix: &Instruction,
         growth: Option<(u16, u16)>,
         lot_exp: u8,
+        phase4: Option<ix::InitMarketPhase4>,
     ) -> ProgramResult {
         match *ix {
             Instruction::InitMarket {
@@ -13737,6 +14157,7 @@ pub mod processor {
                 maintenance_fee_per_slot,
                 growth,
                 lot_exp,
+                phase4,
             ),
             _ => Err(ProgramError::InvalidInstructionData),
         }
@@ -13750,7 +14171,7 @@ pub mod processor {
     ) -> ProgramResult {
         match Instruction::decode(instruction_data)? {
             ix @ Instruction::InitMarket { .. } => {
-                dispatch_init_market(program_id, accounts, &ix, None, 0)
+                dispatch_init_market(program_id, accounts, &ix, None, 0, None)
             }
             Instruction::InitMarketV19 {
                 market,
@@ -13762,6 +14183,7 @@ pub mod processor {
                 &market,
                 Some((growth_r_gap_bps, growth_l_launch_x100)),
                 0,
+                None,
             ),
             Instruction::InitMarketLotV22 {
                 market,
@@ -13774,7 +14196,29 @@ pub mod processor {
                 &market,
                 Some((growth_r_gap_bps, growth_l_launch_x100)),
                 lot_exp,
+                None,
             ),
+            Instruction::InitMarketV22 {
+                market,
+                growth_r_gap_bps,
+                growth_l_launch_x100,
+                lot_exp,
+                phase4,
+            } => dispatch_init_market(
+                program_id,
+                accounts,
+                &market,
+                Some((growth_r_gap_bps, growth_l_launch_x100)),
+                lot_exp,
+                Some(phase4),
+            ),
+            Instruction::SettleHoldingRent {
+                asset_index,
+                now_slot,
+            } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
+            Instruction::SweepBandDustLeg { asset_index } => {
+                handle_sweep_band_dust_leg(program_id, accounts, asset_index)
+            }
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
                 portfolio_id,
@@ -14693,10 +15137,13 @@ pub mod processor {
         growth: Option<(u16, u16)>,
         // v2.2 Wave A item 7: the lot exponent (0 unless the 5-byte growth+lot trailer).
         lot_exp: u8,
+        // v2.2 Phase 4: the rent block and the optional band block after the growth block.
+        phase4: Option<ix::InitMarketPhase4>,
     ) -> ProgramResult {
         let admin = account(accounts, 0)?;
         let market_ai = account(accounts, 1)?;
         let mint_ai = account(accounts, 2)?;
+        solana_program::log::sol_log(crate::PERCOLATOR_BUILD_FLAVOR);
         expect_signer(admin)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -14741,6 +15188,34 @@ pub mod processor {
         {
             return Err(PercolatorError::LotConfigInvalid.into());
         }
+        // v2.2 Phase 4: holding-fee rent and the per-epoch band into the (immutable) engine
+        // config. A band / rent failure is named (105 / 106) instead of the generic engine
+        // config error, by validating the config with and without the new words.
+        let band_on = phase4.map(|p| p.band_bps != 0).unwrap_or(false);
+        init_market_apply_phase4_view(&mut cfg, phase4, growth.is_some())?;
+        // v2.2 band: the wrapper maintenance fee is an absolute per-slot debit with no health
+        // check, which the Band Safety Law does not price (the engine never sees it); a band
+        // market keeps it at 0, here and in the maintenance-fee setter (105).
+        if band_on && maintenance_fee_per_slot != 0 {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
+        // Review E-L1 / re-review N-2: a band market launches at >= 100x the smallest anchor
+        // whose band is MIN_BAND_WIDTH_TICKS wide, so the narrow-band floor (where re-anchoring
+        // stops) needs a >99% collapse to reach.
+        if band_on
+            && !percolator::band_rent::band_genesis_price_ok(initial_price, cfg.band_bps)
+                .map_err(|_| PercolatorError::PriceBandConfigInvalid)?
+        {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
+        // Re-review N-1: the minimum leg notional is at least 10 whole collateral tokens, so
+        // filling the 256-per-side position cap locks real margin.
+        if band_on
+            && cfg.band_min_leg_notional
+                < growth_v19::band_min_leg_notional_floor(unpack_mint(mint_ai)?.decimals)
+        {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
         let init_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
         let wrapper = WrapperConfigV16 {
             marketauth: admin.key.to_bytes(),
@@ -14765,7 +15240,13 @@ pub mod processor {
             last_good_oracle_slot: init_slot,
             insurance_withdraw_deposit_remaining: 0,
             insurance_withdraw_max_bps: 0,
-            liquidation_cranker_fee_share_bps: 0,
+            // v2.2: band markets pay third-party liquidators by default (design §1.2: a
+            // liquidation-pending leg holds the epoch until someone liquidates it).
+            liquidation_cranker_fee_share_bps: if band_on {
+                constants::BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS
+            } else {
+                0
+            },
             maintenance_cranker_fee_share_bps: 0,
             backing_trade_fee_bps_long: 0,
             backing_trade_fee_bps_short: 0,
@@ -14835,6 +15316,7 @@ pub mod processor {
                 max_abs_funding_e9_per_slot,
                 max_price_move_bps_per_slot,
                 init_slot,
+                phase4,
             )?;
         }
         if lot_exp != 0 {
@@ -14853,6 +15335,65 @@ pub mod processor {
         let mut profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
         profile._padding0[constants::PROFILE_LOT_EXP_IDX] = lot_exp;
         write_oracle_profile_to_view(&mut group, 0, &profile)
+    }
+
+    /// v2.2 Phase 4: write the rent and band words into `cfg` and name their failures.
+    /// * rent: `rent_max_e9_per_slot <= band_rent::MAX_RENT_E9_PER_SLOT`, kink <= 100%, else 106;
+    /// * band: the engine's shape rules (single asset, `E >= 1`, `Pmax >= E`, `d <= 20%`) and the
+    ///   Band Safety Law (exact, every notional), else 105;
+    /// * mainnet builds: a growth market carries the rent block with both fields > 0 (106),
+    ///   and a single-asset growth market carries the band block (105).
+    #[inline(never)]
+    fn init_market_apply_phase4_view(
+        cfg: &mut V16Config,
+        phase4: Option<ix::InitMarketPhase4>,
+        growth_on: bool,
+    ) -> ProgramResult {
+        #[cfg(not(feature = "devnet"))]
+        {
+            if growth_on {
+                match phase4 {
+                    Some(p) if p.rent_max_e9_per_slot != 0 && p.rent_kink_bps != 0 => {}
+                    _ => return Err(PercolatorError::HoldingRentConfigInvalid.into()),
+                }
+                if cfg.max_portfolio_assets == 1 && phase4.map(|p| p.band_bps).unwrap_or(0) == 0 {
+                    return Err(PercolatorError::PriceBandConfigInvalid.into());
+                }
+            }
+        }
+        #[cfg(feature = "devnet")]
+        let _ = growth_on;
+        let Some(p) = phase4 else {
+            return Ok(());
+        };
+        if p.rent_max_e9_per_slot as u64 > percolator::band_rent::MAX_RENT_E9_PER_SLOT
+            || p.rent_kink_bps as u128 > growth_v19::BPS
+            // Review W-M1: a rent market trades the 500 bps N-2 toll for the 25 bps entry
+            // floor, so the rent must actually bite: a floor on the ceiling and a cap on the
+            // kink (`rent_max = 1, kink = 9999` would nullify the deterrent).
+            || !growth_v19::rent_params_ok(p.rent_max_e9_per_slot as u64, p.rent_kink_bps)
+        {
+            return Err(PercolatorError::HoldingRentConfigInvalid.into());
+        }
+        // Name a failure only when the rest of the config is sound on its own.
+        let base_ok = cfg.validate_public_user_fund().is_ok();
+        cfg.rent_max_e9_per_slot = p.rent_max_e9_per_slot as u64;
+        if base_ok && cfg.validate_public_user_fund().is_err() {
+            return Err(PercolatorError::HoldingRentConfigInvalid.into());
+        }
+        if p.band_bps != 0 {
+            let rent_ok = cfg.validate_public_user_fund().is_ok();
+            cfg.band_bps = p.band_bps as u64;
+            cfg.band_max_epoch_slots = p.band_max_epoch_slots as u64;
+            cfg.band_max_pin_slots = p.band_max_pin_slots as u64;
+            // Review E-M1: the design's per-side position cap (the keeper's sweep bound).
+            cfg.band_max_positions_per_side = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
+            cfg.band_min_leg_notional = p.band_min_leg_notional;
+            if rent_ok && cfg.validate_public_user_fund().is_err() {
+                return Err(PercolatorError::PriceBandConfigInvalid.into());
+            }
+        }
+        Ok(())
     }
 
     /// growth-v19: InitMarket's optional growth block (creator == InitMarket admin, at
@@ -14877,15 +15418,27 @@ pub mod processor {
         max_abs_funding_e9_per_slot: u64,
         max_price_move_bps_per_slot: u64,
         init_slot: u64,
+        phase4: Option<ix::InitMarketPhase4>,
     ) -> ProgramResult {
-        if !growth_v19::init_margin_rule_ok(
-            maintenance_margin_bps,
-            r_gap_bps,
-            liquidation_fee_bps,
-            max_price_move_bps_per_slot,
-        ) {
-            return Err(PercolatorError::GrowthInvalidConfig.into());
-        }
+        let band_bps = phase4.map(|p| p.band_bps as u64).unwrap_or(0);
+        let rent_on = phase4.map(|p| p.rent_max_e9_per_slot != 0).unwrap_or(false);
+        // v2.2: on a band market r_gap is DERIVED (`G(d)`, the worst two-epoch move) and the
+        // engine already validated the exact Band Safety Law, which subsumes the growth-1
+        // rule (`MMR >= r_gap + fee`) and replaces its keeper-latency floor. Off-band the
+        // growth-1 rule applies unchanged.
+        let r_gap_bps = if band_bps != 0 {
+            growth_v19::band_r_gap_bps(band_bps).ok_or(PercolatorError::PriceBandConfigInvalid)?
+        } else {
+            if !growth_v19::init_margin_rule_ok(
+                maintenance_margin_bps,
+                r_gap_bps,
+                liquidation_fee_bps,
+                max_price_move_bps_per_slot,
+            ) {
+                return Err(PercolatorError::GrowthInvalidConfig.into());
+            }
+            r_gap_bps
+        };
         let l_tier_x100 = growth_v19::leverage_x100_for_imr_bps(initial_margin_bps)
             .ok_or(PercolatorError::GrowthInvalidConfig)?;
         if l_launch_x100 < growth_v19::LEVERAGE_X100_ONE || l_launch_x100 > l_tier_x100 {
@@ -14905,16 +15458,22 @@ pub mod processor {
             kink_bps: growth_v19::DEFAULT_KINK_BPS,
             r_gap_bps,
             version: growth_v19::GROWTH_VERSION,
+            rent_kink_bps: phase4.map(|p| p.rent_kink_bps).unwrap_or(0),
+            // v2.2 item 2: on a rent market the toll is only the 25 bps entry floor. Stored
+            // explicitly (0 would read as the 500 bps growth-1 default), so the hot trade path
+            // needs no rent lookup (`util_fee_max_effective_bps` returns the stored dial).
+            util_fee_max_bps: if rent_on { growth_v19::RENT_ENTRY_FLOOR_BPS } else { 0 },
             ..Default::default()
         };
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (cfg, group) = state::market_view_mut(&mut market_data)?;
         // N-2: the engine fee cap must leave room for base + the pinned matcher request + the
         // default utilisation fee at u = 1 (the fee channel charges them through the engine).
+        // v2.2: on a rent market the default toll is only the 25 bps entry floor.
         if !growth_v19::util_fee_fits_trading_cap(
             group.header.config.max_trading_fee_bps.get(),
             cfg.trade_fee_base_bps,
-            growth_v19::GROWTH_UTIL_FEE_DEFAULT_BPS,
+            growth_v19::util_fee_max_effective_bps_for(0, rent_on),
         ) {
             return Err(PercolatorError::GrowthInvalidConfig.into());
         }
@@ -15330,6 +15889,24 @@ pub mod processor {
                 reduces_existing,
             )
             .map_err(map_v16_error)?;
+            // v2.2 band: no favourable-side close at a pinned price (Custom 104). The rule binds
+            // the side that CHOSE the fill: the taker on the matcher route, both signers on
+            // NoCpi. The passive LP of a CPI fill is the party the rule protects (a user closing
+            // at a stale price is favourable to the LP), so it is never refused for it.
+            reject_band_favourable_close_view(
+                &group,
+                asset_index as usize,
+                account_a_position,
+                size_q,
+            )?;
+            if !roles.cpi {
+                reject_band_favourable_close_view(
+                    &group,
+                    asset_index as usize,
+                    account_b_position,
+                    size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
+                )?;
+            }
             // F-TRADENOCPI-FEE: the position enters/settles at the asset mark (effective_price), NOT at
             // the caller-supplied exec_price. The engine uses request.exec_price ONLY as the fee notional
             // basis (fee = size_q*exec_price/POS_SCALE * fee_bps), so without pinning it two cooperating
@@ -15534,6 +16111,20 @@ pub mod processor {
             )? {
                 cfg_after = Some(cfg);
             }
+            // v2.2 item 2: route the asset's unrouted rent to the bound vault LP (account_b on
+            // the CPI route; either side on NoCpi) and refresh its rent N_cap snapshot.
+            vault_lp_rent_route_and_snapshot_view(
+                &mut group,
+                &mut account_b,
+                account_b_ai.key,
+                asset_index as usize,
+            )?;
+            vault_lp_rent_route_and_snapshot_view(
+                &mut group,
+                &mut account_a,
+                account_a_ai.key,
+                asset_index as usize,
+            )?;
             update_hybrid_mark_after_trade_view(
                 &mut oracle_profile,
                 &group,
@@ -15868,6 +16459,22 @@ pub mod processor {
                     reduces_existing,
                 )
                 .map_err(map_v16_error)?;
+                // v2.2 band: no favourable-side close at a pinned price (Custom 104); the taker
+                // on the matcher route, both signers on NoCpi (see the single executor).
+                reject_band_favourable_close_view(
+                    &group,
+                    asset_index,
+                    account_a_position_for_accrual,
+                    leg.size_q,
+                )?;
+                if !roles.cpi {
+                    reject_band_favourable_close_view(
+                        &group,
+                        asset_index,
+                        account_b_position_for_accrual,
+                        leg.size_q.checked_neg().ok_or(PercolatorError::InvalidInstruction)?,
+                    )?;
+                }
                 let fee_basis_price = group.markets[asset_index]
                     .engine
                     .asset
@@ -16070,6 +16677,22 @@ pub mod processor {
                 )?;
                 p1_post_fill_checks_view(
                     &group, &account_a, &account_b, ctx.0, ctx.4, ctx.5, roles,
+                )?;
+            }
+            // v2.2 item 2: the bound vault LP is in this instruction, so route each leg asset's
+            // unrouted rent to it and refresh its rent N_cap snapshot (no-op otherwise).
+            for request in requests.iter() {
+                vault_lp_rent_route_and_snapshot_view(
+                    &mut group,
+                    &mut account_b,
+                    account_b_ai.key,
+                    request.asset_index,
+                )?;
+                vault_lp_rent_route_and_snapshot_view(
+                    &mut group,
+                    &mut account_a,
+                    account_a_ai.key,
+                    request.asset_index,
                 )?;
             }
             // sync/w1-abacking (57d04a7d): a retained transaction can land after the engine's
@@ -19196,7 +19819,10 @@ pub mod processor {
                     .source_insurance_credit_reserved_total_atoms
                     .get(),
             )
-            .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+            .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
+            // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
+            // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
+            .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
         Ok(claim_capacity
             .min(engine_available)
             .min(group.header.vault.get()))
@@ -20454,6 +21080,9 @@ pub mod processor {
         let (cfg_pre, policy_dirty) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -20901,7 +21530,10 @@ pub mod processor {
                         .source_insurance_credit_reserved_total_atoms
                         .get(),
                 )
-                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
+                // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
+                // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
+                .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
             let (transfer_amount, next_withdrawn) = protocol_fee_withdraw_amount(
                 cfg.protocol_fee_accrued_atoms,
                 cfg.protocol_fee_withdrawn_atoms,
@@ -21224,18 +21856,27 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         if let Some((lambda_bps, kink_bps, util_fee_max_bps)) = growth {
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
             // growth-v19 dials: growth assets only; tighten-only / within bounds until the epoch
-            // clamp is enforced (plan §2.9 L3).
-            if !growth_v19::growth_dials_ok(growth_v19::EPOCH_CLAMP_ENFORCED, lambda_bps, kink_bps)
+            // clamp is enforced (plan §2.9 L3). v2.2: the band IS the program-enforced epoch
+            // clamp, so a band market may raise lambda up to `band_lambda_max` (the vault LP
+            // stays 5% clear of its own maintenance over two epochs) and lower the toll to 0;
+            // a rent market may lower the toll to the 25 bps entry floor.
+            let band_bps = group.header.config.band_bps.get();
+            let band = if band_bps == 0 {
+                None
+            } else {
+                let g_bps = percolator::band_rent::band_worst_adverse_bps(band_bps)
+                    .map_err(|_| PercolatorError::PriceBandConfigInvalid)?;
+                Some((group.header.config.maintenance_margin_bps.get(), g_bps))
+            };
+            let rent_on = group.header.config.rent_max_e9_per_slot.get() != 0;
+            if !growth_v19::growth_dials_ok_for(band, lambda_bps, kink_bps)
                 || (util_fee_max_bps != 0
-                    && !growth_v19::util_fee_dial_ok(
-                        growth_v19::EPOCH_CLAMP_ENFORCED,
-                        util_fee_max_bps,
-                    ))
+                    && !growth_v19::util_fee_dial_ok_for(band.is_some(), rent_on, util_fee_max_bps))
             {
                 return Err(PercolatorError::GrowthInvalidConfig.into());
             }
-            let (cfg, group) = state::market_view_mut(&mut market_data)?;
             // N-2: the engine fee cap must carry base + matcher request + this utilisation fee.
             if util_fee_max_bps != 0
                 && !growth_v19::util_fee_fits_trading_cap(
@@ -21343,12 +21984,22 @@ pub mod processor {
             cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
         }
         write_oracle_profile_to_view(group, asset_index, &oracle_profile)?;
+        // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move).
+        let (crank_price, funding_rate_e9, rent_long, rent_short) = band_rent_accrual_inputs_view(
+            group,
+            asset_index,
+            authenticated_now_slot,
+            crank_price,
+            funding_rate_e9,
+        )?;
         group
-            .accrue_asset_to_not_atomic(
+            .accrue_asset_to_with_rent_not_atomic(
                 asset_index,
                 authenticated_now_slot,
                 crank_price,
                 funding_rate_e9,
+                rent_long,
+                rent_short,
                 true,
             )
             .map_err(map_v16_error)?;
@@ -22026,6 +22677,9 @@ pub mod processor {
         let (transfer_amount_u64, cfg_after) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             // MODE GATE — see the doc comment. Live-only, plus matured-Live.
             //
             // P1 F4 exception: a RESOLVED market with NO portfolio left
@@ -22116,7 +22770,10 @@ pub mod processor {
                         .source_insurance_credit_reserved_total_atoms
                         .get(),
                 )
-                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
+                // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
+                // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
+                .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
             let transfer_amount = claim_capacity
                 .min(engine_available)
                 .min(group.header.vault.get());
@@ -22556,7 +23213,10 @@ pub mod processor {
                         .source_insurance_credit_reserved_total_atoms
                         .get(),
                 )
-                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get());
+                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
+                // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
+                // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
+                .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
             if risk_limits_v17::close_refused_for_fees(
                 outstanding_fee_legs_view(&cfg, &group)?,
                 unbudgeted_pool,
@@ -22859,6 +23519,13 @@ pub mod processor {
                 // The relabel moved the pot's credit epoch: re-certify before converting.
                 group.full_account_refresh_not_atomic(portfolio)?;
             }
+            // v2.2 D-1 (re-review N-3): released PnL is valued at P_last; while the mark lags
+            // that is a stale value, so the conversion waits for the staircase (21).
+            if portfolio_has_lagged_asset_view(group, portfolio)
+                .map_err(|_| V16Error::InvalidConfig)?
+            {
+                return Err(V16Error::LockActive);
+            }
             let converted = group.convert_released_pnl_to_capital_not_atomic(portfolio)?;
             if converted == 0 || converted > amount {
                 return Err(V16Error::LockActive);
@@ -23079,6 +23746,40 @@ pub mod processor {
                         asset_index: asset_index as usize,
                         reduce_q,
                     },
+                )
+                .map(|_| ())
+        })
+    }
+
+    /// v2.2 band (security re-review N-1), tag 118: permissionless dust sweep. The leg must be
+    /// dust (`band_leg_is_dust`: under HALF the market's minimum leg notional at `P_last`); the
+    /// asset must not lag its target (a forced close at a stale mark is refused, 21); the close
+    /// is the engine's unilateral reduce at `P_last` (the same primitive as RebalanceReduce,
+    /// no fee), after the canonical zero-move funding catch-up.
+    #[inline(never)]
+    fn handle_sweep_band_dust_leg<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+    ) -> ProgramResult {
+        with_one_portfolio_view(program_id, accounts, false, None, |group, portfolio, cfg| {
+            let a = asset_index as usize;
+            if group.header.mode != 0 || permissionless_resolve_matured_now_view(cfg, group) {
+                return Err(V16Error::LockActive);
+            }
+            if asset_price_lagged_view(group, a).map_err(|_| V16Error::InvalidConfig)? {
+                return Err(V16Error::LockActive);
+            }
+            if !group.band_leg_is_dust(&portfolio.as_view(), a)? {
+                return Err(V16Error::NonProgress);
+            }
+            accrue_zero_move_funding_before_position_change_view(cfg, group, a, true)?;
+            // The whole leg: the engine clamps the request to the position (and to the
+            // unilateral close capacity), so no raw-basis read is needed here.
+            group
+                .rebalance_reduce_position_not_atomic(
+                    portfolio,
+                    RebalanceRequestV16 { asset_index: a, reduce_q: u128::MAX },
                 )
                 .map(|_| ())
         })
@@ -24750,6 +25451,11 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // v2.2 band: the maintenance fee is an absolute per-slot debit with no health check,
+        // which the Band Safety Law does not price; band markets keep it at 0 (105).
+        if maintenance_fee_per_slot != 0 && state::market_band_bps(&market_ai.try_borrow_data()?)? != 0 {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
 
         // ── GH#444 (A): checkpoint the change so the new rate is NOT retroactive ──
         //
@@ -25901,6 +26607,8 @@ pub mod processor {
             let receipt_only_before = portfolio_is_receipt_only(&portfolio)?;
             let reserved_residual = receipt_reserve_bound(&group)?;
             let insurance_before = group.header.insurance.get();
+            // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+            let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
@@ -25919,7 +26627,13 @@ pub mod processor {
                 .header
                 .insurance
                 .get()
-                .saturating_sub(insurance_before);
+                .saturating_sub(insurance_before)
+                .saturating_sub(
+                    group
+                        .rent_unrouted_total()
+                        .map_err(map_v16_error)?
+                        .saturating_sub(rent_unrouted_before),
+                );
             credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, retained)?;
             group.validate_shape().map_err(map_v16_error)?;
             let payout = match outcome {
@@ -26404,12 +27118,25 @@ pub mod processor {
                 }
                 write_oracle_profile_to_view(&mut group, hint_asset_index, &oracle_profile)?;
 
-                let accrual = group
-                    .accrue_asset_to_not_atomic(
+                // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move). The
+                // observation below carries the same values, so the engine's own refresh /
+                // liquidation step certifies at exactly the committed P_last.
+                let (crank_price, computed_funding_rate_e9, rent_long, rent_short) =
+                    band_rent_accrual_inputs_view(
+                        &group,
                         hint_asset_index,
                         authenticated_now_slot,
                         crank_price,
                         computed_funding_rate_e9,
+                    )?;
+                let accrual = group
+                    .accrue_asset_to_with_rent_not_atomic(
+                        hint_asset_index,
+                        authenticated_now_slot,
+                        crank_price,
+                        computed_funding_rate_e9,
+                        rent_long,
+                        rent_short,
                         true,
                     )
                     .map_err(map_v16_error)?;
@@ -26546,6 +27273,8 @@ pub mod processor {
             // after that collection so the reward calculation below sees liquidation proceeds,
             // never the old maintenance obligation.
             let insurance_before = group.header.insurance.get();
+            // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+            let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             let result = match group.permissionless_auto_crank_not_atomic(
                 &mut portfolio,
                 AutoCrankWorkV16 {
@@ -26649,7 +27378,13 @@ pub mod processor {
                     .header
                     .insurance
                     .get()
-                    .saturating_sub(insurance_before);
+                    .saturating_sub(insurance_before)
+                    .saturating_sub(
+                        group
+                            .rent_unrouted_total()
+                            .map_err(map_v16_error)?
+                            .saturating_sub(rent_unrouted_before),
+                    );
                 // FIX (ADOPT upstream 01ec6161, PRESERVED): a liquidation whose penalty is not
                 // reclaimable pays NO cranker reward at all. The full `retained_fee` still flows
                 // to `credit_market_fee_split_across_domains_view` below unchanged (matches this
@@ -26700,7 +27435,13 @@ pub mod processor {
                     .header
                     .insurance
                     .get()
-                    .saturating_sub(insurance_before);
+                    .saturating_sub(insurance_before)
+                    .saturating_sub(
+                        group
+                            .rent_unrouted_total()
+                            .map_err(map_v16_error)?
+                            .saturating_sub(rent_unrouted_before),
+                    );
                 credit_market_fee_split_across_domains_view(
                     &cfg,
                     &mut group,
@@ -28118,6 +28859,9 @@ pub mod processor {
         if state::registry_vault_lp_bound(&registry)? {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (_, group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             let draw = read_vault_lp_draw_from_view(&group, registry.domain as usize / 2)?;
             if draw.pending_moved_atoms != 0
                 || draw.pending_out_even_atoms != 0
@@ -31648,6 +32392,10 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineInvalidConfig)?
                 .engine
                 .asset;
+            // v2.2 D-1: the shared lag predicate; an unlagged leg contributes 0 either way.
+            if !asset_price_lagged_view(group, leg.asset_index as usize)? {
+                continue;
+            }
             let eff = asset.effective_price.get();
             let tgt = asset.raw_oracle_target_price.get();
             let (adv, fav) = match leg.side {
@@ -33300,6 +34048,9 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -33327,7 +34078,10 @@ pub mod processor {
                 state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)?
             {
                 if g.c_launch_atoms == 0 && c_m > 0 {
-                    g.c_launch_atoms = u64::try_from(c_m).unwrap_or(u64::MAX);
+                    // v2.2 (security review I-1): floor the graduation reference so a 1-atom
+                    // first deposit cannot pin it.
+                    g.c_launch_atoms =
+                        u64::try_from(growth_v19::c_launch_atoms_for(c_m)).unwrap_or(u64::MAX);
                     state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
                 }
             }
@@ -33449,6 +34203,9 @@ pub mod processor {
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
@@ -33619,6 +34376,9 @@ pub mod processor {
         let draw_pending_before = {
             let mut md = market_ai.try_borrow_mut_data()?;
             let (_, g) = state::market_view_mut(&mut md)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&g)?;
             let a = st.asset_index as usize;
             let r = read_vault_lp_draw_from_view(&g, a)?;
             r.pending_moved_atoms != 0 || r.pending_out_even_atoms != 0 || r.pending_out_odd_atoms != 0
@@ -34000,6 +34760,11 @@ pub mod processor {
         // route the vault LP's settled loss into a pot for its winners; that is never Earn's.
         let d_even_pre = p2b_alloc_drawable(group, cfg, &registry_pda, even, even_present)?;
         let d_odd_pre = p2b_alloc_drawable(group, cfg, &registry_pda, odd, odd_present)?;
+        // v2.2 D-1 (re-review N-3): the allocation is sized from the LP's certificate at
+        // P_last; during an adverse lag that overstates the LP, so senior capital waits (21).
+        if asset_price_lagged_view(group, a)? {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         // Certificate on the engine's current state: a stale certificate can never value the
         // vault LP (fail closed on any refresh error).
         let cert = group
@@ -34775,6 +35540,9 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // v2.2 D-1 (combined release): every G9 mode (PROPOSE / DRAW / RESTORE) sizes from the
+            // vault LP equity and insurance at P_last: wait (21) while any asset's mark lags.
+            reject_market_price_lagged_view(&group)?;
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             // G9 lends the unit holders' insurance, so it runs ONLY on a unitised market (the
             // receivable must be mirrored from the first draw on; a ledger created after a
@@ -35427,6 +36195,9 @@ pub mod processor {
         let (v_raw_before, v, par) = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (combined release): the rescue prices from the certified vault value at
+            // P_last: wait (21) while any asset's mark lags its target (bound and non-bound).
+            reject_market_price_lagged_view(&group)?;
             if lp_vault_harvestable_fee_atoms(&cfg_v, &group)? != 0 {
                 return Err(PercolatorError::RescueRefused.into());
             }
@@ -35441,7 +36212,7 @@ pub mod processor {
             } else if !rescue_nonbound_loss_current_view(&group, asset_index)?
                 || asset_local_loss_stale_view(&group, asset_index)
                 || asset_local_open_kf_cohort_view(&group, asset_index)
-                || asset_has_exposed_target_effective_lag_view(&group, asset_index)?
+                || asset_price_lagged_view(&group, asset_index)?
             {
                 // Non-bound source asset must be loss-current: E3 is then exact per pot (the
                 // combined reading below closes the cross-pot wedge).
@@ -35652,7 +36423,7 @@ pub mod processor {
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
             let mut own = own_ledger_ai.try_borrow_mut_data()?;
             let mut sib = sibling_ledger_ai.try_borrow_mut_data()?;
-            vault_lp_allocate_core(
+            let result = vault_lp_allocate_core(
                 &cfg_v,
                 &mut group,
                 &mut lp,
@@ -35665,7 +36436,13 @@ pub mod processor {
                 &mut sib,
                 amount,
                 bond_claim,
-            )?
+            )?;
+            // v2.2 item 2: tag 103 carries the vault LP, so route its unrouted rent and
+            // refresh the rent N_cap snapshot here too.
+            if let Some(i) = market_bound_vault_asset(&group)? {
+                vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, lp_ai.key, i)?;
+            }
+            result
         };
         p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
         x.deallocated_total_atoms = x
@@ -35845,6 +36622,8 @@ pub mod processor {
                         true,
                     )?;
                     let insurance_before = group.header.insurance.get();
+                    // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
+                    let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
@@ -35883,7 +36662,13 @@ pub mod processor {
                         .header
                         .insurance
                         .get()
-                        .saturating_sub(insurance_before);
+                        .saturating_sub(insurance_before)
+                        .saturating_sub(
+                            group
+                                .rent_unrouted_total()
+                                .map_err(map_v16_error)?
+                                .saturating_sub(rent_unrouted_before),
+                        );
                     credit_maintenance_fee_to_active_market_budgets_view(&cfg, &mut group, retained)?;
                     match outcome {
                         percolator::ResolvedCloseOutcomeV16::ProgressOnly => 0,
@@ -36275,6 +37060,9 @@ pub mod processor {
         }
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
+            // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
+            // while any asset's mark lags its target that value is stale, so wait (21).
+            reject_market_price_lagged_view(&group)?;
             if resolved {
                 // Terminal-flat only: no portfolio (and so no pending resolved payout) can still
                 // draw on the pots after the junior takes the surplus.
@@ -36436,6 +37224,10 @@ pub mod processor {
         let mut lp_data = lp_ai.try_borrow_mut_data()?;
         let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
         expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        // v2.2 D-1 (re-review N-3): no conversion of PnL valued at a lagged mark (21).
+        if portfolio_has_lagged_asset_view(&group, &lp)? {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         let converted = group
             .convert_released_pnl_to_capital_not_atomic(&mut lp)
             .map_err(map_v16_error)?;
@@ -36535,7 +37327,9 @@ pub mod processor {
         d: [u16; 4],
     ) -> ProgramResult {
         let [alpha, buffer, target, share] = d;
-        if alpha > vault_lp_v18::ALLOC_ALPHA_MAX_BPS
+        // v2.2: alpha above 50% only on a band market (up to 70%).
+        let band_on = state::market_band_bps(&market_ai.try_borrow_data()?)? != 0;
+        if alpha > growth_v19::alloc_alpha_max_bps(band_on)
             || !(vault_lp_v18::ALLOC_BUFFER_MIN_BPS..=10_000).contains(&buffer)
             || target > 10_000
             || share > 10_000
@@ -37045,6 +37839,8 @@ pub mod processor {
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
+        // v2.2 D-1 (combined release): the bond share price reads the vault LP equity at P_last.
+        reject_market_price_lagged_ai(market_ai)?;
         let mint = primary_collateral_mint(&cfg);
         let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
         let source_balance = verify_user_token_account(source_token, depositor.key, &mint)?;
@@ -37328,6 +38124,9 @@ pub mod processor {
             expect_writable(lp_ai)?;
             expect_owner(lp_ai, program_id)?;
             ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+            // v2.2 D-1 (combined release): a Live bond exit is priced from the vault LP equity at
+            // P_last, so it waits (21) while any asset lags. Resolved has no live mark.
+            reject_market_price_lagged_ai(market_ai)?;
         }
         // Fund an insolvent vault LP (Live) and book any pending draw FIRST, in both modes (the
         // 102 order): the bonds are priced against the booked senior claim.
@@ -38947,7 +39746,10 @@ pub mod processor {
     /// growth-v19: the leverage ceiling (x100) in force. Graduation is OFF in growth-1, so this
     /// is `min(L_launch, L_tier)`; once it is on, the stored ratcheted `ceil_x100`.
     fn growth_ceiling_x100(g: &state::AssetGrowthV19) -> u16 {
-        if growth_v19::GRADUATION_ENABLED {
+        // v2.2: graduation is a runtime predicate (band on AND an on-chain depth tier). The
+        // depth tier is item 4 (Wave C); until it exists the tier reads 0 (I-D1: absent depth
+        // is tier 0) and the ceiling stays at min(L_launch, L_tier).
+        if growth_v19::graduation_allowed(0, 0) {
             g.ceil_x100
         } else {
             growth_v19::graduated_ceiling_x100(false, g.l_launch_x100, g.l_tier_x100, 0, 0)
@@ -40482,6 +41284,348 @@ pub mod processor {
         Ok(fee)
     }
 
+    // ══════════════════════════════════════════════════════════════════════
+    // v2.2 Phase 4 items 1 + 2 (design `phase4-design-2026-10-05.md`): the
+    // per-epoch price band and holding-fee rent at every accrual the wrapper
+    // builds. The ENGINE enforces both (band check, duration pin, rent bound)
+    // before any mutation; these helpers only make the wrapper feed exactly the
+    // inputs the engine will accept:
+    //   * `band_shape_price_view`: the capped staircase price, then the band
+    //     through the engine's single D-1 path (`band_rent::band_d1_pinned_step`:
+    //     edge clamp, or `P_last` once the epoch window elapsed);
+    //   * `rent_rates_view`: the per-side rent rate from the growth record's
+    //     `N_cap` snapshot and the users' OI (never caller input, spec §9.1);
+    //   * `band_rent_accrual_inputs_view`: price + funding + rent for one
+    //     single-segment accrual (a pinned accrual carries no funding / rent).
+    // ══════════════════════════════════════════════════════════════════════
+
+    /// The band-shaped price for an accrual of `asset_index` to `now_slot` from the capped
+    /// staircase price `capped_price`, and whether the epoch window has elapsed (the accrual
+    /// must then be no-move). Off-band or an empty book: `(capped_price, false)`.
+    #[inline(never)]
+    fn band_shape_price_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+        capped_price: u64,
+    ) -> Result<(u64, bool), ProgramError> {
+        if group.header.config.band_bps.get() == 0 {
+            return Ok((capped_price, false));
+        }
+        let asset = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        let current = asset.effective_price.get();
+        let segment_end = asset
+            .slot_last
+            .get()
+            .checked_add(asset_segment_dt_view(group, asset_index, now_slot)?)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        match group
+            .band_accrual_preview(asset_index, segment_end)
+            .map_err(map_v16_error)?
+        {
+            None => Ok((capped_price, false)),
+            Some((anchor, band_bps, governing_slot, max_epoch_slots)) => {
+                let pinned = percolator::band_rent::band_duration_pinned(
+                    segment_end,
+                    governing_slot,
+                    max_epoch_slots,
+                );
+                let (price, _) = percolator::band_rent::band_d1_pinned_step(
+                    current,
+                    capped_price,
+                    anchor,
+                    band_bps,
+                    pinned,
+                )
+                .map_err(|_| PercolatorError::PriceBandPinned)?;
+                Ok((price, pinned))
+            }
+        }
+    }
+
+    /// v2.2 item 2: the per-side holding-fee rent rate `(long, short)` in e9 of notional per
+    /// slot. 0 unless the engine config carries a rent ceiling, the asset's growth record is on
+    /// with a measured `N_cap` snapshot, and the asset has a bound vault LP. Users OI per side
+    /// excludes the vault LP's own leg (the N-1 definition, from the `lp_net_q` snapshot).
+    #[inline(never)]
+    fn rent_rates_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<(u64, u64), ProgramError> {
+        let rent_max = group.header.config.rent_max_e9_per_slot.get();
+        if rent_max == 0 {
+            return Ok((0, 0));
+        }
+        let Some(g) = asset_growth_view(group, asset_index)? else {
+            return Ok((0, 0));
+        };
+        let rec = read_asset_vault_lp_from_view(group, asset_index)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || g.rent_n_cap_q == 0 {
+            return Ok((0, 0));
+        }
+        let (oi_long, oi_short) = side_oi_snapshot_view(group, asset_index)?;
+        let n_cap = g.rent_n_cap_q as u128;
+        let users_long = growth_v19::users_side_oi_q(oi_long, rec.lp_net_q, true);
+        let users_short = growth_v19::users_side_oi_q(oi_short, rec.lp_net_q, false);
+        Ok((
+            growth_v19::rent_rate_e9_fail_closed(users_long, n_cap, g.rent_kink_bps, rent_max),
+            growth_v19::rent_rate_e9_fail_closed(users_short, n_cap, g.rent_kink_bps, rent_max),
+        ))
+    }
+
+    /// v2.2: the inputs of one single-segment accrual: `(price, funding, rent_long,
+    /// rent_short)`. A duration-pinned accrual is no-move: `P_last`, no funding, no rent
+    /// (the engine refuses anything else with `BandPinned`, Custom(104)).
+    #[inline(never)]
+    fn band_rent_accrual_inputs_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+        price: u64,
+        funding_rate_e9: i128,
+    ) -> Result<(u64, i128, u64, u64), ProgramError> {
+        let (price, pinned) = band_shape_price_view(group, asset_index, now_slot, price)?;
+        if pinned {
+            return Ok((price, 0, 0, 0));
+        }
+        let (rent_long, rent_short) = rent_rates_view(group, asset_index)?;
+        Ok((price, funding_rate_e9, rent_long, rent_short))
+    }
+
+    /// v2.2 band (re-review N-2): the asset's price can no longer move toward its target: the
+    /// band around `P_last` is narrower than `MIN_BAND_WIDTH_TICKS` (the engine refuses to
+    /// re-anchor there, `band_prepare_accrual`), or the cap law's per-accrual step at `P_last`
+    /// rounds to 0 ticks (spec §9.6's `max_delta == 0`).
+    pub(crate) fn band_floor_stuck_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        let band_bps = group.header.config.band_bps.get();
+        if band_bps == 0 {
+            return Ok(false);
+        }
+        let asset = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        let p_last = asset.effective_price.get();
+        // The cap law's own dead zone: `floor(P * cap * dt / 1e4) == 0` cannot move either.
+        let max_step = (p_last as u128)
+            .saturating_mul(group.header.config.max_price_move_bps_per_slot.get() as u128)
+            .saturating_mul(group.header.config.max_accrual_dt_slots.get() as u128)
+            / 10_000;
+        Ok(max_step == 0
+            || !percolator::band_rent::band_width_ok(p_last, band_bps)
+                .map_err(|_| PercolatorError::PriceBandConfigInvalid)?)
+    }
+
+    /// v2.2 band (design §1.1 "Closes during a pin", spec §9.7; widened by review E-L2):
+    /// while the asset's mark LAGS its target (`asset_price_lagged_view`: a pin, or plain
+    /// cap-law lag between a target move and the staircase catching up), a close may land at
+    /// `P_last` only if that price is the WORSE side for the closer (a long closing while the
+    /// target is above `P_last`, a short while it is below). The favourable-side close waits
+    /// for the staircase: it would otherwise be a free option against the LP at a stale mark.
+    /// Risk-increasing fills are already refused by the §9.7 lag gates. Band markets only (the
+    /// v2.1 off-band path is byte-for-byte unchanged). `position_before` is the account's
+    /// signed position, `delta` its signed change. Custom(104).
+    #[inline(never)]
+    fn reject_band_favourable_close_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        position_before: i128,
+        delta: i128,
+    ) -> ProgramResult {
+        if group.header.config.band_bps.get() == 0 {
+            return Ok(());
+        }
+        // Only the REDUCING part matters: a reduce, a close, or the closing part of a flip.
+        let after = position_before.saturating_add(delta);
+        let reduces = position_before != 0
+            && (after == 0
+                || (after > 0) != (position_before > 0)
+                || after.unsigned_abs() < position_before.unsigned_abs());
+        if !reduces || !asset_price_lagged_view(group, asset_index)? {
+            return Ok(());
+        }
+        // Re-review N-2: at the narrow-band floor the anchor can no longer advance, so the lag
+        // never resolves before BandPinExpired settles everyone at P_last anyway. Exits stay
+        // open at P_last (reduce-only: attaches are refused by the engine there) instead of
+        // trapping the favourable side until the forced resolution at the same price.
+        if band_floor_stuck_view(group, asset_index)? {
+            return Ok(());
+        }
+        let asset = &group.markets[asset_index].engine.asset;
+        let target = asset.raw_oracle_target_price.get();
+        let p_last = asset.effective_price.get();
+        // A long sells at P_last: favourable iff the true target is BELOW it. A short buys at
+        // P_last: favourable iff the target is ABOVE it.
+        let favourable = if position_before > 0 {
+            target < p_last
+        } else {
+            target > p_last
+        };
+        if favourable {
+            return Err(PercolatorError::PriceBandPinned.into());
+        }
+        Ok(())
+    }
+
+    /// v2.2 item 2: route `asset_index`'s unrouted rent from insurance to the bound vault LP
+    /// `lp` (the caller has the LP's portfolio in hand) and refresh the growth record's rent
+    /// `N_cap` snapshot from the LP's conservative equity. A no-op unless `lp_key` IS the
+    /// asset's bound vault LP. Returns the atoms routed.
+    #[inline(never)]
+    fn vault_lp_rent_route_and_snapshot_view(
+        group: &mut state::MarketViewMutV16<'_>,
+        lp: &mut percolator::PortfolioV16ViewMut<'_>,
+        lp_key: &Pubkey,
+        asset_index: usize,
+    ) -> Result<u128, ProgramError> {
+        // CU: a market without a rent ceiling has nothing to route and no rent rate to measure.
+        if group.header.config.rent_max_e9_per_slot.get() == 0
+            || asset_index >= group.header.config.max_market_slots.get() as usize
+        {
+            return Ok(0);
+        }
+        let rec = read_asset_vault_lp_from_view(group, asset_index)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0
+            || rec.vault_lp_portfolio != lp_key.to_bytes()
+        {
+            return Ok(0);
+        }
+        let routed = group
+            .route_rent_to_account_not_atomic(asset_index, lp)
+            .map_err(map_v16_error)?;
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let price = group.markets[asset_index].engine.asset.effective_price.get();
+        let c_m = vault_lp_v18::conservative_equity(
+            lp.header.capital.get(),
+            lp.header.pnl.get(),
+            lp.header.fee_credits.get(),
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let market = group
+            .markets
+            .get_mut(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        if let Some(mut g) = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? {
+            let n_cap = growth_v19::n_cap_q(c_m, g.lambda_bps, price, percolator::POS_SCALE)
+                .unwrap_or(0)
+                .min(percolator::MAX_POSITION_ABS_Q);
+            let n_cap = u64::try_from(n_cap).unwrap_or(u64::MAX);
+            if g.rent_n_cap_q != n_cap {
+                g.rent_n_cap_q = n_cap;
+                state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+            }
+        }
+        Ok(routed)
+    }
+
+    /// v2.2 item 2, tag 106 `SettleHoldingRent` (permissionless). Accounts: `[0] caller (s)`,
+    /// `[1] market (w)`, `[2] portfolio (w)`, `[3] vault_lp_portfolio (w)`, `[4..] oracle
+    /// accounts per the asset's profile`. Effect: the crank-equivalent accrual of the asset
+    /// (band-shaped, rent-bearing), a refresh of `portfolio` (settles its rent, certifies its
+    /// band epoch), and routing of the asset's unrouted rent to the bound vault LP. `[3]` must
+    /// be the asset's bound vault LP (`VaultLpNotBound` otherwise). `[2] == [3]` settles the
+    /// vault LP's own legs.
+    #[inline(never)]
+    fn handle_settle_holding_rent<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        now_slot: u64,
+    ) -> ProgramResult {
+        let caller = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let portfolio_ai = account(accounts, 2)?;
+        let vault_lp_ai = account(accounts, 3)?;
+        let oracle_accounts = accounts.get(4..).unwrap_or(&[]);
+        expect_signer(caller)?;
+        expect_writable(market_ai)?;
+        expect_writable(portfolio_ai)?;
+        expect_writable(vault_lp_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(portfolio_ai, program_id)?;
+        expect_owner(vault_lp_ai, program_id)?;
+        let (_, mode, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        if mode != MarketModeV16::Live {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let asset_index = asset_index as usize;
+        if asset_index >= max_market_slots {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(vault_lp_ai, max_market_slots)?;
+        let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        let rec = read_asset_vault_lp_from_view(&group, asset_index)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0
+            || rec.vault_lp_portfolio != vault_lp_ai.key.to_bytes()
+        {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        // 1. Crank-equivalent accrual (band-shaped, rent-bearing) to the authenticated slot.
+        let (_, obs) = adl_wind_down_refresh_asset_price_view(
+            &mut cfg,
+            &mut group,
+            asset_index,
+            authenticated_now_slot,
+            oracle_accounts,
+        )?;
+        // 2. Refresh the portfolio through the engine's permissionless Refresh (settles rent at
+        //    the K/F settlement entry, certifies the band epoch; lapsed source backing is
+        //    progress, as on the crank).
+        let refresh = |group: &mut state::MarketViewMutV16<'_>,
+                       pf: &mut percolator::PortfolioV16ViewMut<'_>|
+         -> ProgramResult {
+            group
+                .permissionless_crank_not_atomic(
+                    pf,
+                    percolator::PermissionlessCrankRequestV16 {
+                        now_slot: authenticated_now_slot,
+                        asset_index,
+                        effective_price: obs.effective_price,
+                        funding_rate_e9: obs.funding_rate_e9,
+                        action: percolator::PermissionlessCrankActionV16::Refresh,
+                    },
+                )
+                .map(|_| ())
+                .map_err(map_v16_error)
+        };
+        if portfolio_ai.key == vault_lp_ai.key {
+            let mut lp_data = vault_lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&lp, vault_lp_ai.key)?;
+            refresh(&mut group, &mut lp)?;
+            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?;
+        } else {
+            {
+                let mut pf_data = portfolio_ai.try_borrow_mut_data()?;
+                let mut pf =
+                    state::portfolio_view_mut_for_market_slots(&mut pf_data, max_market_slots)?;
+                expect_portfolio_view_account_key(&pf, portfolio_ai.key)?;
+                refresh(&mut group, &mut pf)?;
+            }
+            let mut lp_data = vault_lp_ai.try_borrow_mut_data()?;
+            let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+            expect_portfolio_view_account_key(&lp, vault_lp_ai.key)?;
+            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?;
+        }
+        group.validate_shape().map_err(map_v16_error)?;
+        state::write_wrapper_config(&mut market_data, &cfg)?;
+        Ok(())
+    }
+
     fn hybrid_effective_price_for_crank_view(
         cfg: &WrapperConfigV16,
         profile: &mut state::AssetOracleProfileV16,
@@ -40515,6 +41659,8 @@ pub mod processor {
                 asset_segment_dt_view(group, asset_index, now_slot)?,
                 exposed,
             );
+            // v2.2 band: the staircase price, then the band (edge / duration pin).
+            let (price, _) = band_shape_price_view(group, asset_index, now_slot, price)?;
             profile.oracle_target_price_e6 = target;
             // FIX (ADOPT upstream 01ec6161, adapted): a crank that reads the
             // authenticated EWMA/auth-mark target directly (no external oracle
@@ -40589,6 +41735,8 @@ pub mod processor {
             asset_segment_dt_view(group, asset_index, now_slot)?,
             exposed,
         );
+        // v2.2 band: the staircase price, then the band (edge / duration pin).
+        let (price, _) = band_shape_price_view(group, asset_index, now_slot, price)?;
         profile.oracle_target_price_e6 = target;
         // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
         // provenance", adapted): at the time this hunk was ported, our fork had no
@@ -41061,6 +42209,15 @@ pub mod processor {
         // P3: constant across the simulated path (the vault-LP snapshot does not move while
         // accruing), and the same value the permissionless crank path combines.
         let skew_e9 = vault_lp_skew_rate_e9_view(group, asset_index)?;
+        // v2.2 band: the gate the engine will validate this path against (post re-anchor).
+        // (CU: a band-off market skips the preview, which re-validates the engine config.)
+        let band = if group.header.config.band_bps.get() == 0 {
+            None
+        } else {
+            group
+                .band_path_preview(asset_index, now_slot)
+                .map_err(map_v16_error)?
+        };
         let mut steps = Vec::with_capacity(step_count as usize);
         for _ in 0..step_count {
             advance_funding_mark_checkpoint_view(&mut simulated_profile, simulated_slot);
@@ -41073,13 +42230,27 @@ pub mod processor {
                 old_target
             };
             let remainder_before = price_move_remainder;
-            let (next_price, remainder_after) = canonical_accrual_price_step_v16(
+            // v2.2: the engine's own band-aware canonical step (D-1 lives in the engine).
+            let band_ctx = band.map(|(anchor_price, band_bps, governing_slot, max_epoch_slots)| {
+                percolator::BandStepContextV16 {
+                    anchor_price,
+                    band_bps,
+                    duration_pinned: percolator::band_rent::band_duration_pinned(
+                        next_slot,
+                        governing_slot,
+                        max_epoch_slots,
+                    ),
+                }
+            });
+            let step_pinned = band_ctx.map(|c| c.duration_pinned).unwrap_or(false);
+            let (next_price, remainder_after) = percolator::canonical_band_accrual_price_step_v16(
                 effective_price,
                 step_target,
                 price_cap_anchor,
                 max_price_move_bps_per_slot,
                 exposed,
                 remainder_before,
+                band_ctx,
             )
             .map_err(map_v16_error)?;
             price_move_remainder = remainder_after;
@@ -41099,17 +42270,22 @@ pub mod processor {
                 simulated_profile.mark_ewma_e6 = next_price;
                 simulated_profile.mark_ewma_last_slot = next_slot;
             }
-            let funding_rate_e9 = funding_rate_from_checkpoint_view(
-                &simulated_profile,
-                max_abs_rate,
-                max_price_move_bps_per_slot,
-                exposed,
-                simulated_slot,
-                effective_price,
-                next_price,
-                1,
-                skew_e9,
-            )?;
+            // A duration-pinned step is no-move: no funding (I-B4).
+            let funding_rate_e9 = if step_pinned {
+                0
+            } else {
+                funding_rate_from_checkpoint_view(
+                    &simulated_profile,
+                    max_abs_rate,
+                    max_price_move_bps_per_slot,
+                    exposed,
+                    simulated_slot,
+                    effective_price,
+                    next_price,
+                    1,
+                    skew_e9,
+                )?
+            };
             steps.push(AccrualStepV16 {
                 effective_price: next_price,
                 funding_rate_e9,
@@ -41148,12 +42324,15 @@ pub mod processor {
     /// been advanced to reflect every step (checkpoint promotions, the
     /// price-move remainder carry) -- the caller still owes the matching
     /// engine-side commit via `accrue_asset_path_to_not_atomic`.
+    /// `(now_slot, target, canonical path, (rent_long_e9, rent_short_e9))`.
+    type ZeroMovePathV22 = (u64, u64, Vec<AccrualStepV16>, (u64, u64));
+
     #[inline(never)]
     fn zero_move_funding_path_for_profile_view(
         profile: &mut state::AssetOracleProfileV16,
         group: &mut state::MarketViewMutV16<'_>,
         asset_index: usize,
-    ) -> Result<Option<(u64, u64, Vec<AccrualStepV16>)>, V16Error> {
+    ) -> Result<Option<ZeroMovePathV22>, V16Error> {
         if !oracle_v16::profile_is_price_managed(profile)
             || asset_index >= group.header.config.max_market_slots.get() as usize
             || asset_index >= group.markets.len()
@@ -41180,18 +42359,21 @@ pub mod processor {
             asset.slot_last.get().saturating_add(1),
         )
         .map_err(|_| V16Error::InvalidConfig)?;
+        // v2.2 item 2: holding-fee rent is owed on a stationary interval exactly like funding,
+        // so a position opened and closed between two cranks pays it too.
+        let rents = rent_rates_view(group, asset_index).map_err(|_| V16Error::InvalidConfig)?;
         // This helper settles only the interval a normal crank would process without changing K.
         // Price-moving intervals stay on the ordinary observation-bearing crank route.
         if path.is_empty()
             || path
                 .iter()
                 .any(|step| step.effective_price != effective_price)
-            || path.iter().all(|step| step.funding_rate_e9 == 0)
+            || (path.iter().all(|step| step.funding_rate_e9 == 0) && rents == (0, 0))
         {
             return Ok(None);
         }
         *profile = simulated_profile;
-        Ok(Some((now_slot, target, path)))
+        Ok(Some((now_slot, target, path, rents)))
     }
 
     /// Whether a REDUCING position change (closing/decreasing) must be refused
@@ -41268,7 +42450,7 @@ pub mod processor {
         }
         let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
         advance_funding_mark_checkpoint_view(profile, asset_slot);
-        let Some((now_slot, target, path)) =
+        let Some((now_slot, target, path, (rent_long, rent_short))) =
             zero_move_funding_path_for_profile_view(profile, group, asset_index)?
         else {
             if require_full_catchup
@@ -41278,7 +42460,15 @@ pub mod processor {
             }
             return Ok(());
         };
-        group.accrue_asset_path_to_not_atomic(asset_index, now_slot, target, &path, true)?;
+        group.accrue_asset_path_with_rent_to_not_atomic(
+            asset_index,
+            now_slot,
+            target,
+            &path,
+            rent_long,
+            rent_short,
+            true,
+        )?;
         let asset_slot = group.markets[asset_index].engine.asset.slot_last.get();
         advance_funding_mark_checkpoint_view(profile, asset_slot);
         // One instruction never performs an attacker-sized catch-up loop. If more deterministic
@@ -42746,14 +43936,15 @@ pub mod processor {
         }
 
         #[test]
-        fn portfolio_account_len_is_9563_with_full_identity_trailer() {
+        fn portfolio_account_len_is_10091_with_full_identity_trailer() {
             let data = init_test_portfolio(7);
             assert_eq!(
                 data.len(),
                 constants::PORTFOLIO_ACCOUNT_LEN,
                 "the wrapper tail contains matcher config, portfolio ID, sequence, and expiry"
             );
-            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 9563);
+            // v2.2: engine legs +33 B each (band / rent snapshots) => 9563 + 528.
+            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 10091);
             assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
             assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);

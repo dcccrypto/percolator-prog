@@ -19,6 +19,9 @@
 //! Every test pairs with a NEGATIVE CONTROL: the identical sequence on the legacy market
 //! (growth OFF) is accepted where the growth market refuses. File-copy negative controls on
 //! the program (gate removed) are recorded in the PR.
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{
@@ -315,6 +318,12 @@ struct Env {
 
 impl Env {
     fn try_new_with(so: &PathBuf, cfg: MarketCfg) -> Result<Self, String> {
+        Self::try_new_with_layout(so, cfg, false)
+    }
+
+    /// `v21_layout`: size the market/portfolio accounts for the v2.1 (pre-band/rent) layout,
+    /// for running the deployed v2.1-layout program in the growth-off byte-parity test.
+    fn try_new_with_layout(so: &PathBuf, cfg: MarketCfg, v21_layout: bool) -> Result<Self, String> {
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         svm.add_program(program_id, &std::fs::read(so).expect("read wrapper BPF"));
@@ -353,7 +362,17 @@ impl Env {
         svm.set_account(
             market,
             acct(
-                vec![0u8; state::market_account_len_for_capacity(cfg.slots).unwrap()],
+                vec![
+                    0u8;
+                    {
+                        let len = state::market_account_len_for_capacity(cfg.slots).unwrap();
+                        if v21_layout {
+                            v21_upgrade::v21_market_len(len, cfg.slots)
+                        } else {
+                            len
+                        }
+                    }
+                ],
                 program_id,
             ),
         )
@@ -366,8 +385,14 @@ impl Env {
             mint,
             vault,
             matcher_program,
-            portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
-                .unwrap(),
+            portfolio_account_len: {
+                let len = state::portfolio_account_len_for_market_slots(cfg.slots).unwrap();
+                if v21_layout {
+                    v21_upgrade::v21_portfolio_len(len)
+                } else {
+                    len
+                }
+            },
             next_key: 0x40,
             bind_growth_lp: cfg.growth.is_some() && cfg.slots == 1,
             upgrade_authority: seeded_keypair(3),
@@ -530,8 +555,15 @@ impl Env {
         (k, p)
     }
 
+    /// Account bytes as THIS build reads them: a v2.1-layout account (the deployed base program
+    /// in the growth-off parity run) is re-encoded first, so the test's readers stay current.
+    fn read(&self, key: &Pubkey) -> Vec<u8> {
+        let account = self.svm.get_account(key).unwrap();
+        v21_upgrade::upgrade_v21_account(&self.program_id, &account.owner, account.data)
+    }
+
     fn identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
-        let data = self.svm.get_account(&portfolio).unwrap().data;
+        let data = self.read(&portfolio);
         (
             state::read_portfolio_id(&data).unwrap(),
             state::read_portfolio_matcher_sequence(&data).unwrap(),
@@ -540,7 +572,7 @@ impl Env {
     }
 
     fn market_id(&self) -> u64 {
-        state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, 0)
+        state::read_market_trade_preflight(&self.read(&self.market), 0)
             .unwrap()
             .3
     }
@@ -585,7 +617,7 @@ impl Env {
             .unwrap();
         let (portfolio_id, expected_sequence, _) = self.identity(account);
         let asset_generation_frontier = state::read_market_asset_generation_frontier(
-            &self.svm.get_account(&self.market).unwrap().data,
+            &self.read(&self.market),
         )
         .unwrap();
         let m = self.market;
@@ -1498,20 +1530,25 @@ const PARITY_FIXTURE: &str = "tests/fixtures/growth_legacy_parity_v21.txt";
 
 /// Account bytes with the appended K/F drift tail removed from every engine asset slot.
 fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
+    // `data` is the v2.1 projection (`project_v22_account_to_v21`) of this build's account:
+    // v2.1 layout plus the #277 160 B tail on every slot.
     use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
-    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
+        - v21_upgrade::V22_ASSET_EXTRA
+        - LEGACY_ENGINE_SLOT_LEN;
     if !is_market || appended == 0 {
         return (data.to_vec(), false);
     }
-    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
-    assert_eq!((data.len() - head) % MARKET_ASSET_SLOT_LEN, 0);
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_CONFIG_EXTRA;
+    let stride = MARKET_ASSET_SLOT_LEN - v21_upgrade::V22_ASSET_EXTRA;
+    assert_eq!((data.len() - head) % stride, 0);
     let mut out = data[..head].to_vec();
     let mut tail_nonzero = false;
-    for k in 0..(data.len() - head) / MARKET_ASSET_SLOT_LEN {
-        let s = head + k * MARKET_ASSET_SLOT_LEN;
-        let cut = s + MARKET_ASSET_SLOT_LEN - appended;
+    for k in 0..(data.len() - head) / stride {
+        let s = head + k * stride;
+        let cut = s + stride - appended;
         out.extend_from_slice(&data[s..cut]);
-        tail_nonzero |= data[cut..s + MARKET_ASSET_SLOT_LEN].iter().any(|b| *b != 0);
+        tail_nonzero |= data[cut..s + stride].iter().any(|b| *b != 0);
     }
     (out, tail_nonzero)
 }
@@ -1567,7 +1604,9 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
                     raw[at] = 0;
                 }
             }
-            let (bytes, tail) = strip_drift_tail(&raw, n == "market");
+            // v2.2 Wave B words must stay zero on this band-off, rent-off market (asserted by the
+            // projection); the result is the v2.1 layout + the #277 tail, exactly what c493bbc0 wrote.
+            let (bytes, tail) = strip_drift_tail(&v21_upgrade::project_v22_account_to_v21(&raw), n == "market");
             tail_seen |= tail;
             out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
         }
@@ -1649,7 +1688,9 @@ fn growth_off_is_byte_for_byte_legacy() {
     assert_eq!(zero_stale, 0, "zero-cohort case never goes stale");
     assert!(!zero_tail, "zero-cohort case leaves the drift tail zero");
     assert!(cohort_stale > 0, "cohort case really leaves stale positions");
-    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
+        - v21_upgrade::V22_ASSET_EXTRA
+        - LEGACY_ENGINE_SLOT_LEN;
     assert_eq!(appended, 160);
     assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
     eprintln!("legacy parity: {} lines identical to c493bbc0 (zero + live cohort)", lines.len());
