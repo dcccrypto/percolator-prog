@@ -44,6 +44,10 @@ pub mod vault_lp_v18;
 /// `~/percolator-ops/ledger/devnet-v2-growth-plan-2026-10-04.md` §2.1-2.2.
 pub mod growth_v19;
 
+/// v2.2 Phase 4 Wave A (2026-10-05): pure rules for lot pricing (item 7) and the R3-M1 exit
+/// fix (item 8). See `~/percolator-ops/ledger/phase4-design-2026-10-05.md`.
+pub mod wave_a_v22;
+
 /// Phase 4 items 5 + 6 (2026-10-05): pure math for the rescue tranche (L-RES), the insurance
 /// unit ledger and the G9 insurance backstop. See
 /// `~/percolator-ops/ledger/phase4-design-2026-10-05.md` items 5 and 6.
@@ -643,6 +647,16 @@ pub mod constants {
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG2: u8 = 1 << 0;
     pub const ORACLE_LEG_FLAG_DIVIDE_LEG3: u8 = 1 << 1;
     pub const ORACLE_LEG_FLAGS_MASK: u8 = ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3;
+    // ── v2.2 Phase 4 Wave A constants `src/wave_a_v22.rs` needs (byte-identical to
+    // feat/v22-wave-a @ c7dd10df; Wave D carries that module verbatim for W-3 / W-6). ──────
+    /// Item 7: the largest lot exponent (a lot of 10^15 tokens).
+    pub const LOT_EXP_MAX: u8 = 15;
+    /// Item 7 precision floor: a growth market's initial (per-lot) mark must be at least
+    /// $10 = 10^7 e6, so a 99.9% fall still leaves a mark of 10^4 and a 1 bps tick (the
+    /// spec §1.7 per-slot cap `floor(P·cap·dt/10^4)` stays >= 1 for every cap >= 1 bps).
+    pub const LOT_PRICE_FLOOR_E6: u64 = 10_000_000;
+    /// Security review A6 (Wave A): weight of a refreshed portfolio in the inline-refresh budget.
+    pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
     pub const MAX_DYNAMIC_TRADE_FEE_BPS: u64 = 10_000;
@@ -6442,8 +6456,17 @@ pub mod state {
         /// percolator-stake v5 forwards `creator_paid_to_stake_atoms - forwarded` to the pool
         /// admin (the creator). Never decreases.
         pub creator_paid_to_stake_atoms: u128, // 144..160
+        /// W-2 (security review): slot of the pending G9 proposal (tag 111 mode 2); 0 = none.
+        /// The draw (mode 0) executes no earlier than `G9_DELAY_SLOTS` after it.
+        pub g9_pending_slot: u64, // 160..168
+        /// W-2: the G9 epoch (`slot / G9_EPOCH_SLOTS`) the counter below belongs to.
+        pub g9_epoch: u64, // 168..176
+        /// W-2: atoms G9 lent in `g9_epoch` (per-epoch cap `G9_EPOCH_CAP_BPS`).
+        pub g9_epoch_drawn_atoms: u128, // 176..192
     }
-    const _: () = assert!(core::mem::size_of::<InsuranceUnitsV20>() == 160);
+    const _: () = assert!(core::mem::size_of::<InsuranceUnitsV20>() == 192);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, g9_pending_slot) == 160);
+    const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, g9_epoch_drawn_atoms) == 176);
     const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, creator_paid_to_stake_atoms) == 144);
     const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, units_total) == 32);
     const _: () = assert!(core::mem::offset_of!(InsuranceUnitsV20, units_stake) == 48);
@@ -6597,7 +6620,8 @@ pub mod state {
         pub pending_out_even_atoms: u128, // 0..16
         /// Same for the ODD (short) domain pot.
         pub pending_out_odd_atoms: u128, // 16..32
-        /// Mirror of `VaultLpStateV18::senior_draw_outstanding_atoms` (fill-time halt).
+        /// Mirror of `VaultLpStateV18::senior_draw_outstanding_atoms + backstop_outstanding_atoms`
+        /// (fill-time halt; W-9: the G9 backstop halts risk-increasing fills too).
         pub outstanding_mirror_atoms: u128, // 32..48
         /// Unbooked atoms moved from the pots into the vault LP (junior cover included).
         pub pending_moved_atoms: u128, // 48..64
@@ -7985,12 +8009,15 @@ pub mod ix {
         /// up to `amount` (clamped to the alpha / buffer limit) of Earn principal from the vault's
         /// pots into the bound vault LP's engine capital. The inverse of tag 98; no SPL moves.
         VaultLpAllocate { amount: u128 },
-        /// Tag 111, PERMISSIONLESS (Phase 4 item 6 G9). `mode` 0 = DRAW: once the vault LP's
-        /// certified deficit can no longer be funded by the junior or any senior pot, move
-        /// `min(deficit, I_free, cap room, max_amount if nonzero)` of asset-0 insurance into its
-        /// capital and book it as `backstop_outstanding`. `mode` 1 = RESTORE: repay
-        /// `min(outstanding, LP equity, max_amount if nonzero)` from the vault LP's capital back
-        /// into asset-0 insurance (repaid FIRST, before seniors are restored).
+        /// Tag 111, PERMISSIONLESS (Phase 4 item 6 G9). Two-step (W-2): `mode` 2 = PROPOSE records
+        /// the slot once the vault LP's certified deficit can no longer be funded by the junior or
+        /// any senior pot (and the vault has Earn seniors with a booked, outstanding draw);
+        /// `mode` 0 = DRAW, only in `[proposal + G9_DELAY_SLOTS, + G9_EXEC_WINDOW_SLOTS)`, moves
+        /// `min(deficit, I_free, 50% cap room, 20%-per-epoch room, max_amount if nonzero)` of
+        /// asset-0 insurance into its capital and books it as `backstop_outstanding`. `mode` 1 =
+        /// RESTORE: repay `min(outstanding, LP capital, equity - IM, max_amount if nonzero)` from
+        /// the vault LP's capital (flat or positioned, W-4) back into asset-0 insurance (repaid
+        /// FIRST, before seniors are restored).
         InsuranceBackstopDraw { mode: u8, max_amount: u128 },
         /// Tag 112 (Phase 4 item 5). The rescuer buys senior shares at the certified IMPAIRED
         /// value, never par. `tranche` 0 = senior (the only tranche on this branch; 1 = bond,
@@ -23168,11 +23195,17 @@ pub mod processor {
         // activated (appended or reused).
         if is_activation {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_c, group) = state::market_view_mut(&mut market_data)?;
+            let (act_cfg, group) = state::market_view_mut(&mut market_data)?;
             if let Some(bound) = market_bound_vault_asset(&group)? {
                 if bound != asset_index {
                     return Err(PercolatorError::VaultLpMultiAssetMarket.into());
                 }
+            }
+            // W-10 (security review 2026-10-05): the insurance units cover asset 0 only, while
+            // the terminal payout (41) sums every domain of the payee; a unitised market stays
+            // single-asset so the two readings cannot diverge.
+            if asset_index != 0 && ins_units_required_view(&group, &act_cfg)? {
+                return Err(PercolatorError::InsuranceBackstopRefused.into());
             }
         }
         // Same funding warning as InitMarket: activating an asset is creating a
@@ -29367,6 +29400,14 @@ pub mod processor {
         state::asset_vault_lp_draw_from_wrapper_bytes(&market.wrapper[..])
     }
 
+    /// W-9 (security review 2026-10-05): the fill-time halt mirror is the senior draw outstanding
+    /// PLUS the G9 backstop outstanding, so a vault LP refilled from lent insurance (a junior-only
+    /// vault has no senior outstanding) may only reduce until the backstop is repaid.
+    fn vault_lp_halt_mirror(st: &state::VaultLpStateV18) -> u128 {
+        st.senior_draw_outstanding_atoms
+            .saturating_add(st.backstop_outstanding_atoms as u128)
+    }
+
     #[inline(never)]
     fn write_vault_lp_draw_to_view(
         group: &mut state::MarketViewMutV16<'_>,
@@ -29988,8 +30029,8 @@ pub mod processor {
             let restored = vault_lp_restore_seniors_first(
                 group, cfg, market_key, registry_pda, registry, st, own_ledger, sib_ledger, lp_value,
             )?;
-            if restored || rec.outstanding_mirror_atoms != st.senior_draw_outstanding_atoms {
-                rec.outstanding_mirror_atoms = st.senior_draw_outstanding_atoms;
+            if restored || rec.outstanding_mirror_atoms != vault_lp_halt_mirror(st) {
+                rec.outstanding_mirror_atoms = vault_lp_halt_mirror(st);
                 write_vault_lp_draw_to_view(group, a, &rec)?;
             }
             return Ok(restored);
@@ -30070,7 +30111,7 @@ pub mod processor {
         rec.pending_out_even_atoms = 0;
         rec.pending_out_odd_atoms = 0;
         rec.pending_moved_atoms = 0;
-        rec.outstanding_mirror_atoms = st.senior_draw_outstanding_atoms;
+        rec.outstanding_mirror_atoms = vault_lp_halt_mirror(st);
         write_vault_lp_draw_to_view(group, a, &rec)?;
         let _ = lp_value;
         solana_program::log::sol_log(&alloc::format!(
@@ -30165,7 +30206,7 @@ pub mod processor {
             || rec.pending_out_odd_atoms != 0;
         let needs_book = has_pending
             || st.senior_draw_outstanding_atoms != 0
-            || rec.outstanding_mirror_atoms != st.senior_draw_outstanding_atoms;
+            || rec.outstanding_mirror_atoms != vault_lp_halt_mirror(st);
         if !needs_book {
             return Ok(false);
         }
@@ -30230,7 +30271,7 @@ pub mod processor {
         };
         group.validate_shape().map_err(map_v16_error)?;
         drop(market_data);
-        if booked || st.senior_draw_outstanding_atoms != rec.outstanding_mirror_atoms {
+        if booked || vault_lp_halt_mirror(st) != rec.outstanding_mirror_atoms {
             state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, st)?;
         }
         // Phase 2b Q2: a booking cuts C by less than nav, a recovery raises C: refresh the floor.
@@ -32935,6 +32976,17 @@ pub mod processor {
         }
         let minted = crate::p4_rescue_ins::ins_units_for_topup(x, u.units_total, mint_reading)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // W-1 / S-1 (security review 2026-10-05): never accept a top-up that mints nothing or
+        // loses more than 1 bp (+1 atom) of `x` to rounding, and never a genesis below
+        // `INS_UNITS_GENESIS_MIN_ATOMS`: a dust `U` grown by fees can no longer turn a staker's
+        // (or anyone's) top-up into a donation to the incumbents.
+        if !crate::p4_rescue_ins::ins_mint_admissible(x, minted, u.units_total, mint_reading) {
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_ins_units_mint_refused x={} minted={} U={} I_mint={}",
+                x, minted, u.units_total, mint_reading
+            ));
+            return Err(PercolatorError::InsuranceBackstopRefused.into());
+        }
         u.units_total = u
             .units_total
             .checked_add(minted)
@@ -33160,7 +33212,17 @@ pub mod processor {
             if group.header.mode != 0 {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // W-10: units only on a single-asset market (the activation path refuses a second
+            // asset once the flag is set).
+            if group.header.config.max_market_slots.get() != 1 {
+                return Err(PercolatorError::InsuranceBackstopRefused.into());
+            }
             let (mint, _) = ins_units_readings_view(&group, 0)?;
+            // W-1: no dust genesis. Either an empty fund (the first top-up is then the genesis
+            // and must itself be >= the minimum) or at least `INS_UNITS_GENESIS_MIN_ATOMS`.
+            if mint != 0 && mint < crate::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS {
+                return Err(PercolatorError::InsuranceBackstopRefused.into());
+            }
             let mut u = state::InsuranceUnitsV20 {
                 market_group: market_ai.key.to_bytes(),
                 units_total: mint,
@@ -33195,16 +33257,23 @@ pub mod processor {
     /// vault_lp_state (w) · `[4]` vault LP portfolio (w) · `[5]` own ledger (w) · `[6]` sibling
     /// ledger (w) · `[7..]` `InsuranceUnitsV20` (w; REQUIRED on a units market).
     ///
-    /// DRAW (`mode` 0). Runs the senior draw and books it first (junior, then every senior pot).
+    /// PROPOSE (`mode` 2) / DRAW (`mode` 0), W-2 (security review 2026-10-05). Both run the
+    /// senior draw and book it first (junior, then every senior pot) and both require the vault
+    /// to be ELIGIBLE (`g9_vault_eligible`: Earn seniors exist and carry a booked, outstanding
+    /// draw) and G9 to be DUE. PROPOSE records the slot (refused while a proposal is open, so the
+    /// window cannot be restarted); DRAW executes only in `[proposal + G9_DELAY_SLOTS,
+    /// + G9_EXEC_WINDOW_SLOTS)` (the stakers' exit window), consumes the proposal, and is also
+    /// capped per epoch (`G9_EPOCH_CAP_BPS` of `I + outstanding` per `G9_EPOCH_SLOTS`).
     /// Only if a certified deficit is LEFT with no drawable pot backing and nothing pending
-    /// (`p4_rescue_ins::backstop_due`) does it move `backstop_draw_amount` of asset-0 insurance
+    /// (`p4_rescue_ins::backstop_due`) does DRAW move `backstop_draw_amount` of asset-0 insurance
     /// into the vault LP's capital: the asset-0 budgets are debited (vault out) and the LP is
     /// credited (vault in), so `header.vault` nets to zero and no SPL moves. Every insurance unit
     /// loses pro rata (I falls, U unchanged); the receivable is booked on both ledgers.
     ///
-    /// RESTORE (`mode` 1). Repays `min(outstanding, certified equity, max_amount)` from the vault
-    /// LP's capital (flat-only engine withdraw, after the maintenance fee, A4-checked) back into
-    /// asset-0 insurance. Repayment never moves a senior's or the junior's value: both price on
+    /// RESTORE (`mode` 1). Repays `min(outstanding, capital, certified equity - IM, max_amount)`
+    /// from the vault LP's capital (W-4: the engine's capital-to-insurance charge, which works on
+    /// a POSITIONED LP and refuses to cut equity below IM; after the maintenance fee, A4-checked)
+    /// back into asset-0 insurance. Repayment never moves a senior's or the junior's value: both price on
     /// the vault value NET of the receivable, so `V - b` is unchanged by it.
     #[inline(never)]
     fn handle_insurance_backstop_draw<'a>(
@@ -33229,7 +33298,7 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         expect_owner(registry_ai, program_id)?;
         expect_owner(lp_ai, program_id)?;
-        if mode > 1 {
+        if mode > 2 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let mut st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
@@ -33302,7 +33371,20 @@ pub mod processor {
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_slots)?;
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
             let outstanding = st.backstop_outstanding_atoms as u128;
-            let moved = if mode == 0 {
+            let moved = if mode == 0 || mode == 2 {
+                // W-2: only a vault WITH Earn seniors whose seniors carry a booked, still
+                // outstanding draw. A junior-only vault (`senior_nav == 0` vacuously) never
+                // qualifies, so G9 cannot fund a self-dealing winner straight from insurance.
+                if !crate::p4_rescue_ins::g9_vault_eligible(
+                    registry.total_lp_shares_outstanding,
+                    st.senior_draw_outstanding_atoms,
+                ) {
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_ineligible senior_shares={} senior_draw_outstanding={}",
+                        registry.total_lp_shares_outstanding, st.senior_draw_outstanding_atoms
+                    ));
+                    return Err(PercolatorError::InsuranceBackstopRefused.into());
+                }
                 // A CURRENT certificate (the draw above refreshed the LP) or a flat LP.
                 let deficit = vault_lp_undrawn_deficit_ro(&group, lp.header)?;
                 let reg = registry_pda.to_bytes();
@@ -33329,42 +33411,91 @@ pub mod processor {
                     ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
-                let gross = market_insurance_remaining_view(&group, 0)?;
-                let free = market_insurance_withdraw_capacity_view(&group, 0)?.min(gross);
-                let mut amt = crate::p4_rescue_ins::backstop_draw_amount(
-                    deficit,
-                    free,
-                    gross,
-                    outstanding,
-                    crate::p4_rescue_ins::BACKSTOP_CAP_BPS,
-                );
-                if max_amount != 0 {
-                    amt = amt.min(max_amount);
-                }
-                if amt == 0 {
-                    return Err(PercolatorError::InsuranceBackstopRefused.into());
-                }
-                // Asset-0 budgets out (vault -amt), vault LP capital in (vault +amt).
-                debit_market_insurance_budget_view(&mut group, 0, amt)?;
-                group.deposit_not_atomic(&mut lp, amt).map_err(map_v16_error)?;
-                // Settle the refilled capital against the LP's loss, then re-label the settled
-                // loss into the winners' pots exactly as the senior draw does.
-                group.full_account_refresh_not_atomic(&mut lp).map_err(map_v16_error)?;
-                if vault_lp_relabel_residual_to_claims(&mut group)? != 0 {
+                // W-2: two-step. PROPOSE (mode 2) records the slot; DRAW (mode 0) executes only
+                // in `[pending + G9_DELAY_SLOTS, + G9_EXEC_WINDOW_SLOTS)`: the stakers' exit
+                // window before their insurance is lent. Fail closed without a Clock.
+                let now = Clock::get()?.slot.max(1);
+                let u = &mut units_state
+                    .as_mut()
+                    .ok_or(PercolatorError::InsuranceBackstopRefused)?
+                    .1;
+                if mode == 2 {
+                    if crate::p4_rescue_ins::g9_proposal_open(u.g9_pending_slot, now) {
+                        return Err(PercolatorError::InsuranceBackstopRefused.into());
+                    }
+                    u.g9_pending_slot = now;
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_proposed slot={} deficit={} executable_from={}",
+                        now,
+                        deficit,
+                        now.saturating_add(crate::p4_rescue_ins::G9_DELAY_SLOTS)
+                    ));
+                    0
+                } else {
+                    if !crate::p4_rescue_ins::g9_delay_elapsed(u.g9_pending_slot, now) {
+                        solana_program::log::sol_log(&alloc::format!(
+                            "p4_backstop_not_executable pending={} now={}",
+                            u.g9_pending_slot, now
+                        ));
+                        return Err(PercolatorError::InsuranceBackstopRefused.into());
+                    }
+                    let gross = market_insurance_remaining_view(&group, 0)?;
+                    let free = market_insurance_withdraw_capacity_view(&group, 0)?.min(gross);
+                    let mut amt = crate::p4_rescue_ins::backstop_draw_amount(
+                        deficit,
+                        free,
+                        gross,
+                        outstanding,
+                        crate::p4_rescue_ins::BACKSTOP_CAP_BPS,
+                    );
+                    // W-2 (c): per-epoch cap on top of the cumulative one.
+                    let epoch = now / crate::p4_rescue_ins::G9_EPOCH_SLOTS;
+                    if u.g9_epoch != epoch {
+                        u.g9_epoch = epoch;
+                        u.g9_epoch_drawn_atoms = 0;
+                    }
+                    amt = amt.min(crate::p4_rescue_ins::g9_epoch_room(
+                        gross.saturating_add(outstanding),
+                        u.g9_epoch_drawn_atoms,
+                        crate::p4_rescue_ins::G9_EPOCH_CAP_BPS,
+                    ));
+                    if max_amount != 0 {
+                        amt = amt.min(max_amount);
+                    }
+                    if amt == 0 {
+                        return Err(PercolatorError::InsuranceBackstopRefused.into());
+                    }
+                    u.g9_pending_slot = 0;
+                    u.g9_epoch_drawn_atoms = u
+                        .g9_epoch_drawn_atoms
+                        .checked_add(amt)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    // Asset-0 budgets out (vault -amt), vault LP capital in (vault +amt).
+                    debit_market_insurance_budget_view(&mut group, 0, amt)?;
+                    group.deposit_not_atomic(&mut lp, amt).map_err(map_v16_error)?;
+                    // Settle the refilled capital against the LP's loss, then re-label the settled
+                    // loss into the winners' pots exactly as the senior draw does.
                     group.full_account_refresh_not_atomic(&mut lp).map_err(map_v16_error)?;
+                    if vault_lp_relabel_residual_to_claims(&mut group)? != 0 {
+                        group.full_account_refresh_not_atomic(&mut lp).map_err(map_v16_error)?;
+                    }
+                    let next = outstanding
+                        .checked_add(amt)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    st.backstop_outstanding_atoms =
+                        u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_draw deficit={} moved={} outstanding={} I_gross={} I_free={}",
+                        deficit, amt, next, gross, free
+                    ));
+                    amt
                 }
-                let next = outstanding
-                    .checked_add(amt)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                st.backstop_outstanding_atoms =
-                    u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
-                solana_program::log::sol_log(&alloc::format!(
-                    "p4_backstop_draw deficit={} moved={} outstanding={} I_gross={} I_free={}",
-                    deficit, amt, next, gross, free
-                ));
-                amt
             } else {
                 if outstanding == 0 || pending != 0 {
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_restore_refused outstanding={} pending={}",
+                        outstanding, pending
+                    ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
                 // The maintenance fee is senior to the repayment (as for recall 98).
@@ -33377,19 +33508,41 @@ pub mod processor {
                 } else {
                     0
                 };
-                // Only CAPITAL can leave the account (the flat-only engine withdraw); positive PnL
-                // is converted first by the permissionless tag 100 (keeper: 100 then 111 mode 1).
-                let free = equity.min(lp.header.capital.get());
+                // W-4: repay from the vault LP's FREE capital whether or not it is flat: the
+                // engine's capital-to-insurance charge (`charge_account_backing_fee_not_atomic`,
+                // insurance leg only) debits capital and credits the asset-0 domain budgets with
+                // `header.vault` unchanged, and refuses (LockActive) any debit that would leave
+                // certified equity below the INITIAL margin requirement. So a positioned LP repays
+                // its surplus over IM in Live; it is no longer repayable only when flat. Positive
+                // PnL counts only once converted (tag 100; the engine refuses Live conversion
+                // while source-claim exposure is open), so free = min(capital, equity - IM).
+                let free = equity
+                    .saturating_sub(cert.certified_initial_req)
+                    .min(lp.header.capital.get());
                 let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, free, max_amount);
                 if amt == 0 {
+                    solana_program::log::sol_log(&alloc::format!(
+                        "p4_backstop_restore_nothing equity={} im={} capital={}",
+                        equity,
+                        cert.certified_initial_req,
+                        lp.header.capital.get()
+                    ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
                 let c_m_before = p2b_c_m(&lp)?;
-                // Flat-only, equity-checked engine withdraw (vault -amt), then asset-0 insurance
-                // in (vault +amt): `header.vault` nets to zero.
-                group.withdraw_not_atomic(&mut lp, amt).map_err(map_v16_error)?;
+                // Capital -> asset-0 insurance (long half, short remainder, as
+                // `deposit_market_zero_insurance_view`); `header.vault` is unchanged.
+                let long_amount = amt / 2;
+                let short_amount = amt - long_amount;
+                if long_amount != 0 {
+                    group
+                        .charge_account_backing_fee_not_atomic(&mut lp, 0, 0, 0, long_amount)
+                        .map_err(map_v16_error)?;
+                }
+                group
+                    .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
+                    .map_err(map_v16_error)?;
                 p2b_a4_capacity_check(&group, &lp, 0, c_m_before)?;
-                deposit_market_zero_insurance_view(&mut group, amt)?;
                 let next = outstanding - amt;
                 st.backstop_outstanding_atoms =
                     u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
@@ -33399,6 +33552,12 @@ pub mod processor {
                 ));
                 amt
             };
+            // W-9: keep the fill-time halt mirror in step with the backstop.
+            let mut rec = read_vault_lp_draw_from_view(&group, 0)?;
+            if rec.outstanding_mirror_atoms != vault_lp_halt_mirror(&st) {
+                rec.outstanding_mirror_atoms = vault_lp_halt_mirror(&st);
+                write_vault_lp_draw_to_view(&mut group, 0, &rec)?;
+            }
             group.validate_shape().map_err(map_v16_error)?;
             if let Some((ai, u)) = units_state.as_mut() {
                 u.backstop_receivable_atoms = st.backstop_outstanding_atoms as u128;
@@ -33415,10 +33574,74 @@ pub mod processor {
     // Phase 4 Wave D, item 5: rescue / recapitalisation of an impaired vault (tag 112).
     // ════════════════════════════════════════════════════════════════════════════════════
 
+    /// W-6 (security review 2026-10-05): the non-bound rescue uses Wave A's `loss_current()`
+    /// (stale cohorts, domain loss barriers, pending socialized-loss obligations, pending B-index
+    /// settlement), built exactly as Wave A's tag-77 gate builds its `LossCounters`.
+    fn rescue_nonbound_loss_current_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        let slot = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine;
+        let counters = crate::wave_a_v22::LossCounters {
+            stale_long: slot.asset.stale_account_count_long.get(),
+            stale_short: slot.asset.stale_account_count_short.get(),
+            barrier_long: slot.pending_domain_loss_barrier_long.get(),
+            barrier_short: slot.pending_domain_loss_barrier_short.get(),
+            obligation_long: slot.asset.pending_obligation_count_long.get(),
+            obligation_short: slot.asset.pending_obligation_count_short.get(),
+            b_stale_accounts: group.header.b_stale_account_count.get(),
+        };
+        Ok(crate::wave_a_v22::loss_current(&counters))
+    }
+
+    /// W-3 (security review 2026-10-05): the cross-pot netting `m` of a non-bound vault, READ
+    /// ONLY. E3 caps each pot at its own principal, so a surplus in one pot is not netted
+    /// against the other's deficit (Wave A finding A3); `E3 + m = min(ΣP, Σphys)` is the
+    /// combined-pot reading Wave A's exit uses (`wave_a_v22::cross_pot_netting`, the same
+    /// inputs as its `nonbound_exit_cross_pot_netting`). Unlike an exit, a rescue must price on
+    /// the HIGHER reading (the rescuer pays), so the netting is applied whatever the buckets'
+    /// freshness: it is a reading, nothing moves.
+    #[inline(never)]
+    fn rescue_cross_pot_netting_ro(
+        group: &state::MarketViewMutV16<'_>,
+        market_key: [u8; 32],
+        registry_pda: [u8; 32],
+        domain: u16,
+        own_ledger: &[u8],
+        sib_ledger: &[u8],
+    ) -> Result<u128, ProgramError> {
+        let sib_domain = sibling_domain(domain);
+        let (s_own, b_own) = backing_domain_parts_view(group, domain as usize)?;
+        let (s_sib, b_sib) = backing_domain_parts_view(group, sib_domain as usize)?;
+        let (mut l_own, _) =
+            read_or_new_backing_domain_ledger(own_ledger, market_key, registry_pda, domain, &b_own)?;
+        let (mut l_sib, _) = read_or_new_backing_domain_ledger(
+            sib_ledger,
+            market_key,
+            registry_pda,
+            sib_domain,
+            &b_sib,
+        )?;
+        sync_backing_domain_ledger(&mut l_own, &b_own)?;
+        sync_backing_domain_ledger(&mut l_sib, &b_sib)?;
+        Ok(crate::wave_a_v22::cross_pot_netting(
+            l_own.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_own, &b_own),
+            l_sib.total_principal_atoms,
+            nonbound_pot_physical_parts(&s_sib, &b_sib),
+        )
+        .0)
+    }
+
     /// Item 5 rescue readings `(V, v, par)` of the vault's senior shares (no mutation):
     /// * bound: `V`/`v` from `p4_rescue_ins::rescue_bound_readings` (the price BETTER for the vault
     ///   LP, net of the backstop; CURRENT certificate required, else 85), `par = C`;
-    /// * non-bound: `V = v = ` the E3 EXIT NAV (tag 77's reading), `par = ` the ENTRY (par) NAV.
+    /// * non-bound: `V = v = ` the E3 EXIT NAV (tag 77's reading) PLUS the cross-pot netting
+    ///   (W-3: the combined-pot reading `min(ΣP, Σphys)`), `par = ` the ENTRY (par) NAV.
     #[allow(clippy::too_many_arguments)]
     #[inline(never)]
     fn rescue_readings(
@@ -33471,6 +33694,17 @@ pub mod processor {
                     own_ledger,
                     sib_ledger,
                 )?;
+                // W-3: price AND admit on the combined-pot reading `min(ΣP, Σphys)`, never on
+                // the per-pot E3 wedge (a hedged pair could otherwise fake an impairment).
+                let m = rescue_cross_pot_netting_ro(
+                    group,
+                    market_key,
+                    registry_pda,
+                    registry.domain,
+                    own_ledger,
+                    sib_ledger,
+                )?;
+                let v = v.checked_add(m).ok_or(PercolatorError::EngineArithmeticOverflow)?;
                 Ok((v, v, par))
             }
         }
@@ -33759,11 +33993,13 @@ pub mod processor {
                 {
                     return Err(PercolatorError::RescueRefused.into());
                 }
-            } else if asset_local_loss_stale_view(&group, asset_index)
+            } else if !rescue_nonbound_loss_current_view(&group, asset_index)?
+                || asset_local_loss_stale_view(&group, asset_index)
                 || asset_local_open_kf_cohort_view(&group, asset_index)
                 || asset_has_exposed_target_effective_lag_view(&group, asset_index)?
             {
-                // Non-bound source asset must be loss-current: E3 is then exact.
+                // Non-bound source asset must be loss-current: E3 is then exact per pot (the
+                // combined reading below closes the cross-pot wedge).
                 return Err(PercolatorError::RescueRefused.into());
             }
             let ledger_data = ledger_ai.try_borrow_data()?;

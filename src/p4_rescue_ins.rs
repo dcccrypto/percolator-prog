@@ -89,6 +89,34 @@ pub fn ins_units_value(units: u128, units_total: u128, insurance: u128) -> Optio
     mul_div_floor(units, insurance, units_total)
 }
 
+/// W-1 (security review 2026-10-05): the smallest genesis of the unit ledger (1 token at 6
+/// decimals). A dust genesis (`U` tiny) lets later fee growth push `I / U` so high that every
+/// top-up rounds to zero units.
+pub const INS_UNITS_GENESIS_MIN_ATOMS: u128 = 1_000_000;
+
+/// W-1: a top-up of `x` that mints `minted` units against `(U, I_mint)` (pre-top-up) is admitted
+/// only if it mints something AND loses at most 1 bp (+1 atom) of `x` to rounding:
+/// `x - floor(minted * I / U) <= floor(x / 10_000) + 1`. At genesis (`U == 0`) `x` must be at
+/// least `INS_UNITS_GENESIS_MIN_ATOMS`. Together these bound any first-depositor / donation
+/// inflation to 1 bp of each top-up, whatever `I / U` has grown to.
+pub fn ins_mint_admissible(x: u128, minted: u128, units_total: u128, insurance_mint_reading: u128) -> bool {
+    if x == 0 {
+        return true;
+    }
+    if minted == 0 {
+        return false;
+    }
+    if units_total == 0 {
+        return x >= INS_UNITS_GENESIS_MIN_ATOMS;
+    }
+    let value = match minted.checked_mul(insurance_mint_reading) {
+        Some(p) => p / units_total,
+        None => return false,
+    };
+    let loss = x.saturating_sub(value);
+    loss <= x / 10_000 + 1
+}
+
 /// Mint no-dilution, cross-multiplied (no division): the per-unit value after a top-up of `x`
 /// minting `minted` is at least the value before.
 pub fn ins_mint_no_dilution(insurance: u128, units_total: u128, x: u128, minted: u128) -> bool {
@@ -151,6 +179,46 @@ pub fn backstop_draw_amount(
     let cap_total = bps_floor(base, cap_bps).unwrap_or(0);
     let room = cap_total.saturating_sub(outstanding);
     deficit.min(insurance_free).min(room)
+}
+
+/// W-2: G9 is two-step. A permissionless PROPOSE records the slot; the DRAW executes no earlier
+/// than `G9_DELAY_SLOTS` later (an exit window for stakers before their insurance is lent).
+pub const G9_DELAY_SLOTS: u64 = 9_000;
+/// W-2: per-epoch cap on what G9 may lend: at most `G9_EPOCH_CAP_BPS` of `(I_gross +
+/// outstanding)` per `G9_EPOCH_SLOTS` (~1 day), on top of the cumulative `BACKSTOP_CAP_BPS`.
+pub const G9_EPOCH_SLOTS: u64 = 216_000;
+pub const G9_EPOCH_CAP_BPS: u16 = 2_000;
+
+/// W-2: an executable proposal lapses `G9_EXEC_WINDOW_SLOTS` after its delay ends, so an old
+/// proposal can never turn a later crisis into an instant (undelayed) draw.
+pub const G9_EXEC_WINDOW_SLOTS: u64 = 9_000;
+
+/// W-2: the proposal is executable: `pending != 0`, the delay elapsed, the window not lapsed.
+pub fn g9_delay_elapsed(pending_slot: u64, now: u64) -> bool {
+    let start = pending_slot.saturating_add(G9_DELAY_SLOTS);
+    pending_slot != 0 && now >= start && now < start.saturating_add(G9_EXEC_WINDOW_SLOTS)
+}
+
+/// W-2: a proposal is still open (pending or executable); a new proposal is refused meanwhile,
+/// so nobody can restart (and so postpone) the stakers' exit window.
+pub fn g9_proposal_open(pending_slot: u64, now: u64) -> bool {
+    pending_slot != 0
+        && now
+            < pending_slot
+                .saturating_add(G9_DELAY_SLOTS)
+                .saturating_add(G9_EXEC_WINDOW_SLOTS)
+}
+
+/// W-2: what is left of this epoch's G9 allowance: `floor(cap * base) - drawn_this_epoch`.
+pub fn g9_epoch_room(base: u128, drawn_this_epoch: u128, cap_bps: u16) -> u128 {
+    bps_floor(base, cap_bps).unwrap_or(0).saturating_sub(drawn_this_epoch)
+}
+
+/// W-2: G9 only for a vault that HAS Earn seniors and whose seniors have actually taken a booked
+/// draw. A junior-only vault has `senior_nav == 0` vacuously; without this, G9 would fund a
+/// (possibly self-dealing) winner straight from insurance.
+pub fn g9_vault_eligible(senior_shares: u128, senior_drawn: u128) -> bool {
+    senior_shares > 0 && senior_drawn > 0
 }
 
 /// Repayment of the backstop from the vault LP's free equity, FIRST on recovery:
@@ -348,6 +416,34 @@ mod tests {
         assert!(ins_units_reset_needed(5, 0));
         assert!(!ins_units_reset_needed(0, 0));
         assert_eq!(ins_units_for_topup(5, 5, 0), None);
+    }
+
+    #[test]
+    fn w1_mint_admissible() {
+        assert!(!ins_mint_admissible(500_000, 0, 1, 3_000_000), "zero mint refused");
+        assert!(!ins_mint_admissible(1_000_000, 1, 3, 2_000_000), "lossy mint refused (1 unit = 666,666 for 1,000,000)");
+        assert!(ins_mint_admissible(1_000_000, 1_000_000, 1_000_000, 1_000_000));
+        assert!(ins_mint_admissible(1_000_000, 666_666, 1_000_000, 1_500_000), "1-atom loss ok");
+        assert!(!ins_mint_admissible(999_999, 999_999, 0, 0), "genesis below minimum");
+        assert!(ins_mint_admissible(1_000_000, 1_000_000, 0, 0));
+        assert!(ins_mint_admissible(0, 0, 5, 5));
+    }
+
+    #[test]
+    fn w2_g9_gates() {
+        assert!(!g9_delay_elapsed(0, u64::MAX));
+        assert!(!g9_delay_elapsed(100, 100 + G9_DELAY_SLOTS - 1));
+        assert!(g9_delay_elapsed(100, 100 + G9_DELAY_SLOTS));
+        assert!(!g9_delay_elapsed(100, 100 + G9_DELAY_SLOTS + G9_EXEC_WINDOW_SLOTS), "lapsed");
+        assert!(g9_proposal_open(100, 100));
+        assert!(!g9_proposal_open(0, 100));
+        assert!(!g9_proposal_open(100, 100 + G9_DELAY_SLOTS + G9_EXEC_WINDOW_SLOTS));
+        assert_eq!(g9_epoch_room(1_000, 0, 2_000), 200);
+        assert_eq!(g9_epoch_room(1_000, 150, 2_000), 50);
+        assert_eq!(g9_epoch_room(1_000, 250, 2_000), 0);
+        assert!(!g9_vault_eligible(0, 5));
+        assert!(!g9_vault_eligible(5, 0));
+        assert!(g9_vault_eligible(5, 5));
     }
 
     #[test]
