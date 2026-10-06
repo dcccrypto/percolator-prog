@@ -2868,8 +2868,16 @@ fn run_h_ops(ops: &[HOp]) -> (Option<HExitRecord>, u32) {
         let mut book = vec![a1, a2, lp];
         book.extend_from_slice(busts);
         if inline {
-            for p in book.iter() {
-                r.crank_pf(*p);
+            // Drive the book to quiescence first: each crank is ONE bounded progress step (a
+            // bust may need a liquidation, then an absorption, then a K/F re-touch), so a single
+            // round can leave work that the 77's own inline refresh would then perform, and the
+            // snapshot below would classify a state the program never priced (found by this
+            // proptest at bdff6a6e: a loss-current 77 paying the exact reference after a bust was
+            // misread as a stale exit). After quiescence the inline refresh is a no-op.
+            for _ in 0..4 {
+                for p in book.iter() {
+                    r.crank_pf(*p);
+                }
             }
         }
         let lc = r.loss_current_now();
