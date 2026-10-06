@@ -1763,7 +1763,7 @@ fn growth_off_is_byte_for_byte_legacy() {
     let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
         - v21_upgrade::V22_ASSET_EXTRA
         - LEGACY_ENGINE_SLOT_LEN;
-    assert_eq!(appended, 160);
+    assert_eq!(appended, 192); // #277 (160) + #282 (32)
     assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
     eprintln!("legacy parity: {} lines identical to the deployed v2.1 program (zero + live cohort)", lines.len());
 }

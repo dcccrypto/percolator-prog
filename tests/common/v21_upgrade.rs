@@ -32,7 +32,7 @@ pub const V22_LEG_REM_EXTRA: usize = 32;
 /// fix/v21-funding-scale appended this many bytes of K/F drift-generation state to the END of
 /// every engine asset slot. A live-captured DEPLOYED slab (7c906e45 / ff65ec50 layout) lacks it:
 /// `upgrade_slab` appends the zero tail (what a fresh slab starts with) while widening the slot.
-pub const FUNDING_SCALE_TAIL: usize = 160;
+pub const FUNDING_SCALE_TAIL: usize = 160 + 32; // #277 drift tail (160) + #282 R1 equity-cadence words (32) -- both appended last in the engine slot
 
 fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let new_header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();
