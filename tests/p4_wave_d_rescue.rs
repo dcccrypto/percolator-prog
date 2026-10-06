@@ -1007,14 +1007,19 @@ fn rescue_refused_on_pending_obligation_b_stale_or_barrier() {
         ("b_stale_account_count", |g, _a, v| g.b_stale_account_count = v),
         ("pending_domain_loss_barrier (asset's long domain)", |g, a, v| g.pending_domain_loss_barriers[2 * a] = v),
     ];
+    let mut admitted = Vec::new();
     for (name, patch) in patches {
         let (mut env, v) = impaired(300_000_000);
         let r = new_actor(&mut env, &v);
         with_market(&mut env, |g| patch(g, a, 1));
         let res = try_rescue(&mut env, &r, 200_000_000, 1);
         eprintln!("R-5 {name} = 1 -> {:?}", res.as_ref().err().map(|e| code_of(e)));
-        assert!(res.as_ref().err().map_or(false, |e| has_code(e, RESCUE_REFUSED)), "{name}: refused 114: {res:?}");
+        if !res.as_ref().err().map_or(false, |e| has_code(e, RESCUE_REFUSED)) {
+            admitted.push(name);
+            continue;
+        }
         with_market(&mut env, |g| patch(g, a, 0));
         try_rescue(&mut env, &r, 200_000_000, 1).unwrap_or_else(|e| panic!("{name}: control admitted once clear: {e}"));
     }
+    assert!(admitted.is_empty(), "admitted while a loss is pending: {admitted:?}");
 }
