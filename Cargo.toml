@@ -33,6 +33,12 @@ medium = []
 # percolator-stake has NO mainnet deployment, so a default (non-devnet) build has
 # no pinned id and tag 87 fails closed with `StakeProgramNotPinned`.
 devnet = []
+# v2.2 item 4: the MAINNET program-id pin. Pins the mainnet stake id and the mainnet wrapper id
+# TOGETHER (src/mainnet_ids.rs; a build-time assertion refuses placeholders), un-fail-closes tags 87
+# and 116, and makes the entrypoint refuse any other program id. Mutually exclusive with `devnet`.
+mainnet-ids = []
+# TEST ONLY: dummy ids so the mainnet flavour can be built and exercised. Never for a release.
+mainnet-ids-test-placeholders = ["mainnet-ids"]
 
 [dependencies]
 solana-program = "1.18"
