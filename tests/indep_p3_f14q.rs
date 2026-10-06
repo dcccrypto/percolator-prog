@@ -28,7 +28,10 @@ const DEAD: u128 = 1_000;
 fn p3_so() -> std::path::PathBuf {
     std::env::var_os("INDEP_WRAPPER_SO")
         .map(Into::into)
-        .unwrap_or_else(|| format!("{}/wt-indep/p3-so/current.so", std::env::var("HOME").unwrap()).into())
+        // v2.2 (security review, "fixture skew"): default to THIS tree's SBF build. The old
+        // default, a pinned prebuilt ~/wt-indep/p3-so/current.so, was a v2.1 program that
+        // correctly refuses the v2.2-sized market account this harness creates.
+        .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_prog.so"))
 }
 
 struct P3 {

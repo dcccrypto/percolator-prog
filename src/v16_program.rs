@@ -1519,6 +1519,13 @@ VaultLpMultiAssetMarket,
         /// v2.2 rent: the growth block's holding-fee rent fields are malformed (rate above the
         /// ceiling, kink out of range, or missing on a mainnet growth-v2 market). Custom(106).
         HoldingRentConfigInvalid = 106,
+        /// v2.2 band (review E-M1): a new position would exceed the band market's per-side
+        /// position cap (`band_max_positions_per_side`, 256). Engine `BandPositionCap`.
+        /// Custom(111). SDK/app: "This market is full on this side; try again later."
+        PriceBandPositionCap = 111,
+        /// v2.2 band (review E-L1): the band around the current anchor is narrower than the
+        /// minimum width, so no new exposure may attach. Engine `BandTooNarrow`. Custom(112).
+        PriceBandTooNarrow = 112,
     }
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
@@ -1531,6 +1538,8 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::PriceBandPinned as u32 == 104);
     const _: () = assert!(PercolatorError::PriceBandConfigInvalid as u32 == 105);
     const _: () = assert!(PercolatorError::HoldingRentConfigInvalid as u32 == 106);
+    const _: () = assert!(PercolatorError::PriceBandPositionCap as u32 == 111);
+    const _: () = assert!(PercolatorError::PriceBandTooNarrow as u32 == 112);
 
     impl From<PercolatorError> for ProgramError {
         fn from(value: PercolatorError) -> Self {
@@ -1568,6 +1577,8 @@ VaultLpMultiAssetMarket,
             V16Error::LossStale => PercolatorError::EngineLossStale,
             // v2.2 band (Phase 4 item 1): both engine band refusals surface as 104.
             V16Error::BandOutOfRange | V16Error::BandPinned => PercolatorError::PriceBandPinned,
+            V16Error::BandPositionCap => PercolatorError::PriceBandPositionCap,
+            V16Error::BandTooNarrow => PercolatorError::PriceBandTooNarrow,
         };
         mapped.into()
     }
@@ -5559,7 +5570,8 @@ pub mod state {
             asset.slot_last = init_slot;
             // v2.2 band: arm the per-epoch band at genesis exactly as the engine's own
             // activation does (epoch 1, anchored at the genesis price).
-            percolator::band_initialize_asset(&mut asset, engine_config.band_bps, initial_price, init_slot);
+            percolator::band_initialize_asset(&mut asset, engine_config.band_bps, initial_price, init_slot)
+                .map_err(crate::error::map_v16_error)?;
             let mut slot = EngineAssetSlotV16Account::empty_for_market(market_id);
             slot.asset = percolator::AssetStateV16Account::from_runtime(&asset);
             slot.insurance_domain_budget_long = percolator::V16PodU128::new(0);
@@ -11726,7 +11738,20 @@ pub mod processor {
             && asset_local_has_position_or_loss_state_view(group, asset_index)
     }
 
-    fn asset_has_exposed_target_effective_lag_view(
+    /// v2.2 D-1 (review): THE price-lag predicate. The asset's committed mark `P_last`
+    /// (`effective_price`) differs from the engine's raw oracle target. Under the band's D-1
+    /// carve-out (`docs/v22-d1-spec-9-6-carve-out.md` in the engine) `slot_last` keeps advancing
+    /// while this holds, so "the clock is current" no longer implies "the price is current":
+    /// every payout-bearing path that depends on the mark reads THIS predicate (directly or via
+    /// `asset_price_lagged_view`), never its own comparison. Pinned by
+    /// `tests/v22_band_rent.rs::v22_d1_every_lag_consumer_uses_the_shared_predicate`.
+    pub(crate) fn asset_target_differs_view(asset: &percolator::AssetStateV16Account) -> bool {
+        asset.raw_oracle_target_price.get() != asset.effective_price.get()
+    }
+
+    /// v2.2 D-1: the asset is EXPOSED (open interest on either side) and its mark lags its
+    /// target (`asset_target_differs_view`). An unexposed asset has no lagged payout.
+    pub(crate) fn asset_price_lagged_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
     ) -> Result<bool, ProgramError> {
@@ -11736,14 +11761,14 @@ pub mod processor {
             .ok_or(PercolatorError::InvalidInstruction)?;
         let asset = &slot.engine.asset;
         let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-        Ok(exposed && asset.raw_oracle_target_price.get() != asset.effective_price.get())
+        Ok(exposed && asset_target_differs_view(asset))
     }
 
     fn reject_exposed_target_effective_lag_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
     ) -> ProgramResult {
-        if asset_has_exposed_target_effective_lag_view(group, asset_index)? {
+        if asset_price_lagged_view(group, asset_index)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         Ok(())
@@ -11787,7 +11812,7 @@ pub mod processor {
                 let profile = read_oracle_profile_from_view(group, cfg, asset_index)?;
                 if oracle_v16::profile_is_price_managed(&profile) {
                     let effective_price = asset.effective_price.get();
-                    if asset.raw_oracle_target_price.get() != effective_price
+                    if asset_target_differs_view(&asset)
                         || profile.mark_ewma_e6 != effective_price
                         || profile.oracle_target_price_e6 != effective_price
                     {
@@ -13907,6 +13932,14 @@ pub mod processor {
         if band_on && maintenance_fee_per_slot != 0 {
             return Err(PercolatorError::PriceBandConfigInvalid.into());
         }
+        // Review E-L1: the band at the genesis price must be at least MIN_BAND_WIDTH_TICKS
+        // wide (a micro-priced band market would otherwise be frozen at InitMarket).
+        if band_on
+            && !percolator::band_rent::band_width_ok(initial_price, cfg.band_bps)
+                .map_err(|_| PercolatorError::PriceBandConfigInvalid)?
+        {
+            return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
         // WARNING (not a repair): say so loudly when this market's funding
         // cannot accrue at its genesis price. See `warn_if_funding_cannot_accrue`
         // for why this warns rather than rejects. The flooring itself lives in
@@ -14053,6 +14086,10 @@ pub mod processor {
         };
         if p.rent_max_e9_per_slot as u64 > percolator::band_rent::MAX_RENT_E9_PER_SLOT
             || p.rent_kink_bps as u128 > growth_v19::BPS
+            // Review W-M1: a rent market trades the 500 bps N-2 toll for the 25 bps entry
+            // floor, so the rent must actually bite: a floor on the ceiling and a cap on the
+            // kink (`rent_max = 1, kink = 9999` would nullify the deterrent).
+            || !growth_v19::rent_params_ok(p.rent_max_e9_per_slot as u64, p.rent_kink_bps)
         {
             return Err(PercolatorError::HoldingRentConfigInvalid.into());
         }
@@ -14067,6 +14104,8 @@ pub mod processor {
             cfg.band_bps = p.band_bps as u64;
             cfg.band_max_epoch_slots = p.band_max_epoch_slots as u64;
             cfg.band_max_pin_slots = p.band_max_pin_slots as u64;
+            // Review E-M1: the design's per-side position cap (the keeper's sweep bound).
+            cfg.band_max_positions_per_side = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
             if rent_ok && cfg.validate_public_user_fund().is_err() {
                 return Err(PercolatorError::PriceBandConfigInvalid.into());
             }
@@ -30392,6 +30431,10 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineInvalidConfig)?
                 .engine
                 .asset;
+            // v2.2 D-1: the shared lag predicate; an unlagged leg contributes 0 either way.
+            if !asset_price_lagged_view(group, leg.asset_index as usize)? {
+                continue;
+            }
             let eff = asset.effective_price.get();
             let tgt = asset.raw_oracle_target_price.get();
             let (adv, fav) = match leg.side {
@@ -37005,8 +37048,8 @@ pub mod processor {
         let users_long = growth_v19::users_side_oi_q(oi_long, rec.lp_net_q, true);
         let users_short = growth_v19::users_side_oi_q(oi_short, rec.lp_net_q, false);
         Ok((
-            growth_v19::rent_rate_e9(users_long, n_cap, g.rent_kink_bps, rent_max).unwrap_or(0),
-            growth_v19::rent_rate_e9(users_short, n_cap, g.rent_kink_bps, rent_max).unwrap_or(0),
+            growth_v19::rent_rate_e9_fail_closed(users_long, n_cap, g.rent_kink_bps, rent_max),
+            growth_v19::rent_rate_e9_fail_closed(users_short, n_cap, g.rent_kink_bps, rent_max),
         ))
     }
 
@@ -37029,40 +37072,15 @@ pub mod processor {
         Ok((price, funding_rate_e9, rent_long, rent_short))
     }
 
-    /// v2.2 band: is the asset pinned (it cannot follow its raw target): the engine's pin
-    /// clock is running, or the epoch window has elapsed for an accrual ending now.
-    fn band_asset_pinned_view(
-        group: &state::MarketViewMutV16<'_>,
-        asset_index: usize,
-    ) -> Result<bool, ProgramError> {
-        if group.header.config.band_bps.get() == 0 {
-            return Ok(false);
-        }
-        let asset = &group
-            .markets
-            .get(asset_index)
-            .ok_or(PercolatorError::InvalidInstruction)?
-            .engine
-            .asset;
-        if asset.band_epoch.get() == 0
-            || asset.raw_oracle_target_price.get() == asset.effective_price.get()
-        {
-            return Ok(false);
-        }
-        if asset.band_pin_since_slot.get() != 0 {
-            return Ok(true);
-        }
-        let now = authenticated_market_slot_or_fallback_view(group);
-        Ok(band_shape_price_view(group, asset_index, now, asset.effective_price.get())?.1)
-    }
-
-    /// v2.2 band (design §1.1 "Closes during a pin", spec §9.7): while the asset is pinned, a
-    /// close may land at the pinned price only if that price is the WORSE side for the closer
-    /// (a long closing while the target is above `P_last`, a short while it is below). The
-    /// favourable-side close waits for the staircase (a few seconds): it would otherwise be a
-    /// free option against the LP at a stale mark. Risk-increasing fills are already refused
-    /// by the §9.7 lag gates. `position_before` is the account's signed position, `delta` its
-    /// signed change. Custom(104).
+    /// v2.2 band (design §1.1 "Closes during a pin", spec §9.7; widened by review E-L2):
+    /// while the asset's mark LAGS its target (`asset_price_lagged_view`: a pin, or plain
+    /// cap-law lag between a target move and the staircase catching up), a close may land at
+    /// `P_last` only if that price is the WORSE side for the closer (a long closing while the
+    /// target is above `P_last`, a short while it is below). The favourable-side close waits
+    /// for the staircase: it would otherwise be a free option against the LP at a stale mark.
+    /// Risk-increasing fills are already refused by the §9.7 lag gates. Band markets only (the
+    /// v2.1 off-band path is byte-for-byte unchanged). `position_before` is the account's
+    /// signed position, `delta` its signed change. Custom(104).
     #[inline(never)]
     fn reject_band_favourable_close_view(
         group: &state::MarketViewMutV16<'_>,
@@ -37079,7 +37097,7 @@ pub mod processor {
             && (after == 0
                 || (after > 0) != (position_before > 0)
                 || after.unsigned_abs() < position_before.unsigned_abs());
-        if !reduces || !band_asset_pinned_view(group, asset_index)? {
+        if !reduces || !asset_price_lagged_view(group, asset_index)? {
             return Ok(());
         }
         let asset = &group.markets[asset_index].engine.asset;

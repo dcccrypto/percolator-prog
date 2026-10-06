@@ -821,12 +821,19 @@ pub fn band_lambda_max_bps(maintenance_bps: u64, g_bps: u64) -> Option<u32> {
         return None;
     }
     let v = BPS * (BPS - 500) / den;
-    Some(if v > MAX_LAMBDA_BPS as u128 {
-        MAX_LAMBDA_BPS
+    Some(if v > BAND_LAMBDA_CAP_BPS as u128 {
+        BAND_LAMBDA_CAP_BPS
     } else {
         v as u32
     })
 }
+
+/// Review W-M2: the band-market lambda ceiling. Devnet keeps the design's 10x; mainnet builds
+/// cap at 3x until the oracle has a second source and fraud checks.
+#[cfg(feature = "devnet")]
+pub const BAND_LAMBDA_CAP_BPS: u32 = MAX_LAMBDA_BPS;
+#[cfg(not(feature = "devnet"))]
+pub const BAND_LAMBDA_CAP_BPS: u32 = 30_000;
 
 /// v2.2: the UA dial bounds. Off-band (no epoch clamp): the growth-1 tighten-only box
 /// (`growth_dials_ok(false, ..)`). On a band market: `lambda in [1, band_lambda_max]`, kink
@@ -841,8 +848,13 @@ pub fn growth_dials_ok_for(band: Option<(u64, u64)>, lambda_bps: u32, kink_bps: 
     }
 }
 
-/// v2.2: alpha (Earn allocation) above 50% only on a band market, up to 70%.
+/// v2.2: alpha (Earn allocation) above 50% only on a band market, up to 70% on devnet.
+/// Review W-M2: on mainnet builds (no `devnet` feature) at most 60% until the oracle has a
+/// second source and fraud checks (the band bounds bad debt, not LP principal).
+#[cfg(feature = "devnet")]
 pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
+#[cfg(not(feature = "devnet"))]
+pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 6_000;
 pub fn alloc_alpha_max_bps(band_on: bool) -> u16 {
     if band_on {
         ALLOC_ALPHA_MAX_BAND_BPS
@@ -867,6 +879,23 @@ pub fn c_launch_atoms_for(c_m: u128) -> u128 {
 /// one-slot flash lock pays no rent), 25 bps at `u = 1` instead of 500 (closes N-2: rent, not
 /// a toll, prices a held lock-out).
 pub const RENT_ENTRY_FLOOR_BPS: u16 = 25;
+
+/// Review W-M1: on a rent market (`rent_max != 0`) the rent ceiling is at least
+/// `RENT_MIN_E9_PER_SLOT` and the kink at most `RENT_MAX_KINK_BPS`, so the rent that replaces
+/// the 500 bps N-2 toll actually bites. `rent_max == 0` (no rent) is always shape-valid here.
+pub const RENT_MIN_E9_PER_SLOT: u64 = 10;
+pub const RENT_MAX_KINK_BPS: u16 = 8_000;
+pub fn rent_params_ok(rent_max_e9_per_slot: u64, rent_kink_bps: u16) -> bool {
+    rent_max_e9_per_slot == 0
+        || (rent_max_e9_per_slot >= RENT_MIN_E9_PER_SLOT && rent_kink_bps <= RENT_MAX_KINK_BPS)
+}
+
+/// Review: rent rate that fails CLOSED. `rent_rate_e9` returns `None` only out of domain
+/// (overflow); charging 0 there would let an overflow switch rent off, so it charges the
+/// ceiling instead.
+pub fn rent_rate_e9_fail_closed(users_q: u128, n_cap_q: u128, kink_bps: u16, rent_max: u64) -> u64 {
+    rent_rate_e9(users_q, n_cap_q, kink_bps, rent_max).unwrap_or(rent_max)
+}
 
 /// The utilisation-fee maximum in force: the stored dial, or the default when 0 (the rent
 /// entry floor on rent markets, `GROWTH_UTIL_FEE_DEFAULT_BPS` elsewhere).

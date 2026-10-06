@@ -48,6 +48,11 @@ const BAND_PMAX: u32 = 9_000;
 const RENT_MAX: u32 = 23;
 const RENT_KINK: u16 = 5_000;
 
+thread_local! {
+    /// Genesis price of the next `Env::new` on this thread (E-L1 tests override it).
+    static INIT_PRICE: std::cell::Cell<u64> = const { std::cell::Cell::new(PRICE) };
+}
+
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
@@ -186,7 +191,7 @@ fn init_market_ix(c: &Cfg) -> ProgInstruction {
         max_portfolio_assets: c.slots as u16,
         h_min: 0,
         h_max: 10,
-        initial_price: PRICE,
+        initial_price: INIT_PRICE.with(|p| p.get()),
         min_nonzero_mm_req: 10,
         min_nonzero_im_req: 20,
         maintenance_margin_bps: MMR,
@@ -1116,4 +1121,466 @@ fn v22_rent_rate_kink_cap_monotone_exhaustive() {
     }
     assert_eq!(rent_rate_e9(5, 0, 5_000, 23), None, "no capacity measured -> no rate");
     assert_eq!(rent_rate_e9(5, 10, 10_001, 23), None, "kink above 100%");
+}
+
+// ===========================================================================
+// SENTINEL adversarial additions (review of PR #533). Tests named sec_*.
+// ===========================================================================
+
+impl Env {
+    fn settle_rent_at(&mut self, portfolio: Pubkey, vault_lp: Pubkey, now_slot: u64) -> Result<u64, String> {
+        let (payer, m) = (self.payer.pubkey(), self.market);
+        self.send(
+            ProgInstruction::SettleHoldingRent { asset_index: 0, now_slot },
+            vec![
+                AccountMeta::new(payer, true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(vault_lp, false),
+            ],
+            &[],
+        )
+    }
+    fn total_capital(&self, ps: &[Pubkey]) -> u128 {
+        ps.iter().map(|p| self.portfolio_state(*p).capital).sum()
+    }
+}
+
+#[test]
+fn sec_tag106_cannot_be_spoofed_double_charged_or_redirected() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let taker = env.trader(1_000 * USD);
+    let attacker = env.trader(1_000 * USD);
+    env.trade_cpi(&taker.0, taker.1, &lp, 800 * Q).expect("crowd open");
+    for _ in 0..100 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(taker.1);
+    }
+    // (a) redirect: the attacker's own portfolio as the "vault LP" is refused; nothing moves.
+    let before = (env.engine_asset(), env.total_capital(&[taker.1, lp.account, attacker.1]));
+    let r = env.settle_rent(taker.1, attacker.1);
+    assert_err(&r, &code(PercolatorError::VaultLpNotBound), "redirect to attacker portfolio");
+    let r = env.settle_rent(attacker.1, attacker.1);
+    assert_err(&r, &code(PercolatorError::VaultLpNotBound), "attacker settles itself as LP");
+    assert_eq!(before.0.rent_unrouted_atoms, env.engine_asset().rent_unrouted_atoms);
+    assert_eq!(before.1, env.total_capital(&[taker.1, lp.account, attacker.1]));
+    let attacker_cap = env.portfolio_state(attacker.1).capital;
+
+    // (b) now_slot spoof: the program takes the slot from Clock, never from the argument.
+    env.warp(3);
+    env.push(PRICE);
+    for spoof in [u64::MAX, 0, env.slot + 1_000_000] {
+        let _ = env.settle_rent_at(taker.1, lp.account, spoof);
+        let a = env.engine_asset();
+        assert!(a.slot_last <= env.slot, "asset clock ran ahead of Clock: {} > {}", a.slot_last, env.slot);
+        env.assert_conservation();
+    }
+    let honest_slot_last = env.engine_asset().slot_last;
+    assert!(honest_slot_last <= env.slot);
+
+    // (c) double charge: a second tag 106 in the same slot charges nothing more.
+    env.warp(2);
+    env.push(PRICE);
+    env.settle_rent(taker.1, lp.account).expect("first");
+    let cap1 = env.portfolio_state(taker.1).capital;
+    let idx1 = env.engine_asset().rent_index_long_num;
+    let r2 = env.settle_rent(taker.1, lp.account);
+    let cap2 = env.portfolio_state(taker.1).capital;
+    eprintln!("SEC tag106 second call same slot: {r2:?}, taker capital {cap1} -> {cap2}, idx {idx1}");
+    assert_eq!(cap1, cap2, "double charge in one slot");
+    assert_eq!(idx1, env.engine_asset().rent_index_long_num);
+
+    // (d) settling the SAME elapsed time in many small calls == one call (no rounding drift in the
+    // charged total beyond the carried sub-atom): compare against rent_due math.
+    let cap_before = env.portfolio_state(taker.1).capital;
+    let idx_before = env.engine_asset().rent_index_long_num;
+    for _ in 0..10 {
+        env.warp(1);
+        env.push(PRICE);
+        env.settle_rent(taker.1, lp.account).expect("tag 106");
+    }
+    let charged = cap_before - env.portfolio_state(taker.1).capital;
+    let idx_after = env.engine_asset().rent_index_long_num;
+    let q = 800 * POS_SCALE;
+    let one_shot = percolator::band_rent::rent_due_atoms(q, idx_after, idx_before).unwrap();
+    eprintln!("SEC rent 10 settles charged {charged}, one-shot floor {one_shot}");
+    assert!(charged <= one_shot + 1 && charged + 1 >= one_shot, "split settles drift: {charged} vs {one_shot}");
+    // a third party never gains or loses: the attacker's capital is untouched throughout
+    assert_eq!(attacker_cap, env.portfolio_state(attacker.1).capital);
+    env.assert_conservation();
+}
+
+#[test]
+fn sec_pinned_close_flip_and_open_variants() {
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    let target = PRICE * 13 / 10;
+    for _ in 0..60 {
+        env.warp(1);
+        env.push(target);
+        env.crank(short.1).expect("crank short");
+        env.crank(lp.account).expect("crank lp");
+    }
+    assert!(env.engine_asset().band_pin_since_slot != 0, "pinned");
+    let pin = code(PercolatorError::PriceBandPinned);
+    // short = -100. Full close, partial, and FLIP (close + open long at the stale-low price) are all
+    // favourable for the short side (target above P_last): refused.
+    for q in [100 * Q, 50 * Q, 150 * Q, 1 * Q] {
+        let r = env.trade_cpi(&short.0, short.1, &lp, q);
+        eprintln!("SEC pinned short buys {q}: {r:?}");
+        assert!(r.is_err(), "favourable-side exit/flip landed at the stale price: q={q}");
+    }
+    assert_eq!(env.pos(short.1), -100 * Q);
+    // a fresh long OPEN at the stale-low price (the dangerous one) is refused by the lag gate.
+    let newbie = env.trader(1_000 * USD);
+    let r = env.trade_cpi(&newbie.0, newbie.1, &lp, 10 * Q);
+    eprintln!("SEC pinned fresh long open: {r:?}");
+    assert!(r.is_err(), "open at the pinned stale price must be refused");
+    let _ = (pin, &long);
+}
+
+#[test]
+fn sec_v21_stamped_accounts_are_refused() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("open");
+    let invalid = code(PercolatorError::InvalidVersion);
+    for (name, pk) in [("market", env.market), ("portfolio", t.1)] {
+        let mut acc = env.svm.get_account(&pk).unwrap();
+        let orig = acc.data[8..10].to_vec();
+        acc.data[8..10].copy_from_slice(&18u16.to_le_bytes());
+        env.svm.set_account(pk, acc.clone()).unwrap();
+        env.warp(1);
+        let r = env.crank(t.1);
+        eprintln!("SEC v18-stamped {name}: {r:?}");
+        assert!(r.is_err() && r.as_ref().unwrap_err().contains(&invalid), "{name}: {r:?}");
+        let r = env.settle_rent(t.1, lp.account);
+        assert!(r.is_err(), "{name}: tag 106 must refuse a v2.1 image");
+        acc.data[8..10].copy_from_slice(&orig);
+        env.svm.set_account(pk, acc).unwrap();
+    }
+}
+
+
+// ===========================================================================
+// v2.2 Wave B security-review fixes (E-M1, E-L1, E-L2, W-M1, W-M2, D-1, rent overflow).
+// Every refusal sits next to its accepted control.
+// ===========================================================================
+
+impl Env {
+    fn trade_nocpi(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        size_q: i128,
+    ) -> Result<u64, String> {
+        let (a_id, _, a_epoch) = self.identity(account_a);
+        let (b_id, _, b_epoch) = self.identity(account_b);
+        let market_id = self.market_id();
+        let exec_price = self.engine_asset().effective_price;
+        let m = self.market;
+        self.send(
+            ProgInstruction::TradeNoCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_epoch,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_epoch,
+                market_id,
+                asset_index: 0,
+                size_q,
+                exec_price,
+                fee_bps: 0,
+                backing_fee_cap_bps: 10_000,
+            },
+            vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(account_a, false),
+                AccountMeta::new(account_b, false),
+            ],
+            &[owner_a, owner_b],
+        )
+    }
+
+    fn batch_trade_cpi(&mut self, taker: &Keypair, taker_account: Pubkey, lp: &Lp, size_q: i128) -> Result<u64, String> {
+        let (a_id, _, a_epoch) = self.identity(taker_account);
+        let (b_id, b_seq, b_epoch) = self.identity(lp.account);
+        let market_id = self.market_id();
+        let (m, mp) = (self.market, self.matcher_program);
+        self.send(
+            ProgInstruction::BatchTradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_epoch,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_epoch,
+                account_b_matcher_sequence: b_seq,
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                    asset_index: 0,
+                    market_id,
+                    size_q,
+                    fee_bps: 10_000,
+                    limit_price: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(lp.account, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new(lp.ctx, false),
+                AccountMeta::new_readonly(lp.delegate, false),
+            ],
+            &[taker],
+        )
+    }
+
+    fn withdraw(&mut self, owner: &Keypair, portfolio: Pubkey, amount: u128) -> Result<u64, String> {
+        let dest = self.key();
+        let mint = self.mint;
+        self.svm
+            .set_account(
+                dest,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(mint, owner.pubkey(), 0),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.identity(portfolio);
+        let (m, v) = (self.market, self.vault);
+        let authority = Pubkey::find_program_address(&[b"vault", m.as_ref()], &self.program_id).0;
+        self.send(
+            ProgInstruction::Withdraw { portfolio_id, expected_sequence, amount },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[owner],
+        )
+    }
+}
+
+/// A band market whose mark LAGS its target by plain cap-law lag (NOT pinned): the target is
+/// pushed +0.5% (inside the 1% band); one crank moves the price only the 4 bps the cap allows.
+fn lagged_not_pinned(env: &mut Env, short: Pubkey, lp: Pubkey) {
+    env.warp(1);
+    env.push(PRICE * 1_005 / 1_000);
+    env.crank(short).expect("crank short");
+    env.crank(lp).expect("crank lp");
+    let a = env.engine_asset();
+    assert!(a.raw_oracle_target_price > a.effective_price, "lagged: target above P_last");
+    assert_eq!(a.band_pin_since_slot, 0, "NOT pinned: inside the band, inside the window");
+}
+
+/// Review E-L2 + D-1, per payout-bearing tag: while the mark lags (no pin), the favourable-side
+/// close is refused on TradeCpi, BatchTradeCpi and TradeNoCpi (104); the worse-side close and
+/// the no-lag control land. (Before the fix the rule fired only while pinned: these landed.)
+#[test]
+fn v22_lag_without_pin_refuses_the_favourable_close_on_every_trade_tag() {
+    // TradeCpi (tag 10) + BatchTradeCpi.
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    lagged_not_pinned(&mut env, short.1, lp.account);
+    let r = env.trade_cpi(&short.0, short.1, &lp, 50 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPinned), "TradeCpi favourable close while lagged");
+    let r = env.batch_trade_cpi(&short.0, short.1, &lp, 50 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPinned), "BatchTradeCpi favourable close while lagged");
+    env.crank(long.1).expect("crank long");
+    let r = env.trade_cpi(&long.0, long.1, &lp, -50 * Q);
+    assert!(r.is_ok(), "worse-side close while lagged lands: {r:?}");
+    // No lag: the same favourable close lands once the staircase has caught up.
+    for _ in 0..40 {
+        env.warp(1);
+        env.push(PRICE * 1_005 / 1_000);
+        for p in [long.1, short.1, lp.account] {
+            let _ = env.crank(p);
+        }
+        let a = env.engine_asset();
+        if a.effective_price == a.raw_oracle_target_price {
+            break;
+        }
+    }
+    let a = env.engine_asset();
+    assert_eq!(a.effective_price, a.raw_oracle_target_price, "caught up");
+    let r = env.trade_cpi(&short.0, short.1, &lp, 50 * Q);
+    assert!(r.is_ok(), "control: no lag, the close lands: {r:?}");
+    env.assert_conservation();
+
+    // TradeNoCpi (tag 6): the long and the short close against each other; the short's
+    // (favourable) side is refused while lagged.
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    lagged_not_pinned(&mut env, short.1, lp.account);
+    env.crank(long.1).expect("crank long");
+    let r = env.trade_nocpi(&short.0, short.1, &long.0, long.1, 10 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPinned), "TradeNoCpi favourable close while lagged");
+    env.assert_conservation();
+}
+
+/// D-1 per-tag: Withdraw pays out only from a FLAT account (engine `withdraw_not_atomic`
+/// refuses any active leg), so a lagged mark can never price a withdrawal. Positioned ->
+/// refused; the same account after closing -> lands.
+#[test]
+fn v22_lag_withdraw_needs_a_flat_account() {
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    lagged_not_pinned(&mut env, short.1, lp.account);
+    let r = env.withdraw(&long.0, long.1, 1);
+    assert!(r.is_err(), "a positioned account cannot withdraw while lagged: {r:?}");
+    // Control: a flat account withdraws while the asset lags.
+    let flat = env.trader(10 * USD);
+    let r = env.withdraw(&flat.0, flat.1, USD);
+    assert!(r.is_ok(), "flat withdraw is not mark-dependent: {r:?}");
+    env.assert_conservation();
+}
+
+/// D-1: ONE shared lag predicate. Every mark-lag comparison in the wrapper is
+/// `asset_target_differs_view` (or `asset_price_lagged_view` on top of it), and every
+/// payout-bearing consumer calls it: the favourable-close rule (trade tags), the custody
+/// domain-withdraw gate, the ADL wind-down gate (tag 104), the pending-mark fee-sync gate and
+/// the Earn senior pricing bounds (tags 75/77). Negative control: an ad-hoc comparison added
+/// anywhere turns the count red.
+#[test]
+fn v22_d1_every_lag_consumer_uses_the_shared_predicate() {
+    let src = std::fs::read_to_string(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/v16_program.rs")).unwrap();
+    let body = |name: &str| -> String {
+        let start = src.find(&format!("fn {name}(")).unwrap_or_else(|| panic!("fn {name}"));
+        let rest = &src[start + 3..];
+        let end = rest.find("\n    fn ").or_else(|| rest.find("\n    pub(crate) fn ")).unwrap();
+        rest[..end].to_string()
+    };
+    // The comparison exists exactly once (the predicate), plus the unrelated "did the crank
+    // change the target" check in the auto-crank fee attribution.
+    let raw = src.matches("raw_oracle_target_price.get() != asset.effective_price.get()").count();
+    assert_eq!(raw, 1, "one raw lag comparison: inside asset_target_differs_view");
+    assert!(body("asset_target_differs_view").contains("raw_oracle_target_price.get() != asset.effective_price.get()"));
+    assert!(body("asset_price_lagged_view").contains("asset_target_differs_view(asset)"));
+    for (consumer, uses) in [
+        ("reject_band_favourable_close_view", "asset_price_lagged_view("),
+        ("reject_exposed_target_effective_lag_view", "asset_price_lagged_view("),
+        ("vault_lp_equity_lag_bounds_ro", "asset_price_lagged_view("),
+        ("reject_portfolio_pending_price_managed_mark_view", "asset_target_differs_view("),
+        ("live_domain_withdraw_health_or_shutdown_view", "reject_exposed_target_effective_lag_view("),
+        ("reject_adl_wind_down_unfresh_mark_view", "reject_exposed_target_effective_lag_view("),
+    ] {
+        assert!(body(consumer).contains(uses), "{consumer} must call {uses}");
+    }
+    // No other comparison of the raw target against the effective price.
+    let ad_hoc = src
+        .lines()
+        .filter(|l| l.contains("raw_oracle_target_price") && l.contains("effective_price") && !l.trim_start().starts_with("//"))
+        .count();
+    assert_eq!(ad_hoc, 1, "only the predicate compares target and P_last on one line");
+}
+
+/// Review E-M1 (wrapper): InitMarket writes the per-side position cap (256) on a band market
+/// and 0 off-band; the two new refusals have pinned codes.
+#[test]
+fn v22_band_market_carries_the_position_cap_and_codes_are_pinned() {
+    let env = Env::new(band_cfg());
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::read_market(&data).unwrap();
+    assert_eq!(group.config.band_max_positions_per_side, 256);
+    let env0 = Env::new(Cfg { slots: 1, phase4: Some(phase4(0, RENT_MAX)), r_gap: 400 });
+    let data = env0.svm.get_account(&env0.market).unwrap().data;
+    let (_, group) = state::read_market(&data).unwrap();
+    assert_eq!(group.config.band_max_positions_per_side, 0);
+    assert_eq!(PercolatorError::PriceBandPositionCap as u32, 111);
+    assert_eq!(PercolatorError::PriceBandTooNarrow as u32, 112);
+    assert_eq!(
+        percolator_prog::error::map_v16_error(percolator::V16Error::BandPositionCap),
+        PercolatorError::PriceBandPositionCap.into()
+    );
+    assert_eq!(
+        percolator_prog::error::map_v16_error(percolator::V16Error::BandTooNarrow),
+        PercolatorError::PriceBandTooNarrow.into()
+    );
+}
+
+/// Review E-L1 (wrapper): a band market whose genesis band is narrower than 32 ticks is
+/// refused (105); the same market at a price with a wide-enough band is accepted, and the same
+/// tiny price without a band is accepted.
+#[test]
+fn v22_band_market_refuses_a_too_narrow_genesis_band() {
+    let at = |price: u64, cfg: Cfg| {
+        INIT_PRICE.with(|p| p.set(price));
+        let r = Env::try_new(cfg).map(|_| ());
+        INIT_PRICE.with(|p| p.set(PRICE));
+        r
+    };
+    // d = 100 bps: width = floor(1.01 p) - ceil(0.99 p) >= 32 from p ~ 1,600.
+    let r = at(1_000, band_cfg());
+    assert!(r.as_ref().is_err_and(|e| e.contains(&code(PercolatorError::PriceBandConfigInvalid))), "{r:?}");
+    assert!(at(2_000, band_cfg()).is_ok(), "a 40-tick band is accepted");
+    assert!(at(1_000, Cfg { slots: 1, phase4: Some(phase4(0, RENT_MAX)), r_gap: 400 }).is_ok(), "band off: no width rule");
+}
+
+/// Review W-M1: rent must bite on a rent market: `rent_max >= 10 e9/slot` and `kink <= 80%`
+/// (106), boundaries accepted; no rent (0) is unaffected.
+#[test]
+fn v22_rent_floor_and_kink_cap() {
+    use percolator_prog::growth_v19 as gv;
+    assert!(gv::rent_params_ok(0, 9_999), "rent off");
+    assert!(gv::rent_params_ok(gv::RENT_MIN_E9_PER_SLOT, gv::RENT_MAX_KINK_BPS));
+    assert!(!gv::rent_params_ok(gv::RENT_MIN_E9_PER_SLOT - 1, 0), "below the floor");
+    assert!(!gv::rent_params_ok(1, 9_999), "the review's rent_max = 1, kink = 9999");
+    assert!(!gv::rent_params_ok(23, gv::RENT_MAX_KINK_BPS + 1), "kink above 80%");
+    let mk = |rent_max: u32, kink: u16| {
+        let mut p = phase4(BAND_BPS, rent_max);
+        p.rent_kink_bps = kink;
+        Env::try_new(Cfg { slots: 1, phase4: Some(p), r_gap: 0 }).map(|_| ())
+    };
+    let rent_err = code(PercolatorError::HoldingRentConfigInvalid);
+    assert!(mk(9, RENT_KINK).is_err_and(|e| e.contains(&rent_err)));
+    assert!(mk(23, 8_001).is_err_and(|e| e.contains(&rent_err)));
+    assert!(mk(10, 8_000).is_ok(), "both boundaries accepted");
+}
+
+/// Review (rent overflow): an out-of-domain rent rate charges the CEILING, never 0.
+#[test]
+fn v22_rent_rate_overflow_fails_closed() {
+    use percolator_prog::growth_v19 as gv;
+    assert_eq!(gv::rent_rate_e9(u128::MAX, 1, 0, 23), None, "the raw rate overflows");
+    assert_eq!(gv::rent_rate_e9_fail_closed(u128::MAX, 1, 0, 23), 23, "charged at the ceiling");
+    assert_eq!(gv::rent_rate_e9_fail_closed(0, 1, 5_000, 23), 0, "in domain: unchanged");
+}
+
+/// Review W-M2: mainnet caps (no `devnet` feature): lambda <= 3x and alpha <= 60% on a band
+/// market; devnet keeps the design's 10x / 70%. This BPF test binary is built with
+/// `--features devnet`; `tests/sec_v22b_pure.rs` pins both builds.
+#[test]
+fn v22_band_lambda_and_alpha_caps_follow_the_build() {
+    use percolator_prog::growth_v19 as gv;
+    #[cfg(feature = "devnet")]
+    {
+        assert_eq!(gv::BAND_LAMBDA_CAP_BPS, 100_000);
+        assert_eq!(gv::ALLOC_ALPHA_MAX_BAND_BPS, 7_000);
+    }
+    #[cfg(not(feature = "devnet"))]
+    {
+        assert_eq!(gv::BAND_LAMBDA_CAP_BPS, 30_000);
+        assert_eq!(gv::ALLOC_ALPHA_MAX_BAND_BPS, 6_000);
+    }
+    assert!(gv::band_lambda_max_bps(500, 1).unwrap() <= gv::BAND_LAMBDA_CAP_BPS);
+    assert_eq!(gv::alloc_alpha_max_bps(true), gv::ALLOC_ALPHA_MAX_BAND_BPS);
+    assert!(!gv::graduation_allowed(100, 0), "graduation stays closed until depth tiers exist");
 }
