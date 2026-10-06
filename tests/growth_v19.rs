@@ -1487,63 +1487,152 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
     );
 }
 
-/// Zero means off: a legacy market runs the same transaction sequence with byte-identical
-/// account state on the base (7c906e45) wrapper and on this build.
+/// Engine slot length of the previous (v2.1 pre-#277) layout. On this layout the engine appends
+/// `kf_drift_long/short` (160 B); on the old layout the strip below is a no-op.
+const LEGACY_ENGINE_SLOT_LEN: usize = 1301;
+const PARITY_FIXTURE: &str = "tests/fixtures/growth_legacy_parity_v21.txt";
+
+/// Account bytes with the appended K/F drift tail removed from every engine asset slot.
+fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
+    use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
+    if !is_market || appended == 0 {
+        return (data.to_vec(), false);
+    }
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
+    assert_eq!((data.len() - head) % MARKET_ASSET_SLOT_LEN, 0);
+    let mut out = data[..head].to_vec();
+    let mut tail_nonzero = false;
+    for k in 0..(data.len() - head) / MARKET_ASSET_SLOT_LEN {
+        let s = head + k * MARKET_ASSET_SLOT_LEN;
+        let cut = s + MARKET_ASSET_SLOT_LEN - appended;
+        out.extend_from_slice(&data[s..cut]);
+        tail_nonzero |= data[cut..s + MARKET_ASSET_SLOT_LEN].iter().any(|b| *b != 0);
+    }
+    (out, tail_nonzero)
+}
+
+/// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth
+/// mark, then (positions open) pushes it 4 bp up and lets a risk-reducing TradeCpi accrue, so K
+/// changes and trader y is left STALE: the risk-increasing steps after it are refused identically by both layouts (no
+/// insurance, so no insured admission), and only the drift tail differs.
+fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
+    let cfg = MarketCfg { funding: 0, ..MarketCfg::legacy() };
+    let mut env = Env::try_new_with(&program_path(), cfg).expect("init");
+    let admin = seeded_keypair(2);
+    let (m, mid) = (env.market, env.market_id());
+    let seq = |env: &Env| {
+        state::read_asset_control_sequences(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .oracle_observation
+            + 1
+    };
+    if with_cohort {
+        let slot = env.svm.get_sysvar::<Clock>().slot;
+        let s = seq(&env);
+        env.send(
+            ProgInstruction::ConfigureAuthMark { asset_index: 0, market_id: mid, now_slot: slot, initial_mark_e6: PRICE, observation_sequence: s },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("configure auth mark");
+    }
+    let lp = env.lp(1_000 * USD);
+    let (x, xp) = env.trader(200 * USD);
+    let (y, yp) = env.trader(50 * USD);
+    let keys = [env.market, lp.account, xp, yp, lp.ctx];
+    let names = ["market", "lp", "x", "y", "ctx"];
+    let mut out = Vec::new();
+    let mut tail_seen = false;
+    let mut max_stale = 0u64;
+    let mut snap = |env: &Env, what: &str, out: &mut Vec<String>| {
+        for (k, n) in keys.iter().zip(names) {
+            let (bytes, tail) = strip_drift_tail(&env.svm.get_account(k).unwrap().data, n == "market");
+            tail_seen |= tail;
+            out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
+        }
+        let a = &state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0];
+        max_stale = max_stale.max(a.stale_account_count_long + a.stale_account_count_short);
+    };
+    snap(&env, "setup", &mut out);
+    let mut steps: Vec<(&str, Result<u64, String>)> = vec![
+        ("cpi_open", env.trade_cpi(&x, xp, &lp, units(600))),
+        ("cpi_crowd_5x", env.trade_cpi(&y, yp, &lp, units(100))),
+    ];
+    if with_cohort {
+        // New slot, auth mark 4 bp above the effective price, then a risk-REDUCING TradeCpi by x
+        // performs the canonical accrual: K moves with positions open and y is left STALE (the
+        // LP and x are settled by their own trade).
+        let slot = env.svm.get_sysvar::<Clock>().slot + 1;
+        env.svm.warp_to_slot(slot);
+        let s = seq(&env);
+        let eff = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0].effective_price;
+        steps.push((
+            "push_mark_4bp",
+            env.send(
+                ProgInstruction::PushAuthMark { asset_index: 0, market_id: mid, now_slot: slot, mark_e6: eff + eff * 4 / 10_000, observation_sequence: s },
+                vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+                &[&admin],
+            ),
+        ));
+        steps.push(("cpi_reduce_x_accrues", env.trade_cpi(&x, xp, &lp, -units(10))));
+    }
+    steps.push(("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))));
+    if !with_cohort {
+        // Risk increase. In the cohort case it is deliberately omitted: with a stale cohort an
+        // INSURED risk increase is admitted by #277 and refused by the baseline -- the intended
+        // behaviour change, covered by tests/v21_funding_scale*.rs, not a legacy-parity property.
+        steps.push(("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))));
+    }
+    steps.push(("crank", env.crank(xp)));
+    steps.push(("cpi_close", env.trade_cpi(&x, xp, &lp, -units(610))));
+    for (what, r) in steps {
+        let outcome = match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.split(", meta:").next().unwrap_or(&e).replace(' ', "_"),
+        };
+        out.push(format!("{} OUTCOME {what} {outcome}", if with_cohort { "cohort" } else { "zero" }));
+        snap(&env, what, &mut out);
+    }
+    (out, tail_seen, max_stale)
+}
+
+/// Zero means off: a legacy market (growth OFF, funding OFF) runs the same transaction sequence
+/// with byte-identical account state to the pre-#277 v2.1 wrapper (c493bbc0), outside the
+/// appended K/F drift tail. The reference is a committed fixture of per-snapshot hashes generated
+/// from c493bbc0 in an old-layout tree (`GROWTH_PARITY_FIXTURE_WRITE=<path>`), because a program
+/// of the previous layout cannot run on accounts sized by this build. Two cases:
+/// - zero cohort: nothing ever goes stale, the drift tail stays zero;
+/// - live cohort: an auth-mark move leaves a position stale for the rest of the run; every
+///   outcome of the reduces / closes / cranks and every byte outside the tail still match, and the
+///   tail is non-zero. (Risk increases under a stale cohort are the intended #277 change and are
+///   tested in tests/v21_funding_scale.rs, so they are not part of this parity sequence.)
+///   (Regenerate the fixture whenever the sequence changes.)
 #[test]
 fn growth_off_is_byte_for_byte_legacy() {
-    fn run(so: &PathBuf) -> Vec<(String, Vec<Vec<u8>>)> {
-        let mut env = Env::try_new_with(so, MarketCfg::legacy()).expect("init");
-        let mut out = Vec::new();
-        let lp = env.lp(1_000 * USD);
-        let (x, xp) = env.trader(200 * USD);
-        let (y, yp) = env.trader(50 * USD);
-        let keys = [env.market, lp.account, xp, yp, lp.ctx];
-        let snap = |env: &Env, what: &str, out: &mut Vec<(String, Vec<Vec<u8>>)>| {
-            out.push((
-                what.to_string(),
-                keys.iter()
-                    .map(|k| env.svm.get_account(k).unwrap().data)
-                    .collect(),
-            ));
-        };
-        snap(&env, "setup", &mut out);
-        let steps: Vec<(&str, Result<u64, String>)> = vec![
-            ("cpi open", env.trade_cpi(&x, xp, &lp, units(600))),
-            ("cpi crowd 5x", env.trade_cpi(&y, yp, &lp, units(100))),
-            ("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))),
-            ("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))),
-            ("crank", env.crank(xp)),
-            ("cpi close", env.trade_cpi(&x, xp, &lp, -units(610))),
-        ];
-        for (what, r) in steps {
-            // Outcome only (Ok / the instruction error), never logs: CU differ by design.
-            let outcome = match r {
-                Ok(_) => "ok".to_string(),
-                Err(e) => e.split(", meta:").next().unwrap_or(&e).to_string(),
-            };
-            out.push((format!("{what}: {outcome}"), vec![]));
-            snap(&env, what, &mut out);
-        }
-        out
+    let (zero, zero_tail, zero_stale) = legacy_parity_run(false);
+    let (cohort, cohort_tail, cohort_stale) = legacy_parity_run(true);
+    let mut lines = zero.clone();
+    lines.extend(cohort.clone());
+    if let Some(path) = std::env::var_os("GROWTH_PARITY_FIXTURE_WRITE") {
+        std::fs::write(path, lines.join("\n") + "\n").unwrap();
+        return;
     }
-    let base = run(&base_program_path());
-    let cand = run(&program_path());
-    assert_eq!(base.len(), cand.len());
-    let mut compared = 0;
-    for (b, c) in base.iter().zip(cand.iter()) {
-        assert_eq!(b.0, c.0, "outcome diverged");
-        assert_eq!(b.1, c.1, "account bytes diverged after: {}", b.0);
-        compared += b.1.len();
+    let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fixture.push(PARITY_FIXTURE);
+    let want: Vec<String> = std::fs::read_to_string(&fixture).unwrap().lines().map(str::to_string).collect();
+    assert_eq!(want.len(), lines.len(), "snapshot count");
+    for (w, g) in want.iter().zip(lines.iter()) {
+        assert_eq!(w, g, "diverged from the c493bbc0 legacy run");
     }
-    assert!(
-        compared >= 30,
-        "non-vacuous: {compared} account snapshots compared"
-    );
-    eprintln!(
-        "legacy parity: {} steps, {} account snapshots byte-identical",
-        base.len(),
-        compared
-    );
+    assert!(lines.len() >= 70, "non-vacuous: {} lines compared", lines.len());
+    assert_eq!(zero_stale, 0, "zero-cohort case never goes stale");
+    assert!(!zero_tail, "zero-cohort case leaves the drift tail zero");
+    assert!(cohort_stale > 0, "cohort case really leaves stale positions");
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>() - LEGACY_ENGINE_SLOT_LEN;
+    assert_eq!(appended, 160);
+    assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
+    eprintln!("legacy parity: {} lines identical to c493bbc0 (zero + live cohort)", lines.len());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
