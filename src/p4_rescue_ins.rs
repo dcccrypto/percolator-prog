@@ -247,22 +247,47 @@ pub fn g9_vault_eligible(senior_shares: u128, senior_drawn: u128) -> bool {
     senior_shares > 0 && senior_drawn > 0
 }
 
-/// R-1 (re-review 2026-10-06, mainnet blocker): G9 lends insurance only on a market whose asset-0
-/// price is EXTERNALLY sourced: Hybrid (oracle legs) or an EWMA mark with an external leg. Manual
-/// and AuthMark are creator-pushed (and a leg-less EWMA mark follows the market's own trades), so a
-/// creator could manufacture the deficit G9 pays. `allow_creator_oracle` is the devnet-only
-/// override (`cfg!(feature = "devnet")` at the call site; never on a mainnet build).
-pub fn g9_oracle_allowed(oracle_mode: u8, oracle_leg_count: u8, allow_creator_oracle: bool) -> bool {
+/// R-1 / R-8 (re-reviews 2026-10-06, mainnet blocker): G9 lends insurance only on a market whose
+/// asset-0 price is EXTERNALLY sourced (Hybrid; Manual and AuthMark are creator-pushed, and an
+/// EWMA mark has no legs by the profile validator, so it follows the market's own trades) AND
+/// whose current effective price is AUTHENTICATED (a Hybrid whose feeds went stale falls back to a
+/// trade-driven mark, which a wash trader can move). Each leg must also pass `g9_leg_ok` (R-7).
+/// `allow_creator_oracle` is the devnet-only override (`cfg!(feature = "devnet")` at the call
+/// site; never on a mainnet build).
+pub fn g9_oracle_allowed(oracle_mode: u8, provenance_authenticated: bool, allow_creator_oracle: bool) -> bool {
     const HYBRID: u8 = 1;
-    const EWMA: u8 = 2;
-    let external = (oracle_mode == HYBRID || oracle_mode == EWMA) && oracle_leg_count > 0;
-    external || allow_creator_oracle
+    allow_creator_oracle || (oracle_mode == HYBRID && provenance_authenticated)
 }
 
-/// R-1 (2): insurance never lends more, in total, than the Earn seniors have already lost to
-/// booked draws: the room is `senior_drawn - outstanding`. Dust seniors therefore unlock dust.
-pub fn g9_senior_drawn_room(senior_drawn: u128, outstanding: u128) -> u128 {
-    senior_drawn.saturating_sub(outstanding)
+/// R-7: where a Hybrid leg's account comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum G9LegSource {
+    /// Owned by the Chainlink store program (feeds are not creator-made).
+    Chainlink,
+    /// Owned by Switchboard On-Demand: permissionless, anyone can create a feed with any job.
+    Switchboard,
+    /// Anything else (Pyth is excluded by founder decision; unknown owners fail closed).
+    Other,
+}
+
+/// R-7: a leg is acceptable for G9 iff its account key equals the profile's leg key AND it is a
+/// Chainlink store feed, or a Switchboard feed on the upgrade-authority allowlist
+/// (`["g9_feeds"]`, tag 117).
+pub fn g9_leg_ok(source: G9LegSource, key_matches: bool, allowlisted: bool) -> bool {
+    key_matches
+        && match source {
+            G9LegSource::Chainlink => true,
+            G9LegSource::Switchboard => allowlisted,
+            G9LegSource::Other => false,
+        }
+}
+
+/// R-1 (2) + R-9: insurance never lends more, in total, than the Earn seniors' loss that is STILL
+/// outstanding (and never more than they ever lost): the licence is
+/// `min(senior_drawn, senior_draw_outstanding)`, so it shrinks as seniors are restored, and the
+/// room is that licence minus the backstop already outstanding. Dust seniors unlock only dust.
+pub fn g9_senior_drawn_room(senior_drawn: u128, senior_draw_outstanding: u128, outstanding: u128) -> u128 {
+    senior_drawn.min(senior_draw_outstanding).saturating_sub(outstanding)
 }
 
 /// R-6 (re-review 2026-10-06): the permissionless RESTORE leaves the vault LP this much above its
@@ -492,16 +517,23 @@ mod tests {
 
     #[test]
     fn r1_r2_r6_rules() {
-        // R-1: only externally sourced asset-0 prices, unless the devnet override.
-        assert!(!g9_oracle_allowed(0, 0, false), "Manual refused");
-        assert!(!g9_oracle_allowed(3, 0, false), "AuthMark refused");
-        assert!(!g9_oracle_allowed(2, 0, false), "leg-less EWMA refused");
-        assert!(g9_oracle_allowed(1, 1, false), "Hybrid with a leg allowed");
-        assert!(g9_oracle_allowed(2, 1, false), "EWMA with an external leg allowed");
-        assert!(!g9_oracle_allowed(1, 0, false));
-        assert!(g9_oracle_allowed(3, 0, true), "devnet override");
-        assert_eq!(g9_senior_drawn_room(150, 100), 50);
-        assert_eq!(g9_senior_drawn_room(100, 150), 0);
+        // R-1 / R-8: only an authenticated Hybrid price, unless the devnet override.
+        assert!(!g9_oracle_allowed(0, true, false), "Manual refused");
+        assert!(!g9_oracle_allowed(3, true, false), "AuthMark refused");
+        assert!(!g9_oracle_allowed(2, true, false), "EWMA (leg-less by validation) refused");
+        assert!(g9_oracle_allowed(1, true, false), "authenticated Hybrid allowed");
+        assert!(!g9_oracle_allowed(1, false, false), "R-8: trade-driven fallback refused");
+        assert!(g9_oracle_allowed(3, false, true), "devnet override");
+        // R-7: leg sources.
+        assert!(g9_leg_ok(G9LegSource::Chainlink, true, false));
+        assert!(!g9_leg_ok(G9LegSource::Chainlink, false, true), "key must match");
+        assert!(!g9_leg_ok(G9LegSource::Switchboard, true, false), "creator-made feed refused");
+        assert!(g9_leg_ok(G9LegSource::Switchboard, true, true), "allowlisted feed");
+        assert!(!g9_leg_ok(G9LegSource::Other, true, true), "Pyth / unknown refused");
+        // R-9: the licence shrinks with the seniors' outstanding loss.
+        assert_eq!(g9_senior_drawn_room(150, 150, 100), 50);
+        assert_eq!(g9_senior_drawn_room(100, 150, 150), 0);
+        assert_eq!(g9_senior_drawn_room(1_000, 200, 50), 150, "seniors restored to 200 outstanding");
         // R-2: 1 atom that burns 1 unit worth 428,571 atoms is refused; a full-class exit is not.
         assert!(!ins_burn_admissible(1, 1, 7, 3_000_000, 7));
         assert!(ins_burn_admissible(1, 7, 7, 3_000_000, 7), "full-class exit");
@@ -519,9 +551,10 @@ mod tests {
     #[test]
     fn r1_build_flavour() {
         let devnet = cfg!(feature = "devnet");
-        assert_eq!(g9_oracle_allowed(3, 0, devnet), devnet, "AuthMark: devnet only");
-        assert_eq!(g9_oracle_allowed(0, 0, devnet), devnet, "Manual: devnet only");
-        assert!(g9_oracle_allowed(1, 1, devnet), "Hybrid: both flavours");
+        assert_eq!(g9_oracle_allowed(3, true, devnet), devnet, "AuthMark: devnet only");
+        assert_eq!(g9_oracle_allowed(0, true, devnet), devnet, "Manual: devnet only");
+        assert_eq!(g9_oracle_allowed(1, false, devnet), devnet, "trade-driven Hybrid: devnet only");
+        assert!(g9_oracle_allowed(1, true, devnet), "authenticated Hybrid: both flavours");
     }
 
     #[test]

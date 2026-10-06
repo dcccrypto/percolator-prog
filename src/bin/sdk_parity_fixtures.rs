@@ -161,6 +161,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::InsuranceBackstopDraw { .. } => "InsuranceBackstopDraw",
         Instruction::RescueDeposit { .. } => "RescueDeposit",
         Instruction::InitInsuranceUnits => "InitInsuranceUnits",
+        Instruction::SetG9FeedAllowlist { .. } => "SetG9FeedAllowlist",
     }
 }
 

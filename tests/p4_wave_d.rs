@@ -2867,3 +2867,214 @@ fn r6_restore_leaves_im_buffer() {
     assert!(im > 0, "vacuity: positioned");
     assert!(equity >= im + im.div_ceil(10), "R-6: >= 10% of IM above the floor: {equity} vs {im}");
 }
+
+// ═══════════ Round 4 (2026-10-06): R-7 leg sources, R-8 provenance, R-9 licence ═══════════
+//
+// The leg-source gate exists only on a MAINNET build (devnet keeps the testing override), so these
+// run their real assertions with the non-devnet `.so` and `R1_FLAVOUR=mainnet`; the devnet build
+// asserts the override instead. The gate runs before any vault account is read, so on the
+// mainnet `.so` (where a vault cannot be bound) "gate passed" is read from its
+// `p4_g9_oracle_gate_ok` log on the next (unrelated) refusal.
+
+const ORACLE_AUTHENTICATED: u8 = 0;
+const ORACLE_TRADE_DRIVEN: u8 = 1;
+
+/// Rewrite asset 0's profile as a Hybrid with one leg `feed` (valid per the profile validator).
+fn make_hybrid(w: &mut P3, feed: Pubkey, provenance: u8) {
+    let mut acct = w.env.svm.get_account(&w.env.market).unwrap();
+    {
+        let (_, mut g) = state::market_view_mut(&mut acct.data).unwrap();
+        let len = percolator_prog::constants::ASSET_ORACLE_PROFILE_LEN;
+        let mut p: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(&g.markets[0].wrapper[..len]);
+        p.oracle_mode = 1;
+        p.oracle_leg_count = 1;
+        p.oracle_leg_flags = 0;
+        p.oracle_leg_feeds = [[0u8; 32]; 3];
+        p.oracle_leg_feeds[0] = feed.to_bytes();
+        p.max_staleness_secs = 60;
+        p.hybrid_soft_stale_slots = 50;
+        p.mark_ewma_halflife_slots = 600;
+        p.effective_price_provenance = provenance;
+        state::validate_asset_oracle_profile(&p).expect("valid Hybrid profile");
+        g.markets[0].wrapper[..len].copy_from_slice(bytemuck::bytes_of(&p));
+    }
+    w.env.svm.set_account(w.env.market, acct).unwrap();
+}
+
+fn feed_account(w: &mut P3, owner: Pubkey) -> Pubkey {
+    let k = Pubkey::new_unique();
+    w.env.svm.set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; 256], owner, executable: false, rent_epoch: 0 }).unwrap();
+    k
+}
+
+fn g9_allowlist_pda(w: &P3) -> Pubkey {
+    state::derive_g9_feed_allowlist(&w.env.program_id).0
+}
+
+fn set_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u64, String> {
+    w.env.ensure_signer_account(signer.pubkey());
+    let (pd, list) = (w.program_data, g9_allowlist_pda(w));
+    w.send(
+        ProgInstruction::SetG9FeedAllowlist { keys },
+        vec![
+            AccountMeta::new(signer.pubkey(), true),
+            AccountMeta::new_readonly(pd, false),
+            AccountMeta::new(list, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[signer],
+    )
+}
+
+/// Tag 111 PROPOSE with `tail` appended after the fixed accounts (no units ledger needed: the
+/// gate runs first).
+fn propose_with_tail(w: &mut P3, tail: &[Pubkey]) -> Result<u64, String> {
+    let payer = w.env.payer.pubkey();
+    let mut metas = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new_readonly(w.registry, false),
+        AccountMeta::new(w.state_pda, false),
+        AccountMeta::new(w.lp, false),
+        AccountMeta::new(w.ledger0, false),
+        AccountMeta::new(w.ledger1, false),
+    ];
+    metas.extend(tail.iter().map(|k| AccountMeta::new_readonly(*k, false)));
+    w.send(ProgInstruction::InsuranceBackstopDraw { mode: 2, max_amount: 0 }, metas, &[])
+}
+
+fn gate_passed(r: &Result<u64, String>) -> bool {
+    match r {
+        Ok(_) => true,
+        Err(e) => e.contains("p4_g9_oracle_gate_ok"),
+    }
+}
+fn leg_refused(r: &Result<u64, String>) -> bool {
+    r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_leg_refused") && has(r, INS_REFUSED))
+}
+fn oracle_refused(r: &Result<u64, String>) -> bool {
+    r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused") && has(r, INS_REFUSED))
+}
+
+fn r7_world() -> P3 {
+    let mut w = P3::new();
+    w.lp = Pubkey::new_unique();
+    w
+}
+
+/// R-7 (mainnet): a creator-made (unlisted) Switchboard feed is refused; the SAME feed once the
+/// upgrade authority allowlists it is admitted; without the allowlist account in the tail it is
+/// refused again (control). Devnet: the override admits the unlisted feed (testing only).
+#[test]
+fn r7_switchboard_leg_requires_allowlist() {
+    let mainnet = std::env::var("R1_FLAVOUR").map_or(false, |v| v == "mainnet");
+    let mut w = r7_world();
+    let feed = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
+    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
+    let r = propose_with_tail(&mut w, &[feed]);
+    eprintln!("R-7 unlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
+    if !mainnet {
+        assert!(r.as_ref().err().map_or(false, |e| e.contains("p4_g9_oracle_gate_ok override=1")), "devnet override: {r:?}");
+        return;
+    }
+    assert!(leg_refused(&r), "creator-made Switchboard feed refused: {r:?}");
+    let up = w.upgrade.insecure_clone();
+    set_allowlist(&mut w, &up, vec![feed.to_bytes()]).expect("upgrade authority lists the feed");
+    let list = g9_allowlist_pda(&w);
+    let r = propose_with_tail(&mut w, &[list, feed]);
+    eprintln!("R-7 allowlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(gate_passed(&r), "allowlisted feed admitted by the gate: {r:?}");
+    let r = propose_with_tail(&mut w, &[feed]);
+    assert!(leg_refused(&r), "control: allowlist account omitted -> refused: {r:?}");
+    // A different listed key does not help an unlisted leg.
+    let other = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
+    set_allowlist(&mut w, &up, vec![other.to_bytes()]).expect("relist");
+    let r = propose_with_tail(&mut w, &[list, feed]);
+    assert!(leg_refused(&r), "control: only another feed listed -> refused: {r:?}");
+}
+
+/// R-7 (mainnet): a Chainlink store feed whose key matches the profile is admitted. Controls: the
+/// leg account omitted, a Chainlink account with another key, and a Pyth-owned leg are refused.
+#[test]
+fn r7_chainlink_leg_admitted() {
+    if std::env::var("R1_FLAVOUR").map_or(true, |v| v != "mainnet") {
+        return; // the devnet override is asserted by r7_switchboard_leg_requires_allowlist
+    }
+    let mut w = r7_world();
+    let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
+    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
+    let r = propose_with_tail(&mut w, &[feed]);
+    eprintln!("R-7 Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(gate_passed(&r), "Chainlink admitted: {r:?}");
+    assert!(leg_refused(&propose_with_tail(&mut w, &[])), "control: leg account omitted");
+    let other = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
+    assert!(leg_refused(&propose_with_tail(&mut w, &[other])), "control: Chainlink account with another key");
+    let pyth = feed_account(&mut w, percolator_prog::oracle_v16::PYTH_RECEIVER_PROGRAM_ID);
+    make_hybrid(&mut w, pyth, ORACLE_AUTHENTICATED);
+    assert!(leg_refused(&propose_with_tail(&mut w, &[pyth])), "control: Pyth leg refused (no Pyth)");
+}
+
+/// R-8 (mainnet): a Hybrid whose effective price fell back to the trade-driven mark is refused,
+/// even with a Chainlink leg. Control: the same market AUTHENTICATED passes the gate.
+#[test]
+fn r8_trade_driven_provenance_refused() {
+    if std::env::var("R1_FLAVOUR").map_or(true, |v| v != "mainnet") {
+        return;
+    }
+    let mut w = r7_world();
+    let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
+    make_hybrid(&mut w, feed, ORACLE_TRADE_DRIVEN);
+    let r = propose_with_tail(&mut w, &[feed]);
+    eprintln!("R-8 trade-driven -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(oracle_refused(&r), "trade-driven fallback refused: {r:?}");
+    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
+    assert!(gate_passed(&propose_with_tail(&mut w, &[feed])), "control: authenticated passes");
+}
+
+/// Tag 117 is upgrade-authority only and validates its list (both build flavours).
+#[test]
+fn r7_allowlist_setter_is_authority_only_and_validated() {
+    let mut w = r7_world();
+    let k = Pubkey::new_unique().to_bytes();
+    let stranger = Keypair::new();
+    let r = set_allowlist(&mut w, &stranger, vec![k]);
+    assert!(r.is_err(), "non-authority refused: {r:?}");
+    assert!(w.env.svm.get_account(&g9_allowlist_pda(&w)).map_or(true, |a| a.data.is_empty()), "nothing created");
+    let up = w.upgrade.insecure_clone();
+    assert!(set_allowlist(&mut w, &up, vec![k, k]).is_err(), "duplicates refused");
+    assert!(set_allowlist(&mut w, &up, vec![[0u8; 32]]).is_err(), "zero key refused");
+    assert!(set_allowlist(&mut w, &up, (0..17u8).map(|i| [i + 1; 32]).collect()).is_err(), "17 keys refused");
+    set_allowlist(&mut w, &up, vec![k]).expect("authority sets it");
+    let l = state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(&w)).unwrap().data).unwrap();
+    assert_eq!((l.count, l.keys[0]), (1, k));
+    set_allowlist(&mut w, &up, vec![]).expect("authority clears it");
+    let l = state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(&w)).unwrap().data).unwrap();
+    assert_eq!(l.count, 0);
+}
+
+/// R-9: the G9 licence is the seniors' loss STILL outstanding. With the seniors' outstanding draw
+/// cut to X (as after a partial restore), a draw moves at most X; control: untouched, the draw is
+/// deficit-limited (> X).
+#[test]
+fn r9_licence_shrinks_with_senior_recovery() {
+    let x: u128 = 300_000;
+    let set_senior_out = |w: &mut P3, v: u128| {
+        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
+        st.data[16 + 240..16 + 256].copy_from_slice(&v.to_le_bytes());
+        w.env.svm.set_account(w.state_pda, st).unwrap();
+    };
+    let (mut w, _s, (_t, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+    g9(&mut w, &[tp]).expect("control draw");
+    let full = backstop_st(&w) as u128;
+    assert!(full > x, "control: unlimited draw {full} > {x}");
+    let (mut w, _s, (_t, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+    backstop_111(&mut w, 2, 0, true).expect("propose");
+    g9_wait(&mut w, &[tp], percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
+    set_senior_out(&mut w, x);
+    let r = backstop_111(&mut w, 0, 0, true);
+    eprintln!("R-9 draw with senior outstanding {x} -> {:?}; backstop {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w));
+    r.expect("draw");
+    assert_eq!(backstop_st(&w) as u128, x, "licence = seniors' outstanding loss");
+}
