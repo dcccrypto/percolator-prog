@@ -199,3 +199,7 @@ pub fn v21_market_len(v22_len: usize, slots: usize) -> usize {
 pub fn v21_portfolio_len(v22_len: usize) -> usize {
     v22_len - V16_MAX_PORTFOLIO_ASSETS_N * V22_LEG_EXTRA
 }
+
+pub fn deployed_market_len(v22_len: usize, slots: usize) -> usize {
+    v22_len - V22_CONFIG_EXTRA - slots * (V22_ASSET_EXTRA + FUNDING_SCALE_TAIL)
+}

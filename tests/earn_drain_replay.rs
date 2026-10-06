@@ -3889,10 +3889,6 @@ impl Replay {
         }
         v
     }
-    fn stale_total(&self) -> u64 {
-        let (_, g) = self.env.market_state();
-        g.assets[0].stale_account_count_long + g.assets[0].stale_account_count_short
-    }
     fn sec_rescue(&mut self, who: &Keypair, amount: u64, min_shares: u128) -> (Pubkey, Result<u64, String>) {
         self.env.ensure_signer_account(who.pubkey());
         let ata = self.env.token_account_for_mint(self.lp_mint, who.pubkey(), 0);

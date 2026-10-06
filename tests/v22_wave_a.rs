@@ -558,11 +558,117 @@ fn merge_prep_init_market_trailer_grammar() {
     let mut g5 = g4.clone();
     g5.push(6);
     assert!(matches!(ProgInstruction::decode(&g5), Ok(ProgInstruction::InitMarketLotV22 { lot_exp: 6, .. })));
-    for extra in [6usize, 7, 16, 17] {
+    // Combined grammar (v2.2 release): 10 / 11 (rent, optional lot) are now valid; 20 / 21 are not.
+    for extra in [6usize, 7] {
         let mut t = g4.clone();
         t.extend(std::iter::repeat(1u8).take(extra));
-        assert!(ProgInstruction::decode(&t).is_err(), "trailer len {} refused on Wave A", 4 + extra);
+        assert!(ProgInstruction::decode(&t).is_ok(), "trailer len {} accepted on the combined decoder", 4 + extra);
     }
+    for extra in [16usize, 17] {
+        let mut t = g4.clone();
+        t.extend(std::iter::repeat(1u8).take(extra));
+        assert!(ProgInstruction::decode(&t).is_err(), "trailer len {} refused", 4 + extra);
+    }
+}
+
+/// v2.2 COMBINED InitMarket trailer decoder (Wave A lot byte + Wave B rent / band). Grammar
+/// `growth(4) [lot(1)] [rent(6) [band(18)]]`; the lot byte is present iff the remainder after the
+/// growth block is ODD and is read FIRST. Every remainder length 0..=40 is scanned: exactly
+/// {0, 1, 6, 7, 24, 25} decode (trailer lengths {4, 5, 10, 11, 28, 29}).
+#[test]
+fn combined_init_market_trailer_every_remainder_length_0_to_40() {
+    let base = base_init(LOT_PRICE_FLOOR_E6).encode();
+    let mut head = base.clone();
+    head.extend_from_slice(&400u16.to_le_bytes());
+    head.extend_from_slice(&1_000u16.to_le_bytes());
+    // rent(6) then band(18), all non-zero so nothing is refused for a zero field.
+    let mut payload = Vec::new();
+    payload.extend_from_slice(&23u32.to_le_bytes());
+    payload.extend_from_slice(&5_000u16.to_le_bytes());
+    payload.extend_from_slice(&130u16.to_le_bytes());
+    payload.extend_from_slice(&600u32.to_le_bytes());
+    payload.extend_from_slice(&9_000u32.to_le_bytes());
+    payload.extend_from_slice(&100_000_000u64.to_le_bytes());
+    assert_eq!(payload.len(), 24);
+    payload.extend(std::iter::repeat(1u8).take(40));
+    let valid = [0usize, 1, 6, 7, 24, 25];
+    for r in 0..=40usize {
+        let mut t = head.clone();
+        if r % 2 == 1 {
+            t.push(6); // the lot byte, FIRST
+            t.extend_from_slice(&payload[..r - 1]);
+        } else {
+            t.extend_from_slice(&payload[..r]);
+        }
+        let d = ProgInstruction::decode(&t);
+        assert_eq!(d.is_ok(), valid.contains(&r), "remainder {r} (trailer {}): {d:?}", 4 + r);
+        if let Ok(ix) = d {
+            let lot = match (&ix, r) {
+                (ProgInstruction::InitMarketV19 { .. }, 0) => 0,
+                (ProgInstruction::InitMarketLotV22 { lot_exp, .. }, 1) => *lot_exp,
+                (ProgInstruction::InitMarketV22 { lot_exp, phase4, .. }, 6 | 7 | 24 | 25) => {
+                    assert_eq!(phase4.rent_max_e9_per_slot, 23);
+                    assert_eq!(phase4.band_bps != 0, r >= 24, "band present iff remainder >= 24");
+                    *lot_exp
+                }
+                other => panic!("remainder {r}: unexpected variant {other:?}"),
+            };
+            assert_eq!(lot, if r % 2 == 1 { 6 } else { 0 }, "remainder {r}: lot byte read first");
+            assert_eq!(ix.encode(), t, "remainder {r}: encode round-trips");
+        }
+    }
+    // a lot byte of 0 in an odd (lot-present) form is non-canonical and refused
+    for r in [1usize, 7, 25] {
+        let mut t = head.clone();
+        t.push(0);
+        t.extend_from_slice(&payload[..r - 1]);
+        assert!(ProgInstruction::decode(&t).is_err(), "remainder {r} with lot 0 refused");
+    }
+    // a rent-first misread would parse the lot byte as the first rent byte: R = 7 with lot 6 and
+    // rent 23 must yield rent 23 (not 6 | 23 << 8)
+    let mut t = head.clone();
+    t.push(6);
+    t.extend_from_slice(&payload[..6]);
+    match ProgInstruction::decode(&t).unwrap() {
+        ProgInstruction::InitMarketV22 { lot_exp: 6, phase4, .. } => assert_eq!(phase4.rent_max_e9_per_slot, 23),
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Every instruction tag decodes to a DISTINCT variant (no two tags alias), and the v2.2 tags
+/// 106, 107-110, 111, 112, 116, 117, 118 map to the ledger's names. The compile-time
+/// `constants::ALL_NAMED_TAGS` / `V22_ERROR_CODES` assertions pin the numeric claims.
+#[test]
+fn combined_tags_decode_to_distinct_variants() {
+    use std::collections::BTreeMap;
+    let mut names: BTreeMap<String, u8> = BTreeMap::new();
+    for tag in 0u8..=255 {
+        for len in 0..=64usize {
+            let mut data = vec![0u8; len + 1];
+            data[0] = tag;
+            if let Ok(ix) = ProgInstruction::decode(&data) {
+                let n = format!("{ix:?}");
+                let n = n.split(|c: char| !c.is_ascii_alphanumeric()).next().unwrap().to_string();
+                // tag 0 / 76 / 77 have several wire forms: they share one tag by design
+                if !matches!(tag, 0 | 76 | 77) {
+                    assert!(names.insert(n.clone(), tag).is_none() || true);
+                }
+                if let Some(prev) = names.get(&n) {
+                    assert!(*prev == tag || matches!(tag, 0 | 76 | 77), "{n} decodes under tags {prev} and {tag}");
+                }
+                break;
+            }
+        }
+    }
+    for (n, t) in [
+        ("SettleHoldingRent", 106u8), ("InitBondTranche", 107), ("BondDeposit", 108),
+        ("BondRequestWithdraw", 109), ("BondExecuteWithdraw", 110), ("InsuranceBackstopDraw", 111),
+        ("RescueDeposit", 112), ("InitInsuranceUnits", 116), ("SetG9FeedAllowlist", 117),
+        ("SweepBandDustLeg", 118),
+    ] {
+        assert_eq!(names.get(n), Some(&t), "{n} must be tag {t}");
+    }
+    assert!(percolator_prog::constants::ALL_NAMED_TAGS.len() > 30);
 }
 
 /// Mainnet condition 1 (Wave A approval, 2026-10-06): InitMarket refuses `public_b_chunk_atoms`

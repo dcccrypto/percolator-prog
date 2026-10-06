@@ -41,8 +41,10 @@ const DOMAIN: u16 = 0; // asset 0, long side
 const MATCHER_CONTEXT_LEN: usize = 320;
 /// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
 /// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
-const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX");
-const PRICE: u64 = 1_000_000; // $1.00 e6
+const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+// v2.2 combined release: Wave A's 1e7 launch floor binds every growth market, so the fixtures launch
+// at $10.00 e6 and one test "unit" is 1/10 token: every notional equals the pre-merge $1 fixtures.
+const PRICE: u64 = 10_000_000; // $10.00 e6
 
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
@@ -1549,7 +1551,7 @@ fn growth_params() -> Params {
 }
 
 const U: u64 = 1_000_000; // 1 USDC / 1 unit at $1
-const UQ: i128 = 1_000_000; // 1 unit in Q (POS_SCALE = 1e6)
+const UQ: i128 = 100_000; // 1 unit in Q = 1/10 token (POS_SCALE = 1e6)
 
 impl Env {
     fn ext_key(&self) -> Pubkey {
@@ -2164,7 +2166,7 @@ fn bond_deposit_mints_at_par_and_ncap_counts_junior_alpha_earn_and_bonds() {
         let t = Some(env.tranche_key());
         env.allocate_bond(lp.portfolio, u128::MAX, t).expect("103: 5,000 of Earn");
         let cap_before = env.n_cap(lp.portfolio);
-        assert_eq!(cap_before, 6_000 * POS as u128, "junior 1,000 + alpha 50% x Earn 10,000");
+        assert_eq!(cap_before, 6_000 * UQ as u128, "junior 1,000 + alpha 50% x Earn 10,000");
         if bond {
             let h = env.new_bond_holder();
             let lp_cap0 = env.portfolio(lp.portfolio).capital;
@@ -2189,8 +2191,8 @@ fn bond_deposit_mints_at_par_and_ncap_counts_junior_alpha_earn_and_bonds() {
     };
     let (cap_off, pos_off) = fill(false);
     let (cap_on, pos_on) = fill(true);
-    assert_eq!(cap_on, 8_000 * POS as u128, "N_cap = junior + alpha*Earn + bonds");
-    assert_eq!(cap_off, 6_000 * POS as u128);
+    assert_eq!(cap_on, 8_000 * UQ as u128, "N_cap = junior + alpha*Earn + bonds");
+    assert_eq!(cap_off, 6_000 * UQ as u128);
     assert_eq!(pos_off, 6_000 * UQ, "control: clipped without the bond");
     assert_eq!(pos_on, 8_000 * UQ, "the bond-backed capacity fills the whole order");
 }
@@ -2274,7 +2276,7 @@ fn bond_self_funding_attack_is_refused() {
     let (mut env, lp, _d, _h) = bond_world(growth_params(), 10_000, 1_000, 0, 0);
     let attacker = env.new_bond_holder();
     env.bond_deposit(&attacker, lp.portfolio, 1_000 * U, 1).expect("attacker posts a 1,000 bond");
-    assert_eq!(env.n_cap(lp.portfolio), 2_000 * POS as u128, "capacity doubled by the bond");
+    assert_eq!(env.n_cap(lp.portfolio), 2_000 * UQ as u128, "capacity doubled by the bond");
     // the attacker pre-positions the withdrawal while the book is empty
     env.bond_request(&attacker, 1_000 * U as u128).expect("109");
     // Growth markets here run max_accrual_dt_slots = 1: a slot gap must be caught up crank by
@@ -2302,7 +2304,7 @@ fn bond_self_funding_attack_is_refused() {
     env.trade_signing_fee(&thin, &lp, -2_000 * UQ, GROWTH_FEE).expect("other side");
     assert_eq!(env.position(lp.portfolio), 0, "vault LP flat");
     let g = env.market_state().1;
-    assert!(g.assets[0].oi_eff_long_q >= 2_000 * POS as u128 && g.assets[0].oi_eff_short_q >= 2_000 * POS as u128, "users' OI still open");
+    assert!(g.assets[0].oi_eff_long_q >= 2_000 * UQ as u128 && g.assets[0].oi_eff_short_q >= 2_000 * UQ as u128, "users' OI still open");
     let _ = env.crank(lp.portfolio);
     let _ = env.crank_fees_bond(lp.portfolio); // 38 when nothing is harvestable
     err_has(&env.bond_execute(&attacker, lp.portfolio, 0), PercolatorError::BondCapacityLocked);
@@ -2340,7 +2342,7 @@ fn bond_lock_binds_with_a_flat_vault_lp_and_open_user_oi() {
     env.trade_signing_fee(&short, &lp, -1_500 * UQ, GROWTH_FEE).expect("short 1,500 (LP back to flat)");
     assert_eq!(env.position(lp.portfolio), 0, "vault LP flat");
     let g = env.market_state().1;
-    assert_eq!((g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q), (1_500 * POS as u128, 1_500 * POS as u128));
+    assert_eq!((g.assets[0].oi_eff_long_q, g.assets[0].oi_eff_short_q), (1_500 * UQ as u128, 1_500 * UQ as u128));
     let _ = env.crank(lp.portfolio);
     let _ = env.crank_fees_bond(lp.portfolio);
     // N_cap after the exit would be 1,000 < 1,500 open on each side.
@@ -2362,7 +2364,7 @@ fn bond_lock_binds_with_a_flat_vault_lp_and_open_user_oi() {
 /// exit pays exactly its layer of the split; seniors redeem exactly C.
 #[test]
 fn bond_waterfall_order_under_losses() {
-    for (case, px) in [(0, 1_300_000u64), (1, 2_000_000), (2, 3_000_000)] {
+    for (case, px) in [(0, 13_000_000u64), (1, 20_000_000), (2, 30_000_000)] {
         let (mut env, lp, d, h) = bond_world(Params::default(), 10_000, 500, 1_000, 800);
         let c0 = env.vlp().senior_claim_atoms;
         let t = env.new_trader(5_000 * U);
@@ -2691,7 +2693,7 @@ fn impaired_bond_world(coupon_bps: u16) -> (Env, Lp, Depositor, BondHolder, Trad
     let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, coupon_bps);
     let t = env.new_trader(5_000 * U);
     env.trade(&t, &lp, 1_000 * UQ).expect("long");
-    env.move_price(2_000_000, &[t.portfolio, lp.portfolio]);
+    env.move_price(20_000_000, &[t.portfolio, lp.portfolio]);
     env.trade(&t, &lp, -1_000 * UQ).expect("close");
     env.hold(12, &[t.portfolio, lp.portfolio]);
     let _ = env.crank_fees_bond(lp.portfolio);

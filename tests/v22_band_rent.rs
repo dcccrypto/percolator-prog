@@ -36,8 +36,11 @@ use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
 const MATCHER_CONTEXT_LEN: usize = 320;
-const PRICE: u64 = 1_000_000;
-const Q: i128 = POS_SCALE as i128;
+// v2.2 combined release: Wave A's 1e7 launch floor binds every growth (and so every band) market.
+const PRICE: u64 = 10_000_000;
+// one test "unit" = 1/10 token so every notional (and so every rent / margin figure) equals the pre-merge
+// $1-per-unit fixtures at the 1e7 launch price.
+const Q: i128 = POS_SCALE as i128 / 10;
 const USD: u128 = 1_000_000;
 const ENGINE_IMR: u64 = 1_000;
 const MMR: u64 = 500;
@@ -225,6 +228,7 @@ fn init_market_ix(c: &Cfg) -> ProgInstruction {
             market: Box::new(base),
             growth_r_gap_bps: c.r_gap,
             growth_l_launch_x100: 1_000,
+            lot_exp: 0,
             phase4: p,
         },
     }
@@ -796,6 +800,7 @@ fn v22_init_market_wire_roundtrip_and_strictness() {
             market: market.clone(),
             growth_r_gap_bps: if p.band_bps == 0 { 400 } else { 0 },
             growth_l_launch_x100: 1_000,
+            lot_exp: 0,
             phase4: p,
         };
         let bytes = ix.encode();
@@ -1207,7 +1212,7 @@ fn sec_tag106_cannot_be_spoofed_double_charged_or_redirected() {
     }
     let charged = cap_before - env.portfolio_state(taker.1).capital;
     let idx_after = env.engine_asset().rent_index_long_num;
-    let q = 800 * POS_SCALE;
+    let q = 800 * POS_SCALE / 10;
     let one_shot = percolator::band_rent::rent_due_atoms(q, idx_after, idx_before).unwrap();
     eprintln!("SEC rent 10 settles charged {charged}, one-shot floor {one_shot}");
     assert!(charged <= one_shot + 1 && charged + 1 >= one_shot, "split settles drift: {charged} vs {one_shot}");
@@ -1534,7 +1539,9 @@ fn v22_band_market_refuses_a_too_narrow_genesis_band() {
     let r = at(1_000, band_cfg());
     assert!(r.as_ref().is_err_and(|e| e.contains(&code(PercolatorError::PriceBandConfigInvalid))), "{r:?}");
     assert!(at(PRICE, band_cfg()).is_ok(), "a launch far above the floor is accepted");
-    assert!(at(1_000, Cfg { slots: 1, phase4: Some(phase4(0, RENT_MAX)), r_gap: 400 }).is_ok(), "band off: no width rule");
+    // band off: no width rule (105); Wave A's 1e7 launch floor (119) is the only price rule left
+    let r = at(1_000, Cfg { slots: 1, phase4: Some(phase4(0, RENT_MAX)), r_gap: 400 });
+    assert!(r.as_ref().is_err_and(|e| e.contains(&code(PercolatorError::LotConfigInvalid))), "{r:?}");
 }
 
 /// Review W-M1: rent must bite on a rent market: `rent_max >= 10 e9/slot` and `kink <= 80%`
@@ -1934,7 +1941,10 @@ fn v22_band_genesis_needs_100x_the_width_floor() {
     };
     let cfg_err = code(PercolatorError::PriceBandConfigInvalid);
     assert!(at(min * 100 - 1).is_err_and(|e| e.contains(&cfg_err)));
-    assert!(at(min * 100).is_ok());
+    // v2.2 combined release: at d = 100 bps Wave A's 1e7 launch floor (119) is above this rule.
+    let lot_err = code(PercolatorError::LotConfigInvalid);
+    assert!(at(min * 100).is_err_and(|e| e.contains(&lot_err)), "A's floor binds above B's rule");
+    assert!(at(10_000_000).is_ok());
 }
 
 /// N-2: Wave A's launch floor (`LOT_PRICE_FLOOR_E6` = 1e7, feat/v22-wave-a) applies to every
@@ -1975,7 +1985,7 @@ fn v22_band_floor_keeps_exits_open() {
     let long = env.trader(1_000 * USD);
     env.poke_flat_asset_price(3_300);
     env.crank(lp.account).ok();
-    env.trade_cpi(&long.0, long.1, &lp, 20_000 * Q).expect("open long ($33)");
+    env.trade_cpi(&long.0, long.1, &lp, 20_000 * POS_SCALE as i128).expect("open long ($33)");
     let mut refused_above_floor = false;
     for _ in 0..400 {
         env.warp(1);
@@ -1988,7 +1998,7 @@ fn v22_band_floor_keeps_exits_open() {
         }
         let stuck = !percolator::band_rent::band_width_ok(a.effective_price, D).unwrap();
         if !stuck && !refused_above_floor && a.raw_oracle_target_price < a.effective_price {
-            let r = env.trade_cpi(&long.0, long.1, &lp, -10_000 * Q);
+            let r = env.trade_cpi(&long.0, long.1, &lp, -10_000 * POS_SCALE as i128);
             assert_err(&r, &code(PercolatorError::PriceBandPinned), "lagged favourable close above the floor");
             refused_above_floor = true;
         }
@@ -2000,7 +2010,7 @@ fn v22_band_floor_keeps_exits_open() {
     let a = env.engine_asset();
     assert!(!percolator::band_rent::band_width_ok(a.effective_price, D).unwrap(), "reached the floor: {}", a.effective_price);
     assert!(a.raw_oracle_target_price < a.effective_price, "still lagged");
-    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * Q);
+    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
     assert!(r.is_ok(), "exit at the floor lands: {r:?}");
     assert_eq!(env.pos(long.1), 0);
     env.assert_conservation();
@@ -2018,7 +2028,7 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let long = env.trader(1_000 * USD);
     env.poke_flat_asset_price(1_660);
     env.crank(lp.account).ok();
-    env.trade_cpi(&long.0, long.1, &lp, 20_000 * Q).expect("open long ($33)");
+    env.trade_cpi(&long.0, long.1, &lp, 20_000 * POS_SCALE as i128).expect("open long ($33)");
     env.warp(1);
     env.push(1);
     let _ = env.crank(long.1);
@@ -2026,7 +2036,7 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let a = env.engine_asset();
     assert_eq!(a.effective_price, 1_660, "the cap law cannot move 1,660 at 4 bps/slot");
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
-    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * Q);
+    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
     assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
     env.assert_conservation();
 }

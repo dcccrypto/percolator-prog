@@ -97,7 +97,7 @@ impl P3 {
         std::env::set_var("INDEP_WRAPPER_SO", p3_so());
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams { initial_price: PRICE, ..V16CuMarketParams::default() });
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);

@@ -596,6 +596,39 @@ pub mod constants {
     pub const G9_FEED_ALLOWLIST_VERSION: u8 = 1;
     pub const G9_FEED_ALLOWLIST_CAP: usize = 16;
 
+    /// v2.2 combined release: every named instruction tag, pinned DISTINCT at compile time (a merge
+    /// that gives two instructions the same tag fails to build). Tags 0 / 76 / 77 are extended
+    /// wire forms of existing tags, not new tags.
+    const fn all_distinct_u8(a: &[u8]) -> bool {
+        let mut i = 0;
+        while i < a.len() {
+            let mut j = i + 1;
+            while j < a.len() {
+                if a[i] == a[j] {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+    pub const ALL_NAMED_TAGS: [u8; 41] = [
+        TAG_SET_ASSET_RISK_LIMITS, TAG_INIT_VAULT_LP, TAG_VAULT_LP_SET_MATCHER,
+        TAG_DEPOSIT_JUNIOR_TRANCHE, TAG_WITHDRAW_JUNIOR_TRANCHE, TAG_VAULT_LP_RECALL,
+        TAG_SET_VAULT_LP_RISK, TAG_VAULT_LP_CONVERT_PNL, TAG_VAULT_LP_SETTLE_RESOLVED,
+        TAG_VAULT_LP_RELEASE_SURPLUS, TAG_VAULT_LP_ALLOCATE, TAG_ADL_WIND_DOWN,
+        TAG_SET_ADL_WIND_DOWN_MAX_SLOTS, TAG_SETTLE_HOLDING_RENT, TAG_SWEEP_BAND_DUST_LEG,
+        TAG_INIT_BOND_TRANCHE, TAG_BOND_DEPOSIT, TAG_BOND_REQUEST_WITHDRAW,
+        TAG_BOND_EXECUTE_WITHDRAW, TAG_INSURANCE_BACKSTOP_DRAW, TAG_RESCUE_DEPOSIT,
+        TAG_INIT_INSURANCE_UNITS, TAG_SET_G9_FEED_ALLOWLIST, TAG_CREATE_LP_VAULT,
+        TAG_DEPOSIT_TO_LP_VAULT, TAG_REQUEST_REDEEM_LP_SHARES, TAG_EXECUTE_REDEMPTION,
+        TAG_LP_VAULT_CRANK_FEES, TAG_SET_LP_VAULT_PAUSED, TAG_CLOSE_LP_VAULT,
+        TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
+        // padding entries (distinct sentinels above any real tag) keep the array length fixed
+        200, 201, 202, 203, 204, 205, 206, 207,
+    ];
+    const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
     pub const PORTFOLIO_STATE_LEN: usize = size_of::<PortfolioAccountV16Account>();
@@ -1717,6 +1750,47 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::RescueRefused as u32 == 114);
     const _: () = assert!(PercolatorError::RescueNavFloor as u32 == 115);
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
+    /// v2.2 combined release: every error code of the Phase 2b / v2.2 block, pinned DISTINCT at
+    /// compile time (rustc also rejects duplicate enum discriminants; this keeps the claim visible).
+    const V22_ERROR_CODES: [u32; 26] = [
+        PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32,
+        PercolatorError::VaultLpAllocateRefused as u32,
+        101, 102, 103,
+        PercolatorError::PriceBandPinned as u32,
+        PercolatorError::PriceBandConfigInvalid as u32,
+        PercolatorError::HoldingRentConfigInvalid as u32,
+        PercolatorError::BondTrancheImpaired as u32,
+        PercolatorError::BondCapacityLocked as u32,
+        PercolatorError::BondWithdrawCooldown as u32,
+        PercolatorError::BondConfigInvalid as u32,
+        PercolatorError::PriceBandPositionCap as u32,
+        PercolatorError::PriceBandTooNarrow as u32,
+        PercolatorError::PriceBandLegBelowMinNotional as u32,
+        PercolatorError::RescueRefused as u32,
+        PercolatorError::RescueNavFloor as u32,
+        PercolatorError::InsuranceBackstopRefused as u32,
+        PercolatorError::RedemptionBelowMinPayout as u32,
+        PercolatorError::ExitRequiresLossCurrent as u32,
+        PercolatorError::LotConfigInvalid as u32,
+        120, 121, 122,
+        PercolatorError::BondDepositAboveCap as u32,
+        PercolatorError::BondSlippage as u32,
+    ];
+    const fn all_distinct_u32(a: &[u32]) -> bool {
+        let mut i = 0;
+        while i < a.len() {
+            let mut j = i + 1;
+            while j < a.len() {
+                if a[i] == a[j] {
+                    return false;
+                }
+                j += 1;
+            }
+            i += 1;
+        }
+        true
+    }
+    const _: () = assert!(all_distinct_u32(&V22_ERROR_CODES), "duplicate error code");
     // Phase 2b codes carry EXPLICIT discriminants (security review I-2, P2b lock exits): an
     // implicit tail would silently renumber when merged next to Builder D's pinned 120..=122
     // block. Pinned here and in tests/p3_vault_lp.rs (p2b_error_codes_are_pinned).
@@ -12892,7 +12966,20 @@ pub mod processor {
     pub(crate) fn reject_market_price_lagged_ai(market_ai: &AccountInfo<'_>) -> ProgramResult {
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_, group) = state::market_view_mut(&mut market_data)?;
-        reject_market_price_lagged_view(&group)
+        reject_band_market_price_lagged_view(&group)
+    }
+
+    /// The Wave C / D payout paths wait on a lagged mark ONLY on a band market (`band_bps != 0`):
+    /// off-band the engine's own risk-increasing-fill refusal and the paths' lag-worse valuation
+    /// (`vault_lp_equity_lag_bounds_ro`) already bound the price, and a plain per-slot price-move
+    /// cap lag is normal there. Same scope the Wave B round-3 review fix gives its own gates.
+    pub(crate) fn reject_band_market_price_lagged_view(
+        group: &state::MarketViewMutV16<'_>,
+    ) -> ProgramResult {
+        if group.header.config.band_bps.get() == 0 {
+            return Ok(());
+        }
+        reject_market_price_lagged_view(group)
     }
 
     /// v2.2 D-1 (re-review N-3): any of `portfolio`'s active legs sits on a lagged asset.
@@ -12926,6 +13013,15 @@ pub mod processor {
         let asset = &slot.engine.asset;
         let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
         Ok(exposed && asset_target_differs_view(asset))
+    }
+
+    /// The pre-Wave-B predicate (exposed AND target != effective), kept for Wave D's non-bound
+    /// rescue source-asset check, which has always applied on every market.
+    pub(crate) fn asset_has_exposed_target_effective_lag_view_v22(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        asset_price_lagged_view(group, asset_index)
     }
 
     fn reject_exposed_target_effective_lag_view(
@@ -15180,14 +15276,6 @@ pub mod processor {
         // fix/v21-funding-precision: the engine now accrues funding exactly (no pre-floor to
         // whole price units), so the former `warn_if_funding_cannot_accrue` creation-time warning
         // ("funding floors to zero below a price threshold") is no longer true and was removed.
-        // v2.2 Wave A item 7: a growth market (every creator-launched v2.2 market) is priced
-        // per lot and must start at or above the 10^7 e6 precision floor; the lot exponent is
-        // bounded. A lot exponent without a growth block cannot be expressed on the wire.
-        if !crate::wave_a_v22::lot_exp_ok(lot_exp)
-            || crate::wave_a_v22::lot_price_below_floor(growth.is_some(), initial_price)
-        {
-            return Err(PercolatorError::LotConfigInvalid.into());
-        }
         // v2.2 Phase 4: holding-fee rent and the per-epoch band into the (immutable) engine
         // config. A band / rent failure is named (105 / 106) instead of the generic engine
         // config error, by validating the config with and without the new words.
@@ -15215,6 +15303,16 @@ pub mod processor {
                 < growth_v19::band_min_leg_notional_floor(unpack_mint(mint_ai)?.decimals)
         {
             return Err(PercolatorError::PriceBandConfigInvalid.into());
+        }
+        // (combined release: the band / rent config errors 105 / 106 are named first; the lot / precision
+        // floor 119 applies after them)
+        // v2.2 Wave A item 7: a growth market (every creator-launched v2.2 market) is priced
+        // per lot and must start at or above the 10^7 e6 precision floor; the lot exponent is
+        // bounded. A lot exponent without a growth block cannot be expressed on the wire.
+        if !crate::wave_a_v22::lot_exp_ok(lot_exp)
+            || crate::wave_a_v22::lot_price_below_floor(growth.is_some(), initial_price)
+        {
+            return Err(PercolatorError::LotConfigInvalid.into());
         }
         let init_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
         let wrapper = WrapperConfigV16 {
@@ -35542,7 +35640,7 @@ pub mod processor {
             }
             // v2.2 D-1 (combined release): every G9 mode (PROPOSE / DRAW / RESTORE) sizes from the
             // vault LP equity and insurance at P_last: wait (21) while any asset's mark lags.
-            reject_market_price_lagged_view(&group)?;
+            reject_band_market_price_lagged_view(&group)?;
             reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
             // G9 lends the unit holders' insurance, so it runs ONLY on a unitised market (the
             // receivable must be mirrored from the first draw on; a ledger created after a
@@ -36197,7 +36295,7 @@ pub mod processor {
             let (cfg_v, group) = state::market_view_mut(&mut market_data)?;
             // v2.2 D-1 (combined release): the rescue prices from the certified vault value at
             // P_last: wait (21) while any asset's mark lags its target (bound and non-bound).
-            reject_market_price_lagged_view(&group)?;
+            reject_band_market_price_lagged_view(&group)?;
             if lp_vault_harvestable_fee_atoms(&cfg_v, &group)? != 0 {
                 return Err(PercolatorError::RescueRefused.into());
             }
@@ -36212,7 +36310,7 @@ pub mod processor {
             } else if !rescue_nonbound_loss_current_view(&group, asset_index)?
                 || asset_local_loss_stale_view(&group, asset_index)
                 || asset_local_open_kf_cohort_view(&group, asset_index)
-                || asset_price_lagged_view(&group, asset_index)?
+                || asset_has_exposed_target_effective_lag_view_v22(&group, asset_index)?
             {
                 // Non-bound source asset must be loss-current: E3 is then exact per pot (the
                 // combined reading below closes the cross-pot wedge).

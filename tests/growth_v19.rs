@@ -367,7 +367,7 @@ impl Env {
                     {
                         let len = state::market_account_len_for_capacity(cfg.slots).unwrap();
                         if v21_layout {
-                            v21_upgrade::v21_market_len(len, cfg.slots)
+                            v21_upgrade::deployed_market_len(len, cfg.slots)
                         } else {
                             len
                         }
@@ -1526,7 +1526,6 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
 /// Engine slot length of the previous (v2.1 pre-#277) layout. On this layout the engine appends
 /// `kf_drift_long/short` (160 B); on the old layout the strip below is a no-op.
 const LEGACY_ENGINE_SLOT_LEN: usize = 1301;
-const PARITY_FIXTURE: &str = "tests/fixtures/growth_legacy_parity_v21.txt";
 
 /// Account bytes with the appended K/F drift tail removed from every engine asset slot.
 fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
@@ -1557,13 +1556,22 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
 /// mark, then (positions open) pushes it 4 bp up and lets a risk-reducing TradeCpi accrue, so K
 /// changes and trader y is left STALE: the risk-increasing steps after it are refused identically by both layouts (no
 /// insurance, so no insured admission), and only the drift tail differs.
-fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
+/// Deployed-layout account bytes re-encoded for this build's decoders (zero tail + zero band words).
+fn as_v22(deployed_layout: bool, env: &Env, data: Vec<u8>) -> Vec<u8> {
+    if deployed_layout {
+        v21_upgrade::upgrade_v21_account(&env.program_id, &env.program_id, data)
+    } else {
+        data
+    }
+}
+
+fn legacy_parity_run(so: &PathBuf, deployed_layout: bool, with_cohort: bool) -> (Vec<String>, bool, u64) {
     let cfg = MarketCfg { funding: 0, ..MarketCfg::legacy() };
-    let mut env = Env::try_new_with(&program_path(), cfg).expect("init");
+    let mut env = Env::try_new_with_layout(so, cfg, deployed_layout).expect("init");
     let admin = seeded_keypair(2);
     let (m, mid) = (env.market, env.market_id());
     let seq = |env: &Env| {
-        state::read_asset_control_sequences(&env.svm.get_account(&env.market).unwrap().data, 0)
+        state::read_asset_control_sequences(&as_v22(deployed_layout, &env, env.svm.get_account(&env.market).unwrap().data), 0)
             .unwrap()
             .oracle_observation
             + 1
@@ -1589,28 +1597,33 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
     let mut snap = |env: &Env, what: &str, out: &mut Vec<String>| {
         for (k, n) in keys.iter().zip(names) {
             let mut raw = env.svm.get_account(k).unwrap().data.clone();
-            if n == "market" {
-                // v2.2 Wave A, the ONE deliberate divergence from the c493bbc0 legacy run: every
-                // profile a v2.2 program creates carries p4_flags bit2 EXIT_REQUIRES_LOSS_CURRENT
-                // (asset profile byte +20). Assert it is exactly that byte and bit in every asset
-                // slot, then mask it (on the unstripped bytes); every other byte stays identical
-                // to the legacy fixture.
-                let slots = state::market_slot_capacity(&raw).unwrap();
-                for i in 0..slots {
-                    let at = state::asset_growth_range(&raw, i).unwrap().start
-                        - percolator_prog::constants::ASSET_GROWTH_OFF
-                        + 20;
-                    assert_eq!(raw[at], percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
-                    raw[at] = 0;
+            let (bytes, tail) = if deployed_layout {
+                // the deployed v2.1 program on deployed-layout accounts: nothing to normalise
+                (raw, false)
+            } else {
+                if n == "market" {
+                    // v2.2 Wave A, the ONE deliberate divergence from the deployed program: every
+                    // profile a v2.2 program creates carries p4_flags bit2 EXIT_REQUIRES_LOSS_CURRENT
+                    // (asset profile byte +20). Assert it is exactly that byte and bit in every asset
+                    // slot, then mask it (on the unstripped bytes).
+                    let slots = state::market_slot_capacity(&raw).unwrap();
+                    for i in 0..slots {
+                        let at = state::asset_growth_range(&raw, i).unwrap().start
+                            - percolator_prog::constants::ASSET_GROWTH_OFF
+                            + 20;
+                        assert_eq!(raw[at], percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
+                        raw[at] = 0;
+                    }
                 }
-            }
-            // v2.2 Wave B words must stay zero on this band-off, rent-off market (asserted by the
-            // projection); the result is the v2.1 layout + the #277 tail, exactly what c493bbc0 wrote.
-            let (bytes, tail) = strip_drift_tail(&v21_upgrade::project_v22_account_to_v21(&raw), n == "market");
+                // Wave B words must stay zero on this band-off, rent-off market (asserted by the
+                // projection); the result is the deployed layout + the #277 tail, which is stripped
+                // (and reported) for the market.
+                strip_drift_tail(&v21_upgrade::project_v22_account_to_v21(&raw), n == "market")
+            };
             tail_seen |= tail;
             out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
         }
-        let a = &state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0];
+        let a = &state::read_market(&as_v22(deployed_layout, env, env.svm.get_account(&env.market).unwrap().data)).unwrap().1.assets[0];
         max_stale = max_stale.max(a.stale_account_count_long + a.stale_account_count_short);
     };
     snap(&env, "setup", &mut out);
@@ -1625,7 +1638,7 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
         let slot = env.svm.get_sysvar::<Clock>().slot + 1;
         env.svm.warp_to_slot(slot);
         let s = seq(&env);
-        let eff = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap().1.assets[0].effective_price;
+        let eff = state::read_market(&as_v22(deployed_layout, &env, env.svm.get_account(&env.market).unwrap().data)).unwrap().1.assets[0].effective_price;
         steps.push((
             "push_mark_4bp",
             env.send(
@@ -1657,32 +1670,35 @@ fn legacy_parity_run(with_cohort: bool) -> (Vec<String>, bool, u64) {
 }
 
 /// Zero means off: a legacy market (growth OFF, funding OFF) runs the same transaction sequence
-/// with byte-identical account state to the pre-#277 v2.1 wrapper (c493bbc0), outside the
-/// appended K/F drift tail. The reference is a committed fixture of per-snapshot hashes generated
-/// from c493bbc0 in an old-layout tree (`GROWTH_PARITY_FIXTURE_WRITE=<path>`), because a program
-/// of the previous layout cannot run on accounts sized by this build. Two cases:
+/// with byte-identical account state to the DEPLOYED v2.1 program (7c906e45), outside (a) the
+/// appended K/F drift tail (#277), (b) the Wave B band/rent words (asserted zero), and (c) Wave A's
+/// p4 bit2 (asserted exactly that bit). Two cases:
 /// - zero cohort: nothing ever goes stale, the drift tail stays zero;
 /// - live cohort: an auth-mark move leaves a position stale for the rest of the run; every
 ///   outcome of the reduces / closes / cranks and every byte outside the tail still match, and the
 ///   tail is non-zero. (Risk increases under a stale cohort are the intended #277 change and are
 ///   tested in tests/v21_funding_scale.rs, so they are not part of this parity sequence.)
-///   (Regenerate the fixture whenever the sequence changes.)
+/// The committed `tests/fixtures/growth_legacy_parity_v21.txt` (#528) is NOT used any more: in the
+/// v2.2 combination its first market line already disagrees with the deployed program's bytes
+/// (see ledger/v22-combination-2026-10-06.md), while this direct run agrees on all 88 snapshots.
 #[test]
 fn growth_off_is_byte_for_byte_legacy() {
-    let (zero, zero_tail, zero_stale) = legacy_parity_run(false);
-    let (cohort, cohort_tail, cohort_stale) = legacy_parity_run(true);
+    // Reference = the DEPLOYED v2.1 program (GROWTH_BASE_SO, 7c906e45) run on deployed-layout
+    // accounts; candidate = this build, normalised (Wave A p4 bit masked, Wave B words asserted zero
+    // and projected out, the #277 drift tail stripped). Outcomes and every account byte must match.
+    let base_so = base_program_path();
+    let cand_so = program_path();
+    let (zero_b, _, _) = legacy_parity_run(&base_so, true, false);
+    let (cohort_b, _, _) = legacy_parity_run(&base_so, true, true);
+    let (zero, zero_tail, zero_stale) = legacy_parity_run(&cand_so, false, false);
+    let (cohort, cohort_tail, cohort_stale) = legacy_parity_run(&cand_so, false, true);
     let mut lines = zero.clone();
     lines.extend(cohort.clone());
-    if let Some(path) = std::env::var_os("GROWTH_PARITY_FIXTURE_WRITE") {
-        std::fs::write(path, lines.join("\n") + "\n").unwrap();
-        return;
-    }
-    let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    fixture.push(PARITY_FIXTURE);
-    let want: Vec<String> = std::fs::read_to_string(&fixture).unwrap().lines().map(str::to_string).collect();
+    let mut want = zero_b;
+    want.extend(cohort_b);
     assert_eq!(want.len(), lines.len(), "snapshot count");
     for (w, g) in want.iter().zip(lines.iter()) {
-        assert_eq!(w, g, "diverged from the c493bbc0 legacy run");
+        assert_eq!(w, g, "diverged from the deployed v2.1 program");
     }
     assert!(lines.len() >= 70, "non-vacuous: {} lines compared", lines.len());
     assert_eq!(zero_stale, 0, "zero-cohort case never goes stale");
@@ -1693,7 +1709,7 @@ fn growth_off_is_byte_for_byte_legacy() {
         - LEGACY_ENGINE_SLOT_LEN;
     assert_eq!(appended, 160);
     assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
-    eprintln!("legacy parity: {} lines identical to c493bbc0 (zero + live cohort)", lines.len());
+    eprintln!("legacy parity: {} lines identical to the deployed v2.1 program (zero + live cohort)", lines.len());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
