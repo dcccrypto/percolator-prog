@@ -2968,3 +2968,64 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
     env.assert_conserved("launch bundle");
 }
 
+
+/// Follow-up to the approval of #530 @ 80d3a906: tag 78 values the vault LP at
+/// min(certified equity, the LAG-WORSE equity 108/110 use), so the coupon gate cannot open while
+/// 108/110 call the tranche impaired. Setup: seniors 10,000, junior 500, bonds 1,000; a trader
+/// long 1,000 units vs the vault LP; a fee leg pending; the mark target jumps +100% while the
+/// effective price has moved only one 5% step. At the effective price the bonds are whole (LP -50
+/// < junior 500); at the worse price they are impaired (LP -1,000 > junior 500). 78 must pay NO
+/// coupon, and 108 must call the tranche impaired in the same state. CONTROL: no target jump ->
+/// 78 pays the coupon. Negative control: mutant MB10 (no lag-worse term) pays the coupon in the
+/// lag case and fails this test.
+#[test]
+fn bond_coupon_gate_uses_the_lag_worse_value_like_108_110() {
+    let run = |lag: bool| -> (u128, u128, Result<(), String>) {
+        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
+        env.slot += 500_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let f = env.new_trader(20_000 * U);
+        for _ in 0..6 {
+            env.trade(&f, &lp, 200 * UQ).expect("fee open");
+            env.trade(&f, &lp, -200 * UQ).expect("fee close");
+        }
+        let t = env.new_trader(5_000 * U);
+        env.trade(&t, &lp, 1_000 * UQ).expect("long 1,000 vs the vault LP");
+        let target = if lag { 2 * PRICE } else { PRICE };
+        let admin = env.admin.insecure_clone();
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        let seq = env.oracle_seq() + 1;
+        let m = env.market;
+        env.send(
+            ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: env.slot, mark_e6: target, observation_sequence: seq },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("push mark");
+        env.crank(lp.portfolio).expect("crank vault LP");
+        env.crank(t.portfolio).expect("crank trader");
+        let g = env.market_state().1;
+        if lag {
+            assert!(g.assets[0].effective_price < g.assets[0].raw_oracle_target_price, "vacuity: a pending lag");
+        }
+        let cb0 = env.tranche().c_b_atoms;
+        let c0 = env.vlp().senior_claim_atoms;
+        let (cfg, _) = env.market_state();
+        let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+        env.crank_fees_bond(lp.portfolio).expect("78");
+        let coupon = env.tranche().c_b_atoms - cb0;
+        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
+        let h2 = env.new_bond_holder();
+        let r108 = env.bond_deposit(&h2, lp.portfolio, U, 1);
+        eprintln!("LAG-WORSE lag={lag}: leg {leg} coupon {coupon} 108 -> {:?}", r108.as_ref().map_err(|e| e.chars().take(70).collect::<String>()));
+        (leg, coupon, r108)
+    };
+    let (leg_l, coupon_l, r108_l) = run(true);
+    let (leg_c, coupon_c, _) = run(false);
+    assert!(leg_l > 0 && leg_c > 0, "vacuity: fee legs");
+    err_has(&r108_l, PercolatorError::BondTrancheImpaired);
+    assert_eq!(coupon_l, 0, "78 agrees with 108: impaired at the worse price, no coupon");
+    assert!(coupon_c > 0, "control: no lag, the coupon is paid");
+}

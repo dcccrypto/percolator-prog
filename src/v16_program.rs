@@ -29165,10 +29165,16 @@ pub mod processor {
             let mut lp_data = lp_ai.try_borrow_mut_data()?;
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
-            group
+            let certified = group
                 .full_account_refresh_not_atomic(&mut lp)
                 .map_err(map_v16_error)?
-                .certified_equity
+                .certified_equity;
+            // Follow-up to the re-review (2026-10-06): value the LP at the price WORSE for the
+            // vault, exactly as 108/110 do (`vault_lp_equity_lag_bounds_ro(..).0` on the
+            // now-current certificate), so the coupon gate can never open while 108/110 would
+            // call the tranche impaired. `min` keeps it a lower bound even if the lag term moves.
+            let worse = vault_lp_equity_lag_bounds_ro(&group, lp.header)?.0;
+            if worse < certified { worse } else { certified }
         };
         group.validate_shape().map_err(map_v16_error)?;
         let nav = {
@@ -34311,6 +34317,12 @@ pub mod processor {
     /// Refused once the vault has ANY Earn deposit (LP shares or a senior claim): the coupon-first
     /// fee terms are fixed before the first senior arrives (security review M-2).
     /// Sets registry flag 2: from then on 78/97/102(Resolved)/103 REQUIRE the tranche.
+    ///
+    /// LAUNCH MUST BE ATOMIC (re-review N-2): send 69 CreateLpVault + 94 InitVaultLp + 107 in ONE
+    /// transaction (with the two create_account calls 94 needs; measured 992 B, inside even the
+    /// 1,232 B legacy packet). Any split -- e.g. a multisig market authority approving the three
+    /// steps as separate transactions -- reopens the window in which a minimum-size Earn deposit
+    /// makes this instruction refuse forever (no fund risk; bonds unavailable on that market).
     #[inline(never)]
     fn handle_init_bond_tranche<'a>(
         program_id: &Pubkey,

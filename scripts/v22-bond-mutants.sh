@@ -184,6 +184,10 @@ bond_tranche_refused_after_the_first_earn_deposit
                 .certified_equity' \
 '            i128::try_from(vault_lp_value_atoms(&group, lp.header)?).unwrap_or(0)' \
 sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed
+  # MB10: 78 values the LP at the certified (effective-price) equity, ignoring the lag-worse term.
+  run_bpf MB10_coupon_ignores_lag_worse $W \
+'            if worse < certified { worse } else { certified }' \
+'            let _ = worse; certified' bond_coupon_gate_uses_the_lag_worse_value_like_108_110
   ;;
 esac
 rm -rf "$BAK"
