@@ -2183,7 +2183,7 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
     env.assert_conservation();
 }
 
-/// Round-2 re-review N-1b: replace-smallest eviction (tag 119). With the long side full
+/// Round-2 re-review N-1b: eviction of a small leg (tag 119). With the long side full
 /// (cap poked to 2 for the test), an honest taker bringing >= 2x the smallest leg gets in: the
 /// evicted leg is closed against the bound vault LP at the mark with no fee (its account keeps
 /// its exact equity), then the taker's own TradeCpi lands. Too small a fill, a side that is
@@ -2224,5 +2224,142 @@ fn v22_tag119_eviction_lets_an_honest_trader_into_a_full_side() {
     let r = env.evict_and_trade(honest.1, &late.0, late.1, &lp, 80 * Q);
     assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "the side is not full");
     env.trade_cpi(&late.0, late.1, &lp, 80 * Q).expect("an ordinary open lands on a free slot");
+    env.assert_conservation();
+}
+
+// ===========================================================================
+// SENTINEL round 3: tag 119 adversarial tests (ported from the review)
+// ===========================================================================
+
+fn sec_full_long_side(env: &mut Env) -> (Lp, (Keypair, Pubkey), (Keypair, Pubkey)) {
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let small = env.trader(1_000 * USD);
+    let whale = env.trader(1_000 * USD);
+    env.trade_cpi(&small.0, small.1, &lp, 10 * Q).expect("filler ($10 = the minimum)");
+    env.trade_cpi(&whale.0, whale.1, &lp, 40 * Q).expect("a bigger honest trader ($40)");
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
+    (lp, small, whale)
+}
+
+/// Ported from the round-3 review (N-8 evidence). The victim is caller-chosen, so this $40 leg
+/// can be evicted while a $10 leg stays. After the N-8 bound that is only possible because $40
+/// is EXACTLY 4x the $10 minimum (the boundary); `v22_tag119_only_small_legs_are_evictable`
+/// shows a $41 leg cannot be evicted by anyone.
+#[test]
+fn sec4_tag119_can_target_a_chosen_larger_victim_not_just_the_smallest() {
+    let mut env = Env::new(band_cfg());
+    let (lp, small, whale) = sec_full_long_side(&mut env);
+    let attacker = env.trader(1_000 * USD);
+    let lp_before = env.pos(lp.account);
+    // evict the WHALE ($40) with an $80+ open, although a smaller leg ($10) exists on the side
+    let r = env.evict_and_trade(whale.1, &attacker.0, attacker.1, &lp, 85 * Q);
+    eprintln!("SEC4 targeted eviction of the $40 trader while a $10 leg exists: {r:?}");
+    assert!(r.is_ok(), "caller-chosen victim accepted: {r:?}");
+    assert_eq!(env.pos(whale.1), 0, "the chosen victim was force-closed");
+    assert_eq!(env.pos(small.1), 10 * Q, "the smallest leg was NOT the one evicted");
+    // what the LP absorbed: victim's +40 (it buys) and the attacker's -85 (it sells)
+    let lp_after = env.pos(lp.account);
+    eprintln!("SEC4 LP inventory {} -> {} (delta {} = -85 + 40)", lp_before / Q, lp_after / Q, (lp_after - lp_before) / Q);
+    assert_eq!(lp_after - lp_before, -(85 * Q) + 40 * Q);
+    env.assert_conservation();
+}
+
+#[test]
+fn sec4_tag119_refused_while_lagged_and_while_pinned() {
+    // lagged, not pinned
+    let mut env = Env::new(band_cfg());
+    let (lp, small, _w) = sec_full_long_side(&mut env);
+    let attacker = env.trader(1_000 * USD);
+    env.warp(1);
+    env.push(PRICE * 1_005 / 1_000);
+    env.crank(small.1).expect("crank");
+    env.crank(lp.account).expect("crank lp");
+    let a = env.engine_asset();
+    assert!(a.raw_oracle_target_price != a.effective_price);
+    let r = env.evict_and_trade(small.1, &attacker.0, attacker.1, &lp, 25 * Q);
+    assert_err(&r, &code(PercolatorError::EngineLockActive), "tag 119 while lagged");
+    assert_eq!(env.pos(small.1), 10 * Q, "nothing evicted");
+    // pinned at the band edge (uncertified book, target +30%)
+    let mut env = Env::new(band_cfg());
+    let (lp, small, _w) = sec_full_long_side(&mut env);
+    let attacker = env.trader(1_000 * USD);
+    let target = PRICE * 13 / 10;
+    for _ in 0..60 {
+        env.warp(1);
+        env.push(target);
+        let _ = env.crank(lp.account);
+    }
+    assert!(env.engine_asset().band_pin_since_slot != 0, "pinned");
+    let r = env.evict_and_trade(small.1, &attacker.0, attacker.1, &lp, 25 * Q);
+    assert_err(&r, &code(PercolatorError::EngineLockActive), "tag 119 while pinned");
+}
+
+/// A self-hedging cap-filler cannot starve honest entrants any more, but it can re-fill: each
+/// eviction costs the filler its slot, and an honest entrant pays >= 2x the smallest notional.
+/// Cost of evicting a victim of notional N: the evictor's own trade fee and exposure on 2N.
+#[test]
+fn sec4_tag119_evictor_cost_and_no_profit_from_evict_then_reverse() {
+    let mut env = Env::new(band_cfg());
+    let (lp, small, _w) = sec_full_long_side(&mut env);
+    let attacker = env.trader(1_000 * USD);
+    let eq_attacker = env.equity(attacker.1);
+    let eq_victim = env.equity(small.1);
+    env.evict_and_trade(small.1, &attacker.0, attacker.1, &lp, 25 * Q).expect("evict + open");
+    assert_eq!(env.equity(small.1), eq_victim, "victim equity untouched (no fee, mark price)");
+    // reverse immediately: close the new leg
+    env.trade_cpi(&attacker.0, attacker.1, &lp, -25 * Q).expect("evictor closes at the same mark");
+    let eq_after = env.equity(attacker.1);
+    eprintln!("SEC4 evict->open->close round trip: attacker equity {} -> {} (fees paid {})", eq_attacker, eq_after, eq_attacker - eq_after);
+    assert!(eq_after <= eq_attacker, "round trip must not profit");
+    env.assert_conservation();
+}
+
+
+/// Round-3 re-review N-8: only a SMALL leg is evictable (notional <= 4x the market minimum).
+/// A $41 trader on a full side cannot be displaced even by a taker bringing 20x its size
+/// (111, nothing evicted), while the $10 filler next to it can; $40 (exactly 4x) is the
+/// boundary and is still evictable.
+#[test]
+fn v22_tag119_only_small_legs_are_evictable() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(100_000 * USD);
+    let small = env.trader(1_000 * USD);
+    let big = env.trader(1_000 * USD);
+    env.trade_cpi(&small.0, small.1, &lp, 10 * Q).expect("filler at the $10 minimum");
+    env.trade_cpi(&big.0, big.1, &lp, 41 * Q).expect("an honest $41 trader (> 4x the minimum)");
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
+    let whale = env.trader(10_000 * USD);
+    // 20x the victim: still refused, because the victim is above 4x the minimum.
+    let r = env.evict_and_trade(big.1, &whale.0, whale.1, &lp, 820 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "a $41 leg is not evictable");
+    assert_eq!(env.pos(big.1), 41 * Q, "nothing was evicted");
+    // The same taker can take the small filler's slot instead.
+    env.evict_and_trade(small.1, &whale.0, whale.1, &lp, 820 * Q).expect("evict the $10 filler");
+    assert_eq!(env.pos(small.1), 0);
+    assert_eq!(env.pos(big.1), 41 * Q, "the larger honest trader is untouched");
+    assert_eq!(env.pos(whale.1), 820 * Q);
+    env.assert_conservation();
+}
+
+/// Round-3 re-review, LP exemptions (wrapper half): only the asset's RECORDED bound vault LP is
+/// the exempt maker. A second matcher LP that is not the bound one cannot take a new fill on
+/// the bound asset at all, and cannot be named as the counterparty of a forced close
+/// (`VaultLpNotBound`, pinned in `v22_tag118_dust_sweep_refusals`).
+#[test]
+fn v22_only_the_bound_vault_lp_is_the_exempt_maker() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let other = env.lp(10_000 * USD); // bound first ...
+    let lp = env.lp(10_000 * USD); // ... then the binding moves to this LP (state poke)
+    let t = env.trader(1_000 * USD);
+    let r = env.trade_cpi(&t.0, t.1, &other, 30 * Q);
+    assert!(r.is_err(), "a non-bound LP is not a counterparty on a bound band asset: {r:?}");
+    env.trade_cpi(&t.0, t.1, &lp, 30 * Q).expect("the bound vault LP fills");
+    // Sub-minimum NET position: allowed for the bound LP only (the taker leg stays >= minimum).
+    let u = env.trader(1_000 * USD);
+    env.trade_cpi(&u.0, u.1, &lp, -25 * Q).expect("bound LP nets to $5");
+    assert_eq!(env.pos(lp.account), -5 * Q);
     env.assert_conservation();
 }

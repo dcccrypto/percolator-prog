@@ -521,12 +521,18 @@ pub mod constants {
     /// v2.2 band (security re-review N-1): permissionless sweep of a DUST band leg (below half
     /// the market's minimum leg notional), freeing its per-side position slot.
     pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 118;
-    /// v2.2 band (round-2 re-review N-1b): replace-smallest eviction, atomic with the evicting
-    /// taker's own TradeCpi. Wire: `[119]` + the TradeCpi body; accounts: `[0] victim portfolio
+    /// v2.2 band (round-2 re-review N-1b, bounded in round 3 N-8): eviction of a SMALL leg
+    /// (at most `BAND_EVICT_MAX_VICTIM_MULTIPLE` x the market minimum) from a full side, atomic
+    /// with the evicting taker's own TradeCpi. The victim is chosen by the caller (the program
+    /// cannot prove "smallest"), so the bound is on WHO can be evicted. Wire: `[119]` + the TradeCpi body; accounts: `[0] victim portfolio
     /// (w)`, then exactly the TradeCpi accounts.
     pub const TAG_EVICT_AND_TRADE_CPI: u8 = 119;
     /// N-1b: the newcomer's fill must be at least this multiple of the evicted leg's notional.
     pub const BAND_EVICT_NOTIONAL_MULTIPLE: u128 = 2;
+    /// N-8 (round-3 re-review): only a leg whose notional is at most this multiple of the
+    /// market's `band_min_leg_notional` can be evicted. A trader above a few times the minimum
+    /// can never be displaced, however large the newcomer (40 tokens at the 10-token floor).
+    pub const BAND_EVICT_MAX_VICTIM_MULTIPLE: u128 = 4;
     /// v2.2 band markets: default share of the liquidation penalty paid to a third-party
     /// cranker (design §1.2: liquidation must be paid to happen, a pending leg holds the epoch).
     pub const BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS: u16 = 2_000;
@@ -7785,7 +7791,7 @@ pub mod ix {
         /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
         SweepBandDustLeg { asset_index: u16 },
         /// v2.2 tag 119: on a band market whose target side is FULL, close `accounts[0]`'s
-        /// (smaller) leg bilaterally against the bound vault LP at `P_last` (fee 0) and then
+        /// SMALL leg (at most 4x the market minimum, and at most half the taker's size) bilaterally against the bound vault LP at `P_last` (fee 0) and then
         /// run `trade` (a `TradeCpi`) for the taker on `accounts[1..]`. Refused unless the
         /// taker ends with a leg of at least `BAND_EVICT_NOTIONAL_MULTIPLE` x the evicted
         /// notional on that side.
@@ -11519,7 +11525,7 @@ pub mod lag_policy {
             Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
             Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
             Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 118: a forced bilateral close at P_last, refused while the asset lags (band markets only)"),
-            Instruction::EvictAndTradeCpi { .. } => entry("EvictAndTradeCpi", LagPolicy::Gated, "tag 119: a forced bilateral close at P_last plus a TradeCpi, refused while the asset lags (band markets only)"),
+            Instruction::EvictAndTradeCpi { .. } => entry("EvictAndTradeCpi", LagPolicy::Gated, "tag 119: evicts a small leg (<= 4x the minimum) by a forced bilateral close at P_last plus a TradeCpi, refused while the asset lags (band markets only)"),
             Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
             Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags (band markets only)"),
         }
@@ -22854,8 +22860,10 @@ pub mod processor {
         band_forced_close_against_vault_lp(program_id, market_ai, portfolio_ai, lp_ai, asset_index)
     }
 
-    /// v2.2 band (round-2 re-review N-1b), tag 119: replace-smallest eviction, atomic with the
-    /// evicting taker's own fill. Accounts: `[0] victim portfolio (w)`, then exactly the
+    /// v2.2 band (round-2 re-review N-1b; N-8), tag 119: evict a small leg (<= 4x the market
+    /// minimum) from a full side, atomic with the evicting taker's own fill. The victim is the
+    /// caller's choice among the legs that satisfy the bounds below; it is NOT necessarily the
+    /// smallest leg on the side. Accounts: `[0] victim portfolio (w)`, then exactly the
     /// TradeCpi accounts (`[1] taker (s)`, `[2] market (w)`, `[3] taker portfolio (w)`, `[4]
     /// bound vault LP portfolio (w)`, matcher program, ctx, delegate, tail...).
     ///
@@ -22864,7 +22872,10 @@ pub mod processor {
     /// * the taker has NO leg on the asset and is opening on the victim's side;
     /// * that side is full (`band_max_positions_per_side` positioned legs);
     /// * the taker's requested notional at `P_last` is at least `BAND_EVICT_NOTIONAL_MULTIPLE`
-    ///   x the victim leg's notional.
+    ///   x the victim leg's notional;
+    /// * the victim leg's notional is at most `BAND_EVICT_MAX_VICTIM_MULTIPLE` x
+    ///   `band_min_leg_notional` (N-8): a larger trader is never evictable, whatever the taker
+    ///   brings.
     ///
     /// Then the victim's whole leg is closed against the bound vault LP at `P_last` with no fee
     /// (it loses nothing but the position), the taker's `TradeCpi` runs unchanged on
@@ -22938,10 +22949,14 @@ pub mod processor {
             let need = victim_notional
                 .checked_mul(constants::BAND_EVICT_NOTIONAL_MULTIPLE)
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let max_victim = (group.header.config.band_min_leg_notional.get() as u128)
+                .checked_mul(constants::BAND_EVICT_MAX_VICTIM_MULTIPLE)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
             if victim_side != side
                 || taker_has_leg
                 || !group.band_side_is_full(a, side).map_err(map_v16_error)?
                 || requested < need
+                || victim_notional > max_victim
             {
                 return Err(PercolatorError::PriceBandPositionCap.into());
             }
