@@ -33261,8 +33261,9 @@ pub mod processor {
     /// senior draw and book it first (junior, then every senior pot) and both require the vault
     /// to be ELIGIBLE (`g9_vault_eligible`: Earn seniors exist and carry a booked, outstanding
     /// draw) and G9 to be DUE. PROPOSE records the slot (refused while a proposal is open, so the
-    /// window cannot be restarted); DRAW executes only in `[proposal + G9_DELAY_SLOTS,
-    /// + G9_EXEC_WINDOW_SLOTS)` (the stakers' exit window), consumes the proposal, and is also
+    /// window cannot be restarted); DRAW executes only in
+    /// `[proposal + G9_DELAY_SLOTS, + G9_EXEC_WINDOW_SLOTS)` (the stakers' exit window), consumes
+    /// the proposal, and is also
     /// capped per epoch (`G9_EPOCH_CAP_BPS` of `I + outstanding` per `G9_EPOCH_SLOTS`).
     /// Only if a certified deficit is LEFT with no drawable pot backing and nothing pending
     /// (`p4_rescue_ins::backstop_due`) does DRAW move `backstop_draw_amount` of asset-0 insurance
