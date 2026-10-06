@@ -22657,20 +22657,12 @@ pub mod processor {
                 return Err(V16Error::NonProgress);
             }
             accrue_zero_move_funding_before_position_change_view(cfg, group, a, true)?;
-            let mut reduce_q = 0u128;
-            for pod in portfolio.header.legs.iter() {
-                let leg = pod.try_to_runtime()?;
-                if leg.active && leg.asset_index as usize == a {
-                    reduce_q = leg.basis_pos_q.unsigned_abs();
-                }
-            }
-            if reduce_q == 0 {
-                return Err(V16Error::InvalidLeg);
-            }
+            // The whole leg: the engine clamps the request to the position (and to the
+            // unilateral close capacity), so no raw-basis read is needed here.
             group
                 .rebalance_reduce_position_not_atomic(
                     portfolio,
-                    RebalanceRequestV16 { asset_index: a, reduce_q },
+                    RebalanceRequestV16 { asset_index: a, reduce_q: u128::MAX },
                 )
                 .map(|_| ())
         })
