@@ -162,6 +162,11 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SetAdlWindDownMaxSlots { .. } => "SetAdlWindDownMaxSlots",
         // Phase 2b (2026-10-05), tag 103.
         Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
+        // Phase 4 item 3 (v22 Wave C), tags 107-110: capacity bonds.
+        Instruction::InitBondTranche { .. } => "InitBondTranche",
+        Instruction::BondDeposit { .. } => "BondDeposit",
+        Instruction::BondRequestWithdraw { .. } => "BondRequestWithdraw",
+        Instruction::BondExecuteWithdraw { .. } => "BondExecuteWithdraw",
     }
 }
 
