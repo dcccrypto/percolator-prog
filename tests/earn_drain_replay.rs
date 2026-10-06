@@ -2376,3 +2376,153 @@ proptest::proptest! {
         proptest::prop_assert!(paid <= dep + 2, "E extracted {}: deposited {dep}, paid {paid}, ops {ops:?}", paid as i128 - dep as i128);
     }
 }
+
+// ═════ Security review v22 Wave D (2026-10-05), rescue adversarial tests: REGRESSIONS (W-3) ═════
+// Ported from the reviewer's `~/wt-sec-v22d/prog/tests/sec_v22d_replay.rs` (Sentinel); assertions flipped.
+const SEC_DEPOSIT: u64 = 2_000_000_000;
+
+impl Replay {
+    fn sec_pots(&self) -> Vec<(u128, i128)> {
+        let s = self.snap();
+        let mut v = vec![];
+        for d in 0..2usize {
+            let l = state::read_backing_domain_ledger(&self.env.svm.get_account(&self.ledgers[d]).unwrap().data).unwrap();
+            v.push((l.total_principal_atoms, (s.fresh[d] + s.valid[d]) as i128 - s.claim[d] as i128));
+        }
+        v
+    }
+    fn stale_total(&self) -> u64 {
+        let (_, g) = self.env.market_state();
+        g.assets[0].stale_account_count_long + g.assets[0].stale_account_count_short
+    }
+    fn sec_rescue(&mut self, who: &Keypair, amount: u64, min_shares: u128) -> (Pubkey, Result<u64, String>) {
+        self.env.ensure_signer_account(who.pubkey());
+        let ata = self.env.token_account_for_mint(self.lp_mint, who.pubkey(), 0);
+        let src = self.env.token_account_for_mint(self.env.mint, who.pubkey(), amount);
+        let metas = vec![
+            AccountMeta::new(who.pubkey(), true),
+            AccountMeta::new(self.env.market, false),
+            AccountMeta::new(self.registry, false),
+            AccountMeta::new(self.lp_mint, false),
+            AccountMeta::new(ata, false),
+            AccountMeta::new(src, false),
+            AccountMeta::new(self.env.vault, false),
+            AccountMeta::new(self.ledgers[0], false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            AccountMeta::new(self.ledgers[1], false),
+        ];
+        self.env.svm.expire_blockhash();
+        let r = self.env.send(ProgInstruction::RescueDeposit { tranche: 0, amount, min_shares }, metas, &[who]);
+        (ata, r)
+    }
+}
+
+/// SEC-D1: the E3 per-pot cap wedge (Wave A review A3: a hedged zero-sum pair strands over-principal
+/// surplus in the other pot, so E3 < par although the vault physically holds par) makes a perfectly
+/// SOLVENT vault look "impaired". Does tag 112 admit a rescue, and at what price vs par?
+#[test]
+fn sec_d1_rescue_refused_on_a_solvent_vault() {
+    let mut r = Replay::new(r2_market());
+    let h = Keypair::new();
+    let m = Keypair::new();
+    let (_h_ata, h_sh) = r.deposit_shares(&h, SEC_DEPOSIT, 0).expect("H");
+    let (_m_ata, m_sh) = r.deposit_shares(&m, SEC_DEPOSIT, 0).expect("M");
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let (a1k, a1) = r.new_trader(1_000_000_000);
+    let (a2k, a2) = r.new_trader(1_000_000_000);
+    let lp = r.lp;
+    let pair = [a1, a2, lp];
+    r.trade(&a1k, a1, q).unwrap();
+    r.trade(&a2k, a2, -q).unwrap();
+    r.walk(1_090_000, &pair);
+    r.trade(&a1k, a1, -q).unwrap();
+    r.trade(&a2k, a2, q).unwrap();
+    r.hold(r.lm.params.h_max + 2, &pair);
+    r.convert_all(&a1k, a1).ok();
+    r.hold(3, &pair);
+    let s = r.snap();
+    s.print("SEC-D1 after pair closed + A1 converted");
+    let pots = r.sec_pots();
+    let st1 = r.env.portfolio_state(a1);
+    let st2 = r.env.portfolio_state(a2);
+    let pair_net = st1.capital as i128 + st1.pnl + st2.capital as i128 + st2.pnl - 2_000_000_000;
+    eprintln!("SEC-D1 pots (principal, phys-claims) {:?}; earn principal {} E3 NAV {}; pair net {}; stale {}", pots, s.earn_principal, s.earn_nav, pair_net, r.stale_total());
+    let par = s.earn_principal;
+    let v = s.earn_nav;
+    eprintln!("SEC-D1 par {par} E3 v {v} => impairment {:.4}% (physical sum of pots {})", (par as f64 - v as f64) / par as f64 * 100.0, pots.iter().map(|p| p.1).sum::<i128>());
+    // Rescuer: R buys at the "impaired" E3 value.
+    let rr = Keypair::new();
+    let x = 10 * v.min(par) as u64 / 11; // below 10v cap
+    let x = x.max(100_000_000);
+    let (r_ata, res) = r.sec_rescue(&rr, x, 1);
+    let minted = r.env.token_amount(r_ata);
+    let fair_at_par = (x as u128) * (h_sh as u128 + m_sh as u128) / par;
+    eprintln!("SEC-D1 rescue x={x} -> {:?}; minted {minted}; shares a par-priced entry would give {fair_at_par}; S before {}", res, h_sh + m_sh);
+    // Regression: the vault is solvent at the combined reading, so the rescue is refused (114).
+    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(114), "solvent vault: rescue refused: {res:?}");
+    assert_eq!(minted, 0, "no shares minted");
+    if res.is_ok() && fair_at_par > 0 {
+        eprintln!("SEC-D1 rescuer got {:.4}% more shares than par-priced entry", (minted as f64 / fair_at_par as f64 - 1.0) * 100.0);
+    }
+    let s2 = r.snap();
+    s2.print("SEC-D1 after rescue");
+    eprintln!("SEC-D1 pots after {:?}; E3 NAV after {} (principal {})", r.sec_pots(), s2.earn_nav, s2.earn_principal);
+}
+
+/// SEC-D1b regression (W-3): the exact Wave-A-review A3 seed (E3 per-pot cap wedge: the per-pot
+/// E3 reads 0.87% below par although the pots' physical nets sum to par). The rescue is now priced
+/// and admitted on the combined-pot reading `min(ΣP, Σphys)` = par, so it is refused (114).
+/// Control (non-vacuity): the wedge is present (E3 < par while Σphys >= par), i.e. the old per-pot
+/// reading would have admitted it (the reviewer's GREEN run).
+#[test]
+fn sec_d1b_rescue_refused_on_the_a3_wedge_seed() {
+    let mut r = Replay::new(r2_market());
+    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
+    let h = Keypair::new();
+    let (_h_ata, h_shares) = r.deposit_shares(&h, SEC_DEPOSIT / 2, 0).expect("H 75 at par");
+    let (a1k, a1) = r.new_trader(3_000_000_000);
+    let (a2k, a2) = r.new_trader(3_000_000_000);
+    let lp = r.lp;
+    r.trade(&a1k, a1, q).expect("A1 long");
+    r.trade(&a2k, a2, -q).expect("A2 short");
+    let up = |r: &mut Replay, bps: u64, up: bool, who: &[Pubkey]| {
+        let p0 = r.env.market_state().1.assets[0].effective_price;
+        let d = p0 * bps / 10_000;
+        let target = if up { p0 + d } else { p0.saturating_sub(d).max(200_000) };
+        walk_only(r, target, who);
+    };
+    up(&mut r, 302, true, &[lp]);
+    let _ = r.convert_all(&a1k.insecure_clone(), a1);
+    up(&mut r, 843, false, &[lp, a1]);
+    for p in [a1, a2, lp] {
+        r.crank_pf(p);
+    }
+    let s = r.snap();
+    s.print("SEC-D1b pre-rescue");
+    let pots = r.sec_pots();
+    eprintln!("SEC-D1b pots (ledger principal, physical net of claims) {:?}; principal {} E3 NAV {}; stale {}", pots, s.earn_principal, s.earn_nav, r.stale_total());
+    let (par, v) = (s.earn_principal, s.earn_nav);
+    eprintln!("SEC-D1b par {par} v {v} => {:.4}% below par; sum of physical nets {}", (par as f64 - v as f64) / par as f64 * 100.0, pots.iter().map(|p| p.1).sum::<i128>());
+    let rr = Keypair::new();
+    let x = ((10 * v) / 11).min(u64::MAX as u128) as u64;
+    let (r_ata, res) = r.sec_rescue(&rr, x, 1);
+    let minted = r.env.token_amount(r_ata);
+    let s_before = r.registry_shares_total(h_shares as u128);
+    eprintln!("SEC-D1b rescue x={x} -> {:?}", res.as_ref().map_err(|e| e.chars().take(80).collect::<String>()));
+    eprintln!("SEC-D1b minted {minted}; par-priced entry would mint {}; S before {s_before}", (x as u128) * s_before / par);
+    let s2 = r.snap();
+    eprintln!("SEC-D1b after: principal {} E3 NAV {} pots {:?}", s2.earn_principal, s2.earn_nav, r.sec_pots());
+    assert!(v < par, "control: the per-pot E3 wedge reads below par");
+    assert!(pots.iter().map(|p| p.1).sum::<i128>() >= par as i128, "control: the pots physically hold par");
+    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(114), "W-3: rescue on the wedge refused: {res:?}");
+    assert_eq!(minted, 0, "no shares minted");
+    assert_eq!((s2.earn_principal, s2.earn_nav), (s.earn_principal, s.earn_nav), "nothing moved");
+}
+
+impl Replay {
+    fn registry_shares_total(&self, fallback: u128) -> u128 {
+        let d = self.env.svm.get_account(&self.registry).map(|a| a.data).unwrap_or_default();
+        state::read_lp_vault_registry(&d).map(|x| x.total_lp_shares_outstanding).unwrap_or(fallback)
+    }
+}

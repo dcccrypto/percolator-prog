@@ -236,3 +236,47 @@ fn mutants_item6_are_caught() {
     let mutant_due = |d: u128, drawable: u128, pending: u128, _nav: u128| d != 0 && drawable == 0 && pending == 0;
     assert!(mutant_due(10, 0, 0, 1), "the mutant would have lent insurance ahead of the seniors");
 }
+
+// ── W-1 (security review 2026-10-05): admissible mints ─────────────────────────────────────────
+
+/// MUTANT: the pre-review rule (every mint admitted, zero included).
+fn admissible_mutant_any(_x: u128, _m: u128, _u: u128, _i: u128) -> bool {
+    true
+}
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(8192))]
+
+    /// W-1: every ADMITTED top-up mints > 0 units, keeps the incumbents whole (no dilution) and
+    /// loses at most 1 bp + 1 atom of `x` to rounding: whatever `I / U` has grown to (dust
+    /// genesis + fee growth), a top-up can never become a donation.
+    #[test]
+    fn w1_admitted_mints_lose_at_most_one_bp(
+        // 2^60: the cross-multiplied no-dilution check stays inside u128 (as the L-RES property).
+        u in 1u128..(1u128 << 60),
+        i in 1u128..(1u128 << 60),
+        x in 1u128..(1u128 << 60),
+    ) {
+        let m = p4::ins_units_for_topup(x, u, i).unwrap();
+        if p4::ins_mint_admissible(x, m, u, i) {
+            prop_assert!(m > 0);
+            prop_assert!(p4::ins_mint_no_dilution(i, u, x, m));
+            let value = m * i / u;
+            prop_assert!(x - value <= x / 10_000 + 1, "lost {} of {x}", x - value);
+        }
+    }
+}
+
+/// W-1 negative control: on the reviewer's SEC-D2 state (`U = 1`, `I = 3,000,000`) the mutant
+/// admits a 500,000 top-up that mints 0 units; the rule refuses it. And the rule is not vacuous:
+/// on an honest ledger (`U == I`) it admits.
+#[test]
+fn w1_mutant_admits_the_sec_d2_donation() {
+    let (u, i, x) = (1u128, 3_000_000u128, 500_000u128);
+    let m = p4::ins_units_for_topup(x, u, i).unwrap();
+    assert_eq!(m, 0);
+    assert!(admissible_mutant_any(x, m, u, i), "mutant admits the zero mint");
+    assert!(!p4::ins_mint_admissible(x, m, u, i), "the rule refuses it");
+    let m2 = p4::ins_units_for_topup(x, i, i).unwrap();
+    assert!(p4::ins_mint_admissible(x, m2, i, i), "honest ledger admitted");
+}

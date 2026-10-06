@@ -104,7 +104,7 @@ impl P3 {
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "EDKKgRaVHna6FCxiY1kgMzegD9rpaN1nwJNSzAzeBUBX".parse::<Pubkey>().unwrap() };
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -1577,6 +1577,35 @@ fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Res
     w.send(ProgInstruction::InsuranceBackstopDraw { mode, max_amount }, metas, &[])
 }
 
+/// W-2: wait out the G9 delay with the book kept current (mark re-pushed, ports cranked).
+fn g9_wait(w: &mut P3, ports: &[Pubkey], slots: u64) {
+    let mark = MARK.with(|c| c.get());
+    let target = w.slot() + slots;
+    w.env.svm.warp_to_slot(target);
+    w.env.push_auth_mark_for_asset_as_admin(0, target, mark);
+    let lp = w.lp;
+    for _ in 0..2 {
+        for p in ports {
+            let _ = w.crank(*p);
+        }
+        let _ = w.crank(lp);
+    }
+}
+
+/// W-2 two-step G9: PROPOSE (mode 2), wait `G9_DELAY_SLOTS`, DRAW (mode 0).
+fn g9(w: &mut P3, ports: &[Pubkey]) -> Result<u64, String> {
+    backstop_111(w, 2, 0, true)?;
+    g9_wait(w, ports, percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
+    backstop_111(w, 0, 0, true)
+}
+
+/// The fill-time halt mirror of asset 0 (`AssetVaultLpDrawV18::outstanding_mirror_atoms`).
+fn halt_mirror(w: &P3) -> u128 {
+    let mut d = w.env.svm.get_account(&w.env.market).unwrap().data;
+    let (_, g) = state::market_view_mut(&mut d).unwrap();
+    state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap().outstanding_mirror_atoms
+}
+
 /// Tag 112 on the bound vault (tag-75 accounts + bound tail).
 fn rescue_bound(w: &mut P3, who: &Keypair, amount: u64) -> Result<u64, String> {
     w.env.ensure_signer_account(who.pubkey());
@@ -1711,11 +1740,14 @@ fn g9_refused_while_seniors_can_fund() {
 /// halted while the backstop is outstanding; the dead vault cannot be rescued (115).
 #[test]
 fn g9_draws_after_exhaustion_bounded_pro_rata() {
-    let (mut w, _s, _t) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_tk, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
     seed_units(&mut w, 20_000_000);
     // Without the ledger on a units market: refused before anything moves.
     let r0 = backstop_111(&mut w, 0, 0, false);
     assert!(r0.is_err(), "111 without the units ledger");
+    backstop_111(&mut w, 2, 0, true).expect("G9 propose");
+    g9_wait(&mut w, &[tp], percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
+    init_units(&mut w).expect("refresh");
     let u0 = units(&w).unwrap();
     let ins0 = w.env.market_state().1.insurance;
     let r = backstop_111(&mut w, 0, 0, true);
@@ -1727,6 +1759,8 @@ fn g9_draws_after_exhaustion_bounded_pro_rata() {
     let ins1 = w.env.market_state().1.insurance;
     assert_eq!(ins0 - ins1, b, "insurance fell by exactly the moved amount");
     assert!(b <= (u0.snap_insurance_mint_atoms * 5_000) / 10_000, "50% cap");
+    assert!(b <= (u0.snap_insurance_mint_atoms * 2_000) / 10_000, "W-2 per-epoch 20% cap");
+    assert_eq!(halt_mirror(&w), outstanding(&w) + b, "W-9: the fill halt mirror carries the backstop");
     let u1 = units(&w).unwrap();
     assert_eq!(u1.backstop_receivable_atoms, b, "receivable mirrored");
     assert_eq!((u1.units_total, u1.units_stake, u1.units_creator), (u0.units_total, u0.units_stake, u0.units_creator), "U unchanged");
@@ -1755,7 +1789,7 @@ fn g9_draws_after_exhaustion_bounded_pro_rata() {
 fn g9_restore_repays_backstop_first() {
     let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
     seed_units(&mut w, 20_000_000);
-    backstop_111(&mut w, 0, 0, true).expect("draw");
+    g9(&mut w, &[tp]).expect("draw");
     let b0 = backstop_st(&w) as u128;
     assert!(b0 > 0);
     // Restore while the LP is still under water: nothing to repay.
@@ -1822,18 +1856,23 @@ fn rescue_bound_refused_when_not_impaired() {
 // ═══════════════════════ Phase 4 Wave D: cross-program stake v5 <-> wrapper ══════════════════════
 //
 // The REAL percolator-stake v5 `.so` (../percolator-stake/target/deploy, built with
-// `--features devnet`, i.e. at VmpVUArR, the id this wrapper's devnet build pins) runs against the
+// `--features devnet`, i.e. at A6DVNubv (v2.1 fresh id), the id this wrapper's devnet build pins) runs against the
 // wrapper in the same LiteSVM. Stake pools are crafted at the exact v5 byte layout (480 B; the
 // wrapper test crate does not link percolator-stake), then driven through real stake
 // instructions: bind (19), burn (21), deposit with consent (1), sync (31), withdraw (2),
 // propose/commit target (32/33), the removed flush (3).
 
-const STAKE_PID: Pubkey = solana_sdk::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w");
+const STAKE_PID: Pubkey = solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
 const ST_CONSENT_REQUIRED: u32 = 33;
+/// Stake `CONSENT_VERSION_FIRST_LOSS` (v2: S-5 binds the deployment parameters; G9 disclosed).
+const CONSENT: u8 = 2;
+const ST_READINGS_DIVERGED: u32 = 44;
+const ST_UNITS_MISMATCH: u32 = 45;
 const ST_DEPRECATED_V5: u32 = 34;
 const ST_LIQUIDITY_BUFFER: u32 = 36;
 const ST_SYNC_COOLDOWN: u32 = 37;
 const ST_NOT_PROTOCOL_AUTHORITY: u32 = 39;
+const ST_NO_PENDING_TARGET: u32 = 40;
 
 fn stake_so() -> Vec<u8> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../percolator-stake/target/deploy/percolator_stake.so");
@@ -1888,7 +1927,7 @@ fn craft_pool(w: &mut P3, risk_mode: u8, cooldown_slots: u64) -> Pool {
     d[320..328].copy_from_slice(b"SPOOL_V1");
     d[328] = 5;
     d[408] = risk_mode;
-    d[409] = if risk_mode == 1 { 1 } else { 0 };
+    d[409] = if risk_mode == 1 { CONSENT } else { 0 };
     let target: u16 = if risk_mode == 1 { 5_000 } else { 0 };
     d[410..412].copy_from_slice(&target.to_le_bytes());
     d[412..414].copy_from_slice(&3_000u16.to_le_bytes());
@@ -1931,11 +1970,20 @@ fn staker(w: &mut P3, p: &Pool, amount: u64) -> Staker {
     Staker { k, ata, lp_ata }
 }
 
+/// `consent = Some(version)` signs the crafted pool's parameters (target 5,000, buffer 3,000,
+/// hysteresis 500; S-5); `stake_deposit_consent` signs arbitrary ones.
 fn stake_deposit(w: &mut P3, p: &Pool, s: &Staker, amount: u64, consent: Option<u8>) -> Result<u64, String> {
+    stake_deposit_consent(w, p, s, amount, consent.map(|v| (v, 5_000, 3_000, 500)))
+}
+
+fn stake_deposit_consent(w: &mut P3, p: &Pool, s: &Staker, amount: u64, consent: Option<(u8, u16, u16, u16)>) -> Result<u64, String> {
     let mut data = vec![1u8];
     data.extend_from_slice(&amount.to_le_bytes());
-    if let Some(c) = consent {
-        data.push(c);
+    if let Some((v, t, b, h)) = consent {
+        data.push(v);
+        data.extend_from_slice(&t.to_le_bytes());
+        data.extend_from_slice(&b.to_le_bytes());
+        data.extend_from_slice(&h.to_le_bytes());
     }
     let dep = Pubkey::find_program_address(&[b"stake_deposit", p.pda.as_ref(), s.k.pubkey().as_ref()], &STAKE_PID).0;
     let (m, pid) = (w.env.market, w.env.program_id);
@@ -2041,8 +2089,13 @@ fn xprog_consent_sync_recover_and_no_admin_flush() {
     let a = staker(&mut w, &p, 4_000_000);
     // I-S2: no consent / stale consent refused; the current version accepted.
     assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, None), ST_CONSENT_REQUIRED), "deposit without consent");
-    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, Some(2)), ST_CONSENT_REQUIRED), "wrong consent version");
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)).expect("deposit with consent");
+    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)), ST_CONSENT_REQUIRED), "stale consent version (v1 text, no G9 disclosure)");
+    // S-5: the consent binds the pool's deployment parameters, not just the version.
+    for (t, b, h) in [(4_999u16, 3_000u16, 500u16), (5_000, 2_999, 500), (5_000, 3_000, 501)] {
+        let r = stake_deposit_consent(&mut w, &p, &a, 4_000_000, Some((CONSENT, t, b, h)));
+        assert!(st_code(&r, ST_CONSENT_REQUIRED), "consent to other parameters ({t},{b},{h}) refused: {r:?}");
+    }
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
     let lp_a = w.tok(&a.lp_ata);
     assert!(lp_a > 0);
     // I-S1: the creator-admin flush is removed.
@@ -2068,7 +2121,7 @@ fn xprog_consent_sync_recover_and_no_admin_flush() {
     assert!(st_code(&stake_sync(&mut w, &p), ST_SYNC_COOLDOWN), "second sync in the cooldown");
     // A later depositor buys at liquid + deployed(entry) and a leaver is paid from liquidity.
     let b = staker(&mut w, &p, 2_000_000);
-    stake_deposit(&mut w, &p, &b, 2_000_000, Some(1)).expect("B deposit");
+    stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT)).expect("B deposit");
     let lp_b = w.tok(&b.lp_ata);
     // Pool value at the entry reading is still exactly 4M over 4M shares (A's genesis carve-out
     // is dead supply): B pays 1 atom per share, never less.
@@ -2084,9 +2137,15 @@ fn xprog_consent_sync_recover_and_no_admin_flush() {
     let raise = stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&6_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]);
     assert!(st_code(&raise, ST_NOT_PROTOCOL_AUTHORITY), "admin raise refused: {raise:?}");
     stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&2_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]).expect("admin lowers");
+    // S-6: the timelock is max(pool cooldown = 1 slot, 216,000 slots), not the pool cooldown.
     let s = w.slot() + 200;
     w.env.svm.warp_to_slot(s);
     let payer = w.env.payer.pubkey();
+    let early = stake_send(&mut w, vec![33], vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], &[]);
+    assert!(st_code(&early, ST_NO_PENDING_TARGET), "commit before the 216,000-slot floor refused: {early:?}");
+    let s = w.slot() + 216_000;
+    w.env.svm.warp_to_slot(s);
+    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
     stake_send(&mut w, vec![33], vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], &[]).expect("commit");
     let u2 = units(&w).unwrap();
     let vault0 = w.tok(&p.vault);
@@ -2106,15 +2165,15 @@ fn xprog_consent_sync_recover_and_no_admin_flush() {
 /// fraction of their insurance value. A staker can still exit from liquidity.
 #[test]
 fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
-    let (mut w, _s, _t) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    let (mut w, _s, (_tk, tp_xp2)) = underwater_world(90_000, 60_000, 1_000_000, 6);
     top_up_9(&mut w, 2_000_000, false).expect("creator seed");
     init_units(&mut w).expect("116");
     let p = craft_pool(&mut w, 1, 1);
     bind_and_burn(&mut w, &p);
     let a = staker(&mut w, &p, 6_000_000);
     let b = staker(&mut w, &p, 3_000_000);
-    stake_deposit(&mut w, &p, &a, 6_000_000, Some(1)).expect("A");
-    stake_deposit(&mut w, &p, &b, 3_000_000, Some(1)).expect("B");
+    stake_deposit(&mut w, &p, &a, 6_000_000, Some(CONSENT)).expect("A");
+    stake_deposit(&mut w, &p, &b, 3_000_000, Some(CONSENT)).expect("B");
     let r = stake_sync(&mut w, &p);
     eprintln!("XP-2 sync -> {:?}", r.as_ref().map_err(|e| code(e)));
     r.expect("deploy");
@@ -2126,7 +2185,7 @@ fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
     let (va0, vb0) = (val(l0, d0, sup0, lp_a), val(l0, d0, sup0, lp_b));
     let creator0 = u0.units_creator * u0.snap_insurance_free_atoms / u0.units_total;
     // The loss: G9 lends insurance to the exhausted vault LP.
-    backstop_111(&mut w, 0, 0, true).expect("G9");
+    g9(&mut w, &[tp_xp2]).expect("G9");
     let b_moved = backstop_st(&w) as u128;
     assert!(b_moved > 0);
     init_units(&mut w).expect("refresh");
@@ -2205,7 +2264,7 @@ fn settle_resolved_units(w: &mut P3, junior_owner: Pubkey, topup: u8) -> Result<
 fn g9_resolved_settle_repays_backstop_first() {
     let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
     seed_units(&mut w, 20_000_000);
-    backstop_111(&mut w, 0, 0, true).expect("draw");
+    g9(&mut w, &[tp]).expect("draw");
     let b0 = backstop_st(&w) as u128;
     assert!(b0 > 0);
     // The market falls back (the short LP recovers) and the trader closes in Live: the LP ends
@@ -2247,4 +2306,383 @@ fn g9_resolved_settle_repays_backstop_first() {
     assert_eq!(repaid, b0 - b1, "insurance rises by exactly the repayment");
     assert!(repaid > 0, "vacuity: the recovered vault LP repaid part of the backstop");
     conserved(&w, "after resolved settle");
+}
+
+// ═══════════ Security review v22 Wave D (2026-10-05) BLOCK fixes: regressions ═══════════
+//
+// The reviewer's adversarial tests (`~/wt-sec-v22d/prog/tests/sec_v22d_adv.rs`, GREEN = exploit
+// worked) ported here with the assertions FLIPPED to the fixed behaviour. Each carries an in-test
+// control showing the refusal is the fix (not a broken setup).
+
+/// SEC-D2 regression (W-1 / S-1): the dust-`U` ledger (`U = 1` against a 3,000,000 fund). (a) a
+/// top-up that would mint ZERO units is refused and moves nothing; (b) the stake sync that would
+/// deploy 2,000,000 for zero stake units is refused (the wrapper refuses the mint; stake would
+/// also refuse the count) and the stakers' pool value is untouched. Control: on the honest ledger
+/// (`U = I`) the same top-up and sync succeed.
+#[test]
+fn sec_d2_zero_mint_donation_refused() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 3_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    // Control first, on the honest ledger: a 500,000 top-up mints units.
+    let c0 = units(&w).unwrap();
+    top_up_9(&mut w, 500_000, true).expect("control: honest top-up");
+    let c1 = units(&w).unwrap();
+    assert!(c1.units_total > c0.units_total, "control: units minted");
+    // The dust state.
+    set_units(&mut w, |u| {
+        u.units_total = 1;
+        u.units_creator = 1;
+        u.units_stake = 0;
+    });
+    init_units(&mut w).expect("116 refresh");
+    let u0 = units(&w).unwrap();
+    let ins0 = w.env.market_state().1.insurance;
+    let r = top_up_9(&mut w, 500_000, true);
+    eprintln!("SEC-D2a top-up 500,000 on U=1/I={} -> {:?}", u0.snap_insurance_mint_atoms, r.as_ref().map_err(|e| code(e)));
+    assert!(has(&r, INS_REFUSED), "W-1: a zero-unit top-up is refused: {r:?}");
+    let e = r.unwrap_err();
+    assert!(e.contains("p4_ins_units_mint_refused"), "refused by the mint check, not something else");
+    assert_eq!(w.env.market_state().1.insurance, ins0, "nothing moved");
+    assert_eq!(units(&w).unwrap().units_total, 1);
+    // (b) the stake pool.
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
+    let (l0, d0, s0) = pool_view(&w, &p);
+    let r = stake_sync(&mut w, &p);
+    eprintln!("SEC-D2b sync -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(r.is_err(), "S-1: the zero-unit deployment is refused: {r:?}");
+    let (l1, d1, s1) = pool_view(&w, &p);
+    assert_eq!((l1, d1, s1), (l0, d0, s0), "stakers' pool untouched");
+    assert_eq!(w.env.market_state().1.insurance, ins0, "no insurance moved");
+}
+
+/// SEC-D2 (b) alone, for the two-sided control (S-1 + W-1): the dust-`U` ledger, then the sync.
+/// Stake computes the expected units (0) before the CPI and refuses (45); with stake's S-1 check
+/// MUTATED OUT, the wrapper's own W-1 mint check refuses inside the CPI (116), so each side holds
+/// on its own. `SEC_D2B_EXPECT` (env) names the code a run expects (default 45).
+#[test]
+fn sec_d2b_stake_sync_zero_unit_deployment_refused() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 3_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    set_units(&mut w, |u| {
+        u.units_total = 1;
+        u.units_creator = 1;
+        u.units_stake = 0;
+    });
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
+    let (l0, d0, s0) = pool_view(&w, &p);
+    let ins0 = w.env.market_state().1.insurance;
+    let r = stake_sync(&mut w, &p);
+    let c = r.as_ref().err().and_then(|e| code(e));
+    eprintln!("SEC-D2b sync -> {c:?}");
+    let want: u32 = std::env::var("SEC_D2B_EXPECT").ok().and_then(|v| v.parse().ok()).unwrap_or(ST_UNITS_MISMATCH);
+    assert_eq!(c, Some(want), "zero-unit deployment refused with {want}: {r:?}");
+    assert_eq!(pool_view(&w, &p), (l0, d0, s0), "pool untouched");
+    assert_eq!(w.env.market_state().1.insurance, ins0);
+}
+
+/// W-1 genesis minimum: tag 116 refuses a dust genesis (0 < I < 1e6); an empty fund is allowed
+/// and its first top-up must itself reach the minimum. Control: a 1e6 genesis succeeds.
+#[test]
+fn w1_units_genesis_minimum() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 999_999, false).expect("dust seed");
+    let r = init_units(&mut w);
+    assert!(has(&r, INS_REFUSED), "dust genesis refused: {r:?}");
+    let mut w = P3::new();
+    init_units(&mut w).expect("empty-fund genesis");
+    assert_eq!(units(&w).unwrap().units_total, 0);
+    let r = top_up_9(&mut w, 999_999, true);
+    assert!(has(&r, INS_REFUSED), "first top-up below the minimum refused: {r:?}");
+    top_up_9(&mut w, 1_000_000, true).expect("control: genesis top-up at the minimum");
+    assert_eq!(units(&w).unwrap().units_total, 1_000_000);
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("seed");
+    init_units(&mut w).expect("control: 1e6 genesis");
+}
+
+/// SEC-D4 regression (W-5 / S-3): with a receivable outstanding (mint reading > free reading), a
+/// deposit into a pool with deployed units and the sync are refused (stake 44), so no newcomer is
+/// taxed at the spread. Control: the same deposit succeeds once the readings agree.
+#[test]
+fn sec_d4_deposit_and_sync_refused_while_readings_diverge() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("A");
+    stake_sync(&mut w, &p).expect("sync deploys 2M");
+    set_units(&mut w, |u| u.backstop_receivable_atoms = 3_000_000);
+    init_units(&mut w).expect("refresh");
+    let u = units(&w).unwrap();
+    assert!(u.snap_insurance_mint_atoms > u.snap_insurance_free_atoms, "vacuity: readings diverge");
+    let b = staker(&mut w, &p, 2_000_000);
+    let r = stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT));
+    assert!(st_code(&r, ST_READINGS_DIVERGED), "W-5: deposit at the spread refused: {r:?}");
+    assert_eq!(w.tok(&b.ata), 2_000_000, "B keeps its tokens");
+    let s = w.slot() + 200;
+    w.env.svm.warp_to_slot(s);
+    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
+    // Control: readings agree again -> the deposit goes through.
+    set_units(&mut w, |u| u.backstop_receivable_atoms = 0);
+    init_units(&mut w).expect("refresh");
+    stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT)).expect("control: deposit once the readings agree");
+}
+
+/// SEC-D4 / W-8 sync side: the sync (top-up or recovery) is refused while the readings diverge.
+/// Control: the same pool syncs once they agree.
+#[test]
+fn w5_sync_refused_while_readings_diverge() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let a = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("A");
+    set_units(&mut w, |u| u.backstop_receivable_atoms = 500_000);
+    let r = stake_sync(&mut w, &p);
+    assert!(st_code(&r, ST_READINGS_DIVERGED), "top-up at the spread refused: {r:?}");
+    set_units(&mut w, |u| u.backstop_receivable_atoms = 0);
+    stake_sync(&mut w, &p).expect("control: sync once the readings agree");
+}
+
+/// SEC-D5 (S-2): stake v5 ships under the FRESH v2.1 id A6DVNubv, never as an in-place upgrade
+/// of VmpVUArR, so the 72 live v4 pools keep their own (v4) program. A v4-shaped account under
+/// the v5 program is still refused (fail closed), which is now harmless: no such account exists
+/// under the fresh id.
+#[test]
+fn sec_d5_v5_is_a_fresh_program_not_an_upgrade() {
+    assert_ne!(STAKE_PID, solana_sdk::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w"));
+    assert_eq!(STAKE_PID, solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE"));
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    let mut acct = w.env.svm.get_account(&p.pda).unwrap();
+    acct.data.truncate(408);
+    acct.data[328] = 4;
+    w.env.svm.set_account(p.pda, acct).unwrap();
+    let s = staker(&mut w, &p, 0);
+    assert!(stake_withdraw(&mut w, &p, &s, 1).is_err(), "a v4 layout under the v5 program fails closed");
+}
+
+/// SEC-D7 regression (W-2 (a)): a junior-only vault (no Earn seniors) is never eligible for G9,
+/// whatever its deficit: propose and draw are refused and no insurance moves. Control: the
+/// seniors world (`g9_draws_after_exhaustion_bounded_pro_rata`) draws.
+#[test]
+fn sec_d7_junior_only_vault_never_g9() {
+    let (mut w, _s) = P3::bound(&[], 1_000_000, 1_000);
+    let (t, tp) = w.trader(50_000_000);
+    w.trade_vs_lp(&t, tp, 3 * U).unwrap();
+    MARK.with(|c| c.set(PRICE));
+    for _ in 0..6 {
+        let m = MARK.with(|c| c.get()) * 124 / 100;
+        MARK.with(|c| c.set(m));
+        w.push(m);
+        w.catch_up(&[tp], 30);
+    }
+    seed_units(&mut w, 20_000_000);
+    let ins0 = w.env.market_state().1.insurance;
+    for mode in [2u8, 0] {
+        let r = backstop_111(&mut w, mode, 0, true);
+        eprintln!("SEC-D7 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        assert!(has(&r, INS_REFUSED), "junior-only vault refused: {r:?}");
+        assert!(r.unwrap_err().contains("p4_backstop_ineligible"), "refused by the eligibility rule");
+    }
+    assert_eq!(w.env.market_state().1.insurance, ins0);
+    assert_eq!(backstop_st(&w), 0);
+}
+
+/// W-2 (b, c): G9 is two-step with an exit window and a per-epoch cap. An immediate draw is
+/// refused; a second proposal cannot restart the window; the draw executes after the delay and
+/// clears the proposal; a lapsed proposal cannot execute; the per-epoch cap binds.
+#[test]
+fn w2_g9_two_step_window_and_epoch_cap() {
+    use percolator_prog::p4_rescue_ins::{G9_DELAY_SLOTS, G9_EXEC_WINDOW_SLOTS};
+    let (mut w, _s, (_tk, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    let ins0 = w.env.market_state().1.insurance;
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED) && r.unwrap_err().contains("p4_backstop_not_executable"), "draw without a proposal refused");
+    backstop_111(&mut w, 2, 0, true).expect("propose");
+    let pending = units(&w).unwrap().g9_pending_slot;
+    assert!(pending > 0, "proposal recorded");
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED), "immediate draw refused: {r:?}");
+    g9_wait(&mut w, &[tp], 10);
+    let r = backstop_111(&mut w, 2, 0, true);
+    assert!(has(&r, INS_REFUSED), "a second proposal cannot restart the window: {r:?}");
+    assert_eq!(units(&w).unwrap().g9_pending_slot, pending);
+    assert_eq!(w.env.market_state().1.insurance, ins0, "nothing moved before the delay");
+    // Lapse: past the execution window the proposal is dead; a new one can be made.
+    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS + G9_EXEC_WINDOW_SLOTS);
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED), "lapsed proposal cannot execute: {r:?}");
+    backstop_111(&mut w, 2, 0, true).expect("re-propose after the lapse");
+    // Per-epoch cap: pretend this epoch already lent all but 1,000 atoms of its 20%.
+    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
+    init_units(&mut w).expect("refresh");
+    let u = units(&w).unwrap();
+    let slot = w.slot();
+    let epoch = slot / percolator_prog::p4_rescue_ins::G9_EPOCH_SLOTS;
+    let cap = u.snap_insurance_mint_atoms * 2_000 / 10_000;
+    set_units(&mut w, |x| {
+        x.g9_epoch = epoch;
+        x.g9_epoch_drawn_atoms = cap - 1_000;
+    });
+    backstop_111(&mut w, 0, 0, true).expect("draw after the delay");
+    let b = backstop_st(&w) as u128;
+    assert!(b > 0 && b <= 1_000, "per-epoch cap binds: moved {b}");
+    let u1 = units(&w).unwrap();
+    assert_eq!(u1.g9_pending_slot, 0, "proposal consumed");
+    assert_eq!(u1.g9_epoch_drawn_atoms, cap - 1_000 + b);
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED), "no second draw on a consumed proposal: {r:?}");
+}
+
+/// SEC-D6 regression (W-9): after G9 the vault LP's fill halt counts the backstop. Even with the
+/// senior draw fully restored (outstanding 0), a risk-increasing fill is refused while the
+/// backstop is owed. Control: the same fill with the backstop also cleared is not halted by the
+/// draw halt.
+#[test]
+fn sec_d6_fill_halt_counts_the_backstop() {
+    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    g9(&mut w, &[tp]).expect("G9 draw");
+    let b = backstop_st(&w) as u128;
+    assert!(b > 0);
+    assert_eq!(halt_mirror(&w), outstanding(&w) + b, "mirror = senior outstanding + backstop");
+    let halted = percolator_prog::error::PercolatorError::VaultLpPausedForSeniorDraw as u32;
+    // Isolate the backstop term: zero the senior outstanding in BOTH the state and the mirror.
+    let set_state_and_mirror = |w: &mut P3, senior: u128, backstop: u64| {
+        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
+        st.data[16 + 240..16 + 256].copy_from_slice(&senior.to_le_bytes());
+        st.data[16 + 216..16 + 224].copy_from_slice(&backstop.to_le_bytes());
+        w.env.svm.set_account(w.state_pda, st).unwrap();
+        let mut m = w.env.svm.get_account(&w.env.market).unwrap();
+        {
+            let (_, mut g) = state::market_view_mut(&mut m.data).unwrap();
+            let mut rec = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
+            rec.outstanding_mirror_atoms = senior + backstop as u128;
+            state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
+        }
+        w.env.svm.set_account(w.env.market, m).unwrap();
+    };
+    // Only the backstop owed (senior draw fully restored): the halt mirror is the backstop.
+    set_state_and_mirror(&mut w, 0, b as u64);
+    assert_eq!(halt_mirror(&w), b, "mirror = backstop when the seniors are restored");
+    let (t2, tp2) = w.trader(50_000_000);
+    let r = w.trade_vs_lp(&t2, tp2, U);
+    let c = r.as_ref().err().and_then(|e| code(e));
+    eprintln!("SEC-D6 risk-increasing fill with only the backstop owed -> {c:?}");
+    // In this world the LP floor halt (69, the junior is exhausted) runs before the draw halt
+    // (89); either way the LP cannot add risk on lent insurance (the reviewer's probe saw 69).
+    assert!(c == Some(halted) || c == Some(69), "W-9: risk-increasing fill refused: {r:?}");
+}
+
+/// W-4: the backstop is repayable from a POSITIONED vault LP's free capital (above its initial
+/// margin) in Live, not only once it is flat.
+#[test]
+fn w4_restore_from_positioned_lp() {
+    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    g9(&mut w, &[tp]).expect("draw");
+    let b0 = backstop_st(&w) as u128;
+    // The market falls back part-way; the trader stays OPEN (the LP keeps its leg).
+    for _ in 0..4 {
+        let m = MARK.with(|c| c.get()) * 80 / 100;
+        MARK.with(|c| c.set(m.max(PRICE / 4)));
+        w.push(m.max(PRICE / 4));
+        let lp = w.lp;
+        w.catch_up(&[tp, lp], 30);
+    }
+    assert_ne!(w.pos(w.lp), 0, "vacuity: the vault LP is positioned");
+    // Control: with no free capital (its profit is unconverted PnL, which the engine cannot
+    // convert while the LP holds open source-claim exposure) nothing is repayable.
+    let none = backstop_111(&mut w, 1, 0, true);
+    eprintln!("W-4: restore with no free capital -> {:?}", none.as_ref().map_err(|e| code(e)));
+    assert!(has(&none, INS_REFUSED), "nothing repayable without free capital: {none:?}");
+    // Free capital arrives while the LP stays positioned (here: the junior adds capital).
+    let admin = w.env.admin.insecure_clone();
+    let jd = w.junior_deposit(&admin, 3_000_000);
+    eprintln!("W-4: junior deposit -> {:?}", jd.as_ref().map_err(|e| code(e)));
+    jd.expect("junior capital while positioned");
+    let lpk = w.lp;
+    let _ = w.crank(lpk);
+    let lp = w.lp_state();
+    eprintln!("W-4: LP cap {} pnl {} pos {}", lp.capital, lp.pnl, w.pos(w.lp));
+    let ins0 = w.env.market_state().1.insurance;
+    let vault0 = w.tok(&w.env.vault);
+    let r = backstop_111(&mut w, 1, 0, true);
+    eprintln!("W-4: restore while positioned -> {:?} | backstop {} -> {}", r.as_ref().map_err(|e| code(e)), b0, backstop_st(&w));
+    r.expect("W-4: partial repayment from a positioned LP");
+    let repaid = b0 - backstop_st(&w) as u128;
+    assert!(repaid > 0, "vacuity: something repaid");
+    assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "insurance +repaid");
+    assert_eq!(w.tok(&w.env.vault), vault0, "no SPL moved");
+    assert_ne!(w.pos(w.lp), 0, "still positioned after the repayment");
+    assert_eq!(units(&w).unwrap().backstop_receivable_atoms, backstop_st(&w) as u128);
+    assert_eq!(halt_mirror(&w), outstanding(&w) + backstop_st(&w) as u128, "W-9 mirror in step");
+    conserved(&w, "after positioned restore");
+}
+
+/// W-10: units only on a single-asset market: 116 refuses a market configured with a second
+/// asset, and a unitised market refuses activating a second asset. Control: capacity-1 116 ok.
+#[test]
+fn w10_units_single_asset_only() {
+    let mut w = market_with_capacity(2);
+    top_up_9(&mut w, 2_000_000, false).expect("seed");
+    let slots = {
+        let mut d = w.env.svm.get_account(&w.env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut d).unwrap();
+        g.header.config.max_market_slots.get()
+    };
+    let r = init_units(&mut w);
+    eprintln!("W-10: capacity-2 market (configured slots {slots}) 116 -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert_eq!(slots, 2, "vacuity: two configured assets");
+    assert!(has(&r, INS_REFUSED), "116 on a multi-asset market refused: {r:?}");
+    let mut c = P3::new();
+    top_up_9(&mut c, 2_000_000, false).expect("seed");
+    init_units(&mut c).expect("control: single-asset 116");
+    assert_eq!(p4_flags(&c) & 1, 1);
+}
+
+/// S-6: an admin proposal cannot overwrite a pending PROTOCOL raise, and a deposit during the
+/// pending raise must consent to the raised target (S-5). Control: the admin's own lowering is
+/// accepted while no protocol proposal is pending (XP-1).
+#[test]
+fn s6_protocol_raise_not_overwritable_and_consent_binds_pending() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    // Stake program-data mock: `up` is the stake upgrade authority.
+    let up = Keypair::new();
+    w.env.ensure_signer_account(up.pubkey());
+    let pd_key = Pubkey::find_program_address(&[STAKE_PID.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0;
+    let mut pd = vec![0u8; 45];
+    pd[0..4].copy_from_slice(&3u32.to_le_bytes());
+    pd[12] = 1;
+    pd[13..45].copy_from_slice(up.pubkey().as_ref());
+    w.env.svm.set_account(pd_key, Account { lamports: 1_000_000_000, data: pd, owner: solana_sdk::bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 }).unwrap();
+    let propose = |t: u16| { let mut d = vec![32u8]; d.extend_from_slice(&t.to_le_bytes()); d };
+    stake_send(&mut w, propose(6_000), vec![AccountMeta::new_readonly(up.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(pd_key, false)], &[&up]).expect("protocol raise");
+    let admin = w.env.admin.insecure_clone();
+    let r = stake_send(&mut w, propose(2_000), vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]);
+    assert!(st_code(&r, ST_NOT_PROTOCOL_AUTHORITY), "admin cannot overwrite the protocol raise: {r:?}");
+    let a = staker(&mut w, &p, 1_000_000);
+    let r = stake_deposit(&mut w, &p, &a, 1_000_000, Some(CONSENT));
+    assert!(st_code(&r, ST_CONSENT_REQUIRED), "consent to the old target refused while a raise is pending: {r:?}");
+    stake_deposit_consent(&mut w, &p, &a, 1_000_000, Some((CONSENT, 6_000, 3_000, 500))).expect("consent to the pending target");
 }
