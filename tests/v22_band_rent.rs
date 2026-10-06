@@ -2042,16 +2042,17 @@ impl Env {
     }
 }
 
-/// N-1 dust sweep, tag 111 (wrapper): permissionless, but a leg at or above half the minimum
+/// N-1 dust sweep, tag 118 (wrapper): permissionless, but a leg at or above half the minimum
 /// is not sweepable (NonProgress), and nothing is swept while the asset lags (21). The
 /// positive case (a dust leg closed, slot freed) is the engine test
 /// `band_dust_leg_becomes_sweepable_only_below_half_the_minimum`; the BPF fixture cannot reach
 /// a >50% price fall in reasonable time at 4 bps/slot.
 #[test]
-fn v22_tag111_dust_sweep_refusals() {
+fn v22_tag118_dust_sweep_refusals() {
     let ix = ProgInstruction::SweepBandDustLeg { asset_index: 3 };
     assert_eq!(ProgInstruction::decode(&ix.encode()).unwrap(), ix, "wire roundtrip");
-    assert_eq!(ix.encode(), vec![111, 3, 0]);
+    assert_eq!(ix.encode(), vec![118, 3, 0]);
+    assert_eq!(percolator_prog::constants::TAG_SWEEP_BAND_DUST_LEG, 118, "111 / 112 / 116 / 117 are Wave D's");
     let mut env = Env::new(band_cfg());
     let (lp, long, short) = band_book(&mut env);
     let r = env.sweep_dust(long.1);

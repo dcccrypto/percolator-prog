@@ -520,7 +520,7 @@ pub mod constants {
     pub const TAG_SETTLE_HOLDING_RENT: u8 = 106;
     /// v2.2 band (security re-review N-1): permissionless sweep of a DUST band leg (below half
     /// the market's minimum leg notional), freeing its per-side position slot.
-    pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 111;
+    pub const TAG_SWEEP_BAND_DUST_LEG: u8 = 118;
     /// v2.2 band markets: default share of the liquidation penalty paid to a third-party
     /// cranker (design §1.2: liquidation must be paid to happen, a pending leg holds the epoch).
     pub const BAND_DEFAULT_LIQUIDATION_CRANKER_FEE_SHARE_BPS: u16 = 2_000;
@@ -7773,7 +7773,7 @@ pub mod ix {
         /// rent to the bound vault LP. Accounts: `[0] caller (s)`, `[1] market (w)`,
         /// `[2] portfolio (w)`, `[3] vault_lp_portfolio (w)`, `[4..] oracle accounts`.
         SettleHoldingRent { asset_index: u16, now_slot: u64 },
-        /// v2.2 tag 111 (permissionless): close a band leg whose notional at `P_last` is below
+        /// v2.2 tag 118 (permissionless): close a band leg whose notional at `P_last` is below
         /// half of `band_min_leg_notional` (engine `band_leg_is_dust`), unilaterally at
         /// `P_last` (`rebalance_reduce_position_not_atomic`), so dust cannot hold one of the
         /// 256 per-side slots. Accounts: `[0] caller`, `[1] market (w)`, `[2] portfolio (w)`.
@@ -11489,7 +11489,7 @@ pub mod lag_policy {
             Instruction::VaultLpReleaseSurplus { .. } => entry("VaultLpReleaseSurplus", LagPolicy::Gated, "surplus sized from pooled equity: refused while any asset lags (re-review N-3)"),
             Instruction::AdlWindDown { .. } => entry("AdlWindDown", LagPolicy::Gated, "tag 104: reject_adl_wind_down_unfresh_mark_view"),
             Instruction::SetAdlWindDownMaxSlots { .. } => entry("SetAdlWindDownMaxSlots", LagPolicy::MarkFree, "dial"),
-            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 111: a forced close at P_last, refused while the asset lags"),
+            Instruction::SweepBandDustLeg { .. } => entry("SweepBandDustLeg", LagPolicy::Gated, "tag 118: a forced close at P_last, refused while the asset lags"),
             Instruction::SettleHoldingRent { .. } => entry("SettleHoldingRent", LagPolicy::MarkDriven, "rent accrual at P_last (an index, not a mark-valued payout); routing goes to the bound LP only"),
             Instruction::VaultLpAllocate { .. } => entry("VaultLpAllocate", LagPolicy::Gated, "tag 103: senior allocation sized from the LP certificate, refused while the asset lags"),
         }
@@ -22634,7 +22634,7 @@ pub mod processor {
         })
     }
 
-    /// v2.2 band (security re-review N-1), tag 111: permissionless dust sweep. The leg must be
+    /// v2.2 band (security re-review N-1), tag 118: permissionless dust sweep. The leg must be
     /// dust (`band_leg_is_dust`: under HALF the market's minimum leg notional at `P_last`); the
     /// asset must not lag its target (a forced close at a stale mark is refused, 21); the close
     /// is the engine's unilateral reduce at `P_last` (the same primitive as RebalanceReduce,
