@@ -559,10 +559,20 @@ pub mod constants {
     /// R-7 (Wave D round 4): the G9 Switchboard feed allowlist, global PDA `["g9_feeds"]`, set by
     /// the upgrade authority only (tag 117). Kind 14 is item 4's `OracleGraduationV20`.
     pub const TAG_SET_G9_FEED_ALLOWLIST: u8 = 117;
+    /// R-10: propose a NEW G9 feed allowlist (upgrade authority; count 0 cancels the open proposal).
+    pub const TAG_PROPOSE_G9_FEED_ALLOWLIST: u8 = 120;
+    /// R-10: commit the open proposal after `G9_ALLOWLIST_TIMELOCK_SLOTS`.
+    pub const TAG_COMMIT_G9_FEED_ALLOWLIST: u8 = 121;
     pub const KIND_G9_FEED_ALLOWLIST: u8 = 15;
     pub const G9_FEEDS_SEED: &[u8] = b"g9_feeds";
     pub const G9_FEED_ALLOWLIST_VERSION: u8 = 1;
     pub const G9_FEED_ALLOWLIST_CAP: usize = 16;
+    /// R-10: an ADDED G9 feed takes effect only this many slots after it is proposed (216,000
+    /// slots, about one day), the floor the stake S-6 timelock uses (`max(cooldown, 216,000)`).
+    /// There is no creator or pool setting to take a `max` with: the allowlist is global, so the
+    /// floor IS the delay, independent of anything a market creator configures. A constant on
+    /// every build (devnet included), so a devnet test exercises the mainnet delay.
+    pub const G9_ALLOWLIST_TIMELOCK_SLOTS: u64 = 216_000;
 
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
     pub const MARKET_ASSET_SLOT_LEN: usize = size_of::<Market<[u8; ASSET_ORACLE_WRAPPER_LEN]>>();
@@ -1567,7 +1577,13 @@ VaultLpMultiAssetMarket,
         /// path on a units market was called without the `InsuranceUnitsV20` account, or would
         /// burn more units than the caller's class holds. Custom(116).
         InsuranceBackstopRefused = 116,
+        /// R-10: the G9 feed allowlist timelock refused the call: a commit before the delay has
+        /// elapsed, a commit with no open proposal, or an ADDED feed attempted through the
+        /// removal-only tag 117. Custom(125). Operator: propose (tag 120), wait 216,000 slots,
+        /// then commit (tag 121); removals alone may use tag 117 immediately.
+        G9AllowlistTimelock = 125,
     }
+    const _: () = assert!(PercolatorError::G9AllowlistTimelock as u32 == 125);
     const _: () = assert!(PercolatorError::RescueRefused as u32 == 114);
     const _: () = assert!(PercolatorError::RescueNavFloor as u32 == 115);
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
@@ -6531,20 +6547,27 @@ pub mod state {
     }
 
     // ── R-7 (Wave D round 4): the G9 Switchboard feed allowlist ─────────────────────────────
-    /// Global `["g9_feeds"]`: the Switchboard On-Demand feed keys the upgrade authority accepts as
-    /// a G9-eligible Hybrid leg on a mainnet build (Switchboard feeds are permissionless to
-    /// create, so an unlisted feed may be creator-made). Chainlink store feeds need no listing;
-    /// Pyth is not used (founder decision).
+    /// Global `["g9_feeds"]`: the oracle feed keys the upgrade authority accepts as a G9-eligible
+    /// Hybrid leg on a mainnet build. Switchboard On-Demand feeds are permissionless to create,
+    /// and (R-12, verified on mainnet) so are Chainlink store feeds, so BOTH need a listing; Pyth
+    /// is not used (founder decision). R-10: an ADDED key takes effect only after the timelock
+    /// (`pending_*`, tags 120/121); a removal is immediate (tag 117).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct G9FeedAllowlistV22 {
         pub count: u8,
         pub version: u8,
         pub bump: u8,
-        pub _pad: [u8; 5],
+        /// R-10: number of keys in `pending_keys` (0 = no open proposal).
+        pub pending_count: u8,
+        pub _pad: [u8; 4],
+        /// R-10: slot the open proposal was made (0 = none). Commit needs `now >= pending_slot
+        /// + G9_ALLOWLIST_TIMELOCK_SLOTS`.
+        pub pending_slot: u64,
         pub keys: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
+        pub pending_keys: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
     }
-    const _: () = assert!(core::mem::size_of::<G9FeedAllowlistV22>() == 8 + 32 * 16);
+    const _: () = assert!(core::mem::size_of::<G9FeedAllowlistV22>() == 16 + 32 * 16 * 2);
 
     pub const fn g9_feed_allowlist_account_len() -> usize {
         HEADER_LEN + core::mem::size_of::<G9FeedAllowlistV22>()
@@ -6561,12 +6584,20 @@ pub mod state {
 
     pub fn validate_g9_feed_allowlist(x: &G9FeedAllowlistV22) -> Result<(), ProgramError> {
         let n = x.count as usize;
+        let pn = x.pending_count as usize;
+        let distinct_nonzero = |ks: &[[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP], n: usize| {
+            !ks[..n].contains(&[0u8; 32])
+                && ks[n..].iter().all(|k| *k == [0u8; 32])
+                && (0..n).all(|i| (i + 1..n).all(|j| ks[i] != ks[j]))
+        };
         if x.version != crate::constants::G9_FEED_ALLOWLIST_VERSION
             || n > crate::constants::G9_FEED_ALLOWLIST_CAP
-            || x._pad != [0u8; 5]
-            || x.keys[..n].contains(&[0u8; 32])
-            || x.keys[n..].iter().any(|k| *k != [0u8; 32])
-            || (0..n).any(|i| (i + 1..n).any(|j| x.keys[i] == x.keys[j]))
+            || pn > crate::constants::G9_FEED_ALLOWLIST_CAP
+            || x._pad != [0u8; 4]
+            || !distinct_nonzero(&x.keys, n)
+            || !distinct_nonzero(&x.pending_keys, pn)
+            // a proposal exists iff it has a slot (an empty proposal is a cancel, never stored)
+            || (x.pending_slot == 0) != (pn == 0)
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -8107,6 +8138,8 @@ pub mod ix {
         /// `[0]` upgrade authority (signer, w; pays rent) · `[1]` program data · `[2]` allowlist
         /// PDA (w) · `[3]` system program.
         SetG9FeedAllowlist { keys: Vec<[u8; 32]> },
+        ProposeG9FeedAllowlist { keys: Vec<[u8; 32]> },
+        CommitG9FeedAllowlist,
         /// Tag 112 (Phase 4 item 5). The rescuer buys senior shares at the certified IMPAIRED
         /// value, never par. `tranche` 0 = senior (the only tranche on this branch; 1 = bond,
         /// item 3, refused until bonds ship). Refuses unless `minted >= min_shares`.
@@ -8759,6 +8792,18 @@ pub mod ix {
                     }
                     Self::SetG9FeedAllowlist { keys }
                 }
+                crate::constants::TAG_PROPOSE_G9_FEED_ALLOWLIST => {
+                    let n = read_u8(&mut rest)? as usize;
+                    if n > crate::constants::G9_FEED_ALLOWLIST_CAP {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let mut keys = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        keys.push(read_bytes32(&mut rest)?);
+                    }
+                    Self::ProposeG9FeedAllowlist { keys }
+                }
+                crate::constants::TAG_COMMIT_G9_FEED_ALLOWLIST => Self::CommitG9FeedAllowlist,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -9752,6 +9797,16 @@ pub mod ix {
                     for k in keys {
                         out.extend_from_slice(k);
                     }
+                }
+                Self::ProposeG9FeedAllowlist { ref keys } => {
+                    out.push(crate::constants::TAG_PROPOSE_G9_FEED_ALLOWLIST);
+                    out.push(keys.len() as u8);
+                    for k in keys {
+                        out.extend_from_slice(k);
+                    }
+                }
+                Self::CommitG9FeedAllowlist => {
+                    out.push(crate::constants::TAG_COMMIT_G9_FEED_ALLOWLIST);
                 }
                 Self::RescueDeposit {
                     tranche,
@@ -14033,6 +14088,12 @@ pub mod processor {
             Instruction::InitInsuranceUnits => handle_init_insurance_units(program_id, accounts),
             Instruction::SetG9FeedAllowlist { keys } => {
                 handle_set_g9_feed_allowlist(program_id, accounts, &keys)
+            }
+            Instruction::ProposeG9FeedAllowlist { keys } => {
+                handle_propose_g9_feed_allowlist(program_id, accounts, &keys)
+            }
+            Instruction::CommitG9FeedAllowlist => {
+                handle_commit_g9_feed_allowlist(program_id, accounts)
             }
             Instruction::VaultLpSettleResolved { topup } => {
                 handle_vault_lp_settle_resolved(program_id, accounts, topup)
@@ -33442,18 +33503,14 @@ pub mod processor {
         Ok(())
     }
 
-    /// SetG9FeedAllowlist (tag 117, R-7). UPGRADE-AUTHORITY only (ProgramData-proven, as tags 85,
-    /// 92 and 99): replaces the global G9 Switchboard feed allowlist `["g9_feeds"]`, creating it
-    /// on first use (the authority pays rent).
-    ///
-    /// Accounts: `[0]` upgrade authority (signer, w) · `[1]` program data · `[2]` allowlist PDA
-    /// (w) · `[3]` system program.
+    /// Shared account checks of the three allowlist tags (117 / 120 / 121). UPGRADE-AUTHORITY only
+    /// (ProgramData-proven, as tags 85, 92 and 99). Accounts: `[0]` upgrade authority (signer, w)
+    /// · `[1]` program data · `[2]` allowlist PDA (w) · `[3]` system program. Returns the PDA bump.
     #[inline(never)]
-    fn handle_set_g9_feed_allowlist<'a>(
+    fn g9_allowlist_authority_checks<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        keys: &[[u8; 32]],
-    ) -> ProgramResult {
+    ) -> Result<u8, ProgramError> {
         let upgrade_authority = account(accounts, 0)?;
         let program_data_ai = account(accounts, 1)?;
         let list_ai = account(accounts, 2)?;
@@ -33470,17 +33527,38 @@ pub mod processor {
         }
         let (pda, bump) = state::derive_g9_feed_allowlist(program_id);
         expect_key(list_ai, &pda)?;
-        if keys.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
-            return Err(PercolatorError::InvalidInstruction.into());
+        Ok(bump)
+    }
+
+    /// Loads the allowlist record, or a fresh empty one when the PDA has not been created yet.
+    fn g9_allowlist_load_or_new(
+        program_id: &Pubkey,
+        list_ai: &AccountInfo<'_>,
+        bump: u8,
+    ) -> Result<state::G9FeedAllowlistV22, ProgramError> {
+        if list_ai.data_is_empty() {
+            return Ok(state::G9FeedAllowlistV22 {
+                version: crate::constants::G9_FEED_ALLOWLIST_VERSION,
+                bump,
+                ..<state::G9FeedAllowlistV22 as bytemuck::Zeroable>::zeroed()
+            });
         }
-        let mut rec = state::G9FeedAllowlistV22 {
-            count: keys.len() as u8,
-            version: crate::constants::G9_FEED_ALLOWLIST_VERSION,
-            bump,
-            ..<state::G9FeedAllowlistV22 as bytemuck::Zeroable>::zeroed()
-        };
-        rec.keys[..keys.len()].copy_from_slice(keys);
-        state::validate_g9_feed_allowlist(&rec)?;
+        expect_owner(list_ai, program_id)?;
+        state::read_g9_feed_allowlist(&list_ai.try_borrow_data()?)
+    }
+
+    /// Creates the allowlist PDA on first use (the upgrade authority pays rent), then writes `rec`.
+    #[inline(never)]
+    fn g9_allowlist_store<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        bump: u8,
+        rec: &state::G9FeedAllowlistV22,
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let list_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
+        state::validate_g9_feed_allowlist(rec)?;
         if list_ai.data_is_empty() {
             expect_writable(upgrade_authority)?;
             let bump_bytes = [bump];
@@ -33496,8 +33574,113 @@ pub mod processor {
         } else {
             expect_owner(list_ai, program_id)?;
         }
-        state::write_g9_feed_allowlist(&mut list_ai.try_borrow_mut_data()?, &rec)?;
+        state::write_g9_feed_allowlist(&mut list_ai.try_borrow_mut_data()?, rec)
+    }
+
+    /// SetG9FeedAllowlist (tag 117, R-7; R-10: REMOVAL-ONLY). UPGRADE-AUTHORITY only. Replaces the
+    /// global G9 feed allowlist `["g9_feeds"]` with a list that is a SUBSET of the current one:
+    /// removing a feed that stopped being trustworthy is immediate. Any ADDED key is refused with
+    /// `G9AllowlistTimelock` (it must go through tag 120 then tag 121 after 216,000 slots). An
+    /// immediate change also cancels any open proposal (a removal must never be undone by a
+    /// pending addition that predates it). Accounts as `g9_allowlist_authority_checks`.
+    #[inline(never)]
+    fn handle_set_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        keys: &[[u8; 32]],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if keys.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut rec = g9_allowlist_load_or_new(program_id, list_ai, bump)?;
+        if !crate::p4_rescue_ins::g9_allowlist_removal_only(&rec.keys[..rec.count as usize], keys) {
+            solana_program::log::sol_log("p4_g9_feed_allowlist_add_refused use tag 120 then 121");
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        rec.count = keys.len() as u8;
+        rec.keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        rec.keys[..keys.len()].copy_from_slice(keys);
+        rec.pending_count = 0;
+        rec.pending_slot = 0;
+        rec.pending_keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        g9_allowlist_store(program_id, accounts, bump, &rec)?;
         solana_program::log::sol_log(&alloc::format!("p4_g9_feed_allowlist count={}", keys.len()));
+        Ok(())
+    }
+
+    /// ProposeG9FeedAllowlist (tag 120, R-10). UPGRADE-AUTHORITY only. Records `keys` as the
+    /// pending list at the current slot; a second proposal replaces (and restarts) the first.
+    /// `keys` empty CANCELS the open proposal (refused when there is none). Nothing changes in
+    /// force until tag 121.
+    #[inline(never)]
+    fn handle_propose_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        keys: &[[u8; 32]],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if keys.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let mut rec = g9_allowlist_load_or_new(program_id, list_ai, bump)?;
+        if keys.is_empty() {
+            if rec.pending_count == 0 {
+                return Err(PercolatorError::G9AllowlistTimelock.into());
+            }
+            rec.pending_count = 0;
+            rec.pending_slot = 0;
+            rec.pending_keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+            g9_allowlist_store(program_id, accounts, bump, &rec)?;
+            solana_program::log::sol_log("p4_g9_feed_allowlist_proposal_cancelled");
+            return Ok(());
+        }
+        let now = Clock::get()?.slot.max(1);
+        rec.pending_count = keys.len() as u8;
+        rec.pending_slot = now;
+        rec.pending_keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        rec.pending_keys[..keys.len()].copy_from_slice(keys);
+        g9_allowlist_store(program_id, accounts, bump, &rec)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_g9_feed_allowlist_proposed count={} slot={} commit_from={}",
+            keys.len(),
+            now,
+            now.saturating_add(crate::constants::G9_ALLOWLIST_TIMELOCK_SLOTS)
+        ));
+        Ok(())
+    }
+
+    /// CommitG9FeedAllowlist (tag 121, R-10). UPGRADE-AUTHORITY only. Makes the pending list the
+    /// list in force, only when `now >= pending_slot + G9_ALLOWLIST_TIMELOCK_SLOTS`; refused with
+    /// `G9AllowlistTimelock` when there is no proposal or the delay has not elapsed.
+    #[inline(never)]
+    fn handle_commit_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if list_ai.data_is_empty() {
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        let mut rec = g9_allowlist_load_or_new(program_id, list_ai, bump)?;
+        let now = Clock::get()?.slot;
+        if !crate::p4_rescue_ins::g9_allowlist_commit_ready(rec.pending_slot, now) {
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_g9_feed_allowlist_commit_refused pending_slot={} now={}",
+                rec.pending_slot, now
+            ));
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        rec.count = rec.pending_count;
+        rec.keys = rec.pending_keys;
+        rec.pending_count = 0;
+        rec.pending_slot = 0;
+        rec.pending_keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        g9_allowlist_store(program_id, accounts, bump, &rec)?;
+        solana_program::log::sol_log(&alloc::format!("p4_g9_feed_allowlist_committed count={}", rec.count));
         Ok(())
     }
 
@@ -33554,7 +33737,7 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         // R-1 / R-7 / R-8 (re-reviews 2026-10-06, mainnet blocker): PROPOSE and DRAW only on an
-        // authenticated Hybrid whose every leg is a Chainlink store feed or an allowlisted
+        // authenticated Hybrid whose every leg is an ALLOWLISTED (R-10/R-12) Chainlink store or
         // Switchboard feed (the leg accounts ride in the tail). Devnet builds keep an override for
         // testing; a mainnet build has none. RESTORE (mode 1) is never gated.
         if mode != 1 {
@@ -40499,6 +40682,7 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::EngineAdlReduceOnly), 120);
             assert_eq!(custom_code(PercolatorError::EngineLossStale), 121);
             assert_eq!(custom_code(PercolatorError::EarnExitWouldUnderBackClaims), 122);
+            assert_eq!(custom_code(PercolatorError::G9AllowlistTimelock), 125);
             assert_eq!(custom_code(PercolatorError::EngineLockActive), 21);
             assert_eq!(
                 crate::error::map_v16_error(percolator::V16Error::AdlReduceOnly),

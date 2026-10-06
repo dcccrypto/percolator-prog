@@ -2926,6 +2926,45 @@ fn set_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u6
     )
 }
 
+fn allowlist_metas(w: &P3, signer: &Keypair) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new_readonly(w.program_data, false),
+        AccountMeta::new(g9_allowlist_pda(w), false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ]
+}
+
+/// R-10: tag 120 (propose; empty = cancel).
+fn propose_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u64, String> {
+    w.env.ensure_signer_account(signer.pubkey());
+    let metas = allowlist_metas(w, signer);
+    w.send(ProgInstruction::ProposeG9FeedAllowlist { keys }, metas, &[signer])
+}
+
+/// R-10: tag 121 (commit).
+fn commit_allowlist(w: &mut P3, signer: &Keypair) -> Result<u64, String> {
+    w.env.ensure_signer_account(signer.pubkey());
+    let metas = allowlist_metas(w, signer);
+    w.send(ProgInstruction::CommitG9FeedAllowlist, metas, &[signer])
+}
+
+const TIMELOCK: u64 = percolator_prog::constants::G9_ALLOWLIST_TIMELOCK_SLOTS;
+const ALLOWLIST_TIMELOCK_ERR: u32 = 125;
+
+fn allowlist_rec(w: &P3) -> state::G9FeedAllowlistV22 {
+    state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(w)).unwrap().data).unwrap()
+}
+
+/// R-10: ADD `keys` (the new list in force) the only way an addition can happen: propose, wait the
+/// full timelock, commit.
+fn add_to_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) {
+    propose_allowlist(w, signer, keys).expect("propose");
+    let target = w.slot() + TIMELOCK;
+    w.env.svm.warp_to_slot(target);
+    commit_allowlist(w, signer).expect("commit after the delay");
+}
+
 /// Tag 111 PROPOSE with `tail` appended after the fixed accounts (no units ledger needed: the
 /// gate runs first).
 fn propose_with_tail(w: &mut P3, tail: &[Pubkey]) -> Result<u64, String> {
@@ -2979,7 +3018,7 @@ fn r7_switchboard_leg_requires_allowlist() {
     }
     assert!(leg_refused(&r), "creator-made Switchboard feed refused: {r:?}");
     let up = w.upgrade.insecure_clone();
-    set_allowlist(&mut w, &up, vec![feed.to_bytes()]).expect("upgrade authority lists the feed");
+    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
     let list = g9_allowlist_pda(&w);
     let r = propose_with_tail(&mut w, &[list, feed]);
     eprintln!("R-7 allowlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
@@ -2988,15 +3027,18 @@ fn r7_switchboard_leg_requires_allowlist() {
     assert!(leg_refused(&r), "control: allowlist account omitted -> refused: {r:?}");
     // A different listed key does not help an unlisted leg.
     let other = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
-    set_allowlist(&mut w, &up, vec![other.to_bytes()]).expect("relist");
+    add_to_allowlist(&mut w, &up, vec![other.to_bytes()]);
     let r = propose_with_tail(&mut w, &[list, feed]);
     assert!(leg_refused(&r), "control: only another feed listed -> refused: {r:?}");
 }
 
-/// R-7 (mainnet): a Chainlink store feed whose key matches the profile is admitted. Controls: the
-/// leg account omitted, a Chainlink account with another key, and a Pyth-owned leg are refused.
+/// R-12 (mainnet): a Chainlink store feed is NOT trusted by its owner alone (the store's
+/// `create_feed` is open to any signer, see `evidence/r12-chainlink-store-*`): unlisted it is
+/// refused; once the upgrade authority lists it (propose, 216,000 slots, commit) it is admitted.
+/// Controls: the leg account omitted, a listed key but another Chainlink account, the allowlist
+/// omitted from the tail, and a Pyth-owned leg are refused.
 #[test]
-fn r7_chainlink_leg_admitted() {
+fn r12_chainlink_leg_requires_allowlist() {
     if std::env::var("R1_FLAVOUR").map_or(true, |v| v != "mainnet") {
         return; // the devnet override is asserted by r7_switchboard_leg_requires_allowlist
     }
@@ -3004,14 +3046,21 @@ fn r7_chainlink_leg_admitted() {
     let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
     make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
     let r = propose_with_tail(&mut w, &[feed]);
-    eprintln!("R-7 Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(gate_passed(&r), "Chainlink admitted: {r:?}");
-    assert!(leg_refused(&propose_with_tail(&mut w, &[])), "control: leg account omitted");
+    eprintln!("R-12 unlisted Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(leg_refused(&r), "R-12: an unlisted store-owned feed is refused: {r:?}");
+    let up = w.upgrade.insecure_clone();
+    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
+    let list = g9_allowlist_pda(&w);
+    let r = propose_with_tail(&mut w, &[list, feed]);
+    eprintln!("R-12 listed Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert!(gate_passed(&r), "listed Chainlink admitted: {r:?}");
+    assert!(leg_refused(&propose_with_tail(&mut w, &[list])), "control: leg account omitted");
+    assert!(leg_refused(&propose_with_tail(&mut w, &[feed])), "control: allowlist omitted from the tail");
     let other = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
-    assert!(leg_refused(&propose_with_tail(&mut w, &[other])), "control: Chainlink account with another key");
+    assert!(leg_refused(&propose_with_tail(&mut w, &[list, other])), "control: Chainlink account with another key");
     let pyth = feed_account(&mut w, percolator_prog::oracle_v16::PYTH_RECEIVER_PROGRAM_ID);
     make_hybrid(&mut w, pyth, ORACLE_AUTHENTICATED);
-    assert!(leg_refused(&propose_with_tail(&mut w, &[pyth])), "control: Pyth leg refused (no Pyth)");
+    assert!(leg_refused(&propose_with_tail(&mut w, &[list, pyth])), "control: Pyth leg refused (no Pyth)");
 }
 
 /// R-8 (mainnet): a Hybrid whose effective price fell back to the trade-driven mark is refused,
@@ -3028,28 +3077,119 @@ fn r8_trade_driven_provenance_refused() {
     eprintln!("R-8 trade-driven -> {:?}", r.as_ref().map_err(|e| code(e)));
     assert!(oracle_refused(&r), "trade-driven fallback refused: {r:?}");
     make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-    assert!(gate_passed(&propose_with_tail(&mut w, &[feed])), "control: authenticated passes");
+    let up = w.upgrade.insecure_clone();
+    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
+    let list = g9_allowlist_pda(&w);
+    assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "control: authenticated passes");
 }
 
-/// Tag 117 is upgrade-authority only and validates its list (both build flavours).
+/// Tags 117 / 120 / 121 are upgrade-authority only and validate their list (both build flavours).
 #[test]
 fn r7_allowlist_setter_is_authority_only_and_validated() {
     let mut w = r7_world();
     let k = Pubkey::new_unique().to_bytes();
     let stranger = Keypair::new();
-    let r = set_allowlist(&mut w, &stranger, vec![k]);
-    assert!(r.is_err(), "non-authority refused: {r:?}");
+    assert!(propose_allowlist(&mut w, &stranger, vec![k]).is_err(), "non-authority propose refused");
+    assert!(set_allowlist(&mut w, &stranger, vec![]).is_err(), "non-authority 117 refused");
+    assert!(commit_allowlist(&mut w, &stranger).is_err(), "non-authority commit refused");
     assert!(w.env.svm.get_account(&g9_allowlist_pda(&w)).map_or(true, |a| a.data.is_empty()), "nothing created");
     let up = w.upgrade.insecure_clone();
-    assert!(set_allowlist(&mut w, &up, vec![k, k]).is_err(), "duplicates refused");
-    assert!(set_allowlist(&mut w, &up, vec![[0u8; 32]]).is_err(), "zero key refused");
-    assert!(set_allowlist(&mut w, &up, (0..17u8).map(|i| [i + 1; 32]).collect()).is_err(), "17 keys refused");
-    set_allowlist(&mut w, &up, vec![k]).expect("authority sets it");
-    let l = state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(&w)).unwrap().data).unwrap();
-    assert_eq!((l.count, l.keys[0]), (1, k));
-    set_allowlist(&mut w, &up, vec![]).expect("authority clears it");
-    let l = state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(&w)).unwrap().data).unwrap();
-    assert_eq!(l.count, 0);
+    assert!(propose_allowlist(&mut w, &up, vec![k, k]).is_err(), "duplicates refused");
+    assert!(propose_allowlist(&mut w, &up, vec![[0u8; 32]]).is_err(), "zero key refused");
+    assert!(propose_allowlist(&mut w, &up, (0..17u8).map(|i| [i + 1; 32]).collect()).is_err(), "17 keys refused");
+    add_to_allowlist(&mut w, &up, vec![k]);
+    let l = allowlist_rec(&w);
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, k, 0, 0));
+    set_allowlist(&mut w, &up, vec![]).expect("authority clears it (a removal)");
+    assert_eq!(allowlist_rec(&w).count, 0);
+}
+
+/// R-10: the timelock. An ADDED feed is in force only after `G9_ALLOWLIST_TIMELOCK_SLOTS`; commit
+/// one slot early is refused (125), at the boundary it succeeds; the list in force never changes
+/// before the commit. Both build flavours (the handlers do not depend on the flavour).
+#[test]
+fn r10_addition_needs_the_full_delay() {
+    let mut w = r7_world();
+    let up = w.upgrade.insecure_clone();
+    let a = Pubkey::new_unique().to_bytes();
+    propose_allowlist(&mut w, &up, vec![a]).expect("propose");
+    let p = allowlist_rec(&w);
+    assert_eq!((p.count, p.pending_count), (0, 1), "nothing in force yet");
+    assert!(p.pending_slot != 0);
+    // Immediately: refused.
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit at once refused: {r:?}");
+    // One slot short of the delay: refused.
+    w.env.svm.warp_to_slot(p.pending_slot + TIMELOCK - 1);
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit one slot early refused: {r:?}");
+    assert_eq!(allowlist_rec(&w).count, 0, "still nothing in force");
+    // Exactly at the delay: accepted.
+    w.env.svm.warp_to_slot(p.pending_slot + TIMELOCK);
+    commit_allowlist(&mut w, &up).expect("commit at the boundary");
+    let l = allowlist_rec(&w);
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, a, 0, 0));
+    // A commit with no proposal is refused (replay).
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "no proposal -> refused: {r:?}");
+}
+
+/// R-10: tag 117 can no longer ADD (negative control for the old instant replacement); a removal
+/// is immediate and also cancels an open proposal that predates it.
+#[test]
+fn r10_tag_117_is_removal_only() {
+    let mut w = r7_world();
+    let up = w.upgrade.insecure_clone();
+    let (a, b, c) = (Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes());
+    // The old behaviour (instant replace on a fresh list) is refused.
+    let r = set_allowlist(&mut w, &up, vec![a]);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "an addition through 117 is refused: {r:?}");
+    assert!(w.env.svm.get_account(&g9_allowlist_pda(&w)).map_or(true, |x| x.data.is_empty()), "nothing created");
+    add_to_allowlist(&mut w, &up, vec![a, b]);
+    // Adding c while keeping a: refused; the list is unchanged.
+    let r = set_allowlist(&mut w, &up, vec![a, c]);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "replacement that adds c refused: {r:?}");
+    assert_eq!(allowlist_rec(&w).count, 2);
+    // A pending addition, then an immediate removal: the removal lands NOW and cancels the proposal.
+    propose_allowlist(&mut w, &up, vec![a, b, c]).expect("propose adding c");
+    set_allowlist(&mut w, &up, vec![a]).expect("removal of b is immediate");
+    let l = allowlist_rec(&w);
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, a, 0, 0), "removal cancelled the proposal");
+    let target = w.slot() + TIMELOCK;
+    w.env.svm.warp_to_slot(target);
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "the cancelled proposal cannot commit: {r:?}");
+    assert_eq!(allowlist_rec(&w).count, 1, "b stays removed, c never added");
+}
+
+/// R-10: a second proposal restarts the delay; an empty proposal cancels (and is refused when
+/// nothing is open); the delay is the constant 216,000 on every build.
+#[test]
+fn r10_reproposal_restarts_and_cancel() {
+    let mut w = r7_world();
+    let up = w.upgrade.insecure_clone();
+    let (a, b) = (Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes());
+    assert_eq!(TIMELOCK, 216_000, "the S-6 floor");
+    let r = propose_allowlist(&mut w, &up, vec![]);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancel with nothing open refused: {r:?}");
+    propose_allowlist(&mut w, &up, vec![a]).expect("first");
+    let first = allowlist_rec(&w).pending_slot;
+    w.env.svm.warp_to_slot(first + TIMELOCK - 10);
+    propose_allowlist(&mut w, &up, vec![a, b]).expect("replace");
+    let second = allowlist_rec(&w);
+    assert!(second.pending_slot > first && second.pending_count == 2, "replaced and restarted");
+    // The OLD due slot passes: the replaced proposal is not yet committable.
+    w.env.svm.warp_to_slot(first + TIMELOCK + 5);
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "a replaced proposal restarts the clock: {r:?}");
+    // Cancel: nothing can commit.
+    propose_allowlist(&mut w, &up, vec![]).expect("cancel");
+    let l = allowlist_rec(&w);
+    assert_eq!((l.pending_count, l.pending_slot), (0, 0));
+    w.env.svm.warp_to_slot(second.pending_slot + TIMELOCK + 5);
+    let r = commit_allowlist(&mut w, &up);
+    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancelled -> refused: {r:?}");
+    assert_eq!(allowlist_rec(&w).count, 0);
 }
 
 /// R-9: the G9 licence is the seniors' loss STILL outstanding. With the seniors' outstanding draw
