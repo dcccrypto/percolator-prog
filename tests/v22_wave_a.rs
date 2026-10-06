@@ -643,7 +643,7 @@ fn combined_tags_decode_to_distinct_variants() {
     use std::collections::BTreeMap;
     let mut names: BTreeMap<String, u8> = BTreeMap::new();
     for tag in 0u8..=255 {
-        for len in 0..=64usize {
+        for len in 0..=300usize {
             let mut data = vec![0u8; len + 1];
             data[0] = tag;
             if let Ok(ix) = ProgInstruction::decode(&data) {

@@ -31,7 +31,9 @@ const E_LP_CAP: u32 = 68;
 const E_LP_FLOOR: u32 = 69;
 const E_SIDE_OI: u32 = 70;
 const E_IM: u32 = 49;
-const LIMITS_OFF: usize = 1958; // + 2325*i  (doc: "Absolute byte offset")
+// doc: "Absolute byte offset" of asset 0's limits record. 1958 was the v2.1 offset (engine header 758 B);
+// v2.2 grows the engine header (806 B), so asset 0 moves by the difference.
+const LIMITS_OFF: usize = 1958 + (percolator_prog::constants::MARKET_GROUP_LEN - 758);
 
 fn params(initial_price: u64, fee_bps: u64) -> V16CuMarketParams {
     // Envelope-valid 10x market (same family as the conservation fuzz world).

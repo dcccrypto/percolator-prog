@@ -115,7 +115,7 @@ fn sec3_init_market_trailer_lengths_decode_only_on_the_grammar() {
             max_abs_funding_e9_per_slot: 1, min_funding_lifetime_slots: 1, max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1, max_bankrupt_close_lifetime_slots: 10, public_b_chunk_atoms: 1_000, maintenance_fee_per_slot: 0,
         }),
-        growth_r_gap_bps: 400, growth_l_launch_x100: 1000,
+        growth_r_gap_bps: 400, growth_l_launch_x100: 1000, lot_exp: 0,
         phase4: InitMarketPhase4 { rent_max_e9_per_slot: 23, rent_kink_bps: 5000, band_bps: 0, ..Default::default() },
     };
     let full = base_ix.encode();
@@ -129,6 +129,6 @@ fn sec3_init_market_trailer_lengths_decode_only_on_the_grammar() {
         b.extend_from_slice(&filler);
         if Instruction::decode(&b).is_ok() { ok.push(tl); }
     }
-    eprintln!("SEC3 decodable trailer lengths (growth+rent+band, no lot on this branch): {ok:?}; base_len {base_len}, full {}", full.len());
-    assert!(ok.iter().all(|l| [0usize, 4, 10, 28].contains(l)), "only the grammar decodes: {ok:?}");
+    eprintln!("SEC3 decodable trailer lengths (growth+rent+band, combined grammar incl. the lot byte): {ok:?}; base_len {base_len}, full {}", full.len());
+    assert!(ok.iter().all(|l| [0usize, 4, 5, 10, 11, 28, 29].contains(l)), "only the grammar decodes: {ok:?}");
 }
