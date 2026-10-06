@@ -69,7 +69,10 @@ const MAX_PAYLOAD: usize = 512;
 fn variant_name(ix: &Instruction) -> &'static str {
     match ix {
         // growth-v19: the optional-trailer forms are the SAME tags (0 / 94), same names.
-        Instruction::InitMarket { .. } | Instruction::InitMarketV19 { .. } => "InitMarket",
+        // v2.2 Phase 4: the rent / band trailer form is the same tag 0.
+        Instruction::InitMarket { .. }
+        | Instruction::InitMarketV19 { .. }
+        | Instruction::InitMarketV22 { .. } => "InitMarket",
         Instruction::InitPortfolio { .. } => "InitPortfolio",
         Instruction::Deposit { .. } => "DepositCollateral",
         Instruction::Withdraw { .. } => "WithdrawCollateral",
@@ -158,6 +161,10 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SetAdlWindDownMaxSlots { .. } => "SetAdlWindDownMaxSlots",
         // Phase 2b (2026-10-05), tag 103.
         Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
+        // v2.2 Phase 4 item 2, tag 106.
+        Instruction::SettleHoldingRent { .. } => "SettleHoldingRent",
+        Instruction::SweepBandDustLeg { .. } => "SweepBandDustLeg",
+        Instruction::EvictAndTradeCpi { .. } => "EvictAndTradeCpi",
     }
 }
 

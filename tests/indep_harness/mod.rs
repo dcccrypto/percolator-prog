@@ -556,7 +556,22 @@ impl V16CuEnv {
             ],
             &[&admin],
         )
-        .expect("init market");
+        .unwrap_or_else(|e| {
+            // v2.2: name the fixture skew instead of a bare InvalidAccountData. The account is
+            // sized from THIS library; a wrapper .so built from another layout refuses it.
+            if e.contains("InvalidAccountData") {
+                panic!(
+                    "init market: InvalidAccountData -- wrapper .so {:?} does not match this tree's \
+                     layout (VERSION {}, market len {}). Rebuild it with `cargo build-sbf \
+                     --features devnet` or point INDEP_WRAPPER_SO at a v2.2 build. ({e})",
+                    program_path(),
+                    percolator_prog::constants::VERSION,
+                    state::market_account_len_for_capacity(params.max_portfolio_assets as usize)
+                        .unwrap()
+                )
+            }
+            panic!("init market: {e}")
+        });
         Self {
             svm,
             program_id,

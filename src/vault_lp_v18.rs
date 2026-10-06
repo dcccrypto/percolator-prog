@@ -706,7 +706,9 @@ pub fn vault_lp_alloc_limit(
     alpha_bps: u16,
     buffer_bps: u16,
 ) -> Option<u128> {
-    if alpha_bps > ALLOC_ALPHA_MAX_BPS
+    // v2.2: the hard ceiling is the band-market maximum (70%); the per-market cap (50%
+    // off-band) is enforced where alpha is written.
+    if alpha_bps > crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS
         || buffer_bps < ALLOC_BUFFER_MIN_BPS
         || buffer_bps as u128 > BPS
     {
@@ -1009,8 +1011,12 @@ mod tests {
         assert_eq!(vault_lp_alloc_limit(1_000, 0, 600, 5_000, 3_000), Some(300));
         // drawable under the buffer: nothing.
         assert_eq!(vault_lp_alloc_limit(1_000, 0, 299, 5_000, 3_000), Some(0));
-        // out-of-range dials fail closed.
-        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, 5_001, 3_000), None);
+        // out-of-range dials fail closed. v2.2: the pure hard ceiling is the band-market max
+        // (70% devnet, 60% mainnet, review W-M2); the per-market 50% off-band cap is enforced
+        // where alpha is written (tag 99 dials).
+        let cap = crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS;
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, cap, 3_000), Some(cap as u128 / 10));
+        assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, cap + 1, 3_000), None);
         assert_eq!(vault_lp_alloc_limit(1_000, 0, 1_000, 5_000, 2_999), None);
         assert_eq!(vault_lp_alloc_split(500, 600, 400), Some((300, 200)));
         assert_eq!(vault_lp_alloc_split(1, 1, 1), Some((1, 0)));

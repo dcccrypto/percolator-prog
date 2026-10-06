@@ -4659,3 +4659,50 @@ fn p2b_l3_allocation_needs_a_minimum_junior() {
     let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 500);
     env.allocate(lp.portfolio, u128::MAX).expect("control: 5% junior allocates");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// v2.2 Wave B, round-2 security re-review N-7: the lag gates are BAND-market rules.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// On a band-OFF market with a 1 bp/slot cap, ordinary staircase lag (target != mark) is the
+/// normal state. The v2.2 lag gates (tag 103 senior allocation, junior deposit, recall,
+/// release surplus, ...) must not fire there: v2.1 behaviour, exactly. (Before the scoping,
+/// each of these answered Custom(21) while the mark lagged.)
+#[test]
+fn v22_n7_band_off_lagged_market_keeps_the_keeper_paths_alive() {
+    let (mut env, lp, _d) = p2b_world(Params { move_bps: 1, ..Params::default() }, 10_000, 2_000);
+    let t = env.new_trader(1_000 * U);
+    env.trade(&t, &lp, 100 * UQ).expect("open: the asset is exposed");
+    // One push of +10% and ONE crank: at 1 bp/slot the mark is far behind its target.
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let admin = env.admin.insecure_clone();
+    let seq = env.oracle_seq() + 1;
+    let (m, slot) = (env.market, env.slot);
+    env.send(
+        ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: 1_100_000, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("push");
+    env.crank(t.portfolio).expect("crank trader");
+    env.crank(lp.portfolio).expect("crank lp");
+    let (_, g) = env.market_state();
+    assert_eq!(g.config.band_bps, 0, "band off");
+    assert_ne!(g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, "the mark lags");
+    assert!(g.assets[0].oi_eff_long_q != 0, "and the asset is exposed");
+    let lock = code(PercolatorError::EngineLockActive);
+    // Tag 103 (senior allocation) and the junior deposit land while lagged.
+    env.allocate(lp.portfolio, u128::MAX).expect("103 allocate while lagged on a band-off market");
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000 * U).expect("junior deposit while lagged");
+    // Recall and release-surplus may refuse for their own reasons, never for the lag.
+    for (what, r) in [
+        ("recall", env.recall_ext(lp.portfolio, 1_000 * U as u128, 0)),
+        ("release surplus", env.release_surplus(&admin, lp.portfolio, 1, 0)),
+    ] {
+        if let Err(e) = &r {
+            assert!(!e.contains(&lock), "{what} refused with the lag gate on a band-off market: {e}");
+        }
+    }
+    env.assert_conserved("band-off lagged keeper paths");
+}
