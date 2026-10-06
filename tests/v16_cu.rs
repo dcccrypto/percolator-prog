@@ -7581,8 +7581,12 @@ ProgInstruction::PermissionlessCrank {
     let (_, funded_group) = env.market_state();
     assert_eq!(funded_group.funding_epoch, 1);
     assert_eq!(funded_group.assets[0].effective_price, 1_210_000);
-    assert_eq!(funded_group.assets[0].f_long_num, -(ADL_ONE as i128));
-    assert_eq!(funded_group.assets[0].f_short_num, ADL_ONE as i128);
+    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_210_000 = 1.21 price units for the
+    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.21 * ADL_ONE.
+    let exact = 1_000i128 * 1_210_000 * (ADL_ONE / 1_000_000_000) as i128;
+    assert_eq!(exact, 1_210_000_000_000_000);
+    assert_eq!(funded_group.assets[0].f_long_num, -exact);
+    assert_eq!(funded_group.assets[0].f_short_num, exact);
 }
 
 #[test]
