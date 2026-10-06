@@ -98,7 +98,7 @@ fn load(name: &str) -> Fixture {
         WRAPPER_ID.to_string()
     );
     let clock: Clock = bincode::deserialize(&b64(v["clock_sysvar_b64"].as_str().unwrap())).unwrap();
-    let accounts = v["accounts"]
+    let accounts: Vec<(Pubkey, Account)> = v["accounts"]
         .as_array()
         .unwrap()
         .iter()
@@ -115,12 +115,49 @@ fn load(name: &str) -> Fixture {
             )
         })
         .collect();
+    let slab: Pubkey = v["slab"].as_str().unwrap().parse().unwrap();
+    let accounts = accounts
+        .into_iter()
+        .map(|(k, mut a)| {
+            if k == slab {
+                let grown = legacy_slab_to_current_layout(&a.data);
+                // keep the grown account rent-exempt (~6,960 lamports per byte-year x2)
+                a.lamports += 7_000 * (grown.len() - a.data.len()) as u64;
+                a.data = grown;
+            }
+            (k, a)
+        })
+        .collect();
     Fixture {
         name: name.to_string(),
-        slab: v["slab"].as_str().unwrap().parse().unwrap(),
+        slab,
         clock,
         accounts,
     }
+}
+
+/// fix/v21-funding-scale appended 160 bytes of K/F drift-generation state (`kf_drift_long/short`)
+/// to the END of the engine asset slot, which is the last field of every market asset slot. These
+/// fixtures are live devnet slabs in the previous layout: append the zero tail to each slot (a
+/// fresh slab starts with exactly these zeros). Test-only: the program never loads an old slab in
+/// place, the stride changed, so the layout rides the re-seed.
+fn legacy_slab_to_current_layout(old: &[u8]) -> Vec<u8> {
+    use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
+    const APPENDED: usize = 160;
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN;
+    let old_stride = MARKET_ASSET_SLOT_LEN - APPENDED;
+    if old.len() < head || (old.len() - head) % MARKET_ASSET_SLOT_LEN == 0 {
+        return old.to_vec();
+    }
+    assert_eq!((old.len() - head) % old_stride, 0, "slab is neither layout");
+    let n = (old.len() - head) / old_stride;
+    let mut out = old[..head].to_vec();
+    for k in 0..n {
+        let s = head + k * old_stride;
+        out.extend_from_slice(&old[s..s + old_stride]);
+        out.extend_from_slice(&[0u8; APPENDED]);
+    }
+    out
 }
 
 fn data<'a>(fx: &'a Fixture, k: &Pubkey) -> &'a [u8] {
