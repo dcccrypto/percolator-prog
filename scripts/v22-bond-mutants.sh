@@ -178,11 +178,11 @@ bond_tranche_refused_after_the_first_earn_deposit
   # MB9: N-1 reverted -- no in-instruction refresh: the bonds are valued on the certificate the
   # harvest just made stale (78 then fails on every crank with vault-LP inventory).
   run_bpf MB9_no_refresh_N1 $W \
-'            group
+'            let certified = group
                 .full_account_refresh_not_atomic(&mut lp)
                 .map_err(map_v16_error)?
-                .certified_equity' \
-'            i128::try_from(vault_lp_value_atoms(&group, lp.header)?).unwrap_or(0)' \
+                .certified_equity;' \
+'            let certified = i128::try_from(vault_lp_value_atoms(&group, lp.header)?).unwrap_or(0);' \
 sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed
   # MB10: 78 values the LP at the certified (effective-price) equity, ignoring the lag-worse term.
   run_bpf MB10_coupon_ignores_lag_worse $W \
