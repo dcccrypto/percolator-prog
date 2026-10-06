@@ -564,3 +564,42 @@ fn merge_prep_init_market_trailer_grammar() {
         assert!(ProgInstruction::decode(&t).is_err(), "trailer len {} refused on Wave A", 4 + extra);
     }
 }
+
+/// Mainnet condition 1 (Wave A approval, 2026-10-06): InitMarket refuses `public_b_chunk_atoms`
+/// below `PUBLIC_B_CHUNK_ATOMS_MIN` (1e9 atoms) -- the chunk is a market-kill threshold (a bust
+/// whose residual exceeds it resolves the market; ledger/finding-bankrupt-chunk-wedge-
+/// 2026-10-06.md). Legacy and growth forms alike. CONTROL: the floor itself and the seed default
+/// 1e12 are accepted.
+#[test]
+fn init_market_refuses_a_public_b_chunk_below_the_floor() {
+    let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+    assert_eq!(floor, 1_000_000_000);
+    let with_chunk = |ix: ProgInstruction, chunk: u128| -> ProgInstruction {
+        let set = |m: &mut ProgInstruction| {
+            if let ProgInstruction::InitMarket { public_b_chunk_atoms, .. } = m {
+                *public_b_chunk_atoms = chunk;
+            }
+        };
+        match ix {
+            ProgInstruction::InitMarketV19 { mut market, growth_r_gap_bps, growth_l_launch_x100 } => {
+                set(&mut market);
+                ProgInstruction::InitMarketV19 { market, growth_r_gap_bps, growth_l_launch_x100 }
+            }
+            mut m => {
+                set(&mut m);
+                m
+            }
+        }
+    };
+    let mut env = V16CuEnv::new();
+    for (label, ix) in [("legacy", base_init(LOT_PRICE_FLOOR_E6)), ("growth", growth_init(LOT_PRICE_FLOOR_E6, None))] {
+        for bad in [1u128, 1_000_000, floor - 1] {
+            let r = init_on_fresh(&mut env, with_chunk(ix.clone(), bad));
+            assert_eq!(code(&r), Some(14), "{label}: chunk {bad} must be refused: {r:?}");
+        }
+        init_on_fresh(&mut env, with_chunk(ix.clone(), floor)).unwrap_or_else(|e| panic!("{label}: floor accepted: {e}"));
+        init_on_fresh(&mut env, with_chunk(ix.clone(), 1_000_000_000_000)).unwrap_or_else(|e| panic!("{label}: seed default 1e12 accepted: {e}"));
+        let (_, g) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+        assert_eq!(g.config.public_b_chunk_atoms, 1_000_000_000_000);
+    }
+}

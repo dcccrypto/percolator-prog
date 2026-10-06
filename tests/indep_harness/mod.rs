@@ -465,6 +465,19 @@ impl V16CuEnv {
     }
 
     pub fn new_with_init_params(params: V16CuMarketParams) -> Self {
+        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`. Fixtures
+        // that study sub-floor chunk dynamics (B-settlement chunking, the C-7 immediate-Recovery
+        // path) init at the floor and then set the requested chunk by a test-only STATE POKE of
+        // the engine config (no instruction can set it; this reproduces pre-v2.2 markets).
+        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+        if params.public_b_chunk_atoms < floor {
+            let mut env = Self::new_with_init_params(V16CuMarketParams {
+                public_b_chunk_atoms: floor,
+                ..params
+            });
+            env.poke_public_b_chunk_atoms(params.public_b_chunk_atoms);
+            return env;
+        }
         let mut svm = LiteSVM::new();
         let program_id = harness_program_id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -575,6 +588,28 @@ impl V16CuEnv {
 
     pub fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.create_portfolio_with_cu(owner).0
+    }
+
+    /// Test-only STATE POKE: set the engine config's `public_b_chunk_atoms` (sub-floor
+    /// fixtures; see `new_with_init_params`). Byte-surgical: only the bytes that differ between
+    /// a no-op rewrite and the mutated rewrite are copied back.
+    pub fn poke_public_b_chunk_atoms(&mut self, chunk: u128) {
+        let original = self.svm.get_account(&self.market).expect("market");
+        let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+        let mut noop = original.data.clone();
+        state::write_market(&mut noop, &cfg, &g).unwrap();
+        g.config.public_b_chunk_atoms = chunk;
+        let mut mutated = original.data.clone();
+        state::write_market(&mut mutated, &cfg, &g).unwrap();
+        let mut acct = original;
+        for i in 0..acct.data.len() {
+            if mutated[i] != noop[i] {
+                acct.data[i] = mutated[i];
+            }
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+        let (_, check) = state::read_market(&self.svm.get_account(&self.market).unwrap().data).unwrap();
+        assert_eq!(check.config.public_b_chunk_atoms, chunk, "chunk poke applied");
     }
 
     pub fn create_portfolio_with_cu(&mut self, owner: &Keypair) -> (Pubkey, u64) {

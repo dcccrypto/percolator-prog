@@ -3436,9 +3436,13 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
 /// real bust leaves pending socialized-loss settlement across several touches.
 fn chunked_b_market() -> LiveMarket {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
+    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
     lm
 }
+
+/// A bust sized so its residual exceeds a FLOOR chunk (1e9 atoms): 9.5x on 4,000 USDC.
+const BUST_CAPITAL: u64 = 4_000_000_000;
+const BUST_NOTIONAL: i128 = 38_000_000_000;
 
 impl Replay {
     fn loss_snapshot(&self) -> String {
@@ -3455,7 +3459,7 @@ impl Replay {
 }
 
 /// A5 exploration (corrected 2026-10-06, ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): a
-/// bust whose residual (~8.5 USDC) exceeds `public_b_chunk_atoms` (1 USDC). Prints the market MODE
+/// bust whose residual (~1,700 USDC) exceeds `public_b_chunk_atoms` (the 1e9 floor = 1,000 USDC). Prints the market MODE
 /// and the loss counters per crank and stops once the market is Resolved. Measured: crank 0 leaves
 /// the market Live with `negative_pnl_account_count = 1`; crank 1 declares permissionless Recovery
 /// (`ActiveBankruptCloseCannotProgress`); crank 2 finalises Recovery -> Resolved. Later Live-style
@@ -3474,8 +3478,10 @@ fn a5_explore_real_chunked_bankruptcy() {
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(20_000_000);
+    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
+    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
+    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(BUST_CAPITAL);
     r.trade(&bk, bp, qb).expect("levered long");
     let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
     eprintln!("A5X open [{}]: {}", mode(&r), r.loss_snapshot());
@@ -3518,8 +3524,10 @@ fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubk
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(20_000_000);
+    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
+    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
+    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(BUST_CAPITAL);
     r.trade(&bk, bp, qb).expect("levered long");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
     (r, bp, bk, shorts)
@@ -3527,7 +3535,7 @@ fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubk
 
 #[test]
 fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
-    let (mut r, bp, bk, shorts) = chunk_bust_world(1_000_000);
+    let (mut r, bp, bk, shorts) = chunk_bust_world(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
     let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
     assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
     let mut seen = vec![];
@@ -3746,7 +3754,7 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 }
 
 /// A5 round 2, REAL repro (no state poke): a 9.5x-levered long busts on a 15% walk in a market
-/// whose bankruptcy residual exceeds `public_b_chunk_atoms` (2 USDC). After the bust's crank the
+/// whose bankruptcy residual (~1,700 USDC) exceeds `public_b_chunk_atoms` (the 1e9 floor). After the bust's crank the
 /// account's unabsorbed deficit is pending (`negative_pnl_account_count` = 1) and the shorts are
 /// K/F-stale; the redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused
 /// with 118 and nothing moves.
@@ -3763,7 +3771,7 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = 2_000_000;
+    lm.params.public_b_chunk_atoms = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
@@ -3774,8 +3782,10 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(20_000_000);
+    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
+    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
+    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(BUST_CAPITAL);
     r.trade(&bk, bp, qb).expect("levered long");
     r.request_76(&h, h_ata, None).expect("H 76");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);

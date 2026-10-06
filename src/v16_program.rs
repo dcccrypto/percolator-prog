@@ -657,6 +657,14 @@ pub mod constants {
     /// 8 single-leg (32 units) 1,016,434 CU; 2 x 14-leg (34 units) 1,204,159 CU; 3 x 14-leg (51)
     /// is refused up front (InvalidInstruction).
     pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
+    /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
+    /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
+    /// MARKET-KILL threshold -- a single bankruptcy whose residual exceeds it takes the whole
+    /// market Live -> Recovery -> Resolved (permissionlessly). InitMarket refuses a chunk below
+    /// 1e9 atoms (1,000 USDC at 6 dp), so no creator can pick a chunk any small bust resolves.
+    /// The seed default is 1e12. Refused with EngineInvalidConfig (Custom 14), like the other
+    /// InitMarket config bounds.
+    pub const PUBLIC_B_CHUNK_ATOMS_MIN: u128 = 1_000_000_000;
     pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
@@ -14035,6 +14043,7 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
+            || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
