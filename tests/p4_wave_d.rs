@@ -2645,12 +2645,30 @@ fn w4_restore_from_positioned_lp() {
     conserved(&w, "after positioned restore");
 }
 
-/// W-4 residual world: the vault LP is SHORT against a long trader, the market falls 1% a step
-/// (the trader loses, the LP wins), the trader stays OPEN, and a backstop of `owed` atoms is
-/// outstanding (booked on the state, the halt mirror and the units ledger exactly as G9 books it,
-/// so the restore path reads real state; the receivable's origin is irrelevant to the repayment
-/// mechanics under test).
-fn w4_profit_world(owed: u64, drops: usize) -> (P3, Pubkey) {
+/// Cranks trader and LP until the asset is accrued to the current slot and no account is stale
+/// (a crank accrues about one slot per call, so a big warp would leave the book unaccrued).
+fn w4_settle(w: &mut P3, tp: Pubkey) {
+    let lp = w.lp;
+    for _ in 0..4000 {
+        let (_c, g) = w.env.market_state();
+        let a = &g.assets[0];
+        if a.slot_last >= w.slot() && a.stale_account_count_long == 0 && a.stale_account_count_short == 0 {
+            return;
+        }
+        w.env.svm.expire_blockhash();
+        let _ = w.crank(tp);
+        w.env.svm.expire_blockhash();
+        let _ = w.crank(lp);
+    }
+    panic!("book never became current");
+}
+
+/// W-4 residual world: the vault LP is SHORT `size_u` against a long trader, the market falls 1% a
+/// step (the trader loses, the LP wins and holds real, settled, source-backed positive PnL), the
+/// book is cranked current after every step (ONE slot at a time, so every price move is accrued),
+/// the trader stays OPEN, and a backstop of `owed` atoms is outstanding (booked on the state, the
+/// halt mirror and the units ledger as G9 books it).
+fn w4_profit_world(owed: u64, drops: usize, size_u: i128) -> (P3, Pubkey) {
     let mut w = P3::new();
     w.create_vault();
     let s0 = Keypair::new();
@@ -2663,14 +2681,13 @@ fn w4_profit_world(owed: u64, drops: usize) -> (P3, Pubkey) {
     w.set_risk(&up, 0).unwrap();
     w.junior_deposit(&admin, 1_000_000).unwrap();
     let (t, tp) = w.trader(50_000_000);
-    w.trade_vs_lp(&t, tp, 3 * U).unwrap();
+    w.trade_vs_lp(&t, tp, size_u).unwrap();
     MARK.with(|c| c.set(PRICE));
     for _ in 0..drops {
         let m = MARK.with(|c| c.get()) * 99 / 100;
         MARK.with(|c| c.set(m));
         w.push(m);
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 30);
+        w4_settle(&mut w, tp);
     }
     seed_units(&mut w, 20_000_000);
     {
@@ -2690,41 +2707,125 @@ fn w4_profit_world(owed: u64, drops: usize) -> (P3, Pubkey) {
     (w, tp)
 }
 
-/// W-4 residual, wiring + no-regression (tag 111 mode 3, RESTORE-FROM-PNL). In a live book the
-/// engine's favorable-action gate refuses a PnL conversion-like action while ANY account on the
-/// asset is loss-stale (every K/F tick leaves the counterparties stale until they settle), exactly
-/// as it does for a winner's own ConvertReleasedPnl. Mode 3 must then behave EXACTLY like mode 1:
-/// the capacity is 0 (not an error), capital is repaid, and the same IM + buffer floor binds. The
-/// engine-level tests (`w4_repay_from_released_pnl_*` in the engine repo's `v16_spec_tests`) prove
-/// the PnL path itself against a current book.
-#[test]
-fn w4_mode3_equals_mode1_when_the_engine_refuses_pnl_repay() {
-    let owed = 1_300_000u64;
-    let run = |mode: u8| {
-        let (mut w, _tp) = w4_profit_world(owed, 15);
-        let ins0 = w.env.market_state().1.insurance;
-        let vault0 = w.tok(&w.env.vault);
-        let r = backstop_111(&mut w, mode, 0, true);
-        assert!(r.is_ok(), "mode {mode}: {r:?}");
-        let repaid = owed as u128 - backstop_st(&w) as u128;
-        assert!(repaid > 0, "vacuity: capital repaid in mode {mode}");
-        assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "mode {mode}: insurance +repaid");
-        assert_eq!(w.tok(&w.env.vault), vault0, "mode {mode}: no SPL moved");
-        assert_eq!(units(&w).unwrap().backstop_receivable_atoms, backstop_st(&w) as u128);
-        assert_eq!(halt_mirror(&w), outstanding(&w) + backstop_st(&w) as u128, "mode {mode}: W-9 mirror");
-        conserved(&w, "after restore");
-        (repaid, w.lp_state().capital)
-    };
-    let m1 = run(1);
-    let m3 = run(3);
-    assert_eq!(m1, m3, "mode 3 repays exactly what mode 1 repays when the PnL path is unavailable");
+struct W4Obs {
+    repaid: u128,
+    ins: u128,
+    pnl0: i128,
+    pnl1: i128,
+    cap0: u128,
+    cap1: u128,
+    equity1: i128,
+    im1: u128,
+    c_tot0: u128,
+    c_tot1: u128,
 }
 
-/// Mode 4 (and above) is still an invalid instruction; mode 3 is permissionless and ungated like
-/// mode 1 (it only moves value INTO insurance), but still refuses with nothing owed.
+/// Runs one restore call (`mode`, `max_amount`) on `w` and observes it.
+fn w4_restore(w: &mut P3, mode: u8, max_amount: u128, owed: u64) -> (Result<u64, String>, W4Obs) {
+    let lp0 = w.lp_state();
+    let g0 = w.env.market_state().1;
+    let vault0 = w.tok(&w.env.vault);
+    let r = backstop_111(w, mode, max_amount, true);
+    let lp1 = w.lp_state();
+    let g1 = w.env.market_state().1;
+    if r.is_ok() {
+        assert_eq!(w.tok(&w.env.vault), vault0, "no SPL moved");
+        assert_eq!(units(w).unwrap().backstop_receivable_atoms, backstop_st(w) as u128);
+        assert_eq!(halt_mirror(w), outstanding(w) + backstop_st(w) as u128, "W-9 mirror in step");
+        conserved(w, "after restore");
+    }
+    let repaid = owed as u128 - backstop_st(w) as u128;
+    let obs = W4Obs {
+        repaid,
+        ins: g1.insurance - g0.insurance,
+        pnl0: lp0.pnl,
+        pnl1: lp1.pnl,
+        cap0: lp0.capital,
+        cap1: lp1.capital,
+        equity1: lp1.health_cert.certified_equity,
+        im1: lp1.health_cert.certified_initial_req,
+        c_tot0: g0.c_tot,
+        c_tot1: g1.c_tot,
+    };
+    (r, obs)
+}
+
+/// W-4 residual, END TO END (security review W4-3). The vault LP is positioned (the trader is
+/// open), holds settled source-backed PnL, and the book is current: mode 3 repays FROM PNL FIRST.
+/// Asserts `from_pnl > 0`, conservation (insurance +repaid, vault tokens unchanged, c_tot falls by
+/// exactly the capital taken), the LP never rises in capital, and the 1.1x IM floor (R-6).
+/// `max_amount` below the PnL available takes the whole repayment from PnL with capital untouched.
+/// Control: mode 1 in the same world cannot take from PnL (it repays from capital only).
+#[test]
+fn w4_pnl_restore_end_to_end_pnl_first() {
+    let owed = 1_300_000u64;
+    let size = U * 3 / 10;
+    // Mode 1 control.
+    let (mut c, _) = w4_profit_world(owed, 4, size);
+    let pnl_before = c.lp_state().pnl;
+    assert!(pnl_before > 0, "vacuity: the LP holds real positive PnL ({pnl_before})");
+    let (r1, o1) = w4_restore(&mut c, 1, 0, owed);
+    r1.expect("mode 1");
+    assert_eq!(o1.cap0 - o1.cap1, o1.repaid, "mode 1 repays from capital only");
+    // Mode 3, uncapped.
+    let (mut w, _tp) = w4_profit_world(owed, 4, size);
+    assert_ne!(w.pos(w.lp), 0, "vacuity: the vault LP is positioned");
+    let (r3, o3) = w4_restore(&mut w, 3, 0, owed);
+    r3.expect("mode 3");
+    assert!(o3.repaid > 0 && o3.ins == o3.repaid, "insurance +repaid exactly");
+    let from_cap = o3.cap0 - o3.cap1;
+    let from_pnl = o3.repaid - from_cap;
+    eprintln!("W-4 e2e: repaid {} from_pnl {} from_cap {} pnl {}->{}", o3.repaid, from_pnl, from_cap, o3.pnl0, o3.pnl1);
+    assert!(from_pnl > 0, "FROM PNL FIRST: from_pnl must be > 0");
+    assert!(o3.pnl1 < o3.pnl0, "the LP's profit paid it");
+    assert_eq!(o3.c_tot0 - o3.c_tot1, from_cap, "c_tot falls by exactly the capital taken");
+    assert!(o3.cap1 <= o3.cap0, "capital never rises");
+    assert_ne!(w.pos(w.lp), 0, "still positioned");
+    let floor = o3.im1 + (o3.im1 * 1_000).div_ceil(10_000);
+    assert!(o3.equity1 >= 0 && o3.equity1 as u128 >= floor, "1.1x IM floor: equity {} floor {}", o3.equity1, floor);
+    assert_eq!(o3.repaid, o1.repaid, "same total as mode 1 (both end at the same equity floor)");
+    // Mode 3, capped below the PnL available: the whole repayment is PnL, capital untouched.
+    let (mut p, _) = w4_profit_world(owed, 4, size);
+    let (rp, op) = w4_restore(&mut p, 3, 5_000, owed);
+    rp.expect("mode 3 capped");
+    assert_eq!(op.repaid, 5_000);
+    assert_eq!(op.cap0, op.cap1, "capital untouched");
+    assert!(op.pnl1 < op.pnl0, "all of it from PnL");
+}
+
+/// W-4 negative control for the refusal case: a REAL positive PnL in a genuinely loss-stale asset
+/// (the book is accrued forward and NOT cranked). The engine's favorable-action gate is closed,
+/// mode 3 takes NOTHING from PnL (the LP's PnL is unchanged) and repays from capital like mode 1.
+/// The same world, cranked current, takes from PnL (previous test), so the gate is what decides.
+#[test]
+fn w4_pnl_restore_refused_by_a_loss_stale_asset() {
+    let owed = 1_300_000u64;
+    let (mut w, tp) = w4_profit_world(owed, 4, U * 3 / 10);
+    let pnl_before = w.lp_state().pnl;
+    assert!(pnl_before > 0, "vacuity: real positive PnL ({pnl_before})");
+    // Accrue the asset forward and leave the book unsettled.
+    let m = MARK.with(|c| c.get()) * 99 / 100;
+    MARK.with(|c| c.set(m));
+    let s = w.slot() + 1;
+    w.env.svm.warp_to_slot(s);
+    w.env.push_auth_mark_for_asset_as_admin(0, s, m);
+    let _ = w.crank(w.lp); // accrues the asset; the counterparties are now stale
+    let (_c, g) = w.env.market_state();
+    let a = &g.assets[0];
+    assert!(a.stale_account_count_long != 0 || a.stale_account_count_short != 0 || a.slot_last < w.slot(),
+        "vacuity: the asset really is loss-stale");
+    let _ = tp;
+    let (r, o) = w4_restore(&mut w, 3, 0, owed);
+    r.expect("falls back to capital (mode 1 behaviour)");
+    assert!(o.repaid > 0);
+    assert_eq!(o.cap0 - o.cap1, o.repaid, "all of it from capital: the PnL path is closed");
+}
+
+/// Mode 4 (and above) is still an invalid instruction; with nothing owed both restore modes are
+/// refused.
 #[test]
 fn w4_mode_range_and_nothing_owed() {
-    let (mut w, _tp) = w4_profit_world(0, 2);
+    let (mut w, _tp) = w4_profit_world(0, 2, U * 3 / 10);
     let bad = backstop_111(&mut w, 4, 0, true);
     assert!(bad.is_err(), "mode 4 is invalid: {bad:?}");
     let none = backstop_111(&mut w, 3, 0, true);

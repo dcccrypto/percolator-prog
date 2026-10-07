@@ -33521,6 +33521,10 @@ pub mod processor {
     /// credited (vault in), so `header.vault` nets to zero and no SPL moves. Every insurance unit
     /// loses pro rata (I falls, U unchanged); the receivable is booked on both ledgers.
     ///
+    /// KEEPER NOTE (W4-4): mode 3 can REVERT where mode 1 would succeed (the engine's capacity read
+    /// returns an error, not 0, on an inconsistent source ledger or a failed validation). A keeper
+    /// that gets a mode-3 error must fall back to mode 1 in the same sweep.
+    ///
     /// RESTORE-FROM-PNL (`mode` 3, W-4 residual). As mode 1, but the vault LP's unconverted,
     /// unliened, source-backed profit is repaid FIRST (the engine routes it support -> insurance in
     /// one call, never through withdrawable capital) and capital only for the remainder; same
@@ -33828,6 +33832,8 @@ pub mod processor {
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
                 let c_m_before = p2b_c_m(&lp)?;
+                let ins_before = group.header.insurance.get();
+                let vault_before_restore = group.header.vault.get();
                 // Insurance is credited to asset-0 (long half, short remainder, as
                 // `deposit_market_zero_insurance_view`); `header.vault` is unchanged.
                 if from_pnl != 0 {
@@ -33853,6 +33859,12 @@ pub mod processor {
                     group
                         .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
                         .map_err(map_v16_error)?;
+                }
+                // W4-2: the receivable falls by exactly what insurance gained, and no token moved.
+                if group.header.insurance.get().checked_sub(ins_before) != Some(amt)
+                    || group.header.vault.get() != vault_before_restore
+                {
+                    return Err(PercolatorError::EngineInvalidConfig.into());
                 }
                 p2b_a4_capacity_check(&group, &lp, 0, c_m_before)?;
                 let next = outstanding - amt;
