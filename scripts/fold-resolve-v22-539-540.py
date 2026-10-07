@@ -11,7 +11,8 @@ Every conflicted hunk is an ADJACENT APPEND (RC side + our side): keep BOTH, RC 
 Idempotent. Usage (conflicted files first; pass ONLY the ones git reports as conflicted, `src/p4_rescue_ins.rs` is
 conflicted too when #541 is merged before #539, both append to its tests module):
 
-    git checkout --conflict=diff3 -- <conflicted files>      # so every conflict carries its base section
+    git -c merge.conflictstyle=zdiff3 merge --no-commit --no-ff <branch>   # zdiff3 (NOT `git checkout --conflict=diff3`, which
+                                                                          # re-merges with wider hunks and a non-empty base)
     scripts/fold-resolve-v22-539-540.py src/v16_program.rs src/bin/sdk_parity_fixtures.rs [src/p4_rescue_ins.rs]
     scripts/fold-resolve-v22-539-540.py --rc-release-docs      # after #540: wires the release gate on the RC
 
@@ -55,7 +56,7 @@ def rc_release_docs():
     c = open(ck).read()
     if "check-mainnet-pin.sh" not in c:
         c = c.replace("cargo build-sbf --sbf-out-dir out/mainnet            # NO --features devnet\nscripts/check-mainnet-sbf.sh out/mainnet/percolator_prog.so",
-                      "cargo build-sbf --features mainnet-ids --sbf-out-dir out/mainnet   # NO --features devnet; mainnet-ids is REQUIRED\nscripts/check-mainnet-sbf.sh out/mainnet/percolator_prog.so   # calls check-mainnet-pin.sh (below)\nscripts/check-mainnet-pin.sh out/mainnet/percolator_prog.so   # must print OK: pinned mainnet build\nscripts/mainnet-flavour-tests.sh out/mainnet/percolator_prog.so   # must print MAINNET FLAVOUR TESTS: OK (all ignored mainnet tests ran)", 1)
+                      "cargo build-sbf --features mainnet-ids --sbf-out-dir out/mainnet   # NO --features devnet; mainnet-ids is REQUIRED\nscripts/check-mainnet-sbf.sh out/mainnet/percolator_prog.so   # calls check-mainnet-pin.sh (below)\nscripts/check-mainnet-pin.sh out/mainnet/percolator_prog.so   # must print OK: pinned mainnet build\nscripts/mainnet-flavour-tests.sh out/mainnet/percolator_prog.so   # must print MAINNET FLAVOUR TESTS: OK (all ignored mainnet tests ran)\nscripts/pin-flavour-tests.sh   # builds the placeholder-pin .so itself; tag 94 only under the pinned matcher (never a release artifact)", 1)
         c = c.replace("## 2. Reproducible-build hash comparison", """The pinned set (stake, wrapper, vault-LP matcher, fee authority) lives in `src/mainnet_ids.rs` as
 `RELEASE-STEP` placeholders: `--features mainnet-ids` does NOT COMPILE until all four are set. The build
 carries a marker: `check-mainnet-pin.sh` REJECTS a `mainnet-ids-test-placeholders` build
