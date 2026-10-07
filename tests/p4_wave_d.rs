@@ -2811,24 +2811,29 @@ fn sec2_g9_dust_seniors_epochs() {
 /// restore (1) is not. On the devnet build (default) the override keeps G9 testable: propose is
 /// admitted on the same AuthMark market.
 #[test]
-fn r1_g9_oracle_gate_by_build_flavour() {
-    let mainnet = std::env::var("R1_FLAVOUR").map_or(false, |v| v == "mainnet");
-    if mainnet {
-        let mut w = P3::new();
-        w.lp = Pubkey::new_unique(); // no vault on this build (the bind needs the devnet pins)
-        for mode in [2u8, 0] {
-            let r = backstop_111(&mut w, mode, 0, false);
-            eprintln!("R-1 mainnet 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
-            assert!(has(&r, INS_REFUSED), "mainnet: refused: {r:?}");
-            assert!(r.unwrap_err().contains("p4_backstop_oracle_refused mode=3"), "by the oracle gate");
-        }
-        let r = backstop_111(&mut w, 1, 0, false);
-        assert!(!r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused")), "restore is never oracle-gated: {r:?}");
-    } else {
-        let (mut w, _s, (_t, _tp)) = g9_world();
-        seed_units(&mut w, 20_000_000);
-        backstop_111(&mut w, 2, 0, true).expect("devnet override: propose admitted on AuthMark");
+fn r1_g9_oracle_gate_devnet_override() {
+    if std::env::var("R1_FLAVOUR").as_deref() == Ok("mainnet") {
+        return; // running against the non-devnet .so: the ignored mainnet test covers it
     }
+    let (mut w, _s, (_t, _tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+    backstop_111(&mut w, 2, 0, true).expect("devnet override: propose admitted on AuthMark");
+}
+
+#[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
+fn r1_g9_oracle_gate_mainnet_refuses_authmark() {
+    require_mainnet_flavour();
+    let mut w = P3::new();
+    w.lp = Pubkey::new_unique(); // no vault on this build (the bind needs the devnet pins)
+    for mode in [2u8, 0] {
+        let r = backstop_111(&mut w, mode, 0, false);
+        eprintln!("R-1 mainnet 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
+        assert!(has(&r, INS_REFUSED), "mainnet: refused: {r:?}");
+        assert!(r.unwrap_err().contains("p4_backstop_oracle_refused mode=3"), "by the oracle gate");
+    }
+    let r = backstop_111(&mut w, 1, 0, false);
+    assert!(!r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused")), "restore is never oracle-gated: {r:?}");
 }
 
 /// R-6: RESTORE leaves the vault LP at least 10% of IM above its initial margin. After a
@@ -2901,9 +2906,21 @@ fn make_hybrid(w: &mut P3, feed: Pubkey, provenance: u8) {
     w.env.svm.set_account(w.env.market, acct).unwrap();
 }
 
+/// The feed OWNER every test feed starts with (Chainlink `feed.owner` at +10, Switchboard
+/// `authority` at +2056); R10-2 pins it into the allowlist record.
+const FEED_OWNER: [u8; 32] = [0xF0; 32];
+
+fn set_feed_owner(w: &mut P3, feed: Pubkey, feed_owner: [u8; 32]) {
+    let mut a = w.env.svm.get_account(&feed).unwrap();
+    a.data[10..42].copy_from_slice(&feed_owner);
+    a.data[2_056..2_088].copy_from_slice(&feed_owner);
+    w.env.svm.set_account(feed, a).unwrap();
+}
+
 fn feed_account(w: &mut P3, owner: Pubkey) -> Pubkey {
     let k = Pubkey::new_unique();
-    w.env.svm.set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; 256], owner, executable: false, rent_epoch: 0 }).unwrap();
+    w.env.svm.set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; 2_200], owner, executable: false, rent_epoch: 0 }).unwrap();
+    set_feed_owner(w, k, FEED_OWNER);
     k
 }
 
@@ -2937,9 +2954,13 @@ fn allowlist_metas(w: &P3, signer: &Keypair) -> Vec<AccountMeta> {
 
 /// R-10: tag 120 (propose; empty = cancel).
 fn propose_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u64, String> {
+    propose_allowlist_entries(w, signer, keys.into_iter().map(|k| (k, FEED_OWNER)).collect())
+}
+
+fn propose_allowlist_entries(w: &mut P3, signer: &Keypair, entries: Vec<([u8; 32], [u8; 32])>) -> Result<u64, String> {
     w.env.ensure_signer_account(signer.pubkey());
     let metas = allowlist_metas(w, signer);
-    w.send(ProgInstruction::ProposeG9FeedAllowlist { keys }, metas, &[signer])
+    w.send(ProgInstruction::ProposeG9FeedAllowlist { entries }, metas, &[signer])
 }
 
 /// R-10: tag 121 (commit).
@@ -2995,6 +3016,17 @@ fn oracle_refused(r: &Result<u64, String>) -> bool {
     r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused") && has(r, INS_REFUSED))
 }
 
+/// The mainnet-flavour tests must NEVER pass vacuously: they are `#[ignore]`d (reported as skipped in a
+/// normal run) and, when run, panic unless `R1_FLAVOUR=mainnet` AND the mounted `.so` is the non-devnet
+/// build (an unlisted-feed probe that the devnet override would admit proves the flavour).
+fn require_mainnet_flavour() {
+    assert_eq!(
+        std::env::var("R1_FLAVOUR").as_deref(),
+        Ok("mainnet"),
+        "mainnet-flavour test: set R1_FLAVOUR=mainnet and INDEP_WRAPPER_SO to a NON-devnet .so (scripts/mainnet-flavour-tests.sh)"
+    );
+}
+
 fn r7_world() -> P3 {
     let mut w = P3::new();
     w.lp = Pubkey::new_unique();
@@ -3005,17 +3037,14 @@ fn r7_world() -> P3 {
 /// upgrade authority allowlists it is admitted; without the allowlist account in the tail it is
 /// refused again (control). Devnet: the override admits the unlisted feed (testing only).
 #[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
 fn r7_switchboard_leg_requires_allowlist() {
-    let mainnet = std::env::var("R1_FLAVOUR").map_or(false, |v| v == "mainnet");
+    require_mainnet_flavour();
     let mut w = r7_world();
     let feed = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
     make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
     let r = propose_with_tail(&mut w, &[feed]);
     eprintln!("R-7 unlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
-    if !mainnet {
-        assert!(r.as_ref().err().map_or(false, |e| e.contains("p4_g9_oracle_gate_ok override=1")), "devnet override: {r:?}");
-        return;
-    }
     assert!(leg_refused(&r), "creator-made Switchboard feed refused: {r:?}");
     let up = w.upgrade.insecure_clone();
     add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
@@ -3038,10 +3067,9 @@ fn r7_switchboard_leg_requires_allowlist() {
 /// Controls: the leg account omitted, a listed key but another Chainlink account, the allowlist
 /// omitted from the tail, and a Pyth-owned leg are refused.
 #[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
 fn r12_chainlink_leg_requires_allowlist() {
-    if std::env::var("R1_FLAVOUR").map_or(true, |v| v != "mainnet") {
-        return; // the devnet override is asserted by r7_switchboard_leg_requires_allowlist
-    }
+    require_mainnet_flavour();
     let mut w = r7_world();
     let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
     make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
@@ -3063,13 +3091,85 @@ fn r12_chainlink_leg_requires_allowlist() {
     assert!(leg_refused(&propose_with_tail(&mut w, &[list, pyth])), "control: Pyth leg refused (no Pyth)");
 }
 
+/// R12-2 (mainnet): `Aio4gaX...` (the Switchboard DEVNET program id) is deployed and upgradeable on
+/// mainnet under a different authority, so an account it owns is NOT a Switchboard feed on a
+/// mainnet build: refused even when its key is on the allowlist. Control: the real On-Demand
+/// program id is admitted once listed.
+#[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
+fn r12_switchboard_devnet_program_refused_on_mainnet() {
+    require_mainnet_flavour();
+    let mut w = r7_world();
+    let dev = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID);
+    make_hybrid(&mut w, dev, ORACLE_AUTHENTICATED);
+    let up = w.upgrade.insecure_clone();
+    add_to_allowlist(&mut w, &up, vec![dev.to_bytes()]);
+    let list = g9_allowlist_pda(&w);
+    let r = propose_with_tail(&mut w, &[list, dev]);
+    assert!(leg_refused(&r), "a feed owned by the Switchboard DEVNET id is refused on mainnet, even listed: {r:?}");
+    let real = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
+    make_hybrid(&mut w, real, ORACLE_AUTHENTICATED);
+    add_to_allowlist(&mut w, &up, vec![real.to_bytes()]);
+    let r = propose_with_tail(&mut w, &[list, real]);
+    assert!(gate_passed(&r), "control: the real On-Demand program, listed: {r:?}");
+}
+
+/// R10-2 (mainnet): the allowlist pins the feed OWNER. A listed Chainlink feed whose `feed.owner`
+/// changes afterwards (the owner can change the writer) stops qualifying; the same for a Switchboard
+/// feed whose `authority` changes. Control: restoring the owner re-qualifies it; a feed listed with
+/// a DIFFERENT pinned owner never qualified.
+#[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
+fn r10_listed_feed_owner_change_disqualifies() {
+    require_mainnet_flavour();
+    for program in [
+        percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID,
+        percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID,
+    ] {
+        let mut w = r7_world();
+        let feed = feed_account(&mut w, program);
+        make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
+        let up = w.upgrade.insecure_clone();
+        add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
+        let list = g9_allowlist_pda(&w);
+        assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "listed + owner matches");
+        set_feed_owner(&mut w, feed, [0xEE; 32]);
+        let r = propose_with_tail(&mut w, &[list, feed]);
+        assert!(leg_refused(&r), "the owner changed: the listed feed stops qualifying ({program}): {r:?}");
+        set_feed_owner(&mut w, feed, FEED_OWNER);
+        assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "control: owner restored");
+        // Listed with a different pinned owner: never qualified.
+        let other = feed_account(&mut w, program);
+        make_hybrid(&mut w, other, ORACLE_AUTHENTICATED);
+        propose_allowlist_entries(&mut w, &up, vec![(other.to_bytes(), [0xAB; 32])]).expect("propose");
+        let t = w.slot() + TIMELOCK;
+        w.env.svm.warp_to_slot(t);
+        commit_allowlist(&mut w, &up).expect("commit");
+        let r = propose_with_tail(&mut w, &[list, other]);
+        assert!(leg_refused(&r), "pinned owner differs from the feed's owner: {r:?}");
+    }
+}
+
+/// Devnet flavour: the override admits an unlisted feed (testing only); the mainnet flavour tests
+/// above assert the opposite against the non-devnet `.so`.
+#[test]
+fn g9_devnet_override_admits_an_unlisted_feed() {
+    if std::env::var("R1_FLAVOUR").as_deref() == Ok("mainnet") {
+        return; // running against the non-devnet .so: the ignored mainnet tests cover it
+    }
+    let mut w = r7_world();
+    let feed = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
+    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
+    let r = propose_with_tail(&mut w, &[feed]);
+    assert!(r.as_ref().err().map_or(false, |e| e.contains("p4_g9_oracle_gate_ok override=1")), "devnet override: {r:?}");
+}
+
 /// R-8 (mainnet): a Hybrid whose effective price fell back to the trade-driven mark is refused,
 /// even with a Chainlink leg. Control: the same market AUTHENTICATED passes the gate.
 #[test]
+#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
 fn r8_trade_driven_provenance_refused() {
-    if std::env::var("R1_FLAVOUR").map_or(true, |v| v != "mainnet") {
-        return;
-    }
+    require_mainnet_flavour();
     let mut w = r7_world();
     let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
     make_hybrid(&mut w, feed, ORACLE_TRADE_DRIVEN);
@@ -3099,7 +3199,7 @@ fn r7_allowlist_setter_is_authority_only_and_validated() {
     assert!(propose_allowlist(&mut w, &up, (0..17u8).map(|i| [i + 1; 32]).collect()).is_err(), "17 keys refused");
     add_to_allowlist(&mut w, &up, vec![k]);
     let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, k, 0, 0));
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, k, 0, 0));
     set_allowlist(&mut w, &up, vec![]).expect("authority clears it (a removal)");
     assert_eq!(allowlist_rec(&w).count, 0);
 }
@@ -3115,20 +3215,20 @@ fn r10_addition_needs_the_full_delay() {
     propose_allowlist(&mut w, &up, vec![a]).expect("propose");
     let p = allowlist_rec(&w);
     assert_eq!((p.count, p.pending_count), (0, 1), "nothing in force yet");
-    assert!(p.pending_slot != 0);
+    assert!(p.pending_slot_u64() != 0);
     // Immediately: refused.
     let r = commit_allowlist(&mut w, &up);
     assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit at once refused: {r:?}");
     // One slot short of the delay: refused.
-    w.env.svm.warp_to_slot(p.pending_slot + TIMELOCK - 1);
+    w.env.svm.warp_to_slot(p.pending_slot_u64() + TIMELOCK - 1);
     let r = commit_allowlist(&mut w, &up);
     assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit one slot early refused: {r:?}");
     assert_eq!(allowlist_rec(&w).count, 0, "still nothing in force");
     // Exactly at the delay: accepted.
-    w.env.svm.warp_to_slot(p.pending_slot + TIMELOCK);
+    w.env.svm.warp_to_slot(p.pending_slot_u64() + TIMELOCK);
     commit_allowlist(&mut w, &up).expect("commit at the boundary");
     let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, a, 0, 0));
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, a, 0, 0));
     // A commit with no proposal is refused (replay).
     let r = commit_allowlist(&mut w, &up);
     assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "no proposal -> refused: {r:?}");
@@ -3154,7 +3254,7 @@ fn r10_tag_117_is_removal_only() {
     propose_allowlist(&mut w, &up, vec![a, b, c]).expect("propose adding c");
     set_allowlist(&mut w, &up, vec![a]).expect("removal of b is immediate");
     let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot), (1, a, 0, 0), "removal cancelled the proposal");
+    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, a, 0, 0), "removal cancelled the proposal");
     let target = w.slot() + TIMELOCK;
     w.env.svm.warp_to_slot(target);
     let r = commit_allowlist(&mut w, &up);
@@ -3173,11 +3273,11 @@ fn r10_reproposal_restarts_and_cancel() {
     let r = propose_allowlist(&mut w, &up, vec![]);
     assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancel with nothing open refused: {r:?}");
     propose_allowlist(&mut w, &up, vec![a]).expect("first");
-    let first = allowlist_rec(&w).pending_slot;
+    let first = allowlist_rec(&w).pending_slot_u64();
     w.env.svm.warp_to_slot(first + TIMELOCK - 10);
     propose_allowlist(&mut w, &up, vec![a, b]).expect("replace");
     let second = allowlist_rec(&w);
-    assert!(second.pending_slot > first && second.pending_count == 2, "replaced and restarted");
+    assert!(second.pending_slot_u64() > first && second.pending_count == 2, "replaced and restarted");
     // The OLD due slot passes: the replaced proposal is not yet committable.
     w.env.svm.warp_to_slot(first + TIMELOCK + 5);
     let r = commit_allowlist(&mut w, &up);
@@ -3185,8 +3285,8 @@ fn r10_reproposal_restarts_and_cancel() {
     // Cancel: nothing can commit.
     propose_allowlist(&mut w, &up, vec![]).expect("cancel");
     let l = allowlist_rec(&w);
-    assert_eq!((l.pending_count, l.pending_slot), (0, 0));
-    w.env.svm.warp_to_slot(second.pending_slot + TIMELOCK + 5);
+    assert_eq!((l.pending_count, l.pending_slot_u64()), (0, 0));
+    w.env.svm.warp_to_slot(second.pending_slot_u64() + TIMELOCK + 5);
     let r = commit_allowlist(&mut w, &up);
     assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancelled -> refused: {r:?}");
     assert_eq!(allowlist_rec(&w).count, 0);

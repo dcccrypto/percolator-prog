@@ -284,6 +284,24 @@ pub fn g9_leg_ok(source: G9LegSource, key_matches: bool, allowlisted: bool) -> b
         }
 }
 
+/// R10-2: the feed owner read from the leg account (`None` when the account is too short or the
+/// source is not Chainlink / Switchboard). Chainlink store `Transmissions.owner` at +10; Switchboard
+/// PullFeed `authority` at +2056.
+pub fn g9_leg_feed_owner(source: G9LegSource, data: &[u8]) -> Option<[u8; 32]> {
+    let off = match source {
+        G9LegSource::Chainlink => crate::oracle_v16::CL_OFF_FEED_OWNER,
+        G9LegSource::Switchboard => crate::oracle_v16::SB_OFF_FEED_AUTHORITY,
+        G9LegSource::Other => return None,
+    };
+    data.get(off..off + 32)?.try_into().ok()
+}
+
+/// R10-2: a listed feed qualifies only while its CURRENT owner equals the owner pinned in the
+/// record; both must exist (an unlisted feed or an unreadable owner never qualifies).
+pub fn g9_owner_matches(listed: Option<&[u8; 32]>, actual: Option<&[u8; 32]>) -> bool {
+    matches!((listed, actual), (Some(a), Some(b)) if a == b)
+}
+
 /// R-10: `new` may replace `current` immediately iff it adds nothing (every new key is already
 /// in force). A removal is always immediate; an addition is never.
 pub fn g9_allowlist_removal_only(current: &[[u8; 32]], new: &[[u8; 32]]) -> bool {
@@ -634,6 +652,23 @@ mod tests {
         assert!(rescue_par_per_share_not_raised(c, s, m, dc));
         // Negative control: one share too many (a ceil mint at an exact boundary) breaks L-RES.
         assert!(!rescue_value_no_dilution(1, 1, 1, 3));
+    }
+
+    #[test]
+    fn r10_owner_pin_rules() {
+        let a = [1u8; 32];
+        let b = [2u8; 32];
+        assert!(g9_owner_matches(Some(&a), Some(&a)));
+        assert!(!g9_owner_matches(Some(&a), Some(&b)), "owner changed: stops qualifying");
+        assert!(!g9_owner_matches(None, Some(&a)), "unlisted");
+        assert!(!g9_owner_matches(Some(&a), None), "owner unreadable");
+        let mut d = vec![0u8; 3_000];
+        d[10..42].copy_from_slice(&a);
+        d[2_056..2_088].copy_from_slice(&b);
+        assert_eq!(g9_leg_feed_owner(G9LegSource::Chainlink, &d), Some(a));
+        assert_eq!(g9_leg_feed_owner(G9LegSource::Switchboard, &d), Some(b));
+        assert_eq!(g9_leg_feed_owner(G9LegSource::Other, &d), None);
+        assert_eq!(g9_leg_feed_owner(G9LegSource::Switchboard, &d[..2_087]), None, "short account");
     }
 
     #[test]
