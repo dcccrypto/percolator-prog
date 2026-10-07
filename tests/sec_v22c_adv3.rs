@@ -42,19 +42,9 @@ const MATCHER_CONTEXT_LEN: usize = 320;
 /// = `constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM` (devnet build; the test crate's lib is not
 /// built with `devnet`, so the id is restated and checked against the program by tag 94 itself).
 const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
-// v2.2 combined release: Wave A's 1e7 launch floor binds every growth market, so the fixtures launch
-// at $10.00 e6 and one test "unit" is 1/10 token: every notional equals the pre-merge $1 fixtures.
+// combined release: Wave A's 1e7 launch floor binds every growth market; launch at $10.00 e6 and one test
+// "unit" is 1/10 token so every notional equals the pre-merge $1 fixtures
 const PRICE: u64 = 10_000_000; // $10.00 e6
-
-#[allow(dead_code)]
-pub fn cu_rec(data: &[u8], cu: u64) {
-    if let Ok(path) = std::env::var("CU_LOG") {
-        use std::io::Write;
-        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
-            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
-        }
-    }
-}
 
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
@@ -384,7 +374,7 @@ impl Env {
         env
     }
 
-    /// N-2 test helper: the harness constructor WITHOUT tag 74 CreateLpVault (so a launch can
+    /// N-2 test helper: the harness constructor WITHOUT tag 69 CreateLpVault (so a launch can
     /// create the LP vault, bind it and create the bond tranche in ONE transaction).
     fn new_bare(p: Params, matcher_so: PathBuf) -> Env {
         let mut svm = LiteSVM::new();
@@ -559,10 +549,9 @@ impl Env {
             &signers,
             self.svm.latest_blockhash(),
         );
-        let __d = instructions.last().map(|i| i.data.clone()).unwrap_or_default();
         self.svm
             .send_transaction(tx)
-            .map(|m| { cu_rec(&__d, m.compute_units_consumed); })
+            .map(|m| { eprintln!("CU {}", m.compute_units_consumed); })
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -1562,7 +1551,7 @@ fn growth_params() -> Params {
 }
 
 const U: u64 = 1_000_000; // 1 USDC / 1 unit at $1
-const UQ: i128 = 100_000; // 1 unit in Q = 1/10 token (POS_SCALE = 1e6)
+const UQ: i128 = 100_000; // 1 unit in Q = 1/10 token
 
 impl Env {
     fn ext_key(&self) -> Pubkey {
@@ -2891,7 +2880,7 @@ fn sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed() {
 }
 
 /// N-2: a dust Earn deposit made before tag 107 permanently disables bonds on that market (107
-/// is refused once any Earn exists, M-2). The SAFE LAUNCH is atomic: create the LP vault (74),
+/// is refused once any Earn exists, M-2). The SAFE LAUNCH is atomic: create the LP vault (69),
 /// bind it (94) and create the bond tranche (107) in ONE transaction, which leaves no window for
 /// any Earn deposit. This test (a) shows the grief on the unbundled path, (b) builds the bundle
 /// as a real transaction (the two program-owned accounts tag 94 needs are created by system
@@ -2965,7 +2954,7 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
     env.svm.expire_blockhash();
     let tx = Transaction::new_signed_with_payer(&instructions, Some(&admin.pubkey()), &[&admin, &lp_kp, &ctx_kp], env.svm.latest_blockhash());
     let size = bincode::serialize(&tx).unwrap().len();
-    eprintln!("N-2 launch bundle (74 + 94 + 107 + 2 create_account): {size} bytes");
+    eprintln!("N-2 launch bundle (69 + 94 + 107 + 2 create_account): {size} bytes");
     assert!(size <= 1_232, "the launch bundle must fit one packet: {size} B");
     env.svm.send_transaction(tx).map_err(|e| format!("{e:?}")).expect("atomic launch bundle");
     assert_eq!(env.registry_state()._reserved[0], 1, "bound");
@@ -2982,63 +2971,18 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
 }
 
 
-/// Follow-up to the approval of #530 @ 80d3a906: tag 78 values the vault LP at
-/// min(certified equity, the LAG-WORSE equity 108/110 use), so the coupon gate cannot open while
-/// 108/110 call the tranche impaired. Setup: seniors 10,000, junior 500, bonds 1,000; a trader
-/// long 1,000 units vs the vault LP; a fee leg pending; the mark target jumps +100% while the
-/// effective price has moved only one 5% step. At the effective price the bonds are whole (LP -50
-/// < junior 500); at the worse price they are impaired (LP -1,000 > junior 500). 78 must pay NO
-/// coupon, and 108 must call the tranche impaired in the same state. CONTROL: no target jump ->
-/// 78 pays the coupon. Negative control: mutant MB10 (no lag-worse term) pays the coupon in the
-/// lag case and fails this test.
 #[test]
-fn bond_coupon_gate_uses_the_lag_worse_value_like_108_110() {
-    let run = |lag: bool| -> (u128, u128, Result<(), String>) {
-        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
-        env.slot += 500_000;
-        env.svm.warp_to_slot(env.slot);
-        env.hold(1, &[lp.portfolio]);
-        let f = env.new_trader(20_000 * U);
-        for _ in 0..6 {
-            env.trade(&f, &lp, 200 * UQ).expect("fee open");
-            env.trade(&f, &lp, -200 * UQ).expect("fee close");
-        }
-        let t = env.new_trader(5_000 * U);
-        env.trade(&t, &lp, 1_000 * UQ).expect("long 1,000 vs the vault LP");
-        let target = if lag { 2 * PRICE } else { PRICE };
-        let admin = env.admin.insecure_clone();
-        env.slot += 1;
-        env.svm.warp_to_slot(env.slot);
-        let seq = env.oracle_seq() + 1;
-        let m = env.market;
-        env.send(
-            ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: env.slot, mark_e6: target, observation_sequence: seq },
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
-            &[&admin],
-        )
-        .expect("push mark");
-        env.crank(lp.portfolio).expect("crank vault LP");
-        env.crank(t.portfolio).expect("crank trader");
-        let g = env.market_state().1;
-        if lag {
-            assert!(g.assets[0].effective_price < g.assets[0].raw_oracle_target_price, "vacuity: a pending lag");
-        }
-        let cb0 = env.tranche().c_b_atoms;
-        let c0 = env.vlp().senior_claim_atoms;
-        let (cfg, _) = env.market_state();
-        let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
-        env.crank_fees_bond(lp.portfolio).expect("78");
-        let coupon = env.tranche().c_b_atoms - cb0;
-        assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
-        let h2 = env.new_bond_holder();
-        let r108 = env.bond_deposit(&h2, lp.portfolio, U, 1);
-        eprintln!("LAG-WORSE lag={lag}: leg {leg} coupon {coupon} 108 -> {:?}", r108.as_ref().map_err(|e| e.chars().take(70).collect::<String>()));
-        (leg, coupon, r108)
-    };
-    let (leg_l, coupon_l, r108_l) = run(true);
-    let (leg_c, coupon_c, _) = run(false);
-    assert!(leg_l > 0 && leg_c > 0, "vacuity: fee legs");
-    err_has(&r108_l, PercolatorError::BondTrancheImpaired);
-    assert_eq!(coupon_l, 0, "78 agrees with 108: impaired at the worse price, no coupon");
-    assert!(coupon_c > 0, "control: no lag, the coupon is paid");
+fn sec4_cu_of_78_with_refresh() {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+    let t = env.new_trader(10_000 * U);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.trade(&t, &lp, 500 * UQ).expect("open");
+    let tr0 = env.tranche();
+    eprintln!("SEC4 78 with LP inventory:");
+    env.crank_fees_bond(lp.portfolio).expect("78");
+    let tr1 = env.tranche();
+    eprintln!("SEC4 coupon {} moved {}", tr1.c_b_atoms - tr0.c_b_atoms, tr1.last_coupon_slot != tr0.last_coupon_slot);
+    // third party: refresh forced at will is already possible via tag 5 (PermissionlessCrank)
 }

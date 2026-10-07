@@ -3712,6 +3712,17 @@ impl V16CuEnv {
     }
 }
 
+
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 pub fn send_tx(
     svm: &mut LiteSVM,
     program_id: Pubkey,
@@ -3726,6 +3737,7 @@ pub fn send_tx(
         accounts,
         data: ix.encode(),
     };
+    let __d = instruction.data.clone();
     let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
     signer_refs.push(payer);
     signer_refs.extend_from_slice(extra_signers);
@@ -3741,6 +3753,7 @@ pub fn send_tx(
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
             }
+            cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
         .map_err(|e| format!("{e:?}"));
@@ -3779,6 +3792,7 @@ pub fn send_raw_tx(
     extra_signers: &[&Keypair],
 ) -> Result<u64, String> {
     let touched: Vec<Pubkey> = instruction.accounts.iter().map(|m| m.pubkey).collect();
+    let __d = instruction.data.clone();
     let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
     signer_refs.push(payer);
     signer_refs.extend_from_slice(extra_signers);
@@ -3794,6 +3808,7 @@ pub fn send_raw_tx(
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
             }
+            cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
         .map_err(|e| format!("{e:?}"));

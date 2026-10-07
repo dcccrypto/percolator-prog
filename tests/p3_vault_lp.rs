@@ -38,6 +38,16 @@ const MATCHER_CONTEXT_LEN: usize = 320;
 const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
@@ -407,9 +417,10 @@ impl Env {
             &signers,
             self.svm.latest_blockhash(),
         );
+        let __d = instructions.last().map(|i| i.data.clone()).unwrap_or_default();
         self.svm
             .send_transaction(tx)
-            .map(|_| ())
+            .map(|m| { cu_rec(&__d, m.compute_units_consumed); })
             .map_err(|e| format!("{e:?}"))
     }
 

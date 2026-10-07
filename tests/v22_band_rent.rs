@@ -58,6 +58,16 @@ thread_local! {
     static INIT_PRICE: std::cell::Cell<u64> = const { std::cell::Cell::new(PRICE) };
 }
 
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
@@ -410,6 +420,7 @@ impl Env {
         signers: &[&Keypair],
     ) -> Result<u64, String> {
         let instruction = Instruction { program_id: self.program_id, accounts, data: ix.encode() };
+        let __d = instruction.data.clone();
         let mut all = vec![&self.payer];
         all.extend_from_slice(signers);
         self.svm.expire_blockhash();
@@ -425,7 +436,7 @@ impl Env {
         );
         self.svm
             .send_transaction(tx)
-            .map(|m| m.compute_units_consumed)
+            .map(|m| { cu_rec(&__d, m.compute_units_consumed); m.compute_units_consumed })
             .map_err(|e| format!("{e:?}"))
     }
 

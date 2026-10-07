@@ -561,12 +561,12 @@ fn merge_prep_init_market_trailer_grammar() {
     // Combined grammar (v2.2 release): 10 / 11 (rent, optional lot) are now valid; 20 / 21 are not.
     for extra in [6usize, 7] {
         let mut t = g4.clone();
-        t.extend(std::iter::repeat(1u8).take(extra));
+        t.extend(std::iter::repeat_n(1u8, extra));
         assert!(ProgInstruction::decode(&t).is_ok(), "trailer len {} accepted on the combined decoder", 4 + extra);
     }
     for extra in [16usize, 17] {
         let mut t = g4.clone();
-        t.extend(std::iter::repeat(1u8).take(extra));
+        t.extend(std::iter::repeat_n(1u8, extra));
         assert!(ProgInstruction::decode(&t).is_err(), "trailer len {} refused", 4 + extra);
     }
 }
@@ -590,7 +590,7 @@ fn combined_init_market_trailer_every_remainder_length_0_to_40() {
     payload.extend_from_slice(&9_000u32.to_le_bytes());
     payload.extend_from_slice(&100_000_000u64.to_le_bytes());
     assert_eq!(payload.len(), 24);
-    payload.extend(std::iter::repeat(1u8).take(40));
+    payload.extend(std::iter::repeat_n(1u8, 40));
     let valid = [0usize, 1, 6, 7, 24, 25];
     for r in 0..=40usize {
         let mut t = head.clone();
