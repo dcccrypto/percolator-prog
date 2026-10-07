@@ -4061,3 +4061,144 @@ impl Replay {
         state::read_lp_vault_registry(&d).map(|x| x.total_lp_shares_outstanding).unwrap_or(fallback)
     }
 }
+
+/// S10-X1: `r2_market()` at the wrapper leg cap (InitMarket refuses more than the cap).
+fn r2_market_at_cap() -> LiveMarket {
+    let mut m = r2_market();
+    m.params.max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
+    m
+}
+
+/// S10-X1 cap-aware equivalent of `a6_fourteen_leg_refreshes_are_leg_weighted_and_fit_the_budget`:
+/// the same scenario at the wrapper leg cap (8). The leg-weighted budget (3 + legs per refresh,
+/// <= 38) now refuses 4 x 8-leg refreshes (44) and admits 3 x 8-leg (33) + the 77.
+#[test]
+fn a6_cap_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
+    let mut r = Replay::new(r2_market_at_cap());
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
+    let px = 1_000_000u64;
+    {
+        let (_, g) = r.env.market_state();
+        assert!(g.assets.len() >= assets as usize, "market has {} asset slots", g.assets.len());
+        for a in 1..assets as usize {
+            assert_eq!(g.assets[a].lifecycle, percolator::AssetLifecycleV16::Active, "asset {a} in service");
+        }
+    }
+    // counterparty for assets 1..13
+    let cp_owner = Keypair::new();
+    r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();
+    let cp = r.env.create_portfolio(&cp_owner);
+    r.env.deposit(&cp_owner, cp, 100_000_000_000);
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut tr = vec![];
+    // one tag 5 on the counterparty with every asset hinted: accrues all 14 assets to now
+    let crank_all = |r: &mut Replay| {
+        let payer = r.env.payer.pubkey();
+        let market = r.env.market;
+        r.env.svm.expire_blockhash();
+        r.env
+            .send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations: (0..assets)
+                        .map(|a| CrankObservationHint { asset_index: a, oracle_accounts: 0 })
+                        .collect(),
+                },
+                vec![AccountMeta::new(payer, true), AccountMeta::new(market, false), AccountMeta::new(cp, false)],
+                &[],
+            )
+            .ok();
+    };
+    for i in 0..4 {
+        let (k, p) = r.new_trader(1_000_000_000);
+        let side = if i % 2 == 0 { q } else { -q };
+        crank_all(&mut r);
+        r.trade(&k, p, side).expect("asset 0 leg vs LP");
+        for a in 1..assets {
+            r.env.svm.expire_blockhash();
+            r.env
+                .try_trade_asset_with_cu(a, &k, p, &cp_owner, cp, side, px, 0)
+                .unwrap_or_else(|e| panic!("asset {a} leg: {e}"));
+        }
+        let legs = percolator::active_bitmap_count_ones(r.env.portfolio_state(p).active_bitmap);
+        assert_eq!(legs, assets as u32, "trader {i} holds a leg on every asset");
+        tr.push(p);
+    }
+    let lp = r.lp;
+    walk_only(&mut r, 1_020_000, &[lp]); // asset 0 moves: the 8 traders are stale on it
+    r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    // accrue assets 1..13 in THIS slot (one tag 5 on the counterparty with every hint)
+    crank_all(&mut r);
+    let three = r.execute_77(&h, Some((1, tr.clone())), false);
+    assert!(
+        three.as_ref().is_err_and(|e| e.contains("Custom(13)") || custom_code(e) == Some(percolator_prog::error::PercolatorError::InvalidInstruction as u32)),
+        "A6 (cap): 4 x cap-leg refreshes (4 x (3+8) = 44 > 38) must be refused by the leg budget, not run out of CU: {three:?}"
+    );
+    assert!(three.as_ref().is_err_and(|e| !e.contains("exceeded CUs meter")));
+    r.crank_pf(tr[3]); // the third portfolio refreshed by any permissionless crank
+    let (paid, cu) = r
+        .execute_77(&h, Some((1, tr[..3].to_vec())), false)
+        .expect("3 x cap-leg inline refreshes + 77");
+    eprintln!("A6 (cap): 3 refreshes of cap-leg portfolios + 77 = {cu} CU (paid {paid})");
+    assert!(cu <= 1_300_000, "A6: {cu} CU exceeds the 1.3M budget");
+}
+
+/// S10-X1 cap-aware equivalent of `a6_two_liquidating_fourteen_leg_refreshes_cu` (cap = 8 legs).
+#[test]
+fn a6_two_liquidating_cap_leg_refreshes_cu() {
+    let mut r = Replay::new(r2_market_at_cap());
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
+    let px = 1_000_000u64;
+    let cp_owner = Keypair::new();
+    r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();
+    let cp = r.env.create_portfolio(&cp_owner);
+    r.env.deposit(&cp_owner, cp, 100_000_000_000);
+    let crank_all = |r: &mut Replay| {
+        let payer = r.env.payer.pubkey();
+        let market = r.env.market;
+        r.env.svm.expire_blockhash();
+        r.env
+            .send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 0,
+                    observations: (0..assets)
+                        .map(|a| CrankObservationHint { asset_index: a, oracle_accounts: 0 })
+                        .collect(),
+                },
+                vec![AccountMeta::new(payer, true), AccountMeta::new(market, false), AccountMeta::new(cp, false)],
+                &[],
+            )
+            .ok();
+    };
+    let q10: i128 = 10 * percolator::POS_SCALE as i128;
+    let q100: i128 = 100 * percolator::POS_SCALE as i128;
+    let mut tr = vec![];
+    for _ in 0..2 {
+        let (k, p) = r.new_trader(25_000_000);
+        crank_all(&mut r);
+        r.trade(&k, p, q100).expect("asset 0 long 100 vs LP");
+        for a in 1..assets {
+            r.env.svm.expire_blockhash();
+            r.env
+                .try_trade_asset_with_cu(a, &k, p, &cp_owner, cp, q10, px, 0)
+                .unwrap_or_else(|e| panic!("asset {a} leg: {e}"));
+        }
+        tr.push(p);
+    }
+    let lp = r.lp;
+    walk_only(&mut r, 850_000, &[lp]);
+    r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    crank_all(&mut r);
+    let before: Vec<i128> = tr.iter().map(|p| r.env.portfolio_state(*p).capital as i128).collect();
+    let res = r.execute_77(&h, Some((1, tr.clone())), false);
+    let after: Vec<i128> = tr.iter().map(|p| r.env.portfolio_state(*p).capital as i128).collect();
+    eprintln!("A6-LIQ 2 x cap-leg liquidating refreshes: {:?} (capital {before:?} -> {after:?})", res.as_ref().map(|x| x.1).map_err(|e| custom_code(e)));
+    let (_, cu) = res.expect("2 x cap-leg liquidating refreshes + 77");
+    assert!(cu <= 1_260_000, "A6: {cu} CU leaves < 10% headroom under 1.4M");
+}

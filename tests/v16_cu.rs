@@ -26510,3 +26510,17 @@ fn v22_leg_cap_is_enforced_at_init_and_at_leg_open() {
     println!("X1CAP leg above the cap: {r:?}");
     assert!(r.is_err(), "the leg above the cap must be refused, got {r:?}");
 }
+
+/// S10-X1: every `max_portfolio_assets` above the wrapper cap (9..=14 at cap 8) is refused at
+/// InitMarket; the cap itself and every smaller value is accepted.
+#[test]
+fn v22_init_market_refuses_every_leg_count_above_the_cap() {
+    let cap = LEG_CAP as u16;
+    for n in [1u16, cap - 1, cap] {
+        let _ = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
+    }
+    for n in (cap + 1)..=14 {
+        let r = std::panic::catch_unwind(|| V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500));
+        assert!(r.is_err(), "InitMarket with max_portfolio_assets = {n} (> cap {cap}) must be refused");
+    }
+}
