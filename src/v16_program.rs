@@ -15289,6 +15289,7 @@ pub mod processor {
     }
 
     #[inline(never)]
+    #[allow(clippy::too_many_arguments)] // the combined InitMarket wire carries growth + lot + rent/band
     fn handle_init_market<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
