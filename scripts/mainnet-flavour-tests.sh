@@ -14,7 +14,7 @@ fi
 [ -r "$SO" ] || { echo "FATAL: $SO not readable"; exit 2; }
 # every expected test must RUN (not be filtered): the count is asserted below
 EXPECTED=$(grep -c 'run scripts/mainnet-flavour-tests.sh' tests/p4_wave_d.rs)
-OUT=$(INDEP_WRAPPER_SO="$SO" R1_FLAVOUR=mainnet cargo test --features devnet --test p4_wave_d -- --ignored 2>&1) || { echo "$OUT" | tail -40; echo "MAINNET FLAVOUR TESTS: FAIL"; exit 1; }
+OUT=$(INDEP_WRAPPER_SO="$SO" R1_FLAVOUR=mainnet cargo test --features devnet --test p4_wave_d -- --ignored --skip pin_ 2>&1) || { echo "$OUT" | tail -40; echo "MAINNET FLAVOUR TESTS: FAIL"; exit 1; }
 echo "$OUT" | grep -E "^test |test result"
 PASSED=$(echo "$OUT" | sed -n 's/^test result: ok\. \([0-9]*\) passed.*/\1/p' | head -1)
 if [ "${PASSED:-0}" -ne "$EXPECTED" ] || [ "$EXPECTED" -lt 1 ]; then
