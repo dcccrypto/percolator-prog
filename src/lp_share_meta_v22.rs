@@ -33,6 +33,10 @@ pub const MPL_METADATA_SEED: &[u8] = b"metadata";
 pub const CREATE_METADATA_V3_DATA_LEN: usize =
     1 + (4 + LP_SHARE_NAME_LEN) + (4 + LP_SHARE_SYMBOL.len()) + 4 + 2 + 3 + 1 + 1;
 
+// Metaplex limits: MAX_NAME_LENGTH 32, MAX_SYMBOL_LENGTH 10.
+const _: () = assert!(LP_SHARE_NAME_LEN <= 32);
+const _: () = assert!(LP_SHARE_SYMBOL.len() <= 10);
+
 const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 /// The first `LP_SHARE_NAME_MARKET_CHARS` characters of the base58 encoding of a 32-byte key
@@ -153,8 +157,6 @@ mod tests {
 
     #[test]
     fn name_and_symbol_fit_metaplex_limits_and_keep_the_fixed_prefix() {
-        assert!(LP_SHARE_NAME_LEN <= 32);
-        assert!(LP_SHARE_SYMBOL.len() <= 10);
         let market = Pubkey::new_unique();
         let name = lp_share_name(&market.to_bytes());
         let s = core::str::from_utf8(&name).unwrap();
