@@ -341,6 +341,7 @@ pub fn backstop_restore_equity_room(equity: u128, initial_req: u128) -> u128 {
 /// * `pnl_capacity` = the engine's read-only capacity (0 when any engine precondition fails, which
 ///   falls back to the capital-only mode-1 behaviour);
 /// * `requested == 0` = no caller cap.
+///
 /// Invariants (Kani-friendly, no panics): `from_pnl + from_capital <= min(outstanding, equity_room,
 /// requested-if-set, pnl_capacity + capital)`, `from_pnl <= pnl_capacity`, `from_capital <=
 /// capital`, and `from_capital > 0` only when the PnL source is exhausted (`from_pnl ==
