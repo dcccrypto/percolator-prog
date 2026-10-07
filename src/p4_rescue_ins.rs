@@ -662,7 +662,7 @@ mod tests {
         assert!(!g9_owner_matches(Some(&a), Some(&b)), "owner changed: stops qualifying");
         assert!(!g9_owner_matches(None, Some(&a)), "unlisted");
         assert!(!g9_owner_matches(Some(&a), None), "owner unreadable");
-        let mut d = vec![0u8; 3_000];
+        let mut d = [0u8; 3_000];
         d[10..42].copy_from_slice(&a);
         d[2_056..2_088].copy_from_slice(&b);
         assert_eq!(g9_leg_feed_owner(G9LegSource::Chainlink, &d), Some(a));
