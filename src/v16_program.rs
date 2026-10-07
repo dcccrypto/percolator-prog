@@ -21324,7 +21324,7 @@ pub mod processor {
         #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (program_id, market_ai, pool_ai, bound_insurance_authority);
-            return Err(PercolatorError::StakeProgramNotPinned.into());
+            Err(PercolatorError::StakeProgramNotPinned.into())
         }
         #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
@@ -40189,6 +40189,7 @@ pub mod processor {
         /// `mainnet-ids*`: the vault authority derived under the PINNED stake id is bound and gets
         /// the stake unit class; one derived under any other program, or a stranger, is not.
         #[test]
+        #[allow(clippy::assertions_on_constants)]
         fn item4_stake_pin_flavours() {
             let market = Pubkey::new_from_array([7u8; 32]);
             let stranger = [9u8; 32];
