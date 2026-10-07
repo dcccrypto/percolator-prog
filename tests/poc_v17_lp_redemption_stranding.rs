@@ -399,6 +399,7 @@ fn setup_vault(cooldown_slots: u64) -> Env {
                 AccountMeta::new(lp_mint, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(collateral_mint, false), // [6] collateral mint (prog#542)
             ],
         )],
         &[&admin],

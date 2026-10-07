@@ -383,6 +383,7 @@ impl World {
                 AccountMeta::new(mint, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(self.env.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         );
