@@ -13,7 +13,7 @@ Instruction data is unchanged. The account list gains a 7th entry:
 |---|---|---|
 | 0 | marketauth | signer, writable |
 | 1 | market | writable |
-| 2 | LP vault registry PDA `["lp_vault_registry", market]` | writable |
+| 2 | LP vault registry PDA `["lp_vault", market]` | writable |
 | 3 | LP share mint PDA `["lp_vault_mint", market]` | writable |
 | 4 | system program | |
 | 5 | SPL Token program (classic) | |
