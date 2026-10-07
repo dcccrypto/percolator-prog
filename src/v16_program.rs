@@ -50,6 +50,9 @@ pub mod growth_v19;
 /// fix (item 8). See `~/percolator-ops/ledger/phase4-design-2026-10-05.md`.
 pub mod wave_a_v22;
 
+/// v2.2 executed-fill / reduction / value-move events (`docs/v22-fill-events.md`).
+pub mod fill_events_v22;
+
 /// Phase 4 items 5 + 6 (2026-10-05): pure math for the rescue tranche (L-RES), the insurance
 /// unit ledger and the G9 insurance backstop. See
 /// `~/percolator-ops/ledger/phase4-design-2026-10-05.md` items 5 and 6.
@@ -15946,6 +15949,78 @@ pub mod processor {
         )
     }
 
+    /// v2.2 fill events: what each leg of a batch booked / charged, in leg order. Its own frame:
+    /// the batch executor is pinned in the frame gate and cannot absorb the loop's locals.
+    #[inline(never)]
+    fn collect_batch_fills(
+        out: &mut Vec<FillOut>,
+        requests: &[TradeRequestV16],
+        leg_ctx: &[(usize, state::AssetOracleProfileV16, u64, u128, i128, i128)],
+    ) {
+        out.reserve(requests.len());
+        for (request, ctx) in requests.iter().zip(leg_ctx.iter()) {
+            out.push(FillOut {
+                price_e6: request.exec_price,
+                fee_atoms: fill_events_v22::sat_u64(ctx.3),
+                backing_fee_atoms: 0,
+            });
+        }
+    }
+
+    /// v2.2 fill event for a batch (BatchTradeNoCpi tag 66 / BatchTradeCpi tag 67): packed, one
+    /// line per up to 11 legs. `requested[i]` is the wire size of leg i (the executed size for
+    /// NoCpi). Its own frame, for the same reason as `collect_batch_fills`.
+    #[inline(never)]
+    fn emit_batch_fills(
+        tag: u8,
+        market: &Pubkey,
+        taker: &Pubkey,
+        lp: &Pubkey,
+        wire: Option<&[ix::BatchTradeCpiLeg]>,
+        exec_legs: &[ix::BatchTradeLeg],
+        fills: &[FillOut],
+    ) {
+        let matcher = tag == fill_events_v22::TAG_BATCH_CPI;
+        fill_events_v22::emit_fills(
+            tag,
+            &market.to_bytes(),
+            &taker.to_bytes(),
+            &lp.to_bytes(),
+            exec_legs.len(),
+            |i| {
+                let requested_q = wire.map_or(exec_legs[i].size_q, |w| w[i].size_q);
+                fill_events_v22::FillRec {
+                    asset_index: exec_legs[i].asset_index,
+                    asset_gen: exec_legs[i].market_id,
+                    flags: if matcher { fill_events_v22::FLAG_MATCHER } else { 0 }
+                        | if exec_legs[i].size_q.unsigned_abs() < requested_q.unsigned_abs() {
+                            fill_events_v22::FLAG_PARTIAL
+                        } else {
+                            0
+                        },
+                    requested_q,
+                    executed_q: exec_legs[i].size_q,
+                    price_e6: fills[i].price_e6,
+                    quoted_price_e6: exec_legs[i].exec_price,
+                    fee_atoms: fills[i].fee_atoms,
+                    backing_fee_atoms: fills[i].backing_fee_atoms,
+                }
+            },
+        );
+    }
+
+    /// What one executed fill booked and charged, returned by the shared executors so the
+    /// calling handler can emit the v2.2 FILL event once the whole instruction's state is final.
+    #[derive(Clone, Copy)]
+    struct FillOut {
+        /// The asset `effective_price` the position was booked at.
+        price_e6: u64,
+        /// Engine trade fee (taker + maker fallback), atoms.
+        fee_atoms: u64,
+        /// Backing-domain fee, atoms.
+        backing_fee_atoms: u64,
+    }
+
     #[inline(never)]
     // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
     // binding params (account_{a,b}_portfolio_id/position_epoch); matches the
@@ -15976,10 +16051,11 @@ pub mod processor {
         // P2 fee channel (TradeCpi only; 0 elsewhere): the consented matcher-requested fee,
         // charged to the taker on top of the base fee and credited to account_b (the LP).
         lp_requested_fee_bps: u64,
-    ) -> ProgramResult {
+    ) -> Result<FillOut, ProgramError> {
         ensure_portfolio_storage_for_market_slots(account_a_ai, max_market_slots)?;
         ensure_portfolio_storage_for_market_slots(account_b_ai, max_market_slots)?;
         let mut cfg_after = None;
+        let fill_out: FillOut;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -16271,6 +16347,15 @@ pub mod processor {
                     account_b_backing_fee_cap_bps,
                 )?
             };
+            // v2.2 fill events: what this fill actually booked / charged, read by the caller
+            // AFTER every post-fill gate has passed (see `FillOut`).
+            fill_out = FillOut {
+                price_e6: fee_basis_price,
+                fee_atoms: fill_events_v22::sat_u64(
+                    outcome.fee_a.saturating_add(outcome.fee_b),
+                ),
+                backing_fee_atoms: fill_events_v22::sat_u64(backing_domain_fee),
+            };
             // Four-way split (2026-07-19 design). Both aggregates are split and the two
             // results are added leg by leg below, so this site is correct whether the taker
             // paid the whole fee, the maker paid it under the N1 fallback, or -- since engine
@@ -16360,7 +16445,7 @@ pub mod processor {
         if let Some(cfg) = cfg_after {
             state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
         }
-        Ok(())
+        Ok(fill_out)
     }
 
     /// Reconstruct the exact per-leg fee the engine charges for one leg, so wrapper-side
@@ -16503,6 +16588,7 @@ pub mod processor {
         let assets: Vec<u16> = legs.iter().map(|l| l.asset_index).collect();
         let vault_lp_pre =
             vault_lp_capture_pre_fill(market_ai, account_a_ai, account_b_ai, &assets, max_market_slots)?;
+        let mut fills: Vec<FillOut> = Vec::new();
         handle_batch_execute_zero_copy(
             program_id,
             signer_a.key,
@@ -16518,8 +16604,21 @@ pub mod processor {
             max_market_slots,
             None,
             P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
+            &mut fills,
         )?;
-        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)
+        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)?;
+        // v2.2 fill event (packed: one line per up to 11 legs), emitted last. NoCpi legs execute
+        // exactly as signed, so requested == executed.
+        emit_batch_fills(
+            fill_events_v22::TAG_BATCH_NOCPI,
+            market_ai.key,
+            account_a_ai.key,
+            account_b_ai.key,
+            None,
+            legs,
+            &fills,
+        );
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -16544,6 +16643,9 @@ pub mod processor {
         max_account_a_fee_atoms: Option<u128>,
         // P1: see `handle_trade_nocpi_zero_copy`'s `roles`.
         roles: P1TradeRoles,
+        // v2.2 fill events: filled with one entry per leg, in leg order (what each leg booked /
+        // charged), once every check of the batch has passed.
+        fills_out: &mut Vec<FillOut>,
     ) -> ProgramResult {
         if legs.is_empty() {
             return Err(PercolatorError::EngineNonProgress.into());
@@ -17088,6 +17190,7 @@ pub mod processor {
                 source_lien_before_b.len(),
                 source_lien_after_b.len(),
             )?;
+            collect_batch_fills(fills_out, &requests, &leg_ctx);
         }
         if let Some(cfg) = cfg_after {
             state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
@@ -17170,7 +17273,7 @@ pub mod processor {
             &[asset_index],
             max_market_slots,
         )?;
-        handle_trade_nocpi_zero_copy(
+        let fill = handle_trade_nocpi_zero_copy(
             program_id,
             signer_a.key,
             signer_b.key,
@@ -17192,7 +17295,27 @@ pub mod processor {
             P1TradeRoles::for_nocpi(account_a_ai, account_b_ai)?,
             0,
         )?;
-        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)
+        vault_lp_refuse_outside_growth(market_ai, account_a_ai, account_b_ai, &vault_lp_pre, max_market_slots)?;
+        // v2.2 fill event: emitted last, after every gate of this instruction has passed.
+        fill_events_v22::emit_fills(
+            fill_events_v22::TAG_TRADE_NOCPI,
+            &market_ai.key.to_bytes(),
+            &account_a_ai.key.to_bytes(),
+            &account_b_ai.key.to_bytes(),
+            1,
+            |_| fill_events_v22::FillRec {
+                asset_index,
+                asset_gen: market_id,
+                flags: 0,
+                requested_q: size_q,
+                executed_q: size_q,
+                price_e6: fill.price_e6,
+                quoted_price_e6: exec_price,
+                fee_atoms: fill.fee_atoms,
+                backing_fee_atoms: fill.backing_fee_atoms,
+            },
+        );
+        Ok(())
     }
 
     /// P3: refuse a NoCpi fill that grows EITHER outside portfolio on a bound asset (the vault LP
@@ -17953,6 +18076,8 @@ pub mod processor {
             true,
         )?;
         let lp_headroom_q = p1_pre[0].headroom_q;
+        // v2.2 fill events: the size the taker asked for, before the headroom clip.
+        let requested_q = size_q;
         let size_q = if size_q.unsigned_abs() > lp_headroom_q {
             // lp_headroom_q < |size_q| <= i128::MAX, so the cast is lossless.
             let clipped = lp_headroom_q as i128;
@@ -17966,6 +18091,20 @@ pub mod processor {
         };
         if size_q == 0 {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+            // v2.2 fill event, ZERO fill: clipped to nothing by the LP's headroom, no matcher call.
+            emit_cpi_fill(
+                market_ai.key,
+                account_a_ai.key,
+                account_b_ai.key,
+                asset_index,
+                market_id,
+                requested_q,
+                0,
+                fill_events_v22::FLAG_CLIPPED | fill_events_v22::FLAG_ZERO,
+                oracle_price,
+                0,
+                (0, 0),
+            );
             return Ok(());
         }
         // P2 fee channel: only offered when the call extension is on AND the protocol set a
@@ -18098,8 +18237,24 @@ pub mod processor {
         // P1 item 1: `limit_price == 0` no longer means "any price" -- every matcher fill must
         // sit inside the protocol band around the price the matcher was given.
         ensure_matcher_exec_price_in_band(ret.exec_price_e6, oracle_price, p1_pre[0].band_bps)?;
+        // v2.2 fill events: flags for this fill (clip is known; partial is decided below).
+        let clip_flag = if requested_q != size_q { fill_events_v22::FLAG_CLIPPED } else { 0 };
         if ret.exec_size == 0 {
             state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+            // v2.2 fill event, ZERO fill: the matcher answered with exec_size 0.
+            emit_cpi_fill(
+                market_ai.key,
+                account_a_ai.key,
+                account_b_ai.key,
+                asset_index,
+                market_id,
+                requested_q,
+                0,
+                clip_flag | fill_events_v22::FLAG_ZERO,
+                oracle_price,
+                ret.exec_price_e6,
+                (0, 0),
+            );
             return Ok(());
         }
         let (_, _, max_market_slots, _) =
@@ -18111,7 +18266,7 @@ pub mod processor {
             &[asset_index],
             max_market_slots,
         )?;
-        handle_trade_nocpi_zero_copy(
+        let fill = handle_trade_nocpi_zero_copy(
             program_id,
             signer_a.key,
             &account_b_owner_key,
@@ -18158,7 +18313,63 @@ pub mod processor {
             max_market_slots,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+        // v2.2 fill event: emitted last, after every gate of this instruction has passed.
+        let partial_flag = if ret.exec_size.unsigned_abs() < size_q.unsigned_abs() {
+            fill_events_v22::FLAG_PARTIAL
+        } else {
+            0
+        };
+        emit_cpi_fill(
+            market_ai.key,
+            account_a_ai.key,
+            account_b_ai.key,
+            asset_index,
+            market_id,
+            requested_q,
+            ret.exec_size,
+            clip_flag | partial_flag,
+            fill.price_e6,
+            ret.exec_price_e6,
+            (fill.fee_atoms, fill.backing_fee_atoms),
+        );
         Ok(())
+    }
+
+    /// v2.2 fill event for the single matcher-routed trade (TradeCpi, tag 10; also the inner trade
+    /// of EvictAndTradeCpi, tag 119). One record; `fees` = (engine fee, backing fee).
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn emit_cpi_fill(
+        market: &Pubkey,
+        taker: &Pubkey,
+        lp: &Pubkey,
+        asset_index: u16,
+        asset_gen: u64,
+        requested_q: i128,
+        executed_q: i128,
+        flags: u8,
+        price_e6: u64,
+        quoted_price_e6: u64,
+        fees: (u64, u64),
+    ) {
+        fill_events_v22::emit_fills(
+            fill_events_v22::TAG_TRADE_CPI,
+            &market.to_bytes(),
+            &taker.to_bytes(),
+            &lp.to_bytes(),
+            1,
+            |_| fill_events_v22::FillRec {
+                asset_index,
+                asset_gen,
+                flags: flags | fill_events_v22::FLAG_MATCHER,
+                requested_q,
+                executed_q,
+                price_e6,
+                quoted_price_e6,
+                fee_atoms: fees.0,
+                backing_fee_atoms: fees.1,
+            },
+        );
     }
 
     // ── P3 matcher-fill hook (TradeCpi / BatchTradeCpi) ──────────────────────────────────────
@@ -18216,6 +18427,20 @@ pub mod processor {
             }
         }
         Ok(out)
+    }
+
+    /// `vault_lp_capture_pre_fill` over a batch's legs (own frame: the asset list is built here,
+    /// not in the pinned `handle_batch_trade_cpi`).
+    #[inline(never)]
+    fn vault_lp_capture_pre_fill_for_legs(
+        market_ai: &AccountInfo<'_>,
+        account_a_ai: &AccountInfo<'_>,
+        account_b_ai: &AccountInfo<'_>,
+        legs: &[ix::BatchTradeLeg],
+        max_market_slots: usize,
+    ) -> Result<VaultLpPreFill, ProgramError> {
+        let assets: Vec<u16> = legs.iter().map(|l| l.asset_index).collect();
+        vault_lp_capture_pre_fill(market_ai, account_a_ai, account_b_ai, &assets, max_market_slots)
     }
 
     fn vault_lp_post_fill(
@@ -19192,14 +19417,14 @@ pub mod processor {
 
         let (_, _, max_market_slots, _) =
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        let vault_lp_assets: Vec<u16> = exec_legs.iter().map(|l| l.asset_index).collect();
-        let vault_lp_pre = vault_lp_capture_pre_fill(
+        let vault_lp_pre = vault_lp_capture_pre_fill_for_legs(
             market_ai,
             account_a_ai,
             account_b_ai,
-            &vault_lp_assets,
+            &exec_legs,
             max_market_slots,
         )?;
+        let mut fills: Vec<FillOut> = Vec::new();
         handle_batch_execute_zero_copy(
             program_id,
             signer_a.key,
@@ -19215,6 +19440,7 @@ pub mod processor {
             max_market_slots,
             Some(max_fee_atoms),
             P1TradeRoles::for_cpi(account_a_ai)?,
+            &mut fills,
         )?;
         vault_lp_post_fill(
             market_ai,
@@ -19224,6 +19450,18 @@ pub mod processor {
             max_market_slots,
         )?;
         state::commit_market_matcher_req_id(&mut market_ai.try_borrow_mut_data()?, req_id)?;
+        // v2.2 fill event (packed: one line per up to 11 legs), emitted last. A batch is atomic
+        // and refuses zero fills, so every record is a real fill; a leg the matcher filled
+        // short of its request carries FLAG_PARTIAL.
+        emit_batch_fills(
+            fill_events_v22::TAG_BATCH_CPI,
+            market_ai.key,
+            account_a_ai.key,
+            account_b_ai.key,
+            Some(legs),
+            &exec_legs,
+            &fills,
+        );
         Ok(())
     }
 
@@ -22331,6 +22569,8 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
+        // v2.2 fill events: (closed_q, position was long, asset generation, price) of the step.
+        let wound: Option<(u128, bool, u64, u64)>;
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
         if group.header.mode != 0 {
@@ -22436,12 +22676,23 @@ pub mod processor {
                 true,
             )
             .map_err(map_v16_error)?;
+            // Best effort: reading the side must never change the instruction's error behaviour.
+            let position_before = signed_position_for_asset_view(&group, &portfolio, asset_index).ok();
             let outcome = group
                 .wind_down_adl_position_not_atomic(
                     &mut portfolio,
                     percolator::AdlWindDownRequestV16 { asset_index, bound },
                 )
                 .map_err(map_v16_error)?;
+            wound = position_before.map(|before| {
+                let asset = &group.markets[asset_index].engine.asset;
+                (
+                    outcome.closed_q,
+                    before > 0,
+                    asset.market_id.get(),
+                    asset.effective_price.get(),
+                )
+            });
             // adl_wind_down closed: (104, 1, closed_q, adl_cleared, now)
             solana_program::log::sol_log_64(
                 104,
@@ -22457,6 +22708,22 @@ pub mod processor {
         }
         drop(group);
         state::write_wrapper_config(&mut market_data, &cfg)?;
+        // v2.2 reduce event (tag 104): the whole-leg ADL wind-down close at the mark. Not
+        // emitted on the episode-start path above (nothing closed there).
+        if let Some((closed_q, was_long, asset_gen, price)) = wound {
+            let signed = i128::try_from(closed_q).unwrap_or(i128::MAX);
+            fill_events_v22::emit_reduce(
+                fill_events_v22::TAG_ADL_WIND_DOWN,
+                &market_ai.key.to_bytes(),
+                &portfolio_ai.key.to_bytes(),
+                &[0u8; 32],
+                asset_index as u16,
+                asset_gen,
+                fill_events_v22::REASON_ADL_WIND_DOWN,
+                if was_long { -signed } else { signed },
+                price,
+            );
+        }
         Ok(())
     }
 
@@ -23922,6 +24189,7 @@ pub mod processor {
         if reduce_q == 0 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        let mut reduced: Option<(u128, bool, u64, u64)> = None;
         with_one_portfolio_view(
             program_id,
             accounts,
@@ -23945,16 +24213,51 @@ pub mod processor {
                 asset_index as usize,
                 true,
             )?;
-            group
+            // v2.2 fill events: the side of the leg being reduced (sign of the reduction is the
+            // opposite of the position's) and the price the engine reduces at.
+            // Best effort: reading the side must never change the instruction's error behaviour.
+            let position_before =
+                signed_position_for_asset_view(group, portfolio, asset_index as usize).ok();
+            let outcome = group
                 .rebalance_reduce_position_not_atomic(
                     portfolio,
                     RebalanceRequestV16 {
                         asset_index: asset_index as usize,
                         reduce_q,
                     },
-                )
-                .map(|_| ())
-        })
+                )?;
+            if let Some(position_before) = position_before {
+                let asset = &group.markets[asset_index as usize].engine.asset;
+                reduced = Some((
+                    outcome.reduced_q,
+                    position_before > 0,
+                    asset.market_id.get(),
+                    asset.effective_price.get(),
+                ));
+            }
+            Ok(())
+        })?;
+        // v2.2 reduce event (tag 44): the executed size the engine decided (min of the request,
+        // the unilateral-close capacity and the position), emitted after the instruction's state
+        // change is final.
+        if let Some((reduced_q, was_long, asset_gen, price)) = reduced {
+            // reduced_q <= |position| <= i128::MAX, so the conversion cannot fail; an event never
+            // turns a finished instruction into an error either way.
+            let signed = i128::try_from(reduced_q).unwrap_or(i128::MAX);
+            let signed = if was_long { -signed } else { signed };
+            fill_events_v22::emit_reduce(
+                fill_events_v22::TAG_REBALANCE_REDUCE,
+                &accounts[1].key.to_bytes(),
+                &accounts[2].key.to_bytes(),
+                &[0u8; 32],
+                asset_index,
+                asset_gen,
+                fill_events_v22::REASON_REBALANCE_REDUCE,
+                signed,
+                price,
+            );
+        }
+        Ok(())
     }
 
     /// v2.2 band: close `victim_ai`'s WHOLE leg on `asset_index` against the asset's bound vault
@@ -23970,6 +24273,10 @@ pub mod processor {
         victim_ai: &AccountInfo<'a>,
         lp_ai: &AccountInfo<'a>,
         asset_index: u16,
+        // v2.2 fill events: the REDUCE event's tag and reason (118 dust sweep / 119 eviction).
+        // The event is emitted here, after the close and the vault-LP post-fill gate passed.
+        event_tag: u8,
+        event_reason: u8,
     ) -> ProgramResult {
         if victim_ai.key == lp_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
@@ -24018,6 +24325,7 @@ pub mod processor {
         };
         let vault_lp_pre =
             vault_lp_capture_pre_fill(market_ai, victim_ai, lp_ai, &[asset_index], max_market_slots)?;
+        let closed_q = position.checked_neg().ok_or(PercolatorError::EngineArithmeticOverflow)?;
         handle_trade_nocpi_zero_copy(
             program_id,
             &victim_owner,
@@ -24031,7 +24339,7 @@ pub mod processor {
             lp_epoch,
             asset_index,
             market_id,
-            position.checked_neg().ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            closed_q,
             p_last,
             0,
             Some(0),
@@ -24040,7 +24348,21 @@ pub mod processor {
             P1TradeRoles { cpi: true, a_is_lp: false, b_is_lp: true, forced_close: true },
             0,
         )?;
-        vault_lp_post_fill(market_ai, victim_ai, lp_ai, &vault_lp_pre, max_market_slots)
+        vault_lp_post_fill(market_ai, victim_ai, lp_ai, &vault_lp_pre, max_market_slots)?;
+        // v2.2 reduce event: the victim's whole leg, closed against the bound vault LP at
+        // `P_last` (the booked price of a forced close), no fee.
+        fill_events_v22::emit_reduce(
+            event_tag,
+            &market_ai.key.to_bytes(),
+            &victim_ai.key.to_bytes(),
+            &lp_ai.key.to_bytes(),
+            asset_index,
+            market_id,
+            event_reason,
+            closed_q,
+            p_last,
+        );
+        Ok(())
     }
 
     /// v2.2 band (security re-review N-1; N-6 fixed in round 2), tag 118: permissionless dust
@@ -24088,7 +24410,15 @@ pub mod processor {
                 return Err(PercolatorError::EngineNonProgress.into());
             }
         }
-        band_forced_close_against_vault_lp(program_id, market_ai, portfolio_ai, lp_ai, asset_index)
+        band_forced_close_against_vault_lp(
+            program_id,
+            market_ai,
+            portfolio_ai,
+            lp_ai,
+            asset_index,
+            fill_events_v22::TAG_SWEEP_BAND_DUST,
+            fill_events_v22::REASON_DUST_SWEEP,
+        )
     }
 
     /// v2.2 band (round-2 re-review N-1b; N-8), tag 119: evict a small leg (<= 4x the market
@@ -24193,7 +24523,15 @@ pub mod processor {
             }
             (side, need)
         };
-        band_forced_close_against_vault_lp(program_id, market_ai, victim_ai, lp_ai, asset_index)?;
+        band_forced_close_against_vault_lp(
+            program_id,
+            market_ai,
+            victim_ai,
+            lp_ai,
+            asset_index,
+            fill_events_v22::TAG_EVICT_AND_TRADE,
+            fill_events_v22::REASON_EVICTION,
+        )?;
         process_instruction_dispatch(program_id, &accounts[1..], &trade.encode())?;
         // The taker really took the slot, at the size that justified the eviction.
         let (_, _, max_market_slots, _) =
@@ -27292,6 +27630,9 @@ pub mod processor {
         }
         ensure_portfolio_storage_for_market_slots(portfolio_ai, max_market_slots)?;
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
+        // v2.2 fill events: (asset, asset generation, signed change of the effective position,
+        // price) of a liquidation this crank performed. Emitted at the very end.
+        let mut liq_event: Option<(u16, u64, i128, u64)> = None;
         let cfg_after;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -27695,6 +28036,14 @@ pub mod processor {
                 )?;
             }
 
+            // v2.2 fill events: only a liquidatable account can be liquidated by this call, so only
+            // then pay for the pre-call snapshot of its effective leg sizes (the engine drops the
+            // liquidation's `closed_q` on this path).
+            let liq_legs_before = if summary.liquidatable && !summary.b_stale {
+                Some(snapshot_effective_legs_view(&group, &portfolio))
+            } else {
+                None
+            };
             // Maintenance collection is senior to a liquidation reward. Snapshot insurance only
             // after that collection so the reward calculation below sees liquidation proceeds,
             // never the old maintenance obligation.
@@ -27770,6 +28119,11 @@ pub mod processor {
                 result.as_ref().map(|r| &r.selected),
                 Some(AutoCrankPlanV16::Liquidate { .. })
             );
+            if let (Some(before), Some(AutoCrankPlanV16::Liquidate { asset_index: liq_asset })) =
+                (liq_legs_before.as_ref(), result.as_ref().map(|r| r.selected))
+            {
+                liq_event = liquidation_event_view(&group, &portfolio, before, liq_asset);
+            }
             // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance",
             // PRESERVED): a mark mover can use a fresh cranker key and one paid mark move can
             // render many portfolios liquidatable. A liquidation penalty whose price trace
@@ -27885,7 +28239,96 @@ pub mod processor {
         // progress). Refresh the skew-funding snapshot whenever the cranked portfolio IS a bound
         // vault LP, so skew funding never runs on inventory the LP no longer holds.
         vault_lp_refresh_snapshot(market_ai, portfolio_ai, max_market_slots)?;
+        if let Some((asset, asset_gen, delta_q, price)) = liq_event {
+            fill_events_v22::emit_reduce(
+                fill_events_v22::TAG_CRANK,
+                &market_ai.key.to_bytes(),
+                &portfolio_ai.key.to_bytes(),
+                &[0u8; 32],
+                asset,
+                asset_gen,
+                fill_events_v22::REASON_LIQUIDATION,
+                delta_q,
+                price,
+            );
+        }
         Ok(())
+    }
+
+    /// v2.2 fill events: the ADL-effective signed size of one leg slot, read straight from the
+    /// leg's account bytes (no `try_to_runtime` decode: that costs ~4k CU a leg, +60k on the
+    /// 14-leg liquidation crank). Same arithmetic as
+    /// `raw_and_effective_signed_position_for_asset_view` (`.1`). None for an inactive or
+    /// unreadable slot.
+    fn leg_slot_effective_signed_q(
+        group: &state::MarketViewMutV16<'_>,
+        leg: &percolator::PortfolioLegV16Account,
+    ) -> Option<(u16, i128)> {
+        if leg.active != 1 {
+            return None;
+        }
+        let idx = leg.asset_index.get() as usize;
+        let asset = &group.markets.get(idx)?.engine.asset;
+        if leg.market_id.get() != asset.market_id.get() {
+            return None;
+        }
+        let raw_abs = leg.basis_pos_q.get().unsigned_abs();
+        let (long, current_a, epoch, mode_byte) = match leg.side {
+            0 => (true, asset.a_long.get(), asset.epoch_long.get(), asset.mode_long),
+            1 => (false, asset.a_short.get(), asset.epoch_short.get(), asset.mode_short),
+            _ => return None,
+        };
+        let epoch_snap = leg.epoch_snap.get();
+        let eff_abs: u128 = if epoch_snap == epoch {
+            risk_limits_v17::adl_effective_abs_q(raw_abs, leg.a_basis.get(), current_a)?
+        } else if mode_byte == 2 && epoch_snap.checked_add(1) == Some(epoch) {
+            0
+        } else {
+            return None;
+        };
+        let eff = i128::try_from(eff_abs).ok()?;
+        Some((idx as u16, if long { eff } else { -eff }))
+    }
+
+    /// v2.2 fill events: the ADL-effective signed size of every active leg, in one pass over the
+    /// leg bytes. Used before a crank that may liquidate (liquidatable accounts only) and after
+    /// it. Best effort: an unreadable leg is left out (its liquidation then emits no event); an
+    /// event must never make a liquidation fail.
+    #[inline(never)]
+    fn snapshot_effective_legs_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Vec<(u16, i128)> {
+        let mut out: Vec<(u16, i128)> = Vec::with_capacity(percolator::V16_MAX_PORTFOLIO_ASSETS_N);
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            if let Some(entry) = leg_slot_effective_signed_q(group, &portfolio.header.legs[slot]) {
+                out.push(entry);
+            }
+            slot += 1;
+        }
+        out
+    }
+
+    /// v2.2 fill events: the liquidation's signed change of the effective position on `asset`
+    /// (None when it did not change the position, or could not be derived: best effort), with
+    /// the asset generation and the price.
+    #[inline(never)]
+    fn liquidation_event_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+        before: &[(u16, i128)],
+        asset: usize,
+    ) -> Option<(u16, u64, i128, u64)> {
+        let &(_, q_before) = before.iter().find(|(a, _)| *a as usize == asset)?;
+        let after = snapshot_effective_legs_view(group, portfolio);
+        let q_after = after.iter().find(|(a, _)| *a as usize == asset).map_or(0, |(_, q)| *q);
+        let delta = q_after.checked_sub(q_before)?;
+        if delta == 0 {
+            return None;
+        }
+        let a = &group.markets.get(asset)?.engine.asset;
+        Some((asset as u16, a.market_id.get(), delta, a.effective_price.get()))
     }
 
     /// P3: re-read `lp_net_q` for every bound asset whose vault LP is `portfolio_ai`. One
@@ -30560,6 +31003,18 @@ pub mod processor {
             .lamports()
             .checked_add(reclaim)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // v2.2 move event (tag 77): the principal / earnings split of the paid amount (the total
+        // is the vault->redeemer token transfer; the split is decided on chain and appears in no
+        // balance) and the shares burned. Emitted last, after the payout and burn succeeded.
+        fill_events_v22::emit_move(
+            fill_events_v22::TAG_EXECUTE_REDEMPTION,
+            &market_ai.key.to_bytes(),
+            fill_events_v22::MOVE_EARN_EXIT,
+            fill_events_v22::NO_ASSET,
+            fill_events_v22::sat_u64(principal_portion),
+            fill_events_v22::sat_u64(earnings_portion),
+            shares_u64,
+        );
         Ok(())
     }
 
@@ -36203,8 +36658,22 @@ pub mod processor {
             }
             moved
         };
-        let _ = moved;
-        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)
+        state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        // v2.2 move event (tag 111): the draw (insurance -> vault LP capital) or restore
+        // (vault LP capital -> insurance) amount decided on chain, and the backstop receivable
+        // left outstanding. A PROPOSE (mode 2) moves nothing and emits nothing.
+        if moved != 0 {
+            fill_events_v22::emit_move(
+                fill_events_v22::TAG_INSURANCE_BACKSTOP,
+                &market_ai.key.to_bytes(),
+                fill_events_v22::MOVE_G9,
+                0,
+                fill_events_v22::sat_u64(moved),
+                st.backstop_outstanding_atoms,
+                u64::from(mode),
+            );
+        }
+        Ok(())
     }
 
     // ════════════════════════════════════════════════════════════════════════════════════
@@ -42047,12 +42516,12 @@ pub mod processor {
                 .map(|_| ())
                 .map_err(map_v16_error)
         };
-        if portfolio_ai.key == vault_lp_ai.key {
+        let routed_rent: u128 = if portfolio_ai.key == vault_lp_ai.key {
             let mut lp_data = vault_lp_ai.try_borrow_mut_data()?;
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, vault_lp_ai.key)?;
             refresh(&mut group, &mut lp)?;
-            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?;
+            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?
         } else {
             {
                 let mut pf_data = portfolio_ai.try_borrow_mut_data()?;
@@ -42064,10 +42533,24 @@ pub mod processor {
             let mut lp_data = vault_lp_ai.try_borrow_mut_data()?;
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, vault_lp_ai.key)?;
-            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?;
-        }
+            vault_lp_rent_route_and_snapshot_view(&mut group, &mut lp, vault_lp_ai.key, asset_index)?
+        };
         group.validate_shape().map_err(map_v16_error)?;
         state::write_wrapper_config(&mut market_data, &cfg)?;
+        // v2.2 move event (tag 106): the unrouted rent this call credited to the bound vault LP
+        // (an internal re-labelling decided on chain; no token moves). Nothing is emitted when
+        // nothing was routed.
+        if routed_rent != 0 {
+            fill_events_v22::emit_move(
+                fill_events_v22::TAG_SETTLE_HOLDING_RENT,
+                &market_ai.key.to_bytes(),
+                fill_events_v22::MOVE_RENT_ROUTED,
+                asset_index as u16,
+                fill_events_v22::sat_u64(routed_rent),
+                0,
+                0,
+            );
+        }
         Ok(())
     }
 

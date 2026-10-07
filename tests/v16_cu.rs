@@ -32,6 +32,18 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
+#[path = "support/fill_events.rs"]
+mod fill_events;
+
+thread_local! {
+    /// v2.2 fill events: logs of the last transaction (success or failure) sent by this test thread.
+    static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn last_logs() -> Vec<String> {
+    LAST_LOGS.with(|l| l.borrow().clone())
+}
+
 // sync/w2-tb3 (ADOPT upstream 20f0b9b1, intent_id slice only): test-only
 // monotonic nonce generator. Every call returns a value strictly greater
 // than the last, guaranteeing intent_id uniqueness across every top-up in
@@ -3575,7 +3587,7 @@ impl V16CuEnv {
             ],
             &[],
         )
-        .expect("crank")
+        .unwrap_or_else(|e| panic!("crank: {e:?}\nlogs: {:#?}", last_logs()))
     }
 
     fn crank_with_oracle_tail(
@@ -3687,9 +3699,16 @@ fn send_tx(
         &signer_refs,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
-        .map_err(|e| format!("{e:?}"))
+    match svm.send_transaction(tx) {
+        Ok(meta) => {
+            LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
+            Ok(meta.compute_units_consumed)
+        }
+        Err(e) => {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            Err(format!("{:?}", e.err))
+        }
+    }
 }
 
 fn send_raw_tx(
@@ -11382,6 +11401,8 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
     env.push_ewma_mark_with_cu(1, 999_999);
     let mut closed = false;
     let mut liquidation_cu = 0;
+    // v2.2 fill events: every REDUCE the cranks emit (liquidation reductions of the short leg).
+    let mut liq_events: Vec<fill_events::Event> = Vec::new();
     for slot in 1..=20u64 {
         env.svm.warp_to_slot(slot);
         env.svm.expire_blockhash();
@@ -11401,6 +11422,7 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
             liquidation_cu,
             CRANK_CU_LIMIT
         );
+        liq_events.extend(fill_events::wrapper_events(&last_logs(), &env.program_id));
         let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data)
             .unwrap();
         if percolator::active_bitmap_is_empty(short.active_bitmap) {
@@ -11409,6 +11431,21 @@ fn v16_bpf_permissionless_liquidation_is_bounded() {
         }
     }
     println!("v16 liquidation crank CU (final call): {liquidation_cu}");
+    // v2.2 fill events: the liquidation's reductions add up to the 1-unit short, as REDUCE events
+    // (reason 3, tag 5, unilateral) with the sign of a covered short (positive).
+    {
+        let mut total = 0i128;
+        for ev in &liq_events {
+            let fill_events::Event::Reduce { ix_tag, market, portfolio, counterparty, reason, signed_reduced_q, asset_index, .. } = ev else {
+                panic!("a crank emits only REDUCE events here: {ev:?}")
+            };
+            assert_eq!((*ix_tag, *market, *portfolio, *reason, *asset_index), (5, env.market, short_account, 3, 0));
+            assert_eq!(*counterparty, Pubkey::default());
+            assert!(*signed_reduced_q > 0, "a short is covered by a positive size: {ev:?}");
+            total += *signed_reduced_q;
+        }
+        assert_eq!(total, POS_SCALE as i128, "events add up to the closed 1-unit short: {liq_events:?}");
+    }
     assert!(
         closed,
         "a genuinely bankrupt account must reach full closure through the public, \
@@ -12612,6 +12649,11 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
     // liquidation dispatch.
     let mut liquidation_cu = 0;
     let mut liquidated = false;
+    let long_leg0_before = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data)
+        .unwrap()
+        .legs[0]
+        .basis_pos_q;
+    let mut liq_events: Vec<fill_events::Event> = Vec::new();
     for _ in 0..40 {
         env.svm.expire_blockhash();
         liquidation_cu = env.crank(
@@ -12627,6 +12669,7 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
         let long_data = env.svm.get_account(&long_account).unwrap().data;
         let long = state::read_portfolio(&long_data).unwrap();
         if percolator::active_bitmap_count_ones(long.active_bitmap) < 14 {
+            liq_events = fill_events::wrapper_events(&last_logs(), &env.program_id);
             liquidated = true;
             break;
         }
@@ -12636,6 +12679,15 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
         "liquidation never fired within the bounded catch-up loop"
     );
     println!("v16 full-14-leg liquidation crank CU: {liquidation_cu}");
+    // v2.2 fill events: the call that liquidated asset 0 of the 14-leg long emitted exactly one
+    // REDUCE: reason 3, the whole leg, a long reduced by a negative size.
+    assert_eq!(liq_events.len(), 1, "{liq_events:?}");
+    let fill_events::Event::Reduce { ix_tag, portfolio, reason, signed_reduced_q, asset_index, .. } = &liq_events[0]
+    else {
+        panic!("expected REDUCE: {liq_events:?}")
+    };
+    assert_eq!((*ix_tag, *portfolio, *reason, *asset_index), (5, long_account, 3, 0));
+    assert_eq!(*signed_reduced_q, -(long_leg0_before.unsigned_abs() as i128), "the whole leg 0 closed");
     const FULL_14_LEG_LIQUIDATION_CU_LIMIT: u64 = 1_375_000;
     assert!(
         liquidation_cu <= FULL_14_LEG_LIQUIDATION_CU_LIMIT,
@@ -18451,6 +18503,39 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: b
     let ctx_data = env.svm.get_account(&ctx).unwrap().data;
     // 64-byte return slot + MatcherCtx.inventory_base at +96.
     let counter = i128::from_le_bytes(ctx_data[64 + 96..64 + 112].try_into().unwrap());
+    eprintln!("(fill-events) batch of {allowed_legs} legs, matcher {matcher_program}: {allowed_cu} CU");
+    // v2.2 fill events: the batch emits ONE packed FILL line (<= 11 legs per line) whose records
+    // equal the executed legs, leg for leg, and agree with the taker's resulting positions.
+    let logs = last_logs();
+    // The runtime truncates a transaction's log at 10,000 bytes (validator default): record how
+    // much of that budget the heaviest batch uses, event line included.
+    let log_bytes: usize = logs.iter().map(|l| l.len() + 1).sum();
+    let event_bytes: usize = logs.iter().filter(|l| l.starts_with("Program data: ")).map(|l| l.len() + 1).sum();
+    eprintln!("(fill-events) {allowed_legs}-leg batch log: {log_bytes} B total, {event_bytes} B of it the event line");
+    assert!(log_bytes < 10_000, "the whole log must stay under the 10,000 B truncation limit");
+    let evs = fill_events::wrapper_events(&logs, &env.program_id);
+    assert_eq!(evs.len(), 1, "11 legs fit one packed FILL line: {evs:?}");
+    let fill_events::Event::Fill { ix_tag, market, taker: ev_taker, lp: ev_lp, recs } = &evs[0] else {
+        panic!("expected a FILL, got {evs:?}")
+    };
+    assert_eq!((*ix_tag, *market, *ev_taker, *ev_lp), (67, env.market, taker_account, lp_account));
+    assert_eq!(recs.len(), allowed_legs);
+    let taker_state = env.portfolio_state(taker_account);
+    for (i, rec) in recs.iter().enumerate() {
+        assert_eq!(rec.asset_index as usize, i, "records are in leg order");
+        assert_eq!(rec.asset_gen, i as u64 + 1);
+        assert_eq!(rec.flags, fill_events::FLAG_MATCHER);
+        assert_eq!((rec.requested_q, rec.executed_q), (POS_SCALE as i128, POS_SCALE as i128));
+        assert_eq!(rec.price_e6, PRICE, "booked at the asset's effective price");
+        // The CPI route charges the market's base fee (0 bps here), never the taker's 100 bps cap.
+        assert_eq!((rec.fee_atoms, rec.backing_fee_atoms), (0, 0), "leg {i} fee: {rec:?}");
+        let leg = taker_state
+            .legs
+            .iter()
+            .find(|l| l.active && l.asset_index as usize == i)
+            .unwrap_or_else(|| panic!("taker has no leg on asset {i}"));
+        assert_eq!(leg.basis_pos_q.unsigned_abs() as i128, rec.executed_q, "state agrees, leg {i}");
+    }
     (allowed_cu, counter)
 }
 

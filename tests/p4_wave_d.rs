@@ -19,6 +19,8 @@
 //!       market with a bound vault is refused.
 //! P3 helpers copied from indep_p1p3_combined.rs (07a1d0eb+ auto-pin flow).
 mod indep_harness;
+#[path = "support/fill_events.rs"]
+mod fill_events;
 
 use indep_harness::*;
 use percolator::POS_SCALE;
@@ -1560,6 +1562,10 @@ fn init_units(w: &mut P3) -> Result<u64, String> {
     w.send(ProgInstruction::InitInsuranceUnits, metas, &[])
 }
 
+fn last_logs_of_draw() -> Vec<String> {
+    last_logs()
+}
+
 fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Result<u64, String> {
     let payer = w.env.payer.pubkey();
     let mut metas = vec![
@@ -1768,6 +1774,20 @@ fn g9_draws_after_exhaustion_bounded_pro_rata() {
     assert!(b > 0, "vacuity: a backstop moved");
     let ins1 = w.env.market_state().1.insurance;
     assert_eq!(ins0 - ins1, b, "insurance fell by exactly the moved amount");
+    // v2.2 fill events: the DRAW (mode 0) emitted ONE MOVE (G9): the amount moved from insurance
+    // into the vault LP's capital and the receivable left outstanding (the first draw: equal).
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs_of_draw(), &w.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: w.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: b as u64,
+            b: b as u64,
+            c: 0,
+        }]
+    );
     assert!(b <= (u0.snap_insurance_mint_atoms * 5_000) / 10_000, "50% cap");
     assert!(b <= (u0.snap_insurance_mint_atoms * 2_000) / 10_000, "W-2 per-epoch 20% cap");
     assert_eq!(halt_mirror(&w), outstanding(&w) + b, "W-9: the fill halt mirror carries the backstop");
@@ -1843,6 +1863,20 @@ fn g9_restore_repays_backstop_first() {
     let b1 = backstop_st(&w) as u128;
     let repaid = b0 - b1;
     assert!(repaid > 0, "vacuity: something was repaid");
+    // v2.2 fill events: the RESTORE (mode 1) emitted ONE MOVE (G9): the capital repaid into
+    // insurance and the receivable still outstanding.
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &w.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: w.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: repaid as u64,
+            b: b1 as u64,
+            c: 1,
+        }]
+    );
     assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "insurance restored by exactly the repayment");
     let u1 = units(&w).unwrap();
     assert_eq!(u1.backstop_receivable_atoms, b1);
