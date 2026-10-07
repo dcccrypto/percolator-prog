@@ -26,7 +26,7 @@
 //!      change `PERCOLATOR_MAINNET` in `processor.rs` (and percolator-nft `cpi_v16.rs`) to the
 //!      mainnet WRAPPER id above (today `ESa89R5…` is the old v12-era wrapper, not v2.2).
 //!   4. `cargo build-sbf --features mainnet-ids` (no `devnet`; THE ONLY ACCEPTABLE RELEASE BUILD),
-//!      verify the assertion passes, then run `scripts/check-mainnet-sbf.sh <so>` (fails unless the
+//!      verify the assertion passes, then run `scripts/check-mainnet-pin.sh <so>` (fails unless the
 //!      binary carries the `PCLR-PIN:MAINNET-OK` marker: a no-feature build carries
 //!      `PCLR-PIN:NONE`, a test-placeholder build `PCLR-PIN:TEST-PLACEHOLDERS`, both rejected) and
 //!      `scripts/mainnet-flavour-tests.sh <so>`.
