@@ -17,6 +17,9 @@
 //! Negative controls are in-test (the same fork, one input changed): not yet armed, armed but
 //! not expired, after the reset (no ADL), loosening the bound, a non-upgrade-authority signer,
 //! and tag 93 rewriting the P1 limits (must not touch the episode).
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, ADL_ONE};
 use percolator_prog::{
@@ -103,10 +106,17 @@ fn fork() -> Fork {
     let mut portfolios = Vec::new();
     for a in v["accounts"].as_array().unwrap() {
         let k: Pubkey = a["pubkey"].as_str().unwrap().parse().unwrap();
+        let raw = b64(a["data_b64"].as_str().unwrap());
+        let owner: Pubkey = a["owner"].as_str().unwrap().parse().unwrap();
+        let raw_len = raw.len();
+        // v2.2: the captured deployed bytes are re-encoded for this layout: the funding-scale
+        // drift tail (zero) and the band/rent words (zero) are inserted, nothing else moves.
+        let data = v21_upgrade::upgrade_v21_account(&WRAPPER_ID, &owner, raw);
+        let lamports = a["lamports"].as_u64().unwrap() + 7_000 * (data.len() - raw_len) as u64;
         let acc = Account {
-            lamports: a["lamports"].as_u64().unwrap(),
-            data: b64(a["data_b64"].as_str().unwrap()),
-            owner: a["owner"].as_str().unwrap().parse().unwrap(),
+            lamports,
+            data,
+            owner,
             executable: a["executable"].as_bool().unwrap(),
             rent_epoch: 0,
         };
@@ -782,3 +792,4 @@ fn p2b_tag93_preserves_both_owned_ranges_of_the_risk_limits_tail() {
     assert_eq!(after.lp_floor_atoms, 7, "tag 93 applied the P1 limits");
     assert_eq!(&d[off + 42..off + 64], &tail_before[..], "tag 93 preserved bytes 42..64 exactly");
 }
+

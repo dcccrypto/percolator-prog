@@ -69,7 +69,11 @@ const MAX_PAYLOAD: usize = 512;
 fn variant_name(ix: &Instruction) -> &'static str {
     match ix {
         // growth-v19: the optional-trailer forms are the SAME tags (0 / 94), same names.
-        Instruction::InitMarket { .. } | Instruction::InitMarketV19 { .. } => "InitMarket",
+        // v2.2: tag 0 growth / lot / rent / band trailer forms are all the same tag.
+        Instruction::InitMarket { .. }
+        | Instruction::InitMarketV19 { .. }
+        | Instruction::InitMarketLotV22 { .. }
+        | Instruction::InitMarketV22 { .. } => "InitMarket",
         Instruction::InitPortfolio { .. } => "InitPortfolio",
         Instruction::Deposit { .. } => "DepositCollateral",
         Instruction::Withdraw { .. } => "WithdrawCollateral",
@@ -124,8 +128,10 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::CreateLpVault { .. } => "CreateLpVault",
         Instruction::DepositToLpVault { .. } => "DepositToLpVault",
         Instruction::RebalanceLpVaultBacking { .. } => "RebalanceLpVaultBacking",
-        Instruction::RequestRedeemLpShares { .. } => "RequestRedeemLpShares",
-        Instruction::ExecuteRedemption { .. } => "ExecuteRedemption",
+        Instruction::RequestRedeemLpShares { .. }
+        | Instruction::RequestRedeemLpSharesV22 { .. } => "RequestRedeemLpShares",
+        Instruction::ExecuteRedemption { .. }
+        | Instruction::ExecuteRedemptionV22 { .. } => "ExecuteRedemption",
         Instruction::LpVaultCrankFees { .. } => "LpVaultCrankFees",
         Instruction::SetLpVaultPaused { .. } => "SetLpVaultPaused",
         Instruction::CloseLpVault { .. } => "CloseLpVault",
@@ -158,6 +164,19 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SetAdlWindDownMaxSlots { .. } => "SetAdlWindDownMaxSlots",
         // Phase 2b (2026-10-05), tag 103.
         Instruction::VaultLpAllocate { .. } => "VaultLpAllocate",
+        // Phase 4 item 3 (v22 Wave C), tags 107-110: capacity bonds.
+        Instruction::InitBondTranche { .. } => "InitBondTranche",
+        Instruction::BondDeposit { .. } => "BondDeposit",
+        Instruction::BondRequestWithdraw { .. } => "BondRequestWithdraw",
+        Instruction::BondExecuteWithdraw { .. } => "BondExecuteWithdraw",
+        Instruction::InsuranceBackstopDraw { .. } => "InsuranceBackstopDraw",
+        Instruction::RescueDeposit { .. } => "RescueDeposit",
+        Instruction::InitInsuranceUnits => "InitInsuranceUnits",
+        Instruction::SetG9FeedAllowlist { .. } => "SetG9FeedAllowlist",
+        // v2.2 Phase 4 item 2, tag 106.
+        Instruction::SettleHoldingRent { .. } => "SettleHoldingRent",
+        Instruction::SweepBandDustLeg { .. } => "SweepBandDustLeg",
+        Instruction::EvictAndTradeCpi { .. } => "EvictAndTradeCpi",
     }
 }
 

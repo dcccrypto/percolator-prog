@@ -448,6 +448,31 @@ impl V16CuEnv {
     }
 
     fn new_with_init_params(params: V16CuMarketParams) -> Self {
+        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`; sub-floor
+        // chunk fixtures init at the floor, then a test-only STATE POKE sets the requested chunk.
+        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+        if params.public_b_chunk_atoms < floor {
+            let env = Self::new_with_init_params(V16CuMarketParams {
+                public_b_chunk_atoms: floor,
+                ..params
+            });
+            let original = env.svm.get_account(&env.market).expect("market");
+            let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+            let mut noop = original.data.clone();
+            state::write_market(&mut noop, &cfg, &g).unwrap();
+            g.config.public_b_chunk_atoms = params.public_b_chunk_atoms;
+            let mut mutated = original.data.clone();
+            state::write_market(&mut mutated, &cfg, &g).unwrap();
+            let mut acct = original;
+            for i in 0..acct.data.len() {
+                if mutated[i] != noop[i] {
+                    acct.data[i] = mutated[i];
+                }
+            }
+            let mut env = env;
+            env.svm.set_account(env.market, acct).unwrap();
+            return env;
+        }
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -7581,8 +7606,12 @@ ProgInstruction::PermissionlessCrank {
     let (_, funded_group) = env.market_state();
     assert_eq!(funded_group.funding_epoch, 1);
     assert_eq!(funded_group.assets[0].effective_price, 1_210_000);
-    assert_eq!(funded_group.assets[0].f_long_num, -(ADL_ONE as i128));
-    assert_eq!(funded_group.assets[0].f_short_num, ADL_ONE as i128);
+    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_210_000 = 1.21 price units for the
+    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.21 * ADL_ONE.
+    let exact = 1_000i128 * 1_210_000 * (ADL_ONE / 1_000_000_000) as i128;
+    assert_eq!(exact, 1_210_000_000_000_000);
+    assert_eq!(funded_group.assets[0].f_long_num, -exact);
+    assert_eq!(funded_group.assets[0].f_short_num, exact);
 }
 
 #[test]
@@ -18884,78 +18913,23 @@ fn funding_warning_line(logs: &[String]) -> Option<&String> {
 }
 
 #[test]
-fn v17_init_market_warns_when_funding_can_never_accrue() {
-    // A realistic risk config — a funding-enabled market must clear the engine's
-    // exact solvency envelope, which the 1x-margin default params do not. Only
-    // `initial_price` and the funding rate vary below.
+fn v21_init_market_no_longer_warns_funding_cannot_accrue() {
+    // fix/v21-funding-precision: the engine accrues funding exactly (no pre-floor of
+    // rate * dt * price / 1e9 to whole price units), so the former creation-time
+    // "WARN funding-cannot-accrue" is gone: these are the configs that used to warn.
     let funding_market = |price: u64, max_abs: u64| V16CuMarketParams {
         initial_price: price,
         max_abs_funding_e9_per_slot: max_abs,
         ..production_risk_params()
     };
-    // production_risk_params fixes max_accrual_dt_slots = 20, so the threshold is
-    //     price >= ceil(1e9 / (rate * 20)).
-    const DT: u128 = 20;
-    let threshold = |rate: u128| -> u64 { (1_000_000_000u128).div_ceil(rate * DT) as u64 };
-    assert_eq!(threshold(1_000), 50_000);
-    assert_eq!(threshold(500), 100_000);
-
-    // Bracket the threshold at rate 1_000: one atom below books zero funding,
-    // the threshold itself books one.
-    assert_eq!(1_000u128 * DT * 49_999 / 1_000_000_000, 0);
-    assert_eq!(1_000u128 * DT * 50_000 / 1_000_000_000, 1);
-
-    let below = try_init_market_with(funding_market(49_999, 1_000))
-        .expect("the market is still creatable — this warns, it does not reject");
-    let warning = funding_warning_line(&below).unwrap_or_else(|| {
-        panic!("a market whose funding cannot accrue must SAY SO at creation; logs: {below:#?}")
-    });
-    assert!(
-        warning.contains("price 49999") && warning.contains("threshold 50000"),
-        "the warning must name the actual price and the price the creator needs; got {warning}"
-    );
-
-    // One atom over: silent. The warning is a real discriminator, not noise on
-    // every funding market.
-    let at_threshold =
-        try_init_market_with(funding_market(50_000, 1_000)).expect("price 50_000 is creatable");
-    assert!(
-        funding_warning_line(&at_threshold).is_none(),
-        "price 50_000 books one funding atom per window and must NOT warn; logs: {at_threshold:#?}"
-    );
-
-    // The threshold tracks the RATE too, not just the price: halving the rate
-    // doubles it, and a price that was fine at rate 1_000 now warns.
-    assert_eq!(500u128 * DT * 99_999 / 1_000_000_000, 0);
-    assert_eq!(500u128 * DT * 100_000 / 1_000_000_000, 1);
-    let below_slow = try_init_market_with(funding_market(99_999, 500)).expect("still creatable");
-    let slow_warning = funding_warning_line(&below_slow)
-        .unwrap_or_else(|| panic!("halving the rate doubles the threshold; logs: {below_slow:#?}"));
-    assert!(
-        slow_warning.contains("threshold 100000"),
-        "the warning must track the rate; got {slow_warning}"
-    );
-    assert!(
-        funding_warning_line(
-            &try_init_market_with(funding_market(100_000, 500)).expect("creatable")
-        )
-        .is_none(),
-        "price 100_000 clears the rate-500 threshold and must not warn"
-    );
-
-    // A market that deliberately switches funding OFF is silent — it is not
-    // broken, it is explicitly disabled. This is the state every existing
-    // fixture in this repo is in.
-    let funding_off = try_init_market_with(V16CuMarketParams {
-        initial_price: 100,
-        max_abs_funding_e9_per_slot: 0,
-        ..V16CuMarketParams::default()
-    })
-    .expect("funding disabled must stay creatable at any price");
-    assert!(
-        funding_warning_line(&funding_off).is_none(),
-        "a market with funding switched off must not be warned about; logs: {funding_off:#?}"
-    );
+    for (price, rate) in [(49_999u64, 1_000u64), (99_999, 500), (50_000, 1_000), (3_086, 111)] {
+        let logs = try_init_market_with(funding_market(price, rate))
+            .unwrap_or_else(|e| panic!("price {price} rate {rate} must be creatable: {e}"));
+        assert!(
+            funding_warning_line(&logs).is_none(),
+            "no funding-floor warning any more (price {price} rate {rate}); logs: {logs:#?}"
+        );
+    }
 }
 
 // ── BUG 3 ────────────────────────────────────────────────────────────────────

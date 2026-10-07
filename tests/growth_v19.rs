@@ -19,6 +19,9 @@
 //! Every test pairs with a NEGATIVE CONTROL: the identical sequence on the legacy market
 //! (growth OFF) is accepted where the growth market refuses. File-copy negative controls on
 //! the program (gate removed) are recorded in the PR.
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{
@@ -41,7 +44,11 @@ use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
 const MATCHER_CONTEXT_LEN: usize = 320;
-const PRICE: u64 = 1_000_000;
+/// v2.2 Wave A item 7: a growth market must open at >= 10^7 e6 per LOT (precision floor), so
+/// this fixture is priced per lot of 10 tokens: $10 per lot, and `units(n)` (n USD of
+/// notional, n tokens at $1) is n/10 lots. Every notional, margin and fee below is unchanged
+/// (`units(n) * PRICE / POS_SCALE == n * 1e6` exactly).
+const PRICE: u64 = 10_000_000;
 const Q: i128 = POS_SCALE as i128;
 const USD: u128 = 1_000_000;
 
@@ -311,6 +318,12 @@ struct Env {
 
 impl Env {
     fn try_new_with(so: &PathBuf, cfg: MarketCfg) -> Result<Self, String> {
+        Self::try_new_with_layout(so, cfg, false)
+    }
+
+    /// `v21_layout`: size the market/portfolio accounts for the v2.1 (pre-band/rent) layout,
+    /// for running the deployed v2.1-layout program in the growth-off byte-parity test.
+    fn try_new_with_layout(so: &PathBuf, cfg: MarketCfg, v21_layout: bool) -> Result<Self, String> {
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         svm.add_program(program_id, &std::fs::read(so).expect("read wrapper BPF"));
@@ -349,7 +362,17 @@ impl Env {
         svm.set_account(
             market,
             acct(
-                vec![0u8; state::market_account_len_for_capacity(cfg.slots).unwrap()],
+                vec![
+                    0u8;
+                    {
+                        let len = state::market_account_len_for_capacity(cfg.slots).unwrap();
+                        if v21_layout {
+                            v21_upgrade::deployed_market_len(len, cfg.slots)
+                        } else {
+                            len
+                        }
+                    }
+                ],
                 program_id,
             ),
         )
@@ -362,8 +385,14 @@ impl Env {
             mint,
             vault,
             matcher_program,
-            portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
-                .unwrap(),
+            portfolio_account_len: {
+                let len = state::portfolio_account_len_for_market_slots(cfg.slots).unwrap();
+                if v21_layout {
+                    v21_upgrade::v21_portfolio_len(len)
+                } else {
+                    len
+                }
+            },
             next_key: 0x40,
             bind_growth_lp: cfg.growth.is_some() && cfg.slots == 1,
             upgrade_authority: seeded_keypair(3),
@@ -526,8 +555,71 @@ impl Env {
         (k, p)
     }
 
+    /// Account bytes as THIS build reads them: a v2.1-layout account (the deployed base program
+    /// in the growth-off parity run) is re-encoded first, so the test's readers stay current.
+    fn read(&self, key: &Pubkey) -> Vec<u8> {
+        let account = self.svm.get_account(key).unwrap();
+        v21_upgrade::upgrade_v21_account(&self.program_id, &account.owner, account.data)
+    }
+
+    /// AuthMark on asset 0 (admin-configured), so a price target can be pushed.
+    fn auth_mark(&mut self) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::ConfigureAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                initial_mark_e6: PRICE,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    fn push_mark(&mut self, mark_e6: u64) -> Result<u64, String> {
+        let admin = seeded_keypair(2);
+        let seq = state::read_asset_control_sequences(&self.read(&self.market), 0)
+            .unwrap()
+            .oracle_observation
+            + 1;
+        let (m, slot) = (self.market, self.svm.get_sysvar::<Clock>().slot);
+        self.send(
+            ProgInstruction::PushAuthMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: slot,
+                mark_e6,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+    }
+
+    /// Tag 28 by the portfolio's owner.
+    fn convert_released_pnl(&mut self, owner: &Keypair, portfolio: Pubkey) -> Result<u64, String> {
+        let (portfolio_id, _, position_epoch) = self.identity(portfolio);
+        let m = self.market;
+        self.send(
+            ProgInstruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount: u64::MAX as u128 },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+    }
+
     fn identity(&self, portfolio: Pubkey) -> (u64, u64, u64) {
-        let data = self.svm.get_account(&portfolio).unwrap().data;
+        let data = self.read(&portfolio);
         (
             state::read_portfolio_id(&data).unwrap(),
             state::read_portfolio_matcher_sequence(&data).unwrap(),
@@ -536,7 +628,7 @@ impl Env {
     }
 
     fn market_id(&self) -> u64 {
-        state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, 0)
+        state::read_market_trade_preflight(&self.read(&self.market), 0)
             .unwrap()
             .3
     }
@@ -581,7 +673,7 @@ impl Env {
             .unwrap();
         let (portfolio_id, expected_sequence, _) = self.identity(account);
         let asset_generation_frontier = state::read_market_asset_generation_frontier(
-            &self.svm.get_account(&self.market).unwrap().data,
+            &self.read(&self.market),
         )
         .unwrap();
         let m = self.market;
@@ -915,7 +1007,7 @@ fn seeded_keypair(tag: u8) -> Keypair {
 }
 
 fn units(n: i128) -> i128 {
-    n * Q
+    n * Q / 10
 }
 
 /// The vault LP's N_cap (Q) at its CURRENT conservative equity (lambda 1x, $1). N-2: the
@@ -1487,63 +1579,193 @@ fn growth_clearable_hlock_does_not_close_the_crowd() {
     );
 }
 
-/// Zero means off: a legacy market runs the same transaction sequence with byte-identical
-/// account state on the base (7c906e45) wrapper and on this build.
+/// Engine slot length of the previous (v2.1 pre-#277) layout. On this layout the engine appends
+/// `kf_drift_long/short` (160 B); on the old layout the strip below is a no-op.
+const LEGACY_ENGINE_SLOT_LEN: usize = 1301;
+
+/// Account bytes with the appended K/F drift tail removed from every engine asset slot.
+fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
+    // `data` is the v2.1 projection (`project_v22_account_to_v21`) of this build's account:
+    // v2.1 layout plus the #277 160 B tail on every slot.
+    use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
+        - v21_upgrade::V22_ASSET_EXTRA
+        - LEGACY_ENGINE_SLOT_LEN;
+    if !is_market || appended == 0 {
+        return (data.to_vec(), false);
+    }
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_CONFIG_EXTRA;
+    let stride = MARKET_ASSET_SLOT_LEN - v21_upgrade::V22_ASSET_EXTRA;
+    assert_eq!((data.len() - head) % stride, 0);
+    let mut out = data[..head].to_vec();
+    let mut tail_nonzero = false;
+    for k in 0..(data.len() - head) / stride {
+        let s = head + k * stride;
+        let cut = s + stride - appended;
+        out.extend_from_slice(&data[s..cut]);
+        tail_nonzero |= data[cut..s + stride].iter().any(|b| *b != 0);
+    }
+    (out, tail_nonzero)
+}
+
+/// The legacy (growth OFF, funding OFF) transaction sequence. `with_cohort` configures an auth
+/// mark, then (positions open) pushes it 4 bp up and lets a risk-reducing TradeCpi accrue, so K
+/// changes and trader y is left STALE: the risk-increasing steps after it are refused identically by both layouts (no
+/// insurance, so no insured admission), and only the drift tail differs.
+/// Deployed-layout account bytes re-encoded for this build's decoders (zero tail + zero band words).
+fn as_v22(deployed_layout: bool, env: &Env, data: Vec<u8>) -> Vec<u8> {
+    if deployed_layout {
+        v21_upgrade::upgrade_v21_account(&env.program_id, &env.program_id, data)
+    } else {
+        data
+    }
+}
+
+fn legacy_parity_run(so: &PathBuf, deployed_layout: bool, with_cohort: bool) -> (Vec<String>, bool, u64) {
+    let cfg = MarketCfg { funding: 0, ..MarketCfg::legacy() };
+    let mut env = Env::try_new_with_layout(so, cfg, deployed_layout).expect("init");
+    let admin = seeded_keypair(2);
+    let (m, mid) = (env.market, env.market_id());
+    let seq = |env: &Env| {
+        state::read_asset_control_sequences(&as_v22(deployed_layout, &env, env.svm.get_account(&env.market).unwrap().data), 0)
+            .unwrap()
+            .oracle_observation
+            + 1
+    };
+    if with_cohort {
+        let slot = env.svm.get_sysvar::<Clock>().slot;
+        let s = seq(&env);
+        env.send(
+            ProgInstruction::ConfigureAuthMark { asset_index: 0, market_id: mid, now_slot: slot, initial_mark_e6: PRICE, observation_sequence: s },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("configure auth mark");
+    }
+    let lp = env.lp(1_000 * USD);
+    let (x, xp) = env.trader(200 * USD);
+    let (y, yp) = env.trader(50 * USD);
+    let keys = [env.market, lp.account, xp, yp, lp.ctx];
+    let names = ["market", "lp", "x", "y", "ctx"];
+    let mut out = Vec::new();
+    let mut tail_seen = false;
+    let mut max_stale = 0u64;
+    let mut snap = |env: &Env, what: &str, out: &mut Vec<String>| {
+        for (k, n) in keys.iter().zip(names) {
+            let mut raw = env.svm.get_account(k).unwrap().data.clone();
+            let (bytes, tail) = if deployed_layout {
+                // the deployed v2.1 program on deployed-layout accounts: nothing to normalise
+                (raw, false)
+            } else {
+                if n == "market" {
+                    // v2.2 Wave A, the ONE deliberate divergence from the deployed program: every
+                    // profile a v2.2 program creates carries p4_flags bit2 EXIT_REQUIRES_LOSS_CURRENT
+                    // (asset profile byte +20). Assert it is exactly that byte and bit in every asset
+                    // slot, then mask it (on the unstripped bytes).
+                    let slots = state::market_slot_capacity(&raw).unwrap();
+                    for i in 0..slots {
+                        let at = state::asset_growth_range(&raw, i).unwrap().start
+                            - percolator_prog::constants::ASSET_GROWTH_OFF
+                            + 20;
+                        assert_eq!(raw[at], percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
+                        raw[at] = 0;
+                    }
+                }
+                // Wave B words must stay zero on this band-off, rent-off market (asserted by the
+                // projection); the result is the deployed layout + the #277 tail, which is stripped
+                // (and reported) for the market.
+                strip_drift_tail(&v21_upgrade::project_v22_account_to_v21(&raw), n == "market")
+            };
+            tail_seen |= tail;
+            out.push(format!("{} {what} {n} {}", if with_cohort { "cohort" } else { "zero" }, solana_sdk::hash::hash(&bytes)));
+        }
+        let a = &state::read_market(&as_v22(deployed_layout, env, env.svm.get_account(&env.market).unwrap().data)).unwrap().1.assets[0];
+        max_stale = max_stale.max(a.stale_account_count_long + a.stale_account_count_short);
+    };
+    snap(&env, "setup", &mut out);
+    let mut steps: Vec<(&str, Result<u64, String>)> = vec![
+        ("cpi_open", env.trade_cpi(&x, xp, &lp, units(600))),
+        ("cpi_crowd_5x", env.trade_cpi(&y, yp, &lp, units(100))),
+    ];
+    if with_cohort {
+        // New slot, auth mark 4 bp above the effective price, then a risk-REDUCING TradeCpi by x
+        // performs the canonical accrual: K moves with positions open and y is left STALE (the
+        // LP and x are settled by their own trade).
+        let slot = env.svm.get_sysvar::<Clock>().slot + 1;
+        env.svm.warp_to_slot(slot);
+        let s = seq(&env);
+        let eff = state::read_market(&as_v22(deployed_layout, &env, env.svm.get_account(&env.market).unwrap().data)).unwrap().1.assets[0].effective_price;
+        steps.push((
+            "push_mark_4bp",
+            env.send(
+                ProgInstruction::PushAuthMark { asset_index: 0, market_id: mid, now_slot: slot, mark_e6: eff + eff * 4 / 10_000, observation_sequence: s },
+                vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+                &[&admin],
+            ),
+        ));
+        steps.push(("cpi_reduce_x_accrues", env.trade_cpi(&x, xp, &lp, -units(10))));
+    }
+    steps.push(("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))));
+    if !with_cohort {
+        // Risk increase. In the cohort case it is deliberately omitted: with a stale cohort an
+        // INSURED risk increase is admitted by #277 and refused by the baseline -- the intended
+        // behaviour change, covered by tests/v21_funding_scale*.rs, not a legacy-parity property.
+        steps.push(("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))));
+    }
+    steps.push(("crank", env.crank(xp)));
+    steps.push(("cpi_close", env.trade_cpi(&x, xp, &lp, -units(610))));
+    for (what, r) in steps {
+        let outcome = match r {
+            Ok(_) => "ok".to_string(),
+            Err(e) => e.split(", meta:").next().unwrap_or(&e).replace(' ', "_"),
+        };
+        out.push(format!("{} OUTCOME {what} {outcome}", if with_cohort { "cohort" } else { "zero" }));
+        snap(&env, what, &mut out);
+    }
+    (out, tail_seen, max_stale)
+}
+
+/// Zero means off: a legacy market (growth OFF, funding OFF) runs the same transaction sequence
+/// with byte-identical account state to the DEPLOYED v2.1 program (7c906e45), outside (a) the
+/// appended K/F drift tail (#277), (b) the Wave B band/rent words (asserted zero), and (c) Wave A's
+/// p4 bit2 (asserted exactly that bit). Two cases:
+/// - zero cohort: nothing ever goes stale, the drift tail stays zero;
+/// - live cohort: an auth-mark move leaves a position stale for the rest of the run; every
+///   outcome of the reduces / closes / cranks and every byte outside the tail still match, and the
+///   tail is non-zero. (Risk increases under a stale cohort are the intended #277 change and are
+///   tested in tests/v21_funding_scale.rs, so they are not part of this parity sequence.)
+/// The committed `tests/fixtures/growth_legacy_parity_v21.txt` (#528) is NOT used any more: in the
+/// v2.2 combination its first market line already disagrees with the deployed program's bytes
+/// (see ledger/v22-combination-2026-10-06.md), while this direct run agrees on all 88 snapshots.
 #[test]
 fn growth_off_is_byte_for_byte_legacy() {
-    fn run(so: &PathBuf) -> Vec<(String, Vec<Vec<u8>>)> {
-        let mut env = Env::try_new_with(so, MarketCfg::legacy()).expect("init");
-        let mut out = Vec::new();
-        let lp = env.lp(1_000 * USD);
-        let (x, xp) = env.trader(200 * USD);
-        let (y, yp) = env.trader(50 * USD);
-        let keys = [env.market, lp.account, xp, yp, lp.ctx];
-        let snap = |env: &Env, what: &str, out: &mut Vec<(String, Vec<Vec<u8>>)>| {
-            out.push((
-                what.to_string(),
-                keys.iter()
-                    .map(|k| env.svm.get_account(k).unwrap().data)
-                    .collect(),
-            ));
-        };
-        snap(&env, "setup", &mut out);
-        let steps: Vec<(&str, Result<u64, String>)> = vec![
-            ("cpi open", env.trade_cpi(&x, xp, &lp, units(600))),
-            ("cpi crowd 5x", env.trade_cpi(&y, yp, &lp, units(100))),
-            ("batch", env.batch_trade_cpi(&y, yp, &lp, -units(50))),
-            ("nocpi", env.trade_nocpi(&x, xp, &y, yp, units(10))),
-            ("crank", env.crank(xp)),
-            ("cpi close", env.trade_cpi(&x, xp, &lp, -units(610))),
-        ];
-        for (what, r) in steps {
-            // Outcome only (Ok / the instruction error), never logs: CU differ by design.
-            let outcome = match r {
-                Ok(_) => "ok".to_string(),
-                Err(e) => e.split(", meta:").next().unwrap_or(&e).to_string(),
-            };
-            out.push((format!("{what}: {outcome}"), vec![]));
-            snap(&env, what, &mut out);
-        }
-        out
+    // Reference = the DEPLOYED v2.1 program (GROWTH_BASE_SO, 7c906e45) run on deployed-layout
+    // accounts; candidate = this build, normalised (Wave A p4 bit masked, Wave B words asserted zero
+    // and projected out, the #277 drift tail stripped). Outcomes and every account byte must match.
+    let base_so = base_program_path();
+    let cand_so = program_path();
+    let (zero_b, _, _) = legacy_parity_run(&base_so, true, false);
+    let (cohort_b, _, _) = legacy_parity_run(&base_so, true, true);
+    let (zero, zero_tail, zero_stale) = legacy_parity_run(&cand_so, false, false);
+    let (cohort, cohort_tail, cohort_stale) = legacy_parity_run(&cand_so, false, true);
+    let mut lines = zero.clone();
+    lines.extend(cohort.clone());
+    let mut want = zero_b;
+    want.extend(cohort_b);
+    assert_eq!(want.len(), lines.len(), "snapshot count");
+    for (w, g) in want.iter().zip(lines.iter()) {
+        assert_eq!(w, g, "diverged from the deployed v2.1 program");
     }
-    let base = run(&base_program_path());
-    let cand = run(&program_path());
-    assert_eq!(base.len(), cand.len());
-    let mut compared = 0;
-    for (b, c) in base.iter().zip(cand.iter()) {
-        assert_eq!(b.0, c.0, "outcome diverged");
-        assert_eq!(b.1, c.1, "account bytes diverged after: {}", b.0);
-        compared += b.1.len();
-    }
-    assert!(
-        compared >= 30,
-        "non-vacuous: {compared} account snapshots compared"
-    );
-    eprintln!(
-        "legacy parity: {} steps, {} account snapshots byte-identical",
-        base.len(),
-        compared
-    );
+    assert!(lines.len() >= 70, "non-vacuous: {} lines compared", lines.len());
+    assert_eq!(zero_stale, 0, "zero-cohort case never goes stale");
+    assert!(!zero_tail, "zero-cohort case leaves the drift tail zero");
+    assert!(cohort_stale > 0, "cohort case really leaves stale positions");
+    let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
+        - v21_upgrade::V22_ASSET_EXTRA
+        - LEGACY_ENGINE_SLOT_LEN;
+    assert_eq!(appended, 160);
+    assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
+    eprintln!("legacy parity: {} lines identical to the deployed v2.1 program (zero + live cohort)", lines.len());
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
