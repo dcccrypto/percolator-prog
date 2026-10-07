@@ -262,7 +262,8 @@ pub fn g9_oracle_allowed(oracle_mode: u8, provenance_authenticated: bool, allow_
 /// R-7: where a Hybrid leg's account comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum G9LegSource {
-    /// Owned by the Chainlink store program (feeds are not creator-made).
+    /// Owned by the Chainlink store program. R-12: NOT creator-proof (the store's `create_feed` is
+    /// open to any signer), so it needs the allowlist exactly like a Switchboard feed.
     Chainlink,
     /// Owned by Switchboard On-Demand: permissionless, anyone can create a feed with any job.
     Switchboard,
@@ -270,16 +271,51 @@ pub enum G9LegSource {
     Other,
 }
 
-/// R-7: a leg is acceptable for G9 iff its account key equals the profile's leg key AND it is a
-/// Chainlink store feed, or a Switchboard feed on the upgrade-authority allowlist
-/// (`["g9_feeds"]`, tag 117).
+/// R-7 + R-12: a leg is acceptable for G9 iff its account key equals the profile's leg key AND the
+/// key is on the upgrade-authority allowlist (`["g9_feeds"]`, tags 117/120/121) AND its owner is a
+/// recognised oracle program. Chainlink store feeds are NO LONGER exempt (R-12, verified on
+/// mainnet 2026-10-07: the store's `create_feed` has no access control, so any signer can create a
+/// store-owned feed with a self-chosen writer; `evidence/r12-chainlink-store-*`).
 pub fn g9_leg_ok(source: G9LegSource, key_matches: bool, allowlisted: bool) -> bool {
     key_matches
         && match source {
-            G9LegSource::Chainlink => true,
-            G9LegSource::Switchboard => allowlisted,
+            G9LegSource::Chainlink | G9LegSource::Switchboard => allowlisted,
             G9LegSource::Other => false,
         }
+}
+
+/// R10-2: the feed owner read from the leg account (`None` when the account is too short or the
+/// source is not Chainlink / Switchboard). Chainlink store `Transmissions.owner` at +10; Switchboard
+/// PullFeed `authority` at +2056.
+pub fn g9_leg_feed_owner(source: G9LegSource, data: &[u8]) -> Option<[u8; 32]> {
+    let off = match source {
+        G9LegSource::Chainlink => crate::oracle_v16::CL_OFF_FEED_OWNER,
+        G9LegSource::Switchboard => crate::oracle_v16::SB_OFF_FEED_AUTHORITY,
+        G9LegSource::Other => return None,
+    };
+    data.get(off..off + 32)?.try_into().ok()
+}
+
+/// R10-2: a listed feed qualifies only while its CURRENT owner equals the owner pinned in the
+/// record; both must exist (an unlisted feed or an unreadable owner never qualifies).
+pub fn g9_owner_matches(listed: Option<&[u8; 32]>, actual: Option<&[u8; 32]>) -> bool {
+    matches!((listed, actual), (Some(a), Some(b)) if a == b)
+}
+
+/// R-10: `new` may replace `current` immediately iff it adds nothing (every new key is already
+/// in force). A removal is always immediate; an addition is never.
+pub fn g9_allowlist_removal_only(current: &[[u8; 32]], new: &[[u8; 32]]) -> bool {
+    new.iter().all(|k| current.contains(k))
+}
+
+/// R-10: a proposal made at `pending_slot` (0 = none) may be committed once the timelock has
+/// elapsed: `now >= pending_slot + G9_ALLOWLIST_TIMELOCK_SLOTS`. Saturating, fail closed at the
+/// top of the range.
+pub fn g9_allowlist_commit_ready(pending_slot: u64, now: u64) -> bool {
+    pending_slot != 0
+        && pending_slot
+            .checked_add(crate::constants::G9_ALLOWLIST_TIMELOCK_SLOTS)
+            .is_some_and(|due| now >= due)
 }
 
 /// R-1 (2) + R-9: insurance never lends more, in total, than the Earn seniors' loss that is STILL
@@ -525,7 +561,8 @@ mod tests {
         assert!(!g9_oracle_allowed(1, false, false), "R-8: trade-driven fallback refused");
         assert!(g9_oracle_allowed(3, false, true), "devnet override");
         // R-7: leg sources.
-        assert!(g9_leg_ok(G9LegSource::Chainlink, true, false));
+        assert!(!g9_leg_ok(G9LegSource::Chainlink, true, false), "R-12: a store-owned feed is not trusted by owner alone");
+        assert!(g9_leg_ok(G9LegSource::Chainlink, true, true));
         assert!(!g9_leg_ok(G9LegSource::Chainlink, false, true), "key must match");
         assert!(!g9_leg_ok(G9LegSource::Switchboard, true, false), "creator-made feed refused");
         assert!(g9_leg_ok(G9LegSource::Switchboard, true, true), "allowlisted feed");
