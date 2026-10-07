@@ -177,6 +177,8 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::SettleHoldingRent { .. } => "SettleHoldingRent",
         Instruction::SweepBandDustLeg { .. } => "SweepBandDustLeg",
         Instruction::EvictAndTradeCpi { .. } => "EvictAndTradeCpi",
+        Instruction::ProposeG9FeedAllowlist { .. } => "ProposeG9FeedAllowlist",
+        Instruction::CommitG9FeedAllowlist => "CommitG9FeedAllowlist",
     }
 }
 
