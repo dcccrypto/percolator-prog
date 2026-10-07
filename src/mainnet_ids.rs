@@ -94,10 +94,13 @@ pub const PIN_MARKER: &[u8; 24] = b"PCLR-PIN:TEST-PLACEHOLDE";
 #[cfg(not(feature = "mainnet-ids"))]
 pub const PIN_MARKER: &[u8; 24] = b"PCLR-PIN:NONE\0\0\0\0\0\0\0\0\0\0\0";
 
-/// Keeps the marker in the linked binary (the optimiser would otherwise drop an unreferenced const).
-#[used]
-#[no_mangle]
-pub static PERCOLATOR_PIN_MARKER: [u8; 24] = *PIN_MARKER;
+/// Keeps the marker in the linked binary: the entrypoint reads one byte through `black_box`, so the
+/// optimiser cannot drop the const (a `#[used]` static adds a SHF_GNU_RETAIN section the SBF loader
+/// rejects).
+#[inline(always)]
+pub fn touch_pin_marker() {
+    core::hint::black_box(&PIN_MARKER[0]);
+}
 
 /// Every value is set (not the unset sentinel) and all are pairwise distinct. `const fn` so it is
 /// usable in the build-time assertion below.
@@ -198,6 +201,15 @@ mod tests {
         assert!(crate::constants::STAKE_PINNED);
     }
 
+    #[test]
+    fn pinned_set_covers_all_four_values() {
+        assert_eq!(PINNED_SET.len(), 4);
+        assert_eq!(PINNED_SET[0], MAINNET_STAKE_PROGRAM_ID_BYTES);
+        assert_eq!(PINNED_SET[1], MAINNET_WRAPPER_PROGRAM_ID_BYTES);
+        assert_eq!(PINNED_SET[2], MAINNET_MATCHER_PROGRAM_ID_BYTES);
+        assert_eq!(PINNED_SET[3], MAINNET_FEE_AUTHORITY_BYTES);
+    }
+
     /// P-2: exactly one of three distinct markers per flavour, all the same length and none a
     /// prefix of another (so a substring search cannot confuse them).
     #[test]
@@ -209,6 +221,5 @@ mod tests {
         assert!(s.starts_with("PCLR-PIN:TEST"), "{s}");
         #[cfg(not(feature = "mainnet-ids"))]
         assert_eq!(s, "PCLR-PIN:NONE");
-        assert_eq!(PERCOLATOR_PIN_MARKER, *PIN_MARKER);
     }
 }

@@ -13227,6 +13227,7 @@ pub mod processor {
         if *program_id != crate::constants::WRAPPER_PROGRAM_ID {
             return Err(ProgramError::IncorrectProgramId);
         }
+        crate::mainnet_ids::touch_pin_marker();
         restamp_vault_pots_in_writable_markets(program_id, accounts)?;
         // P3 option (b): the Earn exits (77, 102) and the terminal harvest/absorption (78) may
         // run beside open resolved receipts; they must never lower the claim-free residual that
