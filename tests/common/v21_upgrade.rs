@@ -50,7 +50,7 @@ fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let rest = &old[MARKET_GROUP_OFF + old_header_len..];
     // A deployed v2.1 slab lacks the funding-scale tail; a v2.1 + tail slab (this tree's v2.1
     // projection) carries it. Exactly one of the two strides divides the length.
-    let bare = rest.len() % old_stride != 0;
+    let bare = !rest.len().is_multiple_of(old_stride);
     let stride = if bare { old_stride - FUNDING_SCALE_TAIL } else { old_stride };
     assert_eq!(
         rest.len() % stride,
