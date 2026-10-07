@@ -55,6 +55,9 @@ pub mod wave_a_v22;
 /// `~/percolator-ops/ledger/phase4-design-2026-10-05.md` items 5 and 6.
 pub mod p4_rescue_ins;
 
+/// v2.2 item 4 (2026-10-07): the mainnet stake + wrapper program-id pin (feature `mainnet-ids`).
+pub mod mainnet_ids;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -513,6 +516,10 @@ pub mod constants {
     #[cfg(feature = "devnet")]
     pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+    /// P-3: the mainnet arm, pinned together with the stake and wrapper ids (`mainnet_ids`).
+    #[cfg(feature = "mainnet-ids")]
+    pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_MATCHER_PROGRAM_ID;
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -875,8 +882,14 @@ pub mod constants {
     /// placeholder the operator is expected to rotate to a real treasury/
     /// multisig via `SetProtocolFeeAuthority` before or shortly after
     /// mainnet, not a permanent design commitment.
+    #[cfg(not(feature = "mainnet-ids"))]
     pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7");
+    /// P-4: a mainnet build takes the fee authority from the pinned set (the devnet EOA above can
+    /// never ship; the placeholder fails the build until a real treasury key is set).
+    #[cfg(feature = "mainnet-ids")]
+    pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_FEE_AUTHORITY;
 
     // ── Fork LP Vault (v17 re-expression — tags renumbered 74-80) ──────────
     // Account kinds 1-4 are MARKET / PORTFOLIO / BACKING_DOMAIN_LEDGER /
@@ -1191,6 +1204,20 @@ pub mod constants {
     #[cfg(feature = "devnet")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
+    // v2.2 item 4: the MAINNET arm. `feature = "mainnet-ids"` (never together with `devnet`)
+    // pins the stake id AND the wrapper id from `src/mainnet_ids.rs`, where a build-time
+    // assertion refuses a build with either still a placeholder. The pair is changed in one
+    // reviewed commit with percolator-stake's matching `declare_id!` / wrapper allowlist.
+    #[cfg(feature = "mainnet-ids")]
+    pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_STAKE_PROGRAM_ID;
+    /// The wrapper's own pinned mainnet id: the entrypoint refuses to run under any other.
+    #[cfg(feature = "mainnet-ids")]
+    pub const WRAPPER_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_WRAPPER_PROGRAM_ID;
+    /// `true` iff this build pins a stake program (devnet or mainnet-ids). Tags 87 and 116 and the
+    /// stake-class unit binding fail closed (`StakeProgramNotPinned`) when `false`.
+    pub const STAKE_PINNED: bool = cfg!(any(feature = "devnet", feature = "mainnet-ids"));
 
     /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
     /// the wrapper market it is bound to, so there is exactly ONE pool per
@@ -14336,6 +14363,13 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
+        // v2.2 item 4: a `mainnet-ids` binary runs only at its pinned mainnet address (the one the
+        // stake program's allowlist names), so it cannot be deployed under another id.
+        #[cfg(feature = "mainnet-ids")]
+        if *program_id != crate::constants::WRAPPER_PROGRAM_ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        crate::mainnet_ids::touch_pin_marker();
         restamp_vault_pots_in_writable_markets(program_id, accounts)?;
         // P3 option (b): the Earn exits (77, 102) and the terminal harvest/absorption (78) may
         // run beside open resolved receipts; they must never lower the claim-free residual that
@@ -22795,12 +22829,12 @@ pub mod processor {
         // there is no program we are willing to send tokens to, so refuse
         // before touching anything. Fail closed: the atoms stay in
         // `header.insurance`. See `constants::STAKE_PROGRAM_ID`.
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (program_id, market_ai, pool_ai, bound_insurance_authority);
-            return Err(PercolatorError::StakeProgramNotPinned.into());
+            Err(PercolatorError::StakeProgramNotPinned.into())
         }
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake_program = crate::constants::STAKE_PROGRAM_ID;
             // (1) OWNER PIN — FIRST, BEFORE ANY BYTE IS READ. This is the check
@@ -23182,12 +23216,12 @@ pub mod processor {
         market_key: &Pubkey,
         insurance_authority: &[u8; 32],
     ) -> bool {
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (market_key, insurance_authority);
             false
         }
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake_program = crate::constants::STAKE_PROGRAM_ID;
             let (pool, _) = Pubkey::find_program_address(
@@ -34326,11 +34360,11 @@ pub mod processor {
     }
 
     fn canonical_vault_lp_matcher_program() -> Result<Pubkey, ProgramError> {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             Ok(crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM)
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             Err(PercolatorError::VaultLpMatcherNotApproved.into())
         }
@@ -35525,7 +35559,7 @@ pub mod processor {
     /// trusts); every other key is CREATOR class. A non-devnet build pins no stake program, so
     /// every unit is creator class there (and tag 87 already fails closed).
     fn ins_unit_class_for(market_key: &Pubkey, who: &Pubkey) -> u8 {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake = crate::constants::STAKE_PROGRAM_ID;
             let (pool, _) = Pubkey::find_program_address(
@@ -35540,7 +35574,7 @@ pub mod processor {
                 return crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE;
             }
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (market_key, who);
         }
@@ -35818,7 +35852,7 @@ pub mod processor {
         // pinned stake program cannot tell the stake class from the creator's, so it must never
         // unitise a market (the class bound would collapse into one class): fail closed, as
         // tag 87 does.
-        if !cfg!(feature = "devnet") {
+        if !crate::constants::STAKE_PINNED {
             return Err(PercolatorError::StakeProgramNotPinned.into());
         }
         let bump_bytes = [bump];
@@ -40155,11 +40189,11 @@ pub mod processor {
     /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = matcher_prog;
             false
@@ -43951,6 +43985,58 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
+        /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
+        /// `mainnet-ids*`: the vault authority derived under the PINNED stake id is bound and gets
+        /// the stake unit class; one derived under any other program, or a stranger, is not.
+        #[test]
+        #[allow(clippy::assertions_on_constants)]
+        fn item4_stake_pin_flavours() {
+            let market = Pubkey::new_from_array([7u8; 32]);
+            let stranger = [9u8; 32];
+            assert!(!insurance_authority_bound_to_stake_pool(&market, &stranger));
+            #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+            {
+                assert!(crate::constants::STAKE_PINNED);
+                let derive = |program: &Pubkey| {
+                    let (pool, _) = Pubkey::find_program_address(
+                        &[crate::constants::STAKE_POOL_SEED, market.as_ref()],
+                        program,
+                    );
+                    Pubkey::find_program_address(
+                        &[crate::constants::STAKE_VAULT_AUTHORITY_SEED, pool.as_ref()],
+                        program,
+                    )
+                    .0
+                };
+                let pinned = derive(&crate::constants::STAKE_PROGRAM_ID);
+                assert!(insurance_authority_bound_to_stake_pool(&market, &pinned.to_bytes()));
+                assert_eq!(
+                    ins_unit_class_for(&market, &pinned),
+                    crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE
+                );
+                // Negative control: the SAME derivation under a different program is refused.
+                let other = derive(&Pubkey::new_from_array([0xBB; 32]));
+                assert!(!insurance_authority_bound_to_stake_pool(&market, &other.to_bytes()));
+                assert_eq!(
+                    ins_unit_class_for(&market, &other),
+                    crate::p4_rescue_ins::INS_UNIT_CLASS_CREATOR
+                );
+            }
+            #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
+            {
+                assert!(!crate::constants::STAKE_PINNED, "no pin: tags 87 / 116 fail closed");
+            }
+            #[cfg(feature = "mainnet-ids")]
+            {
+                assert_ne!(
+                    crate::constants::STAKE_PROGRAM_ID,
+                    crate::constants::WRAPPER_PROGRAM_ID,
+                    "the pair is distinct"
+                );
+            }
+        }
 
         #[test]
         fn wrapper_config_len_matches_struct_size() {
