@@ -35,4 +35,5 @@ cargo test --release --test sec_v22b_pure sec_band_caps_by_build -- --exact >/de
   exit 1
 }
 echo "check-mainnet-sbf: mainnet band caps OK (lambda 3x, alpha 60%)"
+"$ROOT/scripts/check-mainnet-pin.sh" "$SO"
 echo "check-mainnet-sbf: PASS"

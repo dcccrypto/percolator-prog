@@ -11,8 +11,11 @@ allows lambda 10x and alpha 70% on band markets, a mainnet build 3x and 60%. Als
 `devnet`: the devnet stake program id and the devnet vault-LP matcher id.
 
 ```
-cargo build-sbf --sbf-out-dir out/mainnet            # NO --features devnet
-scripts/check-mainnet-sbf.sh out/mainnet/percolator_prog.so
+cargo build-sbf --features mainnet-ids --sbf-out-dir out/mainnet   # NO --features devnet; mainnet-ids is REQUIRED
+scripts/check-mainnet-sbf.sh out/mainnet/percolator_prog.so   # calls check-mainnet-pin.sh (below)
+scripts/check-mainnet-pin.sh out/mainnet/percolator_prog.so   # must print OK: pinned mainnet build
+scripts/mainnet-flavour-tests.sh out/mainnet/percolator_prog.so   # must print MAINNET FLAVOUR TESTS: OK (all ignored mainnet tests ran)
+scripts/pin-flavour-tests.sh   # builds the placeholder-pin .so itself; tag 94 only under the pinned matcher (never a release artifact)
 ```
 
 `check-mainnet-sbf.sh` must print `PASS`. It checks the build-flavor string in the image
@@ -22,6 +25,12 @@ is its negative control; run it once on the devnet `.so` to see it fail).
 
 The marker is an accident guard, not tamper evidence: a hostile builder could embed both
 strings. Item 2 is the tamper check.
+
+The pinned set (stake, wrapper, vault-LP matcher, fee authority) lives in `src/mainnet_ids.rs` as
+`RELEASE-STEP` placeholders: `--features mainnet-ids` does NOT COMPILE until all four are set. The build
+carries a marker: `check-mainnet-pin.sh` REJECTS a `mainnet-ids-test-placeholders` build
+(`PCLR-PIN:TEST...`) and an unpinned build (`PCLR-PIN:NONE`: no feature, or devnet) and accepts only
+`PCLR-PIN:MAINNET-OK`. Also change the stake / NFT allowlists to the mainnet wrapper id in the same release.
 
 ## 2. Reproducible-build hash comparison
 
@@ -33,7 +42,7 @@ The deployed bytes must equal an independent rebuild of the tagged commit.
    path recorded in `ledger/deployments.md` for the release.
 2. Same toolchain: `cargo-build-sbf` and platform-tools exactly as pinned in
    `scripts/sbf-frame-gate.sh` (the script refuses any other version).
-3. Each runs `cargo build-sbf --sbf-out-dir out/mainnet` and `shasum -a 256
+3. Each runs `cargo build-sbf --features mainnet-ids --sbf-out-dir out/mainnet` and `shasum -a 256
    out/mainnet/percolator_prog.so`.
 4. The two hashes must be identical, and identical to the hash of the file handed to the
    deploy step. Record the hash, both commits and the toolchain in `ledger/deployments.md`.
