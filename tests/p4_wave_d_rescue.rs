@@ -1023,3 +1023,38 @@ fn rescue_refused_on_pending_obligation_b_stale_or_barrier() {
     }
     assert!(admitted.is_empty(), "admitted while a loss is pending: {admitted:?}");
 }
+
+// ── S10 re-review cb568a4f, finding 1: a rescue deposit (tag 112, `rescue_pot_deposit`) funds a
+// pot through the wrapper's inline helper, so it must drive the engine's provider mirror.
+fn s10_mirror_and_owned(env: &Env, domain: usize) -> (u128, u128) {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let _ = eng;
+    // the non-bound OTC vault funds pots on assets 0 and 1 (domains 0..3)
+    let a = domain / 2;
+    let e = &group.markets[a].engine;
+    let mirror = if domain % 2 == 0 { e.provider_principal_long.get() } else { e.provider_principal_short.get() };
+    let owned = state::vault_pot_owned_from_wrapper_bytes(&group.markets[a].wrapper[..], domain % 2).unwrap();
+    (mirror / percolator::BOUND_SCALE, owned)
+}
+
+#[test]
+fn s10_rescue_deposit_and_seed_drive_the_mirror() {
+    let consumed = 300_000_000u128;
+    let (mut env, v) = impaired(consumed);
+    let rescuer = new_actor(&mut env, &v);
+    for d in 0..4usize {
+        let (m, o) = s10_mirror_and_owned(&env, d);
+        assert_eq!(m, o, "seeded pot {d}: engine mirror {m} != vault-owned {o}");
+    }
+    let before: u128 = (0..4usize).map(|d| s10_mirror_and_owned(&env, d).0).sum();
+    assert!(before > 0, "the Earn seed is provider principal in the mirror");
+    try_rescue(&mut env, &rescuer, 200_000_000, 1).expect("rescue");
+    let after: u128 = (0..4usize).map(|d| s10_mirror_and_owned(&env, d).0).sum();
+    assert_eq!(after, before + 200_000_000, "the rescue atoms are provider principal in the mirror");
+    for d in 0..4usize {
+        let (m, o) = s10_mirror_and_owned(&env, d);
+        assert_eq!(m, o, "after rescue, pot {d}: engine mirror {m} != vault-owned {o}");
+    }
+}

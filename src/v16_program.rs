@@ -32067,6 +32067,14 @@ pub mod processor {
         } else {
             cur.saturating_sub(atoms)
         };
+        // S10: the engine's provider-principal mirror follows the vault-owned counter through the
+        // engine's single setter (an Earn / LP-vault pot's principal must never be moved by the
+        // unclaimed-backing rebalance); every pot funding and draw reaches this function.
+        let num = atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        percolator::adjust_slot_provider_principal(&mut market.engine, domain % 2 == 1, num, add)
+            .map_err(map_v16_error)?;
         state::vault_pot_owned_to_wrapper_bytes(&mut market.wrapper[..], domain % 2, next)
     }
 

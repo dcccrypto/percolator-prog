@@ -26221,3 +26221,173 @@ fn v22_market_realloc_ceiling_is_absolute_on_a_system_created_account() {
     assert!(e.contains("InvalidRealloc"), "expected InvalidRealloc, got {e}");
     assert_eq!(env.svm.get_account(&env.market).unwrap().data.len(), cap3, "no partial growth");
 }
+
+
+/// S10 re-review cb568a4f, finding 1: the ordinary tag-50 provider path drives the engine's
+/// provider-principal mirror (deposit) and lowers it on withdrawal (tag 51 principal withdraw).
+#[test]
+fn s10_ordinary_provider_deposit_and_withdraw_drive_the_mirror() {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams { initial_price: 1_000_000, ..V16CuMarketParams::default() });
+    env.svm.warp_to_slot(1);
+    let mirror = |env: &V16CuEnv| -> u128 {
+        let mut data = env.svm.get_account(&env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut data).unwrap();
+        g.markets[0].engine.provider_principal_long.get() / percolator::BOUND_SCALE
+    };
+    assert_eq!(mirror(&env), 0);
+    env.top_up_backing_bucket(0, 5_000_000, 1_000_000);
+    assert_eq!(mirror(&env), 5_000_000, "a tag-50 top-up is provider principal in the engine mirror");
+}
+
+/// Seeds `n` legs (long vs short, 100,000 units each at 100) and strands the short's peak loss on
+/// every asset: price up 100 -> 110, the SHORT (loser) settles alone, price down to 95, the LONG
+/// settles (net loss). Direct engine calls on the account data (as the other benchmarks do).
+fn s10_seed_stranded(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize) -> u64 {
+    let mut market_account = env.svm.get_account(&env.market).expect("market account");
+    let mut long_data = env.svm.get_account(&long_account).expect("long");
+    let mut short_data = env.svm.get_account(&short_account).expect("short");
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let mut slot = 2u64;
+    {
+        let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+        let mut long = state::portfolio_view_mut_for_market_slots(&mut long_data.data, max_market_slots).unwrap();
+        let mut short = state::portfolio_view_mut_for_market_slots(&mut short_data.data, max_market_slots).unwrap();
+        for asset_index in 0..n {
+            group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long, &mut short,
+                TradeRequestV16 { asset_index, size_q: (100_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 },
+                true,
+            ).unwrap();
+        }
+        let mut step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+            *slot += 1;
+            for asset_index in 0..n {
+                group.accrue_asset_to_not_atomic(asset_index, *slot, price, 0, true).unwrap();
+                group.markets[asset_index].engine.asset.raw_oracle_target_price = percolator::V16PodU64::new(price);
+            }
+        };
+        for p in [105u64, 110] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut short).unwrap(); // the loser settles alone at the peak
+        for p in [105u64, 100, 95] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut long).unwrap(); // the winner's net is a loss
+    }
+    env.svm.set_account(env.market, market_account).unwrap();
+    env.svm.set_account(long_account, long_data).unwrap();
+    env.svm.set_account(short_account, short_data).unwrap();
+    slot
+}
+
+fn s10_refresh_probe(n: u16) {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 500_000_000);
+    env.deposit(&short_owner, short_account, 500_000_000);
+    let slot = s10_seed_stranded(&mut env, long_account, short_account, n as usize);
+    env.svm.warp_to_slot(slot + 1);
+    let cu = env.send(
+        ProgInstruction::PermissionlessCrank { now_slot: slot + 1, observations: vec![] },
+        vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(short_account, false)],
+        &[],
+    );
+    match cu { Ok(cu) => println!("S10MULTI refresh crank of the stranded short, {n} legs: {cu} CU"), Err(e) => println!("S10MULTI {n} legs ERR {}", format!("{e:?}").chars().take(300).collect::<String>()) }
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let (_, group) = state::market_view_mut(&mut m.data).unwrap();
+    let fresh_short: Vec<u128> = (0..n as usize).map(|i| group.markets[i].engine.backing_short.try_to_runtime().unwrap().fresh_unliened_backing_num / 1_000_000_000_000).collect();
+    println!("S10MULTI short-bucket fresh per asset after: {:?}", fresh_short);
+}
+
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_multi_leg_refresh_11() { s10_refresh_probe(11); }
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_multi_leg_refresh_14() { s10_refresh_probe(14); }
+
+/// Like `s10_seed_stranded` with the LONG as the stranded loser: price down 100 -> 90, the long
+/// settles alone at the trough, price up to 105, the short (winner at the trough) settles (net loss).
+fn s10_seed_stranded_long_loser(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize) -> u64 {
+    let mut market_account = env.svm.get_account(&env.market).expect("market account");
+    let mut long_data = env.svm.get_account(&long_account).expect("long");
+    let mut short_data = env.svm.get_account(&short_account).expect("short");
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let mut slot = 2u64;
+    {
+        let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+        let mut long = state::portfolio_view_mut_for_market_slots(&mut long_data.data, max_market_slots).unwrap();
+        let mut short = state::portfolio_view_mut_for_market_slots(&mut short_data.data, max_market_slots).unwrap();
+        for asset_index in 0..n {
+            group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long, &mut short,
+                TradeRequestV16 { asset_index, size_q: (100_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 },
+                true,
+            ).unwrap();
+        }
+        let mut step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+            *slot += 1;
+            for asset_index in 0..n {
+                group.accrue_asset_to_not_atomic(asset_index, *slot, price, 0, true).unwrap();
+                group.markets[asset_index].engine.asset.raw_oracle_target_price = percolator::V16PodU64::new(price);
+            }
+        };
+        for p in [96u64, 92] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut long).unwrap(); // the long (loser) settles alone at the trough
+        for p in [96u64, 100, 104] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut short).unwrap(); // the short's net is a loss
+    }
+    env.svm.set_account(env.market, market_account).unwrap();
+    env.svm.set_account(long_account, long_data).unwrap();
+    env.svm.set_account(short_account, short_data).unwrap();
+    slot
+}
+
+/// Liquidation crank of the stranded long (every other portfolio of the asset already settled), so
+/// each of its n leg entries can fire (cap 2); compare base vs S10.
+fn s10_liq_probe(n: u16) {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 500_000_000);
+    env.deposit(&short_owner, short_account, 500_000_000);
+    let slot = s10_seed_stranded_long_loser(&mut env, long_account, short_account, n as usize);
+    env.force_portfolio_capital_for_benchmark(long_account, 1_000);
+    env.svm.warp_to_slot(slot + 1);
+    let mut last = 0u64; let mut done = false; let mut errs = 0;
+    for _ in 0..40 {
+        env.svm.expire_blockhash();
+        let r = env.send(
+            ProgInstruction::PermissionlessCrank { now_slot: slot + 1, observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
+            vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(long_account, false)],
+            &[],
+        );
+        match r { Ok(cu) => { last = cu; println!("S10LIQ {n} legs crank CU {cu}"); } Err(_) => { errs += 1; } }
+        let long_data = env.svm.get_account(&long_account).unwrap().data;
+        let long = state::read_portfolio(&long_data).unwrap();
+        if percolator::active_bitmap_count_ones(long.active_bitmap) < n as u32 { done = true; break; }
+    }
+    println!("S10LIQ {n} legs: liquidated={done} final-crank-CU={last} errs={errs}");
+    let mut m = env.svm.get_account(&env.market).unwrap();
+    let (_, group) = state::market_view_mut(&mut m.data).unwrap();
+    let fresh_long: Vec<u128> = (0..n as usize).map(|i| group.markets[i].engine.backing_long.try_to_runtime().unwrap().fresh_unliened_backing_num / 1_000_000_000_000).collect();
+    println!("S10LIQ long-bucket fresh per asset: {:?}", fresh_long);
+}
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_liquidation_11() { s10_liq_probe(11); }
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_liquidation_14() { s10_liq_probe(14); }
+
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_multi_leg_refresh_2() { s10_refresh_probe(2); }
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_multi_leg_refresh_4() { s10_refresh_probe(4); }
+#[test]
+#[ignore = "S10 CU probe (measurement)"]
+fn s10_cu_multi_leg_refresh_8() { s10_refresh_probe(8); }

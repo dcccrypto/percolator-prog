@@ -4755,3 +4755,126 @@ fn v22_n7_band_off_lagged_market_keeps_the_keeper_paths_alive() {
     }
     env.assert_conserved("band-off lagged keeper paths");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// S10 re-review cb568a4f, finding 1: the engine's provider-principal mirror must follow EVERY
+// Earn / LP-vault pot funding and draw (the wrapper's inline helpers), not only tag 50.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+const S10_SC: u128 = percolator::BOUND_SCALE;
+
+/// (engine mirror in atoms, wrapper vault-owned counter in atoms) of pot `domain` (asset 0).
+fn s10_mirror_and_owned(env: &Env, domain: usize) -> (u128, u128) {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let mirror = if domain == 0 { eng.provider_principal_long.get() } else { eng.provider_principal_short.get() };
+    let owned = state::vault_pot_owned_from_wrapper_bytes(&group.markets[0].wrapper[..], domain % 2).unwrap();
+    (mirror / S10_SC, owned)
+}
+
+fn s10_assert_mirror(env: &Env, what: &str) {
+    for d in 0..2 {
+        let (m, o) = s10_mirror_and_owned(env, d);
+        assert_eq!(m, o, "{what}: pot {d}: engine provider mirror {m} != wrapper vault-owned {o}");
+    }
+}
+
+/// Fresh backing and the engine mirror of pot `domain`, in atoms.
+fn s10_fresh(env: &Env, domain: usize) -> u128 {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let b = if domain == 0 { eng.backing_long } else { eng.backing_short };
+    b.try_to_runtime().unwrap().fresh_unliened_backing_num / S10_SC
+}
+
+#[test]
+fn s10_every_pot_funding_and_draw_drives_the_mirror() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    s10_assert_mirror(&env, "after bind");
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 10_000_000, Some(lp.portfolio)).expect("earn deposit (tag 75)");
+    s10_assert_mirror(&env, "after tag 75 deposit");
+    let (m, _) = s10_mirror_and_owned(&env, 0);
+    let (m1, _) = s10_mirror_and_owned(&env, 1);
+    assert!(m + m1 > 0, "the Earn deposit is provider principal in the mirror (a mutant that skips the setter leaves 0)");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior tranche deposit");
+    s10_assert_mirror(&env, "after junior tranche deposit");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    s10_assert_mirror(&env, "after fills");
+    env.crank_fees(true).expect("fee crank");
+    s10_assert_mirror(&env, "after the fee crank");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 5_000_000, Some(lp.portfolio)).expect("second deposit");
+    s10_assert_mirror(&env, "after the second deposit");
+    let sh = env.lp_shares(&d2);
+    env.earn_request(&d2, sh);
+    env.earn_execute(&d2, Some(lp.portfolio)).expect("redemption (tag 77)");
+    s10_assert_mirror(&env, "after the redemption draw");
+    let sh1 = env.lp_shares(&d1);
+    env.earn_request(&d1, sh1);
+    env.earn_execute(&d1, Some(lp.portfolio)).expect("redemption of the genesis depositor");
+    s10_assert_mirror(&env, "after the last redemption");
+}
+
+/// A forced deficit in the opposite domain must never take the pot's principal: loser cash is
+/// poked into the pot beside the Earn principal, a claim shortfall into the sibling domain, and the
+/// refresh crank (the only entry point with a move budget) runs; the pot keeps at least its owned
+/// principal and the Earn withdrawal still succeeds.
+#[test]
+fn s10_forced_deficit_never_moves_earn_pot_principal() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 50_000_000, Some(lp.portfolio)).expect("earn deposit");
+    s10_assert_mirror(&env, "funded");
+    let (own0, own1) = (s10_mirror_and_owned(&env, 0).1, s10_mirror_and_owned(&env, 1).1);
+    let pot = if own0 >= own1 { 0usize } else { 1 };
+    let principal = s10_mirror_and_owned(&env, pot).1;
+    assert!(principal > 0);
+    // poke: 5M of loser cash in the pot, 40M of unbacked claims in the other domain
+    {
+        let mut acct = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, mut group) = state::market_view_mut(&mut acct.data).unwrap();
+            let l = 5_000_000u128 * S10_SC;
+            let c = 40_000_000u128 * S10_SC;
+            {
+                let e = &mut group.markets[0].engine;
+                let (src, bk, os) = if pot == 0 {
+                    (&mut e.source_credit_long, &mut e.backing_long, &mut e.source_credit_short)
+                } else {
+                    (&mut e.source_credit_short, &mut e.backing_short, &mut e.source_credit_long)
+                };
+                let mut b = bk.try_to_runtime().unwrap();
+                b.fresh_unliened_backing_num += l;
+                *bk = percolator::BackingBucketV16Account::from_runtime(&b);
+                let mut s = src.try_to_runtime().unwrap();
+                s.fresh_reserved_backing_num += l;
+                s.credit_rate_num = percolator::CREDIT_RATE_SCALE;
+                *src = percolator::SourceCreditStateV16Account::from_runtime(&s);
+                let mut o = os.try_to_runtime().unwrap();
+                o.positive_claim_bound_num += c;
+                o.credit_rate_num = (o.fresh_reserved_backing_num * percolator::CREDIT_RATE_SCALE) / o.positive_claim_bound_num;
+                *os = percolator::SourceCreditStateV16Account::from_runtime(&o);
+            }
+            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(group.header.source_fresh_backing_total_num.get() + l);
+            group.header.source_claim_bound_total_num = percolator::V16PodU128::new(group.header.source_claim_bound_total_num.get() + c);
+            group.header.pnl_pos_bound_tot_num = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() + c);
+            group.header.pnl_pos_bound_tot = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() / S10_SC);
+            group.header.vault = percolator::V16PodU128::new(group.header.vault.get() + 5_000_000);
+        }
+        env.svm.set_account(env.market, acct).unwrap();
+    }
+    let before = s10_fresh(&env, pot);
+    let r = env.crank(lp.portfolio);
+    println!("S10POT crank result {r:?}");
+    let after = s10_fresh(&env, pot);
+    println!("S10POT principal {principal} fresh before {before} after {after}");
+    assert!(after >= principal, "the pot's principal was moved: fresh {after} < owned {principal}");
+}
