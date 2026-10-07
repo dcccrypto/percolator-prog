@@ -3759,9 +3759,13 @@ fn send_tx(
         &signer_refs,
         svm.latest_blockhash(),
     );
+    let probe = std::env::var_os("X1_LOGS").is_some();
+    let dump = |logs: &Vec<String>| {
+        if probe { for l in logs { if l.contains("0xc0de") { println!("X1PROBE {l}"); } } }
+    };
     svm.send_transaction(tx)
-        .map(|meta| meta.compute_units_consumed)
-        .map_err(|e| format!("{e:?}"))
+        .map(|meta| { dump(&meta.logs); meta.compute_units_consumed })
+        .map_err(|e| { dump(&e.meta.logs); format!("{e:?}") })
 }
 
 fn send_raw_tx(
@@ -12607,16 +12611,19 @@ fn v16_bpf_hybrid_trade_driven_liquidation_reward_is_not_reclaimable_by_self_cra
     );
 }
 
+/// The wrapper leg cap (S10-X1). The max-shape benchmarks below use it instead of a literal 14.
+const LEG_CAP: usize = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize;
+
 #[test]
 fn v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 2_000);
     env.deposit(&short_owner, short_account, 100_000);
-    env.seed_n_leg_position_for_benchmark(long_account, short_account, 14);
+    env.seed_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP);
     let before_slot_last = {
         let market_data = env.svm.get_account(&env.market).unwrap().data;
         let (_, group) = state::read_market(&market_data).unwrap();
@@ -12643,8 +12650,8 @@ ProgInstruction::PermissionlessCrank {
     let long_data = env.svm.get_account(&long_account).unwrap().data;
     let (_, group) = state::read_market(&market_data).unwrap();
     let long = state::read_portfolio(&long_data).unwrap();
-    assert_eq!(group.config.max_portfolio_assets, 14);
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+    assert_eq!(group.config.max_portfolio_assets, LEG_CAP as u16);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
     assert!(
         group.assets[0].slot_last > before_slot_last,
         "full-14 refresh crank must commit bounded asset progress"
@@ -12654,14 +12661,14 @@ ProgInstruction::PermissionlessCrank {
 
 #[test]
 fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 2_000);
     env.deposit(&short_owner, short_account, 100_000);
-    env.seed_n_leg_position_for_benchmark(long_account, short_account, 14);
+    env.seed_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP);
     env.force_portfolio_capital_for_benchmark(long_account, 1_000);
 
     env.svm.warp_to_slot(16);
@@ -12720,7 +12727,7 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
     let long_data = env.svm.get_account(&long_account).unwrap().data;
     let (_, group) = state::read_market(&market_data).unwrap();
     let long = state::read_portfolio(&long_data).unwrap();
-    assert_eq!(group.config.max_portfolio_assets, 14);
+    assert_eq!(group.config.max_portfolio_assets, LEG_CAP as u16);
     assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 13);
     assert!(!long.legs[0].active);
     assert_eq!(group.assets[0].oi_eff_long_q, 0);
@@ -12729,14 +12736,14 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
 
 #[test]
 fn v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 20_000);
     env.deposit(&short_owner, short_account, 100_000);
-    env.seed_current_n_leg_position_for_benchmark(long_account, short_account, 14);
+    env.seed_current_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP);
     let trade_cu = env.trade_with_cu(
         &long_owner,
         long_account,
@@ -12758,7 +12765,7 @@ fn v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit() {
     let short_data = env.svm.get_account(&short_account).unwrap().data;
     let long = state::read_portfolio(&long_data).unwrap();
     let short = state::read_portfolio(&short_data).unwrap();
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
         14
@@ -12803,14 +12810,14 @@ fn cu_consumed_from_err(err: &str) -> String {
 // and the refresh crank is the bounded second instruction this refusal points the client at.
 #[test]
 fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 20_000);
     env.deposit(&short_owner, short_account, 100_000);
-    env.seed_n_leg_position_for_benchmark(long_account, short_account, 14);
+    env.seed_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP);
     env.svm.warp_to_slot(16);
 
     let market_before = env.svm.get_account(&env.market).unwrap();
@@ -12859,7 +12866,7 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
 
     let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
     let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
         14
@@ -12881,7 +12888,7 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
 // no reason recorded); `TradeNoCpi` was never covered even while that fix was in.
 #[test]
 fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
@@ -12949,7 +12956,7 @@ fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
 /// and returns everything a `TradeCpi` needs. Shared by the CPI tests below.
 #[allow(clippy::type_complexity)]
 fn ecu_cpi_env() -> (V16CuEnv, Pubkey, Keypair, Pubkey, Pubkey, Pubkey, Pubkey) {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let matcher_program = Pubkey::new_unique();
     let matcher_bytes = std::fs::read(matcher_program_path()).expect("read matcher BPF");
     env.svm.add_program(matcher_program, &matcher_bytes);
@@ -13138,7 +13145,7 @@ fn v16_bpf_stale_thirteen_leg_existing_asset_tradecpi_rejects_before_matcher_cpi
 #[test]
 fn v16_bpf_current_thirteen_leg_fresh_asset_trade_still_fills_on_both_routes() {
     // (a) TradeNoCpi.
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(14, 1_000, 1_000, 500);
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
     let long_account = env.create_portfolio(&long_owner);
@@ -13164,7 +13171,7 @@ fn v16_bpf_current_thirteen_leg_fresh_asset_trade_still_fills_on_both_routes() {
         has_active_leg_for_asset(&long, 13),
         "the fresh asset must actually be open on the taker"
     );
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 14);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
 
     // (b) TradeCpi, through the real matcher.
     let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
@@ -19254,9 +19261,9 @@ fn v16_bpf_batch_trade_cpi_fanout_budget_characterisation() {
         }
     }
     // The corner the companion test proves fatal, for continuity.
-    match run(14, 4) {
-        Ok(cu) => println!("  {:>4} x {:>4} = {:>4} : {:>9} CU", 14, 4, 56, cu),
-        Err(e) => println!("  {:>4} x {:>4} = {:>4} : {}", 14, 4, 56, e),
+    match run(LEG_CAP as u16, 4) {
+        Ok(cu) => println!("  {:>4} x {:>4} = {:>4} : {:>9} CU", LEG_CAP, 4, LEG_CAP * 4, cu),
+        Err(e) => println!("  {:>4} x {:>4} = {:>4} : {}", LEG_CAP, 4, LEG_CAP * 4, e),
     }
 
     if per_leg.len() >= 2 {
@@ -26220,4 +26227,286 @@ fn v22_market_realloc_ceiling_is_absolute_on_a_system_created_account() {
     let e = r.expect_err("capacity 4 (> 10,240 B) is refused although the real delta is small");
     assert!(e.contains("InvalidRealloc"), "expected InvalidRealloc, got {e}");
     assert_eq!(env.svm.get_account(&env.market).unwrap().data.len(), cap3, "no partial growth");
+}
+
+// ---------------------------------------------------------------------------------------------
+// S10-X1: many-leg liquidation compute. Worst case = every leg carries a pending K/F net.
+// ---------------------------------------------------------------------------------------------
+
+/// `n` legs (long vs short, 100,000 units each at 100). The LONG is the stranded loser: price down
+/// 100 -> 92, the long settles alone at the trough, price up to 104, the short settles (so the
+/// long's every leg carries a pending K/F net when its liquidation starts).
+fn x1_seed_stranded_long_loser(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize, funding_e9: i128) -> u64 {
+    let mut market_account = env.svm.get_account(&env.market).expect("market account");
+    let mut long_data = env.svm.get_account(&long_account).expect("long");
+    let mut short_data = env.svm.get_account(&short_account).expect("short");
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let mut slot = 2u64;
+    {
+        let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+        let mut long = state::portfolio_view_mut_for_market_slots(&mut long_data.data, max_market_slots).unwrap();
+        let mut short = state::portfolio_view_mut_for_market_slots(&mut short_data.data, max_market_slots).unwrap();
+        for asset_index in 0..n {
+            group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long, &mut short,
+                TradeRequestV16 { asset_index, size_q: (100_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 },
+                true,
+            ).unwrap();
+        }
+        let step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+            *slot += 1;
+            for asset_index in 0..n {
+                group.accrue_asset_to_not_atomic(asset_index, *slot, price, funding_e9, true).unwrap();
+                group.markets[asset_index].engine.asset.raw_oracle_target_price = percolator::V16PodU64::new(price);
+            }
+        };
+        for p in [96u64, 92] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut long).unwrap();
+        for p in [96u64, 100, 104] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut short).unwrap();
+    }
+    env.svm.set_account(env.market, market_account).unwrap();
+    env.svm.set_account(long_account, long_data).unwrap();
+    env.svm.set_account(short_account, short_data).unwrap();
+    slot
+}
+
+/// Market shape of the probe. `worst` adds the two inputs the plain scenario leaves out: a
+/// non-zero funding rate on every accrual (every leg carries a pending F net next to its K net)
+/// and a non-zero maintenance fee. Band and rent are single-asset-only features (engine config
+/// rule: `band_bps != 0` requires `max_portfolio_assets == 1`), so no many-leg market carries them.
+fn x1_env(n: u16, worst: bool) -> (V16CuEnv, i128) {
+    if worst {
+        let env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            max_portfolio_assets: n,
+            maintenance_margin_bps: 1_000,
+            initial_margin_bps: 1_000,
+            max_price_move_bps_per_slot: 500,
+            max_abs_funding_e9_per_slot: 10,
+            maintenance_fee_per_slot: 1,
+            ..V16CuMarketParams::default()
+        });
+        (env, 10)
+    } else {
+        (V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500), 0)
+    }
+}
+
+/// Returns (per-call results, liquidated, remaining legs). Prints one `X1LIQ` line per call.
+fn x1_liq_probe_with(n: u16, capital: u128, max_calls: usize, worst: bool, until_flat: bool) -> (Vec<Result<u64, String>>, bool, u32) {
+    let (mut env, funding) = x1_env(n, worst);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 500_000_000);
+    env.deposit(&short_owner, short_account, 500_000_000);
+    let slot = x1_seed_stranded_long_loser(&mut env, long_account, short_account, n as usize, funding);
+    env.force_portfolio_capital_for_benchmark(long_account, capital);
+    env.svm.warp_to_slot(slot + 1);
+    let mut out = vec![];
+    let mut remaining = n as u32;
+    let mut done = false;
+    for i in 0..max_calls {
+        env.svm.expire_blockhash();
+        let r = env.send(
+            ProgInstruction::PermissionlessCrank { now_slot: slot + 1, observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
+            vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(long_account, false)],
+            &[],
+        );
+        let long_data = env.svm.get_account(&long_account).unwrap().data;
+        let long = state::read_portfolio(&long_data).unwrap();
+        remaining = percolator::active_bitmap_count_ones(long.active_bitmap);
+        match &r {
+            Ok(cu) => println!("X1LIQ n={n} worst={worst} call {i}: {cu} CU, legs left {remaining}"),
+            Err(e) => println!("X1LIQ n={n} worst={worst} call {i}: ERR {}", format!("{e:?}").chars().take(110).collect::<String>()),
+        }
+        let failed = r.is_err();
+        out.push(r.map_err(|e| format!("{e:?}")));
+        if remaining < n as u32 { done = true; if !until_flat || remaining == 0 { break; } }
+        if failed && !until_flat { continue; }
+    }
+    println!("X1LIQ n={n} worst={worst} capital={capital}: liquidated={done} calls={} legs_left={remaining}", out.len());
+    (out, done, remaining)
+}
+
+fn x1_liq_probe(n: u16, capital: u128, max_calls: usize) -> (Vec<Result<u64, String>>, bool, u32) {
+    x1_liq_probe_with(n, capital, max_calls, false, false)
+}
+
+#[test]
+fn x1_liq_profile_matrix() {
+    for n in [2u16, 8, 10, 11, 14] {
+        let _ = x1_liq_probe(n, 1_000, 6);
+    }
+}
+
+/// The CU matrix the ledger quotes: plain pending-K scenario and the worst-case one (funding and
+/// maintenance fee on top), at 2, 8, 10, 11, 12, 13 and 14 legs. Markets above the wrapper cap
+/// cannot be created, so legs above it are skipped on a build that enforces the cap.
+#[test]
+fn x1_liq_matrix_for_ledger() {
+    for worst in [false, true] {
+        for n in [2u16, 8, 9, 10, 11, 12, 13, 14] {
+            if n > percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS { continue; }
+            let _ = x1_liq_probe_with(n, 1_000, 8, worst, false);
+        }
+    }
+}
+
+/// What a bankrupt, unliquidatable 14-leg account does to the market, and which other
+/// instructions can reach it (read-only exercise on LiteSVM).
+#[test]
+fn x1_unliquidatable_account_state_and_alternatives() {
+    let n: u16 = 14;
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 500_000_000);
+    env.deposit(&short_owner, short_account, 500_000_000);
+    let slot = x1_seed_stranded_long_loser(&mut env, long_account, short_account, n as usize, 0);
+    env.force_portfolio_capital_for_benchmark(long_account, 1_000);
+    env.svm.warp_to_slot(slot + 1);
+    let crank = |env: &mut V16CuEnv, acct: Pubkey| {
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::PermissionlessCrank { now_slot: slot + 1, observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
+            vec![AccountMeta::new(env.payer.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(acct, false)],
+            &[],
+        )
+    };
+    for _ in 0..5 { let _ = crank(&mut env, long_account); }
+    let dump = |env: &V16CuEnv, tag: &str| {
+        let mut m = env.svm.get_account(&env.market).unwrap();
+        let (_, group) = state::market_view_mut(&mut m.data).unwrap();
+        let h = &group.header;
+        let lp = env.portfolio_state(long_account);
+        let sp = env.portfolio_state(short_account);
+        println!("X1STATE {tag}: hlock={} loss_stale={} neg_pnl_accts={} stale_certs={} mode={} pnl_pos_tot={} c_tot={} vault={} insurance={} | long pnl={} cap={} legs={} | short pnl={} cap={} legs={}",
+            h.bankruptcy_hlock_active, h.loss_stale_active, h.negative_pnl_account_count.get(), h.stale_certificate_count.get(), h.mode,
+            h.pnl_pos_tot.get(), h.c_tot.get(), h.vault.get(), h.insurance.get(),
+            lp.pnl, lp.capital, percolator::active_bitmap_count_ones(lp.active_bitmap),
+            sp.pnl, sp.capital, percolator::active_bitmap_count_ones(sp.active_bitmap));
+    };
+    dump(&env, "after 5 stuck liquidation cranks");
+    // 1. the counterparty (short, the winner) tries to take its capital out
+    let (sid, sseq, _) = env.portfolio_identity(short_account);
+    let dest = Pubkey::new_unique();
+    env.svm.set_account(dest, Account { lamports: 1_000_000_000, data: make_token_data(env.mint, short_owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    for amt in [1_000_000u128, 400_000_000u128] {
+        env.svm.expire_blockhash();
+        let r = env.send(
+            ProgInstruction::Withdraw { portfolio_id: sid, expected_sequence: sseq, amount: amt },
+            vec![
+                AccountMeta::new(short_owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(short_account, false),
+                AccountMeta::new(dest, false), AccountMeta::new(env.vault, false), AccountMeta::new_readonly(env.vault_authority, false), AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&short_owner],
+        );
+        println!("X1ALT short withdraw {amt}: {}", match &r { Ok(cu) => format!("OK {cu} CU"), Err(e) => format!("ERR {}", e.chars().take(150).collect::<String>()) });
+    }
+    // 2. the short's own permissionless crank
+    let r = crank(&mut env, short_account);
+    println!("X1ALT crank of the SHORT (winner): {}", match &r { Ok(cu) => format!("OK {cu} CU"), Err(e) => format!("ERR {}", e.chars().take(150).collect::<String>()) });
+    // 3. owner-signed RebalanceReduce on one leg of the bankrupt account
+    let (lid, _, lpe) = env.portfolio_identity(long_account);
+    env.svm.expire_blockhash();
+    let r = env.send(
+        ProgInstruction::RebalanceReduce { portfolio_id: lid, position_epoch: lpe, asset_index: 13, reduce_q: 100_000 * POS_SCALE },
+        vec![AccountMeta::new(long_owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(long_account, false)],
+        &[&long_owner],
+    );
+    println!("X1ALT owner RebalanceReduce(asset 13, full leg): {}", match &r { Ok(cu) => format!("OK {cu} CU"), Err(e) => format!("ERR {}", e.chars().take(150).collect::<String>()) });
+    dump(&env, "after the alternatives");
+}
+
+/// Transaction budget minus the headroom the pending v2.2 changes need: the stranded-backing hook
+/// (up to 66k CU on refresh cranks), fill/reduce event logging on the trade and liquidation paths
+/// (a few k CU) and a safety margin. A crank above this at the cap is a regression.
+const X1_CRANK_CU_LIMIT: u64 = 1_400_000 - 160_000;
+
+/// S10-X1 regression: at the wrapper leg cap, with every leg carrying a pending K net AND a
+/// pending F net AND a maintenance fee, the account can be settled, liquidated leg by leg and
+/// taken to flat, and every single crank stays inside the budget with headroom. (The old
+/// `v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit` seeded flat legs and passed at
+/// 1.25M while the real worst case at 14 legs could never be liquidated.)
+#[test]
+fn v22_bpf_worst_case_liquidation_at_the_leg_cap() {
+    let n = LEG_CAP as u16;
+    for worst in [true, false] {
+        let (calls, liquidated, left) = x1_liq_probe_with(n, 1_000, 8 + 2 * LEG_CAP, worst, true);
+        assert!(liquidated, "n={n} worst={worst}: no leg was liquidated");
+        // The forced-capital account turns healthy once enough legs are closed; from then on the
+        // crank answers NonProgress (Custom 22). Every other call must succeed.
+        let mut max = 0u64;
+        let mut ok = 0usize;
+        for (i, c) in calls.iter().enumerate() {
+            match c {
+                Ok(cu) => { max = max.max(*cu); ok += 1; }
+                Err(e) => assert!(e.contains("Custom(22)"), "n={n} worst={worst} call {i} failed: {e}"),
+            }
+        }
+        assert!(ok >= 4, "n={n} worst={worst}: expected settle + at least one liquidation, {ok} ok calls");
+        assert!(left < n as u32, "{left} legs left of {n}");
+        println!("X1CAP n={n} worst={worst} max crank CU {max} (limit {X1_CRANK_CU_LIMIT})");
+        assert!(max <= X1_CRANK_CU_LIMIT, "n={n} worst={worst}: crank of {max} CU exceeds {X1_CRANK_CU_LIMIT}");
+    }
+}
+
+/// The cap is enforced where a market is created and where a leg is opened.
+#[test]
+fn v22_leg_cap_is_enforced_at_init_and_at_leg_open() {
+    let cap = LEG_CAP as u16;
+    // InitMarket: the cap itself works, cap + 1 is refused (EngineInvalidConfig).
+    let _ok = V16CuEnv::new_with_market_params_and_price_move(cap, 1_000, 1_000, 500);
+    let over = std::panic::catch_unwind(|| {
+        V16CuEnv::new_with_market_params_and_price_move(cap + 1, 1_000, 1_000, 500)
+    });
+    assert!(over.is_err(), "InitMarket with max_portfolio_assets = cap + 1 must be refused");
+    // Leg open: a system-created market capped at 2 legs, one more asset slot appended (index 2).
+    // The portfolio holds 2 legs and the 3rd is refused by the engine (no free leg slot): the
+    // per-portfolio cap is the market's `max_portfolio_assets`, fixed at InitMarket.
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        system_created_market: true,
+        max_portfolio_assets: 2,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 500,
+        ..V16CuMarketParams::default()
+    });
+    let admin = env.admin.pubkey();
+    env.try_activate_asset_with_authorities(2, 5, 100, admin, admin, admin, admin)
+        .expect("append one asset slot above the cap");
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 500_000_000);
+    env.deposit(&short_owner, short_account, 500_000_000);
+    let mut market_account = env.svm.get_account(&env.market).unwrap();
+    let mut long_data = env.svm.get_account(&long_account).unwrap();
+    let mut short_data = env.svm.get_account(&short_account).unwrap();
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+    let mut long = state::portfolio_view_mut_for_market_slots(&mut long_data.data, max_market_slots).unwrap();
+    let mut short = state::portfolio_view_mut_for_market_slots(&mut short_data.data, max_market_slots).unwrap();
+    let open = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, long: &mut _, short: &mut _, asset_index: usize| {
+        group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+            long, short,
+            TradeRequestV16 { asset_index, size_q: (1_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 },
+            true,
+        )
+    };
+    for i in 0..2usize {
+        open(&mut group, &mut long, &mut short, i).unwrap_or_else(|e| panic!("leg {i} within the cap must open: {e:?}"));
+    }
+    assert_eq!(percolator::active_bitmap_count_ones(long.header.active_bitmap.map(percolator::V16PodU64::get)), 2);
+    let r = open(&mut group, &mut long, &mut short, 2);
+    // The engine is `not_atomic`: it may have written the leg before its post-trade validation
+    // (a leg slot at or above the cap is a `HiddenLeg`) refused; on chain the whole transaction
+    // rolls back, so what matters is that the call fails.
+    println!("X1CAP leg above the cap: {r:?}");
+    assert!(r.is_err(), "the leg above the cap must be refused, got {r:?}");
 }

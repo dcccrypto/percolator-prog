@@ -4,4 +4,4 @@
 #
 # It is recommended to check this file in to source control so that
 # everyone who runs the test benefits from these saved cases.
-cc 2ecf7445fab60b06cdc9825dd1a938989a67a0c23c4e8ce9a1cc94d39fada4bd # shrinks to ops = [Touch(Open), Touch(Walk { up: false, bps: 300, touch_a1: false, touch_a2: false }), HExit { inline: false, min_bps: 3567 }, HExit { inline: false, min_bps: 5478 }, HExit { inline: true, min_bps: 6953 }, HExit { inline: true, min_bps: 1251 }, HExit { inline: false, min_bps: 7865 }, HExit { inline: false, min_bps: 3558 }]
+cc ea01dc893701edd5c0a3b30983c72feb67d57cb0a8cd3f20b3fdd0c2136ccdca # shrinks to ops = [Touch(Open), Touch(Walk { up: false, bps: 300, touch_a1: false, touch_a2: false }), HExit { inline: false, min_bps: 4546 }, Touch(Deposit { pot: 0, units: 203 }), Touch(Redeem), HExit { inline: true, min_bps: 3459 }, HExit { inline: false, min_bps: 5361 }, HExit { inline: true, min_bps: 1103 }, HExit { inline: false, min_bps: 788 }]

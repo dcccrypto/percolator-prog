@@ -64,7 +64,7 @@ fn swordcat() -> LiveMarket {
         name: "swordcat",
         // tag 0 InitMarket, 3LKdrk6m… (slot 507,031,028)
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_625,
@@ -119,7 +119,7 @@ fn backpack() -> LiveMarket {
     LiveMarket {
         name: "backpack",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_794,
@@ -994,7 +994,7 @@ fn r2_market() -> LiveMarket {
     LiveMarket {
         name: "r2",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1,
             h_max: 10,
             initial_price: 1_000_000,

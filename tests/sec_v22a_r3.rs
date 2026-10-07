@@ -64,7 +64,7 @@ fn swordcat() -> LiveMarket {
         name: "swordcat",
         // tag 0 InitMarket, 3LKdrk6m… (slot 507,031,028)
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_625,
@@ -119,7 +119,7 @@ fn backpack() -> LiveMarket {
     LiveMarket {
         name: "backpack",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_794,
@@ -994,7 +994,7 @@ fn r2_market() -> LiveMarket {
     LiveMarket {
         name: "r2",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1,
             h_max: 10,
             initial_price: 1_000_000,
@@ -3162,11 +3162,12 @@ fn a4_keeper_ok_without_a_floor_is_refused() {
 /// every refresh is real and the 77 executes. NEGATIVE CONTROL: the 8 single-leg case in
 /// `refresh_cap_is_eight_and_fits_the_budget` still fits (32 units).
 #[test]
+#[ignore = "S10-X1: premised on 14-leg portfolios; the wrapper leg cap is now 8, see v22_bpf_worst_case_liquidation_at_the_leg_cap"]
 fn a6_fourteen_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
     let mut r = Replay::new(r2_market());
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
-    let assets: u16 = 14;
+    let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS; // S10-X1: the leg cap (was 14)
     let px = 1_000_000u64;
     {
         let (_, g) = r.env.market_state();
@@ -3494,11 +3495,12 @@ fn a5_explore_real_chunked_bankruptcy() {
 /// one bounded crank, so each refresh liquidates (at most one leg) on top of re-certifying 14
 /// legs: the heaviest refresh the budget admits (2 x 17 = 34 units).
 #[test]
+#[ignore = "S10-X1: premised on 14-leg portfolios; the wrapper leg cap is now 8, see v22_bpf_worst_case_liquidation_at_the_leg_cap"]
 fn a6_two_liquidating_fourteen_leg_refreshes_cu() {
     let mut r = Replay::new(r2_market());
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
-    let assets: u16 = 14;
+    let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS; // S10-X1: the leg cap (was 14)
     let px = 1_000_000u64;
     let cp_owner = Keypair::new();
     r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();

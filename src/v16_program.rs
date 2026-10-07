@@ -821,7 +821,18 @@ pub mod constants {
     // one portfolio may only carry the largest active-leg count that fits the
     // audited stale-trade and crank CU envelope. Additional markets remain
     // usable through separate portfolios.
-    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
+    //
+    // S10-X1 (2026-10-07): the cap is set by the WORST-CASE many-leg settle/liquidation crank, not
+    // by the engine array size (16). With every leg carrying a pending K and F net plus a
+    // maintenance fee, the single settle crank costs 1,046,354 CU at 8 legs, 1,153,535 at 9,
+    // 1,260,903 at 10 and 1,368,456 at 11 (about 107k CU per leg); at 12 it exceeds the 1.4M
+    // transaction budget and the account can never be settled or liquidated. On the release
+    // engine alone the final liquidation call is 1,176,557 CU at 8 legs, 1,298,478 at 9 and fails
+    // at 10, so 8 is the largest cap proven on BOTH the base engine and the engine with the
+    // after-refresh fee charge. The `v22_bpf_worst_case_*` tests in tests/v16_cu.rs pin it:
+    // every crank up to a flat account must stay under `1,400,000 - 160,000` CU at this cap.
+    // Raising it needs a new worst-case measurement and a fresh Kani/engine review.
+    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 8;
 
     // Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of
     // surviving positions at admission"): the wrapper's own self-imposed cap on how many
