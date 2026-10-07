@@ -502,6 +502,10 @@ pub mod constants {
     #[cfg(feature = "devnet")]
     pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+    /// P-3: the mainnet arm, pinned together with the stake and wrapper ids (`mainnet_ids`).
+    #[cfg(feature = "mainnet-ids")]
+    pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_MATCHER_PROGRAM_ID;
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -753,8 +757,14 @@ pub mod constants {
     /// placeholder the operator is expected to rotate to a real treasury/
     /// multisig via `SetProtocolFeeAuthority` before or shortly after
     /// mainnet, not a permanent design commitment.
+    #[cfg(not(feature = "mainnet-ids"))]
     pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7");
+    /// P-4: a mainnet build takes the fee authority from the pinned set (the devnet EOA above can
+    /// never ship; the placeholder fails the build until a real treasury key is set).
+    #[cfg(feature = "mainnet-ids")]
+    pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_FEE_AUTHORITY;
 
     // ── Fork LP Vault (v17 re-expression — tags renumbered 74-80) ──────────
     // Account kinds 1-4 are MARKET / PORTFOLIO / BACKING_DOMAIN_LEDGER /
@@ -31986,11 +31996,11 @@ pub mod processor {
     }
 
     fn canonical_vault_lp_matcher_program() -> Result<Pubkey, ProgramError> {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             Ok(crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM)
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             Err(PercolatorError::VaultLpMatcherNotApproved.into())
         }
@@ -36797,11 +36807,11 @@ pub mod processor {
     /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = matcher_prog;
             false
