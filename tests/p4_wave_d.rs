@@ -99,12 +99,23 @@ impl P3 {
     }
 
     fn new() -> Self {
+        Self::new_with_matcher(None)
+    }
+
+    /// `matcher_override`: mount the vault-LP matcher at this id instead of the canonical one.
+    /// With `PIN_FLAVOUR=1` the canonical matcher is the pinned placeholder `[0xA3; 32]`.
+    fn new_with_matcher(matcher_override: Option<Pubkey>) -> Self {
         std::env::set_var("INDEP_WRAPPER_SO", p3_so());
         let mut params = market_params();
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
+        let canonical = if std::env::var("PIN_FLAVOUR").as_deref() == Ok("1") {
+            Pubkey::new_from_array([0xA3; 32])
+        } else {
+            "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap()
+        };
+        let matcher = matcher_override.unwrap_or(if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { canonical });
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -3317,4 +3328,31 @@ fn r9_licence_shrinks_with_senior_recovery() {
     eprintln!("R-9 draw with senior outstanding {x} -> {:?}; backstop {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w));
     r.expect("draw");
     assert_eq!(backstop_st(&w) as u128, x, "licence = seniors' outstanding loss");
+}
+
+/// Item 4 (tag 94 on a PINNED build). Needs the `mainnet-ids-test-placeholders` `.so` (pinned wrapper
+/// `[0xA2; 32]`, pinned vault-LP matcher `[0xA3; 32]`): run with `PIN_FLAVOUR=1` and that `.so` as
+/// `INDEP_WRAPPER_SO` (`scripts/pin-flavour-tests.sh`). A vault LP CAN be created under the pinned
+/// matcher id; under ANY other matcher id tag 94 is refused with `VaultLpMatcherNotApproved`, so the
+/// pin is what decides (on a build with no pin tag 94 is refused for every matcher).
+#[test]
+#[ignore = "pinned flavour: run scripts/pin-flavour-tests.sh (mainnet-ids-test-placeholders .so, PIN_FLAVOUR=1)"]
+fn pin_tag94_vault_lp_only_under_the_pinned_matcher() {
+    assert_eq!(std::env::var("PIN_FLAVOUR").as_deref(), Ok("1"), "set PIN_FLAVOUR=1 and use the placeholder-pin .so");
+    // Control: the pinned matcher: the vault LP is created.
+    let mut w = P3::new();
+    w.create_vault();
+    let admin = w.env.admin.insecure_clone();
+    let r = w.init_vault_lp(&admin, 1_000);
+    assert!(r.is_ok(), "tag 94 under the pinned matcher must succeed on a pinned build: {r:?}");
+    assert_ne!(w.lp, Pubkey::default());
+    // Negative control: any other matcher id is refused.
+    let refused = percolator_prog::error::PercolatorError::VaultLpMatcherNotApproved as u32;
+    for other in [Pubkey::new_from_array([0xA4; 32]), Pubkey::new_unique()] {
+        let mut w2 = P3::new_with_matcher(Some(other));
+        w2.create_vault();
+        let admin2 = w2.env.admin.insecure_clone();
+        let r2 = w2.init_vault_lp(&admin2, 1_000);
+        assert!(has(&r2, refused), "tag 94 under matcher {other} must be refused ({refused}): {r2:?}");
+    }
 }
