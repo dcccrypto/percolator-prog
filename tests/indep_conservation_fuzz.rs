@@ -2819,7 +2819,7 @@ fn indep_f3_adl_reduce_only_then_owner_exits_reopen_market() {
     w.do_deposit(b, 5_000_000).unwrap();
     let _ = w.do_crank(a);
     let _ = w.do_crank(b);
-    assert_eq!(w.do_trade_nocpi(a, b, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)), Err(Some(21)), "spec: no fresh attach while A != ADL_ONE");
+    assert_eq!(w.do_trade_nocpi(a, b, POS_SCALE as i128, w.mark).map_err(|e| custom_code(&e)), Err(Some(120)), "spec: no fresh attach while A != ADL_ONE (P2b E7: the DISTINCT close-only code EngineAdlReduceOnly=120, not the generic EngineLockActive=21 this test was written against)");
     let left = w.owner_exits(6);
     assert_eq!(left, 0, "every holder must exit on its own signature (tag 44)");
     assert!(!w.in_adl_reduce_only(), "zero-OI reset must restore A = ADL_ONE");

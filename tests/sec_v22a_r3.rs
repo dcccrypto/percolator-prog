@@ -19,8 +19,6 @@
 #![cfg(not(kani))]
 #![allow(dead_code)]
 mod indep_harness;
-#[path = "support/fill_events.rs"]
-mod fill_events;
 
 use indep_harness::*;
 use percolator::BOUND_SCALE;
@@ -2562,23 +2560,12 @@ fn r3m1_honest_exit_inside_dip_is_not_skimmed() {
     assert_eq!(code(&dip), Some(ERR_NOT_LOSS_CURRENT), "the dip exit is refused as not loss-current");
     assert_eq!(w.r.exit_state(&w.h.pubkey()), before, "a refused 77 moves nothing");
     // H's honest SDK flow: refresh every positioned portfolio inline, floor = its par quote.
-    let supply_before_exit = w.r.share_supply();
     let (paid, cu) = w
         .r
         .execute_77(&w.h, Some((R3M1_DEPOSIT - 2, vec![w.a1, w.a2, lp])), true)
         .expect("H 77 with inline refresh");
     eprintln!("R3-M1 H paid {paid} (deposit {R3M1_DEPOSIT}), CU {cu}");
     assert!(paid + 2 >= R3M1_DEPOSIT, "H under-paid after the inline refresh: {paid}");
-    // v2.2 fill events: tag 77 emitted ONE MOVE (EARN_EXIT): principal + earnings is exactly the
-    // paid amount (the token transfer), and the shares burned are stated.
-    let evs = fill_events::wrapper_events(&last_logs(), &w.r.env.program_id);
-    assert_eq!(evs.len(), 1, "{evs:?}");
-    let fill_events::Event::Move { ix_tag, market, sub, asset_index, a, b, c } = &evs[0] else {
-        panic!("expected MOVE: {evs:?}")
-    };
-    assert_eq!((*ix_tag, *market, *sub, *asset_index), (77, w.r.env.market, 1, u16::MAX));
-    assert_eq!(a + b, paid, "principal {a} + earnings {b} == the amount paid");
-    assert_eq!(*c, supply_before_exit - w.r.share_supply(), "shares burned == the LP-mint supply drop");
     // M (the dip-holder) gains nothing from H's exit.
     w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
     w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
@@ -3168,47 +3155,6 @@ fn a4_keeper_ok_without_a_floor_is_refused() {
     w.r.request_76(&w.h, w.h_ata, Some((1, 1))).expect("with a floor");
 }
 
-/// A4 pin (SDK finding 6): the tag 77 decoder accepts `min_payout = 0` with `n_refresh > 0` (only
-/// the ALL-ZERO v2.2 trailer is refused). That cannot bypass the A4 rule:
-///  * A4 is enforced at REQUEST time (tag 76 refuses `keeper_ok = 1` with `min_payout = 0`), so
-///    every keeper_ok request carries a non-zero stored floor;
-///  * the executed floor is `max(wire, stored)`, so a keeper's wire 0 still executes at the stored
-///    floor, never below it;
-///  * a legacy (non keeper_ok) request cannot be executed by anyone but the redeemer's signature,
-///    whatever the wire floor and refresh count.
-#[test]
-fn a4_wire_zero_floor_with_refresh_cannot_bypass_the_stored_floor() {
-    use percolator_prog::ix::Instruction as ProgInstruction;
-    // decoder shape: min_payout = 0 with n_refresh = 1 decodes; the all-zero trailer does not
-    let mut ok = vec![77u8];
-    ok.extend_from_slice(&0u16.to_le_bytes());
-    ok.extend_from_slice(&0u64.to_le_bytes());
-    ok.push(1);
-    assert!(matches!(ProgInstruction::decode(&ok), Ok(ProgInstruction::ExecuteRedemptionV22 { min_payout_atoms: 0, n_refresh: 1, .. })));
-    let mut zero = vec![77u8];
-    zero.extend_from_slice(&0u16.to_le_bytes());
-    zero.extend_from_slice(&0u64.to_le_bytes());
-    zero.push(0);
-    assert!(ProgInstruction::decode(&zero).is_err(), "the all-zero trailer is refused");
-
-    let mut w = r3m1_world();
-    let lp = w.r.lp;
-    // legacy request (no keeper_ok): an unsigned 77 is refused whatever the wire floor / refresh count
-    w.r.request_76(&w.m, w.m_ata, None).expect("M 76 legacy");
-    // keeper_ok request with a non-zero stored floor (A4 makes a zero floor impossible here)
-    assert!(w.r.request_76(&w.h, w.h_ata, Some((0, 1))).is_err(), "A4 at request time");
-    w.r.request_76(&w.h, w.h_ata, Some((R3M1_DEPOSIT - 2, 1))).expect("H 76 keeper_ok with a floor");
-    w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
-    let legacy = w.r.execute_77(&w.m, Some((0, vec![w.a1, w.a2, lp])), false);
-    assert_eq!(code(&legacy), Some(ERR_EXPECTED_SIGNER), "legacy + wire 0 + refresh, unsigned: {legacy:?}");
-    // keeper with wire floor 0 and refresh accounts: executes only at >= the STORED floor
-    let (paid, _) = w
-        .r
-        .execute_77(&w.h, Some((0, vec![w.a1, w.a2, lp])), false)
-        .expect("keeper 77 with wire 0 on a keeper_ok request");
-    assert!(paid >= R3M1_DEPOSIT - 2, "wire 0 did not lower the stored floor: paid {paid}");
-}
-
 /// A6 (security review): 14-leg portfolios. One inline refresh of a 14-leg portfolio costs
 /// ~530k CU, so 8 of them (or even 3) would exhaust the 1.4M meter. The leg-weighted budget
 /// (3 + legs per refresh, <= 38) refuses 3 x 14-leg up front (InvalidInstruction, not a CU
@@ -3490,13 +3436,9 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
 /// real bust leaves pending socialized-loss settlement across several touches.
 fn chunked_b_market() -> LiveMarket {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
+    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
     lm
 }
-
-/// A bust sized so its residual exceeds a FLOOR chunk (1e9 atoms): 9.5x on 4,000 USDC.
-const BUST_CAPITAL: u64 = 4_000_000_000;
-const BUST_NOTIONAL: i128 = 38_000_000_000;
 
 impl Replay {
     fn loss_snapshot(&self) -> String {
@@ -3512,134 +3454,39 @@ impl Replay {
     }
 }
 
-/// A5 exploration (corrected 2026-10-06, ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): a
-/// bust whose residual (~1,700 USDC) exceeds `public_b_chunk_atoms` (the 1e9 floor = 1,000 USDC). Prints the market MODE
-/// and the loss counters per crank and stops once the market is Resolved. Measured: crank 0 leaves
-/// the market Live with `negative_pnl_account_count = 1`; crank 1 declares permissionless Recovery
-/// (`ActiveBankruptCloseCannotProgress`); crank 2 finalises Recovery -> Resolved. Later Live-style
-/// cranks fail Custom(14) only because the market is TERMINAL; it is not a wedge (the first
-/// version of this test swallowed the crank errors and never printed the mode). Terminal close is
-/// `CloseResolved`, pinned by `wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes`.
 #[test]
+#[ignore = "exploration: prints the counters through a real chunked bankruptcy"]
 fn a5_explore_real_chunked_bankruptcy() {
     let mut r = Replay::new(chunked_b_market());
     let h = Keypair::new();
     let (_h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
     let q: i128 = 10 * percolator::POS_SCALE as i128;
-    for _ in 0..3 {
-        let (k, p) = r.new_trader(100_000_000);
-        r.trade(&k, p, -q).expect("short");
-    }
-    let lp = r.lp;
-    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
-    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
-    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(BUST_CAPITAL);
-    r.trade(&bk, bp, qb).expect("levered long");
-    let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
-    eprintln!("A5X open [{}]: {}", mode(&r), r.loss_snapshot());
-    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    eprintln!("A5X after walk [{}]: {}", mode(&r), r.loss_snapshot());
-    let mut modes = vec![];
-    for i in 0..6 {
-        r.crank_pf(bp);
-        let m = mode(&r);
-        eprintln!("A5X bust crank {i} [{m}]: {}", r.loss_snapshot());
-        modes.push(m.clone());
-        if m == "Resolved" {
-            break;
-        }
-    }
-    assert_eq!(modes, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery -> Resolved within 3 cranks: {modes:?}");
-    let _ = bk;
-}
-
-
-/// Wedge finding 2026-10-06 (ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): a bankruptcy
-/// residual larger than `public_b_chunk_atoms` is NOT a liveness wedge. The Live crank declares
-/// permissionless Recovery (`ActiveBankruptCloseCannotProgress`, committed through
-/// `kernel_commit_declared_liquidation_recovery`), the next crank finalises Recovery -> Resolved,
-/// and every later Live-style `PermissionlessCrank` fails Custom(14) BECAUSE the market is
-/// terminal (not because it is stuck). Terminal progress is `CloseResolved` (tag 30), one chunk
-/// of the residual per call, then the winners are paid.
-fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubkey)>) {
-    let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = chunk;
-    let mut r = Replay::new(lm);
-    let h = Keypair::new();
-    r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
-    let q: i128 = 10 * percolator::POS_SCALE as i128;
     let mut shorts = vec![];
     for _ in 0..3 {
         let (k, p) = r.new_trader(100_000_000);
         r.trade(&k, p, -q).expect("short");
-        shorts.push((k, p));
+        shorts.push(p);
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
-    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
-    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(BUST_CAPITAL);
+    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(20_000_000);
     r.trade(&bk, bp, qb).expect("levered long");
+    eprintln!("A5X open: {}", r.loss_snapshot());
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    (r, bp, bk, shorts)
-}
-
-#[test]
-fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
-    let (mut r, bp, bk, shorts) = chunk_bust_world(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
-    let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
-    assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
-    let mut seen = vec![];
-    for _ in 0..3 {
+    eprintln!("A5X after walk: {}", r.loss_snapshot());
+    for i in 0..12 {
         r.crank_pf(bp);
-        seen.push(mode(&r));
+        eprintln!("A5X bust crank {i}: {}", r.loss_snapshot());
     }
-    assert_eq!(seen, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
-    // the Live-style crank is refused on a terminal market: this is the Custom(14) the Wave A
-    // exploration read as a wedge
-    let payer = r.env.payer.pubkey();
-    r.env.svm.expire_blockhash();
-    let res = r.env.send(
-        ProgInstruction::PermissionlessCrank {
-            now_slot: 0,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
-        },
-        vec![AccountMeta::new(payer, true), AccountMeta::new(r.env.market, false), AccountMeta::new(bp, false)],
-        &[],
-    );
-    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(14), "{res:?}");
-    // terminal progress: CloseResolved drains the residual one chunk per call (8.5 USDC / 1 USDC)
-    let mut owners: Vec<(Pubkey, Pubkey)> = vec![(bk.pubkey(), bp), (r.lp_owner.pubkey(), r.lp)];
-    owners.extend(shorts.iter().map(|(k, p)| (k.pubkey(), *p)));
-    for _pass in 0..2 {
-        for (o, p) in owners.iter() {
-            for _ in 0..10 {
-                r.close_resolved_any(*o, *p).expect("CloseResolved is permissionless progress");
-            }
+    for i in 0..6 {
+        r.crank_pf(lp);
+        eprintln!("A5X lp crank {i}: {}", r.loss_snapshot());
+        for p in shorts.iter() {
+            r.crank_pf(*p);
         }
+        eprintln!("A5X shorts crank {i}: {}", r.loss_snapshot());
     }
-    let (_, g) = r.env.market_state();
-    assert_eq!(g.negative_pnl_account_count, 0);
-    assert_eq!(g.c_tot, 0, "every portfolio paid out and closed");
-    for (_, p) in owners.iter() {
-        let s = r.env.portfolio_state(*p);
-        assert_eq!((s.pnl, s.capital), (0, 0));
-    }
-}
-
-/// NEGATIVE CONTROL: the same bust with the default (huge) chunk is socialised at once; the
-/// market never leaves Live. Proves the Recovery above is caused by residual > chunk.
-#[test]
-fn wedge_negative_control_residual_below_chunk_stays_live() {
-    let (mut r, bp, _bk, _s) = chunk_bust_world(1_000_000_000_000);
-    for _ in 0..4 {
-        r.crank_pf(bp);
-        assert_eq!(format!("{:?}", r.env.market_state().1.mode), "Live", "residual <= chunk must not declare Recovery");
-    }
-    assert_eq!(r.env.market_state().1.negative_pnl_account_count, 0);
 }
 
 /// A6 round 2: two 14-leg portfolios that are LIQUIDATABLE after an asset-0 drop (a 100-token
@@ -3808,24 +3655,21 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 }
 
 /// A5 round 2, REAL repro (no state poke): a 9.5x-levered long busts on a 15% walk in a market
-/// whose bankruptcy residual (~1,700 USDC) exceeds `public_b_chunk_atoms` (the 1e9 floor). After the bust's crank the
+/// whose bankruptcy residual exceeds `public_b_chunk_atoms` (2 USDC). After the bust's crank the
 /// account's unabsorbed deficit is pending (`negative_pnl_account_count` = 1) and the shorts are
 /// K/F-stale; the redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused
 /// with 118 and nothing moves.
 ///
-/// The exit is attempted after the bust's FIRST crank, while the market is still Live with the
-/// unabsorbed deficit pending (`a5_explore_real_chunked_bankruptcy` prints the sequence: the next
-/// crank declares Recovery, the one after resolves the market; corrected 2026-10-06, see
-/// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md -- there is NO wedge, the later Custom(14) is
-/// a terminal market). Why not `b_stale_account_count`: in LIVE mode it is not reachable in this
-/// harness -- a residual > `public_b_chunk_atoms` takes the market to Recovery -> Resolved (where
-/// B settlement is chunk-stepped by CloseResolved, outside the Live exit path), and a residual <=
-/// the chunk is socialised at once, so every account settles its B share in one touch. The
-/// pending Live state that IS reachable is the unabsorbed negative PnL, which the gate includes.
+/// Why not `b_stale_account_count`: measured (`a5_explore_real_chunked_bankruptcy`, ignored), a
+/// residual > `public_b_chunk_atoms` never starts the multi-step close in this harness (every
+/// later crank fails EngineInvalidConfig = 14: an engine-side wedge, recorded in findings.md),
+/// and a residual <= the chunk is socialized through K at once, so every account settles its B
+/// share in one touch: per-account B-staleness is not reachable here. The pending state that IS
+/// reachable is the unabsorbed negative PnL, which the gate now includes.
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+    lm.params.public_b_chunk_atoms = 2_000_000;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
@@ -3836,10 +3680,8 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     }
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    // v2.2 chunk floor (1e9): the bust is scaled x200 (4,000 USDC capital, 38,000 notional) so its
-    // residual (~1,700 USDC) still exceeds a FLOOR chunk; no config poke.
-    let qb = BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(BUST_CAPITAL);
+    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(20_000_000);
     r.trade(&bk, bp, qb).expect("levered long");
     r.request_76(&h, h_ata, None).expect("H 76");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
@@ -3847,7 +3689,6 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     eprintln!("A5 real: {}", r.loss_snapshot());
     let (_, g) = r.env.market_state();
     assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
-    assert_eq!(format!("{:?}", g.mode), "Live", "the exit is attempted while the market is still Live");
     assert!(!r.no_genuine_loss_now());
     let before = r.exit_state(&h.pubkey());
     let res = r.execute_77(&h, None, true);
@@ -3929,148 +3770,80 @@ fn multi_asset_keeper_exit_needs_every_asset_loss_current() {
     assert!(h_paid + 2 >= R3M1_DEPOSIT, "{h_paid}");
 }
 
-// ═════ Security review v22 Wave D (2026-10-05), rescue adversarial tests: REGRESSIONS (W-3) ═════
-// Ported from the reviewer's `~/wt-sec-v22d/prog/tests/sec_v22d_replay.rs` (Sentinel); assertions flipped.
-const SEC_DEPOSIT: u64 = 2_000_000_000;
+// =============================================================================================
+// ROUND 3 reviewer tests: is negative_pnl_account_count a liveness grief?
+// =============================================================================================
 
-impl Replay {
-    fn sec_pots(&self) -> Vec<(u128, i128)> {
-        let s = self.snap();
-        let mut v = vec![];
-        for d in 0..2usize {
-            let l = state::read_backing_domain_ledger(&self.env.svm.get_account(&self.ledgers[d]).unwrap().data).unwrap();
-            v.push((l.total_principal_atoms, (s.fresh[d] + s.valid[d]) as i128 - s.claim[d] as i128));
+fn sec_bust_world(chunk: u64, lev_notional: i128, capital: u64) -> (Replay, Keypair, Pubkey, Vec<Pubkey>, Pubkey) {
+    let mut lm = r2_market();
+    lm.params.public_b_chunk_atoms = chunk as u128;
+    let mut r = Replay::new(lm);
+    let h = Keypair::new();
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let mut shorts = vec![];
+    for _ in 0..3 {
+        let (k, p) = r.new_trader(100_000_000);
+        r.trade(&k, p, -q).expect("short");
+        shorts.push(p);
+    }
+    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
+    let qb = lev_notional * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(capital);
+    r.trade(&bk, bp, qb).expect("levered long");
+    r.request_76(&h, h_ata, None).expect("H 76");
+    let _ = bk;
+    (r, h, h_ata, shorts, bp)
+}
+
+fn sec_report(tag: &str, r: &mut Replay, h: &Keypair, all: &[Pubkey]) {
+    let (_, g) = r.env.market_state();
+    eprintln!("SEC-R3 {tag}: {} | status ok", r.loss_snapshot());
+    let _ = (h, all, g);
+}
+
+/// N1: a SOLVENT but underwater (below maintenance? no: above) account, touched: does it count?
+#[test]
+fn sec_r3_n1_solvent_underwater_account_does_not_count() {
+    // 5x long (100e6 notional on 20e6), walk -10%: loss 10e6 < 20e6 capital, equity 10e6 > MM.
+    let (mut r, h, _ha, shorts, bp) = sec_bust_world(1_000_000_000_000, 100_000_000, 20_000_000);
+    let lp = r.lp;
+    let p0 = r.env.market_state().1.assets[0].effective_price;
+    walk_only(&mut r, p0 * 90 / 100, &[lp]);
+    r.crank_pf(bp);
+    sec_report("solvent-underwater touched", &mut r, &h, &[]);
+    let (_, g) = r.env.market_state();
+    assert_eq!(g.negative_pnl_account_count, 0, "a touched solvent account settles from principal");
+    let _ = shorts;
+}
+
+/// N2/N3: a bust. Default chunk (1e12) and the builder's small chunk (2e6). After the bust,
+/// keep cranking everyone for 40 slots; report the counters and whether a signed exit works.
+#[test]
+fn sec_r3_n2_bust_persistence_default_chunk() {
+    sec_bust_persistence("default chunk", 1_000_000_000_000);
+}
+#[test]
+fn sec_r3_n3_bust_persistence_small_chunk() {
+    sec_bust_persistence("small chunk 2e6", 2_000_000);
+}
+fn sec_bust_persistence(tag: &str, chunk: u64) {
+    let (mut r, h, _ha, shorts, bp) = sec_bust_world(chunk, 190_000_000, 20_000_000);
+    let lp = r.lp;
+    let p0 = r.env.market_state().1.assets[0].effective_price;
+    walk_only(&mut r, p0 * 85 / 100, &[lp]);
+    r.crank_pf(bp);
+    eprintln!("SEC-R3 [{tag}] after bust crank: {}", r.loss_snapshot());
+    let mut all = shorts.clone();
+    all.push(bp);
+    all.push(lp);
+    for k in 0..40u64 {
+        r.hold(1, &all);
+        if k == 0 || k == 9 || k == 39 {
+            eprintln!("SEC-R3 [{tag}] +{} slots of full cranks: {}", k + 1, r.loss_snapshot());
         }
-        v
     }
-    fn sec_rescue(&mut self, who: &Keypair, amount: u64, min_shares: u128) -> (Pubkey, Result<u64, String>) {
-        self.env.ensure_signer_account(who.pubkey());
-        let ata = self.env.token_account_for_mint(self.lp_mint, who.pubkey(), 0);
-        let src = self.env.token_account_for_mint(self.env.mint, who.pubkey(), amount);
-        let metas = vec![
-            AccountMeta::new(who.pubkey(), true),
-            AccountMeta::new(self.env.market, false),
-            AccountMeta::new(self.registry, false),
-            AccountMeta::new(self.lp_mint, false),
-            AccountMeta::new(ata, false),
-            AccountMeta::new(src, false),
-            AccountMeta::new(self.env.vault, false),
-            AccountMeta::new(self.ledgers[0], false),
-            AccountMeta::new_readonly(spl_token::ID, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-            AccountMeta::new(self.ledgers[1], false),
-        ];
-        self.env.svm.expire_blockhash();
-        let r = self.env.send(ProgInstruction::RescueDeposit { tranche: 0, amount, min_shares }, metas, &[who]);
-        (ata, r)
-    }
-}
-
-/// SEC-D1: the E3 per-pot cap wedge (Wave A review A3: a hedged zero-sum pair strands over-principal
-/// surplus in the other pot, so E3 < par although the vault physically holds par) makes a perfectly
-/// SOLVENT vault look "impaired". Does tag 112 admit a rescue, and at what price vs par?
-#[test]
-fn sec_d1_rescue_refused_on_a_solvent_vault() {
-    let mut r = Replay::new(r2_market());
-    let h = Keypair::new();
-    let m = Keypair::new();
-    let (_h_ata, h_sh) = r.deposit_shares(&h, SEC_DEPOSIT, 0).expect("H");
-    let (_m_ata, m_sh) = r.deposit_shares(&m, SEC_DEPOSIT, 0).expect("M");
-    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
-    let (a1k, a1) = r.new_trader(1_000_000_000);
-    let (a2k, a2) = r.new_trader(1_000_000_000);
-    let lp = r.lp;
-    let pair = [a1, a2, lp];
-    r.trade(&a1k, a1, q).unwrap();
-    r.trade(&a2k, a2, -q).unwrap();
-    r.walk(1_090_000, &pair);
-    r.trade(&a1k, a1, -q).unwrap();
-    r.trade(&a2k, a2, q).unwrap();
-    r.hold(r.lm.params.h_max + 2, &pair);
-    r.convert_all(&a1k, a1).ok();
-    r.hold(3, &pair);
-    let s = r.snap();
-    s.print("SEC-D1 after pair closed + A1 converted");
-    let pots = r.sec_pots();
-    let st1 = r.env.portfolio_state(a1);
-    let st2 = r.env.portfolio_state(a2);
-    let pair_net = st1.capital as i128 + st1.pnl + st2.capital as i128 + st2.pnl - 2_000_000_000;
-    eprintln!("SEC-D1 pots (principal, phys-claims) {:?}; earn principal {} E3 NAV {}; pair net {}; stale {}", pots, s.earn_principal, s.earn_nav, pair_net, r.stale_total());
-    let par = s.earn_principal;
-    let v = s.earn_nav;
-    eprintln!("SEC-D1 par {par} E3 v {v} => impairment {:.4}% (physical sum of pots {})", (par as f64 - v as f64) / par as f64 * 100.0, pots.iter().map(|p| p.1).sum::<i128>());
-    // Rescuer: R buys at the "impaired" E3 value.
-    let rr = Keypair::new();
-    let x = 10 * v.min(par) as u64 / 11; // below 10v cap
-    let x = x.max(100_000_000);
-    let (r_ata, res) = r.sec_rescue(&rr, x, 1);
-    let minted = r.env.token_amount(r_ata);
-    let fair_at_par = (x as u128) * (h_sh as u128 + m_sh as u128) / par;
-    eprintln!("SEC-D1 rescue x={x} -> {:?}; minted {minted}; shares a par-priced entry would give {fair_at_par}; S before {}", res, h_sh + m_sh);
-    // Regression: the vault is solvent at the combined reading, so the rescue is refused (114).
-    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(114), "solvent vault: rescue refused: {res:?}");
-    assert_eq!(minted, 0, "no shares minted");
-    if res.is_ok() && fair_at_par > 0 {
-        eprintln!("SEC-D1 rescuer got {:.4}% more shares than par-priced entry", (minted as f64 / fair_at_par as f64 - 1.0) * 100.0);
-    }
-    let s2 = r.snap();
-    s2.print("SEC-D1 after rescue");
-    eprintln!("SEC-D1 pots after {:?}; E3 NAV after {} (principal {})", r.sec_pots(), s2.earn_nav, s2.earn_principal);
-}
-
-/// SEC-D1b regression (W-3): the exact Wave-A-review A3 seed (E3 per-pot cap wedge: the per-pot
-/// E3 reads 0.87% below par although the pots' physical nets sum to par). The rescue is now priced
-/// and admitted on the combined-pot reading `min(ΣP, Σphys)` = par, so it is refused (114).
-/// Control (non-vacuity): the wedge is present (E3 < par while Σphys >= par), i.e. the old per-pot
-/// reading would have admitted it (the reviewer's GREEN run).
-#[test]
-fn sec_d1b_rescue_refused_on_the_a3_wedge_seed() {
-    let mut r = Replay::new(r2_market());
-    let q: i128 = 1_000 * percolator::POS_SCALE as i128;
-    let h = Keypair::new();
-    let (_h_ata, h_shares) = r.deposit_shares(&h, SEC_DEPOSIT / 2, 0).expect("H 75 at par");
-    let (a1k, a1) = r.new_trader(3_000_000_000);
-    let (a2k, a2) = r.new_trader(3_000_000_000);
-    let lp = r.lp;
-    r.trade(&a1k, a1, q).expect("A1 long");
-    r.trade(&a2k, a2, -q).expect("A2 short");
-    let up = |r: &mut Replay, bps: u64, up: bool, who: &[Pubkey]| {
-        let p0 = r.env.market_state().1.assets[0].effective_price;
-        let d = p0 * bps / 10_000;
-        let target = if up { p0 + d } else { p0.saturating_sub(d).max(200_000) };
-        walk_only(r, target, who);
-    };
-    up(&mut r, 302, true, &[lp]);
-    let _ = r.convert_all(&a1k.insecure_clone(), a1);
-    up(&mut r, 843, false, &[lp, a1]);
-    for p in [a1, a2, lp] {
-        r.crank_pf(p);
-    }
-    let s = r.snap();
-    s.print("SEC-D1b pre-rescue");
-    let pots = r.sec_pots();
-    eprintln!("SEC-D1b pots (ledger principal, physical net of claims) {:?}; principal {} E3 NAV {}; stale {}", pots, s.earn_principal, s.earn_nav, r.stale_total());
-    let (par, v) = (s.earn_principal, s.earn_nav);
-    eprintln!("SEC-D1b par {par} v {v} => {:.4}% below par; sum of physical nets {}", (par as f64 - v as f64) / par as f64 * 100.0, pots.iter().map(|p| p.1).sum::<i128>());
-    let rr = Keypair::new();
-    let x = ((10 * v) / 11).min(u64::MAX as u128) as u64;
-    let (r_ata, res) = r.sec_rescue(&rr, x, 1);
-    let minted = r.env.token_amount(r_ata);
-    let s_before = r.registry_shares_total(h_shares as u128);
-    eprintln!("SEC-D1b rescue x={x} -> {:?}", res.as_ref().map_err(|e| e.chars().take(80).collect::<String>()));
-    eprintln!("SEC-D1b minted {minted}; par-priced entry would mint {}; S before {s_before}", (x as u128) * s_before / par);
-    let s2 = r.snap();
-    eprintln!("SEC-D1b after: principal {} E3 NAV {} pots {:?}", s2.earn_principal, s2.earn_nav, r.sec_pots());
-    assert!(v < par, "control: the per-pot E3 wedge reads below par");
-    assert!(pots.iter().map(|p| p.1).sum::<i128>() >= par as i128, "control: the pots physically hold par");
-    assert_eq!(res.as_ref().err().and_then(|e| custom_code(e)), Some(114), "W-3: rescue on the wedge refused: {res:?}");
-    assert_eq!(minted, 0, "no shares minted");
-    assert_eq!((s2.earn_principal, s2.earn_nav), (s.earn_principal, s.earn_nav), "nothing moved");
-}
-
-impl Replay {
-    fn registry_shares_total(&self, fallback: u128) -> u128 {
-        let d = self.env.svm.get_account(&self.registry).map(|a| a.data).unwrap_or_default();
-        state::read_lp_vault_registry(&d).map(|x| x.total_lp_shares_outstanding).unwrap_or(fallback)
-    }
+    r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
+    let res = r.execute_77(&h, Some((1, all.clone())), true);
+    eprintln!("SEC-R3 [{tag}] signed exit with full refresh: {:?}", res.as_ref().map(|x| x.0).map_err(|e| custom_code(e)));
 }

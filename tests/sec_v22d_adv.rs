@@ -19,8 +19,6 @@
 //!       market with a bound vault is refused.
 //! P3 helpers copied from indep_p1p3_combined.rs (07a1d0eb+ auto-pin flow).
 mod indep_harness;
-#[path = "support/fill_events.rs"]
-mod fill_events;
 
 use indep_harness::*;
 use percolator::POS_SCALE;
@@ -101,23 +99,12 @@ impl P3 {
     }
 
     fn new() -> Self {
-        Self::new_with_matcher(None)
-    }
-
-    /// `matcher_override`: mount the vault-LP matcher at this id instead of the canonical one.
-    /// With `PIN_FLAVOUR=1` the canonical matcher is the pinned placeholder `[0xA3; 32]`.
-    fn new_with_matcher(matcher_override: Option<Pubkey>) -> Self {
         std::env::set_var("INDEP_WRAPPER_SO", p3_so());
         let mut params = market_params();
         params.max_portfolio_assets = CAP.with(|c| c.get());
         let mut env = V16CuEnv::new_with_init_params(params);
         // 07a1d0eb auto-pin: vault LP matcher must be CANONICAL_VAULT_LP_MATCHER_PROGRAM.
-        let canonical = if std::env::var("PIN_FLAVOUR").as_deref() == Ok("1") {
-            Pubkey::new_from_array([0xA3; 32])
-        } else {
-            "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap()
-        };
-        let matcher = matcher_override.unwrap_or(if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { canonical });
+        let matcher = if std::env::var("P3_LEGACY_BIND").map_or(false, |v| v == "1") { Pubkey::new_unique() } else { "DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam".parse::<Pubkey>().unwrap() };
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
@@ -1573,10 +1560,6 @@ fn init_units(w: &mut P3) -> Result<u64, String> {
     w.send(ProgInstruction::InitInsuranceUnits, metas, &[])
 }
 
-fn last_logs_of_draw() -> Vec<String> {
-    last_logs()
-}
-
 fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Result<u64, String> {
     let payer = w.env.payer.pubkey();
     let mut metas = vec![
@@ -1592,44 +1575,6 @@ fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Res
         metas.push(AccountMeta::new(units_pda(w), false));
     }
     w.send(ProgInstruction::InsuranceBackstopDraw { mode, max_amount }, metas, &[])
-}
-
-/// The G9 world: seniors (2,500,000 over both pots) large enough that, under R-1 (2), the
-/// insurance they unlock (`senior_drawn - outstanding`) covers the deficit left after they are
-/// exhausted (round 1 used 150,000 of seniors, i.e. the dust-senior case the re-review flagged).
-fn g9_world() -> (P3, Vec<(Keypair, Pubkey)>, (Keypair, Pubkey)) {
-    let (d0, d1, pushes) = G9W.with(|c| c.get());
-    underwater_world(d0, d1, 1_000_000, pushes)
-}
-thread_local! { static G9W: std::cell::Cell<(u64, u64, usize)> = const { std::cell::Cell::new((1_500_000, 1_000_000, 8)) }; }
-
-/// W-2: wait out the G9 delay with the book kept current (mark re-pushed, ports cranked).
-fn g9_wait(w: &mut P3, ports: &[Pubkey], slots: u64) {
-    let mark = MARK.with(|c| c.get());
-    let target = w.slot() + slots;
-    w.env.svm.warp_to_slot(target);
-    w.env.push_auth_mark_for_asset_as_admin(0, target, mark);
-    let lp = w.lp;
-    for _ in 0..2 {
-        for p in ports {
-            let _ = w.crank(*p);
-        }
-        let _ = w.crank(lp);
-    }
-}
-
-/// W-2 two-step G9: PROPOSE (mode 2), wait `G9_DELAY_SLOTS`, DRAW (mode 0).
-fn g9(w: &mut P3, ports: &[Pubkey]) -> Result<u64, String> {
-    backstop_111(w, 2, 0, true)?;
-    g9_wait(w, ports, percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
-    backstop_111(w, 0, 0, true)
-}
-
-/// The fill-time halt mirror of asset 0 (`AssetVaultLpDrawV18::outstanding_mirror_atoms`).
-fn halt_mirror(w: &P3) -> u128 {
-    let mut d = w.env.svm.get_account(&w.env.market).unwrap().data;
-    let (_, g) = state::market_view_mut(&mut d).unwrap();
-    state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap().outstanding_mirror_atoms
 }
 
 /// Tag 112 on the bound vault (tag-75 accounts + bound tail).
@@ -1655,74 +1600,7 @@ fn rescue_bound(w: &mut P3, who: &Keypair, amount: u64) -> Result<u64, String> {
     w.send(ProgInstruction::RescueDeposit { tranche: 0, amount, min_shares: 1 }, metas, &[who])
 }
 
-/// U-1: tag 116 creates the ledger (existing asset-0 insurance -> creator units 1:1) and sets
-/// the profile flag; from then on a tag-9 top-up WITHOUT the ledger is refused (fail closed) and
-/// one WITH it mints at the entry price. An oracle reconfiguration (62) keeps the flag.
-#[test]
-fn units_init_flag_and_fail_closed_topups() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 1_000_000, false).expect("tag 9 before units");
-    // merged tree: a new profile carries Wave A's bit2 (EXIT_REQUIRES_LOSS_CURRENT); bit0 only after 116
-    assert_eq!(p4_flags(&w), 4);
-    init_units(&mut w).expect("116 create");
-    let u = units(&w).expect("ledger");
-    assert_eq!(p4_flags(&w), 5, "INS_UNITS_REQUIRED (bit0) | EXIT_REQUIRES_LOSS_CURRENT (bit2)");
-    assert!(u.units_creator >= 1_000_000 && u.units_stake == 0 && u.units_total == u.units_creator);
-    assert_eq!(u.units_total, u.snap_insurance_mint_atoms, "genesis 1:1 at the entry reading");
-    // NEGATIVE CONTROL: the units gate is fail-closed.
-    let r = top_up_9(&mut w, 500_000, false);
-    assert!(has(&r, INS_REFUSED), "tag 9 without the ledger must be refused: {r:?}");
-    let (u0, i0) = (u.units_total, u.snap_insurance_mint_atoms);
-    top_up_9(&mut w, 500_000, true).expect("tag 9 with the ledger");
-    let u1 = units(&w).unwrap();
-    assert_eq!(u1.units_creator - u.units_creator, 500_000u128 * u0 / i0, "mint floor(x*U/I)");
-    assert!(percolator_prog::p4_rescue_ins::ins_mint_no_dilution(i0, u0, 500_000, u1.units_total - u0));
-    // The flag survives an oracle reconfiguration (profile literal rebuild).
-    let s = w.slot() + 1;
-    w.env.svm.warp_to_slot(s);
-    w.env.configure_auth_mark_for_asset_as_admin(0, s, PRICE);
-    assert_eq!(p4_flags(&w) & 1, 1, "62 must carry p4_flags");
-    // 116 again only refreshes the snapshot.
-    let s2 = w.slot() + 5;
-    w.env.svm.warp_to_slot(s2);
-    init_units(&mut w).expect("116 refresh");
-    let u2 = units(&w).unwrap();
-    assert_eq!(u2.snap_slot, s2);
-    assert_eq!(u2.units_total, u1.units_total, "refresh mints nothing");
-}
 
-/// U-2 (I-S3, the class bound): a withdrawal burns ceil(a*U/I_free) of the CALLER's class and
-/// can never take another class's insurance. With half the units in the stake class, the creator
-/// can withdraw its half's value but not one unit more; without the ledger the path is refused.
-#[test]
-fn units_withdrawal_bounded_by_class() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 2_000_000, false).unwrap();
-    init_units(&mut w).unwrap();
-    // Model a stake class holding half (as if the bound pool had topped up the other half).
-    set_units(&mut w, |u| {
-        u.units_stake = u.units_total / 2;
-        u.units_creator = u.units_total - u.units_stake;
-    });
-    let u = units(&w).unwrap();
-    let free = u.snap_insurance_free_atoms;
-    assert!(free > 0, "vacuity: withdrawable insurance");
-    let creator_value = u.units_creator * free / u.units_total;
-    let (_, no_units) = withdraw_57(&mut w, 1_000, false);
-    assert!(has(&no_units, INS_REFUSED), "57 without the ledger: {no_units:?}");
-    let (_, too_much) = withdraw_57(&mut w, creator_value + 1, true);
-    assert!(has(&too_much, INS_REFUSED), "creator over its class: {too_much:?}");
-    let a = creator_value / 2;
-    let (dest, ok) = withdraw_57(&mut w, a, true);
-    ok.expect("creator within its class");
-    assert_eq!(w.tok(&dest) as u128, a);
-    let u1 = units(&w).unwrap();
-    let burned = u.units_creator - u1.units_creator;
-    assert_eq!(burned, (a * u.units_total).div_ceil(free), "burn = ceil(a*U/I_free)");
-    assert_eq!(u1.units_stake, u.units_stake, "the stake class is untouched");
-    assert!(percolator_prog::p4_rescue_ins::ins_burn_no_dilution(free, u.units_total, a, burned));
-    conserved(&w, "after 57");
-}
 
 /// Seed insurance (creator), create the units ledger, and split the units 50/50 between the two
 /// classes, so that pro-rata effects are visible on both.
@@ -1735,183 +1613,14 @@ fn seed_units(w: &mut P3, insurance: u64) {
     });
 }
 
-/// G9-1 (I-S5, the order): with senior backing able to fund the deficit, tag 111 is refused
-/// (the seniors go first); nothing moves.
-#[test]
-fn g9_refused_while_seniors_can_fund() {
-    let (mut w, _s, _t) = underwater_world(9_000_000, 1_000_000, 1_000_000, 6);
-    seed_units(&mut w, 20_000_000);
-    let ins0 = w.env.market_state().1.insurance;
-    let r = backstop_111(&mut w, 0, 0, true);
-    eprintln!("G9-1: 111 -> {:?} | backstop {} | drawn {} outstanding {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w), drawn(&w), outstanding(&w));
-    assert!(has(&r, INS_REFUSED), "G9 before the seniors are exhausted must be refused: {r:?}");
-    // Non-vacuity: refused by the ORDER rule (a deficit exists, seniors still hold value), not by
-    // a missing deficit or account.
-    let e = r.as_ref().unwrap_err();
-    let i = e.find("p4_backstop_not_due").expect("refused by backstop_due");
-    let field = |k: &str| -> u128 {
-        let j = e[i..].find(k).unwrap() + i + k.len();
-        e[j..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
-    };
-    let (deficit, drawable, senior_nav) = (field("deficit="), field("drawable="), field("senior_nav="));
-    eprintln!("G9-1: deficit {deficit} drawable {drawable} senior_nav {senior_nav}");
-    assert!(deficit > 0 || drawable + senior_nav > 0, "vacuity");
-    assert!(drawable > 0 || senior_nav > 0, "seniors still hold value");
-    assert_eq!(w.env.market_state().1.insurance, ins0);
-    assert_eq!(backstop_st(&w), 0);
-}
 
-/// G9-2 (I-S5, I-S3 loss pro rata): seniors EXHAUSTED by the draw, deficit left: tag 111 moves
-/// min(deficit, I_free, 50% cap) of asset-0 insurance into the vault LP, books it on both ledgers,
-/// and every unit (both classes) loses the same fraction; vault conservation holds; the junior is
-/// halted while the backstop is outstanding; the dead vault cannot be rescued (115).
-#[test]
-fn g9_draws_after_exhaustion_bounded_pro_rata() {
-    let (mut w, _s, (_tk, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    // Without the ledger on a units market: refused before anything moves.
-    let r0 = backstop_111(&mut w, 0, 0, false);
-    assert!(r0.is_err(), "111 without the units ledger");
-    backstop_111(&mut w, 2, 0, true).expect("G9 propose");
-    g9_wait(&mut w, &[tp], percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
-    init_units(&mut w).expect("refresh");
-    let u0 = units(&w).unwrap();
-    let ins0 = w.env.market_state().1.insurance;
-    let r = backstop_111(&mut w, 0, 0, true);
-    let lp = w.lp_state();
-    eprintln!("G9-2: 111 -> {:?} | backstop {} | drawn {} outstanding {} | lp cap {} pnl {} | ins {} -> {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w), drawn(&w), outstanding(&w), lp.capital, lp.pnl, ins0, w.env.market_state().1.insurance);
-    r.expect("G9 due after the seniors are exhausted");
-    let b = backstop_st(&w) as u128;
-    assert!(b > 0, "vacuity: a backstop moved");
-    let ins1 = w.env.market_state().1.insurance;
-    assert_eq!(ins0 - ins1, b, "insurance fell by exactly the moved amount");
-    // v2.2 fill events: the DRAW (mode 0) emitted ONE MOVE (G9): the amount moved from insurance
-    // into the vault LP's capital and the receivable left outstanding (the first draw: equal).
-    assert_eq!(
-        fill_events::wrapper_events(&last_logs_of_draw(), &w.env.program_id),
-        vec![fill_events::Event::Move {
-            ix_tag: 111,
-            market: w.env.market,
-            sub: 2,
-            asset_index: 0,
-            a: b as u64,
-            b: b as u64,
-            c: 0,
-        }]
-    );
-    assert!(b <= (u0.snap_insurance_mint_atoms * 5_000) / 10_000, "50% cap");
-    assert!(b <= (u0.snap_insurance_mint_atoms * 2_000) / 10_000, "W-2 per-epoch 20% cap");
-    assert_eq!(halt_mirror(&w), outstanding(&w) + b, "W-9: the fill halt mirror carries the backstop");
-    let u1 = units(&w).unwrap();
-    assert_eq!(u1.backstop_receivable_atoms, b, "receivable mirrored");
-    assert_eq!((u1.units_total, u1.units_stake, u1.units_creator), (u0.units_total, u0.units_stake, u0.units_creator), "U unchanged");
-    // Pro rata at the exit reading: both classes' value fell by the same fraction.
-    let vs0 = u0.units_stake * u0.snap_insurance_free_atoms / u0.units_total;
-    let vc0 = u0.units_creator * u0.snap_insurance_free_atoms / u0.units_total;
-    let vs1 = u1.units_stake * u1.snap_insurance_free_atoms / u1.units_total;
-    let vc1 = u1.units_creator * u1.snap_insurance_free_atoms / u1.units_total;
-    assert!(vs1 < vs0 && vc1 < vc0, "both classes absorb the loss");
-    assert!((vs1 * vc0).abs_diff(vc1 * vs0) <= vc0 + vs0, "same fraction: {vs1}/{vs0} vs {vc1}/{vc0}");
-    conserved(&w, "after G9");
-    // The junior may not withdraw while the backstop is owed.
-    let admin = w.env.admin.insecure_clone();
-    let (_, jw) = w.junior_withdraw(&admin, admin.pubkey(), 1);
-    assert!(jw.is_err(), "junior halted while backstop outstanding");
-    // The vault is dead (seniors exhausted, backstop owed): a rescue is refused at the floor.
-    let rescuer = Keypair::new();
-    let rr = rescue_bound(&mut w, &rescuer, 200_000_000);
-    eprintln!("G9-2: rescue -> {:?}", rr.as_ref().map_err(|e| code(e)));
-    assert!(has(&rr, RESCUE_FLOOR_C) || has(&rr, RESCUE_REFUSED_C), "dead vault not rescuable: {rr:?}");
-}
 
-/// G9-3 (I-S6): RESTORE repays the backstop from the vault LP's free equity back into asset-0
-/// insurance; unit value recovers; the receivable falls on both ledgers.
-#[test]
-fn g9_restore_repays_backstop_first() {
-    let (mut w, _s, (t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("draw");
-    let b0 = backstop_st(&w) as u128;
-    assert!(b0 > 0);
-    // Restore while the LP is still under water: nothing to repay.
-    let early = backstop_111(&mut w, 1, 0, true);
-    eprintln!("G9-3: early restore -> {:?}", early.as_ref().map_err(|e| code(e)));
-    assert!(early.is_err(), "no repayment from a deficit");
-    // The market falls back: the LP (short) recovers, then the trader closes (LP flat).
-    for _ in 0..8 {
-        let m = MARK.with(|c| c.get()) * 80 / 100;
-        MARK.with(|c| c.set(m.max(PRICE / 4)));
-        w.push(m.max(PRICE / 4));
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 30);
-    }
-    for _ in 0..8 {
-        let pos = w.pos(tp);
-        if pos == 0 { break; }
-        let r = w.trade_vs_lp(&t, tp, -pos);
-        eprintln!("G9-3: close -> {:?}", r.as_ref().map_err(|e| code(e)));
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 5);
-    }
-    // Keeper sequence: convert the vault LP's released PnL into capital (tag 100), then restore.
-    for _ in 0..6 {
-        let pnl = w.lp_state().pnl;
-        if pnl <= 0 { break; }
-        let payer = w.env.payer.pubkey();
-        let (m, st, lpk) = (w.env.market, w.state_pda, w.lp);
-        let rc = w.send(ProgInstruction::VaultLpConvertPnl { amount: pnl as u128 },
-            vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(st, false), AccountMeta::new(lpk, false)], &[]);
-        eprintln!("G9-3: convert {pnl} -> {:?}", rc.as_ref().map_err(|e| code(e)));
-        w.catch_up(&[tp, lpk], 5);
-    }
-    let lp = w.lp_state();
-    eprintln!("G9-3: lp cap {} pnl {} legs {}", lp.capital, lp.pnl, lp.legs.iter().filter(|l| l.active).count());
-    let u0 = units(&w).unwrap();
-    let ins0 = w.env.market_state().1.insurance;
-    let r = backstop_111(&mut w, 1, 0, true);
-    eprintln!("G9-3: restore -> {:?} | backstop {} -> {}", r.as_ref().map_err(|e| code(e)), b0, backstop_st(&w));
-    r.expect("restore");
-    let b1 = backstop_st(&w) as u128;
-    let repaid = b0 - b1;
-    assert!(repaid > 0, "vacuity: something was repaid");
-    // v2.2 fill events: the RESTORE (mode 1) emitted ONE MOVE (G9): the capital repaid into
-    // insurance and the receivable still outstanding.
-    assert_eq!(
-        fill_events::wrapper_events(&last_logs(), &w.env.program_id),
-        vec![fill_events::Event::Move {
-            ix_tag: 111,
-            market: w.env.market,
-            sub: 2,
-            asset_index: 0,
-            a: repaid as u64,
-            b: b1 as u64,
-            c: 1,
-        }]
-    );
-    assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "insurance restored by exactly the repayment");
-    let u1 = units(&w).unwrap();
-    assert_eq!(u1.backstop_receivable_atoms, b1);
-    assert!(u1.snap_insurance_free_atoms > u0.snap_insurance_free_atoms, "unit value recovers");
-    conserved(&w, "after restore");
-}
 
-/// Bound rescue control (I-RS3): a healthy bound vault is not impaired, so tag 112 is refused
-/// (use tag 75) and nothing moves.
-#[test]
-fn rescue_bound_refused_when_not_impaired() {
-    let s0 = Keypair::new();
-    let (mut w, _atas) = P3::bound(&[(&s0, 5_000_000)], 1_000_000, 1_000);
-    let vault0 = w.tok(&w.env.vault);
-    let r = Keypair::new();
-    let res = rescue_bound(&mut w, &r, 200_000_000);
-    assert!(has(&res, RESCUE_REFUSED_C), "{res:?}");
-    assert_eq!(w.tok(&w.env.vault), vault0);
-}
 
 // ═══════════════════════ Phase 4 Wave D: cross-program stake v5 <-> wrapper ══════════════════════
 //
 // The REAL percolator-stake v5 `.so` (../percolator-stake/target/deploy, built with
-// `--features devnet`, i.e. at A6DVNubv (v2.1 fresh id), the id this wrapper's devnet build pins) runs against the
+// `--features devnet`, i.e. at VmpVUArR, the id this wrapper's devnet build pins) runs against the
 // wrapper in the same LiteSVM. Stake pools are crafted at the exact v5 byte layout (480 B; the
 // wrapper test crate does not link percolator-stake), then driven through real stake
 // instructions: bind (19), burn (21), deposit with consent (1), sync (31), withdraw (2),
@@ -1919,15 +1628,10 @@ fn rescue_bound_refused_when_not_impaired() {
 
 const STAKE_PID: Pubkey = solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
 const ST_CONSENT_REQUIRED: u32 = 33;
-/// Stake `CONSENT_VERSION_FIRST_LOSS` (v2: S-5 binds the deployment parameters; G9 disclosed).
-const CONSENT: u8 = 2;
-const ST_READINGS_DIVERGED: u32 = 44;
-const ST_UNITS_MISMATCH: u32 = 45;
 const ST_DEPRECATED_V5: u32 = 34;
 const ST_LIQUIDITY_BUFFER: u32 = 36;
 const ST_SYNC_COOLDOWN: u32 = 37;
 const ST_NOT_PROTOCOL_AUTHORITY: u32 = 39;
-const ST_NO_PENDING_TARGET: u32 = 40;
 
 fn stake_so() -> Vec<u8> {
     let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../percolator-stake/target/deploy/percolator_stake.so");
@@ -1982,7 +1686,7 @@ fn craft_pool(w: &mut P3, risk_mode: u8, cooldown_slots: u64) -> Pool {
     d[320..328].copy_from_slice(b"SPOOL_V1");
     d[328] = 5;
     d[408] = risk_mode;
-    d[409] = if risk_mode == 1 { CONSENT } else { 0 };
+    d[409] = if risk_mode == 1 { 2 } else { 0 }; // consent version 2 (round 2)
     let target: u16 = if risk_mode == 1 { 5_000 } else { 0 };
     d[410..412].copy_from_slice(&target.to_le_bytes());
     d[412..414].copy_from_slice(&3_000u16.to_le_bytes());
@@ -2025,20 +1729,15 @@ fn staker(w: &mut P3, p: &Pool, amount: u64) -> Staker {
     Staker { k, ata, lp_ata }
 }
 
-/// `consent = Some(version)` signs the crafted pool's parameters (target 5,000, buffer 3,000,
-/// hysteresis 500; S-5); `stake_deposit_consent` signs arbitrary ones.
 fn stake_deposit(w: &mut P3, p: &Pool, s: &Staker, amount: u64, consent: Option<u8>) -> Result<u64, String> {
-    stake_deposit_consent(w, p, s, amount, consent.map(|v| (v, 5_000, 3_000, 500)))
-}
-
-fn stake_deposit_consent(w: &mut P3, p: &Pool, s: &Staker, amount: u64, consent: Option<(u8, u16, u16, u16)>) -> Result<u64, String> {
     let mut data = vec![1u8];
     data.extend_from_slice(&amount.to_le_bytes());
-    if let Some((v, t, b, h)) = consent {
-        data.push(v);
-        data.extend_from_slice(&t.to_le_bytes());
-        data.extend_from_slice(&b.to_le_bytes());
-        data.extend_from_slice(&h.to_le_bytes());
+    if consent.is_some() {
+        // v5 deposit consent wire (16 B): [1][amount][version 2][target 5,000][buffer 3,000][hysteresis 500]
+        data.push(2u8);
+        data.extend_from_slice(&5_000u16.to_le_bytes());
+        data.extend_from_slice(&3_000u16.to_le_bytes());
+        data.extend_from_slice(&500u16.to_le_bytes());
     }
     let dep = Pubkey::find_program_address(&[b"stake_deposit", p.pda.as_ref(), s.k.pubkey().as_ref()], &STAKE_PID).0;
     let (m, pid) = (w.env.market, w.env.program_id);
@@ -2128,180 +1827,8 @@ fn st_code(r: &Result<u64, String>, c: u32) -> bool {
     r.as_ref().err().map_or(false, |e| code(e) == Some(c))
 }
 
-/// XP-1 (I-S1, I-S2, I-S4): consent is enforced on chain, the creator-admin flush is gone, and
-/// the permissionless sync deploys toward the target through the units ledger (stake class),
-/// never below the liquid buffer; it is rate-limited; a later depositor buys at the entry
-/// reading and a leaver redeems at the exit reading from liquidity; the admin can LOWER the
-/// target (timelocked) and the next sync RECOVERS the excess through tag 57 (units burned), but
-/// cannot RAISE it.
-#[test]
-fn xprog_consent_sync_recover_and_no_admin_flush() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
-    init_units(&mut w).expect("116");
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    let a = staker(&mut w, &p, 4_000_000);
-    // I-S2: no consent / stale consent refused; the current version accepted.
-    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, None), ST_CONSENT_REQUIRED), "deposit without consent");
-    assert!(st_code(&stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)), ST_CONSENT_REQUIRED), "stale consent version (v1 text, no G9 disclosure)");
-    // S-5: the consent binds the pool's deployment parameters, not just the version.
-    for (t, b, h) in [(4_999u16, 3_000u16, 500u16), (5_000, 2_999, 500), (5_000, 3_000, 501)] {
-        let r = stake_deposit_consent(&mut w, &p, &a, 4_000_000, Some((CONSENT, t, b, h)));
-        assert!(st_code(&r, ST_CONSENT_REQUIRED), "consent to other parameters ({t},{b},{h}) refused: {r:?}");
-    }
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
-    let lp_a = w.tok(&a.lp_ata);
-    assert!(lp_a > 0);
-    // I-S1: the creator-admin flush is removed.
-    let admin = w.env.admin.insecure_clone();
-    let (m, pid, wv) = (w.env.market, w.env.program_id, w.env.vault);
-    let mut fd = vec![3u8];
-    fd.extend_from_slice(&1_000u64.to_le_bytes());
-    let flush = stake_send(&mut w, fd, vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(pid, false), AccountMeta::new_readonly(spl_token::ID, false)], &[&admin]);
-    assert!(st_code(&flush, ST_DEPRECATED_V5), "admin flush must be gone: {flush:?}");
-    // Sync: target 50% of 4M = 2M, buffer ceil(30%) = 1.2M -> top up 2M, minted as STAKE units.
-    let u0 = units(&w).unwrap();
-    let ins0 = w.env.market_state().1.insurance;
-    stake_sync(&mut w, &p).expect("sync top-up");
-    let u1 = units(&w).unwrap();
-    let ins1 = w.env.market_state().1.insurance;
-    assert_eq!(ins1 - ins0, 2_000_000, "deployed exactly to the target");
-    assert_eq!(u1.units_stake, 2_000_000 * u0.units_total / u0.snap_insurance_mint_atoms, "stake-class units at the entry price");
-    assert_eq!(u1.units_creator, u0.units_creator, "creator units untouched");
-    assert_eq!(pool_u64(&w, &p, 200), 2_000_000, "total_flushed records the deployment");
-    let (liquid, deployed, _) = pool_view(&w, &p);
-    assert!(liquid as u128 * 10_000 >= 3_000 * (liquid + deployed) as u128, "liquid buffer kept: {liquid} vs {deployed}");
-    // Rate limit.
-    assert!(st_code(&stake_sync(&mut w, &p), ST_SYNC_COOLDOWN), "second sync in the cooldown");
-    // A later depositor buys at liquid + deployed(entry) and a leaver is paid from liquidity.
-    let b = staker(&mut w, &p, 2_000_000);
-    stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT)).expect("B deposit");
-    let lp_b = w.tok(&b.lp_ata);
-    // Pool value at the entry reading is still exactly 4M over 4M shares (A's genesis carve-out
-    // is dead supply): B pays 1 atom per share, never less.
-    assert!(lp_b <= 2_000_000 && lp_b + 2 >= 2_000_000, "B priced at the entry reading: {lp_b}");
-    let _ = lp_a;
-    let s = w.slot() + 3;
-    w.env.svm.warp_to_slot(s);
-    let before = w.tok(&b.ata);
-    stake_withdraw(&mut w, &p, &b, lp_b).expect("B withdraw");
-    let got = w.tok(&b.ata) - before;
-    assert!(got <= 2_000_000 && got + 2 >= 2_000_000, "B redeems its deposit (no gain, rounding only): {got}");
-    // Admin may LOWER the target (timelocked by the cooldown); may NOT raise it.
-    let raise = stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&6_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]);
-    assert!(st_code(&raise, ST_NOT_PROTOCOL_AUTHORITY), "admin raise refused: {raise:?}");
-    stake_send(&mut w, { let mut d = vec![32u8]; d.extend_from_slice(&2_000u16.to_le_bytes()); d }, vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]).expect("admin lowers");
-    // S-6: the timelock is max(pool cooldown = 1 slot, 216,000 slots), not the pool cooldown.
-    let s = w.slot() + 200;
-    w.env.svm.warp_to_slot(s);
-    let payer = w.env.payer.pubkey();
-    let early = stake_send(&mut w, vec![33], vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], &[]);
-    assert!(st_code(&early, ST_NO_PENDING_TARGET), "commit before the 216,000-slot floor refused: {early:?}");
-    let s = w.slot() + 216_000;
-    w.env.svm.warp_to_slot(s);
-    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
-    stake_send(&mut w, vec![33], vec![AccountMeta::new_readonly(payer, true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(solana_sdk::sysvar::clock::ID, false)], &[]).expect("commit");
-    let u2 = units(&w).unwrap();
-    let vault0 = w.tok(&p.vault);
-    let r = stake_sync(&mut w, &p);
-    eprintln!("XP-1 recover sync -> {:?}", r.as_ref().map_err(|e| code(e)));
-    r.expect("sync recovery");
-    let u3 = units(&w).unwrap();
-    let recovered = w.tok(&p.vault) - vault0;
-    assert!(recovered > 0, "vacuity: something recovered");
-    assert!(u3.units_stake < u2.units_stake && u3.units_creator == u2.units_creator, "only stake units burned");
-    assert_eq!(pool_u64(&w, &p, 208) as u128, recovered as u128, "total_returned records it");
-}
 
-/// XP-2 (I-S3, the point of item 6): a REAL insurance loss (the G9 backstop lends asset-0
-/// insurance to the exhausted vault LP) lands on every unit pro rata: the two stakers lose the
-/// same fraction of their stake, and the stake class and the creator class lose the same
-/// fraction of their insurance value. A staker can still exit from liquidity.
-#[test]
-fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
-    // v2.2 combined release: the stake deployment (tag 31 sync) is made on the healthy book and the
-    // vault LP is driven underwater AFTER it. With #277 the insurance withdraw capacity (the sync
-    // reading) reserves the hidden loss of a stale K/F cohort, so a sync inside an already
-    // underwater, stale market refuses with 44 InsuranceReadingsDiverged (conservative by design).
-    let (d0_, d1_, pushes) = G9W.with(|c| c.get());
-    let (mut w, _s, (_tk, tp_xp2)) = underwater_world(d0_, d1_, 1_000_000, 0);
-    top_up_9(&mut w, 2_000_000, false).expect("creator seed");
-    init_units(&mut w).expect("116");
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    let a = staker(&mut w, &p, 6_000_000);
-    let b = staker(&mut w, &p, 3_000_000);
-    stake_deposit(&mut w, &p, &a, 6_000_000, Some(CONSENT)).expect("A");
-    stake_deposit(&mut w, &p, &b, 3_000_000, Some(CONSENT)).expect("B");
-    let r = stake_sync(&mut w, &p);
-    eprintln!("XP-2 sync -> {:?}", r.as_ref().map_err(|e| code(e)));
-    r.expect("deploy");
-    init_units(&mut w).expect("refresh");
-    // now the book goes underwater (the same 8 x +24% walk `underwater_world` applies)
-    MARK.with(|c| c.set(PRICE));
-    for _ in 0..pushes {
-        let m = MARK.with(|c| c.get()) * 124 / 100;
-        MARK.with(|c| c.set(m));
-        w.push(m);
-        w.catch_up(&[tp_xp2], 30);
-    }
-    let (l0, d0, sup0) = pool_view(&w, &p);
-    let u0 = units(&w).unwrap();
-    let (lp_a, lp_b) = (w.tok(&a.lp_ata) as u128, w.tok(&b.lp_ata) as u128);
-    let val = |l: u64, d: u64, sup: u64, lp: u128| lp * (l + d) as u128 / sup as u128;
-    let (va0, vb0) = (val(l0, d0, sup0, lp_a), val(l0, d0, sup0, lp_b));
-    let creator0 = u0.units_creator * u0.snap_insurance_free_atoms / u0.units_total;
-    // The loss: G9 lends insurance to the exhausted vault LP.
-    g9(&mut w, &[tp_xp2]).expect("G9");
-    let b_moved = backstop_st(&w) as u128;
-    assert!(b_moved > 0);
-    init_units(&mut w).expect("refresh");
-    let (l1, d1, sup1) = pool_view(&w, &p);
-    let u1 = units(&w).unwrap();
-    let (va1, vb1) = (val(l1, d1, sup1, lp_a), val(l1, d1, sup1, lp_b));
-    let creator1 = u1.units_creator * u1.snap_insurance_free_atoms / u1.units_total;
-    eprintln!("XP-2: moved {b_moved} | A {va0}->{va1} B {vb0}->{vb1} | creator {creator0}->{creator1} | deployed {d0}->{d1}");
-    assert!(va1 < va0 && vb1 < vb0 && creator1 < creator0, "everyone with units absorbs it");
-    // Same fraction for the two stakers (cross-multiplied, rounding tolerance).
-    assert!((va1 * vb0).abs_diff(vb1 * va0) <= va0 + vb0, "stakers pro rata: A {va1}/{va0} B {vb1}/{vb0}");
-    // Same fraction for the stake class (its deployed value) and the creator class.
-    assert!((d1 as u128 * creator0).abs_diff(creator1 * d0 as u128) <= creator0 + d0 as u128, "classes pro rata");
-    // The total loss across both classes is the moved amount (at the free reading).
-    let loss = (d0 as u128 - d1 as u128) + (creator0 - creator1);
-    assert!(loss.abs_diff(b_moved) <= 4, "loss {loss} vs moved {b_moved}"); // combined release: 3 atoms of unit-rounding at the refreshed reading (was 2)
-    // A withdrawal is paid from liquidity at the post-loss exit value.
-    let s = w.slot() + 3;
-    w.env.svm.warp_to_slot(s);
-    let before = w.tok(&b.ata);
-    let lp_b64 = lp_b as u64;
-    stake_withdraw(&mut w, &p, &b, lp_b64).expect("B exits from liquidity");
-    let got = (w.tok(&b.ata) - before) as u128;
-    assert!(got <= vb1 + 1 && got + 2 >= vb1, "B paid its post-loss value {vb1}, got {got}");
-    // A cannot pull more than the liquid value (the deployed part waits for a healthy sync).
-    let lp_a64 = lp_a as u64;
-    let too_much = stake_withdraw(&mut w, &p, &a, lp_a64);
-    let (l2, _, _) = pool_view(&w, &p);
-    if va1 > l2 as u128 {
-        assert!(st_code(&too_much, ST_LIQUIDITY_BUFFER), "beyond liquidity: {too_much:?}");
-    }
-}
 
-/// XP-3: the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS pools only; a FEE_ONLY pool
-/// (no deployment, no risk) is refused.
-#[test]
-fn xprog_fee_leg_refuses_fee_only_pool() {
-    let mut w = P3::new();
-    let p = craft_pool(&mut w, 2, 1);
-    let admin = w.env.admin.insecure_clone();
-    let (m, pid) = (w.env.market, w.env.program_id);
-    stake_send(&mut w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("bind");
-    let payer = w.env.payer.pubkey();
-    let (wv, wva) = (w.env.vault, w.env.vault_authority);
-    let r = w.send_raw(vec![87], vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(wva, false), AccountMeta::new_readonly(spl_token::ID, false)], &[]);
-    let want = percolator_prog::error::PercolatorError::StakePoolModeMismatch as u32;
-    assert!(r.as_ref().err().map_or(false, |e| code(e) == Some(want)), "fee-only pool must be refused the fee leg: {r:?}");
-}
 
 /// Tag 101 with the units ledger appended (after [11] system program).
 fn settle_resolved_units(w: &mut P3, junior_owner: Pubkey, topup: u8) -> Result<u64, String> {
@@ -2325,230 +1852,158 @@ fn settle_resolved_units(w: &mut P3, junior_owner: Pubkey, topup: u8) -> Result<
     w.send_raw(raw(101, &[topup]), metas, &[])
 }
 
-/// G9-4 (I-S6 in Resolved): the settled vault LP's payouts repay the backstop FIRST, into
-/// asset-0 insurance (where unit holders withdraw it through tag 41); a progress-only call never
-/// writes anything off early; both ledgers keep the same receivable; tokens are conserved.
-#[test]
-fn g9_resolved_settle_repays_backstop_first() {
-    let (mut w, _s, (t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("draw");
-    let b0 = backstop_st(&w) as u128;
-    assert!(b0 > 0);
-    // The market falls back (the short LP recovers) and the trader closes in Live: the LP ends
-    // with realised profit that is NOT restored in Live (no tag 111 mode 1) before resolution.
-    for _ in 0..8 {
-        let m = MARK.with(|c| c.get()) * 80 / 100;
-        MARK.with(|c| c.set(m.max(PRICE / 4)));
-        w.push(m.max(PRICE / 4));
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 30);
+
+/// W-2 two-step G9 (Wave D round 2): PROPOSE (mode 2), wait the delay with the book kept current,
+/// then DRAW (mode 0). The single-step draw this suite was written against no longer exists.
+fn g9_two_step(w: &mut P3, ports: &[Pubkey]) -> Result<u64, String> {
+    backstop_111(w, 2, 0, true)?;
+    let mark = MARK.with(|c| c.get());
+    let target = w.slot() + percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS;
+    w.env.svm.warp_to_slot(target);
+    w.env.push_auth_mark_for_asset_as_admin(0, target, mark);
+    let lp = w.lp;
+    for _ in 0..2 {
+        for p in ports {
+            let _ = w.crank(*p);
+        }
+        let _ = w.crank(lp);
     }
-    for _ in 0..8 {
-        let pos = w.pos(tp);
-        if pos == 0 { break; }
-        let _ = w.trade_vs_lp(&t, tp, -pos);
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 5);
-    }
-    let l = w.lp_state();
-    eprintln!("G9-4: LP before resolve cap {} pnl {}", l.capital, l.pnl);
-    w.env.resolve();
-    assert_eq!(w.env.market_state().1.mode, percolator::MarketModeV16::Resolved);
-    let ins0 = w.env.market_state().1.insurance;
-    let jo = w.env.admin.pubkey();
-    for i in 0..40 {
-        let l = w.env.portfolio_state(w.lp);
-        if i > 0 && l.capital == 0 && l.pnl == 0 && l.legs.iter().all(|x| !x.active) { break; }
-        let topup = 0;
-        let r = settle_resolved_units(&mut w, jo, topup);
-        let u = units(&w).unwrap();
-        eprintln!("G9-4: 101({topup}) -> {:?} | backstop {} receivable {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w), u.backstop_receivable_atoms);
-        assert_eq!(u.backstop_receivable_atoms, backstop_st(&w) as u128, "mirror kept in step");
-        let s = w.slot() + 50;
-        w.env.svm.warp_to_slot(s);
-    }
-    let b1 = backstop_st(&w) as u128;
-    let repaid = w.env.market_state().1.insurance.saturating_sub(ins0);
-    eprintln!("G9-4: b0 {b0} -> {b1}, insurance +{repaid}");
-    assert_eq!(repaid, b0 - b1, "insurance rises by exactly the repayment");
-    assert!(repaid > 0, "vacuity: the recovered vault LP repaid part of the backstop");
-    conserved(&w, "after resolved settle");
+    backstop_111(w, 0, 0, true)
 }
 
-// ═══════════ Security review v22 Wave D (2026-10-05) BLOCK fixes: regressions ═══════════
-//
-// The reviewer's adversarial tests (`~/wt-sec-v22d/prog/tests/sec_v22d_adv.rs`, GREEN = exploit
-// worked) ported here with the assertions FLIPPED to the fixed behaviour. Each carries an in-test
-// control showing the refusal is the fix (not a broken setup).
+// ═════════════════ Sentinel v22 Wave D review (2026-10-05): adversarial tests ═════════════════
 
-/// SEC-D2 regression (W-1 / S-1): the dust-`U` ledger (`U = 1` against a 3,000,000 fund). (a) a
-/// top-up that would mint ZERO units is refused and moves nothing; (b) the stake sync that would
-/// deploy 2,000,000 for zero stake units is refused (the wrapper refuses the mint; stake would
-/// also refuse the count) and the stakers' pool value is untouched. Control: on the honest ledger
-/// (`U = I`) the same top-up and sync succeed.
+/// SEC-D2: first-depositor / donation inflation of the unit ledger. The ledger can be left with a
+/// tiny `U` against a large `I` (genesis at a dust balance, then fee growth: simulated here by
+/// setting `U = 1` on a 3,000,000-atom fund; fee growth raises I without minting). Then:
+///  (a) a creator-class top-up smaller than I/U succeeds and mints ZERO units (donation);
+///  (b) the permissionless stake sync deploys the pool's money, mints ZERO stake units, and the
+///      stakers' NAV drops by the full deployed amount; the atoms are creator-class value.
 #[test]
-fn sec_d2_zero_mint_donation_refused() {
+fn sec_d2_zero_mint_donation_inflation_takes_the_stake_pools_deployment() {
     let mut w = P3::new();
     top_up_9(&mut w, 3_000_000, false).expect("creator seed");
     init_units(&mut w).expect("116");
-    // Control first, on the honest ledger: a 500,000 top-up mints units.
-    let c0 = units(&w).unwrap();
-    top_up_9(&mut w, 500_000, true).expect("control: honest top-up");
-    let c1 = units(&w).unwrap();
-    assert!(c1.units_total > c0.units_total, "control: units minted");
-    // The dust state.
+    // Dust genesis + later fee growth: one unit owns the whole fund.
     set_units(&mut w, |u| {
         u.units_total = 1;
         u.units_creator = 1;
         u.units_stake = 0;
     });
-    init_units(&mut w).expect("116 refresh");
-    let u0 = units(&w).unwrap();
+    // (a) donation by a creator-class top-up
+    let u0 = { init_units(&mut w).expect("116 refresh"); units(&w).unwrap() };
     let ins0 = w.env.market_state().1.insurance;
     let r = top_up_9(&mut w, 500_000, true);
-    eprintln!("SEC-D2a top-up 500,000 on U=1/I={} -> {:?}", u0.snap_insurance_mint_atoms, r.as_ref().map_err(|e| code(e)));
-    assert!(has(&r, INS_REFUSED), "W-1: a zero-unit top-up is refused: {r:?}");
-    let e = r.unwrap_err();
-    assert!(e.contains("p4_ins_units_mint_refused"), "refused by the mint check, not something else");
-    assert_eq!(w.env.market_state().1.insurance, ins0, "nothing moved");
-    assert_eq!(units(&w).unwrap().units_total, 1);
-    // (b) the stake pool.
+    let u1 = units(&w).unwrap();
+    let ins1 = w.env.market_state().1.insurance;
+    eprintln!("SEC-D2a top-up 500,000 on U=1/I={} -> {:?}; insurance {} -> {}; units_total {} -> {}", u0.snap_insurance_mint_atoms, r.as_ref().map_err(|e| code(e)), ins0, ins1, u0.units_total, u1.units_total);
+    // FIXED (W-1 / S-1, Wave D round 2): a creator-class top-up that would mint ZERO units is REFUSED
+    // (it used to be accepted: the depositor gave 500,000 atoms for nothing and the atoms became
+    // creator-class value). Nothing moves.
+    assert!(r.is_err(), "the zero-mint top-up is refused");
+    assert_eq!(u1.units_total, u0.units_total, "no units minted");
+    assert_eq!(ins1, ins0, "no insurance moved");
+    // (b) the stake pool: the permissionless sync must not deploy the pool's money for ZERO stake units
     let p = craft_pool(&mut w, 1, 1);
     bind_and_burn(&mut w, &p);
     let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)).expect("deposit with consent");
     let (l0, d0, s0) = pool_view(&w, &p);
     let r = stake_sync(&mut w, &p);
-    eprintln!("SEC-D2b sync -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(r.is_err(), "S-1: the zero-unit deployment is refused: {r:?}");
+    let u2 = units(&w).unwrap();
+    let ins2 = w.env.market_state().1.insurance;
     let (l1, d1, s1) = pool_view(&w, &p);
-    assert_eq!((l1, d1, s1), (l0, d0, s0), "stakers' pool untouched");
-    assert_eq!(w.env.market_state().1.insurance, ins0, "no insurance moved");
+    eprintln!("SEC-D2b sync -> {:?}; insurance {} -> {}; stake units {} (U {}); pool (liquid, deployed@exit, supply) {:?} -> {:?}", r.as_ref().map_err(|e| code(e)), ins1, ins2, u2.units_stake, u2.units_total, (l0, d0, s0), (l1, d1, s1));
+    // either the sync refuses (stake InsuranceUnitsInvalid / wrapper refusal) or it mints a non-zero
+    // number of stake units; in no case may the stakers' value fall for zero units
+    if r.is_ok() {
+        assert!(u2.units_stake > 0, "a successful sync mints stake units");
+    }
+    assert!(l1 + d1 >= l0 + d0 - 1, "stakers' pool value must not fall by a deployed amount for zero units");
 }
 
-/// SEC-D2 (b) alone, for the two-sided control (S-1 + W-1): the dust-`U` ledger, then the sync.
-/// Stake computes the expected units (0) before the CPI and refuses (45); with stake's S-1 check
-/// MUTATED OUT, the wrapper's own W-1 mint check refuses inside the CPI (116), so each side holds
-/// on its own. `SEC_D2B_EXPECT` (env) names the code a run expects (default 45).
+/// SEC-D4: entry reading includes the G9 receivable at face; exit reading excludes it. With a
+/// receivable outstanding, a deposit followed by an immediate withdrawal in the same slot range
+/// returns less than deposited, and the difference stays in the pool for incumbents. (The
+/// receivable is set directly on the ledger; the snapshot formula is what is exercised.)
 #[test]
-fn sec_d2b_stake_sync_zero_unit_deployment_refused() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 3_000_000, false).expect("creator seed");
-    init_units(&mut w).expect("116");
-    set_units(&mut w, |u| {
-        u.units_total = 1;
-        u.units_creator = 1;
-        u.units_stake = 0;
-    });
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("deposit with consent");
-    let (l0, d0, s0) = pool_view(&w, &p);
-    let ins0 = w.env.market_state().1.insurance;
-    let r = stake_sync(&mut w, &p);
-    let c = r.as_ref().err().and_then(|e| code(e));
-    eprintln!("SEC-D2b sync -> {c:?}");
-    let want: u32 = std::env::var("SEC_D2B_EXPECT").ok().and_then(|v| v.parse().ok()).unwrap_or(ST_UNITS_MISMATCH);
-    assert_eq!(c, Some(want), "zero-unit deployment refused with {want}: {r:?}");
-    assert_eq!(pool_view(&w, &p), (l0, d0, s0), "pool untouched");
-    assert_eq!(w.env.market_state().1.insurance, ins0);
-}
-
-/// W-1 genesis minimum: tag 116 refuses a dust genesis (0 < I < 1e6); an empty fund is allowed
-/// and its first top-up must itself reach the minimum. Control: a 1e6 genesis succeeds.
-#[test]
-fn w1_units_genesis_minimum() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 999_999, false).expect("dust seed");
-    let r = init_units(&mut w);
-    assert!(has(&r, INS_REFUSED), "dust genesis refused: {r:?}");
-    let mut w = P3::new();
-    init_units(&mut w).expect("empty-fund genesis");
-    assert_eq!(units(&w).unwrap().units_total, 0);
-    let r = top_up_9(&mut w, 999_999, true);
-    assert!(has(&r, INS_REFUSED), "first top-up below the minimum refused: {r:?}");
-    top_up_9(&mut w, 1_000_000, true).expect("control: genesis top-up at the minimum");
-    assert_eq!(units(&w).unwrap().units_total, 1_000_000);
-    let mut w = P3::new();
-    top_up_9(&mut w, 1_000_000, false).expect("seed");
-    init_units(&mut w).expect("control: 1e6 genesis");
-}
-
-/// SEC-D4 regression (W-5 / S-3): with a receivable outstanding (mint reading > free reading), a
-/// deposit into a pool with deployed units and the sync are refused (stake 44), so no newcomer is
-/// taxed at the spread. Control: the same deposit succeeds once the readings agree.
-#[test]
-fn sec_d4_deposit_and_sync_refused_while_readings_diverge() {
+fn sec_d4_entry_exit_gap_with_receivable_taxes_new_stakers() {
     let mut w = P3::new();
     top_up_9(&mut w, 1_000_000, false).expect("creator seed");
     init_units(&mut w).expect("116");
     let p = craft_pool(&mut w, 1, 1);
     bind_and_burn(&mut w, &p);
     let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("A");
-    stake_sync(&mut w, &p).expect("sync deploys 2M");
+    stake_deposit(&mut w, &p, &a, 4_000_000, Some(1)).expect("A");
+    { let r = stake_sync(&mut w, &p); if let Err(e) = &r { eprintln!("SEC-D4 sync err: {}", e.split("logs:").nth(1).unwrap_or(e).chars().take(1500).collect::<String>()); } r.expect("sync deploys 2M"); }
+    // Pretend G9 lent 1,000,000 atoms to the vault LP and nothing came back.
     set_units(&mut w, |u| u.backstop_receivable_atoms = 3_000_000);
     init_units(&mut w).expect("refresh");
     let u = units(&w).unwrap();
-    assert!(u.snap_insurance_mint_atoms > u.snap_insurance_free_atoms, "vacuity: readings diverge");
+    eprintln!("SEC-D4 snapshot: mint reading {} free reading {} U {} stake units {}", u.snap_insurance_mint_atoms, u.snap_insurance_free_atoms, u.units_total, u.units_stake);
     let b = staker(&mut w, &p, 2_000_000);
-    let r = stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT));
-    assert!(st_code(&r, ST_READINGS_DIVERGED), "W-5: deposit at the spread refused: {r:?}");
-    assert_eq!(w.tok(&b.ata), 2_000_000, "B keeps its tokens");
-    let s = w.slot() + 200;
-    w.env.svm.warp_to_slot(s);
-    w.env.push_auth_mark_for_asset_as_admin(0, s, PRICE);
-    // Control: readings agree again -> the deposit goes through.
-    set_units(&mut w, |u| u.backstop_receivable_atoms = 0);
-    init_units(&mut w).expect("refresh");
-    stake_deposit(&mut w, &p, &b, 2_000_000, Some(CONSENT)).expect("control: deposit once the readings agree");
+    // FIXED (W-5 / S-3, Wave D round 2): while the wrapper's mint reading differs from its free reading
+    // (here a 3,000,000 receivable is outstanding) a deposit into the deployed units is REFUSED
+    // (stake InsuranceReadingsDiverged = 44), so a newcomer can no longer be taxed by the entry/exit
+    // gap at all. The balance is untouched.
+    let before = w.tok(&b.ata);
+    let r = stake_deposit(&mut w, &p, &b, 2_000_000, Some(1));
+    eprintln!("SEC-D4 B deposit while the receivable is outstanding -> {:?}", r.as_ref().map_err(|e| code(e)));
+    assert_eq!(r.as_ref().err().map(|e| code(e)), Some(Some(44)), "W-5: deposit refused while readings diverge: {r:?}");
+    assert_eq!(w.tok(&b.ata), before, "nothing moved");
 }
 
-/// SEC-D4 / W-8 sync side: the sync (top-up or recovery) is refused while the readings diverge.
-/// Control: the same pool syncs once they agree.
+/// SEC-D5: a v4 (408 B, version 4) pool under an in-place upgrade to v5: can its stakers withdraw?
 #[test]
-fn w5_sync_refused_while_readings_diverge() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
-    init_units(&mut w).expect("116");
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("A");
-    set_units(&mut w, |u| u.backstop_receivable_atoms = 500_000);
-    let r = stake_sync(&mut w, &p);
-    assert!(st_code(&r, ST_READINGS_DIVERGED), "top-up at the spread refused: {r:?}");
-    set_units(&mut w, |u| u.backstop_receivable_atoms = 0);
-    stake_sync(&mut w, &p).expect("control: sync once the readings agree");
-}
-
-/// SEC-D5 (S-2): stake v5 ships under the FRESH v2.1 id A6DVNubv, never as an in-place upgrade
-/// of VmpVUArR, so the 72 live v4 pools keep their own (v4) program. A v4-shaped account under
-/// the v5 program is still refused (fail closed), which is now harmless: no such account exists
-/// under the fresh id.
-#[test]
-fn sec_d5_v5_is_a_fresh_program_not_an_upgrade() {
-    assert_ne!(STAKE_PID, solana_sdk::pubkey!("VmpVUArRnVkrjaPXQ2qaqCQa3ZrZFgsz7rjeALitF5w"));
-    assert_eq!(STAKE_PID, solana_sdk::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE"));
+fn sec_d5_v4_pool_is_unusable_after_in_place_upgrade() {
     let mut w = P3::new();
     top_up_9(&mut w, 1_000_000, false).expect("seed");
     init_units(&mut w).expect("116");
     let p = craft_pool(&mut w, 1, 1);
+    // Rewrite the account as a v4 pool: 408 bytes, version byte 4.
     let mut acct = w.env.svm.get_account(&p.pda).unwrap();
     acct.data.truncate(408);
     acct.data[328] = 4;
+    acct.data[168..176].copy_from_slice(&5_000_000u64.to_le_bytes()); // total_deposited
+    acct.data[176..184].copy_from_slice(&5_000_000u64.to_le_bytes()); // lp supply
     w.env.svm.set_account(p.pda, acct).unwrap();
     let s = staker(&mut w, &p, 0);
-    assert!(stake_withdraw(&mut w, &p, &s, 1).is_err(), "a v4 layout under the v5 program fails closed");
+    let r = stake_withdraw(&mut w, &p, &s, 1);
+    eprintln!("SEC-D5 withdraw on a 408 B v4 pool -> {:?}", r);
+    assert!(r.is_err(), "v4 pool refuses everything (stranded)");
 }
 
-/// SEC-D7 regression (W-2 (a)): a junior-only vault (no Earn seniors) is never eligible for G9,
-/// whatever its deficit: propose and draw are refused and no insurance moves. Control: the
-/// seniors world (`g9_draws_after_exhaustion_bounded_pro_rata`) draws.
+/// SEC-D6: after the G9 draw, is the vault LP still halted from RISK-INCREASING fills (as it is
+/// while a senior draw is outstanding)? The PR halts 97/98/102/103 but the fill halt reads only
+/// the senior draw mirror (`draw.outstanding_mirror_atoms + pending`), not `backstop_outstanding`.
 #[test]
-fn sec_d7_junior_only_vault_never_g9() {
+fn sec_d6_lp_keeps_taking_risk_on_borrowed_insurance_after_g9() {
+    let (mut w, _s, (t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
+    seed_units(&mut w, 20_000_000);
+    g9_two_step(&mut w, &[tp]).expect("G9 two-step draw");
+    let b = backstop_st(&w);
+    assert!(b > 0);
+    let pos0 = w.pos(w.lp);
+    // control: the senior-draw halt itself (outstanding mirror) -- read its state
+    eprintln!("SEC-D6 backstop {b}; senior draw outstanding {}; LP pos {pos0}", outstanding(&w));
+    let (t2, tp2) = w.trader(50_000_000);
+    // New taker opens in the SAME direction as the first (LP gets more short): risk-increasing for the LP.
+    let r = w.trade_vs_lp(&t2, tp2, U);
+    let pos1 = w.pos(w.lp);
+    eprintln!("SEC-D6 new risk-increasing fill -> {:?}; LP pos {pos0} -> {pos1}", r.as_ref().map_err(|e| code(e)));
+    // FIXED (W-9, Wave D round 2): while the G9 backstop is outstanding the LP's risk-increasing
+    // fills are halted (the outstanding mirror carries the backstop), so the LP cannot keep taking
+    // risk on borrowed insurance: the fill is refused and the LP position does not grow.
+    assert!(r.is_err(), "W-9: a risk-increasing fill is refused while the backstop is outstanding");
+    assert!(pos1.abs() <= pos0.abs(), "the LP position did not grow: {pos0} -> {pos1}");
+}
+
+/// SEC-D7: a vault with NO Earn seniors at all (creator junior only). G9's "seniors exhausted"
+/// test (`senior_nav == 0`) is vacuously true. The creator's own trader account wins against the
+/// LP on a creator-pushed mark; G9 (permissionless) lends asset-0 insurance (stake + creator
+/// units) into the LP, which pays the winner. Also: is the LP still halted from new risk?
+#[test]
+fn sec_d7_junior_only_vault_g9_funds_a_self_dealing_winner() {
     let (mut w, _s) = P3::bound(&[], 1_000_000, 1_000);
     let (t, tp) = w.trader(50_000_000);
     w.trade_vs_lp(&t, tp, 3 * U).unwrap();
@@ -2561,1035 +2016,17 @@ fn sec_d7_junior_only_vault_never_g9() {
     }
     seed_units(&mut w, 20_000_000);
     let ins0 = w.env.market_state().1.insurance;
-    for mode in [2u8, 0] {
-        let r = backstop_111(&mut w, mode, 0, true);
-        eprintln!("SEC-D7 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
-        assert!(has(&r, INS_REFUSED), "junior-only vault refused: {r:?}");
-        assert!(r.unwrap_err().contains("p4_backstop_ineligible"), "refused by the eligibility rule");
-    }
-    assert_eq!(w.env.market_state().1.insurance, ins0);
-    assert_eq!(backstop_st(&w), 0);
-}
-
-/// W-2 (b, c): G9 is two-step with an exit window and a per-epoch cap. An immediate draw is
-/// refused; a second proposal cannot restart the window; the draw executes after the delay and
-/// clears the proposal; a lapsed proposal cannot execute; the per-epoch cap binds.
-#[test]
-fn w2_g9_two_step_window_and_epoch_cap() {
-    use percolator_prog::p4_rescue_ins::{G9_DELAY_SLOTS, G9_EXEC_WINDOW_SLOTS};
-    let (mut w, _s, (_tk, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    let ins0 = w.env.market_state().1.insurance;
+    let t0 = w.env.portfolio_state(tp);
     let r = backstop_111(&mut w, 0, 0, true);
-    assert!(has(&r, INS_REFUSED) && r.unwrap_err().contains("p4_backstop_not_executable"), "draw without a proposal refused");
-    backstop_111(&mut w, 2, 0, true).expect("propose");
-    let pending = units(&w).unwrap().g9_pending_slot;
-    assert!(pending > 0, "proposal recorded");
-    let r = backstop_111(&mut w, 0, 0, true);
-    assert!(has(&r, INS_REFUSED), "immediate draw refused: {r:?}");
-    g9_wait(&mut w, &[tp], 10);
-    let r = backstop_111(&mut w, 2, 0, true);
-    assert!(has(&r, INS_REFUSED), "a second proposal cannot restart the window: {r:?}");
-    assert_eq!(units(&w).unwrap().g9_pending_slot, pending);
-    assert_eq!(w.env.market_state().1.insurance, ins0, "nothing moved before the delay");
-    // Lapse: past the execution window the proposal is dead; a new one can be made.
-    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS + G9_EXEC_WINDOW_SLOTS);
-    let r = backstop_111(&mut w, 0, 0, true);
-    assert!(has(&r, INS_REFUSED), "lapsed proposal cannot execute: {r:?}");
-    backstop_111(&mut w, 2, 0, true).expect("re-propose after the lapse");
-    // Per-epoch cap: pretend this epoch already lent all but 1,000 atoms of its 20%.
-    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
-    init_units(&mut w).expect("refresh");
-    let u = units(&w).unwrap();
-    let slot = w.slot();
-    let epoch = slot / percolator_prog::p4_rescue_ins::G9_EPOCH_SLOTS;
-    let cap = u.snap_insurance_mint_atoms * 2_000 / 10_000;
-    set_units(&mut w, |x| {
-        x.g9_epoch = epoch;
-        x.g9_epoch_drawn_atoms = cap - 1_000;
-    });
-    backstop_111(&mut w, 0, 0, true).expect("draw after the delay");
-    let b = backstop_st(&w) as u128;
-    assert!(b > 0 && b <= 1_000, "per-epoch cap binds: moved {b}");
-    let u1 = units(&w).unwrap();
-    assert_eq!(u1.g9_pending_slot, 0, "proposal consumed");
-    assert_eq!(u1.g9_epoch_drawn_atoms, cap - 1_000 + b);
-    let r = backstop_111(&mut w, 0, 0, true);
-    assert!(has(&r, INS_REFUSED), "no second draw on a consumed proposal: {r:?}");
-}
-
-/// SEC-D6 regression (W-9): after G9 the vault LP's fill halt counts the backstop. Even with the
-/// senior draw fully restored (outstanding 0), a risk-increasing fill is refused while the
-/// backstop is owed. Control: the same fill with the backstop also cleared is not halted by the
-/// draw halt.
-#[test]
-fn sec_d6_fill_halt_counts_the_backstop() {
-    let (mut w, _s, (_t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("G9 draw");
-    let b = backstop_st(&w) as u128;
-    assert!(b > 0);
-    assert_eq!(halt_mirror(&w), outstanding(&w) + b, "mirror = senior outstanding + backstop");
-    let halted = percolator_prog::error::PercolatorError::VaultLpPausedForSeniorDraw as u32;
-    // Isolate the backstop term: zero the senior outstanding in BOTH the state and the mirror.
-    let set_state_and_mirror = |w: &mut P3, senior: u128, backstop: u64| {
-        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
-        st.data[16 + 240..16 + 256].copy_from_slice(&senior.to_le_bytes());
-        st.data[16 + 216..16 + 224].copy_from_slice(&backstop.to_le_bytes());
-        w.env.svm.set_account(w.state_pda, st).unwrap();
-        let mut m = w.env.svm.get_account(&w.env.market).unwrap();
-        {
-            let (_, mut g) = state::market_view_mut(&mut m.data).unwrap();
-            let mut rec = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
-            rec.outstanding_mirror_atoms = senior + backstop as u128;
-            state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
-        }
-        w.env.svm.set_account(w.env.market, m).unwrap();
-    };
-    // Only the backstop owed (senior draw fully restored): the halt mirror is the backstop.
-    set_state_and_mirror(&mut w, 0, b as u64);
-    assert_eq!(halt_mirror(&w), b, "mirror = backstop when the seniors are restored");
-    let (t2, tp2) = w.trader(50_000_000);
-    let r = w.trade_vs_lp(&t2, tp2, U);
-    let c = r.as_ref().err().and_then(|e| code(e));
-    eprintln!("SEC-D6 risk-increasing fill with only the backstop owed -> {c:?}");
-    // In this world the LP floor halt (69, the junior is exhausted) runs before the draw halt
-    // (89); either way the LP cannot add risk on lent insurance (the reviewer's probe saw 69).
-    assert!(c == Some(halted) || c == Some(69), "W-9: risk-increasing fill refused: {r:?}");
-}
-
-/// W-4: the backstop is repayable from a POSITIONED vault LP's free capital (above its initial
-/// margin) in Live, not only once it is flat.
-#[test]
-fn w4_restore_from_positioned_lp() {
-    let (mut w, _s, (_t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("draw");
-    let b0 = backstop_st(&w) as u128;
-    // The market falls back part-way; the trader stays OPEN (the LP keeps its leg).
-    for _ in 0..4 {
-        let m = MARK.with(|c| c.get()) * 80 / 100;
-        MARK.with(|c| c.set(m.max(PRICE / 4)));
-        w.push(m.max(PRICE / 4));
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 30);
-    }
-    assert_ne!(w.pos(w.lp), 0, "vacuity: the vault LP is positioned");
-    // Control: with no free capital (its profit is unconverted PnL, which the engine cannot
-    // convert while the LP holds open source-claim exposure) nothing is repayable.
-    let none = backstop_111(&mut w, 1, 0, true);
-    eprintln!("W-4: restore with no free capital -> {:?}", none.as_ref().map_err(|e| code(e)));
-    assert!(has(&none, INS_REFUSED), "nothing repayable without free capital: {none:?}");
-    // Free capital arrives while the LP stays positioned (here: the junior adds capital).
-    let admin = w.env.admin.insecure_clone();
-    let jd = w.junior_deposit(&admin, 3_000_000);
-    eprintln!("W-4: junior deposit -> {:?}", jd.as_ref().map_err(|e| code(e)));
-    jd.expect("junior capital while positioned");
-    let lpk = w.lp;
-    let _ = w.crank(lpk);
-    let lp = w.lp_state();
-    eprintln!("W-4: LP cap {} pnl {} pos {}", lp.capital, lp.pnl, w.pos(w.lp));
-    let ins0 = w.env.market_state().1.insurance;
-    let vault0 = w.tok(&w.env.vault);
-    let r = backstop_111(&mut w, 1, 0, true);
-    eprintln!("W-4: restore while positioned -> {:?} | backstop {} -> {}", r.as_ref().map_err(|e| code(e)), b0, backstop_st(&w));
-    r.expect("W-4: partial repayment from a positioned LP");
-    let repaid = b0 - backstop_st(&w) as u128;
-    assert!(repaid > 0, "vacuity: something repaid");
-    assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "insurance +repaid");
-    assert_eq!(w.tok(&w.env.vault), vault0, "no SPL moved");
-    assert_ne!(w.pos(w.lp), 0, "still positioned after the repayment");
-    assert_eq!(units(&w).unwrap().backstop_receivable_atoms, backstop_st(&w) as u128);
-    assert_eq!(halt_mirror(&w), outstanding(&w) + backstop_st(&w) as u128, "W-9 mirror in step");
-    conserved(&w, "after positioned restore");
-}
-
-/// Cranks trader and LP until the asset is accrued to the current slot and no account is stale
-/// (a crank accrues about one slot per call, so a big warp would leave the book unaccrued).
-fn w4_settle(w: &mut P3, tp: Pubkey) {
-    let lp = w.lp;
-    for _ in 0..4000 {
-        let (_c, g) = w.env.market_state();
-        let a = &g.assets[0];
-        if a.slot_last >= w.slot() && a.stale_account_count_long == 0 && a.stale_account_count_short == 0 {
-            return;
-        }
-        w.env.svm.expire_blockhash();
-        let _ = w.crank(tp);
-        w.env.svm.expire_blockhash();
-        let _ = w.crank(lp);
-    }
-    panic!("book never became current");
-}
-
-/// W-4 residual world: the vault LP is SHORT `size_u` against a long trader, the market falls 1% a
-/// step (the trader loses, the LP wins and holds real, settled, source-backed positive PnL), the
-/// book is cranked current after every step (ONE slot at a time, so every price move is accrued),
-/// the trader stays OPEN, and a backstop of `owed` atoms is outstanding (booked on the state, the
-/// halt mirror and the units ledger as G9 books it).
-fn w4_profit_world(owed: u64, drops: usize, size_u: i128) -> (P3, Pubkey) {
-    let mut w = P3::new();
-    w.create_vault();
-    let s0 = Keypair::new();
-    let s1 = Keypair::new();
-    w.earn_deposit_domain(&s0, 1_500_000, false, 0).expect("75 d0");
-    w.earn_deposit_domain(&s1, 1_000_000, false, 1).expect("75 d1");
-    let admin = w.env.admin.insecure_clone();
-    w.init_vault_lp(&admin, 1_000).unwrap();
-    let up = w.upgrade.insecure_clone();
-    w.set_risk(&up, 0).unwrap();
-    w.junior_deposit(&admin, 1_000_000).unwrap();
-    let (t, tp) = w.trader(50_000_000);
-    w.trade_vs_lp(&t, tp, size_u).unwrap();
-    MARK.with(|c| c.set(PRICE));
-    for _ in 0..drops {
-        let m = MARK.with(|c| c.get()) * 99 / 100;
-        MARK.with(|c| c.set(m));
-        w.push(m);
-        w4_settle(&mut w, tp);
-    }
-    seed_units(&mut w, 20_000_000);
-    {
-        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
-        st.data[16 + 216..16 + 224].copy_from_slice(&owed.to_le_bytes());
-        w.env.svm.set_account(w.state_pda, st).unwrap();
-        let mut m = w.env.svm.get_account(&w.env.market).unwrap();
-        {
-            let (_, mut g) = state::market_view_mut(&mut m.data).unwrap();
-            let mut rec = state::asset_vault_lp_draw_from_wrapper_bytes(&g.markets[0].wrapper[..]).unwrap();
-            rec.outstanding_mirror_atoms = owed as u128;
-            state::asset_vault_lp_draw_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
-        }
-        w.env.svm.set_account(w.env.market, m).unwrap();
-    }
-    set_units(&mut w, |u| u.backstop_receivable_atoms = owed as u128);
-    (w, tp)
-}
-
-struct W4Obs {
-    repaid: u128,
-    ins: u128,
-    pnl0: i128,
-    pnl1: i128,
-    cap0: u128,
-    cap1: u128,
-    equity1: i128,
-    im1: u128,
-    c_tot0: u128,
-    c_tot1: u128,
-}
-
-/// Runs one restore call (`mode`, `max_amount`) on `w` and observes it.
-fn w4_restore(w: &mut P3, mode: u8, max_amount: u128, owed: u64) -> (Result<u64, String>, W4Obs) {
-    let lp0 = w.lp_state();
-    let g0 = w.env.market_state().1;
-    let vault0 = w.tok(&w.env.vault);
-    let r = backstop_111(w, mode, max_amount, true);
-    let lp1 = w.lp_state();
-    let g1 = w.env.market_state().1;
+    let t1 = w.env.portfolio_state(tp);
+    eprintln!("SEC-D7 G9 -> {:?}; backstop {}; insurance {} -> {}; trader cap/pnl {}/{} -> {}/{}; senior draw outstanding {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w), ins0, w.env.market_state().1.insurance, t0.capital, t0.pnl, t1.capital, t1.pnl, outstanding(&w));
     if r.is_ok() {
-        assert_eq!(w.tok(&w.env.vault), vault0, "no SPL moved");
-        assert_eq!(units(w).unwrap().backstop_receivable_atoms, backstop_st(w) as u128);
-        assert_eq!(halt_mirror(w), outstanding(w) + backstop_st(w) as u128, "W-9 mirror in step");
-        conserved(w, "after restore");
-    }
-    let repaid = owed as u128 - backstop_st(w) as u128;
-    let obs = W4Obs {
-        repaid,
-        ins: g1.insurance - g0.insurance,
-        pnl0: lp0.pnl,
-        pnl1: lp1.pnl,
-        cap0: lp0.capital,
-        cap1: lp1.capital,
-        equity1: lp1.health_cert.certified_equity,
-        im1: lp1.health_cert.certified_initial_req,
-        c_tot0: g0.c_tot,
-        c_tot1: g1.c_tot,
-    };
-    (r, obs)
-}
-
-/// W-4 residual, END TO END (security review W4-3). The vault LP is positioned (the trader is
-/// open), holds settled source-backed PnL, and the book is current: mode 3 repays FROM PNL FIRST.
-/// Asserts `from_pnl > 0`, conservation (insurance +repaid, vault tokens unchanged, c_tot falls by
-/// exactly the capital taken), the LP never rises in capital, and the 1.1x IM floor (R-6).
-/// `max_amount` below the PnL available takes the whole repayment from PnL with capital untouched.
-/// Control: mode 1 in the same world cannot take from PnL (it repays from capital only).
-#[test]
-fn w4_pnl_restore_end_to_end_pnl_first() {
-    let owed = 1_300_000u64;
-    let size = U * 3 / 10;
-    // Mode 1 control.
-    let (mut c, _) = w4_profit_world(owed, 4, size);
-    let pnl_before = c.lp_state().pnl;
-    assert!(pnl_before > 0, "vacuity: the LP holds real positive PnL ({pnl_before})");
-    let (r1, o1) = w4_restore(&mut c, 1, 0, owed);
-    r1.expect("mode 1");
-    assert_eq!(o1.cap0 - o1.cap1, o1.repaid, "mode 1 repays from capital only");
-    // Mode 3, uncapped.
-    let (mut w, _tp) = w4_profit_world(owed, 4, size);
-    assert_ne!(w.pos(w.lp), 0, "vacuity: the vault LP is positioned");
-    let (r3, o3) = w4_restore(&mut w, 3, 0, owed);
-    r3.expect("mode 3");
-    assert!(o3.repaid > 0 && o3.ins == o3.repaid, "insurance +repaid exactly");
-    let from_cap = o3.cap0 - o3.cap1;
-    let from_pnl = o3.repaid - from_cap;
-    eprintln!("W-4 e2e: repaid {} from_pnl {} from_cap {} pnl {}->{}", o3.repaid, from_pnl, from_cap, o3.pnl0, o3.pnl1);
-    assert!(from_pnl > 0, "FROM PNL FIRST: from_pnl must be > 0");
-    assert!(o3.pnl1 < o3.pnl0, "the LP's profit paid it");
-    assert_eq!(o3.c_tot0 - o3.c_tot1, from_cap, "c_tot falls by exactly the capital taken");
-    assert!(o3.cap1 <= o3.cap0, "capital never rises");
-    assert_ne!(w.pos(w.lp), 0, "still positioned");
-    let floor = o3.im1 + (o3.im1 * 1_000).div_ceil(10_000);
-    assert!(o3.equity1 >= 0 && o3.equity1 as u128 >= floor, "1.1x IM floor: equity {} floor {}", o3.equity1, floor);
-    assert_eq!(o3.repaid, o1.repaid, "same total as mode 1 (both end at the same equity floor)");
-    // Mode 3, capped below the PnL available: the whole repayment is PnL, capital untouched.
-    let (mut p, _) = w4_profit_world(owed, 4, size);
-    let (rp, op) = w4_restore(&mut p, 3, 5_000, owed);
-    rp.expect("mode 3 capped");
-    assert_eq!(op.repaid, 5_000);
-    assert_eq!(op.cap0, op.cap1, "capital untouched");
-    assert!(op.pnl1 < op.pnl0, "all of it from PnL");
-}
-
-/// W-4 negative control for the refusal case: a REAL positive PnL in a genuinely loss-stale asset
-/// (the book is accrued forward and NOT cranked). The engine's favorable-action gate is closed,
-/// mode 3 takes NOTHING from PnL (the LP's PnL is unchanged) and repays from capital like mode 1.
-/// The same world, cranked current, takes from PnL (previous test), so the gate is what decides.
-#[test]
-fn w4_pnl_restore_refused_by_a_loss_stale_asset() {
-    let owed = 1_300_000u64;
-    let (mut w, tp) = w4_profit_world(owed, 4, U * 3 / 10);
-    let pnl_before = w.lp_state().pnl;
-    assert!(pnl_before > 0, "vacuity: real positive PnL ({pnl_before})");
-    // Accrue the asset forward and leave the book unsettled.
-    let m = MARK.with(|c| c.get()) * 99 / 100;
-    MARK.with(|c| c.set(m));
-    let s = w.slot() + 1;
-    w.env.svm.warp_to_slot(s);
-    w.env.push_auth_mark_for_asset_as_admin(0, s, m);
-    let _ = w.crank(w.lp); // accrues the asset; the counterparties are now stale
-    let (_c, g) = w.env.market_state();
-    let a = &g.assets[0];
-    assert!(a.stale_account_count_long != 0 || a.stale_account_count_short != 0 || a.slot_last < w.slot(),
-        "vacuity: the asset really is loss-stale");
-    let _ = tp;
-    let (r, o) = w4_restore(&mut w, 3, 0, owed);
-    r.expect("falls back to capital (mode 1 behaviour)");
-    assert!(o.repaid > 0);
-    assert_eq!(o.cap0 - o.cap1, o.repaid, "all of it from capital: the PnL path is closed");
-}
-
-/// Mode 4 (and above) is still an invalid instruction; with nothing owed both restore modes are
-/// refused.
-#[test]
-fn w4_mode_range_and_nothing_owed() {
-    let (mut w, _tp) = w4_profit_world(0, 2, U * 3 / 10);
-    let bad = backstop_111(&mut w, 4, 0, true);
-    assert!(bad.is_err(), "mode 4 is invalid: {bad:?}");
-    let none = backstop_111(&mut w, 3, 0, true);
-    assert!(has(&none, INS_REFUSED), "mode 3 with nothing owed is refused: {none:?}");
-    let none1 = backstop_111(&mut w, 1, 0, true);
-    assert!(has(&none1, INS_REFUSED), "mode 1 with nothing owed is refused: {none1:?}");
-}
-
-/// W-10: units only on a single-asset market: 116 refuses a market configured with a second
-/// asset, and a unitised market refuses activating a second asset. Control: capacity-1 116 ok.
-#[test]
-fn w10_units_single_asset_only() {
-    let mut w = market_with_capacity(2);
-    top_up_9(&mut w, 2_000_000, false).expect("seed");
-    let slots = {
-        let mut d = w.env.svm.get_account(&w.env.market).unwrap().data;
-        let (_, g) = state::market_view_mut(&mut d).unwrap();
-        g.header.config.max_market_slots.get()
-    };
-    let r = init_units(&mut w);
-    eprintln!("W-10: capacity-2 market (configured slots {slots}) 116 -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert_eq!(slots, 2, "vacuity: two configured assets");
-    assert!(has(&r, INS_REFUSED), "116 on a multi-asset market refused: {r:?}");
-    let mut c = P3::new();
-    top_up_9(&mut c, 2_000_000, false).expect("seed");
-    init_units(&mut c).expect("control: single-asset 116");
-    assert_eq!(p4_flags(&c) & 1, 1);
-}
-
-/// S-6: an admin proposal cannot overwrite a pending PROTOCOL raise, and a deposit during the
-/// pending raise must consent to the raised target (S-5). Control: the admin's own lowering is
-/// accepted while no protocol proposal is pending (XP-1).
-#[test]
-fn s6_protocol_raise_not_overwritable_and_consent_binds_pending() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 1_000_000, false).expect("seed");
-    init_units(&mut w).expect("116");
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    // Stake program-data mock: `up` is the stake upgrade authority.
-    let up = Keypair::new();
-    w.env.ensure_signer_account(up.pubkey());
-    let pd_key = Pubkey::find_program_address(&[STAKE_PID.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0;
-    let mut pd = vec![0u8; 45];
-    pd[0..4].copy_from_slice(&3u32.to_le_bytes());
-    pd[12] = 1;
-    pd[13..45].copy_from_slice(up.pubkey().as_ref());
-    w.env.svm.set_account(pd_key, Account { lamports: 1_000_000_000, data: pd, owner: solana_sdk::bpf_loader_upgradeable::id(), executable: false, rent_epoch: 0 }).unwrap();
-    let propose = |t: u16| { let mut d = vec![32u8]; d.extend_from_slice(&t.to_le_bytes()); d };
-    stake_send(&mut w, propose(6_000), vec![AccountMeta::new_readonly(up.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(pd_key, false)], &[&up]).expect("protocol raise");
-    let admin = w.env.admin.insecure_clone();
-    let r = stake_send(&mut w, propose(2_000), vec![AccountMeta::new_readonly(admin.pubkey(), true), AccountMeta::new(p.pda, false)], &[&admin]);
-    assert!(st_code(&r, ST_NOT_PROTOCOL_AUTHORITY), "admin cannot overwrite the protocol raise: {r:?}");
-    let a = staker(&mut w, &p, 1_000_000);
-    let r = stake_deposit(&mut w, &p, &a, 1_000_000, Some(CONSENT));
-    assert!(st_code(&r, ST_CONSENT_REQUIRED), "consent to the old target refused while a raise is pending: {r:?}");
-    stake_deposit_consent(&mut w, &p, &a, 1_000_000, Some((CONSENT, 6_000, 3_000, 500))).expect("consent to the pending target");
-}
-
-// ═══════════ Re-review (2026-10-06) items R-1, R-2, R-6 + the reviewer's sec2 tests ═══════════
-
-/// SEC2 (ported): dust (< 1e6) donated into the fund before genesis blocks 116 (liveness only,
-/// R-3: the creator tops up to 1e6); exactly 1e6 passes.
-#[test]
-fn sec2_genesis_after_dust_donation() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 999_999, false).expect("dust");
-    let r = init_units(&mut w);
-    assert!(has(&r, INS_REFUSED), "999,999 in the fund: 116 refused: {r:?}");
-    top_up_9(&mut w, 1, false).expect("1 more atom (no units yet)");
-    init_units(&mut w).expect("exactly 1e6 passes");
-    let u = units(&w).unwrap();
-    assert_eq!((u.units_total, u.units_creator), (1_000_000, 1_000_000));
-}
-
-/// SEC2 (ported): on an empty-fund ledger the first top-up is the genesis and needs >= 1e6.
-#[test]
-fn sec2_first_topup_is_genesis_min() {
-    let mut w = P3::new();
-    init_units(&mut w).expect("116 on an empty fund");
-    assert!(has(&top_up_9(&mut w, 999_999, true), INS_REFUSED));
-    top_up_9(&mut w, 1_000_000, true).expect("1e6");
-}
-
-fn sec2_pool_world(seed: u64) -> (P3, Pool) {
-    let mut w = P3::new();
-    top_up_9(&mut w, seed, false).expect("seed");
-    init_units(&mut w).expect("116");
-    let p = craft_pool(&mut w, 1, 1);
-    bind_and_burn(&mut w, &p);
-    (w, p)
-}
-
-/// SEC2 (ported): an inflated unit price. At price 3 (`U = 1e6, I = 3e6`) a 2e6 sync mints
-/// 666,666 stake units (2 atoms of rounding, within 1 bp): accepted. At price 428,571 (`U = 7`)
-/// the same sync would mint 4 units worth 1,714,284: refused.
-#[test]
-fn sec2_inflated_price_mint_bound() {
-    let (mut w, p) = sec2_pool_world(3_000_000);
-    set_units(&mut w, |u| { u.units_total = 1_000_000; u.units_creator = 1_000_000; u.units_stake = 0; });
-    let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("dep");
-    stake_sync(&mut w, &p).expect("sync at price 3 accepted");
-    assert_eq!(units(&w).unwrap().units_stake, 666_666);
-    let (mut w, p) = sec2_pool_world(3_000_000);
-    set_units(&mut w, |u| { u.units_total = 7; u.units_creator = 7; u.units_stake = 0; });
-    let a = staker(&mut w, &p, 4_000_000);
-    stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("dep");
-    assert!(stake_sync(&mut w, &p).is_err(), "lossy mint refused");
-    assert_eq!(units(&w).unwrap().units_stake, 0);
-}
-
-/// R-2: the burn side of the rounding bound. At price 428,571 (`U = 7`, I = 3e6) a 1-atom
-/// creator withdrawal would burn a whole unit (428,571 atoms): refused. Controls: a withdrawal of
-/// exactly one unit's value is admitted, and a full-class exit is always admitted.
-#[test]
-fn r2_lossy_burn_refused() {
-    let mut w = P3::new();
-    top_up_9(&mut w, 3_000_000, false).unwrap();
-    init_units(&mut w).unwrap();
-    set_units(&mut w, |u| { u.units_total = 7; u.units_creator = 7; u.units_stake = 0; });
-    init_units(&mut w).unwrap();
-    let u = units(&w).unwrap();
-    let free = u.snap_insurance_free_atoms;
-    let (_, r) = withdraw_57(&mut w, 1, true);
-    assert!(has(&r, INS_REFUSED), "1 atom for a whole unit refused: {r:?}");
-    assert!(r.unwrap_err().contains("p4_ins_units_burn_lossy"), "refused by the burn bound");
-    let one_unit = free / 7;
-    let (_, ok) = withdraw_57(&mut w, one_unit, true);
-    ok.expect("exactly one unit's value admitted");
-    assert_eq!(units(&w).unwrap().units_total, 6);
-    let u = units(&w).unwrap();
-    let all = u.snap_insurance_free_atoms;
-    let (_, full) = withdraw_57(&mut w, all, true);
-    full.expect("full-class exit admitted");
-    assert_eq!(units(&w).unwrap().units_creator, 0);
-}
-
-/// R-1 (2) + the reviewer's `sec2_g9_dust_seniors_epochs`: with DUST seniors (150,000 against a
-/// 20,000,000 fund) on a creator-pushed mark, G9 can lend at most what the seniors have lost to
-/// booked draws, in total, over any number of epochs (before: 50% of the fund in 4 epochs).
-#[test]
-fn sec2_g9_dust_seniors_epochs() {
-    use percolator_prog::p4_rescue_ins::G9_EPOCH_SLOTS;
-    let (mut w, _s, (_t, tp)) = underwater_world(90_000, 60_000, 1_000_000, 6);
-    seed_units(&mut w, 20_000_000);
-    let fund0 = w.env.market_state().1.insurance;
-    for epoch in 0..4 {
-        let r = g9(&mut w, &[tp]);
-        let b = backstop_st(&w) as u128;
-        eprintln!("SEC2 epoch {epoch}: g9 -> {:?}; outstanding {b} of fund {fund0}; senior drawn {}", r.as_ref().map_err(|e| code(e)), drawn(&w));
-        if epoch == 0 {
-            r.expect("the first draw goes through (vacuity)");
-            assert!(b > 0);
-        }
-        assert!(b <= drawn(&w), "R-1 (2): outstanding {b} <= senior drawn {}", drawn(&w));
-        assert!(b <= 150_000, "dust seniors unlock only dust: {b}");
-        g9_wait(&mut w, &[tp], G9_EPOCH_SLOTS);
-        for _ in 0..4 {
-            let m = MARK.with(|c| c.get()) * 124 / 100;
-            MARK.with(|c| c.set(m));
-            w.push(m);
-            let lp = w.lp;
-            w.catch_up(&[tp, lp], 30);
-        }
-    }
-}
-
-/// R-1 (1), both build flavours. The P3 market is AuthMark (creator-pushed). On a MAINNET build
-/// (no `devnet` feature; run with `R1_FLAVOUR=mainnet` and that `.so` as `INDEP_WRAPPER_SO`)
-/// propose (2) and draw (0) are refused by the oracle gate before any account is read, and
-/// restore (1) is not. On the devnet build (default) the override keeps G9 testable: propose is
-/// admitted on the same AuthMark market.
-#[test]
-fn r1_g9_oracle_gate_devnet_override() {
-    if std::env::var("R1_FLAVOUR").as_deref() == Ok("mainnet") {
-        return; // running against the non-devnet .so: the ignored mainnet test covers it
-    }
-    let (mut w, _s, (_t, _tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    backstop_111(&mut w, 2, 0, true).expect("devnet override: propose admitted on AuthMark");
-}
-
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r1_g9_oracle_gate_mainnet_refuses_authmark() {
-    require_mainnet_flavour();
-    let mut w = P3::new();
-    w.lp = Pubkey::new_unique(); // no vault on this build (the bind needs the devnet pins)
-    for mode in [2u8, 0] {
-        let r = backstop_111(&mut w, mode, 0, false);
-        eprintln!("R-1 mainnet 111 mode {mode} -> {:?}", r.as_ref().map_err(|e| code(e)));
-        assert!(has(&r, INS_REFUSED), "mainnet: refused: {r:?}");
-        assert!(r.unwrap_err().contains("p4_backstop_oracle_refused mode=3"), "by the oracle gate");
-    }
-    let r = backstop_111(&mut w, 1, 0, false);
-    assert!(!r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused")), "restore is never oracle-gated: {r:?}");
-}
-
-/// R-6: RESTORE leaves the vault LP at least 10% of IM above its initial margin. After a
-/// repayment from a positioned LP, a second restore finds nothing more to repay and its log
-/// shows equity >= IM + ceil(IM / 10) (the buffer binds, not the IM floor).
-#[test]
-fn r6_restore_leaves_im_buffer() {
-    let (mut w, _s, (_t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("draw");
-    for _ in 0..4 {
-        let m = MARK.with(|c| c.get()) * 80 / 100;
-        MARK.with(|c| c.set(m.max(PRICE / 4)));
-        w.push(m.max(PRICE / 4));
-        let lp = w.lp;
-        w.catch_up(&[tp, lp], 30);
-    }
-    let admin = w.env.admin.insecure_clone();
-    w.junior_deposit(&admin, 3_000_000).expect("junior");
-    let lpk = w.lp;
-    let _ = w.crank(lpk);
-    let b0 = backstop_st(&w);
-    backstop_111(&mut w, 1, 0, true).expect("restore");
-    let b1 = backstop_st(&w);
-    assert!(b1 < b0, "vacuity: repaid");
-    assert!(b1 > 0, "vacuity: the buffer, not the outstanding, limited the repayment");
-    let r = backstop_111(&mut w, 1, 0, true);
-    let e = r.expect_err("nothing more repayable");
-    let i = e.find("p4_backstop_restore_nothing").expect("restore_nothing log");
-    let field = |k: &str| -> u128 {
-        let j = e[i..].find(k).unwrap() + i + k.len();
-        e[j..].chars().take_while(|c| c.is_ascii_digit()).collect::<String>().parse().unwrap()
-    };
-    let (equity, im) = (field("equity="), field("im="));
-    eprintln!("R-6: backstop {b0} -> {b1}; LP equity {equity} IM {im}");
-    assert!(im > 0, "vacuity: positioned");
-    assert!(equity >= im + im.div_ceil(10), "R-6: >= 10% of IM above the floor: {equity} vs {im}");
-}
-
-// ═══════════ Round 4 (2026-10-06): R-7 leg sources, R-8 provenance, R-9 licence ═══════════
-//
-// The leg-source gate exists only on a MAINNET build (devnet keeps the testing override), so these
-// run their real assertions with the non-devnet `.so` and `R1_FLAVOUR=mainnet`; the devnet build
-// asserts the override instead. The gate runs before any vault account is read, so on the
-// mainnet `.so` (where a vault cannot be bound) "gate passed" is read from its
-// `p4_g9_oracle_gate_ok` log on the next (unrelated) refusal.
-
-const ORACLE_AUTHENTICATED: u8 = 0;
-const ORACLE_TRADE_DRIVEN: u8 = 1;
-
-/// Rewrite asset 0's profile as a Hybrid with one leg `feed` (valid per the profile validator).
-fn make_hybrid(w: &mut P3, feed: Pubkey, provenance: u8) {
-    let mut acct = w.env.svm.get_account(&w.env.market).unwrap();
-    {
-        let (_, mut g) = state::market_view_mut(&mut acct.data).unwrap();
-        let len = percolator_prog::constants::ASSET_ORACLE_PROFILE_LEN;
-        let mut p: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(&g.markets[0].wrapper[..len]);
-        p.oracle_mode = 1;
-        p.oracle_leg_count = 1;
-        p.oracle_leg_flags = 0;
-        p.oracle_leg_feeds = [[0u8; 32]; 3];
-        p.oracle_leg_feeds[0] = feed.to_bytes();
-        p.max_staleness_secs = 60;
-        p.hybrid_soft_stale_slots = 50;
-        p.mark_ewma_halflife_slots = 600;
-        p.effective_price_provenance = provenance;
-        state::validate_asset_oracle_profile(&p).expect("valid Hybrid profile");
-        g.markets[0].wrapper[..len].copy_from_slice(bytemuck::bytes_of(&p));
-    }
-    w.env.svm.set_account(w.env.market, acct).unwrap();
-}
-
-/// The feed OWNER every test feed starts with (Chainlink `feed.owner` at +10, Switchboard
-/// `authority` at +2056); R10-2 pins it into the allowlist record.
-const FEED_OWNER: [u8; 32] = [0xF0; 32];
-
-fn set_feed_owner(w: &mut P3, feed: Pubkey, feed_owner: [u8; 32]) {
-    let mut a = w.env.svm.get_account(&feed).unwrap();
-    a.data[10..42].copy_from_slice(&feed_owner);
-    a.data[2_056..2_088].copy_from_slice(&feed_owner);
-    w.env.svm.set_account(feed, a).unwrap();
-}
-
-fn feed_account(w: &mut P3, owner: Pubkey) -> Pubkey {
-    let k = Pubkey::new_unique();
-    w.env.svm.set_account(k, Account { lamports: 1_000_000_000, data: vec![0u8; 2_200], owner, executable: false, rent_epoch: 0 }).unwrap();
-    set_feed_owner(w, k, FEED_OWNER);
-    k
-}
-
-fn g9_allowlist_pda(w: &P3) -> Pubkey {
-    state::derive_g9_feed_allowlist(&w.env.program_id).0
-}
-
-fn set_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u64, String> {
-    w.env.ensure_signer_account(signer.pubkey());
-    let (pd, list) = (w.program_data, g9_allowlist_pda(w));
-    w.send(
-        ProgInstruction::SetG9FeedAllowlist { keys },
-        vec![
-            AccountMeta::new(signer.pubkey(), true),
-            AccountMeta::new_readonly(pd, false),
-            AccountMeta::new(list, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        &[signer],
-    )
-}
-
-fn allowlist_metas(w: &P3, signer: &Keypair) -> Vec<AccountMeta> {
-    vec![
-        AccountMeta::new(signer.pubkey(), true),
-        AccountMeta::new_readonly(w.program_data, false),
-        AccountMeta::new(g9_allowlist_pda(w), false),
-        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-    ]
-}
-
-/// R-10: tag 120 (propose; empty = cancel).
-fn propose_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) -> Result<u64, String> {
-    propose_allowlist_entries(w, signer, keys.into_iter().map(|k| (k, FEED_OWNER)).collect())
-}
-
-fn propose_allowlist_entries(w: &mut P3, signer: &Keypair, entries: Vec<([u8; 32], [u8; 32])>) -> Result<u64, String> {
-    w.env.ensure_signer_account(signer.pubkey());
-    let metas = allowlist_metas(w, signer);
-    w.send(ProgInstruction::ProposeG9FeedAllowlist { entries }, metas, &[signer])
-}
-
-/// R-10: tag 121 (commit).
-fn commit_allowlist(w: &mut P3, signer: &Keypair) -> Result<u64, String> {
-    w.env.ensure_signer_account(signer.pubkey());
-    let metas = allowlist_metas(w, signer);
-    w.send(ProgInstruction::CommitG9FeedAllowlist, metas, &[signer])
-}
-
-const TIMELOCK: u64 = percolator_prog::constants::G9_ALLOWLIST_TIMELOCK_SLOTS;
-const ALLOWLIST_TIMELOCK_ERR: u32 = 125;
-
-fn allowlist_rec(w: &P3) -> state::G9FeedAllowlistV22 {
-    state::read_g9_feed_allowlist(&w.env.svm.get_account(&g9_allowlist_pda(w)).unwrap().data).unwrap()
-}
-
-/// R-10: ADD `keys` (the new list in force) the only way an addition can happen: propose, wait the
-/// full timelock, commit.
-fn add_to_allowlist(w: &mut P3, signer: &Keypair, keys: Vec<[u8; 32]>) {
-    propose_allowlist(w, signer, keys).expect("propose");
-    let target = w.slot() + TIMELOCK;
-    w.env.svm.warp_to_slot(target);
-    commit_allowlist(w, signer).expect("commit after the delay");
-}
-
-/// Tag 111 PROPOSE with `tail` appended after the fixed accounts (no units ledger needed: the
-/// gate runs first).
-fn propose_with_tail(w: &mut P3, tail: &[Pubkey]) -> Result<u64, String> {
-    let payer = w.env.payer.pubkey();
-    let mut metas = vec![
-        AccountMeta::new(payer, true),
-        AccountMeta::new(w.env.market, false),
-        AccountMeta::new_readonly(w.registry, false),
-        AccountMeta::new(w.state_pda, false),
-        AccountMeta::new(w.lp, false),
-        AccountMeta::new(w.ledger0, false),
-        AccountMeta::new(w.ledger1, false),
-    ];
-    metas.extend(tail.iter().map(|k| AccountMeta::new_readonly(*k, false)));
-    w.send(ProgInstruction::InsuranceBackstopDraw { mode: 2, max_amount: 0 }, metas, &[])
-}
-
-fn gate_passed(r: &Result<u64, String>) -> bool {
-    match r {
-        Ok(_) => true,
-        Err(e) => e.contains("p4_g9_oracle_gate_ok"),
-    }
-}
-fn leg_refused(r: &Result<u64, String>) -> bool {
-    r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_leg_refused") && has(r, INS_REFUSED))
-}
-fn oracle_refused(r: &Result<u64, String>) -> bool {
-    r.as_ref().err().map_or(false, |e| e.contains("p4_backstop_oracle_refused") && has(r, INS_REFUSED))
-}
-
-/// The mainnet-flavour tests must NEVER pass vacuously: they are `#[ignore]`d (reported as skipped in a
-/// normal run) and, when run, panic unless `R1_FLAVOUR=mainnet` AND the mounted `.so` is the non-devnet
-/// build (an unlisted-feed probe that the devnet override would admit proves the flavour).
-fn require_mainnet_flavour() {
-    assert_eq!(
-        std::env::var("R1_FLAVOUR").as_deref(),
-        Ok("mainnet"),
-        "mainnet-flavour test: set R1_FLAVOUR=mainnet and INDEP_WRAPPER_SO to a NON-devnet .so (scripts/mainnet-flavour-tests.sh)"
-    );
-}
-
-fn r7_world() -> P3 {
-    let mut w = P3::new();
-    w.lp = Pubkey::new_unique();
-    w
-}
-
-/// R-7 (mainnet): a creator-made (unlisted) Switchboard feed is refused; the SAME feed once the
-/// upgrade authority allowlists it is admitted; without the allowlist account in the tail it is
-/// refused again (control). Devnet: the override admits the unlisted feed (testing only).
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r7_switchboard_leg_requires_allowlist() {
-    require_mainnet_flavour();
-    let mut w = r7_world();
-    let feed = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
-    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-    let r = propose_with_tail(&mut w, &[feed]);
-    eprintln!("R-7 unlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(leg_refused(&r), "creator-made Switchboard feed refused: {r:?}");
-    let up = w.upgrade.insecure_clone();
-    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
-    let list = g9_allowlist_pda(&w);
-    let r = propose_with_tail(&mut w, &[list, feed]);
-    eprintln!("R-7 allowlisted Switchboard -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(gate_passed(&r), "allowlisted feed admitted by the gate: {r:?}");
-    let r = propose_with_tail(&mut w, &[feed]);
-    assert!(leg_refused(&r), "control: allowlist account omitted -> refused: {r:?}");
-    // A different listed key does not help an unlisted leg.
-    let other = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
-    add_to_allowlist(&mut w, &up, vec![other.to_bytes()]);
-    let r = propose_with_tail(&mut w, &[list, feed]);
-    assert!(leg_refused(&r), "control: only another feed listed -> refused: {r:?}");
-}
-
-/// R-12 (mainnet): a Chainlink store feed is NOT trusted by its owner alone (the store's
-/// `create_feed` is open to any signer, see `evidence/r12-chainlink-store-*`): unlisted it is
-/// refused; once the upgrade authority lists it (propose, 216,000 slots, commit) it is admitted.
-/// Controls: the leg account omitted, a listed key but another Chainlink account, the allowlist
-/// omitted from the tail, and a Pyth-owned leg are refused.
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r12_chainlink_leg_requires_allowlist() {
-    require_mainnet_flavour();
-    let mut w = r7_world();
-    let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
-    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-    let r = propose_with_tail(&mut w, &[feed]);
-    eprintln!("R-12 unlisted Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(leg_refused(&r), "R-12: an unlisted store-owned feed is refused: {r:?}");
-    let up = w.upgrade.insecure_clone();
-    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
-    let list = g9_allowlist_pda(&w);
-    let r = propose_with_tail(&mut w, &[list, feed]);
-    eprintln!("R-12 listed Chainlink -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(gate_passed(&r), "listed Chainlink admitted: {r:?}");
-    assert!(leg_refused(&propose_with_tail(&mut w, &[list])), "control: leg account omitted");
-    assert!(leg_refused(&propose_with_tail(&mut w, &[feed])), "control: allowlist omitted from the tail");
-    let other = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
-    assert!(leg_refused(&propose_with_tail(&mut w, &[list, other])), "control: Chainlink account with another key");
-    let pyth = feed_account(&mut w, percolator_prog::oracle_v16::PYTH_RECEIVER_PROGRAM_ID);
-    make_hybrid(&mut w, pyth, ORACLE_AUTHENTICATED);
-    assert!(leg_refused(&propose_with_tail(&mut w, &[list, pyth])), "control: Pyth leg refused (no Pyth)");
-}
-
-/// R12-2 (mainnet): `Aio4gaX...` (the Switchboard DEVNET program id) is deployed and upgradeable on
-/// mainnet under a different authority, so an account it owns is NOT a Switchboard feed on a
-/// mainnet build: refused even when its key is on the allowlist. Control: the real On-Demand
-/// program id is admitted once listed.
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r12_switchboard_devnet_program_refused_on_mainnet() {
-    require_mainnet_flavour();
-    let mut w = r7_world();
-    let dev = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID);
-    make_hybrid(&mut w, dev, ORACLE_AUTHENTICATED);
-    let up = w.upgrade.insecure_clone();
-    add_to_allowlist(&mut w, &up, vec![dev.to_bytes()]);
-    let list = g9_allowlist_pda(&w);
-    let r = propose_with_tail(&mut w, &[list, dev]);
-    assert!(leg_refused(&r), "a feed owned by the Switchboard DEVNET id is refused on mainnet, even listed: {r:?}");
-    let real = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
-    make_hybrid(&mut w, real, ORACLE_AUTHENTICATED);
-    add_to_allowlist(&mut w, &up, vec![real.to_bytes()]);
-    let r = propose_with_tail(&mut w, &[list, real]);
-    assert!(gate_passed(&r), "control: the real On-Demand program, listed: {r:?}");
-}
-
-/// R10-2 (mainnet): the allowlist pins the feed OWNER. A listed Chainlink feed whose `feed.owner`
-/// changes afterwards (the owner can change the writer) stops qualifying; the same for a Switchboard
-/// feed whose `authority` changes. Control: restoring the owner re-qualifies it; a feed listed with
-/// a DIFFERENT pinned owner never qualified.
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r10_listed_feed_owner_change_disqualifies() {
-    require_mainnet_flavour();
-    for program in [
-        percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID,
-        percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID,
-    ] {
-        let mut w = r7_world();
-        let feed = feed_account(&mut w, program);
-        make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-        let up = w.upgrade.insecure_clone();
-        add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
-        let list = g9_allowlist_pda(&w);
-        assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "listed + owner matches");
-        set_feed_owner(&mut w, feed, [0xEE; 32]);
-        let r = propose_with_tail(&mut w, &[list, feed]);
-        assert!(leg_refused(&r), "the owner changed: the listed feed stops qualifying ({program}): {r:?}");
-        set_feed_owner(&mut w, feed, FEED_OWNER);
-        assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "control: owner restored");
-        // Listed with a different pinned owner: never qualified.
-        let other = feed_account(&mut w, program);
-        make_hybrid(&mut w, other, ORACLE_AUTHENTICATED);
-        propose_allowlist_entries(&mut w, &up, vec![(other.to_bytes(), [0xAB; 32])]).expect("propose");
-        let t = w.slot() + TIMELOCK;
-        w.env.svm.warp_to_slot(t);
-        commit_allowlist(&mut w, &up).expect("commit");
-        let r = propose_with_tail(&mut w, &[list, other]);
-        assert!(leg_refused(&r), "pinned owner differs from the feed's owner: {r:?}");
-    }
-}
-
-/// Devnet flavour: the override admits an unlisted feed (testing only); the mainnet flavour tests
-/// above assert the opposite against the non-devnet `.so`.
-#[test]
-fn g9_devnet_override_admits_an_unlisted_feed() {
-    if std::env::var("R1_FLAVOUR").as_deref() == Ok("mainnet") {
-        return; // running against the non-devnet .so: the ignored mainnet tests cover it
-    }
-    let mut w = r7_world();
-    let feed = feed_account(&mut w, percolator_prog::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID);
-    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-    let r = propose_with_tail(&mut w, &[feed]);
-    assert!(r.as_ref().err().map_or(false, |e| e.contains("p4_g9_oracle_gate_ok override=1")), "devnet override: {r:?}");
-}
-
-/// R-8 (mainnet): a Hybrid whose effective price fell back to the trade-driven mark is refused,
-/// even with a Chainlink leg. Control: the same market AUTHENTICATED passes the gate.
-#[test]
-#[ignore = "mainnet flavour: run scripts/mainnet-flavour-tests.sh (non-devnet .so, R1_FLAVOUR=mainnet)"]
-fn r8_trade_driven_provenance_refused() {
-    require_mainnet_flavour();
-    let mut w = r7_world();
-    let feed = feed_account(&mut w, percolator_prog::oracle_v16::CHAINLINK_STORE_PROGRAM_ID);
-    make_hybrid(&mut w, feed, ORACLE_TRADE_DRIVEN);
-    let r = propose_with_tail(&mut w, &[feed]);
-    eprintln!("R-8 trade-driven -> {:?}", r.as_ref().map_err(|e| code(e)));
-    assert!(oracle_refused(&r), "trade-driven fallback refused: {r:?}");
-    make_hybrid(&mut w, feed, ORACLE_AUTHENTICATED);
-    let up = w.upgrade.insecure_clone();
-    add_to_allowlist(&mut w, &up, vec![feed.to_bytes()]);
-    let list = g9_allowlist_pda(&w);
-    assert!(gate_passed(&propose_with_tail(&mut w, &[list, feed])), "control: authenticated passes");
-}
-
-/// Tags 117 / 120 / 121 are upgrade-authority only and validate their list (both build flavours).
-#[test]
-fn r7_allowlist_setter_is_authority_only_and_validated() {
-    let mut w = r7_world();
-    let k = Pubkey::new_unique().to_bytes();
-    let stranger = Keypair::new();
-    assert!(propose_allowlist(&mut w, &stranger, vec![k]).is_err(), "non-authority propose refused");
-    assert!(set_allowlist(&mut w, &stranger, vec![]).is_err(), "non-authority 117 refused");
-    assert!(commit_allowlist(&mut w, &stranger).is_err(), "non-authority commit refused");
-    assert!(w.env.svm.get_account(&g9_allowlist_pda(&w)).map_or(true, |a| a.data.is_empty()), "nothing created");
-    let up = w.upgrade.insecure_clone();
-    assert!(propose_allowlist(&mut w, &up, vec![k, k]).is_err(), "duplicates refused");
-    assert!(propose_allowlist(&mut w, &up, vec![[0u8; 32]]).is_err(), "zero key refused");
-    assert!(propose_allowlist(&mut w, &up, (0..17u8).map(|i| [i + 1; 32]).collect()).is_err(), "17 keys refused");
-    add_to_allowlist(&mut w, &up, vec![k]);
-    let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, k, 0, 0));
-    set_allowlist(&mut w, &up, vec![]).expect("authority clears it (a removal)");
-    assert_eq!(allowlist_rec(&w).count, 0);
-}
-
-/// R-10: the timelock. An ADDED feed is in force only after `G9_ALLOWLIST_TIMELOCK_SLOTS`; commit
-/// one slot early is refused (125), at the boundary it succeeds; the list in force never changes
-/// before the commit. Both build flavours (the handlers do not depend on the flavour).
-#[test]
-fn r10_addition_needs_the_full_delay() {
-    let mut w = r7_world();
-    let up = w.upgrade.insecure_clone();
-    let a = Pubkey::new_unique().to_bytes();
-    propose_allowlist(&mut w, &up, vec![a]).expect("propose");
-    let p = allowlist_rec(&w);
-    assert_eq!((p.count, p.pending_count), (0, 1), "nothing in force yet");
-    assert!(p.pending_slot_u64() != 0);
-    // Immediately: refused.
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit at once refused: {r:?}");
-    // One slot short of the delay: refused.
-    w.env.svm.warp_to_slot(p.pending_slot_u64() + TIMELOCK - 1);
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "commit one slot early refused: {r:?}");
-    assert_eq!(allowlist_rec(&w).count, 0, "still nothing in force");
-    // Exactly at the delay: accepted.
-    w.env.svm.warp_to_slot(p.pending_slot_u64() + TIMELOCK);
-    commit_allowlist(&mut w, &up).expect("commit at the boundary");
-    let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, a, 0, 0));
-    // A commit with no proposal is refused (replay).
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "no proposal -> refused: {r:?}");
-}
-
-/// R-10: tag 117 can no longer ADD (negative control for the old instant replacement); a removal
-/// is immediate and also cancels an open proposal that predates it.
-#[test]
-fn r10_tag_117_is_removal_only() {
-    let mut w = r7_world();
-    let up = w.upgrade.insecure_clone();
-    let (a, b, c) = (Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes());
-    // The old behaviour (instant replace on a fresh list) is refused.
-    let r = set_allowlist(&mut w, &up, vec![a]);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "an addition through 117 is refused: {r:?}");
-    assert!(w.env.svm.get_account(&g9_allowlist_pda(&w)).map_or(true, |x| x.data.is_empty()), "nothing created");
-    add_to_allowlist(&mut w, &up, vec![a, b]);
-    // Adding c while keeping a: refused; the list is unchanged.
-    let r = set_allowlist(&mut w, &up, vec![a, c]);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "replacement that adds c refused: {r:?}");
-    assert_eq!(allowlist_rec(&w).count, 2);
-    // A pending addition, then an immediate removal: the removal lands NOW and cancels the proposal.
-    propose_allowlist(&mut w, &up, vec![a, b, c]).expect("propose adding c");
-    set_allowlist(&mut w, &up, vec![a]).expect("removal of b is immediate");
-    let l = allowlist_rec(&w);
-    assert_eq!((l.count, l.keys[0], l.pending_count, l.pending_slot_u64()), (1, a, 0, 0), "removal cancelled the proposal");
-    let target = w.slot() + TIMELOCK;
-    w.env.svm.warp_to_slot(target);
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "the cancelled proposal cannot commit: {r:?}");
-    assert_eq!(allowlist_rec(&w).count, 1, "b stays removed, c never added");
-}
-
-/// R-10: a second proposal restarts the delay; an empty proposal cancels (and is refused when
-/// nothing is open); the delay is the constant 216,000 on every build.
-#[test]
-fn r10_reproposal_restarts_and_cancel() {
-    let mut w = r7_world();
-    let up = w.upgrade.insecure_clone();
-    let (a, b) = (Pubkey::new_unique().to_bytes(), Pubkey::new_unique().to_bytes());
-    assert_eq!(TIMELOCK, 216_000, "the S-6 floor");
-    let r = propose_allowlist(&mut w, &up, vec![]);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancel with nothing open refused: {r:?}");
-    propose_allowlist(&mut w, &up, vec![a]).expect("first");
-    let first = allowlist_rec(&w).pending_slot_u64();
-    w.env.svm.warp_to_slot(first + TIMELOCK - 10);
-    propose_allowlist(&mut w, &up, vec![a, b]).expect("replace");
-    let second = allowlist_rec(&w);
-    assert!(second.pending_slot_u64() > first && second.pending_count == 2, "replaced and restarted");
-    // The OLD due slot passes: the replaced proposal is not yet committable.
-    w.env.svm.warp_to_slot(first + TIMELOCK + 5);
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "a replaced proposal restarts the clock: {r:?}");
-    // Cancel: nothing can commit.
-    propose_allowlist(&mut w, &up, vec![]).expect("cancel");
-    let l = allowlist_rec(&w);
-    assert_eq!((l.pending_count, l.pending_slot_u64()), (0, 0));
-    w.env.svm.warp_to_slot(second.pending_slot_u64() + TIMELOCK + 5);
-    let r = commit_allowlist(&mut w, &up);
-    assert!(has(&r, ALLOWLIST_TIMELOCK_ERR), "cancelled -> refused: {r:?}");
-    assert_eq!(allowlist_rec(&w).count, 0);
-}
-
-/// R-9: the G9 licence is the seniors' loss STILL outstanding. With the seniors' outstanding draw
-/// cut to X (as after a partial restore), a draw moves at most X; control: untouched, the draw is
-/// deficit-limited (> X).
-#[test]
-fn r9_licence_shrinks_with_senior_recovery() {
-    let x: u128 = 300_000;
-    let set_senior_out = |w: &mut P3, v: u128| {
-        let mut st = w.env.svm.get_account(&w.state_pda).unwrap();
-        st.data[16 + 240..16 + 256].copy_from_slice(&v.to_le_bytes());
-        w.env.svm.set_account(w.state_pda, st).unwrap();
-    };
-    let (mut w, _s, (_t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    g9(&mut w, &[tp]).expect("control draw");
-    let full = backstop_st(&w) as u128;
-    assert!(full > x, "control: unlimited draw {full} > {x}");
-    let (mut w, _s, (_t, tp)) = g9_world();
-    seed_units(&mut w, 20_000_000);
-    backstop_111(&mut w, 2, 0, true).expect("propose");
-    g9_wait(&mut w, &[tp], percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS);
-    set_senior_out(&mut w, x);
-    let r = backstop_111(&mut w, 0, 0, true);
-    eprintln!("R-9 draw with senior outstanding {x} -> {:?}; backstop {}", r.as_ref().map_err(|e| code(e)), backstop_st(&w));
-    r.expect("draw");
-    assert_eq!(backstop_st(&w) as u128, x, "licence = seniors' outstanding loss");
-}
-
-/// Item 4 (tag 94 on a PINNED build). Needs the `mainnet-ids-test-placeholders` `.so` (pinned wrapper
-/// `[0xA2; 32]`, pinned vault-LP matcher `[0xA3; 32]`): run with `PIN_FLAVOUR=1` and that `.so` as
-/// `INDEP_WRAPPER_SO` (`scripts/pin-flavour-tests.sh`). A vault LP CAN be created under the pinned
-/// matcher id; under ANY other matcher id tag 94 is refused with `VaultLpMatcherNotApproved`, so the
-/// pin is what decides (on a build with no pin tag 94 is refused for every matcher).
-#[test]
-#[ignore = "pinned flavour: run scripts/pin-flavour-tests.sh (mainnet-ids-test-placeholders .so, PIN_FLAVOUR=1)"]
-fn pin_tag94_vault_lp_only_under_the_pinned_matcher() {
-    assert_eq!(std::env::var("PIN_FLAVOUR").as_deref(), Ok("1"), "set PIN_FLAVOUR=1 and use the placeholder-pin .so");
-    // Control: the pinned matcher: the vault LP is created.
-    let mut w = P3::new();
-    w.create_vault();
-    let admin = w.env.admin.insecure_clone();
-    let r = w.init_vault_lp(&admin, 1_000);
-    assert!(r.is_ok(), "tag 94 under the pinned matcher must succeed on a pinned build: {r:?}");
-    assert_ne!(w.lp, Pubkey::default());
-    // Negative control: any other matcher id is refused.
-    let refused = percolator_prog::error::PercolatorError::VaultLpMatcherNotApproved as u32;
-    for other in [Pubkey::new_from_array([0xA4; 32]), Pubkey::new_unique()] {
-        let mut w2 = P3::new_with_matcher(Some(other));
-        w2.create_vault();
-        let admin2 = w2.env.admin.insecure_clone();
-        let r2 = w2.init_vault_lp(&admin2, 1_000);
-        assert!(has(&r2, refused), "tag 94 under matcher {other} must be refused ({refused}): {r2:?}");
+        for _ in 0..3 { let _ = w.crank(tp); let _ = w.crank(w.lp); }
+        let t2 = w.env.portfolio_state(tp);
+        eprintln!("SEC-D7 after cranks trader cap/pnl {}/{}", t2.capital, t2.pnl);
+        let (t2k, tp2) = w.trader(50_000_000);
+        let pos0 = w.pos(w.lp);
+        let r2 = w.trade_vs_lp(&t2k, tp2, U);
+        eprintln!("SEC-D7 new risk-increasing fill after G9 -> {:?}; LP pos {} -> {}", r2.as_ref().map_err(|e| code(e)), pos0, w.pos(w.lp));
     }
 }

@@ -38,6 +38,16 @@ const MATCHER_CONTEXT_LEN: usize = 320;
 const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
@@ -407,9 +417,10 @@ impl Env {
             &signers,
             self.svm.latest_blockhash(),
         );
+        let __d = instructions.last().map(|i| i.data.clone()).unwrap_or_default();
         self.svm
             .send_transaction(tx)
-            .map(|_| ())
+            .map(|m| { cu_rec(&__d, m.compute_units_consumed); })
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -1152,6 +1163,26 @@ fn p3_init_vault_lp_binds_a_registry_owned_lp_and_seeds_senior_claim_at_nav() {
     // Re-bind refused.
     let admin = env.admin.insecure_clone();
     err_has(&env.init_vault_lp_as(&admin, 1_000), PercolatorError::VaultLpAlreadyBound);
+}
+
+/// v2.2 (10,603 B portfolios): InitVaultLp REFUSES a pre-created lp portfolio whose length is not
+/// exactly `PORTFOLIO_ACCOUNT_LEN` (InvalidAccountLen) instead of attempting a realloc that the
+/// program's entrypoint bridge cannot perform above 10,240 B; the exact length binds. The
+/// refused account is untouched (no silent resize).
+#[test]
+fn v22_init_vault_lp_refuses_a_wrong_portfolio_length_and_never_reallocs() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 5_000_000, None).expect("pre-bind earn deposit");
+    let admin = env.admin.insecure_clone();
+    let exact = env.plen;
+    for bad in [0usize, 10_240, exact - 1, exact + 1, exact + 10_240] {
+        env.plen = bad;
+        let r = env.init_vault_lp_as(&admin, 1_000);
+        err_has(&r, PercolatorError::InvalidAccountLen);
+    }
+    env.plen = exact;
+    env.init_vault_lp_as(&admin, 1_000).expect("the exact length binds");
 }
 
 #[test]

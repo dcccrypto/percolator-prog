@@ -262,7 +262,8 @@ pub fn g9_oracle_allowed(oracle_mode: u8, provenance_authenticated: bool, allow_
 /// R-7: where a Hybrid leg's account comes from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum G9LegSource {
-    /// Owned by the Chainlink store program (feeds are not creator-made).
+    /// Owned by the Chainlink store program. R-12: NOT creator-proof (the store's `create_feed` is
+    /// open to any signer), so it needs the allowlist exactly like a Switchboard feed.
     Chainlink,
     /// Owned by Switchboard On-Demand: permissionless, anyone can create a feed with any job.
     Switchboard,
@@ -270,16 +271,51 @@ pub enum G9LegSource {
     Other,
 }
 
-/// R-7: a leg is acceptable for G9 iff its account key equals the profile's leg key AND it is a
-/// Chainlink store feed, or a Switchboard feed on the upgrade-authority allowlist
-/// (`["g9_feeds"]`, tag 117).
+/// R-7 + R-12: a leg is acceptable for G9 iff its account key equals the profile's leg key AND the
+/// key is on the upgrade-authority allowlist (`["g9_feeds"]`, tags 117/120/121) AND its owner is a
+/// recognised oracle program. Chainlink store feeds are NO LONGER exempt (R-12, verified on
+/// mainnet 2026-10-07: the store's `create_feed` has no access control, so any signer can create a
+/// store-owned feed with a self-chosen writer; `evidence/r12-chainlink-store-*`).
 pub fn g9_leg_ok(source: G9LegSource, key_matches: bool, allowlisted: bool) -> bool {
     key_matches
         && match source {
-            G9LegSource::Chainlink => true,
-            G9LegSource::Switchboard => allowlisted,
+            G9LegSource::Chainlink | G9LegSource::Switchboard => allowlisted,
             G9LegSource::Other => false,
         }
+}
+
+/// R10-2: the feed owner read from the leg account (`None` when the account is too short or the
+/// source is not Chainlink / Switchboard). Chainlink store `Transmissions.owner` at +10; Switchboard
+/// PullFeed `authority` at +2056.
+pub fn g9_leg_feed_owner(source: G9LegSource, data: &[u8]) -> Option<[u8; 32]> {
+    let off = match source {
+        G9LegSource::Chainlink => crate::oracle_v16::CL_OFF_FEED_OWNER,
+        G9LegSource::Switchboard => crate::oracle_v16::SB_OFF_FEED_AUTHORITY,
+        G9LegSource::Other => return None,
+    };
+    data.get(off..off + 32)?.try_into().ok()
+}
+
+/// R10-2: a listed feed qualifies only while its CURRENT owner equals the owner pinned in the
+/// record; both must exist (an unlisted feed or an unreadable owner never qualifies).
+pub fn g9_owner_matches(listed: Option<&[u8; 32]>, actual: Option<&[u8; 32]>) -> bool {
+    matches!((listed, actual), (Some(a), Some(b)) if a == b)
+}
+
+/// R-10: `new` may replace `current` immediately iff it adds nothing (every new key is already
+/// in force). A removal is always immediate; an addition is never.
+pub fn g9_allowlist_removal_only(current: &[[u8; 32]], new: &[[u8; 32]]) -> bool {
+    new.iter().all(|k| current.contains(k))
+}
+
+/// R-10: a proposal made at `pending_slot` (0 = none) may be committed once the timelock has
+/// elapsed: `now >= pending_slot + G9_ALLOWLIST_TIMELOCK_SLOTS`. Saturating, fail closed at the
+/// top of the range.
+pub fn g9_allowlist_commit_ready(pending_slot: u64, now: u64) -> bool {
+    pending_slot != 0
+        && pending_slot
+            .checked_add(crate::constants::G9_ALLOWLIST_TIMELOCK_SLOTS)
+            .is_some_and(|due| now >= due)
 }
 
 /// R-1 (2) + R-9: insurance never lends more, in total, than the Earn seniors' loss that is STILL
@@ -316,6 +352,47 @@ pub fn backstop_restore_amount(outstanding: u128, lp_equity_free: u128, requeste
     } else {
         r.min(requested)
     }
+}
+
+/// R-6: the equity the LP may give up in total (`equity - (IM + buffer)`, `buffer = ceil(IM *
+/// RESTORE_IM_BUFFER_BPS / 10_000)`); 0 on overflow (fail closed). `backstop_restore_free` is
+/// this room capped by the LP's capital.
+pub fn backstop_restore_equity_room(equity: u128, initial_req: u128) -> u128 {
+    let buffer = match initial_req.checked_mul(RESTORE_IM_BUFFER_BPS as u128) {
+        Some(p) => p.div_ceil(10_000),
+        None => return 0,
+    };
+    match initial_req.checked_add(buffer) {
+        Some(floor) => equity.saturating_sub(floor),
+        None => 0,
+    }
+}
+
+/// W-4 residual, mode 3 (RESTORE-FROM-PNL): split a repayment between the vault LP's unconverted,
+/// unliened, source-backed PnL (repaid FIRST: the engine's `repay_insurance_from_released_pnl`) and
+/// its capital (the existing capital-to-insurance charge). Returns `(from_pnl, from_capital)`.
+///
+/// * `equity_room` = certified equity minus the R-6 floor (`IM + buffer`); neither source may take
+///   the LP below it, and conversion neutrality means PnL and capital draw on the same room;
+/// * `pnl_capacity` = the engine's read-only capacity (0 when any engine precondition fails, which
+///   falls back to the capital-only mode-1 behaviour);
+/// * `requested == 0` = no caller cap.
+///
+/// Invariants (Kani-friendly, no panics): `from_pnl + from_capital <= min(outstanding, equity_room,
+/// requested-if-set, pnl_capacity + capital)`, `from_pnl <= pnl_capacity`, `from_capital <=
+/// capital`, and `from_capital > 0` only when the PnL source is exhausted (`from_pnl ==
+/// pnl_capacity` or the cap was reached) so the LP's profit always goes first.
+pub fn backstop_restore_split(
+    outstanding: u128,
+    equity_room: u128,
+    requested: u128,
+    pnl_capacity: u128,
+    capital: u128,
+) -> (u128, u128) {
+    let want = backstop_restore_amount(outstanding, equity_room, requested);
+    let from_pnl = want.min(pnl_capacity);
+    let from_capital = (want - from_pnl).min(capital);
+    (from_pnl, from_capital)
 }
 
 /// The vault value Earn seniors and the junior price against while a backstop is outstanding:
@@ -525,7 +602,8 @@ mod tests {
         assert!(!g9_oracle_allowed(1, false, false), "R-8: trade-driven fallback refused");
         assert!(g9_oracle_allowed(3, false, true), "devnet override");
         // R-7: leg sources.
-        assert!(g9_leg_ok(G9LegSource::Chainlink, true, false));
+        assert!(!g9_leg_ok(G9LegSource::Chainlink, true, false), "R-12: a store-owned feed is not trusted by owner alone");
+        assert!(g9_leg_ok(G9LegSource::Chainlink, true, true));
         assert!(!g9_leg_ok(G9LegSource::Chainlink, false, true), "key must match");
         assert!(!g9_leg_ok(G9LegSource::Switchboard, true, false), "creator-made feed refused");
         assert!(g9_leg_ok(G9LegSource::Switchboard, true, true), "allowlisted feed");
@@ -615,5 +693,42 @@ mod tests {
         assert!(rescue_par_per_share_not_raised(c, s, m, dc));
         // Negative control: one share too many (a ceil mint at an exact boundary) breaks L-RES.
         assert!(!rescue_value_no_dilution(1, 1, 1, 3));
+    }
+
+    #[test]
+    fn w4_restore_split_pnl_first_then_capital() {
+        // PnL first, capital only for the remainder.
+        assert_eq!(backstop_restore_split(1_000, 10_000, 0, 600, 5_000), (600, 400));
+        assert_eq!(backstop_restore_split(1_000, 10_000, 0, 1_500, 5_000), (1_000, 0));
+        // PnL unavailable (capacity 0) == the capital-only mode-1 amount.
+        assert_eq!(backstop_restore_split(1_000, 10_000, 0, 0, 5_000), (0, 1_000));
+        assert_eq!(backstop_restore_split(1_000, 300, 0, 0, 5_000), (0, 300));
+        // Equity room binds the TOTAL, PnL first.
+        assert_eq!(backstop_restore_split(1_000, 500, 0, 600, 5_000), (500, 0));
+        assert_eq!(backstop_restore_split(1_000, 700, 0, 600, 5_000), (600, 100));
+        // Caller cap binds the total.
+        assert_eq!(backstop_restore_split(1_000, 10_000, 250, 600, 5_000), (250, 0));
+        // Capital bound; flat everything.
+        assert_eq!(backstop_restore_split(1_000, 10_000, 0, 100, 50), (100, 50));
+        assert_eq!(backstop_restore_split(0, 10_000, 0, 100, 50), (0, 0));
+        // Never exceeds any bound across a small grid (no value created, no overdraw).
+        for o in [0u128, 1, 7, 100] {
+            for r in [0u128, 1, 50, 200] {
+                for q in [0u128, 3, 90] {
+                    for pc in [0u128, 5, 120] {
+                        for c in [0u128, 9, 80] {
+                            let (a, b) = backstop_restore_split(o, r, q, pc, c);
+                            assert!(a + b <= o && a + b <= r && a <= pc && b <= c);
+                            if q != 0 {
+                                assert!(a + b <= q);
+                            }
+                            if b > 0 {
+                                assert_eq!(a, pc.min(o.min(r)), "capital only after PnL is exhausted");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }

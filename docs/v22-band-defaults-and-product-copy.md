@@ -20,13 +20,13 @@ The wizard should display: "Forced recovery after N minutes of keeper absence" w
 
 | Code | When | Copy (one calm line) |
 |---|---|---|
-| 104 `PriceBandPinned` | Closing on the favourable side while the mark is still catching up to the oracle (any lag on a band market, not only a pin) | "Price catching up; closing resumes in a few seconds." |
+| 104 `PriceBandPinned` | Closing on the favourable side while the mark is still catching up to the oracle (any lag on a band market, not only a pin) | "Price catching up; this action resumes in a few seconds." (same text as the Rust doc on `PriceBandPinned`; new positions are blocked by 21 / 112, not 104) |
 | 111 `PriceBandPositionCap` | The side already holds 256 positions | "This market is full on this side; try again shortly." |
 | 112 `PriceBandTooNarrow` | New exposure on an asset whose price fell to the band floor | "This market is close-only at this price." |
 | 113 `PriceBandLegBelowMinNotional` | A trade would leave a position below the market minimum | "Below the minimum position size: trade at least X, or close fully." |
 | 21 `EngineLockActive` | Earn / insurance / conversion paths while the mark lags | "Price catching up; try again in a few seconds." |
 
-Tag 118 `SweepBandDustLeg { asset_index }` (permissionless; accounts `[caller][market w][portfolio w][bound vault LP portfolio w]`) closes a band leg whose notional at the current mark is below HALF the market minimum, bilaterally against the bound vault LP at the current mark, with no fee. `A` is unchanged, so the market stays open. The app should warn a user whose position falls below half the minimum that it can be closed by anyone.
+Tag 118 `SweepBandDustLeg { asset_index }` (permissionless; accounts `[unused: never read, no signature required][market w][portfolio w][bound vault LP portfolio w]`) closes a band leg whose notional at the current mark is below HALF the market minimum, bilaterally against the bound vault LP at the current mark, with no fee. `A` is unchanged, so the market stays open. The app should warn a user whose position falls below half the minimum that it can be closed by anyone.
 
 **Keeper note:** keep the tag-118 sweep OFF on any live market whose deployed wrapper predates this fix (round-2 re-review N-6): the first version used a unilateral reduce, which scales the opposite side's `A` and pushes the asset close-only. Only enable it against a deployment that carries the bilateral sweep (accounts length 4).
 
