@@ -26529,7 +26529,7 @@ fn s10_cu_multi_leg_refresh_8() { s10_refresh_probe(8); }
 /// `n` legs (long vs short, 100,000 units each at 100). The LONG is the stranded loser: price down
 /// 100 -> 92, the long settles alone at the trough, price up to 104, the short settles (so the
 /// long's every leg carries a pending K/F net when its liquidation starts).
-fn x1_seed_stranded_long_loser(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize, funding_e9: i128) -> u64 {
+fn x1_seed_stranded_long_winner(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize, funding_e9: i128) -> u64 {
     let mut market_account = env.svm.get_account(&env.market).expect("market account");
     let mut long_data = env.svm.get_account(&long_account).expect("long");
     let mut short_data = env.svm.get_account(&short_account).expect("short");
@@ -26564,6 +26564,48 @@ fn x1_seed_stranded_long_loser(env: &mut V16CuEnv, long_account: Pubkey, short_a
     slot
 }
 
+/// Same market/inputs as `x1_seed_stranded_long_winner`, but the long's last settlement is at the
+/// PEAK and the price then falls, so every leg carries a pending K (+F) LOSS: the account is
+/// underwater on its own legs, not because a counterparty's backing sits in the wrong domain
+/// (which #287 now repairs).
+fn x1_seed_pending_loss_long(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pubkey, n: usize, funding_e9: i128) -> u64 {
+    let mut market_account = env.svm.get_account(&env.market).expect("market account");
+    let mut long_data = env.svm.get_account(&long_account).expect("long");
+    let mut short_data = env.svm.get_account(&short_account).expect("short");
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let mut slot = 2u64;
+    {
+        let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+        let mut long = state::portfolio_view_mut_for_market_slots(&mut long_data.data, max_market_slots).unwrap();
+        let mut short = state::portfolio_view_mut_for_market_slots(&mut short_data.data, max_market_slots).unwrap();
+        for asset_index in 0..n {
+            group.execute_trade_with_fee_loss_stale_scoped_not_atomic(
+                &mut long, &mut short,
+                TradeRequestV16 { asset_index, size_q: (100_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 },
+                true,
+            ).unwrap();
+        }
+        let step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+            *slot += 1;
+            for _pass in 0..2 {
+                for asset_index in 0..n {
+                    group.accrue_asset_to_not_atomic(asset_index, *slot, price, funding_e9, true).unwrap();
+                    group.markets[asset_index].engine.asset.raw_oracle_target_price = percolator::V16PodU64::new(price);
+                }
+            }
+        };
+        for p in [104u64, 108] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut short).unwrap();
+        group.full_account_refresh_not_atomic(&mut long).unwrap();
+        for p in [104u64, 100, 96, 92] { step(&mut group, &mut slot, p); }
+        group.full_account_refresh_not_atomic(&mut short).unwrap();
+    }
+    env.svm.set_account(env.market, market_account).unwrap();
+    env.svm.set_account(long_account, long_data).unwrap();
+    env.svm.set_account(short_account, short_data).unwrap();
+    slot
+}
+
 /// Market shape of the probe. `worst` adds the two inputs the plain scenario leaves out: a
 /// non-zero funding rate on every accrual (every leg carries a pending F net next to its K net)
 /// and a non-zero maintenance fee. Band and rent are single-asset-only features (engine config
@@ -26587,6 +26629,12 @@ fn x1_env(n: u16, worst: bool) -> (V16CuEnv, i128) {
 
 /// Returns (per-call results, liquidated, remaining legs). Prints one `X1LIQ` line per call.
 fn x1_liq_probe_with(n: u16, capital: u128, max_calls: usize, worst: bool, until_flat: bool) -> (Vec<Result<u64, String>>, bool, u32) {
+    x1_liq_probe_seeded(n, capital, max_calls, worst, until_flat, x1_seed_pending_loss_long)
+}
+
+type X1Seed = fn(&mut V16CuEnv, Pubkey, Pubkey, usize, i128) -> u64;
+
+fn x1_liq_probe_seeded(n: u16, capital: u128, max_calls: usize, worst: bool, until_flat: bool, seed: X1Seed) -> (Vec<Result<u64, String>>, bool, u32) {
     let (mut env, funding) = x1_env(n, worst);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -26594,7 +26642,7 @@ fn x1_liq_probe_with(n: u16, capital: u128, max_calls: usize, worst: bool, until
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 500_000_000);
     env.deposit(&short_owner, short_account, 500_000_000);
-    let slot = x1_seed_stranded_long_loser(&mut env, long_account, short_account, n as usize, funding);
+    let slot = seed(&mut env, long_account, short_account, n as usize, funding);
     env.force_portfolio_capital_for_benchmark(long_account, capital);
     env.svm.warp_to_slot(slot + 1);
     let mut out = vec![];
@@ -26661,7 +26709,7 @@ fn x1_unliquidatable_account_state_and_alternatives() {
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 500_000_000);
     env.deposit(&short_owner, short_account, 500_000_000);
-    let slot = x1_seed_stranded_long_loser(&mut env, long_account, short_account, n as usize, 0);
+    let slot = x1_seed_stranded_long_winner(&mut env, long_account, short_account, n as usize, 0);
     env.force_portfolio_capital_for_benchmark(long_account, 1_000);
     env.svm.warp_to_slot(slot + 1);
     let crank = |env: &mut V16CuEnv, acct: Pubkey| {
@@ -26728,6 +26776,21 @@ const X1_STRANDED_BACKING_CU: u64 = 66_000;
 /// taken to flat, and every single crank stays inside the budget with headroom. (The old
 /// `v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit` seeded flat legs and passed at
 /// 1.25M while the real worst case at 14 legs could never be liquidated.)
+/// Regression for #287 (reviewer ruling, fold 2026-10-08): the OLD fixture (long settles at the trough, price then
+/// recovers) is a stranded WINNER once the strand is repaired: after the settle crank its certified deficit is 0 and
+/// it is NOT liquidatable (crank answers Custom 22). If this ever liquidates again the repair regressed.
+#[test]
+fn v22_stranded_long_winner_is_not_liquidatable_after_the_s10_move() {
+    let n = LEG_CAP as u16;
+    for worst in [true, false] {
+        let (calls, liquidated, left) = x1_liq_probe_seeded(n, 1_000, 8, worst, false, x1_seed_stranded_long_winner);
+        assert!(!liquidated, "n={n} worst={worst}: the stranded winner was liquidated ({left} legs left): #287 repair regressed");
+        assert_eq!(left, n as u32);
+        assert!(calls.iter().any(|c| c.is_ok()), "vacuity: the settle crank must run");
+        assert!(calls.iter().filter_map(|c| c.as_ref().err()).all(|e| e.contains("Custom(22)")), "only NonProgress after the settle: {calls:?}");
+    }
+}
+
 #[test]
 fn v22_bpf_worst_case_liquidation_at_the_leg_cap() {
     let n = LEG_CAP as u16;
