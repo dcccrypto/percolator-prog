@@ -12705,7 +12705,7 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
         );
         let long_data = env.svm.get_account(&long_account).unwrap().data;
         let long = state::read_portfolio(&long_data).unwrap();
-        if percolator::active_bitmap_count_ones(long.active_bitmap) < 14 {
+        if percolator::active_bitmap_count_ones(long.active_bitmap) < LEG_CAP as u32 {
             liquidated = true;
             break;
         }
@@ -12728,7 +12728,7 @@ fn v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit() {
     let (_, group) = state::read_market(&market_data).unwrap();
     let long = state::read_portfolio(&long_data).unwrap();
     assert_eq!(group.config.max_portfolio_assets, LEG_CAP as u16);
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 13);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32 - 1);
     assert!(!long.legs[0].active);
     assert_eq!(group.assets[0].oi_eff_long_q, 0);
     assert_eq!(group.assets[0].oi_eff_short_q, 0);
@@ -12768,7 +12768,7 @@ fn v16_bpf_current_full_14_leg_tradenocpi_is_under_tx_limit() {
     assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
-        14
+        LEG_CAP as u32
     );
     assert_eq!(long.legs[0].basis_pos_q, (9 * POS_SCALE) as i128);
     assert_eq!(short.legs[0].basis_pos_q, -((9 * POS_SCALE) as i128));
@@ -12869,7 +12869,7 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
     assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
     assert_eq!(
         percolator::active_bitmap_count_ones(short.active_bitmap),
-        14
+        LEG_CAP as u32
     );
     assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
     assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
@@ -12949,7 +12949,7 @@ fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
         !has_active_leg_for_asset(&long, 13),
         "the refused trade must not have opened the fresh asset"
     );
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), 13);
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32 - 1);
 }
 
 /// Builds a 14-asset market with a REAL `percolator-match` matcher registered on the LP portfolio
@@ -26337,6 +26337,7 @@ fn x1_liq_probe(n: u16, capital: u128, max_calls: usize) -> (Vec<Result<u64, Str
 #[test]
 fn x1_liq_profile_matrix() {
     for n in [2u16, 8, 10, 11, 14] {
+        if n > percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS { continue; }
         let _ = x1_liq_probe(n, 1_000, 6);
     }
 }
@@ -26357,6 +26358,7 @@ fn x1_liq_matrix_for_ledger() {
 /// What a bankrupt, unliquidatable 14-leg account does to the market, and which other
 /// instructions can reach it (read-only exercise on LiteSVM).
 #[test]
+#[ignore = "S10-X1 measurement probe: builds a 14-leg market, which this wrapper refuses; run it against the base (cap 14) artifact, see the ledger finding"]
 fn x1_unliquidatable_account_state_and_alternatives() {
     let n: u16 = 14;
     let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
