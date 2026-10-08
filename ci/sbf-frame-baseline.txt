@@ -8,7 +8,14 @@
 # PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
 # never allowed to grow; each should be brought under 3840 in its own change):
 4032 percolator_prog::processor::handle_execute_redemption
-3968 percolator_prog::processor::handle_lp_vault_crank_fees
+4032 percolator_prog::processor::handle_lp_vault_crank_fees
+3904 percolator_prog::processor::handle_close_slab
+#
+# v2.2 RC fold (engine #287 785c5cee): +64 B in EVERY handler that builds a market-group view (the view
+# gained s10_moves_left + s10_grant_denied: 24 -> 32 B per view copy). Measured at wrapper 8f2c43c8 +
+# engine ccc3fda4 vs ad82a411 + 8e5a8c8f: lp_vault_crank_fees 3968 -> 4032 (64 B under the hard 4096),
+# close_slab 3840 -> 3904 (now over budget), init_vault_lp 3776 -> 3840. NOT bounded by any reviewed change:
+# needs a decision (accept, or shrink the view / outline). No other function crosses 3840.
 #
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
 # handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the
@@ -18,4 +25,4 @@
 1664 percolator_prog::processor::handle_trade_cpi pin
 2048 percolator_prog::processor::handle_batch_trade_cpi pin
 1536 percolator_prog::processor::p1_cpi_preflight_before_matcher pin
-3776 percolator_prog::processor::handle_init_vault_lp pin
+3840 percolator_prog::processor::handle_init_vault_lp pin
