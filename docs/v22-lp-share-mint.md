@@ -191,6 +191,47 @@ sign for the registry PDA and it has no instruction that does.
   merely happens to be the registry PDA is refused); the metadata PDA and the fee-payer PDA
   are derived on chain.
 
+### The fund constant and the fee-payer PDA (review round 2: F2, F4, F5)
+
+* **F2. The caller must HOLD `LP_SHARE_META_FUND_LAMPORTS` = 30,000,000 lamports (0.03 SOL)
+  to create a record, although the net cost is 15,115,600.** The difference comes back in the
+  same instruction. A caller with less is refused by the System Program (`Custom(1)`,
+  insufficient lamports) and loses nothing. The same constant is a CEILING: if Metaplex's rent
+  plus fee for a record ever rises above 0.03 SOL, creates fail until this program is upgraded
+  (updates and repairs, which move no lamports, keep working). The constant is kept on purpose:
+  it is the most a hostile callee can take per call. Tested with a hostile stand-in at the
+  Metaplex id (`tests/fixtures/hostile_mpl`): the caller loses exactly 30,000,000 or nothing,
+  marketauth nothing, wrapper state nothing.
+* **F4. Lamports sent to the fee-payer PDA after a record exists are stranded.** The PDA is
+  swept to the caller only by a CREATE; the update path never touches it. Anything parked
+  there once the share is named stays there (the sender's loss; no instruction can move it).
+  Lamports parked BEFORE the create go to whoever creates the record.
+* **F5. A record seeded with a verified collection would make updates fail.** If the
+  pre-existing record (R6) carried a verified collection, Metaplex refuses an update that sets
+  `collection = None`, so the repair and the ticker upgrade would fail and the share would
+  keep that record. Only the Metaplex program (or a key it trusts) can produce such a record
+  for our mint: the same trust class as a hostile upgrade, and cosmetic.
+
+### Decisions for the founder (collected)
+
+1. **Mainnet uri base** (`https://percolator.trade` is the builder's default) and the
+   commitment to hold that domain for as long as share tokens exist.
+2. **The `/api/earn-share/<market>` endpoint must exist on that host before ANY share is named
+   on mainnet.** A ticker record is immutable; its uri cannot be pointed elsewhere later.
+3. **Freeze on ticker (built) or mutable for ever** (the uri is then correctable by a later
+   program upgrade, at the cost described under Mutability).
+4. **marketauth can turn generic into ticker once, at any time, including after deposits.**
+   Holders who saw `Percolator Earn Share <market>` / `pEARN` will then see
+   `Percolator Earn <TICKER> <market>` / `pe<TICKER>`. The framing and the market fragment
+   stay; the ticker is unverified.
+5. **Two markets with the same ticker share a symbol** (`pe<TICKER>`); only the name differs.
+   Alternative: cap tickers at 6 characters to fit a 2-character market fragment.
+6. **The 0.03 SOL fund constant** (F2): the balance a caller must hold, the ceiling on
+   Metaplex's charge, and the bound on hostile-callee loss, all in one number.
+7. Accepting the third-party-upgradeable Metaplex program as a dependency of this one optional
+   instruction; whether `UpdateBaseUnitMints` should refuse a decimals change once an LP vault
+   exists (review Info-1, not changed here).
+
 ### URI (security review R10)
 
 `LP_SHARE_URI_BASE + "/api/earn-share/" + base58(market)`, built on chain, no caller input,

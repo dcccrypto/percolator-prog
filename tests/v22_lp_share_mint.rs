@@ -1503,6 +1503,258 @@ fn create_vault_and_name_it_in_one_transaction_real_metaplex() {
     assert_eq!(lp_mint_state(&env).decimals, 6);
 }
 
+// ── 6b. tag 122 against a MISBEHAVING callee, and the edges (security review round 2, F1) ─────
+//
+// Ported from the reviewer's probes. The hostile stand-in (source in
+// `tests/fixtures/hostile_mpl`, built by `scripts/build-hostile-mpl.sh`) is mounted at the
+// Metaplex program id and attacks the PAYER it is handed. Because that payer is the transient
+// fee-payer PDA, the caller can lose at most `LP_SHARE_META_FUND_LAMPORTS`, and nothing of the
+// wrapper's changes.
+
+const FUND: u64 = 30_000_000; // lp_share_meta_v22::LP_SHARE_META_FUND_LAMPORTS
+const REAL_COST: u64 = 15_115_600; // rent for 607 B + Metaplex's create fee, today
+
+#[test]
+fn fund_constant_is_what_the_tests_assume() {
+    assert_eq!(percolator_prog::lp_share_meta_v22::LP_SHARE_META_FUND_LAMPORTS, FUND);
+}
+
+fn hostile_so() -> PathBuf {
+    let p = std::env::var("HOSTILE_MPL_SO").map(PathBuf::from).unwrap_or_else(|_| {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hostile_mpl/target/deploy/hostile_mpl.so")
+    });
+    assert!(p.exists(), "hostile stand-in missing: run scripts/build-hostile-mpl.sh ({p:?})");
+    p
+}
+
+/// Mount the hostile stand-in at the Metaplex id and select its mode (the lamports of the
+/// still system-owned, empty metadata PDA, modulo 10).
+fn hostile(env: &mut Env, mode: u64) {
+    env.svm.add_program(MPL_TOKEN_METADATA_PROGRAM_ID, &std::fs::read(hostile_so()).unwrap());
+    env.svm
+        .set_account(
+            metadata_pda(&env.lp_mint),
+            Account { lamports: 1_000_000 + mode, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 },
+        )
+        .unwrap();
+}
+
+/// The five hostile modes, for the generic call AND for marketauth's ticker call.
+///
+/// * 1 assign the payer to itself / 3 allocate data on it / 5 take most, assign, leave some:
+///   the wrapper's drain of the fee PDA then fails, the whole transaction reverts, the caller
+///   loses nothing.
+/// * 2 take everything then assign / 4 take everything: lands; the caller loses EXACTLY the
+///   fund constant, never more (the callee never held the caller's signature), marketauth
+///   loses nothing, and the fee PDA is left with 0 lamports (no permanent poison: the next call
+///   with the real program names the share).
+#[test]
+#[ignore = "needs HOSTILE_MPL_SO (scripts/build-hostile-mpl.sh) and MPL_TOKEN_METADATA_SO"]
+fn hostile_metaplex_can_take_the_fund_constant_and_nothing_else() {
+    for named in [false, true] {
+        for mode in [1u64, 2, 3, 4, 5] {
+            let mut env = setup_vault();
+            hostile(&mut env, mode);
+            let stranger = funded(&mut env); // holds 10 SOL: far more than the fund constant
+            let admin = env.admin.insecure_clone();
+            let pp = meta_payer_pda(&env);
+            let (l0, a0) = (lamports(&env, &stranger.pubkey()), lamports(&env, &admin.pubkey()));
+            let w0 = wrapper_state(&env);
+            let r = if named { name_ticker(&mut env, &stranger, &admin, "SOL") } else { name_generic(&mut env, &stranger) };
+            let delta = l0 - lamports(&env, &stranger.pubkey());
+            let p = env.svm.get_account(&pp);
+            println!(
+                "hostile mode {mode} named={named}: {} caller_delta={delta} fee_pda={:?}",
+                if r.is_ok() { "LANDED" } else { "REVERTED" },
+                p.as_ref().map(|a| (a.lamports, a.data.len()))
+            );
+            assert!(w0 == wrapper_state(&env), "mode {mode}: registry, mint, market and ledger untouched");
+            assert_eq!(lamports(&env, &admin.pubkey()), a0, "mode {mode}: marketauth loses nothing");
+            match mode {
+                1 | 3 | 5 => {
+                    assert!(r.is_err(), "mode {mode} must revert (the drain of a hijacked PDA fails)");
+                    assert_eq!(delta, 0, "mode {mode}: a reverted call costs the caller nothing");
+                    assert!(p.map(|a| a.lamports == 0 && a.data.is_empty()).unwrap_or(true));
+                }
+                _ => {
+                    assert!(r.is_ok(), "mode {mode} lands: {r:?}");
+                    assert_eq!(delta, FUND, "mode {mode}: the caller loses exactly the fund constant, not its balance");
+                    assert_eq!(p.map(|a| a.lamports).unwrap_or(0), 0);
+                }
+            }
+            if mode == 2 || mode == 4 {
+                // A 0-lamport account is purged by a real validator when the transaction ends;
+                // LiteSVM 0.1 keeps its bytes. Purge it here (asserting it IS empty of lamports).
+                if let Some(a) = env.svm.get_account(&pp) {
+                    assert_eq!(a.lamports, 0);
+                    env.svm.set_account(pp, Account::default()).unwrap();
+                }
+                // the metadata PDA holds what the callee took but is still system-owned and empty
+                real_metaplex(&mut env);
+                name_generic(&mut env, &stranger).expect("the real program then names the share");
+                assert_eq!(record(&env), generic(&env));
+            }
+        }
+    }
+}
+
+/// Fee-PDA pre-states. Owned by another program, or carrying data: create is refused and
+/// nothing is taken, but an existing record can still be repaired (the update path never
+/// touches the PDA). 1 lamport or a large balance parked: swept to the caller.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn odd_fee_pda_prestates_real_metaplex() {
+    for (owner, data) in [(Pubkey::new_unique(), vec![]), (solana_sdk::system_program::ID, vec![0u8; 8])] {
+        let mut env = setup_vault();
+        real_metaplex(&mut env);
+        let stranger = funded(&mut env);
+        let pp = meta_payer_pda(&env);
+        env.svm.set_account(pp, Account { lamports: 2_000_000, data, owner, executable: false, rent_epoch: 0 }).unwrap();
+        let l0 = lamports(&env, &stranger.pubkey());
+        let e = name_generic(&mut env, &stranger).expect_err("a fee PDA that is not a plain system account");
+        assert!(e.contains(&custom(PercolatorError::InvalidInstruction)), "{e}");
+        assert_eq!(l0, lamports(&env, &stranger.pubkey()));
+        assert!(no_record(&env));
+        let reg_key = env.registry;
+        plant_foreign_record(&mut env, reg_key, true);
+        name_generic(&mut env, &stranger).expect("the update path ignores the fee PDA");
+        assert_eq!(record(&env), generic(&env));
+    }
+    for parked in [1u64, 5_000_000_000] {
+        let mut env = setup_vault();
+        real_metaplex(&mut env);
+        let stranger = funded(&mut env);
+        let pp = meta_payer_pda(&env);
+        env.svm
+            .set_account(pp, Account { lamports: parked, data: vec![], owner: solana_sdk::system_program::ID, executable: false, rent_epoch: 0 })
+            .unwrap();
+        let l0 = lamports(&env, &stranger.pubkey()) as i128;
+        name_generic(&mut env, &stranger).expect("parked lamports do not block");
+        assert_eq!(l0 - lamports(&env, &stranger.pubkey()) as i128, REAL_COST as i128 - parked as i128, "parked {parked}");
+        assert_eq!(lamports(&env, &pp), 0);
+    }
+}
+
+/// F2: the caller must HOLD the fund constant (0.03 SOL) although the real cost is 0.0151 SOL.
+/// A caller with 20,000,000 lamports is refused (System Program: insufficient lamports) and
+/// loses nothing; with the constant plus the cost of nothing else, it works.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn caller_must_hold_the_fund_constant_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let poor = Keypair::new();
+    env.svm.airdrop(&poor.pubkey(), 20_000_000).unwrap();
+    assert!(20_000_000 > REAL_COST && 20_000_000 < FUND);
+    let e = name_generic(&mut env, &poor).expect_err("less than the fund constant");
+    assert!(e.contains("Custom(1)"), "System Program insufficient funds expected: {e}");
+    assert_eq!(lamports(&env, &poor.pubkey()), 20_000_000, "a refused call costs nothing");
+    assert!(no_record(&env));
+    env.svm.airdrop(&poor.pubkey(), FUND - 20_000_000).unwrap();
+    name_generic(&mut env, &poor).expect("exactly the fund constant is enough");
+    assert_eq!(lamports(&env, &poor.pubkey()), FUND - REAL_COST);
+}
+
+/// F4: lamports sent to the fee PDA AFTER a record exists are never swept (the update path does
+/// not touch the PDA): stranded, the sender's loss.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn lamports_sent_to_the_fee_pda_after_naming_are_stranded_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    let admin = env.admin.insecure_clone();
+    name_generic(&mut env, &stranger).unwrap();
+    let pp = meta_payer_pda(&env);
+    env.svm.airdrop(&pp, 5_000_000).unwrap();
+    name_ticker(&mut env, &stranger, &admin, "SOL").unwrap();
+    assert_eq!(lamports(&env, &pp), 5_000_000);
+}
+
+fn send_raw(env: &mut Env, data: Vec<u8>, accounts: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
+    let payer = env.payer.insecure_clone();
+    let ixs = vec![
+        ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+        Instruction { program_id: env.program_id, accounts, data },
+    ];
+    let mut s = vec![&payer];
+    s.extend_from_slice(signers);
+    env.svm.expire_blockhash();
+    let tx = Transaction::new_signed_with_payer(&ixs, Some(&payer.pubkey()), &s, env.svm.latest_blockhash());
+    env.svm.send_transaction(tx).map(|m| m.compute_units_consumed).map_err(|e| format!("{e:?}"))
+}
+
+/// Wire boundaries against the real program (nothing may be created), then the whole state
+/// machine in ONE transaction: a stranger's generic followed by marketauth's 8-character ticker.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn wire_boundaries_and_generic_then_ticker_in_one_transaction_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    let admin = env.admin.insecure_clone();
+    let full = metadata_accounts(&env, stranger.pubkey(), Some(admin.pubkey()));
+    let l0 = lamports(&env, &stranger.pubkey());
+    for (what, data) in [
+        ("no length byte", vec![122u8]),
+        ("n=9", vec![122, 9, b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A', b'A']),
+        ("n=255", {
+            let mut v = vec![122u8, 255];
+            v.extend(std::iter::repeat(b'A').take(255));
+            v
+        }),
+        ("n=0 + trailing", vec![122, 0, b'X']),
+        ("n=3 + trailing", vec![122, 3, b'S', b'O', b'L', 0]),
+        ("n=3 short", vec![122, 3, b'S', b'O']),
+        ("lowercase", vec![122, 3, b's', b'o', b'l']),
+        ("space", vec![122, 3, b'S', b' ', b'L']),
+        ("NUL", vec![122, 3, b'S', 0, b'L']),
+        ("utf8", vec![122, 2, 0xC2, 0xB7]),
+    ] {
+        send_raw(&mut env, data, full.clone(), &[&stranger, &admin]).expect_err(what);
+        assert!(no_record(&env), "{what}");
+    }
+    assert_eq!(lamports(&env, &stranger.pubkey()), l0, "refusals cost the caller nothing");
+    let payer = env.payer.insecure_clone();
+    let g = metadata_accounts(&env, stranger.pubkey(), None);
+    send(&mut env.svm, env.program_id, &payer, vec![(meta_ix(""), g), (meta_ix("ABCDEFG8"), full)], &[&stranger, &admin])
+        .expect("generic + ticker in one transaction");
+    assert_eq!(record(&env), ticker_record(&env, "ABCDEFG8"));
+    for (who, r) in [
+        ("stranger generic", name_generic(&mut env, &stranger)),
+        ("marketauth another ticker", name_ticker(&mut env, &stranger, &admin, "SOL")),
+        ("marketauth same ticker", name_ticker(&mut env, &stranger, &admin, "ABCDEFG8")),
+    ] {
+        let e = r.expect_err(who);
+        assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{who}: {e}");
+    }
+    assert_eq!(record(&env), ticker_record(&env, "ABCDEFG8"));
+}
+
+/// marketauth burned (all zero) or rotated: the OLD key can no longer set a ticker; the generic
+/// form still works for anyone.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn burned_or_rotated_marketauth_cannot_name_real_metaplex() {
+    for new_auth in [[0u8; 32], Pubkey::new_unique().to_bytes()] {
+        let mut env = setup_vault();
+        real_metaplex(&mut env);
+        let stranger = funded(&mut env);
+        let admin = env.admin.insecure_clone();
+        let mut a = env.svm.get_account(&env.market).unwrap();
+        let (mut cfg, group) = state::read_market(&a.data).unwrap();
+        cfg.marketauth = new_auth;
+        state::write_market(&mut a.data, &cfg, &group).unwrap();
+        env.svm.set_account(env.market, a).unwrap();
+        let e = name_ticker(&mut env, &stranger, &admin, "SOL").expect_err("the old marketauth");
+        assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
+        assert!(no_record(&env));
+        name_generic(&mut env, &stranger).expect("generic needs no marketauth");
+        assert_eq!(record(&env), generic(&env));
+    }
+}
+
 // ── 7. compute ───────────────────────────────────────────────────────────────────────────────
 
 #[test]

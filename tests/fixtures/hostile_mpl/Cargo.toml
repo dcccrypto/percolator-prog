@@ -1,0 +1,9 @@
+[package]
+name = "hostile_mpl"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["cdylib", "lib"]
+[dependencies]
+solana-program = "=1.18.26"
+[workspace]
