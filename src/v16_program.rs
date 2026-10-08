@@ -55,6 +55,9 @@ pub mod wave_a_v22;
 /// `~/percolator-ops/ledger/phase4-design-2026-10-05.md` items 5 and 6.
 pub mod p4_rescue_ins;
 
+/// v2.2 item 4 (2026-10-07): the mainnet stake + wrapper program-id pin (feature `mainnet-ids`).
+pub mod mainnet_ids;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -513,6 +516,10 @@ pub mod constants {
     #[cfg(feature = "devnet")]
     pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
+    /// P-3: the mainnet arm, pinned together with the stake and wrapper ids (`mainnet_ids`).
+    #[cfg(feature = "mainnet-ids")]
+    pub const CANONICAL_VAULT_LP_MATCHER_PROGRAM: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_MATCHER_PROGRAM_ID;
     /// P3-H2: default / maximum protocol leverage for a vault LP, bps of its conservative
     /// equity. Default 1x: a price gap must exceed 100% before the junior-funded LP can owe more
     /// than its equity. The upgrade authority may raise it to at most 5x.
@@ -610,10 +617,20 @@ pub mod constants {
     /// R-7 (Wave D round 4): the G9 Switchboard feed allowlist, global PDA `["g9_feeds"]`, set by
     /// the upgrade authority only (tag 117). Kind 14 is item 4's `OracleGraduationV20`.
     pub const TAG_SET_G9_FEED_ALLOWLIST: u8 = 117;
+    /// R-10: propose a NEW G9 feed allowlist (upgrade authority; count 0 cancels the open proposal).
+    pub const TAG_PROPOSE_G9_FEED_ALLOWLIST: u8 = 120;
+    /// R-10: commit the open proposal after `G9_ALLOWLIST_TIMELOCK_SLOTS`.
+    pub const TAG_COMMIT_G9_FEED_ALLOWLIST: u8 = 121;
     pub const KIND_G9_FEED_ALLOWLIST: u8 = 15;
     pub const G9_FEEDS_SEED: &[u8] = b"g9_feeds";
     pub const G9_FEED_ALLOWLIST_VERSION: u8 = 1;
     pub const G9_FEED_ALLOWLIST_CAP: usize = 16;
+    /// R-10: an ADDED G9 feed takes effect only this many slots after it is proposed (216,000
+    /// slots, about one day), the floor the stake S-6 timelock uses (`max(cooldown, 216,000)`).
+    /// There is no creator or pool setting to take a `max` with: the allowlist is global, so the
+    /// floor IS the delay, independent of anything a market creator configures. A constant on
+    /// every build (devnet included), so a devnet test exercises the mainnet delay.
+    pub const G9_ALLOWLIST_TIMELOCK_SLOTS: u64 = 216_000;
 
     /// v2.2 combined release: every named instruction tag, pinned DISTINCT at compile time (a merge
     /// that gives two instructions the same tag fails to build). Tags 0 / 76 / 77 are extended
@@ -645,7 +662,8 @@ pub mod constants {
         TAG_LP_VAULT_CRANK_FEES, TAG_SET_LP_VAULT_PAUSED, TAG_CLOSE_LP_VAULT,
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
-        TAG_EVICT_AND_TRADE_CPI, 201, 202, 203, 204, 205, 206, 207,
+        TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
+        203, 204, 205, 206, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -875,8 +893,14 @@ pub mod constants {
     /// placeholder the operator is expected to rotate to a real treasury/
     /// multisig via `SetProtocolFeeAuthority` before or shortly after
     /// mainnet, not a permanent design commitment.
+    #[cfg(not(feature = "mainnet-ids"))]
     pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("FbTbDeGWQpjrEqJdqoBHX3sTWHoAmU2xywD7wyxH6WC7");
+    /// P-4: a mainnet build takes the fee authority from the pinned set (the devnet EOA above can
+    /// never ship; the placeholder fails the build until a real treasury key is set).
+    #[cfg(feature = "mainnet-ids")]
+    pub const PROTOCOL_FEE_AUTHORITY_DEFAULT: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_FEE_AUTHORITY;
 
     // ── Fork LP Vault (v17 re-expression — tags renumbered 74-80) ──────────
     // Account kinds 1-4 are MARKET / PORTFOLIO / BACKING_DOMAIN_LEDGER /
@@ -1191,6 +1215,20 @@ pub mod constants {
     #[cfg(feature = "devnet")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("A6DVNubvzMMETQinK6bipekkaTTrkUu2RMw2kBoJrdkE");
+    // v2.2 item 4: the MAINNET arm. `feature = "mainnet-ids"` (never together with `devnet`)
+    // pins the stake id AND the wrapper id from `src/mainnet_ids.rs`, where a build-time
+    // assertion refuses a build with either still a placeholder. The pair is changed in one
+    // reviewed commit with percolator-stake's matching `declare_id!` / wrapper allowlist.
+    #[cfg(feature = "mainnet-ids")]
+    pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_STAKE_PROGRAM_ID;
+    /// The wrapper's own pinned mainnet id: the entrypoint refuses to run under any other.
+    #[cfg(feature = "mainnet-ids")]
+    pub const WRAPPER_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_WRAPPER_PROGRAM_ID;
+    /// `true` iff this build pins a stake program (devnet or mainnet-ids). Tags 87 and 116 and the
+    /// stake-class unit binding fail closed (`StakeProgramNotPinned`) when `false`.
+    pub const STAKE_PINNED: bool = cfg!(any(feature = "devnet", feature = "mainnet-ids"));
 
     /// SHARED SEED CONTRACT with percolator-stake: the pool PDA is derived from
     /// the wrapper market it is bound to, so there is exactly ONE pool per
@@ -1771,6 +1809,11 @@ VaultLpMultiAssetMarket,
         /// market's minimum leg notional (`band_min_leg_notional`). Open bigger or close the
         /// leg fully. Engine `BandLegBelowMinNotional`. Custom(113).
         PriceBandLegBelowMinNotional = 113,
+        /// R-10: the G9 feed allowlist timelock refused the call: a commit before the delay has
+        /// elapsed, a commit with no open proposal, or an ADDED feed attempted through the
+        /// removal-only tag 117. Custom(125). Operator: propose (tag 120), wait 216,000 slots,
+        /// then commit (tag 121); removals alone may use tag 117 immediately.
+        G9AllowlistTimelock = 125,
     }
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
     const _: () = assert!(PercolatorError::ExitRequiresLossCurrent as u32 == 118);
@@ -1781,12 +1824,13 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::BondConfigInvalid as u32 == 110);
     const _: () = assert!(PercolatorError::BondDepositAboveCap as u32 == 123);
     const _: () = assert!(PercolatorError::BondSlippage as u32 == 124);
+    const _: () = assert!(PercolatorError::G9AllowlistTimelock as u32 == 125);
     const _: () = assert!(PercolatorError::RescueRefused as u32 == 114);
     const _: () = assert!(PercolatorError::RescueNavFloor as u32 == 115);
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
     /// v2.2 combined release: every error code of the Phase 2b / v2.2 block, pinned DISTINCT at
     /// compile time (rustc also rejects duplicate enum discriminants; this keeps the claim visible).
-    const V22_ERROR_CODES: [u32; 26] = [
+    const V22_ERROR_CODES: [u32; 27] = [
         PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32,
         PercolatorError::VaultLpAllocateRefused as u32,
         101, 102, 103,
@@ -1809,6 +1853,7 @@ VaultLpMultiAssetMarket,
         120, 121, 122,
         PercolatorError::BondDepositAboveCap as u32,
         PercolatorError::BondSlippage as u32,
+        PercolatorError::G9AllowlistTimelock as u32,
     ];
     const fn all_distinct_u32(a: &[u32]) -> bool {
         let mut i = 0;
@@ -7162,20 +7207,49 @@ pub mod state {
     }
 
     // ── R-7 (Wave D round 4): the G9 Switchboard feed allowlist ─────────────────────────────
-    /// Global `["g9_feeds"]`: the Switchboard On-Demand feed keys the upgrade authority accepts as
-    /// a G9-eligible Hybrid leg on a mainnet build (Switchboard feeds are permissionless to
-    /// create, so an unlisted feed may be creator-made). Chainlink store feeds need no listing;
-    /// Pyth is not used (founder decision).
+    /// Global `["g9_feeds"]`: the oracle feed keys the upgrade authority accepts as a G9-eligible
+    /// Hybrid leg on a mainnet build. Switchboard On-Demand feeds are permissionless to create,
+    /// and (R-12, verified on mainnet) so are Chainlink store feeds, so BOTH need a listing; Pyth
+    /// is not used (founder decision). R-10: an ADDED key takes effect only after the timelock
+    /// (`pending_*`, tags 120/121); a removal is immediate (tag 117).
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct G9FeedAllowlistV22 {
         pub count: u8,
         pub version: u8,
         pub bump: u8,
-        pub _pad: [u8; 5],
+        /// R-10: number of entries in `pending_*` (0 = no open proposal).
+        pub pending_count: u8,
+        pub _pad: [u8; 4],
+        /// R-10: slot of the open proposal, little-endian (0 = none); `[u8; 8]` keeps the record
+        /// alignment 1 so it is read and written IN PLACE (no 2 KB stack copy). Commit needs
+        /// `now >= pending_slot + G9_ALLOWLIST_TIMELOCK_SLOTS`.
+        pub pending_slot: [u8; 8],
         pub keys: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
+        /// R10-2: the feed OWNER pinned for each listed feed (Chainlink `feed.owner`, Switchboard
+        /// PullFeed `authority`). A listed feed qualifies only while its CURRENT owner equals this.
+        pub owners: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
+        pub pending_keys: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
+        pub pending_owners: [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP],
     }
-    const _: () = assert!(core::mem::size_of::<G9FeedAllowlistV22>() == 8 + 32 * 16);
+    const _: () = assert!(core::mem::size_of::<G9FeedAllowlistV22>() == 16 + 32 * 16 * 4);
+    const _: () = assert!(core::mem::align_of::<G9FeedAllowlistV22>() == 1);
+
+    impl G9FeedAllowlistV22 {
+        pub fn pending_slot_u64(&self) -> u64 {
+            u64::from_le_bytes(self.pending_slot)
+        }
+        pub fn set_pending_slot(&mut self, v: u64) {
+            self.pending_slot = v.to_le_bytes();
+        }
+        /// Clears the open proposal (all of it).
+        pub fn clear_pending(&mut self) {
+            self.pending_count = 0;
+            self.pending_slot = [0u8; 8];
+            self.pending_keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+            self.pending_owners = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        }
+    }
 
     pub const fn g9_feed_allowlist_account_len() -> usize {
         HEADER_LEN + core::mem::size_of::<G9FeedAllowlistV22>()
@@ -7191,17 +7265,72 @@ pub mod state {
     }
 
     pub fn validate_g9_feed_allowlist(x: &G9FeedAllowlistV22) -> Result<(), ProgramError> {
+        type Ks = [[u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
         let n = x.count as usize;
+        let pn = x.pending_count as usize;
+        let distinct_nonzero = |ks: &Ks, os: &Ks, n: usize| {
+            !ks[..n].contains(&[0u8; 32])
+                && !os[..n].contains(&[0u8; 32])
+                && ks[n..].iter().all(|k| *k == [0u8; 32])
+                && os[n..].iter().all(|k| *k == [0u8; 32])
+                && (0..n).all(|i| (i + 1..n).all(|j| ks[i] != ks[j]))
+        };
         if x.version != crate::constants::G9_FEED_ALLOWLIST_VERSION
             || n > crate::constants::G9_FEED_ALLOWLIST_CAP
-            || x._pad != [0u8; 5]
-            || x.keys[..n].contains(&[0u8; 32])
-            || x.keys[n..].iter().any(|k| *k != [0u8; 32])
-            || (0..n).any(|i| (i + 1..n).any(|j| x.keys[i] == x.keys[j]))
+            || pn > crate::constants::G9_FEED_ALLOWLIST_CAP
+            || x._pad != [0u8; 4]
+            || !distinct_nonzero(&x.keys, &x.owners, n)
+            || !distinct_nonzero(&x.pending_keys, &x.pending_owners, pn)
+            // a proposal exists iff it has a slot (an empty proposal is a cancel, never stored)
+            || (x.pending_slot_u64() == 0) != (pn == 0)
         {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
+    }
+
+    /// IN-PLACE read view of the allowlist record (no copy: the record is 2 KB and the gate runs
+    /// inside the already-large tag 111 frame).
+    pub fn view_g9_feed_allowlist(data: &[u8]) -> Result<&G9FeedAllowlistV22, ProgramError> {
+        if data.len() < g9_feed_allowlist_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        check_header(data, crate::constants::KIND_G9_FEED_ALLOWLIST)?;
+        let x: &G9FeedAllowlistV22 = bytemuck::try_from_bytes(
+            data.get(HEADER_LEN..g9_feed_allowlist_account_len())
+                .ok_or(PercolatorError::InvalidAccountLen)?,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        validate_g9_feed_allowlist(x)?;
+        Ok(x)
+    }
+
+    /// IN-PLACE mutable view; creates the header on first use. The caller validates afterwards.
+    pub fn open_g9_feed_allowlist_mut(
+        data: &mut [u8],
+        bump: u8,
+    ) -> Result<&mut G9FeedAllowlistV22, ProgramError> {
+        if data.len() < g9_feed_allowlist_account_len() {
+            return Err(PercolatorError::InvalidAccountLen.into());
+        }
+        let fresh = !is_initialized(data);
+        if fresh {
+            for b in data.iter_mut() {
+                *b = 0;
+            }
+            write_header(data, crate::constants::KIND_G9_FEED_ALLOWLIST)?;
+        }
+        check_header(data, crate::constants::KIND_G9_FEED_ALLOWLIST)?;
+        let x: &mut G9FeedAllowlistV22 = bytemuck::try_from_bytes_mut(
+            data.get_mut(HEADER_LEN..g9_feed_allowlist_account_len())
+                .ok_or(PercolatorError::InvalidAccountLen)?,
+        )
+        .map_err(|_| ProgramError::InvalidAccountData)?;
+        if fresh {
+            x.version = crate::constants::G9_FEED_ALLOWLIST_VERSION;
+            x.bump = bump;
+        }
+        Ok(x)
     }
 
     pub fn read_g9_feed_allowlist(data: &[u8]) -> Result<G9FeedAllowlistV22, ProgramError> {
@@ -7215,25 +7344,6 @@ pub mod state {
         );
         validate_g9_feed_allowlist(&x)?;
         Ok(x)
-    }
-
-    /// Writes (creating the header on first use) the allowlist record.
-    pub fn write_g9_feed_allowlist(data: &mut [u8], x: &G9FeedAllowlistV22) -> Result<(), ProgramError> {
-        if data.len() < g9_feed_allowlist_account_len() {
-            return Err(PercolatorError::InvalidAccountLen.into());
-        }
-        validate_g9_feed_allowlist(x)?;
-        if !is_initialized(data) {
-            for b in data.iter_mut() {
-                *b = 0;
-            }
-            write_header(data, crate::constants::KIND_G9_FEED_ALLOWLIST)?;
-        }
-        check_header(data, crate::constants::KIND_G9_FEED_ALLOWLIST)?;
-        data.get_mut(HEADER_LEN..g9_feed_allowlist_account_len())
-            .ok_or(PercolatorError::InvalidAccountLen)?
-            .copy_from_slice(bytemuck::bytes_of(x));
-        Ok(())
     }
 
     pub fn write_insurance_units(data: &mut [u8], x: &InsuranceUnitsV20) -> Result<(), ProgramError> {
@@ -8824,6 +8934,8 @@ pub mod ix {
         /// `[0]` upgrade authority (signer, w; pays rent) · `[1]` program data · `[2]` allowlist
         /// PDA (w) · `[3]` system program.
         SetG9FeedAllowlist { keys: Vec<[u8; 32]> },
+        ProposeG9FeedAllowlist { entries: Vec<([u8; 32], [u8; 32])> },
+        CommitG9FeedAllowlist,
         /// Tag 112 (Phase 4 item 5). The rescuer buys senior shares at the certified IMPAIRED
         /// value, never par. `tranche` 0 = senior (the only supported tranche). `tranche` 1 (the
         /// bond tranche) is REFUSED (`RescueRefused`, Custom 114): bond-tranche rescue is NOT
@@ -9611,6 +9723,20 @@ pub mod ix {
                         trade: alloc::boxed::Box::new(trade),
                     });
                 }
+                crate::constants::TAG_PROPOSE_G9_FEED_ALLOWLIST => {
+                    let n = read_u8(&mut rest)? as usize;
+                    if n > crate::constants::G9_FEED_ALLOWLIST_CAP {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let mut entries = Vec::with_capacity(n);
+                    for _ in 0..n {
+                        let k = read_bytes32(&mut rest)?;
+                        let o = read_bytes32(&mut rest)?;
+                        entries.push((k, o));
+                    }
+                    Self::ProposeG9FeedAllowlist { entries }
+                }
+                crate::constants::TAG_COMMIT_G9_FEED_ALLOWLIST => Self::CommitG9FeedAllowlist,
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -10700,6 +10826,17 @@ pub mod ix {
                         out.extend_from_slice(k);
                     }
                 }
+                Self::ProposeG9FeedAllowlist { ref entries } => {
+                    out.push(crate::constants::TAG_PROPOSE_G9_FEED_ALLOWLIST);
+                    out.push(entries.len() as u8);
+                    for (k, o) in entries {
+                        out.extend_from_slice(k);
+                        out.extend_from_slice(o);
+                    }
+                }
+                Self::CommitG9FeedAllowlist => {
+                    out.push(crate::constants::TAG_COMMIT_G9_FEED_ALLOWLIST);
+                }
                 Self::RescueDeposit {
                     tranche,
                     amount,
@@ -10943,6 +11080,19 @@ pub mod oracle_v16 {
         solana_program::pubkey!("SBondMDrcV3K4kxZR1HNVT7osZxAHVHgYXL5Ze1oMUv");
     pub const SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID: Pubkey =
         solana_program::pubkey!("Aio4gaXjXzJNVLtzwtNVmSqGKpANtXhybbkhtAC94ji2");
+    /// R12-2 (mainnet security review): `Aio4gaXj...` is the Switchboard DEVNET program id, but it is
+    /// ALSO deployed and upgradeable on mainnet under a different authority, so a mainnet build
+    /// must not treat an account it owns as a Switchboard feed. Devnet builds only.
+    #[inline]
+    pub fn is_switchboard_on_demand_program(owner: &Pubkey) -> bool {
+        *owner == SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID
+            || (cfg!(feature = "devnet") && *owner == SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID)
+    }
+    /// R10-2: offset of the feed OWNER the allowlist pins, per source. Chainlink store
+    /// `Transmissions.owner` (disc 8 + version 1 + state 1); Switchboard PullFeed `authority`
+    /// (disc 8 + 32 submissions x 64 B). The feed owner is who can change the writer / authority.
+    pub const CL_OFF_FEED_OWNER: usize = 10;
+    pub const SB_OFF_FEED_AUTHORITY: usize = 8 + 2_048;
     pub const CHAINLINK_STORE_PROGRAM_ID: Pubkey =
         solana_program::pubkey!("HEvSKofvBgfaexv23kMabbYqxasxU3mQ4ibBMEmJWHny");
     const PRICE_UPDATE_V2_MIN_LEN: usize = 134;
@@ -11170,9 +11320,7 @@ pub mod oracle_v16 {
         max_staleness_secs: u64,
         conf_bps: u16,
     ) -> Result<(u64, i64), ProgramError> {
-        if *price_ai.owner != SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID
-            && *price_ai.owner != SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID
-        {
+        if !is_switchboard_on_demand_program(price_ai.owner) {
             return Err(ProgramError::IllegalOwner);
         }
         if price_ai.key.to_bytes() != *expected_feed_key {
@@ -11286,9 +11434,7 @@ pub mod oracle_v16 {
                 max_staleness_secs,
                 conf_bps,
             )
-        } else if *price_ai.owner == SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID
-            || *price_ai.owner == SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID
-        {
+        } else if is_switchboard_on_demand_program(price_ai.owner) {
             read_switchboard_price_e6(
                 price_ai,
                 expected_feed_id,
@@ -12668,6 +12814,8 @@ pub mod lag_policy {
             Instruction::RescueDeposit { .. } => entry("RescueDeposit", LagPolicy::Gated, "tag 112: priced from the certified vault value, refused while a band market's asset lags (band markets only; combined release)"),
             Instruction::InitInsuranceUnits => entry("InitInsuranceUnits", LagPolicy::MarkFree, "creates the unit ledger at genesis 1:1 insurance; no mark-valued payout"),
             Instruction::SetG9FeedAllowlist { .. } => entry("SetG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config"),
+            Instruction::ProposeG9FeedAllowlist { .. } => entry("ProposeG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelocked proposal)"),
+            Instruction::CommitG9FeedAllowlist => entry("CommitG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelock commit)"),
         }
     }
 }
@@ -14226,6 +14374,13 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
+        // v2.2 item 4: a `mainnet-ids` binary runs only at its pinned mainnet address (the one the
+        // stake program's allowlist names), so it cannot be deployed under another id.
+        #[cfg(feature = "mainnet-ids")]
+        if *program_id != crate::constants::WRAPPER_PROGRAM_ID {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+        crate::mainnet_ids::touch_pin_marker();
         restamp_vault_pots_in_writable_markets(program_id, accounts)?;
         // P3 option (b): the Earn exits (77, 102) and the terminal harvest/absorption (78) may
         // run beside open resolved receipts; they must never lower the claim-free residual that
@@ -15263,6 +15418,12 @@ pub mod processor {
             Instruction::InitInsuranceUnits => handle_init_insurance_units(program_id, accounts),
             Instruction::SetG9FeedAllowlist { keys } => {
                 handle_set_g9_feed_allowlist(program_id, accounts, &keys)
+            }
+            Instruction::ProposeG9FeedAllowlist { entries } => {
+                handle_propose_g9_feed_allowlist(program_id, accounts, &entries)
+            }
+            Instruction::CommitG9FeedAllowlist => {
+                handle_commit_g9_feed_allowlist(program_id, accounts)
             }
             Instruction::VaultLpSettleResolved { topup } => {
                 handle_vault_lp_settle_resolved(program_id, accounts, topup)
@@ -22679,12 +22840,12 @@ pub mod processor {
         // there is no program we are willing to send tokens to, so refuse
         // before touching anything. Fail closed: the atoms stay in
         // `header.insurance`. See `constants::STAKE_PROGRAM_ID`.
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (program_id, market_ai, pool_ai, bound_insurance_authority);
-            return Err(PercolatorError::StakeProgramNotPinned.into());
+            Err(PercolatorError::StakeProgramNotPinned.into())
         }
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake_program = crate::constants::STAKE_PROGRAM_ID;
             // (1) OWNER PIN — FIRST, BEFORE ANY BYTE IS READ. This is the check
@@ -23066,12 +23227,12 @@ pub mod processor {
         market_key: &Pubkey,
         insurance_authority: &[u8; 32],
     ) -> bool {
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (market_key, insurance_authority);
             false
         }
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake_program = crate::constants::STAKE_PROGRAM_ID;
             let (pool, _) = Pubkey::find_program_address(
@@ -34210,11 +34371,11 @@ pub mod processor {
     }
 
     fn canonical_vault_lp_matcher_program() -> Result<Pubkey, ProgramError> {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             Ok(crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM)
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             Err(PercolatorError::VaultLpMatcherNotApproved.into())
         }
@@ -35409,7 +35570,7 @@ pub mod processor {
     /// trusts); every other key is CREATOR class. A non-devnet build pins no stake program, so
     /// every unit is creator class there (and tag 87 already fails closed).
     fn ins_unit_class_for(market_key: &Pubkey, who: &Pubkey) -> u8 {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             let stake = crate::constants::STAKE_PROGRAM_ID;
             let (pool, _) = Pubkey::find_program_address(
@@ -35424,7 +35585,7 @@ pub mod processor {
                 return crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE;
             }
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = (market_key, who);
         }
@@ -35702,7 +35863,7 @@ pub mod processor {
         // pinned stake program cannot tell the stake class from the creator's, so it must never
         // unitise a market (the class bound would collapse into one class): fail closed, as
         // tag 87 does.
-        if !cfg!(feature = "devnet") {
+        if !crate::constants::STAKE_PINNED {
             return Err(PercolatorError::StakeProgramNotPinned.into());
         }
         let bump_bytes = [bump];
@@ -35798,11 +35959,14 @@ pub mod processor {
         }
         let tail = accounts.get(tail_start..).unwrap_or(&[]);
         let (list_key, _) = state::derive_g9_feed_allowlist(program_id);
-        let list = match tail.iter().find(|a| *a.key == list_key) {
-            Some(a) if a.owner == program_id => {
-                Some(state::read_g9_feed_allowlist(&a.try_borrow_data()?)?)
-            }
+        // In-place view of the allowlist (2 KB record: never copied onto this frame).
+        let list_guard = match tail.iter().find(|a| *a.key == list_key) {
+            Some(a) if a.owner == program_id => Some(a.try_borrow_data()?),
             _ => None,
+        };
+        let list = match &list_guard {
+            Some(g) => Some(state::view_g9_feed_allowlist(g)?),
+            None => None,
         };
         let legs = (profile0.oracle_leg_count as usize).min(crate::constants::ORACLE_LEG_CAP);
         for i in 0..legs {
@@ -35812,17 +35976,23 @@ pub mod processor {
                 Some(a) if *a.owner == crate::oracle_v16::CHAINLINK_STORE_PROGRAM_ID => {
                     crate::p4_rescue_ins::G9LegSource::Chainlink
                 }
-                Some(a)
-                    if *a.owner == crate::oracle_v16::SWITCHBOARD_ON_DEMAND_MAINNET_PROGRAM_ID
-                        || *a.owner == crate::oracle_v16::SWITCHBOARD_ON_DEMAND_DEVNET_PROGRAM_ID =>
-                {
+                Some(a) if crate::oracle_v16::is_switchboard_on_demand_program(a.owner) => {
                     crate::p4_rescue_ins::G9LegSource::Switchboard
                 }
                 _ => crate::p4_rescue_ins::G9LegSource::Other,
             };
-            let allowlisted = list
-                .as_ref()
-                .is_some_and(|l| l.keys[..l.count as usize].contains(&expected));
+            // R10-2: the listed feed qualifies only while its CURRENT owner (the party who can
+            // change the writer / authority) equals the owner pinned in the record.
+            let listed_owner = list.and_then(|l| {
+                let n = l.count as usize;
+                (0..n).find(|&k| l.keys[k] == expected).map(|k| l.owners[k])
+            });
+            let actual_owner = leg_ai.and_then(|a| {
+                let d = a.try_borrow_data().ok()?;
+                crate::p4_rescue_ins::g9_leg_feed_owner(source, &d)
+            });
+            let allowlisted =
+                crate::p4_rescue_ins::g9_owner_matches(listed_owner.as_ref(), actual_owner.as_ref());
             if !crate::p4_rescue_ins::g9_leg_ok(source, leg_ai.is_some(), allowlisted) {
                 solana_program::log::sol_log(&alloc::format!(
                     "p4_backstop_leg_refused leg={} passed={} source={:?} allowlisted={}",
@@ -35838,18 +36008,19 @@ pub mod processor {
         Ok(())
     }
 
-    /// SetG9FeedAllowlist (tag 117, R-7). UPGRADE-AUTHORITY only (ProgramData-proven, as tags 85,
-    /// 92 and 99): replaces the global G9 Switchboard feed allowlist `["g9_feeds"]`, creating it
-    /// on first use (the authority pays rent).
+    /// Shared account checks of the three allowlist tags (117 / 120 / 121). UPGRADE-AUTHORITY only
+    /// (ProgramData-proven, as tags 85, 92 and 99). Accounts: `[0]` upgrade authority (signer, w)
+    /// · `[1]` program data · `[2]` allowlist PDA (w) · `[3]` system program. Returns the PDA bump.
     ///
-    /// Accounts: `[0]` upgrade authority (signer, w) · `[1]` program data · `[2]` allowlist PDA
-    /// (w) · `[3]` system program.
+    /// R10-3 (what the timelock is and is not): it gives public notice (one day) before a feed is
+    /// ADDED and protects against operator error; it does NOT protect against a compromised
+    /// upgrade authority, which can replace the program itself. Burning the authority freezes the
+    /// list (a bad feed could then no longer be removed).
     #[inline(never)]
-    fn handle_set_g9_feed_allowlist<'a>(
+    fn g9_allowlist_authority_checks<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
-        keys: &[[u8; 32]],
-    ) -> ProgramResult {
+    ) -> Result<u8, ProgramError> {
         let upgrade_authority = account(accounts, 0)?;
         let program_data_ai = account(accounts, 1)?;
         let list_ai = account(accounts, 2)?;
@@ -35866,17 +36037,20 @@ pub mod processor {
         }
         let (pda, bump) = state::derive_g9_feed_allowlist(program_id);
         expect_key(list_ai, &pda)?;
-        if keys.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
-            return Err(PercolatorError::InvalidInstruction.into());
-        }
-        let mut rec = state::G9FeedAllowlistV22 {
-            count: keys.len() as u8,
-            version: crate::constants::G9_FEED_ALLOWLIST_VERSION,
-            bump,
-            ..<state::G9FeedAllowlistV22 as bytemuck::Zeroable>::zeroed()
-        };
-        rec.keys[..keys.len()].copy_from_slice(keys);
-        state::validate_g9_feed_allowlist(&rec)?;
+        Ok(bump)
+    }
+
+    /// Creates the allowlist PDA on first use (the upgrade authority pays rent); otherwise checks
+    /// the program owns it.
+    #[inline(never)]
+    fn g9_allowlist_ensure_account<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        bump: u8,
+    ) -> ProgramResult {
+        let upgrade_authority = account(accounts, 0)?;
+        let list_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
         if list_ai.data_is_empty() {
             expect_writable(upgrade_authority)?;
             let bump_bytes = [bump];
@@ -35888,12 +36062,146 @@ pub mod processor {
                 state::g9_feed_allowlist_account_len(),
                 program_id,
                 seeds,
-            )?;
+            )
         } else {
-            expect_owner(list_ai, program_id)?;
+            expect_owner(list_ai, program_id)
         }
-        state::write_g9_feed_allowlist(&mut list_ai.try_borrow_mut_data()?, &rec)?;
+    }
+
+    /// SetG9FeedAllowlist (tag 117, R-7; R-10: REMOVAL-ONLY). UPGRADE-AUTHORITY only. Replaces the
+    /// global G9 feed allowlist `["g9_feeds"]` with a list that is a SUBSET (by feed key) of the
+    /// current one; the pinned owners of the kept feeds are retained. Removing a feed that stopped
+    /// being trustworthy is immediate. Any ADDED key is refused with `G9AllowlistTimelock` (it must
+    /// go through tag 120 then tag 121 after 216,000 slots). An immediate change also cancels any
+    /// open proposal (a removal must never be undone by an older pending addition).
+    #[inline(never)]
+    fn handle_set_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        keys: &[[u8; 32]],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if keys.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if list_ai.data_is_empty() {
+            // nothing in force: only the empty list is a removal
+            if !keys.is_empty() {
+                return Err(PercolatorError::G9AllowlistTimelock.into());
+            }
+            g9_allowlist_ensure_account(program_id, accounts, bump)?;
+        } else {
+            g9_allowlist_ensure_account(program_id, accounts, bump)?;
+        }
+        let mut data = list_ai.try_borrow_mut_data()?;
+        let rec = state::open_g9_feed_allowlist_mut(&mut data, bump)?;
+        if !crate::p4_rescue_ins::g9_allowlist_removal_only(&rec.keys[..rec.count as usize], keys) {
+            solana_program::log::sol_log("p4_g9_feed_allowlist_add_refused use tag 120 then 121");
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        // keep the owners of the surviving keys, in the requested order
+        let old_keys = rec.keys;
+        let old_owners = rec.owners;
+        let old_n = rec.count as usize;
+        rec.keys = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        rec.owners = [[0u8; 32]; crate::constants::G9_FEED_ALLOWLIST_CAP];
+        for (i, k) in keys.iter().enumerate() {
+            let pos = old_keys[..old_n]
+                .iter()
+                .position(|o| o == k)
+                .ok_or(PercolatorError::G9AllowlistTimelock)?;
+            rec.keys[i] = *k;
+            rec.owners[i] = old_owners[pos];
+        }
+        rec.count = keys.len() as u8;
+        rec.clear_pending();
+        state::validate_g9_feed_allowlist(rec)?;
         solana_program::log::sol_log(&alloc::format!("p4_g9_feed_allowlist count={}", keys.len()));
+        Ok(())
+    }
+
+    /// ProposeG9FeedAllowlist (tag 120, R-10 / R10-2). UPGRADE-AUTHORITY only. Wire
+    /// `[120][count u8]{[feed 32][owner 32]}*count`: each feed is listed together with the feed
+    /// OWNER it must have (Chainlink store `feed.owner`; Switchboard PullFeed `authority`); a listed
+    /// feed stops qualifying if its owner changes. Records the list as pending at the current
+    /// slot; a second proposal replaces (and restarts) the first. An EMPTY proposal CANCELS the
+    /// open proposal (refused when none is open). Nothing is in force until tag 121.
+    #[inline(never)]
+    fn handle_propose_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        entries: &[([u8; 32], [u8; 32])],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if entries.len() > crate::constants::G9_FEED_ALLOWLIST_CAP {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if entries.is_empty() && list_ai.data_is_empty() {
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        g9_allowlist_ensure_account(program_id, accounts, bump)?;
+        let now = Clock::get()?.slot.max(1);
+        let mut data = list_ai.try_borrow_mut_data()?;
+        let rec = state::open_g9_feed_allowlist_mut(&mut data, bump)?;
+        if entries.is_empty() {
+            if rec.pending_count == 0 {
+                return Err(PercolatorError::G9AllowlistTimelock.into());
+            }
+            rec.clear_pending();
+            state::validate_g9_feed_allowlist(rec)?;
+            solana_program::log::sol_log("p4_g9_feed_allowlist_proposal_cancelled");
+            return Ok(());
+        }
+        rec.clear_pending();
+        for (i, (k, o)) in entries.iter().enumerate() {
+            rec.pending_keys[i] = *k;
+            rec.pending_owners[i] = *o;
+        }
+        rec.pending_count = entries.len() as u8;
+        rec.set_pending_slot(now);
+        state::validate_g9_feed_allowlist(rec)?;
+        solana_program::log::sol_log(&alloc::format!(
+            "p4_g9_feed_allowlist_proposed count={} slot={} commit_from={}",
+            entries.len(),
+            now,
+            now.saturating_add(crate::constants::G9_ALLOWLIST_TIMELOCK_SLOTS)
+        ));
+        Ok(())
+    }
+
+    /// CommitG9FeedAllowlist (tag 121, R-10). UPGRADE-AUTHORITY only. Makes the pending list the
+    /// list in force, only when `now >= pending_slot + G9_ALLOWLIST_TIMELOCK_SLOTS`; refused with
+    /// `G9AllowlistTimelock` when there is no proposal or the delay has not elapsed.
+    #[inline(never)]
+    fn handle_commit_g9_feed_allowlist<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+    ) -> ProgramResult {
+        let bump = g9_allowlist_authority_checks(program_id, accounts)?;
+        let list_ai = account(accounts, 2)?;
+        if list_ai.data_is_empty() {
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        expect_owner(list_ai, program_id)?;
+        let now = Clock::get()?.slot;
+        let mut data = list_ai.try_borrow_mut_data()?;
+        let rec = state::open_g9_feed_allowlist_mut(&mut data, bump)?;
+        if !crate::p4_rescue_ins::g9_allowlist_commit_ready(rec.pending_slot_u64(), now) {
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_g9_feed_allowlist_commit_refused pending_slot={} now={}",
+                rec.pending_slot_u64(),
+                now
+            ));
+            return Err(PercolatorError::G9AllowlistTimelock.into());
+        }
+        rec.count = rec.pending_count;
+        rec.keys = rec.pending_keys;
+        rec.owners = rec.pending_owners;
+        rec.clear_pending();
+        state::validate_g9_feed_allowlist(rec)?;
+        solana_program::log::sol_log(&alloc::format!("p4_g9_feed_allowlist_committed count={}", rec.count));
         Ok(())
     }
 
@@ -35917,6 +36225,14 @@ pub mod processor {
     /// credited (vault in), so `header.vault` nets to zero and no SPL moves. Every insurance unit
     /// loses pro rata (I falls, U unchanged); the receivable is booked on both ledgers.
     ///
+    /// KEEPER NOTE (W4-4): mode 3 can REVERT where mode 1 would succeed (the engine's capacity read
+    /// returns an error, not 0, on an inconsistent source ledger or a failed validation). A keeper
+    /// that gets a mode-3 error must fall back to mode 1 in the same sweep.
+    ///
+    /// RESTORE-FROM-PNL (`mode` 3, W-4 residual). As mode 1, but the vault LP's unconverted,
+    /// unliened, source-backed profit is repaid FIRST (the engine routes it support -> insurance in
+    /// one call, never through withdrawable capital) and capital only for the remainder; same
+    /// equity room (IM + R-6 buffer), same repay-first rule, same ungated permissionless access.
     /// RESTORE (`mode` 1). Repays `min(outstanding, capital, certified equity - IM, max_amount)`
     /// from the vault LP's capital (W-4: the engine's capital-to-insurance charge, which works on
     /// a POSITIONED LP and refuses to cut equity below IM; after the maintenance fee, A4-checked)
@@ -35946,14 +36262,15 @@ pub mod processor {
         expect_writable(own_ledger_ai)?;
         expect_writable(sibling_ledger_ai)?;
         expect_owner(market_ai, program_id)?;
-        if mode > 2 {
+        if mode > 3 {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         // R-1 / R-7 / R-8 (re-reviews 2026-10-06, mainnet blocker): PROPOSE and DRAW only on an
-        // authenticated Hybrid whose every leg is a Chainlink store feed or an allowlisted
+        // authenticated Hybrid whose every leg is an ALLOWLISTED (R-10/R-12) Chainlink store or
         // Switchboard feed (the leg accounts ride in the tail). Devnet builds keep an override for
-        // testing; a mainnet build has none. RESTORE (mode 1) is never gated.
-        if mode != 1 {
+        // testing; a mainnet build has none. RESTORE (modes 1 and 3) is never gated: it moves
+        // value INTO insurance only.
+        if mode != 1 && mode != 3 {
             g9_oracle_gate(program_id, market_ai, accounts, 7)?;
         }
         expect_owner(registry_ai, program_id)?;
@@ -36181,45 +36498,88 @@ pub mod processor {
                 // insurance leg only) debits capital and credits the asset-0 domain budgets with
                 // `header.vault` unchanged, and refuses (LockActive) any debit that would leave
                 // certified equity below the INITIAL margin requirement. So a positioned LP repays
-                // its surplus over IM in Live; it is no longer repayable only when flat. Positive
-                // PnL counts only once converted (tag 100; the engine refuses Live conversion
-                // while source-claim exposure is open), so free = min(capital, equity - IM).
+                // its surplus over IM in Live; it is no longer repayable only when flat.
                 // R-6: leave a buffer of `RESTORE_IM_BUFFER_BPS` of IM above the margin floor.
-                let free = crate::p4_rescue_ins::backstop_restore_free(
+                //
+                // W-4 residual (mode 3, RESTORE-FROM-PNL): the LP's UNCONVERTED, unliened,
+                // source-backed profit is repaid FIRST, through the engine's
+                // `repay_insurance_from_released_pnl_not_atomic` (value goes support -> insurance
+                // inside one call and never rests in the LP's withdrawable capital; the engine
+                // capacity is 0 whenever a precondition fails, so mode 3 then equals mode 1), and
+                // capital only for the remainder. Mode 1 is unchanged.
+                let pnl_cap = if mode == 3 {
+                    group
+                        .released_pnl_insurance_repay_capacity(&lp.as_view())
+                        .map_err(map_v16_error)?
+                } else {
+                    0
+                };
+                let floor_room = crate::p4_rescue_ins::backstop_restore_equity_room(
                     equity,
                     cert.certified_initial_req,
+                );
+                let (from_pnl, from_cap) = crate::p4_rescue_ins::backstop_restore_split(
+                    outstanding,
+                    floor_room,
+                    max_amount,
+                    pnl_cap,
                     lp.header.capital.get(),
                 );
-                let amt = crate::p4_rescue_ins::backstop_restore_amount(outstanding, free, max_amount);
+                let amt = from_pnl + from_cap;
                 if amt == 0 {
                     solana_program::log::sol_log(&alloc::format!(
-                        "p4_backstop_restore_nothing equity={} im={} capital={}",
+                        "p4_backstop_restore_nothing equity={} im={} capital={} pnl_cap={} pnl={} reserved={}",
                         equity,
                         cert.certified_initial_req,
-                        lp.header.capital.get()
+                        lp.header.capital.get(),
+                        pnl_cap,
+                        lp.header.pnl.get(),
+                        lp.header.reserved_pnl.get()
                     ));
                     return Err(PercolatorError::InsuranceBackstopRefused.into());
                 }
                 let c_m_before = p2b_c_m(&lp)?;
-                // Capital -> asset-0 insurance (long half, short remainder, as
+                let ins_before = group.header.insurance.get();
+                let vault_before_restore = group.header.vault.get();
+                // Insurance is credited to asset-0 (long half, short remainder, as
                 // `deposit_market_zero_insurance_view`); `header.vault` is unchanged.
-                let long_amount = amt / 2;
-                let short_amount = amt - long_amount;
-                if long_amount != 0 {
+                if from_pnl != 0 {
+                    let long_pnl = from_pnl / 2;
                     group
-                        .charge_account_backing_fee_not_atomic(&mut lp, 0, 0, 0, long_amount)
+                        .repay_insurance_from_released_pnl_not_atomic(
+                            &mut lp,
+                            0,
+                            long_pnl,
+                            1,
+                            from_pnl - long_pnl,
+                        )
                         .map_err(map_v16_error)?;
                 }
-                group
-                    .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
-                    .map_err(map_v16_error)?;
+                if from_cap != 0 {
+                    let long_amount = from_cap / 2;
+                    let short_amount = from_cap - long_amount;
+                    if long_amount != 0 {
+                        group
+                            .charge_account_backing_fee_not_atomic(&mut lp, 0, 0, 0, long_amount)
+                            .map_err(map_v16_error)?;
+                    }
+                    group
+                        .charge_account_backing_fee_not_atomic(&mut lp, 1, 0, 1, short_amount)
+                        .map_err(map_v16_error)?;
+                }
+                // W4-2: the receivable falls by exactly what insurance gained, and no token moved.
+                if group.header.insurance.get().checked_sub(ins_before) != Some(amt)
+                    || group.header.vault.get() != vault_before_restore
+                {
+                    return Err(PercolatorError::EngineInvalidConfig.into());
+                }
                 p2b_a4_capacity_check(&group, &lp, 0, c_m_before)?;
                 let next = outstanding - amt;
                 st.backstop_outstanding_atoms =
                     u64::try_from(next).map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
                 solana_program::log::sol_log(&alloc::format!(
-                    "p4_backstop_restore repaid={} outstanding={} equity_before={} im={}",
-                    amt, next, equity, cert.certified_initial_req
+                    "p4_backstop_restore repaid={} from_pnl={} outstanding={} equity_before={} im={}",
+                    amt, from_pnl, next, equity, cert.certified_initial_req
                 ));
                 amt
             };
@@ -39840,11 +40200,11 @@ pub mod processor {
     /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
-        #[cfg(feature = "devnet")]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
         {
             *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
         }
-        #[cfg(not(feature = "devnet"))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
         {
             let _ = matcher_prog;
             false
@@ -43637,6 +43997,58 @@ pub mod processor {
         use alloc::vec;
         use percolator::HealthCertV16;
 
+        /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
+        /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
+        /// `mainnet-ids*`: the vault authority derived under the PINNED stake id is bound and gets
+        /// the stake unit class; one derived under any other program, or a stranger, is not.
+        #[test]
+        #[allow(clippy::assertions_on_constants)]
+        fn item4_stake_pin_flavours() {
+            let market = Pubkey::new_from_array([7u8; 32]);
+            let stranger = [9u8; 32];
+            assert!(!insurance_authority_bound_to_stake_pool(&market, &stranger));
+            #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+            {
+                assert!(crate::constants::STAKE_PINNED);
+                let derive = |program: &Pubkey| {
+                    let (pool, _) = Pubkey::find_program_address(
+                        &[crate::constants::STAKE_POOL_SEED, market.as_ref()],
+                        program,
+                    );
+                    Pubkey::find_program_address(
+                        &[crate::constants::STAKE_VAULT_AUTHORITY_SEED, pool.as_ref()],
+                        program,
+                    )
+                    .0
+                };
+                let pinned = derive(&crate::constants::STAKE_PROGRAM_ID);
+                assert!(insurance_authority_bound_to_stake_pool(&market, &pinned.to_bytes()));
+                assert_eq!(
+                    ins_unit_class_for(&market, &pinned),
+                    crate::p4_rescue_ins::INS_UNIT_CLASS_STAKE
+                );
+                // Negative control: the SAME derivation under a different program is refused.
+                let other = derive(&Pubkey::new_from_array([0xBB; 32]));
+                assert!(!insurance_authority_bound_to_stake_pool(&market, &other.to_bytes()));
+                assert_eq!(
+                    ins_unit_class_for(&market, &other),
+                    crate::p4_rescue_ins::INS_UNIT_CLASS_CREATOR
+                );
+            }
+            #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
+            {
+                assert!(!crate::constants::STAKE_PINNED, "no pin: tags 87 / 116 fail closed");
+            }
+            #[cfg(feature = "mainnet-ids")]
+            {
+                assert_ne!(
+                    crate::constants::STAKE_PROGRAM_ID,
+                    crate::constants::WRAPPER_PROGRAM_ID,
+                    "the pair is distinct"
+                );
+            }
+        }
+
         #[test]
         fn wrapper_config_len_matches_struct_size() {
             assert_eq!(
@@ -44245,6 +44657,7 @@ pub mod processor {
             assert_eq!(custom_code(PercolatorError::EngineAdlReduceOnly), 120);
             assert_eq!(custom_code(PercolatorError::EngineLossStale), 121);
             assert_eq!(custom_code(PercolatorError::EarnExitWouldUnderBackClaims), 122);
+            assert_eq!(custom_code(PercolatorError::G9AllowlistTimelock), 125);
             assert_eq!(custom_code(PercolatorError::EngineLockActive), 21);
             assert_eq!(
                 crate::error::map_v16_error(percolator::V16Error::AdlReduceOnly),
