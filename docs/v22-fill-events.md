@@ -128,7 +128,7 @@ an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without con
 |---|---|---|---|
 | 1 | `REBALANCE_REDUCE` | 44 | **basis units.** The **executed** size: min(requested, unilateral close capacity, position). Unilateral (zero counterparty). Best effort: not emitted if the leg's side cannot be read |
 | 2 | `ADL_WIND_DOWN` | 104 | **ADL-effective units** (not the raw basis). Unilateral. Not emitted on the call that only arms the episode. Best effort, as reason 1 |
-| 3 | `LIQUIDATION` | 5 (the crank handler that liquidated; also when that crank runs as the pre-crank inside tag 77) | **ADL-effective units.** The change of the position on the liquidated asset across the call. Unilateral. An after-leg that is **absent** is a full close; an after-leg that is present but **unreadable** (a generation or ADL epoch the reader cannot interpret) suppresses the event rather than being read as zero. Not emitted either when the before-leg is unreadable or the change is zero (best effort: an event never makes a liquidation fail) |
+| 3 | `LIQUIDATION` | 5 (the crank handler that liquidated; also when that crank runs as the pre-crank inside tag 77) | **ADL-effective units.** The change of the position on the liquidated asset across the call. Unilateral. An after-leg that is **absent** is a full close; an after-leg that is present but **unreadable** (a generation or ADL epoch the reader cannot interpret) suppresses the event rather than being read as zero. The after-leg is the active leg whose `asset_index` AND generation (`market_id`) match the asset; a leg of an older generation on the same index is passed over. Both cases are defensive: the engine keeps one active leg per asset index, of the current generation, with its ADL epoch snapshot bound to its side (the same epoch, or one behind while the side's reset is pending, which reads as size 0), so an unreadable after-leg cannot be produced through the program; the suppression is exercised natively over real account bytes (`liquidation_event_wiring_absent_unreadable_and_stale_generation`). Not emitted either when the before-leg is unreadable or the change is zero (best effort: an event never makes a liquidation fail) |
 | 4 | `DUST_SWEEP` | 118 | the whole leg, bilateral against the bound vault LP at `P_last`, no fee |
 | 5 | `EVICTION` | 119 | the victim's whole leg, bilateral against the bound vault LP at `P_last`, no fee; emitted before the taker's FILL |
 
@@ -396,9 +396,7 @@ capacity- and position-clipped, a failed transaction whose log carries a fill th
 `Program log: success` / `invoke [2]`, embedded newlines, `Log truncated`, null logs, frame
 inconsistencies, unknown kind / version; no `.so` needed),
 `tests/v16_cu.rs` (11-leg packed batch, 1-leg and 14-leg liquidation crank), `tests/v22_band_rent.rs`
-(118, 119, 106), `tests/p2b_adl_wind_down.rs` (104), `tests/earn_drain_replay.rs` and
-`tests/v16_fork_lp_vault_redeem.rs` (77; the second checks each part of the split against the
-ledger), `tests/p4_wave_d.rs` (111 draw, restore, and the mode-3 restore sub). The unit tests in
+(118, 119, 106), `tests/p2b_adl_wind_down.rs` (104), `tests/v16_fork_lp_vault_redeem.rs` (77; each part of the split is checked against the ledger), `tests/p4_wave_d.rs` (111 draw, restore, and the mode-3 restore sub). The unit tests in
 `src/fill_events_v22.rs` pin the lengths, the worked examples and the liquidation absent /
 unreadable decision. Each LiteSVM test decodes the events from the transaction logs of the built
 `.so` and compares them with the account-state change.

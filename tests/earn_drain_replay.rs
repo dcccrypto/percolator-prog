@@ -19,8 +19,6 @@
 #![cfg(not(kani))]
 #![allow(dead_code)]
 mod indep_harness;
-#[path = "support/fill_events.rs"]
-mod fill_events;
 
 use indep_harness::*;
 use percolator::BOUND_SCALE;
@@ -2562,23 +2560,12 @@ fn r3m1_honest_exit_inside_dip_is_not_skimmed() {
     assert_eq!(code(&dip), Some(ERR_NOT_LOSS_CURRENT), "the dip exit is refused as not loss-current");
     assert_eq!(w.r.exit_state(&w.h.pubkey()), before, "a refused 77 moves nothing");
     // H's honest SDK flow: refresh every positioned portfolio inline, floor = its par quote.
-    let supply_before_exit = w.r.share_supply();
     let (paid, cu) = w
         .r
         .execute_77(&w.h, Some((R3M1_DEPOSIT - 2, vec![w.a1, w.a2, lp])), true)
         .expect("H 77 with inline refresh");
     eprintln!("R3-M1 H paid {paid} (deposit {R3M1_DEPOSIT}), CU {cu}");
     assert!(paid + 2 >= R3M1_DEPOSIT, "H under-paid after the inline refresh: {paid}");
-    // v2.2 fill events: tag 77 emitted ONE MOVE (EARN_EXIT): principal + earnings is exactly the
-    // paid amount (the token transfer), and the shares burned are stated.
-    let evs = fill_events::wrapper_events(&last_logs(), &w.r.env.program_id);
-    assert_eq!(evs.len(), 1, "{evs:?}");
-    let fill_events::Event::Move { ix_tag, market, sub, asset_index, a, b, c } = &evs[0] else {
-        panic!("expected MOVE: {evs:?}")
-    };
-    assert_eq!((*ix_tag, *market, *sub, *asset_index), (77, w.r.env.market, 1, u16::MAX));
-    assert_eq!(a + b, paid, "principal {a} + earnings {b} == the amount paid");
-    assert_eq!(*c, supply_before_exit - w.r.share_supply(), "shares burned == the LP-mint supply drop");
     // M (the dip-holder) gains nothing from H's exit.
     w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
     w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);

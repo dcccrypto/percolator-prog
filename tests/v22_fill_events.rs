@@ -1279,6 +1279,88 @@ fn reduce_event_rebalance_reduce_full_and_clipped() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Liquidation REDUCE: the after-leg wiring (security review round 2, N-1 / N-2).
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// `processor::liquidation_event_view` run NATIVELY over the real market and portfolio account
+/// bytes of a taker that is long 10 units, with the after-leg edited to each state the function
+/// must tell apart. An active-but-unreadable after-leg cannot be produced through the program
+/// (the engine keeps every active leg's ADL epoch snapshot bound to its side, one active leg per
+/// asset index, current generation only), so the LiteSVM liquidation tests never reach that
+/// branch: this test is what kills "map an unreadable leg to Absent" (it would report a full
+/// close) and "match the leg by asset index only" (a stale-generation leg would end the scan).
+#[test]
+fn liquidation_event_wiring_absent_unreadable_and_stale_generation() {
+    let mut env = Env::new();
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    let lp = env.lp(1_000_000);
+    env.trade_cpi(&taker, taker_account, &lp, 10 * Q).expect("open 10 long");
+    let gen = env.market_id();
+    let price = env.effective_price();
+    let before = [(0u16, 10 * Q)];
+
+    let run = |edit: &dyn Fn(&mut PortfolioAccountV16)| -> Option<(u16, u64, i128, u64)> {
+        let mut market_data = env.svm.get_account(&env.market).unwrap().data;
+        let mut portfolio_data = env.svm.get_account(&taker_account).unwrap().data;
+        let mut p = state::read_portfolio(&portfolio_data).unwrap();
+        edit(&mut p);
+        state::write_portfolio(&mut portfolio_data, &p).unwrap();
+        let (_cfg, group) = state::market_view_mut(&mut market_data).unwrap();
+        let portfolio = state::portfolio_view_mut_for_market_slots(&mut portfolio_data, 1).unwrap();
+        percolator_prog::processor::liquidation_event_view(&group, &portfolio, &before, 0)
+    };
+    let leg_slot = env
+        .portfolio_state(taker_account)
+        .legs
+        .iter()
+        .position(|l| l.active && l.asset_index == 0)
+        .expect("the taker's leg");
+    let spare = (leg_slot + 1) % env.portfolio_state(taker_account).legs.len();
+    assert_ne!(spare, leg_slot, "fixture: the portfolio has a second leg slot");
+
+    // Unchanged: nothing to report.
+    assert_eq!(run(&|_| {}), None, "no change, no event");
+    // Partial close 10 -> 4: readable, delta -6.
+    assert_eq!(run(&|p| p.legs[leg_slot].basis_pos_q = 4 * Q), Some((0, gen, -6 * Q, price)));
+    // ABSENT (leg gone): a full close.
+    assert_eq!(run(&|p| p.legs[leg_slot].active = false), Some((0, gen, -10 * Q, price)), "absent = full close");
+    // UNREADABLE (ADL epoch snapshot this reader cannot interpret): no event, NOT a full close.
+    assert_eq!(
+        run(&|p| p.legs[leg_slot].epoch_snap += 5),
+        None,
+        "an active but unreadable after-leg suppresses the event"
+    );
+    // N-2: an active leg of an OLDER generation on the same asset index is not the after-leg.
+    // Alone, the current-generation leg is absent: a full close.
+    assert_eq!(
+        run(&|p| p.legs[leg_slot].market_id += 1),
+        Some((0, gen, -10 * Q, price)),
+        "a stale-generation leg is passed over"
+    );
+    // Stale-generation leg FIRST, the current leg (now 4) after it: the scan must not stop at the
+    // stale one. In both slot orders.
+    for (stale, current) in [(leg_slot, spare), (spare, leg_slot)] {
+        let got = run(&|p| {
+            let live = p.legs[leg_slot];
+            p.legs[current] = live;
+            p.legs[current].basis_pos_q = 4 * Q;
+            p.legs[stale] = live;
+            p.legs[stale].market_id += 1;
+        });
+        assert_eq!(got, Some((0, gen, -6 * Q, price)), "stale slot {stale}, current slot {current}");
+    }
+    // The before-leg is not in the snapshot (it was unreadable before the crank): no event.
+    {
+        let mut market_data = env.svm.get_account(&env.market).unwrap().data;
+        let mut portfolio_data = env.svm.get_account(&taker_account).unwrap().data;
+        let (_cfg, group) = state::market_view_mut(&mut market_data).unwrap();
+        let portfolio = state::portfolio_view_mut_for_market_slots(&mut portfolio_data, 1).unwrap();
+        assert_eq!(percolator_prog::processor::liquidation_event_view(&group, &portfolio, &[], 0), None);
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Attribution and failure rules.
 // ─────────────────────────────────────────────────────────────────────────────
 

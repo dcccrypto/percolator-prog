@@ -28499,22 +28499,38 @@ pub mod processor {
     ///
     /// The after-leg is looked up directly (one slot decoded, no snapshot of all 16 and no
     /// allocation). Security review 2026-10-07, L-4: an ABSENT after-leg means the position is
-    /// gone (size 0, a full close); an after-leg that is active but UNREADABLE (generation or
-    /// ADL epoch this reader cannot interpret) is not zero, so the event is suppressed rather
-    /// than claiming a full close.
+    /// gone (size 0, a full close); an after-leg that is active but UNREADABLE (an ADL epoch
+    /// this reader cannot interpret) is not zero, so the event is suppressed rather than
+    /// claiming a full close.
+    ///
+    /// Round 2, N-2: the after-leg is THE leg of the asset's current generation (`asset_index`
+    /// AND `market_id` match), so an active leg of an older generation on the same index is
+    /// passed over instead of ending the scan. The engine allows one active leg per asset
+    /// index, of the current generation only (`validate_with_market`: duplicates and a
+    /// generation mismatch are `HiddenLeg`), so this is defensive.
+    ///
+    /// `pub` for `tests/v22_fill_events.rs`, which drives this function natively over real
+    /// account bytes (round 2, N-1): an unreadable after-leg cannot be produced through the
+    /// program (the engine keeps every active leg's epoch snapshot bound to its side).
+    #[doc(hidden)]
     #[inline(never)]
-    fn liquidation_event_view(
+    pub fn liquidation_event_view(
         group: &state::MarketViewMutV16<'_>,
         portfolio: &percolator::PortfolioV16ViewMut<'_>,
         before: &[(u16, i128)],
         asset: usize,
     ) -> Option<(u16, u64, i128, u64)> {
         let &(_, q_before) = before.iter().find(|(a, _)| *a as usize == asset)?;
+        let a = &group.markets.get(asset)?.engine.asset;
+        let asset_gen = a.market_id.get();
         let mut after = fill_events_v22::LegAfter::Absent;
         let mut slot = 0usize;
         while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
             let leg = &portfolio.header.legs[slot];
-            if leg.active == 1 && leg.asset_index.get() as usize == asset {
+            if leg.active == 1
+                && leg.asset_index.get() as usize == asset
+                && leg.market_id.get() == asset_gen
+            {
                 after = match leg_slot_effective_signed_q(group, leg) {
                     Some((_, q)) => fill_events_v22::LegAfter::Size(q),
                     None => fill_events_v22::LegAfter::Unreadable,
@@ -28524,8 +28540,7 @@ pub mod processor {
             slot += 1;
         }
         let delta = fill_events_v22::liquidation_delta_q(q_before, after)?;
-        let a = &group.markets.get(asset)?.engine.asset;
-        Some((asset as u16, a.market_id.get(), delta, a.effective_price.get()))
+        Some((asset as u16, asset_gen, delta, a.effective_price.get()))
     }
 
     /// P3: re-read `lp_net_q` for every bound asset whose vault LP is `portfolio_ai`. One
