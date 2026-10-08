@@ -35,6 +35,14 @@ use solana_sdk::{
 use spl_token::state::{Account as TokenAccount, AccountState, Mint};
 use std::path::PathBuf;
 
+#[path = "support/fill_events.rs"]
+mod fill_events;
+
+thread_local! {
+    /// v2.2 fill events: logs of the last transaction (success or failure) sent by this thread.
+    static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 const MATCHER_CONTEXT_LEN: usize = 320;
 // v2.2 combined release: Wave A's 1e7 launch floor binds every growth (and so every band) market.
 const PRICE: u64 = 10_000_000;
@@ -434,10 +442,22 @@ impl Env {
             &all,
             self.svm.latest_blockhash(),
         );
-        self.svm
-            .send_transaction(tx)
-            .map(|m| { cu_rec(&__d, m.compute_units_consumed); m.compute_units_consumed })
-            .map_err(|e| format!("{e:?}"))
+        match self.svm.send_transaction(tx) {
+            Ok(m) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = m.logs.clone());
+                cu_rec(&__d, m.compute_units_consumed);
+                Ok(m.compute_units_consumed)
+            }
+            Err(e) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+                Err(format!("{e:?}"))
+            }
+        }
+    }
+
+    /// v2.2 fill events the wrapper emitted in the last transaction (frame-attributed).
+    fn events(&self) -> Vec<fill_events::Event> {
+        fill_events::wrapper_events(&LAST_LOGS.with(|l| l.borrow().clone()), &self.program_id)
     }
 
     fn portfolio(&mut self, owner: &Keypair, deposit: u128) -> Pubkey {
@@ -1024,6 +1044,19 @@ fn v22_rent_accrues_above_the_kink_routes_to_the_vault_lp_and_tag_106_settles() 
     let newest = taker_cap1 - env.portfolio_state(taker.1).capital;
     let lp_gain = env.portfolio_state(lp.account).capital - lp_cap0;
     assert_eq!(lp_gain, unrouted + newest, "the vault LP receives every unrouted atom");
+    // v2.2 fill events: the MOVE event states exactly the atoms routed to the vault LP.
+    assert_eq!(
+        env.events(),
+        vec![fill_events::Event::Move {
+            ix_tag: 106,
+            market: env.market,
+            sub: 3,
+            asset_index: 0,
+            a: lp_gain as u64,
+            b: 0,
+            c: 0,
+        }]
+    );
     assert_eq!(env.engine_asset().rent_unrouted_atoms, 0);
     env.assert_conservation();
 }
@@ -2186,7 +2219,23 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
     env.crank_current(lp.account);
     let equity_before = env.equity(long.1);
     let short_leg_before = env.portfolio_state(short.1).legs.iter().find(|l| l.active).cloned().unwrap();
+    let long_pos_before = env.pos(long.1);
     env.sweep_dust(long.1, lp.account).expect("bilateral dust sweep");
+    // v2.2 fill events: one REDUCE (reason 4, tag 118) closing the whole leg against the LP at P_last.
+    assert_eq!(
+        env.events(),
+        vec![fill_events::Event::Reduce {
+            ix_tag: 118,
+            market: env.market,
+            portfolio: long.1,
+            counterparty: lp.account,
+            asset_index: 0,
+            asset_gen: env.market_id(),
+            reason: 4,
+            signed_reduced_q: -long_pos_before,
+            price_e6: env.engine_asset().effective_price,
+        }]
+    );
     assert_eq!(env.pos(long.1), 0, "the dust leg is closed");
     assert_eq!(env.equity(long.1), equity_before, "no fee, no value moved: exact equity kept");
     let a = env.engine_asset();
@@ -2234,6 +2283,30 @@ fn v22_tag119_eviction_lets_an_honest_trader_into_a_full_side() {
     // The eviction.
     let equity_before = env.equity(a.1);
     env.evict_and_trade(a.1, &honest.0, honest.1, &lp, 30 * Q).expect("evict + open");
+    // v2.2 fill events: REDUCE (the victim's whole leg, tag 119, reason 5) then the taker's FILL
+    // (the inner TradeCpi reports its own tag 10), in execution order.
+    let evs = env.events();
+    assert_eq!(evs.len(), 2, "{evs:?}");
+    assert_eq!(
+        evs[0],
+        fill_events::Event::Reduce {
+            ix_tag: 119,
+            market: env.market,
+            portfolio: a.1,
+            counterparty: lp.account,
+            asset_index: 0,
+            asset_gen: env.market_id(),
+            reason: 5,
+            signed_reduced_q: -10 * Q,
+            price_e6: env.engine_asset().effective_price,
+        }
+    );
+    let fill_events::Event::Fill { ix_tag, taker, lp: ev_lp, recs, .. } = &evs[1] else {
+        panic!("expected the inner trade's FILL: {evs:?}")
+    };
+    assert_eq!((*ix_tag, *taker, *ev_lp), (10, honest.1, lp.account));
+    assert_eq!(recs.len(), 1);
+    assert_eq!((recs[0].requested_q, recs[0].executed_q), (30 * Q, 30 * Q));
     assert_eq!(env.pos(a.1), 0, "the smallest leg was closed");
     assert_eq!(env.equity(a.1), equity_before, "the evicted account lost nothing but the position");
     assert_eq!(env.pos(honest.1), 30 * Q, "the honest trader is in");

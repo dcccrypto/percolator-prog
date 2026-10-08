@@ -3712,6 +3712,16 @@ impl V16CuEnv {
     }
 }
 
+thread_local! {
+    /// v2.2 fill events: logs of the last transaction (success or failure) sent by this thread.
+    pub static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Logs of the last transaction sent through `send_tx` / `send_raw_tx` on this thread.
+#[allow(dead_code)]
+pub fn last_logs() -> Vec<String> {
+    LAST_LOGS.with(|l| l.borrow().clone())
+}
 
 #[allow(dead_code)]
 pub fn cu_rec(data: &[u8], cu: u64) {
@@ -3749,6 +3759,7 @@ pub fn send_tx(
     );
     let r = svm.send_transaction(tx)
         .map(|meta| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
             if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
@@ -3756,7 +3767,10 @@ pub fn send_tx(
             cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
-        .map_err(|e| format!("{e:?}"));
+        .map_err(|e| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            format!("{e:?}")
+        });
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
@@ -3804,6 +3818,7 @@ pub fn send_raw_tx(
     );
     let r = svm.send_transaction(tx)
         .map(|meta| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
             if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
@@ -3811,7 +3826,10 @@ pub fn send_raw_tx(
             cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
-        .map_err(|e| format!("{e:?}"));
+        .map_err(|e| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            format!("{e:?}")
+        });
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }

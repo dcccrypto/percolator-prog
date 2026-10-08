@@ -19,6 +19,8 @@
 //! handle_request_redeem_lp_shares / handle_execute_redemption (mirrors
 //! handle_withdraw_backing_bucket).
 
+#[path = "support/fill_events.rs"]
+mod fill_events;
 use litesvm::LiteSVM;
 use percolator::MarketModeV16;
 use percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY;
@@ -3472,4 +3474,68 @@ fn issue_413_a_refill_is_not_counted_as_both_principal_and_recovery() {
          pays out against it.",
         avail.saturating_sub(expected)
     );
+}
+
+// ── v2.2 fill events: the Earn-exit split (security review 2026-10-07, M-3) ──────────────────
+
+/// `execute`, returning the transaction's logs.
+fn execute_with_logs(env: &mut Env, d: &Depositor) -> Vec<String> {
+    let accts = execute_accounts(env, d);
+    let instructions = vec![
+        ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+        ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+        Instruction {
+            program_id: env.program_id,
+            accounts: accts,
+            data: ProgInstruction::ExecuteRedemption { domain: DOMAIN }.encode(),
+        },
+    ];
+    let tx = Transaction::new_signed_with_payer(
+        &instructions,
+        Some(&env.payer.pubkey()),
+        &[&env.payer, &d.kp],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("execute redemption").logs
+}
+
+/// The MOVE `EARN_EXIT` event (tag 77) carries the principal / earnings SPLIT, each part checked
+/// on its own against the state, not just `a + b == paid`: `a` is the fall of the ledger's
+/// principal, `b` is the rest of the token payout, `c` the fall of the share supply. Same world
+/// and numbers as `conservation_with_earnings_partial_then_full_redeem` (earnings present, so
+/// the two parts differ and neither is zero).
+#[test]
+fn earn_exit_event_carries_the_principal_earnings_split() {
+    let mut env = setup_vault(0); // fee_share_bps = 5_000, immediate cooldown
+    let d_a = new_depositor(&mut env, 1_000_000);
+    let d_b = new_depositor(&mut env, 2_000_000);
+    seed_earnings(&mut env, 400_000);
+
+    let exit = |env: &mut Env, d: &Depositor, shares: u128| -> (u64, u64, u64) {
+        let principal_before = ledger(env).total_principal_atoms;
+        let shares_before = reg(env).total_lp_shares_outstanding;
+        let dest_before = tok(&env.svm, d.dest);
+        request(env, d, shares).expect("request");
+        env.svm.expire_blockhash();
+        let logs = execute_with_logs(env, d);
+        let evs = fill_events::wrapper_events(&logs, &env.program_id);
+        assert_eq!(evs.len(), 1, "one MOVE per Earn exit: {evs:?}");
+        let fill_events::Event::Move { ix_tag, market, sub, asset_index, a, b, c } = evs[0].clone() else {
+            panic!("expected a MOVE: {evs:?}")
+        };
+        assert_eq!((ix_tag, market, sub, asset_index), (77, env.market, 1, u16::MAX));
+        let paid = tok(&env.svm, d.dest) - dest_before;
+        let principal_drop = principal_before - ledger(env).total_principal_atoms;
+        assert_eq!(a as u128, principal_drop, "a = the principal part (the ledger's principal fall)");
+        assert_eq!(b as u128, paid as u128 - principal_drop, "b = the earnings part (the rest of the payout)");
+        assert_eq!(a + b, paid, "a + b = the vault -> redeemer transfer");
+        assert_eq!(c as u128, shares_before - reg(env).total_lp_shares_outstanding, "c = shares burned");
+        assert_eq!(c as u128, shares);
+        (a, b, c)
+    };
+
+    // A: 999,000 shares -> principal 999,000 + earnings 66,600 = 1,065,600.
+    assert_eq!(exit(&mut env, &d_a, 999_000), (999_000, 66_600, 999_000));
+    // B: 2,000,000 shares -> principal 2,000,000 + earnings 133,333 = 2,133,333.
+    assert_eq!(exit(&mut env, &d_b, 2_000_000), (2_000_000, 133_333, 2_000_000));
 }

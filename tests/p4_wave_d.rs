@@ -19,6 +19,8 @@
 //!       market with a bound vault is refused.
 //! P3 helpers copied from indep_p1p3_combined.rs (07a1d0eb+ auto-pin flow).
 mod indep_harness;
+#[path = "support/fill_events.rs"]
+mod fill_events;
 
 use indep_harness::*;
 use percolator::POS_SCALE;
@@ -1572,6 +1574,10 @@ fn init_units(w: &mut P3) -> Result<u64, String> {
     w.send(ProgInstruction::InitInsuranceUnits, metas, &[])
 }
 
+fn last_logs_of_draw() -> Vec<String> {
+    last_logs()
+}
+
 fn backstop_111(w: &mut P3, mode: u8, max_amount: u128, with_units: bool) -> Result<u64, String> {
     let payer = w.env.payer.pubkey();
     let mut metas = vec![
@@ -1780,6 +1786,20 @@ fn g9_draws_after_exhaustion_bounded_pro_rata() {
     assert!(b > 0, "vacuity: a backstop moved");
     let ins1 = w.env.market_state().1.insurance;
     assert_eq!(ins0 - ins1, b, "insurance fell by exactly the moved amount");
+    // v2.2 fill events: the DRAW (mode 0) emitted ONE MOVE (G9): the amount moved from insurance
+    // into the vault LP's capital and the receivable left outstanding (the first draw: equal).
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs_of_draw(), &w.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: w.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: b as u64,
+            b: b as u64,
+            c: 0,
+        }]
+    );
     assert!(b <= (u0.snap_insurance_mint_atoms * 5_000) / 10_000, "50% cap");
     assert!(b <= (u0.snap_insurance_mint_atoms * 2_000) / 10_000, "W-2 per-epoch 20% cap");
     assert_eq!(halt_mirror(&w), outstanding(&w) + b, "W-9: the fill halt mirror carries the backstop");
@@ -1855,6 +1875,20 @@ fn g9_restore_repays_backstop_first() {
     let b1 = backstop_st(&w) as u128;
     let repaid = b0 - b1;
     assert!(repaid > 0, "vacuity: something was repaid");
+    // v2.2 fill events: the RESTORE (mode 1) emitted ONE MOVE (G9): the capital repaid into
+    // insurance and the receivable still outstanding.
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &w.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: w.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: repaid as u64,
+            b: b1 as u64,
+            c: 1,
+        }]
+    );
     assert_eq!(w.env.market_state().1.insurance - ins0, repaid, "insurance restored by exactly the repayment");
     let u1 = units(&w).unwrap();
     assert_eq!(u1.backstop_receivable_atoms, b1);
@@ -2845,6 +2879,83 @@ fn w4_pnl_restore_refused_by_a_loss_stale_asset() {
     r.expect("falls back to capital (mode 1 behaviour)");
     assert!(o.repaid > 0);
     assert_eq!(o.cap0 - o.cap1, o.repaid, "all of it from capital: the PnL path is closed");
+}
+
+/// v2.2 fill events (security review 2026-10-07, L-6): tag 111 mode 3 has its OWN MOVE sub
+/// (4, G9_RESTORE_PNL) carrying the released-profit part and the capital part separately
+/// (a = from PnL, b = from capital, c = receivable outstanding after). It no longer reuses the
+/// G9 sub with `c = 3` and `a = from_pnl + from_cap`. Each field is checked against the state:
+/// the capital part is the LP's capital drop, the profit part is the rest of the repayment.
+#[test]
+fn w4_pnl_restore_event_splits_profit_and_capital() {
+    let owed = 1_300_000u64;
+    let size = U * 3 / 10;
+    let g9_restore_pnl = |w: &P3| -> (u64, u64, u64) {
+        let evs = fill_events::wrapper_events(&last_logs(), &w.env.program_id);
+        assert_eq!(evs.len(), 1, "one MOVE per restore: {evs:?}");
+        let fill_events::Event::Move { ix_tag, market, sub, asset_index, a, b, c } = evs[0].clone() else {
+            panic!("expected a MOVE: {evs:?}")
+        };
+        assert_eq!((ix_tag, market, asset_index), (111, w.env.market, 0));
+        assert_eq!(sub, 4, "mode 3 emits G9_RESTORE_PNL, never G9 (2): {evs:?}");
+        (a, b, c)
+    };
+
+    // 1. Uncapped: profit first, capital for the remainder.
+    let (mut w, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut w, 3, 0, owed);
+    r.expect("mode 3");
+    let from_cap = o.cap0 - o.cap1;
+    let from_pnl = o.repaid - from_cap;
+    assert!(from_pnl > 0, "vacuity: part of the repayment came from profit");
+    let (a, b, c) = g9_restore_pnl(&w);
+    eprintln!("L-6 mode 3 uncapped: event a(from_pnl)={a} b(from_cap)={b} c(outstanding)={c}; state from_pnl={from_pnl} from_cap={from_cap}");
+    assert_eq!(a as u128, from_pnl, "a = the released-profit part");
+    assert_eq!(b as u128, from_cap, "b = the capital part (the LP's capital drop)");
+    assert_eq!(a as u128 + b as u128, o.repaid, "a + b = the receivable's fall = insurance's gain");
+    assert_eq!(o.ins, o.repaid);
+    assert_eq!(c, backstop_st(&w), "c = the receivable still outstanding");
+    assert_eq!(c as u128, owed as u128 - o.repaid);
+
+    // 2. Capped below the profit available: all profit, no capital.
+    let (mut p, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut p, 3, 5_000, owed);
+    r.expect("mode 3 capped");
+    assert_eq!(o.cap0, o.cap1);
+    assert_eq!(g9_restore_pnl(&p), (5_000, 0, owed - 5_000));
+
+    // 3. The profit path closed (loss-stale asset): mode 3 repays from capital only and STILL
+    //    reports under its own sub, with a = 0.
+    let (mut s, _) = w4_profit_world(owed, 4, size);
+    let m = MARK.with(|c| c.get()) * 99 / 100;
+    MARK.with(|c| c.set(m));
+    let slot = s.slot() + 1;
+    s.env.svm.warp_to_slot(slot);
+    s.env.push_auth_mark_for_asset_as_admin(0, slot, m);
+    let _ = s.crank(s.lp);
+    let (r, o) = w4_restore(&mut s, 3, 0, owed);
+    r.expect("mode 3 falls back to capital");
+    assert!(o.repaid > 0);
+    assert_eq!(o.cap0 - o.cap1, o.repaid, "vacuity: all of it from capital");
+    assert_eq!(g9_restore_pnl(&s), (0, o.repaid as u64, backstop_st(&s)));
+
+    // 4. Control: mode 1 in the same world keeps the G9 sub (2) with c = 1 and a = the capital
+    //    repaid; nothing about it changed.
+    let (mut c1, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut c1, 1, 0, owed);
+    r.expect("mode 1");
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &c1.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: c1.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: o.repaid as u64,
+            b: backstop_st(&c1),
+            c: 1,
+        }]
+    );
 }
 
 /// Mode 4 (and above) is still an invalid instruction; with nothing owed both restore modes are
