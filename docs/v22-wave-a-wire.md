@@ -64,7 +64,7 @@ program creates; forced on in mainnet builds. Bits 0/1 are reserved for items 6/
 - v2.2: `[77, domain u16, min_payout_atoms u64, n_refresh u8]` (12 B); `n_refresh <= 8`; the
   all-zero trailer is refused. **Leg-weighted (A6):** each refreshed portfolio weighs
   `3 + active legs`; the sum must be <= 34 (else `InvalidInstruction`, before any refresh). Measured:
-  8 single-leg 1,016,434 CU; 2 x 14-leg 1,199,659 CU; 8 liquidating single-leg 1,066,615 CU.
+  8 single-leg 1,016,434 CU; 2 x 14-leg 1,199,659 CU (historical: the wrapper leg cap is now 4, S10-X1); 8 liquidating single-leg 1,066,615 CU.
 - Accounts: unchanged [0..12]; then `n_refresh` stale positioned portfolios (writable) at
   [13..13+n]; then the vault asset's oracle accounts (none for AuthMark). Refresh is non-bound Live
   only (bound vaults keep [13]/[14] for the vault-LP tail).
@@ -103,7 +103,7 @@ unsigned 77 (n_refresh 0, wire min 1). Keep the par − E3 gap monitor as teleme
    A CU overrun aborts the whole transaction (`ComputationalBudgetExceeded`, not a program error):
    never surface it as 118.
 2. **Explicit compute budget.** Prepend `SetComputeUnitLimit(1_300_000)` (the measured worst case
-   under the leg budget is 1,199,659 CU for 2 x 14-leg refreshes; 2 x 14-leg LIQUIDATING refreshes
+   under the leg budget was 1,199,659 CU for 2 x 14-leg refreshes (the cap is now 4 legs); 2 x 14-leg LIQUIDATING refreshes
    1,199,215; 8 single-leg 1,016,434; 8 single-leg on a Hybrid vault asset with a Pyth tail
    1,018,782). The default 200k limit always fails a refreshing 77.
 3. **Default floor = quote - at most 5 bps.** `min_payout = floor(simulated_payout * (10_000 - 5)

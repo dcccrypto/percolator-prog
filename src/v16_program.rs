@@ -790,12 +790,13 @@ pub mod constants {
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
     pub const REDEMPTION_REFRESH_MAX: u8 = 8;
     /// Security review A6: the inline refresh is also LEG-weighted. One refresh costs ~85k CU
-    /// fixed plus ~32k CU per active leg it re-certifies (measured: 1 leg ~117k, 14 legs ~530k;
+    /// fixed plus ~32k CU per active leg it re-certifies (measured at the old 14-leg cap: 1 leg ~117k, 14 legs ~530k; the cap is now 4, so the largest weight is 7;
     /// the 77 itself ~60k). Weight of a refreshed portfolio = `REDEMPTION_REFRESH_BASE_WEIGHT +
     /// legs`, and the sum must be <= `REDEMPTION_REFRESH_WEIGHT_BUDGET` (34 units), so a 77 stays
     /// under ~1.3M CU and never exhausts the 1.4M meter. Measured with the budget check included:
     /// 8 single-leg (32 units) 1,016,434 CU; 2 x 14-leg (34 units) 1,204,159 CU; 3 x 14-leg (51)
-    /// is refused up front (InvalidInstruction).
+    /// is refused up front (InvalidInstruction). Those 14-leg figures are historical: with the cap at 4 a
+    /// 4-leg refresh weighs 7 and the budget admits 4 of them (28 units); see the S10-X1 ledger.
     pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
     /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
     /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
@@ -840,17 +841,18 @@ pub mod constants {
     // audited stale-trade and crank CU envelope. Additional markets remain
     // usable through separate portfolios.
     //
-    // S10-X1 (2026-10-07): the cap is set by the WORST-CASE many-leg settle/liquidation crank, not
-    // by the engine array size (16). With every leg carrying a pending K and F net plus a
-    // maintenance fee, the single settle crank costs 1,046,354 CU at 8 legs, 1,153,535 at 9,
-    // 1,260,903 at 10 and 1,368,456 at 11 (about 107k CU per leg); at 12 it exceeds the 1.4M
-    // transaction budget and the account can never be settled or liquidated. On the release
-    // engine alone the final liquidation call is 1,176,557 CU at 8 legs, 1,298,478 at 9 and fails
-    // at 10, so 8 is the largest cap proven on BOTH the base engine and the engine with the
-    // after-refresh fee charge. The `v22_bpf_worst_case_*` tests in tests/v16_cu.rs pin it:
-    // every crank up to a flat account must stay under `1,400,000 - 160,000` CU at this cap.
-    // Raising it needs a new worst-case measurement and a fresh Kani/engine review.
-    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 8;
+    // S10-X1 (2026-10-08): the cap is set by the heaviest known single-crank shape, not by the
+    // engine array size (16). A multi-leg account with claims in both domains of every asset that
+    // then takes a loss on every leg ("2n-domain reversal") settles in ONE crank that costs about
+    // 170k CU per leg: 852,933 CU at 4 legs, 1,021,598 at 5, 1,191,006 at 6, 1,361,375 at 7 and
+    // it fails (ProgramFailedToComplete, deterministically) at 8; a plain reversal costs
+    // 1,158,113 at 8 and fails at 10. The stranded-backing hook adds up to 66k CU to a refresh
+    // crank. 4 legs leaves 918,933 CU worst case (34% headroom under the 1.4M budget, 10% rule
+    // = 1,260,000); 5 leaves 22%, 6 is borderline, 8 is unsettleable. The gate is
+    // `v22_bpf_worst_case_*` in tests/v16_cu.rs. Raising the cap needs a new measurement of every
+    // shape listed there and an engine-side bound on per-crank settle work.
+    // This is the ONLY place the number lives: `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS` is derived.
+    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 4;
 
     // Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of
     // surviving positions at admission"): the wrapper's own self-imposed cap on how many
@@ -858,7 +860,8 @@ pub mod constants {
     // across BOTH accounts touched by the trade/batch. Deliberately tighter than the
     // engine's hard `PORTFOLIO_SOURCE_DOMAIN_CAP` (32) array bound -- this is a wrapper
     // liveness guard, not the engine's own overflow backstop. Byte-identical value to
-    // upstream's `WRAPPER_MAX_PORTFOLIO_ASSETS * 2` (14 * 2 = 28 on both forks).
+    // upstream's formula `WRAPPER_MAX_PORTFOLIO_ASSETS * 2`; the VALUE differs from upstream and from this fork's
+    // earlier 28 because the cap is now 4 (S10-X1): 8 domains per trade-admission pass.
     pub const WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS: usize = WRAPPER_MAX_PORTFOLIO_ASSETS as usize * 2;
 
     // ── Protocol-fee program change ─────────────────────────────────────
