@@ -179,6 +179,8 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::EvictAndTradeCpi { .. } => "EvictAndTradeCpi",
         Instruction::ProposeG9FeedAllowlist { .. } => "ProposeG9FeedAllowlist",
         Instruction::CommitG9FeedAllowlist => "CommitG9FeedAllowlist",
+        // prog#542, tag 122.
+        Instruction::InitLpShareMetadata { .. } => "InitLpShareMetadata",
     }
 }
 

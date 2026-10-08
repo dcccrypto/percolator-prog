@@ -25754,6 +25754,7 @@ mod p3_vault_lp_skew {
                 AccountMeta::new(lp_mint, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(env.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         )

@@ -1031,6 +1031,7 @@ impl CrosscutEnv {
                 AccountMeta::new(self.lp_mint, false),
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new_readonly(self.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         )

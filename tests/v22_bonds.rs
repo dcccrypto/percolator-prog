@@ -377,6 +377,7 @@ impl Env {
                 AccountMeta::new(lp_mint, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(env.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         )
@@ -2936,6 +2937,7 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
             AccountMeta::new(env.lp_mint, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(env.mint, false), // [6] collateral mint (prog#542)
         ]),
         ix(env.pid, ProgInstruction::InitVaultLp { junior_floor_bps: 2_000 }, vec![
             AccountMeta::new(admin.pubkey(), true),

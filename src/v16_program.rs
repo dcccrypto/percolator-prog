@@ -58,6 +58,9 @@ pub mod p4_rescue_ins;
 /// v2.2 item 4 (2026-10-07): the mainnet stake + wrapper program-id pin (feature `mainnet-ids`).
 pub mod mainnet_ids;
 
+/// v2.2 (prog#542, 2026-10-07): the LP / Earn share mint's wallet-facing name (tag 122).
+pub mod lp_share_meta_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -621,6 +624,13 @@ pub mod constants {
     pub const TAG_PROPOSE_G9_FEED_ALLOWLIST: u8 = 120;
     /// R-10: commit the open proposal after `G9_ALLOWLIST_TIMELOCK_SLOTS`.
     pub const TAG_COMMIT_G9_FEED_ALLOWLIST: u8 = 121;
+    /// prog#542: names a market's LP / Earn share mint through a Metaplex metadata account
+    /// (`lp_share_meta_v22`): a permissionless generic form, or marketauth's ticker form.
+    pub const TAG_INIT_LP_SHARE_METADATA: u8 = 122;
+    /// The Metaplex Token Metadata program (same id on devnet and mainnet). Tag 122's only CPI
+    /// target; pinned, so no caller-chosen program ever receives the registry PDA's signature.
+    pub const MPL_TOKEN_METADATA_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        solana_program::pubkey!("metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s");
     pub const KIND_G9_FEED_ALLOWLIST: u8 = 15;
     pub const G9_FEEDS_SEED: &[u8] = b"g9_feeds";
     pub const G9_FEED_ALLOWLIST_VERSION: u8 = 1;
@@ -663,7 +673,7 @@ pub mod constants {
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
-        203, 204, 205, 206, 207,
+        TAG_INIT_LP_SHARE_METADATA, 204, 205, 206, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -8937,6 +8947,11 @@ pub mod ix {
         /// existing asset-0 insurance becomes creator-class units 1:1) and sets the profile's
         /// `INS_UNITS_REQUIRED` flag; on an existing ledger it only refreshes the snapshot.
         InitInsuranceUnits,
+        /// Tag 122 (prog#542). Names the market's LP / Earn share mint through a Metaplex
+        /// metadata account. Wire `[122][n u8][n ticker bytes]`, `n <= 8`.
+        /// `n == 0`: PERMISSIONLESS generic form. `n > 0`: marketauth only, ticker form (creates
+        /// it, or upgrades an existing generic record once).
+        InitLpShareMetadata { ticker_len: u8, ticker: [u8; 8] },
     }
 
     impl Instruction {
@@ -9726,6 +9741,17 @@ pub mod ix {
                     Self::ProposeG9FeedAllowlist { entries }
                 }
                 crate::constants::TAG_COMMIT_G9_FEED_ALLOWLIST => Self::CommitG9FeedAllowlist,
+                crate::constants::TAG_INIT_LP_SHARE_METADATA => {
+                    let ticker_len = read_u8(&mut rest)?;
+                    if ticker_len as usize > crate::lp_share_meta_v22::LP_SHARE_TICKER_MAX {
+                        return Err(ProgramError::InvalidInstructionData);
+                    }
+                    let mut ticker = [0u8; 8];
+                    for b in ticker.iter_mut().take(ticker_len as usize) {
+                        *b = read_u8(&mut rest)?;
+                    }
+                    Self::InitLpShareMetadata { ticker_len, ticker }
+                }
                 _ => return Err(ProgramError::InvalidInstructionData),
             };
             if !rest.is_empty() {
@@ -10837,6 +10863,11 @@ pub mod ix {
                     push_u128(&mut out, min_shares);
                 }
                 Self::InitInsuranceUnits => out.push(crate::constants::TAG_INIT_INSURANCE_UNITS),
+                Self::InitLpShareMetadata { ticker_len, ticker } => {
+                    out.push(crate::constants::TAG_INIT_LP_SHARE_METADATA);
+                    out.push(ticker_len);
+                    out.extend_from_slice(&ticker[..(ticker_len as usize).min(8)]);
+                }
             }
             out
         }
@@ -12805,6 +12836,7 @@ pub mod lag_policy {
             Instruction::SetG9FeedAllowlist { .. } => entry("SetG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config"),
             Instruction::ProposeG9FeedAllowlist { .. } => entry("ProposeG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelocked proposal)"),
             Instruction::CommitG9FeedAllowlist => entry("CommitG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelock commit)"),
+            Instruction::InitLpShareMetadata { .. } => entry("InitLpShareMetadata", LagPolicy::MarkFree, "tag 122: writes the share mint's Metaplex name; reads no price, moves no value"),
         }
     }
 }
@@ -15405,6 +15437,13 @@ pub mod processor {
                 min_shares,
             } => handle_rescue_deposit(program_id, accounts, tranche, amount, min_shares),
             Instruction::InitInsuranceUnits => handle_init_insurance_units(program_id, accounts),
+            Instruction::InitLpShareMetadata { ticker_len, ticker } => {
+                handle_init_lp_share_metadata(
+                    program_id,
+                    accounts,
+                    &ticker[..(ticker_len as usize).min(8)],
+                )
+            }
             Instruction::SetG9FeedAllowlist { keys } => {
                 handle_set_g9_feed_allowlist(program_id, accounts, &keys)
             }
@@ -28198,6 +28237,18 @@ pub mod processor {
     ///
     /// Creates the registry PDA + SPL LP-share mint PDA for a market's LP vault.
     /// marketauth-gated. Domain must be within the market's configured range.
+    ///
+    /// Accounts: `[0]` marketauth (signer, w), `[1]` market (w), `[2]` registry PDA (w),
+    /// `[3]` LP share mint PDA (w), `[4]` system program, `[5]` SPL Token program,
+    /// `[6]` the market's collateral mint (readonly; REQUIRED since v2.2, prog#542).
+    ///
+    /// prog#542: the share mint is created with the COLLATERAL mint's `decimals` (it was 0), so
+    /// a wallet shows about N shares for a first deposit of N tokens. `decimals` is display
+    /// metadata on the mint and nothing else: no instruction of this program reads the share
+    /// mint's `decimals`, every token CPI on shares is the unchecked `MintTo` / `Burn` /
+    /// `Transfer` (raw u64 amounts), and all share pricing runs on raw share counts and raw
+    /// collateral atoms. The share:atom scale (one raw share per atom at genesis), the
+    /// dead-share floor and every rounding direction are untouched.
     #[inline(never)]
     fn handle_create_lp_vault<'a>(
         program_id: &Pubkey,
@@ -28316,6 +28367,16 @@ pub mod processor {
             return Err(PercolatorError::AlreadyInitialized.into());
         }
 
+        // prog#542: the share mint takes the decimals of the market's PRIMARY collateral mint.
+        // The account is REQUIRED: a missing one fails with NotEnoughAccountKeys instead of
+        // silently creating a 0-decimal mint (a mint's decimals can never be changed). It is
+        // bound by key to the config, and `unpack_mint` requires a classic SPL mint of exactly
+        // Mint::LEN. The secondary collateral mint, when set, has the same decimals (#447).
+        // Read here, after every pre-existing refusal, so those keep their error codes.
+        let collateral_mint_ai = account(accounts, 6)?;
+        expect_key(collateral_mint_ai, &Pubkey::new_from_array(cfg.collateral_mint))?;
+        let share_decimals = unpack_mint(collateral_mint_ai)?.decimals;
+
         // FIND-1 fix: bind the registry PDA as the vault domain's backing-bucket
         // authority *here*, atomically with vault creation. DepositToLpVault
         // (tag 75) requires `backing_bucket_authority == registry_pda` for the
@@ -28372,13 +28433,14 @@ pub mod processor {
             mint_seeds,
         )?;
 
-        // Initialize the LP share mint: authority = registry PDA, no freeze.
+        // Initialize the LP share mint: authority = registry PDA, no freeze, decimals = the
+        // collateral mint's (prog#542; display only, see the handler doc).
         let init_mint_ix = spl_token::instruction::initialize_mint2(
             token_program.key,
             mint_ai.key,
             &registry_pda,
             None,
-            0,
+            share_decimals,
         )?;
         invoke(&init_mint_ix, &[mint_ai.clone(), token_program.clone()])?;
 
@@ -35804,6 +35866,232 @@ pub mod processor {
         let mut u = state::read_insurance_units(&ai.try_borrow_data()?)?;
         ins_units_snapshot(&mut u, group)?;
         state::write_insurance_units(&mut ai.try_borrow_mut_data()?, &u)
+    }
+
+    /// InitLpShareMetadata (tag 122, prog#542).
+    ///
+    /// Gives a market's LP / Earn share mint a Metaplex Token Metadata record, so wallets show a
+    /// name and an icon instead of "Unknown Token". The registry PDA is the mint authority and
+    /// the record's update authority, so only this program can create or change it. Kept OUT of
+    /// tag 74 on purpose: creating a market never depends on Metaplex.
+    ///
+    /// Wire `[122][n][n ticker bytes]`. Accounts: `[0]` payer (signer, w; funds the record,
+    /// never handed to Metaplex), `[1]` LP vault registry PDA, `[2]` LP share mint PDA,
+    /// `[3]` Metaplex metadata PDA `["metadata", token_metadata_program, mint]` (w),
+    /// `[4]` Metaplex Token Metadata program, `[5]` system program,
+    /// `[6]` fee-payer PDA `["lp_share_meta_payer", mint]` (w), and for `n > 0` only
+    /// `[7]` the market (readonly) and `[8]` `config.marketauth` (signer). Neither `[7]` nor
+    /// `[8]` is ever passed to Metaplex.
+    ///
+    /// | record before | `n == 0` (anyone) | `n > 0` (marketauth) |
+    /// |---|---|---|
+    /// | none | create GENERIC (mutable) | create TICKER (immutable) |
+    /// | ours, mutable, canonical generic | refused `AlreadyInitialized` | update to TICKER + freeze |
+    /// | ours, mutable, anything else | rewrite to GENERIC | update to TICKER + freeze |
+    /// | ours, immutable | refused | refused |
+    /// | not ours (other authority / unparseable) | refused | refused |
+    ///
+    /// "Ours" = a Metaplex-owned `MetadataV1` for this mint whose update authority is the
+    /// registry PDA. A record somebody else managed to create for the mint (Metaplex has a
+    /// seed-authority path that yields exactly such a mutable record) is therefore repaired by
+    /// the permissionless call instead of blocking the name for ever. A permissionless generic
+    /// record can never lock out the authorised name, and a ticker record is frozen at birth, so
+    /// the generic call can never overwrite it.
+    ///
+    /// Security (review R1-R11):
+    /// * R1: the CPI target is pinned by key to `MPL_TOKEN_METADATA_PROGRAM_ID`; only
+    ///   `CreateMetadataAccountV3` (33) and `UpdateMetadataAccountV2` (15) are ever built.
+    /// * R2: create passes the mint READ-ONLY whatever the outer transaction marks it; update
+    ///   does not pass it. No token program, token account, market, ledger or escrow is in
+    ///   either CPI.
+    /// * R3: no privileged or user signer enters a Metaplex CPI. The payer handed to create is
+    ///   a transient PDA of this program, funded here from `[0]` and drained back to `[0]`
+    ///   here; `marketauth` signs this instruction only.
+    /// * R4: update passes exactly two accounts (metadata w, registry PDA signer) and its data
+    ///   pins `new_update_authority = None` (`lp_share_meta_v22::update_metadata_v2_data`).
+    /// * R5: registry (owner, kind, version, PDA re-derived from its own `market_group`), mint
+    ///   (the derived PDA AND `registry.lp_mint`) and metadata PDA are all bound on chain.
+    /// * The ticker is `A-Z 0-9`, 1..=8, CREATOR-CHOSEN AND UNVERIFIED; the framing leads the
+    ///   name and cannot be removed; the uri has no caller input.
+    /// * Reads no price and writes no account of this program. The worst a hostile upgrade of
+    ///   the Metaplex program can do is write a wrong record (cosmetic) and keep the lamports
+    ///   funded into the fee-payer PDA (`LP_SHARE_META_FUND_LAMPORTS`).
+    #[inline(never)]
+    fn handle_init_lp_share_metadata<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        ticker: &[u8],
+    ) -> ProgramResult {
+        use crate::lp_share_meta_v22 as meta;
+        const MPL: Pubkey = crate::constants::MPL_TOKEN_METADATA_PROGRAM_ID;
+        let payer = account(accounts, 0)?;
+        let registry_ai = account(accounts, 1)?;
+        let mint_ai = account(accounts, 2)?;
+        let metadata_ai = account(accounts, 3)?;
+        let mpl_program_ai = account(accounts, 4)?;
+        let system_program_ai = account(accounts, 5)?;
+        let meta_payer_ai = account(accounts, 6)?;
+
+        expect_signer(payer)?;
+        expect_writable(payer)?;
+        expect_writable(metadata_ai)?;
+        expect_writable(meta_payer_ai)?;
+        expect_owner(registry_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        if mpl_program_ai.key != &MPL || !mpl_program_ai.executable {
+            return Err(ProgramError::IncorrectProgramId);
+        }
+
+        // The registry names its market and its mint; both PDAs are re-derived from the market.
+        let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+        let market_key = Pubkey::new_from_array(registry.market_group);
+        let (registry_pda, registry_bump) =
+            state::derive_lp_vault_registry(program_id, &market_key);
+        expect_key(registry_ai, &registry_pda)?;
+        let (mint_pda, _) = state::derive_lp_vault_mint(program_id, &market_key);
+        expect_key(mint_ai, &mint_pda)?;
+        if mint_ai.key.to_bytes() != registry.lp_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        // A classic SPL mint whose authority is the registry PDA (what tag 74 created).
+        let mint = unpack_mint(mint_ai)?;
+        if mint.mint_authority
+            != solana_program::program_option::COption::Some(registry_pda)
+        {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        let (metadata_pda, _) = Pubkey::find_program_address(
+            &[meta::MPL_METADATA_SEED, MPL.as_ref(), mint_ai.key.as_ref()],
+            &MPL,
+        );
+        expect_key(metadata_ai, &metadata_pda)?;
+        let (meta_payer_pda, meta_payer_bump) = Pubkey::find_program_address(
+            &[meta::LP_SHARE_META_PAYER_SEED, mint_ai.key.as_ref()],
+            program_id,
+        );
+        expect_key(meta_payer_ai, &meta_payer_pda)?;
+
+        // Ticker form: only the market's marketauth (the tag 74 signer), on THIS market.
+        let named = !ticker.is_empty();
+        if named {
+            if !meta::ticker_ok(ticker) {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            let market_ai = account(accounts, 7)?;
+            let marketauth_ai = account(accounts, 8)?;
+            expect_key(market_ai, &market_key)?;
+            expect_owner(market_ai, program_id)?;
+            expect_signer(marketauth_ai)?;
+            let (cfg, _, _, _) =
+                state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+            if marketauth_ai.key.to_bytes() != cfg.marketauth {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+        }
+        let (name, symbol, uri) = meta::share_identity(&registry.market_group, ticker)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let registry_seeds: &[&[u8]] = &[
+            crate::constants::LP_VAULT_REGISTRY_SEED,
+            market_key.as_ref(),
+            &[registry_bump],
+        ];
+
+        if !metadata_ai.data_is_empty() {
+            // A record exists. Act only on a Metaplex-owned, MUTABLE record whose update
+            // authority is the registry PDA; `is_mutable` (enforced by Metaplex) is the latch.
+            if metadata_ai.owner != &MPL {
+                return Err(PercolatorError::AlreadyInitialized.into());
+            }
+            let st = meta::record_state(
+                &metadata_ai.try_borrow_data()?,
+                &registry_pda.to_bytes(),
+                &mint_ai.key.to_bytes(),
+                &registry.market_group,
+            );
+            let proceed = match st {
+                meta::RecordState::Mutable { canonical_generic } => named || !canonical_generic,
+                meta::RecordState::Immutable | meta::RecordState::NotOurs => false,
+            };
+            if !proceed {
+                return Err(PercolatorError::AlreadyInitialized.into());
+            }
+            // UpdateMetadataAccountV2: EXACTLY metadata (w) + update authority (signer). The
+            // ticker upgrade freezes the record; the generic repair leaves it mutable.
+            let ix = meta::update_metadata_ix(metadata_ai.key, &registry_pda, &name, &symbol, &uri, named);
+            return invoke_signed(
+                &ix,
+                &[
+                    metadata_ai.clone(),
+                    registry_ai.clone(),
+                    mpl_program_ai.clone(),
+                ],
+                &[registry_seeds],
+            );
+        }
+
+        // No record: create it. Fund the transient fee-payer PDA from the caller (a System
+        // Program CPI: the caller's signature goes to the System Program only), let Metaplex
+        // charge THAT, then return what is left. The PDA must be a plain system account.
+        if meta_payer_ai.owner != &system_program::ID || !meta_payer_ai.data_is_empty() {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let meta_payer_seeds: &[&[u8]] = &[
+            meta::LP_SHARE_META_PAYER_SEED,
+            mint_ai.key.as_ref(),
+            &[meta_payer_bump],
+        ];
+        invoke(
+            &system_instruction::transfer(
+                payer.key,
+                meta_payer_ai.key,
+                meta::LP_SHARE_META_FUND_LAMPORTS,
+            ),
+            &[
+                payer.clone(),
+                meta_payer_ai.clone(),
+                system_program_ai.clone(),
+            ],
+        )?;
+        // CreateMetadataAccountV3: metadata (w), mint (READ-ONLY), mint authority (signer),
+        // payer (the PDA; signer, w), update authority, system program.
+        let ix = meta::create_metadata_ix(
+            metadata_ai.key,
+            mint_ai.key,
+            &registry_pda,
+            &meta_payer_pda,
+            &name,
+            &symbol,
+            &uri,
+            !named,
+        );
+        invoke_signed(
+            &ix,
+            &[
+                metadata_ai.clone(),
+                mint_ai.clone(),
+                registry_ai.clone(),
+                meta_payer_ai.clone(),
+                system_program_ai.clone(),
+                mpl_program_ai.clone(),
+            ],
+            &[registry_seeds, meta_payer_seeds],
+        )?;
+        // Return the remainder (including anything a third party parked on the PDA).
+        let left = meta_payer_ai.lamports();
+        if left != 0 {
+            invoke_signed(
+                &system_instruction::transfer(meta_payer_ai.key, payer.key, left),
+                &[
+                    meta_payer_ai.clone(),
+                    payer.clone(),
+                    system_program_ai.clone(),
+                ],
+                &[meta_payer_seeds],
+            )?;
+        }
+        Ok(())
     }
 
     /// InitInsuranceUnits (tag 116). PERMISSIONLESS.

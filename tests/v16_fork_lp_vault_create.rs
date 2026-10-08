@@ -219,6 +219,7 @@ fn create_lp_vault_accounts(
     registry: Pubkey,
     mint: Pubkey,
     admin: Pubkey,
+    collateral_mint: Pubkey,
 ) -> Vec<AccountMeta> {
     vec![
         AccountMeta::new(admin, true),
@@ -230,6 +231,7 @@ fn create_lp_vault_accounts(
         AccountMeta::new(mint, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(collateral_mint, false), // [6] collateral mint (prog#542)
     ]
 }
 
@@ -248,7 +250,7 @@ fn create_lp_vault_happy_path() {
     let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
     let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
     let admin = env.admin.insecure_clone();
-    let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey());
+    let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey(), env.collateral_mint);
 
     send(
         &mut env.svm,
@@ -318,7 +320,7 @@ fn create_lp_vault_rejects_non_admin() {
     env.svm
         .airdrop(&attacker.pubkey(), 100_000_000_000)
         .unwrap();
-    let accounts = create_lp_vault_accounts(env.market, registry, mint, attacker.pubkey());
+    let accounts = create_lp_vault_accounts(env.market, registry, mint, attacker.pubkey(), env.collateral_mint);
 
     let res = send(
         &mut env.svm,
@@ -353,7 +355,7 @@ fn create_lp_vault_double_create_rejected() {
         env.program_id,
         &env.payer,
         create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey(), env.collateral_mint),
         &[&admin],
     )
     .expect("first create");
@@ -363,7 +365,7 @@ fn create_lp_vault_double_create_rejected() {
         env.program_id,
         &env.payer,
         create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey(), env.collateral_mint),
         &[&admin],
     );
     assert!(
@@ -378,7 +380,7 @@ fn create_lp_vault_rejects_fee_share_above_cap() {
     let (registry, _) = derive_lp_vault_registry(&env.program_id, &env.market);
     let (mint, _) = derive_lp_vault_mint(&env.program_id, &env.market);
     let admin = env.admin.insecure_clone();
-    let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey());
+    let accounts = create_lp_vault_accounts(env.market, registry, mint, admin.pubkey(), env.collateral_mint);
 
     let res = send(
         &mut env.svm,
@@ -446,7 +448,7 @@ fn create_lp_vault_succeeds_with_prefunded_registry_and_mint() {
         env.program_id,
         &env.payer,
         create_lp_vault_ix(5_000),
-        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey()),
+        create_lp_vault_accounts(env.market, registry, mint, admin.pubkey(), env.collateral_mint),
         &[&admin],
     );
 
