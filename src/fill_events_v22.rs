@@ -59,6 +59,9 @@ pub const REASON_EVICTION: u8 = 5;
 pub const MOVE_EARN_EXIT: u8 = 1;
 pub const MOVE_G9: u8 = 2;
 pub const MOVE_RENT_ROUTED: u8 = 3;
+/// Tag 111 mode 3 (repay the backstop from released LP profit first, capital for the rest):
+/// a = atoms from released profit, b = atoms from capital, c = receivable outstanding after.
+pub const MOVE_G9_RESTORE_PNL: u8 = 4;
 
 pub const HEADER_LEN: usize = 35;
 /// FILL fixed part: header + taker portfolio + LP portfolio + record count.
@@ -95,6 +98,33 @@ pub struct FillRec {
     pub fee_atoms: u64,
     /// Backing-domain fee charged on top (single trades only; 0 in batches), atoms.
     pub backing_fee_atoms: u64,
+}
+
+/// The liquidated leg as found AFTER the crank (security review 2026-10-07, L-4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegAfter {
+    /// No active leg on the asset: the position is gone (size 0).
+    Absent,
+    /// An active leg this reader cannot interpret (generation / ADL epoch). NOT zero.
+    Unreadable,
+    /// The leg's ADL-effective signed size.
+    Size(i128),
+}
+
+/// The REDUCE reason-3 size: the signed change of the liquidated position, or None when no
+/// event is to be emitted (the after-leg is unreadable, nothing changed, or the subtraction
+/// overflows). An absent after-leg is a full close; an unreadable one is never treated as zero.
+#[inline]
+pub fn liquidation_delta_q(q_before: i128, after: LegAfter) -> Option<i128> {
+    let q_after = match after {
+        LegAfter::Absent => 0,
+        LegAfter::Unreadable => return None,
+        LegAfter::Size(q) => q,
+    };
+    match q_after.checked_sub(q_before) {
+        Some(0) | None => None,
+        d => d,
+    }
 }
 
 #[inline]
@@ -306,6 +336,37 @@ mod tests {
         assert_eq!(b[99], 1);
         assert_eq!(&b[100..102], &3u16.to_le_bytes());
         assert_eq!(&b[111..127], &(-5i128).to_le_bytes());
+    }
+
+    /// Security review 2026-10-07, L-4: an absent after-leg is a full close, an unreadable one
+    /// emits nothing (it used to be read as 0, i.e. reported as a full close).
+    #[test]
+    fn liquidation_delta_distinguishes_absent_from_unreadable() {
+        // Long 7 fully closed (leg gone) / short 7 fully closed.
+        assert_eq!(liquidation_delta_q(7, LegAfter::Absent), Some(-7));
+        assert_eq!(liquidation_delta_q(-7, LegAfter::Absent), Some(7));
+        // Unreadable: no event, whatever the before size.
+        assert_eq!(liquidation_delta_q(7, LegAfter::Unreadable), None);
+        assert_eq!(liquidation_delta_q(-7, LegAfter::Unreadable), None);
+        assert_eq!(liquidation_delta_q(0, LegAfter::Unreadable), None);
+        // Partial: long 7 -> 3, short 7 -> 3.
+        assert_eq!(liquidation_delta_q(7, LegAfter::Size(3)), Some(-4));
+        assert_eq!(liquidation_delta_q(-7, LegAfter::Size(-3)), Some(4));
+        // A leg left active at effective size 0 (ADL epoch rolled) is a full close.
+        assert_eq!(liquidation_delta_q(7, LegAfter::Size(0)), Some(-7));
+        // Unchanged: nothing to report.
+        assert_eq!(liquidation_delta_q(7, LegAfter::Size(7)), None);
+        assert_eq!(liquidation_delta_q(0, LegAfter::Absent), None);
+        // Overflow never panics and emits nothing.
+        assert_eq!(liquidation_delta_q(i128::MIN, LegAfter::Size(1)), None);
+        assert_eq!(liquidation_delta_q(i128::MIN, LegAfter::Absent), None);
+    }
+
+    /// L-6: the mode-3 sub is distinct from every other MOVE sub.
+    #[test]
+    fn move_subs_are_distinct() {
+        let subs = [MOVE_EARN_EXIT, MOVE_G9, MOVE_RENT_ROUTED, MOVE_G9_RESTORE_PNL];
+        assert_eq!(subs, [1, 2, 3, 4]);
     }
 
     #[allow(clippy::too_many_arguments)]

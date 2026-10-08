@@ -466,6 +466,19 @@ impl Env {
     }
 
     fn lp_with(&mut self, deposit: u128, max_fill_abs: u128) -> Lp {
+        self.lp_cfg(deposit, max_fill_abs, 0, 0)
+    }
+
+    /// As `lp_with`, with the matcher's quote spread (`base_spread_bps`: the matcher then quotes
+    /// away from the oracle price) and its inventory limit (`max_inventory_abs`, 0 = none: at the
+    /// limit the matcher answers `exec_size == 0`).
+    fn lp_cfg(
+        &mut self,
+        deposit: u128,
+        max_fill_abs: u128,
+        base_spread_bps: u32,
+        max_inventory_abs: u128,
+    ) -> Lp {
         let owner = Keypair::new();
         let account = self.portfolio(&owner, deposit);
         let ctx = Pubkey::new_unique();
@@ -531,12 +544,12 @@ impl Env {
             ProgInstruction::InitMatcherCtx {
                 kind: 0,
                 trading_fee_bps: 0,
-                base_spread_bps: 0,
+                base_spread_bps,
                 max_total_bps: 100,
                 impact_k_bps: 0,
                 liquidity_notional_e6: 0,
                 max_fill_abs,
-                max_inventory_abs: 0,
+                max_inventory_abs,
                 fee_to_insurance_bps: 0,
                 skew_spread_mult_bps: 0,
             },
@@ -810,6 +823,62 @@ impl Env {
         self.portfolio_state(portfolio).capital
     }
 
+    /// The TradeCpi instruction `trade_cpi` sends, as a bare instruction.
+    fn trade_cpi_ix(&self, taker: &Keypair, taker_account: Pubkey, lp: &Lp, size_q: i128) -> Instruction {
+        let (a_id, _, a_epoch) = self.identity(taker_account);
+        let (b_id, b_seq, b_epoch) = self.identity(lp.account);
+        Instruction {
+            program_id: self.program_id,
+            accounts: vec![
+                AccountMeta::new(taker.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(taker_account, false),
+                AccountMeta::new(lp.account, false),
+                AccountMeta::new_readonly(self.matcher_program, false),
+                AccountMeta::new(lp.ctx, false),
+                AccountMeta::new_readonly(lp.delegate, false),
+            ],
+            data: ProgInstruction::TradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_epoch,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_epoch,
+                market_id: self.market_id(),
+                account_b_matcher_sequence: b_seq,
+                asset_index: 0,
+                size_q,
+                fee_bps: self.fee_bps,
+                limit_price: 0,
+                backing_fee_cap_bps: 10_000,
+            }
+            .encode(),
+        }
+    }
+
+    /// Several wrapper instructions in ONE transaction. Returns Ok(()) / the error; the logs
+    /// (success or failure) are in `last_logs()`.
+    fn send_ixs(&mut self, ixs: &[Instruction], signers: &[&Keypair]) -> Result<(), String> {
+        let mut all = vec![
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+        ];
+        all.extend_from_slice(ixs);
+        let mut s = vec![&self.payer];
+        s.extend_from_slice(signers);
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(&all, Some(&self.payer.pubkey()), &s, self.svm.latest_blockhash());
+        match self.svm.send_transaction(tx) {
+            Ok(meta) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
+                Ok(())
+            }
+            Err(e) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+                Err(format!("{:?}", e.err))
+            }
+        }
+    }
+
     fn effective_price(&self) -> u64 {
         self.group().assets[0].effective_price
     }
@@ -977,6 +1046,188 @@ fn fill_event_batch_trade_cpi_leg_matches_state() {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Security review 2026-10-07, M-3: the four mutants that survived the first test set.
+//   (a) booked and quoted price swapped on TradeCpi      -> quoted != booked below
+//   (b) batch booked price replaced by the quoted price  -> quoted != booked on a batch
+//   (c) fee_atoms = fee_a only                           -> short taker fee, maker-fallback fee
+//   (d) the matcher-returned-zero emit dropped           -> matcher at its inventory limit
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// (a) The matcher quotes AWAY from the reference price (spread 100 bps: 101 for a buy, 99 for a
+/// sell) while the wrapper books at the asset's `effective_price` (100). The two fields must not
+/// be swapped: `price_e6` is the booked price, proven by the state (a position booked at 100
+/// with the mark at 100 has zero PnL; booked at 101 it would be 5 atoms under water).
+#[test]
+fn fill_event_trade_cpi_quoted_price_differs_from_booked() {
+    let mut env = Env::new();
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    let lp = env.lp_cfg(1_000_000, u128::MAX, 100, 0);
+    let cap_before = env.capital(taker_account);
+    env.trade_cpi(&taker, taker_account, &lp, 5 * Q).expect("buy through a 1% spread");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!(env.effective_price(), PRICE);
+    assert_eq!(rec.quoted_price_e6, PRICE + 1, "the matcher's quote: reference + 1% spread");
+    assert_eq!(rec.price_e6, PRICE, "booked at the asset's effective price, not at the quote");
+    assert_ne!(rec.price_e6, rec.quoted_price_e6, "vacuity: this case separates the two fields");
+    let p = env.portfolio_state(taker_account);
+    assert_eq!(p.pnl, 0, "state: booked at the mark (100); a booking at the quote would show a loss");
+    assert_eq!(env.capital(taker_account), cap_before);
+
+    // The sell side: the quote is below the reference.
+    let taker2 = Keypair::new();
+    let taker2_account = env.portfolio(&taker2, 1_000_000);
+    env.trade_cpi(&taker2, taker2_account, &lp, -3 * Q).expect("sell through a 1% spread");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!((rec.quoted_price_e6, rec.price_e6), (PRICE - 1, PRICE));
+    assert_eq!(env.portfolio_state(taker2_account).pnl, 0);
+}
+
+/// (b) The same on BatchTradeCpi: the record's `price_e6` is the booked price, `quoted_price_e6`
+/// the matcher's quote.
+#[test]
+fn fill_event_batch_trade_cpi_quoted_price_differs_from_booked() {
+    let mut env = Env::with_fee(100);
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    let lp = env.lp_cfg(1_000_000, u128::MAX, 100, 0);
+    let cap_before = env.capital(taker_account);
+    env.batch_trade_cpi(&taker, taker_account, &lp, 5 * Q).expect("batch through a 1% spread");
+    let (tag, _, _, _, rec) = env.only_fill();
+    assert_eq!(tag, 67);
+    assert_eq!(rec.quoted_price_e6, PRICE + 1, "the matcher's quote");
+    assert_eq!(rec.price_e6, PRICE, "booked at the asset's effective price");
+    assert_eq!(rec.price_e6, env.effective_price());
+    // State: the fee is charged on the BOOKED notional (5 * 100 = 500 -> 5 atoms at 1%), and the
+    // position shows no PnL at the mark.
+    assert_eq!(rec.fee_atoms, expected_fee(5 * Q, PRICE, 100));
+    assert_eq!(cap_before - env.capital(taker_account), rec.fee_atoms as u128);
+    assert_eq!(env.portfolio_state(taker_account).pnl, 0);
+}
+
+/// (c) A SHORT taker pays the fee: the engine reports it on the other half of its (fee_a, fee_b)
+/// pair than for a long taker, so an event built from one half only reads 0 here.
+#[test]
+fn fill_event_trade_cpi_short_taker_fee() {
+    let mut env = Env::with_fee(100);
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    let lp = env.lp(1_000_000);
+    let (cap_taker, cap_lp) = (env.capital(taker_account), env.capital(lp.account));
+    env.trade_cpi(&taker, taker_account, &lp, -7 * Q).expect("short with a fee");
+    let (_, _, _, _, rec) = env.only_fill();
+    let fee = expected_fee(7 * Q, PRICE, 100);
+    assert_eq!(fee, 7);
+    assert_eq!(rec.executed_q, -7 * Q);
+    assert_eq!(rec.fee_atoms, fee, "the short taker's fee is in the event");
+    assert_eq!(cap_taker - env.capital(taker_account), fee as u128, "state: the taker paid it");
+    assert_eq!(env.capital(lp.account), cap_lp, "state: the maker paid nothing");
+
+    // And on a batch.
+    let taker2 = Keypair::new();
+    let taker2_account = env.portfolio(&taker2, 1_000_000);
+    let cap2 = env.capital(taker2_account);
+    env.batch_trade_cpi(&taker2, taker2_account, &lp, -4 * Q).expect("short batch with a fee");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!(rec.fee_atoms, expected_fee(4 * Q, PRICE, 100));
+    assert_eq!(cap2 - env.capital(taker2_account), rec.fee_atoms as u128);
+}
+
+/// (c) The maker-fallback route: a taker that cannot pay the whole fee pays what it has and the
+/// maker (the LP) is charged the remainder. `fee_atoms` is the TOTAL charged across both, i.e.
+/// `fee_a + fee_b`; it is not "the taker's fee" (doc L-2).
+#[test]
+fn fill_event_trade_cpi_maker_fallback_fee_is_the_sum() {
+    for long in [true, false] {
+        let mut env = Env::with_fee(100);
+        let taker = Keypair::new();
+        let taker_account = env.portfolio(&taker, 1_000_000);
+        let lp = env.lp(1_000_000);
+        let open = if long { 10 * Q } else { -10 * Q };
+        env.trade_cpi(&taker, taker_account, &lp, open).expect("open");
+        // Leave the taker 3 atoms: the closing fee is 10.
+        env.force_capital(taker_account, 3);
+        let (cap_taker, cap_lp) = (env.capital(taker_account), env.capital(lp.account));
+        env.trade_cpi(&taker, taker_account, &lp, -open).expect("close with a fee the taker cannot cover");
+        let (_, _, _, _, rec) = env.only_fill();
+        let fee = expected_fee(10 * Q, PRICE, 100);
+        assert_eq!(fee, 10);
+        let taker_paid = cap_taker - env.capital(taker_account);
+        let maker_paid = cap_lp - env.capital(lp.account);
+        assert_eq!(taker_paid, 3, "long={long}: the taker paid all it had");
+        assert_eq!(maker_paid, 7, "long={long}: the maker was charged the remainder");
+        assert_eq!(
+            rec.fee_atoms as u128,
+            taker_paid + maker_paid,
+            "long={long}: fee_atoms is the sum across taker and maker"
+        );
+        assert_eq!(rec.fee_atoms, fee, "long={long}");
+        assert_eq!(rec.executed_q, -open);
+        assert_eq!(env.pos(taker_account), 0);
+    }
+}
+
+/// (d) The matcher answers `exec_size == 0` (it is at its own inventory limit): `Ok`, nothing
+/// moves, and the wrapper still emits a FILL, `ZERO|MATCHER` without `CLIPPED`, carrying the
+/// matcher's quote. This is the second zero-fill exit; the first (clipped to zero by headroom, no
+/// matcher call) has `quoted_price_e6 == 0`.
+#[test]
+fn fill_event_trade_cpi_matcher_returned_zero() {
+    let mut env = Env::new();
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    // The matcher will sell at most 4 units of inventory.
+    let lp = env.lp_cfg(1_000_000, u128::MAX, 0, 4 * Q as u128);
+    env.trade_cpi(&taker, taker_account, &lp, 4 * Q).expect("fills the matcher's inventory limit");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!((rec.flags, rec.executed_q), (FLAG_MATCHER, 4 * Q));
+
+    let before = env.snapshot(&[taker_account, lp.account]);
+    let nonce_before = env.req_nonce();
+    env.trade_cpi(&taker, taker_account, &lp, 3 * Q).expect("a matcher zero fill is Ok");
+    let (tag, market, t, l, rec) = env.only_fill();
+    assert_eq!((tag, market, t, l), (10, env.market, taker_account, lp.account));
+    assert_eq!(rec.flags, FLAG_MATCHER | FLAG_ZERO, "the matcher returned 0; nothing was clipped");
+    assert_eq!((rec.requested_q, rec.executed_q), (3 * Q, 0));
+    assert_eq!(rec.quoted_price_e6, PRICE, "the matcher answered, so its quote is present");
+    assert_eq!(rec.price_e6, env.effective_price(), "reference price only");
+    assert_eq!((rec.fee_atoms, rec.backing_fee_atoms), (0, 0));
+    assert_eq!(env.snapshot(&[taker_account, lp.account]), before, "zero fill: no state change");
+    assert_eq!(env.pos(taker_account), 4 * Q);
+    assert_eq!(env.req_nonce(), nonce_before + 1, "the matcher WAS called (request id consumed)");
+}
+
+/// Doc L-5: `CLIPPED|PARTIAL|MATCHER` occurs (the request is clipped to the LP's headroom AND
+/// the matcher then fills less than the clipped size), and `CLIPPED|ZERO|MATCHER` covers two
+/// cases told apart only by `quoted_price_e6` (0 = no matcher call; non-zero = the matcher was
+/// asked for the clipped size and returned 0).
+#[test]
+fn fill_event_trade_cpi_clipped_then_partial_and_clipped_then_matcher_zero() {
+    let mut env = Env::new();
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    // Headroom 10 units (1,000 atoms of LP equity); the matcher fills at most 4 per call and
+    // holds at most 6 units of inventory.
+    let lp = env.lp_cfg(1_000, 4 * Q as u128, 0, 6 * Q as u128);
+    env.trade_cpi(&taker, taker_account, &lp, 15 * Q).expect("clipped to 10, matcher fills 4");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!(rec.flags, FLAG_MATCHER | FLAG_CLIPPED | FLAG_PARTIAL);
+    assert_eq!((rec.requested_q, rec.executed_q), (15 * Q, 4 * Q));
+    assert_eq!(env.pos(taker_account), 4 * Q);
+
+    env.trade_cpi(&taker, taker_account, &lp, 2 * Q).expect("fills to the inventory limit");
+    assert_eq!(env.pos(taker_account), 6 * Q);
+    // Headroom is now 4; the request for 9 is clipped to 4 and the matcher (at its limit) returns 0.
+    let before = env.snapshot(&[taker_account, lp.account]);
+    env.trade_cpi(&taker, taker_account, &lp, 9 * Q).expect("clipped, then a matcher zero fill");
+    let (_, _, _, _, rec) = env.only_fill();
+    assert_eq!(rec.flags, FLAG_MATCHER | FLAG_CLIPPED | FLAG_ZERO);
+    assert_eq!((rec.requested_q, rec.executed_q), (9 * Q, 0));
+    assert_eq!(rec.quoted_price_e6, PRICE, "non-zero quote: the matcher WAS called");
+    assert_eq!(env.snapshot(&[taker_account, lp.account]), before);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // REDUCE: RebalanceReduce (tag 44).
 // ─────────────────────────────────────────────────────────────────────────────
 #[test]
@@ -1031,19 +1282,67 @@ fn reduce_event_rebalance_reduce_full_and_clipped() {
 // Attribution and failure rules.
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// A failed transaction's logs may carry events (logs outlive the revert): the documented rule is
-/// that an indexer trusts only successful transactions. Prove the premise: a trade that errors
-/// AFTER some wrapper work still yields a failed meta, and the success path is the only one the
-/// decoder is applied to in these tests.
+/// A failed transaction's logs DO carry events (logs outlive the revert), so an indexer must
+/// trust only successful transactions. One transaction, two wrapper instructions: a TradeCpi that
+/// runs to its end and emits its FILL, then an instruction that fails. The transaction fails and
+/// nothing it did persists, yet its log holds a well-formed FILL, inside the wrapper's own frame,
+/// for a fill that never happened. `tx_events` refuses it because the transaction failed.
 #[test]
 fn fill_events_only_trusted_on_success() {
-    let mut env = Env::new();
+    let mut env = Env::with_fee(100);
     let taker = Keypair::new();
-    let taker_account = env.portfolio(&taker, 1_000);
+    let taker_account = env.portfolio(&taker, 1_000_000);
     let lp = env.lp(1_000_000);
-    // Far beyond the taker's margin: the engine refuses it -> the instruction (and tx) fails.
-    let r = env.trade_cpi(&taker, taker_account, &lp, 1_000_000 * Q);
-    assert!(r.is_err(), "over-margin trade must fail: {r:?}");
+    let trade = env.trade_cpi_ix(&taker, taker_account, &lp, 2 * Q);
+    // RebalanceReduce with reduce_q == 0 is refused (InvalidInstruction).
+    let (id, _, epoch) = env.identity(taker_account);
+    let failing = Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(taker_account, false),
+        ],
+        data: ProgInstruction::RebalanceReduce { portfolio_id: id, position_epoch: epoch, asset_index: 0, reduce_q: 0 }.encode(),
+    };
+    let keys = [env.market, taker_account, lp.account, lp.ctx];
+    let before = env.snapshot(&keys);
+
+    let r = env.send_ixs(&[trade.clone(), failing], &[&taker]);
+    assert!(r.is_err(), "the second instruction must fail the transaction: {r:?}");
+    let failed_logs = last_logs();
+    // Nothing happened.
+    assert_eq!(env.snapshot(&keys), before, "a failed transaction changes no account");
+    assert_eq!(env.pos(taker_account), 0);
+    // But the log says a fill did: one well-formed FILL in the wrapper's frame.
+    let tokens = fill_events::wrapper_frame_tokens(&failed_logs, &env.program_id)
+        .expect("the failed transaction's frames are complete (invoke ... failed)");
+    assert_eq!(tokens.len(), 1, "the failed transaction's log carries the trade's event: {failed_logs:#?}");
+    let Ok(Event::Fill { ix_tag, taker: ev_taker, recs, .. }) = fill_events::decode_token(&tokens[0]) else {
+        panic!("expected a FILL in the failed transaction's log")
+    };
+    assert_eq!((ix_tag, ev_taker), (10, taker_account));
+    assert_eq!(recs[0].executed_q, 2 * Q, "the log claims an executed fill");
+    assert!(recs[0].fee_atoms > 0, "and a charged fee");
+    // The rule: a failed transaction yields no events, whatever its log says.
+    assert_eq!(
+        fill_events::tx_events(false, Some(&failed_logs), &env.program_id),
+        fill_events::TxEvents::Failed
+    );
+
+    // Control: the same trade alone succeeds, the same event is then trusted, and the state moved.
+    let trade = env.trade_cpi_ix(&taker, taker_account, &lp, 2 * Q);
+    env.send_ixs(&[trade], &[&taker]).expect("the trade alone succeeds");
+    let fill_events::TxEvents::Known { events, skipped } =
+        fill_events::tx_events(true, Some(&last_logs()), &env.program_id)
+    else {
+        panic!("a successful transaction's events are known")
+    };
+    assert!(skipped.is_empty());
+    assert_eq!(events.len(), 1);
+    let Event::Fill { recs, .. } = &events[0] else { panic!("{events:?}") };
+    assert_eq!(recs[0].executed_q, 2 * Q);
+    assert_eq!(env.pos(taker_account), 2 * Q, "this time it happened");
 }
 
 /// The attribution rule on synthetic logs: a "Program data:" line that another program emits

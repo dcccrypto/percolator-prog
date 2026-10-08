@@ -2880,6 +2880,83 @@ fn w4_pnl_restore_refused_by_a_loss_stale_asset() {
     assert_eq!(o.cap0 - o.cap1, o.repaid, "all of it from capital: the PnL path is closed");
 }
 
+/// v2.2 fill events (security review 2026-10-07, L-6): tag 111 mode 3 has its OWN MOVE sub
+/// (4, G9_RESTORE_PNL) carrying the released-profit part and the capital part separately
+/// (a = from PnL, b = from capital, c = receivable outstanding after). It no longer reuses the
+/// G9 sub with `c = 3` and `a = from_pnl + from_cap`. Each field is checked against the state:
+/// the capital part is the LP's capital drop, the profit part is the rest of the repayment.
+#[test]
+fn w4_pnl_restore_event_splits_profit_and_capital() {
+    let owed = 1_300_000u64;
+    let size = U * 3 / 10;
+    let g9_restore_pnl = |w: &P3| -> (u64, u64, u64) {
+        let evs = fill_events::wrapper_events(&last_logs(), &w.env.program_id);
+        assert_eq!(evs.len(), 1, "one MOVE per restore: {evs:?}");
+        let fill_events::Event::Move { ix_tag, market, sub, asset_index, a, b, c } = evs[0].clone() else {
+            panic!("expected a MOVE: {evs:?}")
+        };
+        assert_eq!((ix_tag, market, asset_index), (111, w.env.market, 0));
+        assert_eq!(sub, 4, "mode 3 emits G9_RESTORE_PNL, never G9 (2): {evs:?}");
+        (a, b, c)
+    };
+
+    // 1. Uncapped: profit first, capital for the remainder.
+    let (mut w, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut w, 3, 0, owed);
+    r.expect("mode 3");
+    let from_cap = o.cap0 - o.cap1;
+    let from_pnl = o.repaid - from_cap;
+    assert!(from_pnl > 0, "vacuity: part of the repayment came from profit");
+    let (a, b, c) = g9_restore_pnl(&w);
+    eprintln!("L-6 mode 3 uncapped: event a(from_pnl)={a} b(from_cap)={b} c(outstanding)={c}; state from_pnl={from_pnl} from_cap={from_cap}");
+    assert_eq!(a as u128, from_pnl, "a = the released-profit part");
+    assert_eq!(b as u128, from_cap, "b = the capital part (the LP's capital drop)");
+    assert_eq!(a as u128 + b as u128, o.repaid, "a + b = the receivable's fall = insurance's gain");
+    assert_eq!(o.ins, o.repaid);
+    assert_eq!(c, backstop_st(&w), "c = the receivable still outstanding");
+    assert_eq!(c as u128, owed as u128 - o.repaid);
+
+    // 2. Capped below the profit available: all profit, no capital.
+    let (mut p, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut p, 3, 5_000, owed);
+    r.expect("mode 3 capped");
+    assert_eq!(o.cap0, o.cap1);
+    assert_eq!(g9_restore_pnl(&p), (5_000, 0, owed - 5_000));
+
+    // 3. The profit path closed (loss-stale asset): mode 3 repays from capital only and STILL
+    //    reports under its own sub, with a = 0.
+    let (mut s, _) = w4_profit_world(owed, 4, size);
+    let m = MARK.with(|c| c.get()) * 99 / 100;
+    MARK.with(|c| c.set(m));
+    let slot = s.slot() + 1;
+    s.env.svm.warp_to_slot(slot);
+    s.env.push_auth_mark_for_asset_as_admin(0, slot, m);
+    let _ = s.crank(s.lp);
+    let (r, o) = w4_restore(&mut s, 3, 0, owed);
+    r.expect("mode 3 falls back to capital");
+    assert!(o.repaid > 0);
+    assert_eq!(o.cap0 - o.cap1, o.repaid, "vacuity: all of it from capital");
+    assert_eq!(g9_restore_pnl(&s), (0, o.repaid as u64, backstop_st(&s)));
+
+    // 4. Control: mode 1 in the same world keeps the G9 sub (2) with c = 1 and a = the capital
+    //    repaid; nothing about it changed.
+    let (mut c1, _) = w4_profit_world(owed, 4, size);
+    let (r, o) = w4_restore(&mut c1, 1, 0, owed);
+    r.expect("mode 1");
+    assert_eq!(
+        fill_events::wrapper_events(&last_logs(), &c1.env.program_id),
+        vec![fill_events::Event::Move {
+            ix_tag: 111,
+            market: c1.env.market,
+            sub: 2,
+            asset_index: 0,
+            a: o.repaid as u64,
+            b: backstop_st(&c1),
+            c: 1,
+        }]
+    );
+}
+
 /// Mode 4 (and above) is still an invalid instruction; with nothing owed both restore modes are
 /// refused.
 #[test]

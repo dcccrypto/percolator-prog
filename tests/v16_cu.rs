@@ -18266,7 +18266,7 @@ fn v16_bpf_batch_trade_cpi_canonical_matcher_v2_11_legs_fit_budget() {
 /// multi-asset market with asset 0 growth-enabled: ext v3 (72 B) on every leg, the growth gate
 /// on asset 0's leg. It must still fit the 1.4M budget with the legacy case's safety margin.
 #[test]
-fn v16_bpf_batch_trade_cpi_canonical_growth_v3_11_legs_fit_budget() {
+fn v16_bpf_batch_trade_cpi_canonical_growth_v3_10_legs_fit_budget_11_refused() {
     let canonical = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
     let (allowed_cu, _counter) = batch_trade_cpi_tail_fanout_budget_case(canonical, true);
     eprintln!("(L-6) 10 legs (growth cap), canonical matcher, growth asset 0 (v3 wire on all legs): {allowed_cu} CU");

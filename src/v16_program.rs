@@ -28474,8 +28474,8 @@ pub mod processor {
     }
 
     /// v2.2 fill events: the ADL-effective signed size of every active leg, in one pass over the
-    /// leg bytes. Used before a crank that may liquidate (liquidatable accounts only) and after
-    /// it. Best effort: an unreadable leg is left out (its liquidation then emits no event); an
+    /// leg bytes. Used before a crank that may liquidate (liquidatable accounts only; the asset
+    /// the engine will pick is not known yet). Best effort: an unreadable leg is left out (its liquidation then emits no event); an
     /// event must never make a liquidation fail.
     #[inline(never)]
     fn snapshot_effective_legs_view(
@@ -28496,6 +28496,12 @@ pub mod processor {
     /// v2.2 fill events: the liquidation's signed change of the effective position on `asset`
     /// (None when it did not change the position, or could not be derived: best effort), with
     /// the asset generation and the price.
+    ///
+    /// The after-leg is looked up directly (one slot decoded, no snapshot of all 16 and no
+    /// allocation). Security review 2026-10-07, L-4: an ABSENT after-leg means the position is
+    /// gone (size 0, a full close); an after-leg that is active but UNREADABLE (generation or
+    /// ADL epoch this reader cannot interpret) is not zero, so the event is suppressed rather
+    /// than claiming a full close.
     #[inline(never)]
     fn liquidation_event_view(
         group: &state::MarketViewMutV16<'_>,
@@ -28504,12 +28510,20 @@ pub mod processor {
         asset: usize,
     ) -> Option<(u16, u64, i128, u64)> {
         let &(_, q_before) = before.iter().find(|(a, _)| *a as usize == asset)?;
-        let after = snapshot_effective_legs_view(group, portfolio);
-        let q_after = after.iter().find(|(a, _)| *a as usize == asset).map_or(0, |(_, q)| *q);
-        let delta = q_after.checked_sub(q_before)?;
-        if delta == 0 {
-            return None;
+        let mut after = fill_events_v22::LegAfter::Absent;
+        let mut slot = 0usize;
+        while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
+            let leg = &portfolio.header.legs[slot];
+            if leg.active == 1 && leg.asset_index.get() as usize == asset {
+                after = match leg_slot_effective_signed_q(group, leg) {
+                    Some((_, q)) => fill_events_v22::LegAfter::Size(q),
+                    None => fill_events_v22::LegAfter::Unreadable,
+                };
+                break;
+            }
+            slot += 1;
         }
+        let delta = fill_events_v22::liquidation_delta_q(q_before, after)?;
         let a = &group.markets.get(asset)?.engine.asset;
         Some((asset as u16, a.market_id.get(), delta, a.effective_price.get()))
     }
@@ -36756,6 +36770,8 @@ pub mod processor {
             sibling_ledger_ai,
             true,
         )?;
+        // v2.2 fill events: the released-PnL part of a mode-3 restore (0 in every other mode).
+        let mut restore_from_pnl: u128 = 0;
         let moved = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
@@ -37025,6 +37041,7 @@ pub mod processor {
                     "p4_backstop_restore repaid={} from_pnl={} outstanding={} equity_before={} im={}",
                     amt, from_pnl, next, equity, cert.certified_initial_req
                 ));
+                restore_from_pnl = from_pnl;
                 amt
             };
             // W-9: keep the fill-time halt mirror in step with the backstop.
@@ -37042,19 +37059,35 @@ pub mod processor {
             moved
         };
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-        // v2.2 move event (tag 111): the draw (insurance -> vault LP capital) or restore
-        // (vault LP capital -> insurance) amount decided on chain, and the backstop receivable
-        // left outstanding. A PROPOSE (mode 2) moves nothing and emits nothing.
+        // v2.2 move event (tag 111): the amount decided on chain and the backstop receivable left
+        // outstanding. A PROPOSE (mode 2) moves nothing and emits nothing.
+        //   mode 0 draw (insurance -> vault LP capital) and mode 1 restore (vault LP capital ->
+        //   insurance): MOVE G9, a = amount, b = outstanding after, c = mode.
+        //   mode 3 restore (released LP profit first, capital for the rest): MOVE G9_RESTORE_PNL,
+        //   a = from released profit, b = from capital, c = outstanding after. Always this sub for
+        //   mode 3, also when the profit part is 0.
         if moved != 0 {
-            fill_events_v22::emit_move(
-                fill_events_v22::TAG_INSURANCE_BACKSTOP,
-                &market_ai.key.to_bytes(),
-                fill_events_v22::MOVE_G9,
-                0,
-                fill_events_v22::sat_u64(moved),
-                st.backstop_outstanding_atoms,
-                u64::from(mode),
-            );
+            if mode == 3 {
+                fill_events_v22::emit_move(
+                    fill_events_v22::TAG_INSURANCE_BACKSTOP,
+                    &market_ai.key.to_bytes(),
+                    fill_events_v22::MOVE_G9_RESTORE_PNL,
+                    0,
+                    fill_events_v22::sat_u64(restore_from_pnl),
+                    fill_events_v22::sat_u64(moved.saturating_sub(restore_from_pnl)),
+                    st.backstop_outstanding_atoms,
+                );
+            } else {
+                fill_events_v22::emit_move(
+                    fill_events_v22::TAG_INSURANCE_BACKSTOP,
+                    &market_ai.key.to_bytes(),
+                    fill_events_v22::MOVE_G9,
+                    0,
+                    fill_events_v22::sat_u64(moved),
+                    st.backstop_outstanding_atoms,
+                    u64::from(mode),
+                );
+            }
         }
         Ok(())
     }
