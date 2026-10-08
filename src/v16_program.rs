@@ -27880,14 +27880,12 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            // S10: the engine's Refresh crank grants itself the unclaimed-backing move budget
-            // (2 firings, about 33k CU each). The tag-5 crank keeps it. The tag-77 redemption
-            // runs its refreshes inline as a prelude (two 14-leg refreshes are about 1.25M CU,
-            // A6) and has no compute to spare, so it denies the grant; a move left pending there
-            // is made by the next tag-5 refresh crank of any leg of the asset.
-            if !s10_refresh_budget {
-                group.deny_s10_budget();
-            }
+            // S10: the engine's Refresh crank takes an explicit unclaimed-backing move budget
+            // (2 firings, about 33k CU each; `S10_MAX_MOVES_PER_INSTRUCTION`). The tag-5 crank passes
+            // it. The tag-77 redemption runs its refreshes inline as a prelude (two 14-leg refreshes
+            // are about 1.25M CU, A6) and has no compute to spare, so it passes 0; a move left
+            // pending there is made by the next tag-5 refresh crank of any leg of the asset.
+            let s10_grant: u8 = if s10_refresh_budget { percolator::S10_MAX_MOVES_PER_INSTRUCTION } else { 0 };
             // FIX F-05 (register row C-W-04, PRESERVED VERBATIM): a market in Recovery has
             // exactly ONE bounded public step left -- release the remaining obligation, then the
             // value-neutral transition to Resolved. The engine's escalation valve
@@ -28301,13 +28299,14 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
-            let result = match group.permissionless_auto_crank_not_atomic(
+            let result = match group.permissionless_auto_crank_s10_not_atomic(
                 &mut portfolio,
                 AutoCrankWorkV16 {
                     now_slot: authenticated_now_slot,
                     observations: observations.as_slice(),
                     resolved_close_fee_rate_per_slot: 0,
                 },
+                s10_grant,
             ) {
                 Ok(result) if matches!(result.selected, AutoCrankPlanV16::NoAction) => {
                     if market_accrual_performed {
