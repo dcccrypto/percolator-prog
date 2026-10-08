@@ -82,7 +82,7 @@ fn r2_market() -> LiveMarket {
     LiveMarket {
         name: "r2",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS, // fold 2026-10-08: #546 cap (was 14)
             h_min: 1,
             h_max: 10,
             initial_price: 1_000_000,
@@ -231,6 +231,7 @@ impl Replay {
                     AccountMeta::new(mint, false),
                     AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                     AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(self.env.mint, false), // [6] collateral mint (#545; fold 2026-10-08)
                 ],
                 &[&admin],
             )

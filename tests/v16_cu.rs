@@ -26398,6 +26398,11 @@ fn s10_seed_stranded(env: &mut V16CuEnv, long_account: Pubkey, short_account: Pu
 }
 
 fn s10_refresh_probe(n: u16) {
+    if n > LEG_CAP as u16 {
+        // fold 2026-10-08: #546 caps a market at WRAPPER_MAX_PORTFOLIO_ASSETS legs; a larger probe cannot be built.
+        println!("S10SKIP n={n} is above the wrapper cap {LEG_CAP}");
+        return;
+    }
     let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -26466,6 +26471,11 @@ fn s10_seed_stranded_long_loser(env: &mut V16CuEnv, long_account: Pubkey, short_
 /// Liquidation crank of the stranded long (every other portfolio of the asset already settled), so
 /// each of its n leg entries can fire (cap 2); compare base vs S10.
 fn s10_liq_probe(n: u16) {
+    if n > LEG_CAP as u16 {
+        // fold 2026-10-08: #546 caps a market at WRAPPER_MAX_PORTFOLIO_ASSETS legs; a larger probe cannot be built.
+        println!("S10SKIP n={n} is above the wrapper cap {LEG_CAP}");
+        return;
+    }
     let mut env = V16CuEnv::new_with_market_params_and_price_move(n, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
