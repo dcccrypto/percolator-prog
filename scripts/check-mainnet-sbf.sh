@@ -29,6 +29,27 @@ if dev or not main:
 print(f"check-mainnet-sbf: artifact OK ({len(data)} B): mainnet build flavor")
 PY
 
+# prog#542 / security review R10: the LP share token's metadata uri base is a compile-time
+# constant and a ticker record is immutable, so the artifact must carry the MAINNET base and
+# must not carry the devnet one. Both strings are read from the source, not repeated here.
+python3 - "$SO" "$ROOT/src/lp_share_meta_v22.rs" <<'PY'
+import re, sys
+data = open(sys.argv[1], "rb").read()
+src = open(sys.argv[2]).read()
+def const(name):
+    m = re.search(r'pub const %s: &str = "([^"]+)";' % name, src)
+    if not m:
+        print(f"check-mainnet-sbf: FAIL: {name} not found in src/lp_share_meta_v22.rs"); sys.exit(1)
+    return m.group(1).encode()
+main, dev = const("LP_SHARE_URI_BASE_MAINNET"), const("LP_SHARE_URI_BASE_DEVNET")
+# (the 16-byte path is too short to survive as a string: the compiler inlines it as immediates)
+ok = main in data and dev not in data
+if not ok:
+    print(f"check-mainnet-sbf: FAIL: LP share uri base: mainnet {main!r} present={main in data}, devnet {dev!r} present={dev in data}")
+    sys.exit(1)
+print(f"check-mainnet-sbf: LP share uri base OK ({main.decode()})")
+PY
+
 cd "$ROOT"
 cargo test --release --test sec_v22b_pure sec_band_caps_by_build -- --exact >/dev/null 2>&1 || {
   echo "check-mainnet-sbf: FAIL: sec_band_caps_by_build without devnet" >&2

@@ -11,11 +11,14 @@
 //!     price arithmetic does not read `decimals`;
 //!   * first deposit (dead-share floor), second deposit, a donation attack and redeem rounding
 //!     (against the redeemer);
-//!   * tag 122: wire, the pre-CPI refusals (wrong program, wrong PDA, cross-market substitution,
-//!     wrong signer, bad ticker; no Metaplex binary needed) and, in ignored tests that need
-//!     `MPL_TOKEN_METADATA_SO` (`solana program dump -u m metaqbxx... <file>`), the real
-//!     Metaplex program: generic by a stranger, marketauth's one upgrade to the ticker form,
-//!     ticker first, name / symbol / uri / mutability / update authority read back.
+//!   * tag 122 (security review R1-R11): wire; the pre-CPI refusals (wrong program, wrong PDA,
+//!     an attacker mint whose authority is the registry PDA, cross-market substitution, wrong
+//!     or missing marketauth signature, bad ticker; no Metaplex binary needed); and, in ignored
+//!     tests that need `MPL_TOKEN_METADATA_SO` (`solana program dump -u m metaqbxx... <file>`),
+//!     the real Metaplex program: generic by a stranger, marketauth's upgrade that freezes the
+//!     record, ticker first (immutable from birth), repair of a foreign mutable record, a
+//!     writable mint in the outer transaction, name / symbol / uri / mutability / update
+//!     authority read back, and who pays what.
 //!
 //! Harness adapted from `tests/v16_fork_lp_vault_redeem.rs` (same market, same vault).
 #![cfg(not(kani))]
@@ -639,6 +642,30 @@ fn create_with_a_non_spl_collateral_account_is_refused() {
     assert_nothing_created(&env);
 }
 
+/// Security review (surviving mutant): `[6]` must be the PRIMARY collateral mint. The market's
+/// SECONDARY collateral mint (same decimals by #447, so the outcome would look the same today)
+/// is refused with `InvalidArgument`.
+#[test]
+fn create_with_the_secondary_collateral_mint_is_refused() {
+    let mut env = setup_market();
+    let secondary = Pubkey::new_unique();
+    env.svm
+        .set_account(secondary, Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+        .unwrap();
+    // register it as the market's secondary collateral mint (state edit; same 6 decimals)
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    let (mut cfg, group) = state::read_market(&acct.data).expect("read market");
+    cfg.secondary_collateral_mint = secondary.to_bytes();
+    state::write_market(&mut acct.data, &cfg, &group).expect("write market");
+    env.svm.set_account(env.market, acct).unwrap();
+    let e = create_vault_with(&mut env, vec![AccountMeta::new_readonly(secondary, false)])
+        .expect_err("the secondary collateral mint is not accepted at [6]");
+    assert!(e.contains("InvalidArgument"), "{e}");
+    assert_nothing_created(&env);
+    let primary = env.collateral_mint;
+    create_vault_with(&mut env, vec![AccountMeta::new_readonly(primary, false)]).expect("primary works");
+}
+
 // ── 3. share counts and prices: pinned, decimals-independent, base-identical ─────────────────
 
 /// Every number a fixed script produces. `decimals` is deliberately NOT part of it.
@@ -876,11 +903,12 @@ fn redeeming_dust_that_rounds_to_zero_atoms_is_refused() {
     assert!(e.contains(&custom(PercolatorError::LpVaultZeroAmount)), "{e}");
 }
 
-// ── 6. tag 122 InitLpShareMetadata ───────────────────────────────────────────────────────────
+// ── 6. tag 122 InitLpShareMetadata (security review R1-R11) ──────────────────────────────────
 //
-// `n == 0`: permissionless generic record. `n > 0`: marketauth's ticker record (create, or
-// upgrade a generic record once). The ticker is creator-chosen and unverified; the framing is
-// not removable.
+// `n == 0`: permissionless generic record (mutable). `n > 0`: marketauth's ticker record
+// (immutable; created, or a mutable record upgraded and frozen). The ticker is creator-chosen
+// and unverified; the framing leads the name and is not removable. The fee payer handed to
+// Metaplex is a transient PDA of the wrapper, never the caller or marketauth.
 
 fn metadata_pda(mint: &Pubkey) -> Pubkey {
     Pubkey::find_program_address(
@@ -890,49 +918,63 @@ fn metadata_pda(mint: &Pubkey) -> Pubkey {
     .0
 }
 
+fn meta_payer_pda(env: &Env) -> Pubkey {
+    Pubkey::find_program_address(&[b"lp_share_meta_payer", env.lp_mint.as_ref()], &env.program_id).0
+}
+
 fn meta_ix(ticker: &str) -> ProgInstruction {
     let mut t = [0u8; 8];
     t[..ticker.len()].copy_from_slice(ticker.as_bytes());
     ProgInstruction::InitLpShareMetadata { ticker_len: ticker.len() as u8, ticker: t }
 }
 
-/// The six generic accounts; the ticker form appends the market.
-fn metadata_accounts(env: &Env, caller: Pubkey, with_market: bool) -> Vec<AccountMeta> {
+/// The seven generic accounts; the ticker form appends the market and marketauth (signer).
+fn metadata_accounts(env: &Env, payer: Pubkey, auth: Option<Pubkey>) -> Vec<AccountMeta> {
     let mut v = vec![
-        AccountMeta::new(caller, true),
+        AccountMeta::new(payer, true),
         AccountMeta::new_readonly(env.registry, false),
         AccountMeta::new_readonly(env.lp_mint, false),
         AccountMeta::new(metadata_pda(&env.lp_mint), false),
         AccountMeta::new_readonly(MPL_TOKEN_METADATA_PROGRAM_ID, false),
         AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        AccountMeta::new(meta_payer_pda(env), false),
     ];
-    if with_market {
+    if let Some(a) = auth {
         v.push(AccountMeta::new_readonly(env.market, false));
+        v.push(AccountMeta::new_readonly(a, true));
     }
     v
 }
 
-fn send_meta(env: &mut Env, ix: ProgInstruction, accounts: Vec<AccountMeta>, caller: &Keypair) -> Result<u64, String> {
+fn send_meta(env: &mut Env, ix: ProgInstruction, accounts: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
     let payer = env.payer.insecure_clone();
-    send(&mut env.svm, env.program_id, &payer, vec![(ix, accounts)], &[caller])
+    send(&mut env.svm, env.program_id, &payer, vec![(ix, accounts)], signers)
 }
 
-/// Generic form by `caller`.
-fn name_generic(env: &mut Env, caller: &Keypair) -> Result<u64, String> {
-    let a = metadata_accounts(env, caller.pubkey(), false);
-    send_meta(env, meta_ix(""), a, caller)
+/// Generic form, paid by `payer`.
+fn name_generic(env: &mut Env, payer: &Keypair) -> Result<u64, String> {
+    let a = metadata_accounts(env, payer.pubkey(), None);
+    send_meta(env, meta_ix(""), a, &[payer])
 }
 
-/// Ticker form by `caller` (must be marketauth to succeed).
-fn name_ticker(env: &mut Env, caller: &Keypair, ticker: &str) -> Result<u64, String> {
-    let a = metadata_accounts(env, caller.pubkey(), true);
-    send_meta(env, meta_ix(ticker), a, caller)
+/// Ticker form, paid by `payer`, authorised by `auth` (must be marketauth to succeed).
+fn name_ticker(env: &mut Env, payer: &Keypair, auth: &Keypair, ticker: &str) -> Result<u64, String> {
+    let a = metadata_accounts(env, payer.pubkey(), Some(auth.pubkey()));
+    if payer.pubkey() == auth.pubkey() {
+        send_meta(env, meta_ix(ticker), a, &[payer])
+    } else {
+        send_meta(env, meta_ix(ticker), a, &[payer, auth])
+    }
 }
 
 fn funded(env: &mut Env) -> Keypair {
     let k = Keypair::new();
     env.svm.airdrop(&k.pubkey(), 10_000_000_000).unwrap();
     k
+}
+
+fn lamports(env: &Env, k: &Pubkey) -> u64 {
+    env.svm.get_account(k).map(|a| a.lamports).unwrap_or(0)
 }
 
 /// A stand-in executable (the SPL Token ELF) at an arbitrary address (NOT the Metaplex id).
@@ -967,56 +1009,85 @@ fn tag_122_wire() {
     assert!(ProgInstruction::decode(&[122, 9, 65, 65, 65, 65, 65, 65, 65, 65, 65]).is_err(), "9-byte ticker refused at decode");
 }
 
+/// R1: the CPI target is pinned.
 #[test]
 fn metadata_refuses_any_program_but_metaplex() {
     let mut env = setup_vault();
     let admin = env.admin.insecure_clone();
     let fake = fake_program(&mut env);
     for ticker in ["", "SOL"] {
-        let mut accts = metadata_accounts(&env, admin.pubkey(), !ticker.is_empty());
+        let mut accts = metadata_accounts(&env, admin.pubkey(), (!ticker.is_empty()).then(|| admin.pubkey()));
         accts[4] = AccountMeta::new_readonly(fake, false);
-        let e = send_meta(&mut env, meta_ix(ticker), accts, &admin)
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin])
             .expect_err("a caller-chosen program must never get the registry PDA's signature");
         assert!(e.contains("IncorrectProgramId"), "{e}");
     }
 }
 
+/// R5: registry, mint, metadata PDA and the fee-payer PDA are all bound on chain.
 #[test]
-fn metadata_refuses_a_wrong_metadata_address_mint_or_registry() {
+fn metadata_refuses_a_wrong_metadata_address_mint_registry_or_fee_pda() {
     let mut env = setup_vault();
     let admin = env.admin.insecure_clone();
     stand_in_metaplex(&mut env);
+    // R5: an attacker's own classic SPL mint whose mint authority IS this market's registry PDA
+    // (anyone can create such a mint): the authority check alone would accept it.
+    let evil_mint = Pubkey::new_unique();
+    let mut data = vec![0u8; Mint::LEN];
+    Mint::pack(
+        Mint { mint_authority: COption::Some(env.registry), supply: 0, decimals: 6, is_initialized: true, freeze_authority: COption::None },
+        &mut data,
+    )
+    .unwrap();
+    env.svm
+        .set_account(evil_mint, Account { lamports: 1_000_000_000, data, owner: spl_token::ID, executable: false, rent_epoch: 0 })
+        .unwrap();
     for ticker in ["", "SOL"] {
-        let named = !ticker.is_empty();
+        let auth = (!ticker.is_empty()).then(|| admin.pubkey());
         // (a) a metadata address that is not the mint's PDA
-        let mut accts = metadata_accounts(&env, admin.pubkey(), named);
+        let mut accts = metadata_accounts(&env, admin.pubkey(), auth);
         accts[3] = AccountMeta::new(Pubkey::new_unique(), false);
-        let e = send_meta(&mut env, meta_ix(ticker), accts, &admin).expect_err("wrong metadata PDA");
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin]).expect_err("wrong metadata PDA");
         assert!(e.contains("InvalidArgument"), "{e}");
         // (b) a mint that is not this registry's share mint (the collateral mint)
-        let mut accts = metadata_accounts(&env, admin.pubkey(), named);
+        let mut accts = metadata_accounts(&env, admin.pubkey(), auth);
         accts[2] = AccountMeta::new_readonly(env.collateral_mint, false);
         accts[3] = AccountMeta::new(metadata_pda(&env.collateral_mint), false);
-        let e = send_meta(&mut env, meta_ix(ticker), accts, &admin).expect_err("a mint that is not the share mint");
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin]).expect_err("a mint that is not the share mint");
+        assert!(e.contains("InvalidArgument"), "{e}");
+        // (b') R5: the attacker mint whose authority is the registry PDA, with ITS metadata PDA
+        let mut accts = metadata_accounts(&env, admin.pubkey(), auth);
+        accts[2] = AccountMeta::new_readonly(evil_mint, false);
+        accts[3] = AccountMeta::new(metadata_pda(&evil_mint), false);
+        accts[6] = AccountMeta::new(
+            Pubkey::find_program_address(&[b"lp_share_meta_payer", evil_mint.as_ref()], &env.program_id).0,
+            false,
+        );
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin])
+            .expect_err("a mint with the right AUTHORITY but the wrong ADDRESS must be refused");
         assert!(e.contains("InvalidArgument"), "{e}");
         // (c) a registry that is not a program-owned LP vault registry (the market account)
-        let mut accts = metadata_accounts(&env, admin.pubkey(), named);
+        let mut accts = metadata_accounts(&env, admin.pubkey(), auth);
         accts[1] = AccountMeta::new_readonly(env.market, false);
-        let e = send_meta(&mut env, meta_ix(ticker), accts, &admin).expect_err("not a registry");
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin]).expect_err("not a registry");
         assert!(!e.contains("IncorrectProgramId"), "{e}");
+        // (d) a fee-payer account that is not the derived PDA (e.g. a victim's wallet)
+        let mut accts = metadata_accounts(&env, admin.pubkey(), auth);
+        accts[6] = AccountMeta::new(env.payer.pubkey(), false);
+        let e = send_meta(&mut env, meta_ix(ticker), accts, &[&admin]).expect_err("wrong fee-payer PDA");
+        assert!(e.contains("InvalidArgument"), "{e}");
     }
     assert!(no_record(&env));
+    assert!(env.svm.get_account(&metadata_pda(&evil_mint)).map(|a| a.data.is_empty()).unwrap_or(true));
 }
 
-/// Cross-market substitution. The attacker is the genuine marketauth of its OWN market B and
-/// tries to name market A's share token: (1) A's registry + mint with market B as the authority
-/// source, (2) B's registry with A's mint and metadata, (3) A's registry with B's mint.
+/// R5 / R7. Cross-market substitution. The attacker is the genuine marketauth of its OWN market
+/// B and tries to name market A's share token.
 #[test]
 fn metadata_cross_market_substitution_is_refused() {
     let mut env = setup_vault(); // market A
     let b = setup_vault(); // market B, a different marketauth
     stand_in_metaplex(&mut env);
-    // bring B's market, registry and mint into A's world, owned as on chain
     for k in [b.market, b.registry, b.lp_mint] {
         let a = b.svm.get_account(&k).unwrap();
         env.svm.set_account(k, a).unwrap();
@@ -1025,47 +1096,51 @@ fn metadata_cross_market_substitution_is_refused() {
     env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
 
     // (1) registry A + mint A, market B as the place to read marketauth from
-    let mut accts = metadata_accounts(&env, attacker.pubkey(), true);
-    accts[6] = AccountMeta::new_readonly(b.market, false);
-    let e = send_meta(&mut env, meta_ix("USDC"), accts, &attacker).expect_err("market B cannot authorise naming A");
+    let mut accts = metadata_accounts(&env, attacker.pubkey(), Some(attacker.pubkey()));
+    accts[7] = AccountMeta::new_readonly(b.market, false);
+    let e = send_meta(&mut env, meta_ix("USDC"), accts, &[&attacker]).expect_err("market B cannot authorise naming A");
     assert!(e.contains("InvalidArgument"), "{e}");
     // (2) registry B (attacker's own) with A's mint + A's metadata PDA
-    let mut accts = metadata_accounts(&env, attacker.pubkey(), true);
+    let mut accts = metadata_accounts(&env, attacker.pubkey(), Some(attacker.pubkey()));
     accts[1] = AccountMeta::new_readonly(b.registry, false);
-    accts[6] = AccountMeta::new_readonly(b.market, false);
-    let e = send_meta(&mut env, meta_ix("USDC"), accts, &attacker).expect_err("registry B does not own mint A");
+    accts[7] = AccountMeta::new_readonly(b.market, false);
+    let e = send_meta(&mut env, meta_ix("USDC"), accts, &[&attacker]).expect_err("registry B does not own mint A");
     assert!(e.contains("InvalidArgument"), "{e}");
     // (3) registry A with B's mint + B's metadata PDA
-    let mut accts = metadata_accounts(&env, attacker.pubkey(), true);
+    let mut accts = metadata_accounts(&env, attacker.pubkey(), Some(attacker.pubkey()));
     accts[2] = AccountMeta::new_readonly(b.lp_mint, false);
     accts[3] = AccountMeta::new(metadata_pda(&b.lp_mint), false);
-    let e = send_meta(&mut env, meta_ix("USDC"), accts, &attacker).expect_err("mint B is not registry A's mint");
+    let e = send_meta(&mut env, meta_ix("USDC"), accts, &[&attacker]).expect_err("mint B is not registry A's mint");
     assert!(e.contains("InvalidArgument"), "{e}");
     // (4) the honest shape, but the attacker is not A's marketauth
-    let e = name_ticker(&mut env, &attacker, "USDC").expect_err("B's marketauth is nobody on A");
+    let e = name_ticker(&mut env, &attacker, &attacker, "USDC").expect_err("B's marketauth is nobody on A");
     assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
     assert!(no_record(&env));
 }
 
+/// R3 / R7: the ticker form needs marketauth's SIGNATURE (as `[8]`, not as the payer).
 #[test]
-fn ticker_form_needs_marketauth_and_the_market_account() {
+fn ticker_form_needs_marketauth_signature_and_the_market_account() {
     let mut env = setup_vault();
     stand_in_metaplex(&mut env);
-    let stranger = funded(&mut env);
-    let e = name_ticker(&mut env, &stranger, "SOL").expect_err("a stranger cannot choose the ticker");
-    assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
-    // marketauth named as [0] but NOT signing (the fee payer signs): refused
     let admin = env.admin.insecure_clone();
-    let mut accts = metadata_accounts(&env, admin.pubkey(), true);
-    accts[0] = AccountMeta::new(admin.pubkey(), false);
-    let payer = env.payer.insecure_clone();
-    let e = send(&mut env.svm, env.program_id, &payer, vec![(meta_ix("SOL"), accts)], &[])
-        .expect_err("marketauth must sign");
+    let stranger = funded(&mut env);
+    // a stranger names itself as the authority
+    let e = name_ticker(&mut env, &stranger, &stranger, "SOL").expect_err("a stranger cannot choose the ticker");
+    assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
+    // marketauth's KEY at [8] without its signature (the stranger pays and signs)
+    let mut accts = metadata_accounts(&env, stranger.pubkey(), Some(admin.pubkey()));
+    accts[8] = AccountMeta::new_readonly(admin.pubkey(), false);
+    let e = send_meta(&mut env, meta_ix("SOL"), accts, &[&stranger]).expect_err("marketauth must sign");
     assert!(e.contains(&custom(PercolatorError::ExpectedSigner)), "{e}");
-    // marketauth without the market account
-    let accts = metadata_accounts(&env, admin.pubkey(), false);
-    let e = send_meta(&mut env, meta_ix("SOL"), accts, &admin).expect_err("the market account is required");
+    // marketauth as the PAYER only (the pre-review shape): not an authority any more
+    let accts = metadata_accounts(&env, admin.pubkey(), None);
+    let e = send_meta(&mut env, meta_ix("SOL"), accts, &[&admin]).expect_err("market + marketauth accounts are required");
     assert!(e.contains("NotEnoughAccountKeys"), "{e}");
+    let mut accts = metadata_accounts(&env, admin.pubkey(), Some(stranger.pubkey()));
+    accts[8] = AccountMeta::new_readonly(stranger.pubkey(), true);
+    let e = send_meta(&mut env, meta_ix("SOL"), accts, &[&admin, &stranger]).expect_err("paying is not authority");
+    assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
     assert!(no_record(&env));
 }
 
@@ -1074,12 +1149,11 @@ fn bad_tickers_are_refused_even_from_marketauth() {
     let mut env = setup_vault();
     stand_in_metaplex(&mut env);
     let admin = env.admin.insecure_clone();
-    // raw wire, so bytes the typed builder would never produce are covered too
     let payer = env.payer.insecure_clone();
     for bad in [&b"sol"[..], b"Sol", b"SO L", b"SOL ", b" SOL", b"SOL-", b"SO.L", b"$SOL", b"SOL\0", b"\xc3\x96L", b"A\n", b"USDC\xc2\xb7"] {
         let mut data = vec![122u8, bad.len() as u8];
         data.extend_from_slice(bad);
-        let accounts = metadata_accounts(&env, admin.pubkey(), true);
+        let accounts = metadata_accounts(&env, admin.pubkey(), Some(admin.pubkey()));
         env.svm.expire_blockhash();
         let tx = Transaction::new_signed_with_payer(
             &[Instruction { program_id: env.program_id, accounts, data }],
@@ -1110,7 +1184,7 @@ fn borsh_str(data: &[u8], o: &mut usize) -> String {
     s.trim_end_matches('\0').to_string()
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone)]
 struct Record {
     name: String,
     symbol: String,
@@ -1140,6 +1214,24 @@ fn expected_uri(env: &Env) -> String {
     format!("https://play.percolator.trade/api/earn-share/{}", env.market)
 }
 
+fn generic(env: &Env) -> Record {
+    Record {
+        name: format!("Percolator Earn Share {}", &env.market.to_string()[..8]),
+        symbol: "pEARN".into(),
+        uri: expected_uri(env),
+        is_mutable: true,
+    }
+}
+
+fn ticker_record(env: &Env, t: &str) -> Record {
+    Record {
+        name: format!("Percolator Earn {t} {}", &env.market.to_string()[..6]),
+        symbol: format!("pe{t}"),
+        uri: expected_uri(env),
+        is_mutable: false,
+    }
+}
+
 fn wrapper_state(env: &Env) -> Vec<Vec<u8>> {
     [env.registry, env.lp_mint, env.market, env.ledger]
         .iter()
@@ -1147,11 +1239,11 @@ fn wrapper_state(env: &Env) -> Vec<Vec<u8>> {
         .collect()
 }
 
-/// The whole lifecycle with the REAL Metaplex program: a stranger creates the generic record,
-/// cannot do more; marketauth upgrades it to the ticker form exactly once; nothing afterwards.
+/// The lifecycle with the REAL Metaplex program: a stranger creates the generic record and can
+/// do no more; marketauth upgrades it to the ticker form, which freezes it.
 #[test]
 #[ignore = "needs MPL_TOKEN_METADATA_SO=<dump of metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s>"]
-fn generic_first_then_marketauth_upgrades_once_real_metaplex() {
+fn generic_first_then_marketauth_upgrades_and_freezes_real_metaplex() {
     let mut env = setup_vault();
     real_metaplex(&mut env);
     let a = deposit(&mut env, 1_000 * U);
@@ -1159,42 +1251,40 @@ fn generic_first_then_marketauth_upgrades_once_real_metaplex() {
     let stranger = funded(&mut env);
     let before = wrapper_state(&env);
 
-    let lamports_before = env.svm.get_account(&stranger.pubkey()).unwrap().lamports;
+    let l0 = lamports(&env, &stranger.pubkey());
     let cu = name_generic(&mut env, &stranger).expect("generic by a stranger");
-    let cost = lamports_before - env.svm.get_account(&stranger.pubkey()).unwrap().lamports;
-    println!("tag 122 generic create: {cu} CU (whole tx); caller paid {cost} lamports (rent + Metaplex fee)");
+    let cost = l0 - lamports(&env, &stranger.pubkey());
+    println!("tag 122 generic create: {cu} CU (whole tx); caller paid {cost} lamports net (rent + Metaplex fee)");
+    assert_eq!(lamports(&env, &meta_payer_pda(&env)), 0, "the fee-payer PDA is drained back to the caller");
+    assert!(cost < 30_000_000, "the unused part of the 0.03 SOL funding came back");
     let r = record(&env);
     println!("generic: {r:?}");
-    assert_eq!(r.name, format!("Percolator Earn Share {}", &env.market.to_string()[..8]));
-    assert_eq!(r.symbol, "pEARN");
-    assert_eq!(r.uri, expected_uri(&env), "uri is exactly base + path + market");
-    assert!(r.is_mutable, "mutable: the registry PDA can still upgrade it");
+    assert_eq!(r, generic(&env));
 
-    // a second generic call, and a stranger's ticker call, change nothing
-    let e = name_generic(&mut env, &stranger).expect_err("generic over an existing record");
+    // a second generic call (already canonical), and a stranger's ticker call, change nothing
+    let e = name_generic(&mut env, &stranger).expect_err("already canonical");
     assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
-    let e = name_ticker(&mut env, &stranger, "USDC").expect_err("a stranger cannot upgrade");
+    let e = name_ticker(&mut env, &stranger, &stranger, "USDC").expect_err("a stranger cannot upgrade");
     assert!(e.contains(&custom(PercolatorError::Unauthorized)), "{e}");
     assert_eq!(record(&env), r);
 
-    // marketauth upgrades generic -> ticker
-    let lamports_before = env.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    let cu = name_ticker(&mut env, &admin, "BURNIE").expect("marketauth upgrade");
-    let cost = lamports_before - env.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    println!("tag 122 generic -> ticker update: {cu} CU (whole tx); marketauth paid {cost} lamports");
+    // marketauth upgrades generic -> ticker; a STRANGER pays the transaction, marketauth only signs
+    let (la, ls) = (lamports(&env, &admin.pubkey()), lamports(&env, &stranger.pubkey()));
+    let cu = name_ticker(&mut env, &stranger, &admin, "BURNIE").expect("marketauth upgrade");
+    println!("tag 122 mutable -> ticker update + freeze: {cu} CU (whole tx); payer delta {} lamports", ls - lamports(&env, &stranger.pubkey()));
+    assert_eq!(lamports(&env, &admin.pubkey()), la, "marketauth's lamports are untouched (R3)");
+    assert_eq!(lamports(&env, &stranger.pubkey()), ls, "the update moves no lamports at all (R4: no payer)");
     let r2 = record(&env);
     println!("ticker:  {r2:?}");
-    assert_eq!(r2.name, "BURNIE Earn Share - Percolator");
-    assert_eq!(r2.symbol, "peBURNIE");
-    assert_eq!(r2.uri, expected_uri(&env));
-    assert!(r2.is_mutable, "still mutable, update authority still the registry PDA (asserted in record())");
+    assert_eq!(r2, ticker_record(&env, "BURNIE"));
+    assert!(!r2.is_mutable, "frozen by the upgrade (R8)");
 
-    // once: no second ticker, no return to generic, by anyone
+    // final: no second ticker, no return to generic, by anyone
     for t in ["BURNIE", "USDC"] {
-        let e = name_ticker(&mut env, &admin, t).expect_err("a ticker record is final");
+        let e = name_ticker(&mut env, &admin, &admin, t).expect_err("a ticker record is final");
         assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
     }
-    let e = name_generic(&mut env, &admin).expect_err("no return to generic");
+    let e = name_generic(&mut env, &stranger).expect_err("generic cannot overwrite a ticker record (R7)");
     assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
     assert_eq!(record(&env), r2);
 
@@ -1202,53 +1292,191 @@ fn generic_first_then_marketauth_upgrades_once_real_metaplex() {
     assert_eq!(redeem(&mut env, &a, 999_999_000), 999_999_000, "shares still redeem 1:1");
 }
 
-/// Ticker first (the launch flow): the generic fallback can then not replace it.
+/// Ticker first (the launch flow): immutable from birth; the generic fallback cannot replace it.
 #[test]
 #[ignore = "needs MPL_TOKEN_METADATA_SO"]
-fn ticker_first_by_marketauth_then_nothing_else_real_metaplex() {
+fn ticker_first_is_immutable_from_birth_real_metaplex() {
     let mut env = setup_vault();
     real_metaplex(&mut env);
     let admin = env.admin.insecure_clone();
     let stranger = funded(&mut env);
     let before = wrapper_state(&env);
-    let lamports_before = env.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    let cu = name_ticker(&mut env, &admin, "ABCDEFGH").expect("ticker create, 8 characters");
-    let cost = lamports_before - env.svm.get_account(&admin.pubkey()).unwrap().lamports;
-    println!("tag 122 ticker create: {cu} CU (whole tx); marketauth paid {cost} lamports");
+    let (la, ls) = (lamports(&env, &admin.pubkey()), lamports(&env, &stranger.pubkey()));
+    // a third party pays, marketauth signs: marketauth is never the Metaplex payer
+    let cu = name_ticker(&mut env, &stranger, &admin, "ABCDEFGH").expect("ticker create, 8 characters");
+    println!("tag 122 ticker create: {cu} CU (whole tx); payer paid {} lamports net", ls - lamports(&env, &stranger.pubkey()));
+    assert_eq!(lamports(&env, &admin.pubkey()), la, "marketauth's lamports are untouched (R3)");
+    assert_eq!(lamports(&env, &meta_payer_pda(&env)), 0);
     let r = record(&env);
     println!("{r:?}");
-    assert_eq!(r.name, "ABCDEFGH Earn Share - Percolator");
-    assert_eq!(r.name.len(), 32, "the longest ticker fills Metaplex's name exactly");
+    assert_eq!(r, ticker_record(&env, "ABCDEFGH"));
+    assert_eq!(r.name.len(), 31);
     assert_eq!(r.symbol, "peABCDEFGH");
-    assert_eq!(r.uri, expected_uri(&env));
-    assert!(r.is_mutable);
+    assert!(!r.is_mutable, "immutable from birth (R8)");
     let e = name_generic(&mut env, &stranger).expect_err("generic cannot replace a ticker record");
     assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
-    let e = name_ticker(&mut env, &admin, "SOL").expect_err("a ticker cannot be changed");
+    let e = name_ticker(&mut env, &admin, &admin, "SOL").expect_err("a ticker cannot be changed");
     assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
     assert_eq!(record(&env), r);
     assert!(before == wrapper_state(&env));
     assert_eq!(lp_mint_state(&env).supply, 0, "works on an empty vault");
 }
 
-/// The creator calls a junk market's share "USDC": allowed (the ticker is unverified, like the
-/// market's name in the app), and the result still cannot read as USDC.
+/// R2: the caller marks the mint WRITABLE in the outer transaction. The create CPI still passes
+/// it read-only (the call succeeds only because the wrapper down-grades it; the mint's bytes
+/// and lamports do not change).
 #[test]
 #[ignore = "needs MPL_TOKEN_METADATA_SO"]
-fn a_usdc_ticker_still_carries_the_framing_real_metaplex() {
+fn mint_marked_writable_by_the_caller_is_still_untouched_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    let mint_before = env.svm.get_account(&env.lp_mint).unwrap();
+    let mut accts = metadata_accounts(&env, stranger.pubkey(), None);
+    accts[2] = AccountMeta::new(env.lp_mint, false); // writable in the outer tx
+    accts[1] = AccountMeta::new(env.registry, false); // and the registry too
+    let reg_before = env.svm.get_account(&env.registry).unwrap();
+    send_meta(&mut env, meta_ix(""), accts, &[&stranger]).expect("generic with a writable mint in the outer tx");
+    assert_eq!(record(&env), generic(&env));
+    let (m, r) = (env.svm.get_account(&env.lp_mint).unwrap(), env.svm.get_account(&env.registry).unwrap());
+    assert!(m.data == mint_before.data && m.lamports == mint_before.lamports && m.owner == mint_before.owner, "mint untouched");
+    assert!(r.data == reg_before.data && r.lamports == reg_before.lamports && r.owner == reg_before.owner, "registry untouched");
+    let ms = lp_mint_state(&env);
+    assert_eq!((ms.supply, ms.mint_authority, ms.freeze_authority, ms.decimals), (0, COption::Some(env.registry), COption::None, 6));
+}
+
+/// Overwrite name / symbol / uri bytes of the stored record in place (same lengths), as a
+/// stand-in for "a record this program did not write".
+fn tamper(env: &mut Env, f: impl FnOnce(&mut Vec<u8>)) {
+    let k = metadata_pda(&env.lp_mint);
+    let mut a = env.svm.get_account(&k).unwrap();
+    f(&mut a.data);
+    env.svm.set_account(k, a).unwrap();
+}
+
+/// A Metaplex-owned `MetadataV1` written from scratch for this mint: what a third party with
+/// Metaplex's seed-authority path would leave behind (mutable, update authority = the mint
+/// authority, i.e. the registry PDA), with hostile content.
+fn plant_foreign_record(env: &mut Env, update_authority: Pubkey, is_mutable: bool) {
+    let mut d = vec![4u8];
+    d.extend_from_slice(update_authority.as_ref());
+    d.extend_from_slice(env.lp_mint.as_ref());
+    for f in [&b"USD Coin"[..], b"USDC", b"https://evil.example/usdc.json"] {
+        d.extend_from_slice(&(f.len() as u32).to_le_bytes());
+        d.extend_from_slice(f);
+    }
+    d.extend_from_slice(&500u16.to_le_bytes()); // seller fee
+    d.push(0); // creators: None
+    d.push(0); // primary_sale_happened
+    d.push(is_mutable as u8);
+    d.resize(607, 0);
+    let k = metadata_pda(&env.lp_mint);
+    env.svm
+        .set_account(k, Account { lamports: 15_115_600, data: d, owner: MPL_TOKEN_METADATA_PROGRAM_ID, executable: false, rent_epoch: 0 })
+        .unwrap();
+}
+
+/// R6: a record that exists but is not ours in content (mutable, update authority = registry)
+/// is REPAIRED by the permissionless call instead of blocking the name for ever; an
+/// already-canonical record is a clean refusal.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn a_foreign_mutable_record_is_repaired_by_anyone_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    // (1) planted from scratch, hostile content
+    let reg_key = env.registry;
+    plant_foreign_record(&mut env, reg_key, true);
+    let l0 = lamports(&env, &stranger.pubkey());
+    let cu = name_generic(&mut env, &stranger).expect("anyone repairs a foreign mutable record");
+    println!("tag 122 repair of a foreign record: {cu} CU; payer delta {} lamports", l0 - lamports(&env, &stranger.pubkey()));
+    assert_eq!(record(&env), generic(&env), "canonical generic content, still mutable");
+    let e = name_generic(&mut env, &stranger).expect_err("already canonical: clean refusal");
+    assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
+    // (2) a canonical record whose bytes are changed afterwards: each field alone triggers repair
+    // (an UPDATE makes Metaplex pad name / symbol / uri with NULs to 32 / 10 / 200 bytes, so
+    // the field offsets are walked, not assumed; the program's reader ignores the padding)
+    for (what, field) in [("name", 0usize), ("symbol", 1), ("uri", 2)] {
+        tamper(&mut env, |d| {
+            let mut o = 65usize;
+            for _ in 0..field {
+                o += 4 + u32::from_le_bytes(d[o..o + 4].try_into().unwrap()) as usize;
+            }
+            d[o + 4] = b'X';
+        });
+        assert_ne!(record(&env), generic(&env), "{what} tampered");
+        name_generic(&mut env, &stranger).unwrap_or_else(|e| panic!("repair after {what} tamper: {e}"));
+        assert_eq!(record(&env), generic(&env), "{what} repaired");
+    }
+    // (3) marketauth can take a foreign mutable record straight to the ticker form
+    let reg_key = env.registry;
+    plant_foreign_record(&mut env, reg_key, true);
+    let admin = env.admin.insecure_clone();
+    name_ticker(&mut env, &stranger, &admin, "SOL").expect("marketauth names over a foreign record");
+    assert_eq!(record(&env), ticker_record(&env, "SOL"));
+}
+
+/// R6 limits: a record that is frozen, or whose update authority is not the registry PDA, is
+/// not ours to change. Nothing is signed for it (and the program fails closed, it does not
+/// hand the registry PDA's signature to Metaplex).
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn a_frozen_or_foreign_authority_record_is_left_alone_real_metaplex() {
+    let admin_of = |e: &Env| e.admin.insecure_clone();
+    for (authority_is_registry, is_mutable) in [(true, false), (false, true), (false, false)] {
+        let mut env = setup_vault();
+        real_metaplex(&mut env);
+        let stranger = funded(&mut env);
+        let admin = admin_of(&env);
+        let ua = if authority_is_registry { env.registry } else { Pubkey::new_unique() };
+        plant_foreign_record(&mut env, ua, is_mutable);
+        let before = env.svm.get_account(&metadata_pda(&env.lp_mint)).unwrap().data;
+        let e = name_generic(&mut env, &stranger).expect_err("not repairable");
+        assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
+        let e = name_ticker(&mut env, &stranger, &admin, "SOL").expect_err("not nameable");
+        assert!(e.contains(&custom(PercolatorError::AlreadyInitialized)), "{e}");
+        assert!(before == env.svm.get_account(&metadata_pda(&env.lp_mint)).unwrap().data);
+    }
+}
+
+/// Lamports parked on the fee-payer PDA by a third party do not block naming; they go to the
+/// caller with the rest of the remainder.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn lamports_parked_on_the_fee_pda_do_not_block_real_metaplex() {
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    let pp = meta_payer_pda(&env);
+    env.svm.airdrop(&pp, 5_000_000).unwrap();
+    let l0 = lamports(&env, &stranger.pubkey());
+    name_generic(&mut env, &stranger).expect("generic with a pre-funded fee PDA");
+    assert_eq!(lamports(&env, &pp), 0);
+    assert_eq!(l0 - lamports(&env, &stranger.pubkey()), 15_115_600 - 5_000_000, "net cost = Metaplex's charge minus the parked lamports");
+    assert_eq!(record(&env), generic(&env));
+}
+
+/// The creator calls a junk market's share "USDC": allowed (the ticker is unverified, like the
+/// market's name in the app). The result leads with the framing and cannot read as USDC.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO"]
+fn a_usdc_ticker_still_carries_the_leading_framing_real_metaplex() {
     let mut env = setup_vault();
     real_metaplex(&mut env);
     let admin = env.admin.insecure_clone();
-    name_ticker(&mut env, &admin, "USDC").expect("unverified ticker");
+    name_ticker(&mut env, &admin, &admin, "USDC").expect("unverified ticker; payer == marketauth is allowed");
     let r = record(&env);
-    assert_eq!(r.name, "USDC Earn Share - Percolator");
+    assert_eq!(r.name, format!("Percolator Earn USDC {}", &env.market.to_string()[..6]));
     assert_eq!(r.symbol, "peUSDC");
     assert_ne!(r.symbol, "USDC");
-    assert!(r.name.ends_with(" Earn Share - Percolator") && r.symbol.starts_with("pe"));
+    assert!(r.name.starts_with("Percolator Earn ") && r.symbol.starts_with("pe"));
+    // what a wallet that truncates to 12 characters shows
+    assert_eq!(&r.name[..12], "Percolator E");
 }
 
 /// The launch flow: tag 74 and tag 122 (ticker) in ONE transaction with the one signer tag 74
-/// already needs.
+/// already needs (the creator pays and is marketauth).
 #[test]
 #[ignore = "needs MPL_TOKEN_METADATA_SO"]
 fn create_vault_and_name_it_in_one_transaction_real_metaplex() {
@@ -1268,11 +1496,10 @@ fn create_vault_and_name_it_in_one_transaction_real_metaplex() {
             AccountMeta::new_readonly(env.collateral_mint, false),
         ],
     );
-    let name = (meta_ix("SOL"), metadata_accounts(&env, admin.pubkey(), true));
+    let name = (meta_ix("SOL"), metadata_accounts(&env, admin.pubkey(), Some(admin.pubkey())));
     let cu = send(&mut env.svm, env.program_id, &payer, vec![create, name], &[&admin]).expect("74 + 122 in one tx");
     println!("tag 74 + tag 122 (ticker) in one transaction: {cu} CU");
-    let r = record(&env);
-    assert_eq!((r.name.as_str(), r.symbol.as_str()), ("SOL Earn Share - Percolator", "peSOL"));
+    assert_eq!(record(&env), ticker_record(&env, "SOL"));
     assert_eq!(lp_mint_state(&env).decimals, 6);
 }
 

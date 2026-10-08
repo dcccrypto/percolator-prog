@@ -27,65 +27,79 @@ Instruction data is unchanged. The account list gains a 7th entry:
 
 ## Tag 122 `InitLpShareMetadata`: the share token's name, symbol and uri
 
-One instruction, two forms, selected by the ticker length.
+One instruction, two forms, selected by the ticker length. It is deliberately NOT part of
+tag 74: creating a market never depends on the Metaplex program (security review R11).
 
 Data: `[122][n: u8][n ticker bytes]`, `n` in `0..=8`. The length byte is mandatory (`[122]`
 alone is refused), `n > 8` and trailing bytes are refused at decode.
 
 | # | account | flags |
 |---|---|---|
-| 0 | payer; for `n > 0` this MUST be `config.marketauth` | signer, writable |
-| 1 | LP vault registry PDA | readonly |
-| 2 | LP share mint PDA | readonly |
+| 0 | payer: funds the record. Anyone. Never handed to Metaplex | signer, writable |
+| 1 | LP vault registry PDA `["lp_vault", market]` | readonly |
+| 2 | LP share mint PDA `["lp_vault_mint", market]` | readonly |
 | 3 | Metaplex metadata PDA `["metadata", metaqbxx..., mint]` under the Token Metadata program | writable |
 | 4 | Metaplex Token Metadata program `metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s` | |
 | 5 | system program | |
-| 6 | the market, **only for `n > 0`** (read for `marketauth`; never passed to Metaplex) | readonly |
+| 6 | fee-payer PDA `["lp_share_meta_payer", mint]` under the wrapper | writable |
+| 7 | the market, **only for `n > 0`** (read for `marketauth`; never passed to Metaplex) | readonly |
+| 8 | `config.marketauth`, **only for `n > 0`** (never passed to Metaplex) | signer |
+
+`[0]` and `[8]` may be the same wallet (the launch flow: the creator pays and is marketauth).
 
 ### What is written
 
 | | generic form (`n == 0`) | ticker form (`n > 0`) |
 |---|---|---|
-| who | anyone | `config.marketauth` of this market, signing as `[0]` |
-| name | `Percolator Earn Share ` + first 8 base58 characters of the market address | `TICKER` + ` Earn Share - Percolator` |
-| symbol | `pEARN` | `pe` + `TICKER` |
+| who | anyone | `config.marketauth` of this market signs as `[8]` |
+| name | `Percolator Earn Share ` + first 8 base58 characters of the market address (30 bytes) | `Percolator Earn ` + `TICKER` + ` ` + first 6 base58 characters of the market address (max 31 bytes) |
+| symbol | `pEARN` | `pe` + `TICKER` (max 10 bytes) |
 | uri | `<BASE>/api/earn-share/<market address, base58>` | the same |
+| `is_mutable` | **true** | **false** (frozen at birth, or by the upgrade) |
 
-Examples (devnet build):
+Worked examples at the MAXIMUM ticker length (8), devnet build, two markets that both chose
+`1000PEPE`:
 
 ```text
-market Azagguvr... , ticker SOL
-  name   SOL Earn Share - Percolator
-  symbol peSOL
-  uri    https://play.percolator.trade/api/earn-share/Azagguvr...(full address)
+market Azagguvr... (full address A), ticker 1000PEPE
+  name   Percolator Earn 1000PEPE Azaggu          (31 bytes)
+  symbol pe1000PEPE                               (10 bytes)
+  uri    https://play.percolator.trade/api/earn-share/<A>
 
-market BeumQKPd... , ticker BURNIE
-  name   BURNIE Earn Share - Percolator
-  symbol peBURNIE
-  uri    https://play.percolator.trade/api/earn-share/BeumQKPd...(full address)
+market BeumQKPd... (full address B), ticker 1000PEPE
+  name   Percolator Earn 1000PEPE BeumQK          (31 bytes)
+  symbol pe1000PEPE                               (10 bytes)
+  uri    https://play.percolator.trade/api/earn-share/<B>
 
-market BeumQKPd... , nobody authorised ever named it (generic)
-  name   Percolator Earn Share BeumQKPd
-  symbol pEARN
-  uri    https://play.percolator.trade/api/earn-share/BeumQKPd...(full address)
+market BeumQKPd..., ticker BURNIE:  Percolator Earn BURNIE BeumQK / peBURNIE
+market BeumQKPd..., never named by its creator (generic):
+  name   Percolator Earn Share BeumQKPd / symbol pEARN / same uri
 ```
 
-Fixed for both: seller fee 0, no creators, `is_mutable = true`, update authority = the registry
-PDA.
+Fixed for both: seller fee 0, no creators, no collection, update authority = the registry PDA.
+
+### Name layout and spoofing (security review R9)
+
+* **The framing leads.** Every name starts with `Percolator Earn `, so a wallet that truncates
+  the name shows `Percolator E…`, never `USDC Earn Sh…`. The symbol always starts with
+  lowercase `pe`; a ticker is uppercase and digits only, so a share symbol can never equal a
+  ticker. The caller cannot remove or reorder any of it.
+* **The market fragment stays in the name.** Two markets with the same ticker get different
+  names (the last 6 characters). They get the SAME symbol: `pe` + an 8-character ticker fills
+  Metaplex's 10 bytes, so there is no room for a fragment there. The fragment is a
+  disambiguator, not proof of authenticity (6 base58 characters can be ground).
+* **The ticker is chosen by the market creator and is NOT verified**, exactly like the market's
+  name in the app. The creator of a junk market can call its share `USDC`; the result reads
+  `Percolator Earn USDC <market>` / `peUSDC`. No reserved-word list is used: it would not be
+  sufficient protection.
+* `Share` is dropped from the ticker form to make room: `Percolator Earn Share ` (22) + an
+  8-character ticker (8) leaves 2 of Metaplex's 32 bytes, not enough for a market fragment.
 
 ### Ticker rules
 
 * 1 to 8 bytes, each `A-Z` or `0-9`. Anything else (lowercase, space, `.`, `-`, `$`, NUL,
   non-ASCII) is refused with `InvalidInstruction` (Custom 9).
-* 8 is the hard limit: Metaplex allows a 10-byte symbol (`pe` + 8). With 8 the name is exactly
-  Metaplex's 32 bytes. This is also why the separator is ` - ` and not ` · `: `·` is two bytes
-  in UTF-8 and an 8-character ticker would make the name 33.
-* **The ticker is chosen by the market creator and is NOT verified**, exactly like the market's
-  name in the app. The creator of a junk market can call its share `USDC`. What the caller
-  cannot do is remove the framing: the name always ends in ` Earn Share - Percolator`, the
-  symbol always starts with lowercase `pe` (a ticker is uppercase and digits only, so a share
-  symbol can never equal a ticker), and the uri takes no caller input. A reserved-word list is
-  deliberately not used: it would not be sufficient protection.
+* 8 is the hard limit: Metaplex allows a 10-byte symbol (`pe` + 8).
 * The app's own symbol limit is 20 characters of `[A-Za-z0-9._-]` (`app/lib/market-metadata.ts`
   `SYMBOL_MAX_LEN`, `origin/playground`). The client must reduce it before sending: uppercase,
   drop every character outside `A-Z 0-9`, keep the first 8; if nothing is left, send the
@@ -93,74 +107,115 @@ PDA.
 
 ### Who may set the ticker, and why
 
-`config.marketauth`, read live from the market account passed at `[6]` (which must be the
-registry's own market and owned by this program). It is the signer tag 74 already requires to
-create the vault, so the launch flow sends 74 and 122 with the one signer it already has (proven
-in one transaction). It is also the only party the program knows that speaks for the market: it
-already sets the market's parameters and can pause or close the vault. If `marketauth` is later
-handed to a keyless address, nobody can set a ticker any more; the generic form remains
-available to everyone.
+`config.marketauth`, read live from the market account at `[7]` (which must be the registry's
+own market, `registry.market_group`, and owned by this program), signing as `[8]`. It is the
+signer tag 74 already requires to create the vault, so the launch flow sends 74 and 122 with
+the one signer it already has (proven in one transaction). It is the only party the program
+knows that speaks for the market. If `marketauth` is later handed to a keyless address, nobody
+can set a ticker any more; the generic form remains available to everyone. The app must
+therefore name the share in the launch flow.
 
-### State machine (no wrapper account is written; the record itself is the state)
+### State machine (no wrapper account is written; the Metaplex record is the state)
+
+"Ours" = the metadata PDA is owned by the Metaplex program, is a `MetadataV1` for this mint,
+and its update authority is the registry PDA.
 
 | record before | `n == 0` (anyone) | `n > 0` (marketauth) |
 |---|---|---|
-| none | create GENERIC | create TICKER |
-| GENERIC | refused, `AlreadyInitialized` (Custom 2) | **update to TICKER, once** |
-| TICKER | refused, `AlreadyInitialized` | refused, `AlreadyInitialized` |
+| none | create GENERIC (mutable) | create TICKER (immutable) |
+| ours, mutable, exactly the generic content | refused, `AlreadyInitialized` (Custom 2) | update to TICKER and freeze |
+| ours, mutable, any other content | **rewritten to GENERIC** | update to TICKER and freeze |
+| ours, immutable | refused, `AlreadyInitialized` | refused, `AlreadyInitialized` |
+| not ours (other update authority, other mint, unparseable) | refused, `AlreadyInitialized` | refused, `AlreadyInitialized` |
 
-* The permissionless fallback means a vault is never stuck as "Unknown Token", and it can never
-  lock the proper name out: marketauth can still upgrade a generic record.
-* "Once" is enforced by reading the Metaplex record: the upgrade is signed only if the record is
-  a `MetadataV1` for this mint, its update authority is the registry PDA and its name is still
-  this market's generic name. After the upgrade the name is the ticker form, so a second call
-  is refused. An unrecognised layout is treated as "not generic" (no update is signed).
+* A permissionless generic record can never lock out the authorised name (R7), and the generic
+  call can never overwrite a ticker record: a ticker record is immutable, and the latch is
+  Metaplex's own `is_mutable` flag, not something inferred from the name (R8).
+* **A record somebody else created is repaired, not fatal (R6).** Metaplex's source has a
+  seed-authority path that lets a Metaplex-held key create metadata for any SPL mint that has
+  none: mutable, update authority = the mint authority, i.e. our registry PDA. Such a record,
+  or one whose content was changed, is rewritten to the generic content by ANY caller, or taken
+  straight to the ticker form by marketauth. A record that is immutable, or whose update
+  authority is not the registry PDA, cannot be changed by this program at all; the share then
+  keeps whatever that record says (cosmetic; no instruction of this program reads it).
 * A ticker cannot be changed, and a ticker record cannot go back to generic.
+* An update makes Metaplex pad name / symbol / uri with NUL bytes to 32 / 10 / 200; readers
+  must trim trailing NULs (the program's own reader does).
 
-### Mutability
+### Mutability (security review R8) — FOUNDER DECISION
 
-The record is created **mutable**, with the registry PDA as update authority.
+Built as the reviewer recommended: **generic records are mutable, ticker records are
+immutable** (created with `is_mutable = false`, or frozen by the upgrade with
+`is_mutable = Some(false)`).
 
-* Only this program can sign for the registry PDA, and the only update it signs is the
-  generic -> ticker upgrade above. There is no instruction that changes a ticker record.
-* What mutability adds to the Metaplex CPI: one more call shape, `UpdateMetadataAccountV2`,
-  which receives ONLY the metadata PDA (writable) and the registry PDA (signer). That is less
-  than the create call (which also carries the payer and the system program). No mint, token
-  program, token account, market or ledger is passed in either call.
-* A hostile upgrade of the Metaplex program: it OWNS every metadata account, so it could rewrite
-  any record whatever the `is_mutable` flag says; the flag is enforced by Metaplex itself.
-  Immutability would therefore not have protected the name against that program, and
-  mutability gives it nothing new: with the registry PDA's signature it still cannot mint, burn
-  or move shares (the mint is read-only in create and absent in update; no token program is in
-  the call), cannot touch wrapper state (not passed; A -> B -> A reentrancy is refused by the
-  runtime), and in create can at most spend the caller's own lamports.
-* What it buys: the uri base is a compile-time constant. If the domain ever has to change, a
-  later program upgrade can add a narrowly scoped update path (registry PDA signs) and correct
-  existing records. With immutable records that would be impossible. Today no such path exists.
-* The trade: "the name can never change" is a property of this program's code (and of whoever
-  holds its upgrade authority), not of the Metaplex record.
+| | freeze on ticker (built) | mutable for ever |
+|---|---|---|
+| "a ticker is set once" | enforced by Metaplex's own flag | inferred from record content, which a hostile Metaplex upgrade can forge |
+| a later program upgrade can correct the uri base of named records | **no, never** | yes (a new, narrow update path signed by the registry PDA) |
+| a later program upgrade can rename a named share | no | yes (so "the name cannot change" would rest on this program's upgrade authority) |
 
-### URI
+The cost of the built form: **once a share is named with a ticker, its uri can never be
+corrected**. The base domain in the build is then a permanent trust anchor (below). Switching
+to "mutable for ever" is two booleans in `handle_init_lp_share_metadata` plus the content
+latch; say so before the release is cut.
+
+The update authority is the registry PDA in every case and is never reassigned
+(`new_update_authority = None`, pinned byte-exact). `is_mutable = false` blocks data changes
+only; Metaplex would still let the update authority be reassigned, but only this program can
+sign for the registry PDA and it has no instruction that does.
+
+### What Metaplex is given (security review R1-R5), and the exposure (R11)
+
+| | create (`CreateMetadataAccountV3`, ix 33) | update (`UpdateMetadataAccountV2`, ix 15) |
+|---|---|---|
+| program | pinned by key to `metaqbxx...`; discriminators are compile-time constants | same |
+| accounts | metadata PDA (w), mint (**read-only**, whatever the outer tx says), registry PDA (signer), fee-payer PDA (signer, w), registry PDA, system program | **exactly two**: metadata PDA (w), registry PDA (read-only signer) |
+| never passed | the caller's wallet, marketauth, any token program, token account, market, ledger, escrow | the same, and no payer, no mint |
+| data | `DataV2`, seller fee 0, creators / collection / uses `None` | `Some(DataV2)` as left, `new_update_authority = None`, `primary_sale_happened = None`, `is_mutable = None` or `Some(false)` |
+
+* **No user signature and no privileged signature ever enters a Metaplex CPI (R3).** The
+  wrapper moves `LP_SHARE_META_FUND_LAMPORTS` (0.03 SOL) from the caller to the fee-payer PDA
+  with a System Program CPI, lets Metaplex charge the PDA (today 15,115,600 lamports: rent for
+  607 bytes + Metaplex's create fee), and returns the remainder to the caller in the same
+  instruction. The PDA ends at 0 lamports. marketauth signs the wrapper instruction only.
+* **Exposure if the Metaplex program is upgraded to something hostile:** it can write a wrong
+  record for the share token (it owns every metadata account anyway) and keep the lamports in
+  the fee-payer PDA for that one call (at most 0.03 SOL plus anything a third party parked
+  there). That is all: it cannot mint, burn, move or re-authorise shares (the mint is read-only
+  and no token program is in the call), cannot touch wrapper state (nothing of ours is passed
+  writable; A -> B -> A reentrancy is refused by the runtime), and cannot reach the caller's or
+  marketauth's wallet. The exposure is cosmetic plus that bounded fee.
+* Bindings (R5): the registry must be owned by this program, of kind LP-vault-registry and the
+  current version, and equal to the PDA derived from its own `market_group`; the mint must
+  equal BOTH the PDA derived from that market and `registry.lp_mint` (a mint whose authority
+  merely happens to be the registry PDA is refused); the metadata PDA and the fee-payer PDA
+  are derived on chain.
+
+### URI (security review R10)
 
 `LP_SHARE_URI_BASE + "/api/earn-share/" + base58(market)`, built on chain, no caller input,
-at most 88 bytes (limit 200).
+at most `LP_SHARE_URI_MAX_LEN` bytes (const-asserted `<= 200`; 89 on devnet, 84 on mainnet).
 
 | build | constant | value |
 |---|---|---|
 | `--features devnet` | `lp_share_meta_v22::LP_SHARE_URI_BASE_DEVNET` | `https://play.percolator.trade` |
 | default (mainnet) | `lp_share_meta_v22::LP_SHARE_URI_BASE_MAINNET` | `https://percolator.trade` (**FOUNDER DECISION**: the builder's default; confirm before a mainnet build) |
 
-Both are pinned by the unit test `uri_bases_are_pinned`.
+* Both are pinned by the unit test `uri_bases_are_pinned`. `scripts/check-mainnet-sbf.sh`
+  fails unless the mainnet base string is in the `.so` and the devnet one is not.
+* **The domain is a permanent trust anchor.** Whoever controls it controls the name, image and
+  link wallets show for every share token, and for ticker records it can never be changed.
+  Holding the domain indefinitely is part of the decision.
 
 ### The JSON the app must serve (not built here)
 
 `GET <BASE>/api/earn-share/<market>` -> `200`, `Content-Type: application/json`,
 `Access-Control-Allow-Origin: *`, no authentication, cacheable (suggest
-`Cache-Control: public, max-age=300`). `<market>` is the market (slab) address in base58.
+`Cache-Control: public, max-age=300`).
 
 ```json
 {
-  "name": "BURNIE Earn Share - Percolator",
+  "name": "Percolator Earn BURNIE BeumQK",
   "symbol": "peBURNIE",
   "description": "Share of the Earn vault of the BURNIE market on Percolator (market BeumQKPd...). The ticker is set by the market creator and is not verified by Percolator.",
   "image": "https://play.percolator.trade/api/earn-share/BeumQKPd.../image",
@@ -172,15 +227,19 @@ Both are pinned by the unit test `uri_bases_are_pinned`.
 }
 ```
 
-* `name` and `symbol` MUST be read from the on-chain Metaplex record (PDA
-  `["metadata", metaqbxx..., lp_vault_mint(market)]`), not from the app database, so the JSON
-  never disagrees with what the chain says. If the record does not exist yet, return the
-  generic form (`Percolator Earn Share <first 8>`, `pEARN`).
+* **Validate the path parameter**: it must decode as a 32-byte base58 public key, and the LP
+  vault registry PDA `["lp_vault", market]` under the wrapper must exist and be owned by the
+  wrapper; otherwise `404`. Never echo the raw parameter into the response.
+* **Build the response from chain state, not from the app database**: `name` and `symbol` are
+  read from the Metaplex record (PDA `["metadata", metaqbxx..., lp_vault_mint(market)]`, NUL
+  padding trimmed), and only if that record's update authority is the registry PDA and its
+  mint is the share mint. If there is no such record, return the generic form
+  (`Percolator Earn Share <first 8>`, `pEARN`).
 * `image`: `GET <BASE>/api/earn-share/<market>/image` -> a square PNG (512 x 512): the market
   token's logo with a Percolator badge in a corner; when the token has no logo, the Percolator
-  mark alone. It must be a stable URL (wallets cache by URL).
+  mark alone. A stable URL (wallets cache by URL). The token logo is creator-supplied content:
+  serve it re-encoded from our own origin, never as a redirect to a third-party URL.
 * `external_url`: the market's Earn page, `<BASE>/earn/<market>`.
-* Unknown market (no LP vault registry for that address): `404`.
 * The route must keep working for as long as share tokens exist, for both forms, on the host
   named by the build's base constant.
 
