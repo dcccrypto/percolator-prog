@@ -27804,6 +27804,7 @@ pub mod processor {
         now_slot: u64,
         observation_hints: &[CrankObservationHint],
         max_market_slots: usize,
+        s10_refresh_budget: bool,
     ) -> ProgramResult {
         // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation). Full rewrite: the caller
         // no longer picks the action/asset -- it supplies a bounded set of raw-evidence hints and
@@ -27859,6 +27860,14 @@ pub mod processor {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            // S10: the engine's Refresh crank grants itself the unclaimed-backing move budget
+            // (2 firings, about 33k CU each). The tag-5 crank keeps it. The tag-77 redemption
+            // runs its refreshes inline as a prelude (two 14-leg refreshes are about 1.25M CU,
+            // A6) and has no compute to spare, so it denies the grant; a move left pending there
+            // is made by the next tag-5 refresh crank of any leg of the asset.
+            if !s10_refresh_budget {
+                group.deny_s10_budget();
+            }
             // FIX F-05 (register row C-W-04, PRESERVED VERBATIM): a market in Recovery has
             // exactly ONE bounded public step left -- release the remaining obligation, then the
             // value-neutral transition to Resolved. The engine's escalation valve
@@ -28686,6 +28695,7 @@ pub mod processor {
             now_slot,
             observation_hints.as_slice(),
             max_market_slots,
+            true,
         )
     }
 
@@ -29712,6 +29722,7 @@ pub mod processor {
                     0,
                     &hint,
                     max_market_slots,
+                    false, // S10: a redemption's inline refreshes carry no move budget
                 ) {
                     Ok(()) => {}
                     Err(e) if e == ProgramError::from(PercolatorError::EngineNonProgress) => {}
@@ -32613,6 +32624,14 @@ pub mod processor {
         } else {
             cur.saturating_sub(atoms)
         };
+        // S10: the engine's provider-principal mirror follows the vault-owned counter through the
+        // engine's single setter (an Earn / LP-vault pot's principal must never be moved by the
+        // unclaimed-backing rebalance); every pot funding and draw reaches this function.
+        let num = atoms
+            .checked_mul(BOUND_SCALE)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        percolator::adjust_slot_provider_principal(&mut market.engine, domain % 2 == 1, num, add)
+            .map_err(map_v16_error)?;
         state::vault_pot_owned_to_wrapper_bytes(&mut market.wrapper[..], domain % 2, next)
     }
 

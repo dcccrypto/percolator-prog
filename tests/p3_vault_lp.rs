@@ -4756,3 +4756,259 @@ fn v22_n7_band_off_lagged_market_keeps_the_keeper_paths_alive() {
     }
     env.assert_conserved("band-off lagged keeper paths");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// S10 re-review cb568a4f, finding 1: the engine's provider-principal mirror must follow EVERY
+// Earn / LP-vault pot funding and draw (the wrapper's inline helpers), not only tag 50.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+const S10_SC: u128 = percolator::BOUND_SCALE;
+
+/// (engine mirror in atoms, wrapper vault-owned counter in atoms) of pot `domain` (asset 0).
+fn s10_mirror_and_owned(env: &Env, domain: usize) -> (u128, u128) {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let mirror = if domain == 0 { eng.provider_principal_long.get() } else { eng.provider_principal_short.get() };
+    let owned = state::vault_pot_owned_from_wrapper_bytes(&group.markets[0].wrapper[..], domain % 2).unwrap();
+    (mirror / S10_SC, owned)
+}
+
+fn s10_assert_mirror(env: &Env, what: &str) {
+    for d in 0..2 {
+        let (m, o) = s10_mirror_and_owned(env, d);
+        assert_eq!(m, o, "{what}: pot {d}: engine provider mirror {m} != wrapper vault-owned {o}");
+    }
+}
+
+/// Fresh backing and the engine mirror of pot `domain`, in atoms.
+fn s10_fresh(env: &Env, domain: usize) -> u128 {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let b = if domain == 0 { eng.backing_long } else { eng.backing_short };
+    b.try_to_runtime().unwrap().fresh_unliened_backing_num / S10_SC
+}
+
+#[test]
+fn s10_every_pot_funding_and_draw_drives_the_mirror() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    s10_assert_mirror(&env, "after bind");
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 10_000_000, Some(lp.portfolio)).expect("earn deposit (tag 75)");
+    s10_assert_mirror(&env, "after tag 75 deposit");
+    let (m, _) = s10_mirror_and_owned(&env, 0);
+    let (m1, _) = s10_mirror_and_owned(&env, 1);
+    assert!(m + m1 > 0, "the Earn deposit is provider principal in the mirror (a mutant that skips the setter leaves 0)");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior tranche deposit");
+    s10_assert_mirror(&env, "after junior tranche deposit");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    s10_assert_mirror(&env, "after fills");
+    env.crank_fees(true).expect("fee crank");
+    s10_assert_mirror(&env, "after the fee crank");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 5_000_000, Some(lp.portfolio)).expect("second deposit");
+    s10_assert_mirror(&env, "after the second deposit");
+    let sh = env.lp_shares(&d2);
+    env.earn_request(&d2, sh);
+    env.earn_execute(&d2, Some(lp.portfolio)).expect("redemption (tag 77)");
+    s10_assert_mirror(&env, "after the redemption draw");
+    let sh1 = env.lp_shares(&d1);
+    env.earn_request(&d1, sh1);
+    env.earn_execute(&d1, Some(lp.portfolio)).expect("redemption of the genesis depositor");
+    s10_assert_mirror(&env, "after the last redemption");
+}
+
+/// A forced deficit in the opposite domain must never take the pot's principal: loser cash is
+/// poked into the pot beside the Earn principal, a claim shortfall into the sibling domain, and the
+/// refresh crank (the only entry point with a move budget) runs; the pot keeps at least its owned
+/// principal and the Earn withdrawal still succeeds.
+#[test]
+fn s10_forced_deficit_never_moves_earn_pot_principal() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 50_000_000, Some(lp.portfolio)).expect("earn deposit");
+    s10_assert_mirror(&env, "funded");
+    let (own0, own1) = (s10_mirror_and_owned(&env, 0).1, s10_mirror_and_owned(&env, 1).1);
+    let pot = if own0 >= own1 { 0usize } else { 1 };
+    let principal = s10_mirror_and_owned(&env, pot).1;
+    assert!(principal > 0);
+    // poke: 5M of loser cash in the pot, 40M of unbacked claims in the other domain
+    {
+        let mut acct = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, mut group) = state::market_view_mut(&mut acct.data).unwrap();
+            let l = 5_000_000u128 * S10_SC;
+            let c = 40_000_000u128 * S10_SC;
+            {
+                let e = &mut group.markets[0].engine;
+                let (src, bk, os) = if pot == 0 {
+                    (&mut e.source_credit_long, &mut e.backing_long, &mut e.source_credit_short)
+                } else {
+                    (&mut e.source_credit_short, &mut e.backing_short, &mut e.source_credit_long)
+                };
+                let mut b = bk.try_to_runtime().unwrap();
+                b.fresh_unliened_backing_num += l;
+                *bk = percolator::BackingBucketV16Account::from_runtime(&b);
+                let mut s = src.try_to_runtime().unwrap();
+                s.fresh_reserved_backing_num += l;
+                s.credit_rate_num = percolator::CREDIT_RATE_SCALE;
+                *src = percolator::SourceCreditStateV16Account::from_runtime(&s);
+                let mut o = os.try_to_runtime().unwrap();
+                o.positive_claim_bound_num += c;
+                o.credit_rate_num = (o.fresh_reserved_backing_num * percolator::CREDIT_RATE_SCALE) / o.positive_claim_bound_num;
+                *os = percolator::SourceCreditStateV16Account::from_runtime(&o);
+            }
+            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(group.header.source_fresh_backing_total_num.get() + l);
+            group.header.source_claim_bound_total_num = percolator::V16PodU128::new(group.header.source_claim_bound_total_num.get() + c);
+            group.header.pnl_pos_bound_tot_num = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() + c);
+            group.header.pnl_pos_bound_tot = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() / S10_SC);
+            group.header.vault = percolator::V16PodU128::new(group.header.vault.get() + 5_000_000);
+        }
+        env.svm.set_account(env.market, acct).unwrap();
+    }
+    let before = s10_fresh(&env, pot);
+    let r = env.crank(lp.portfolio);
+    println!("S10POT crank result {r:?}");
+    let after = s10_fresh(&env, pot);
+    println!("S10POT principal {principal} fresh before {before} after {after}");
+    assert!(after >= principal, "the pot's principal was moved: fresh {after} < owned {principal}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10 round 4: the engine mirror against the WRAPPER LEDGER principal.
+//
+// `s10_assert_mirror` above compares the engine mirror with the vault-owned counter, and both are
+// moved by the same helper (`vault_pot_owned_adjust`), so a wrong SIGN at one call site moves
+// both the same way and that comparison still passes (reviewer mutant W2: the redemption adjust
+// flipped). The ledger's `total_principal_atoms` is written by different code, so comparing with
+// it catches a call site that drives the mirror the wrong way.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn s10_ledger_principal(env: &Env, key: Pubkey) -> u128 {
+    env.svm
+        .get_account(&key)
+        .and_then(|a| state::read_backing_domain_ledger(&a.data).ok())
+        .map(|l| l.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+/// Engine mirror == wrapper ledger principal for both pots (and == the vault-owned counter).
+/// Returns the two principals so a caller can assert a step really changed something.
+fn s10_assert_mirror_equals_ledger(env: &Env, what: &str) -> (u128, u128) {
+    let (m0, o0) = s10_mirror_and_owned(env, 0);
+    let (m1, o1) = s10_mirror_and_owned(env, 1);
+    let (l0, l1) = (s10_ledger_principal(env, env.ledger), s10_ledger_principal(env, env.sibling));
+    println!("S10LEDGER {what}: mirror ({m0},{m1}) ledger principal ({l0},{l1}) owned ({o0},{o1})");
+    assert_eq!((m0, m1), (l0, l1), "{what}: engine mirror != wrapper ledger principal");
+    assert_eq!((m0, m1), (o0, o1), "{what}: engine mirror != vault-owned counter");
+    (l0, l1)
+}
+
+/// Bind, tag-75 deposit, junior deposit, real fills, fee crank, second deposit and two
+/// redemptions (tag 77, lower the pots): after every step the engine mirror equals the ledger
+/// principal of each pot. Kills the "redemption adjust sign flipped" mutant.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_the_earn_lifecycle() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    s10_assert_mirror_equals_ledger(&env, "bind");
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 10_000_000, Some(lp.portfolio)).expect("deposit");
+    let a = s10_assert_mirror_equals_ledger(&env, "deposit 1");
+    assert!(a.0 + a.1 >= 10_000_000, "vacuity: the deposit is pot principal");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    s10_assert_mirror_equals_ledger(&env, "junior deposit");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    s10_assert_mirror_equals_ledger(&env, "fills");
+    env.crank_fees(true).expect("fee crank");
+    s10_assert_mirror_equals_ledger(&env, "fee crank");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 5_000_000, Some(lp.portfolio)).expect("deposit 2");
+    let after_recall = s10_assert_mirror_equals_ledger(&env, "deposit 2");
+    let sh = env.lp_shares(&d2);
+    env.earn_request(&d2, sh);
+    env.earn_execute(&d2, Some(lp.portfolio)).expect("redeem 2");
+    let after_r2 = s10_assert_mirror_equals_ledger(&env, "redeem 2");
+    assert!(after_r2.0 + after_r2.1 < after_recall.0 + after_recall.1, "vacuity: the redemption drew pot principal");
+    let sh1 = env.lp_shares(&d1);
+    env.earn_request(&d1, sh1);
+    env.earn_execute(&d1, Some(lp.portfolio)).expect("redeem 1");
+    s10_assert_mirror_equals_ledger(&env, "redeem 1");
+}
+
+/// Resolved wind-down past `settle_resolved`: the settle refills a senior shortfall into the
+/// pot, the settled vault LP is deregistered, the junior's terminal sweep (tag 102) draws its
+/// residual, and the Earn holder's Resolved redemption empties the pot. The mirror equals the
+/// ledger principal after every step.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_the_resolved_wind_down() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    poke_senior_claim(&mut env, 13_000_000);
+    let before = s10_assert_mirror_equals_ledger(&env, "before resolve");
+    env.resolve();
+    s10_assert_mirror_equals_ledger(&env, "resolved");
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    let settled = s10_assert_mirror_equals_ledger(&env, "settle_resolved");
+    assert!(settled.0 + settled.1 > before.0 + before.1, "vacuity: the settle returned the vault LP's payout to the pots");
+    let (pid_, seq, epoch) = env.identity(lp.portfolio);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::ClosePortfolio { portfolio_id: pid_, expected_sequence: seq, position_epoch: epoch },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(lp.portfolio, false),
+        ],
+        &[&admin],
+    )
+    .expect("terminal cleanup of the settled vault LP");
+    s10_assert_mirror_equals_ledger(&env, "vault LP deregistered");
+    let swept = env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    let after_sweep = s10_assert_mirror_equals_ledger(&env, "junior terminal sweep");
+    println!("S10LEDGER junior swept {swept:?}");
+    assert!(after_sweep.0 + after_sweep.1 < settled.0 + settled.1, "vacuity: the junior sweep drew pot principal");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.earn_execute(&d, Some(lp.portfolio)).expect("resolved redemption");
+    let end = s10_assert_mirror_equals_ledger(&env, "resolved Earn redemption");
+    assert!(end.0 + end.1 < after_sweep.0 + after_sweep.1, "vacuity: the resolved redemption drew pot principal");
+}
+
+/// The recall path (tag 98): a senior liquidity shortfall (STATE POKE, see `poke_senior_claim`)
+/// lets anyone move junior capital into the pot. The recalled amount is pot principal: mirror,
+/// ledger and vault-owned counter all rise by it, and the seniors' redemption afterwards keeps
+/// them equal.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_a_recall() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 30_000_000).expect("junior");
+    let before = s10_assert_mirror_equals_ledger(&env, "before recall");
+    poke_senior_claim(&mut env, 14_000_000);
+    env.recall(lp.portfolio, 4_000_000, DOMAIN).expect("recall exactly the shortfall");
+    let after = s10_assert_mirror_equals_ledger(&env, "recall");
+    assert_eq!(after.0 + after.1, before.0 + before.1 + 4_000_000, "vacuity: the recall added pot principal");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.earn_execute(&d, Some(lp.portfolio)).expect("redeem after the recall");
+    let end = s10_assert_mirror_equals_ledger(&env, "redeem after recall");
+    assert!(end.0 + end.1 < after.0 + after.1, "vacuity: the redemption drew pot principal");
+}

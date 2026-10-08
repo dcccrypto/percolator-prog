@@ -2457,3 +2457,28 @@ fn v22_only_the_bound_vault_lp_is_the_exempt_maker() {
     assert_eq!(env.pos(lp.account), -5 * Q);
     env.assert_conservation();
 }
+
+/// S10 CU probe: tag 106 (`handle_settle_holding_rent`) is the second production entry point that
+/// runs the engine's Refresh crank, so it carries the S10 move budget. Prints the cost of the
+/// trader settle and of the vault-LP settle; the same probe on the base tree gives the delta.
+#[test]
+fn s10_cu_settle_holding_rent() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let taker = env.trader(1_000 * USD);
+    env.trade_cpi(&taker.0, taker.1, &lp, 800 * Q).expect("crowd open");
+    for _ in 0..100 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(taker.1);
+    }
+    env.warp(1);
+    env.push(PRICE);
+    let cu_taker = env.settle_rent(taker.1, lp.account).expect("tag 106, taker");
+    env.warp(1);
+    env.push(PRICE);
+    let cu_lp = env.settle_rent(lp.account, lp.account).expect("tag 106, vault LP");
+    println!("S10RENT tag 106 settle_holding_rent: taker {cu_taker} CU, vault LP {cu_lp} CU");
+    assert!(cu_taker < 400_000 && cu_lp < 400_000, "tag 106 stays far inside the budget even with two firings (+66k)");
+}
