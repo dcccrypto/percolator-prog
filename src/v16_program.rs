@@ -803,12 +803,13 @@ pub mod constants {
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
     pub const REDEMPTION_REFRESH_MAX: u8 = 8;
     /// Security review A6: the inline refresh is also LEG-weighted. One refresh costs ~85k CU
-    /// fixed plus ~32k CU per active leg it re-certifies (measured: 1 leg ~117k, 14 legs ~530k;
+    /// fixed plus ~32k CU per active leg it re-certifies (measured at the old 14-leg cap: 1 leg ~117k, 14 legs ~530k; the cap is now 4, so the largest weight is 7;
     /// the 77 itself ~60k). Weight of a refreshed portfolio = `REDEMPTION_REFRESH_BASE_WEIGHT +
     /// legs`, and the sum must be <= `REDEMPTION_REFRESH_WEIGHT_BUDGET` (34 units), so a 77 stays
     /// under ~1.3M CU and never exhausts the 1.4M meter. Measured with the budget check included:
     /// 8 single-leg (32 units) 1,016,434 CU; 2 x 14-leg (34 units) 1,204,159 CU; 3 x 14-leg (51)
-    /// is refused up front (InvalidInstruction).
+    /// is refused up front (InvalidInstruction). Those 14-leg figures are historical: with the cap at 4 a
+    /// 4-leg refresh weighs 7 and the budget admits 4 of them (28 units); see the S10-X1 ledger.
     pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
     /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
     /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
@@ -852,7 +853,25 @@ pub mod constants {
     // one portfolio may only carry the largest active-leg count that fits the
     // audited stale-trade and crank CU envelope. Additional markets remain
     // usable through separate portfolios.
-    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 14;
+    //
+    // S10-X1 (2026-10-08): the cap is set by the heaviest known single-crank shape, not by the
+    // engine array size (16). A multi-leg account with claims in both domains of every asset that
+    // then takes a loss on every leg ("2n-domain reversal") settles in ONE crank that costs about
+    // 170k CU per leg: 852,933 CU at 4 legs, 1,021,598 at 5, 1,191,006 at 6, 1,361,375 at 7 and
+    // it fails (ProgramFailedToComplete, deterministically) at 8; a plain reversal costs
+    // 1,158,113 at 8 and fails at 10. The stranded-backing hook adds up to 66k CU to a refresh
+    // crank. 4 legs with REAL liens and a REAL ADL event (the heaviest legitimately constructible shape)
+    // settles in 960,331 CU; + 66k for #287 = 1,026,331 (26.7% headroom under 1.4M; 233,669 under the
+    // 1.26M 10% line). 5 legs with liens + ADL settles in 1,184,471 (+66k leaves 10.7%: do not offer),
+    // 6 legs 1,360,918, 8 is unsettleable. The gate is
+    // `v22_bpf_worst_case_*` in tests/v16_cu.rs. Raising the cap needs a new measurement of every
+    // shape listed there and an engine-side bound on per-crank settle work.
+    // This is the ONLY place the number lives: `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS` is derived.
+    pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 4;
+    /// Active-leg count from which a trade on a stale portfolio is refused (EngineStale) until a
+    /// crank has refreshed it (S10-X1 round 2, N1). Derived from the cap: cap - 1 (3 at cap 4);
+    /// TradeCpi adds a matcher CPI, so 3 is the safer value. Was a literal 8, dead at cap 4.
+    pub const WRAPPER_PRE_CRANK_MIN_LEGS: u32 = if WRAPPER_MAX_PORTFOLIO_ASSETS > 1 { WRAPPER_MAX_PORTFOLIO_ASSETS as u32 - 1 } else { 1 };
 
     // Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of
     // surviving positions at admission"): the wrapper's own self-imposed cap on how many
@@ -860,7 +879,8 @@ pub mod constants {
     // across BOTH accounts touched by the trade/batch. Deliberately tighter than the
     // engine's hard `PORTFOLIO_SOURCE_DOMAIN_CAP` (32) array bound -- this is a wrapper
     // liveness guard, not the engine's own overflow backstop. Byte-identical value to
-    // upstream's `WRAPPER_MAX_PORTFOLIO_ASSETS * 2` (14 * 2 = 28 on both forks).
+    // upstream's formula `WRAPPER_MAX_PORTFOLIO_ASSETS * 2`; the VALUE differs from upstream and from this fork's
+    // earlier 28 because the cap is now 4 (S10-X1): 8 domains per trade-admission pass.
     pub const WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS: usize = WRAPPER_MAX_PORTFOLIO_ASSETS as usize * 2;
 
     // ── Protocol-fee program change ─────────────────────────────────────
@@ -19168,7 +19188,7 @@ pub mod processor {
     /// UPSTREAM DIVERGENCE, deliberate: aeyakovenko/percolator-prog still has 16. The product
     /// budget itself came FROM upstream (91129168 "Cap batch CPI matcher tail fanout"), so this
     /// defect exists there too and no upstream branch bounds the leg count. Worth sending back.
-    const MATCHER_BATCH_MAX_LEGS: usize = 11;
+    const MATCHER_BATCH_MAX_LEGS: usize = if constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize > 11 { 11 } else { constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize };
     // W4 [HIGH]: legs.len()<=16 and tail.len()<=32 are each bounded independently, but their
     // PRODUCT (up to 512) is not -- a batch with many legs AND a full matcher tail multiplies
     // per-leg tail-account validation/CPI-account-resolution work, blowing the CU budget before
@@ -40911,7 +40931,7 @@ pub mod processor {
         // Avoid the pathological 2N stale-leg settlement cliff. Smaller stale
         // portfolios remain engine-handled so first-open and normal UX are not
         // blocked by conservative wrapper currentness heuristics.
-        if percolator::active_bitmap_count_ones(active_bitmap) < 8 {
+        if percolator::active_bitmap_count_ones(active_bitmap) < constants::WRAPPER_PRE_CRANK_MIN_LEGS {
             return Ok(());
         }
         if portfolio.header.b_stale_state != 0 {

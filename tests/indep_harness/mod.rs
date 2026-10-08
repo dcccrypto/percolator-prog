@@ -427,6 +427,13 @@ impl Default for V16CuMarketParams {
     }
 }
 
+/// A refused InitMarket (S10-X1): the error string and whether the market account is unchanged.
+#[derive(Debug)]
+pub struct InitRefusal {
+    pub error: String,
+    pub market_unchanged: bool,
+}
+
 impl V16CuEnv {
     pub fn new() -> Self {
         Self::new_with_market_params_and_price_move(1, 10_000, 10_000, 10_000)
@@ -465,6 +472,15 @@ impl V16CuEnv {
     }
 
     pub fn new_with_init_params(params: V16CuMarketParams) -> Self {
+        match Self::try_new_with_init_params(params) {
+            Ok(env) => env,
+            Err(refusal) => panic!("init market: {}", refusal.error),
+        }
+    }
+
+    /// Fallible form (S10-X1): InitMarket's error string and whether the market account was left
+    /// byte-identical, instead of a panic.
+    pub fn try_new_with_init_params(params: V16CuMarketParams) -> Result<Self, InitRefusal> {
         // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`. Fixtures
         // that study sub-floor chunk dynamics (B-settlement chunking, the C-7 immediate-Recovery
         // path) init at the floor and then set the requested chunk by a test-only STATE POKE of
@@ -476,7 +492,7 @@ impl V16CuEnv {
                 ..params
             });
             env.poke_public_b_chunk_atoms(params.public_b_chunk_atoms);
-            return env;
+            return Ok(env);
         }
         let mut svm = LiteSVM::new();
         let program_id = harness_program_id();
@@ -523,7 +539,7 @@ impl V16CuEnv {
                 data: vec![
                     0u8;
                     state::market_account_len_for_capacity(
-                        params.max_portfolio_assets as usize
+                        (params.max_portfolio_assets as usize).clamp(1, 16)
                     )
                     .unwrap()
                 ],
@@ -534,7 +550,8 @@ impl V16CuEnv {
         )
         .unwrap();
 
-        send_tx(
+        let market_before = svm.get_account(&market).map(|a| a.data).unwrap_or_default();
+        let init_result = send_tx(
             &mut svm,
             program_id,
             &payer,
@@ -568,8 +585,14 @@ impl V16CuEnv {
                 AccountMeta::new_readonly(mint, false),
             ],
             &[&admin],
-        )
-        .unwrap_or_else(|e| {
+        );
+        if let Err(e) = &init_result {
+            if !e.contains("InvalidAccountData") {
+                let market_after = svm.get_account(&market).map(|a| a.data).unwrap_or_default();
+                return Err(InitRefusal { error: e.clone(), market_unchanged: market_before == market_after });
+            }
+        }
+        init_result.unwrap_or_else(|e| {
             // v2.2: name the fixture skew instead of a bare InvalidAccountData. The account is
             // sized from THIS library; a wrapper .so built from another layout refuses it.
             if e.contains("InvalidAccountData") {
@@ -585,7 +608,7 @@ impl V16CuEnv {
             }
             panic!("init market: {e}")
         });
-        Self {
+        Ok(Self {
             svm,
             program_id,
             payer,
@@ -598,7 +621,7 @@ impl V16CuEnv {
                 params.max_portfolio_assets as usize,
             )
             .unwrap(),
-        }
+        })
     }
 
     pub fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {

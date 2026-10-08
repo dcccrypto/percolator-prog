@@ -5217,7 +5217,7 @@ fn v16_wrapper_existing_portfolio_with_growth_capacity_survives_market_append() 
 #[test]
 fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
     let mut admin = signer();
-    let mut market = market_account_with_capacity(14);
+    let mut market = market_account_with_capacity(percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize);
     init_market_with_ix(
         &mut admin,
         &mut market,
@@ -5227,16 +5227,16 @@ fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
             }
         }),
     );
 
-    assert_eq!(state::market_slot_capacity(&market.data).unwrap(), 14);
+    assert_eq!(state::market_slot_capacity(&market.data).unwrap(), percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize);
     let (_, group) = state::read_market(&market.data).unwrap();
-    assert_eq!(group.config.max_market_slots, 14);
+    assert_eq!(group.config.max_market_slots, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as u32);
 
-    let mut too_small = market_account_with_capacity(13);
+    let mut too_small = market_account_with_capacity(percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize - 1);
     let mut mint = mint_account();
     let res = run_ix(
         init_market_ix_with(|ix| {
@@ -5245,7 +5245,7 @@ fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
             }
         }),
         &mut [&mut admin, &mut too_small, &mut mint],
@@ -13737,7 +13737,7 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
                 *max_trading_fee_bps = 10_000;
                 *max_price_move_bps_per_slot = 10_000;
             }
@@ -13747,20 +13747,20 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
         &mut admin,
         &mut market,
         processor::ASSET_ACTION_ACTIVATE,
-        14,
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
         1,
         100,
     )
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
-            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
-            asset_index: 14,
+            market_id: state::read_market_trade_preflight(&market.data, (percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS) as usize).unwrap().3,
+            asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             now_slot: 1,
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
-            observation_sequence: state::read_asset_control_sequences(&market.data, 14)
+            observation_sequence: state::read_asset_control_sequences(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize)
                 .unwrap()
                 .oracle_observation
                 + 1,
@@ -13777,12 +13777,12 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
     run_ix(
 Instruction::PermissionlessCrank {
             now_slot: 2,
-            observations: vec![CrankObservationHint { asset_index: 14, oracle_accounts: 0 }],
+            observations: vec![CrankObservationHint { asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS, oracle_accounts: 0 }],
         },
         &mut [&mut cranker, &mut market, &mut crank_account],
     )
     .unwrap();
-    let before_profile = state::read_asset_oracle_profile(&market.data, 14).unwrap();
+    let before_profile = state::read_asset_oracle_profile(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize).unwrap();
     assert_eq!(before_profile.mark_ewma_e6, 100);
     assert_eq!(before_profile.mark_ewma_last_slot, 1);
 
@@ -13792,8 +13792,8 @@ Instruction::PermissionlessCrank {
             account_a_position_epoch: portfolio_identity(&long_account).2,
             account_b_portfolio_id: portfolio_identity(&short_account).0,
             account_b_position_epoch: portfolio_identity(&short_account).2,
-            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
-            asset_index: 14,
+            market_id: state::read_market_trade_preflight(&market.data, (percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS) as usize).unwrap().3,
+            asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             size_q: POS_SCALE as i128,
             exec_price: 200,
             fee_bps: 0,
@@ -13810,7 +13810,7 @@ Instruction::PermissionlessCrank {
     .unwrap();
 
     let base_profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
-    let after_profile = state::read_asset_oracle_profile(&market.data, 14).unwrap();
+    let after_profile = state::read_asset_oracle_profile(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize).unwrap();
     assert_eq!(base_profile.oracle_mode, ORACLE_MODE_MANUAL);
     assert_eq!(
         after_profile.mark_ewma_e6, 150,
