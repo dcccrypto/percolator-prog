@@ -164,6 +164,11 @@ pub struct World {
     pub minted_by: std::collections::BTreeMap<Pubkey, u128>,
     /// Security MEDIUM on 5e4c15ff: an NFT-escrowed (tag 72) winner. See `escrow_portfolio`.
     pub escrow: Option<EscrowSweep>,
+    /// S10 (stranded-backing repair): rebuild the legacy #175 orphan at the LAST Live moment,
+    /// after the wind-down's own refresh cranks and immediately before `ResolveMarket`, instead of
+    /// before the wind-down. `Some(moved)` after the wind-down. See `inject_legacy_175_orphan`.
+    pub legacy_orphan_at_resolve: bool,
+    pub legacy_orphan_moved: Option<u128>,
 }
 
 /// An escrowed portfolio `u` whose Position NFT is held by `holder`. `sweep`: whether the
@@ -265,6 +270,8 @@ impl World {
             p3: None,
             minted_by: Default::default(),
             escrow: None,
+            legacy_orphan_at_resolve: false,
+            legacy_orphan_moved: None,
         };
         // LP = last portfolio: big deposit + passive matcher (kind 0, spread 0).
         let lp_idx = N_USERS;
@@ -1491,6 +1498,9 @@ impl World {
         // 78/87 before any ResolveMarket"). FUZZ_P3_PRECRANK=0 reproduces F-12 instead.
         if self.p3.is_some() && std::env::var("FUZZ_P3_PRECRANK").map_or(true, |v| v != "0") {
             self.p3_prep();
+        }
+        if self.legacy_orphan_at_resolve {
+            self.legacy_orphan_moved = Some(inject_legacy_175_orphan(self));
         }
         if self.do_resolve().is_err() {
             *self.stats.err.entry("winddown_resolve".into()).or_default() += 1;
@@ -4587,6 +4597,14 @@ fn diluted_receipt_run(fee: u64, plain: bool, ops: &[Op]) -> (Result<(), String>
 /// the header fresh total ±4,875, plus epoch counters and u1's cert, which the wind-down
 /// re-certifies. It is a no-op on the deployed engine, where d1 is already Empty. Returns the
 /// atoms moved.
+///
+/// S10 (2026-10-08): with the stranded-backing repair a Live refresh crank that completes the
+/// cohort moves the sibling domain's claimant-less loser cash into d1's shortfall, so an orphan
+/// injected BEFORE the wind-down's Live cranks is repaired, the winner is paid in full and no
+/// receipt opens (`p3_legacy_orphan_injected_while_live_is_repaired_by_the_refresh_crank`). The
+/// receipt-reservation tests therefore inject it at the last Live moment
+/// (`World::legacy_orphan_at_resolve`): the market resolves with the orphan in place and the
+/// Resolved close repairs nothing, which is the legacy state these tests protect.
 fn inject_legacy_175_orphan(w: &mut World) -> u128 {
     let bs = percolator::BOUND_SCALE;
     let original = w.env.svm.get_account(&w.env.market).expect("market");
@@ -4654,10 +4672,11 @@ fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
         let _ = w.apply(op);
         w.check().expect("invariants");
     }
-    let moved = inject_legacy_175_orphan(&mut w);
-    assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
+    w.legacy_orphan_at_resolve = true;
     let r = w.wind_down();
     std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
+    let moved = w.legacy_orphan_moved.expect("vacuity: the wind-down reached the resolve step");
+    assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
     let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0) as u128;
     let haircut = *w.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0);
     eprintln!("{label} (no sweep): {:?} open receipt owed {owed} haircut {haircut} residual {}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()), w.claim_free_residual());
@@ -4665,6 +4684,37 @@ fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
     assert!(owed > 0, "vacuity: the receipt is still open without the sweep");
     assert_eq!(haircut, 0, "the open remainder stays reserved (not a haircut)");
     assert!(w.claim_free_residual() >= owed, "reserved: residual {} >= owed {owed}", w.claim_free_residual());
+}
+
+/// S10 behaviour change, pinned: the SAME legacy orphan injected while the market is still Live
+/// (before the wind-down's refresh cranks, which is where the two tests above injected it until
+/// the stranded-backing repair) no longer leaves an open receipt. A refresh crank that completes
+/// the cohort moves the sibling domain's claimant-less loser cash into d1's shortfall, the
+/// winner's claim is backed and its Resolved close pays it in full (base: 1,340/1,341 atoms short
+/// and a receipt left open). Dust-level Resolved payout change versus the base engine.
+#[test]
+fn p3_legacy_orphan_injected_while_live_is_repaired_by_the_refresh_crank() {
+    let _g = ANVIL_ENV.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("ANVIL_NO_KEEPER_TOPUP", "1");
+    std::env::set_var("FUZZ_P3", "1");
+    std::env::remove_var("FUZZ_LP_DOMAINS");
+    std::env::set_var("FUZZ_P3_PRECRANK", "1");
+    let (label, fee, _, ops) = diluted_receipt_cases().into_iter().next().unwrap();
+    let mut w = World::new(fee);
+    for op in &ops {
+        let _ = w.apply(op);
+        w.check().expect("invariants");
+    }
+    let moved = inject_legacy_175_orphan(&mut w);
+    assert_eq!(moved, 4_875, "vacuity: the orphan was injected (d1 had 4,875 of fresh backing)");
+    let r = w.wind_down();
+    std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
+    let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0);
+    let haircut = *w.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0);
+    eprintln!("{label} (orphan injected Live, no sweep): {:?} owed {owed} haircut {haircut} residual {}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()), w.claim_free_residual());
+    r.expect("seniors and junior exit");
+    assert_eq!(owed, 0, "the Live refresh crank repaired the orphan: the winner is paid in full, no receipt stays open");
+    assert_eq!(haircut, 0, "nobody is haircut");
 }
 
 /// E1 acceptance (#175 source reclass): on a market that never ran the pre-E1 engine, the eedb
@@ -4781,8 +4831,7 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
         w.check().expect("invariants");
     }
     if mode == EscrowMode::SweepOnceThenIdle {
-        let moved = inject_legacy_175_orphan(&mut w);
-        assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
+        w.legacy_orphan_at_resolve = true;
     }
     let u = 1usize;
     let pf = w.env.portfolio_state(w.ports[u]);
@@ -4804,6 +4853,10 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     let original_owner = w.owners[u].pubkey();
     let owner_before = w.holdings_of(&original_owner);
     let r = w.wind_down();
+    if mode == EscrowMode::SweepOnceThenIdle {
+        let moved = w.legacy_orphan_moved.expect("vacuity: the wind-down reached the resolve step");
+        assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
+    }
     let holder_got = w.holdings_of(&holder);
     let owner_got = w.holdings_of(&original_owner).saturating_sub(owner_before);
     let c = w.p3.as_ref().unwrap();

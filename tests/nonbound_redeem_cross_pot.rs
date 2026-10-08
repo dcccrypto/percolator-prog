@@ -1172,3 +1172,52 @@ fn h1b_third_party_cannot_execute_someone_elses_77() {
         .expect("control: the redeemer's own 77 pays");
     assert!(token_amount(&env.svm, v.dest) > 0);
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10 round 4: engine provider-principal mirror == wrapper LEDGER principal on the non-bound
+// (two-pot) vault: tag 91 rebalance in both directions, physical consumption of a pot, and a
+// cross-pot redemption. The ledger is written by code other than `vault_pot_owned_adjust`, so a
+// call site that drives the mirror the wrong way is caught here.
+// ─────────────────────────────────────────────────────────────────────────────
+fn s10_mirror_atoms(env: &Env, domain: u16) -> u128 {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[(domain / 2) as usize].engine;
+    let m = if domain % 2 == 0 { eng.provider_principal_long.get() } else { eng.provider_principal_short.get() };
+    m / BOUND_SCALE
+}
+
+fn s10_mirror_equals_ledger(env: &Env, v: &Vault, what: &str) -> (u128, u128) {
+    let m = (s10_mirror_atoms(env, DOMAIN), s10_mirror_atoms(env, SIBLING_DOMAIN));
+    let lp = |k: Pubkey| {
+        env.svm
+            .get_account(&k)
+            .and_then(|a| state::read_backing_domain_ledger(&a.data).ok())
+            .map(|l| l.total_principal_atoms)
+            .unwrap_or(0)
+    };
+    let l = (lp(v.ledger), lp(v.sibling_ledger));
+    println!("S10LEDGER {what}: mirror {m:?} ledger principal {l:?}");
+    assert_eq!(m, l, "{what}: engine mirror != wrapper ledger principal");
+    l
+}
+
+#[test]
+fn s10_mirror_equals_ledger_principal_through_rebalance_consumption_and_cross_pot_redemption() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 2_000_000_000, DOMAIN);
+    deposit(&mut env, &v, 500_000_000, SIBLING_DOMAIN);
+    assert_eq!(s10_mirror_equals_ledger(&env, &v, "deposits"), (2_000_000_000, 500_000_000));
+    rebalance(&mut env, &v, DOMAIN, SIBLING_DOMAIN, 300_000_000).expect("tag 91 d0 -> d1");
+    assert_eq!(s10_mirror_equals_ledger(&env, &v, "tag 91 d0 -> d1"), (1_700_000_000, 800_000_000));
+    rebalance(&mut env, &v, SIBLING_DOMAIN, DOMAIN, 100_000_000).expect("tag 91 d1 -> d0");
+    assert_eq!(s10_mirror_equals_ledger(&env, &v, "tag 91 d1 -> d0"), (1_800_000_000, 700_000_000));
+    consume_pot_backing(&mut env, SIBLING_DOMAIN, 50_000_000);
+    let before = s10_mirror_equals_ledger(&env, &v, "physical consumption");
+    let shares = token_amount(&env.svm, v.lp_ata) as u128;
+    request(&mut env, &v, shares / 2);
+    execute(&mut env, &v, DOMAIN).expect("redemption");
+    let after = s10_mirror_equals_ledger(&env, &v, "redemption");
+    assert!(after.0 + after.1 < before.0 + before.1, "vacuity: the redemption drew pot principal");
+}
