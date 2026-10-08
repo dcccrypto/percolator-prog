@@ -847,12 +847,18 @@ pub mod constants {
     // 170k CU per leg: 852,933 CU at 4 legs, 1,021,598 at 5, 1,191,006 at 6, 1,361,375 at 7 and
     // it fails (ProgramFailedToComplete, deterministically) at 8; a plain reversal costs
     // 1,158,113 at 8 and fails at 10. The stranded-backing hook adds up to 66k CU to a refresh
-    // crank. 4 legs leaves 918,933 CU worst case (34% headroom under the 1.4M budget, 10% rule
-    // = 1,260,000); 5 leaves 22%, 6 is borderline, 8 is unsettleable. The gate is
+    // crank. 4 legs with REAL liens and a REAL ADL event (the heaviest legitimately constructible shape)
+    // settles in 960,331 CU; + 66k for #287 = 1,026,331 (26.7% headroom under 1.4M; 233,669 under the
+    // 1.26M 10% line). 5 legs with liens + ADL settles in 1,184,471 (+66k leaves 10.7%: do not offer),
+    // 6 legs 1,360,918, 8 is unsettleable. The gate is
     // `v22_bpf_worst_case_*` in tests/v16_cu.rs. Raising the cap needs a new measurement of every
     // shape listed there and an engine-side bound on per-crank settle work.
     // This is the ONLY place the number lives: `WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS` is derived.
     pub const WRAPPER_MAX_PORTFOLIO_ASSETS: u16 = 4;
+    /// Active-leg count from which a trade on a stale portfolio is refused (EngineStale) until a
+    /// crank has refreshed it (S10-X1 round 2, N1). Derived from the cap: cap - 1 (3 at cap 4);
+    /// TradeCpi adds a matcher CPI, so 3 is the safer value. Was a literal 8, dead at cap 4.
+    pub const WRAPPER_PRE_CRANK_MIN_LEGS: u32 = if WRAPPER_MAX_PORTFOLIO_ASSETS > 1 { WRAPPER_MAX_PORTFOLIO_ASSETS as u32 - 1 } else { 1 };
 
     // Sync unit w1-s3 (upstream `cf0ce5d3`/`7a3a6f30`, "reserve latent domains of
     // surviving positions at admission"): the wrapper's own self-imposed cap on how many
@@ -18918,7 +18924,7 @@ pub mod processor {
     /// UPSTREAM DIVERGENCE, deliberate: aeyakovenko/percolator-prog still has 16. The product
     /// budget itself came FROM upstream (91129168 "Cap batch CPI matcher tail fanout"), so this
     /// defect exists there too and no upstream branch bounds the leg count. Worth sending back.
-    const MATCHER_BATCH_MAX_LEGS: usize = 11;
+    const MATCHER_BATCH_MAX_LEGS: usize = if constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize > 11 { 11 } else { constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize };
     // W4 [HIGH]: legs.len()<=16 and tail.len()<=32 are each bounded independently, but their
     // PRODUCT (up to 512) is not -- a batch with many legs AND a full matcher tail multiplies
     // per-leg tail-account validation/CPI-account-resolution work, blowing the CU budget before
@@ -40101,7 +40107,7 @@ pub mod processor {
         // Avoid the pathological 2N stale-leg settlement cliff. Smaller stale
         // portfolios remain engine-handled so first-open and normal UX are not
         // blocked by conservative wrapper currentness heuristics.
-        if percolator::active_bitmap_count_ones(active_bitmap) < 8 {
+        if percolator::active_bitmap_count_ones(active_bitmap) < constants::WRAPPER_PRE_CRANK_MIN_LEGS {
             return Ok(());
         }
         if portfolio.header.b_stale_state != 0 {

@@ -3573,7 +3573,7 @@ fn wedge_negative_control_residual_below_chunk_stays_live() {
 }
 
 /// A6 round 2: two 14-leg portfolios that are LIQUIDATABLE after an asset-0 drop (a 100-token
-/// asset-0 long + 13 x 10-token legs on $25 capital, asset 0 down 15%). One inline refresh is
+/// asset-0 long + (cap-1) x 10-token legs on $25 capital, asset 0 down 15%). One inline refresh is
 /// one bounded crank, so each refresh liquidates (at most one leg) on top of re-certifying 14
 /// legs: the heaviest refresh the budget admits (2 x 17 = 34 units).
 #[test]
@@ -3983,14 +3983,14 @@ fn a6_cap_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
             assert_eq!(g.assets[a].lifecycle, percolator::AssetLifecycleV16::Active, "asset {a} in service");
         }
     }
-    // counterparty for assets 1..13
+    // counterparty for assets 1..cap
     let cp_owner = Keypair::new();
     r.env.svm.airdrop(&cp_owner.pubkey(), 10_000_000_000).unwrap();
     let cp = r.env.create_portfolio(&cp_owner);
     r.env.deposit(&cp_owner, cp, 100_000_000_000);
     let q: i128 = 10 * percolator::POS_SCALE as i128;
     let mut tr = vec![];
-    // one tag 5 on the counterparty with every asset hinted: accrues all 14 assets to now
+    // one tag 5 on the counterparty with every asset hinted: accrues all cap assets to now
     let crank_all = |r: &mut Replay| {
         let payer = r.env.payer.pubkey();
         let market = r.env.market;
@@ -4024,10 +4024,10 @@ fn a6_cap_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
         tr.push(p);
     }
     let lp = r.lp;
-    walk_only(&mut r, 1_020_000, &[lp]); // asset 0 moves: the 8 traders are stale on it
+    walk_only(&mut r, 1_020_000, &[lp]); // asset 0 moves: the traders are stale on it
     r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
     r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
-    // accrue assets 1..13 in THIS slot (one tag 5 on the counterparty with every hint)
+    // accrue assets 1..cap in THIS slot (one tag 5 on the counterparty with every hint)
     crank_all(&mut r);
     let three = r.execute_77(&h, Some((1, tr.clone())), false);
     assert!(
@@ -4115,7 +4115,7 @@ fn a6_liquidating_refreshes_cu(legs: &[u16]) -> u64 {
 
 /// Strengthened per the security ruling: THREE liquidating cap-leg refreshes (3 x 7 = 21 units) + the 77.
 #[test]
-fn a6_two_liquidating_cap_leg_refreshes_cu() {
+fn a6_three_liquidating_cap_leg_refreshes_cu() {
     let cap = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
     let cu = a6_liquidating_refreshes_cu(&[cap, cap, cap]);
     eprintln!("A6-LIQ 3 x cap-leg: {cu} CU");

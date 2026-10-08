@@ -12806,6 +12806,7 @@ fn cu_consumed_from_err(err: &str) -> String {
     }
 }
 
+// S10-X1: rebuilt at the wrapper leg cap; the pre-crank guard (`WRAPPER_PRE_CRANK_MIN_LEGS` = cap - 1) engages again, so EngineStale with bytes unchanged is asserted as in the original.
 // FIX E-CU-R. This test was `v16_bpf_stale_full_14_leg_tradenocpi_is_under_tx_limit` and asserted
 // `trade_cu <= 1_400_000` for a 14-leg stale `TradeNoCpi`. It reached that path only because
 // `seed_n_leg_position_for_benchmark` zeroed `active_bitmap_at_cert` on both portfolios, which
@@ -12825,14 +12826,8 @@ fn cu_consumed_from_err(err: &str) -> String {
 //   * `v16_bpf_full_14_leg_refresh_crank_is_under_tx_limit`        <=   900,000
 //   * `v16_bpf_full_14_leg_liquidation_crank_is_under_tx_limit`    <= 1,375,000
 // and the refresh crank is the bounded second instruction this refusal points the client at.
-// S10-X1: rebuilt for the wrapper leg cap. The original asserted that a STALE 13/14-leg portfolio is
-// refused (EngineStale) before the matcher CPI / the CU cliff. That guard
-// (`ensure_trade_portfolio_current_for_requests_view`) only engages from 8 active legs
-// (`active_bitmap_count_ones < 8` returns early), and with the cap at 4 no portfolio can reach it, so the
-// refusal can no longer be produced. What the guard protected is the 1.4M budget; the rebuilt test pins
-// that: the same stale shapes at cap-1 / cap legs now execute inside the 10% rule.
 #[test]
-fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
+fn v16_bpf_stale_cap_leg_tradenocpi_rejects_before_cu_cliff() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -12842,13 +12837,63 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
     env.deposit(&short_owner, short_account, 100_000);
     env.seed_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP);
     env.svm.warp_to_slot(16);
-    let cu = env
-        .try_trade_asset_with_cu(0, &long_owner, long_account, &short_owner, short_account, -(POS_SCALE as i128), 95, 0)
-        .expect("a stale cap-leg portfolio is below the 8-leg pre-crank guard and must trade inside the budget");
-    println!("v16 stale cap-leg TradeNoCpi (existing asset) executed at CU: {cu}");
-    assert!(cu <= X1_CRANK_CU_LIMIT, "stale cap-leg TradeNoCpi used {cu} CU (> {X1_CRANK_CU_LIMIT})");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let stale_err = env
+        .try_trade_asset_with_cu(
+            0,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            -(POS_SCALE as i128),
+            95,
+            0,
+        )
+        .expect_err("stale active accounts must pre-crank before trading");
+    println!(
+        "v16 stale full cap-leg TradeNoCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&stale_err)
+    );
+    assert!(
+        stale_err.contains("Custom(19)") || stale_err.contains("custom program error: 0x13"),
+        "stale active trade should reject as EngineStale, got: {stale_err}"
+    );
+    assert!(
+        !stale_err.contains("exceeded CUs"),
+        "stale active trade must reject before the CU cliff: {stale_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused stale trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused stale trade leaves the long portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused stale trade leaves the short portfolio bytes unchanged"
+    );
+
+    let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
+    let short = state::read_portfolio(&env.svm.get_account(&short_account).unwrap().data).unwrap();
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
+    assert_eq!(
+        percolator::active_bitmap_count_ones(short.active_bitmap),
+        LEG_CAP as u32
+    );
+    assert_eq!(long.legs[0].basis_pos_q, (10 * POS_SCALE) as i128);
+    assert_eq!(short.legs[0].basis_pos_q, -((10 * POS_SCALE) as i128));
 }
 
+// S10-X1: rebuilt at the wrapper leg cap; the pre-crank guard (`WRAPPER_PRE_CRANK_MIN_LEGS` = cap - 1) engages again, so EngineStale with bytes unchanged is asserted as in the original.
 // FIX E-CU-R, the route the guard did NOT cover and upstream still does not: a portfolio with 13
 // stale legs OPENING A FRESH ASSET. `ensure_trade_portfolio_current_for_requests_view` used to
 // return `Ok(())` before it read the cert at all whenever no request touched an asset the
@@ -12860,14 +12905,8 @@ fn v16_bpf_stale_full_14_leg_tradenocpi_rejects_before_cu_cliff() {
 // (`cfb78578`, test `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`)
 // on 2026-06-24 for the `TradeCpi` route only, and reverted it in full on 2026-06-27 (`13b0a2cf`,
 // no reason recorded); `TradeNoCpi` was never covered even while that fix was in.
-// S10-X1: rebuilt for the wrapper leg cap. The original asserted that a STALE 13/14-leg portfolio is
-// refused (EngineStale) before the matcher CPI / the CU cliff. That guard
-// (`ensure_trade_portfolio_current_for_requests_view`) only engages from 8 active legs
-// (`active_bitmap_count_ones < 8` returns early), and with the cap at 4 no portfolio can reach it, so the
-// refusal can no longer be produced. What the guard protected is the 1.4M budget; the rebuilt test pins
-// that: the same stale shapes at cap-1 / cap legs now execute inside the 10% rule.
 #[test]
-fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
+fn v16_bpf_stale_capminus1_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
     let mut env = V16CuEnv::new_with_market_params_and_price_move(LEG_CAP as u16, 1_000, 1_000, 500);
     let long_owner = Keypair::new();
     let short_owner = Keypair::new();
@@ -12875,20 +12914,61 @@ fn v16_bpf_stale_thirteen_leg_fresh_asset_tradenocpi_rejects_before_cu_cliff() {
     let short_account = env.create_portfolio(&short_owner);
     env.deposit(&long_owner, long_account, 20_000);
     env.deposit(&short_owner, short_account, 100_000);
-    // cap-1 stale legs on assets 0..cap-2; every asset accrued to slot 16, so asset cap-1 is a FRESH asset.
+    // cap-1 legs on assets 0..cap-2; all assets accrued to slot 16, so asset cap-1 is a FRESH asset the
+    // portfolio has no leg on.
     env.seed_n_leg_position_for_benchmark(long_account, short_account, LEG_CAP - 1);
     env.accrue_asset_for_benchmark(LEG_CAP - 1, 16, 95);
     env.svm.warp_to_slot(16);
-    let cu = env
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let long_before = env.svm.get_account(&long_account).unwrap();
+    let short_before = env.svm.get_account(&short_account).unwrap();
+
+    let fresh_err = env
         .try_trade_asset_with_cu(
-            (LEG_CAP - 1) as u16, &long_owner, long_account, &short_owner, short_account, POS_SCALE as i128, 95, 0,
+            (LEG_CAP - 1) as u16,
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            95,
+            0,
         )
-        .expect("a stale (cap-1)-leg portfolio opening the fresh asset must execute inside the budget");
-    println!("v16 stale (cap-1)-leg TradeNoCpi (fresh asset) executed at CU: {cu}");
-    assert!(cu <= X1_CRANK_CU_LIMIT, "{cu} CU > {X1_CRANK_CU_LIMIT}");
+        .expect_err("a (cap-1)-leg stale portfolio must pre-crank before opening a fresh asset");
+    println!(
+        "v16 stale (cap-1)-leg TradeNoCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&fresh_err)
+    );
+    assert!(
+        fresh_err.contains("Custom(19)") || fresh_err.contains("custom program error: 0x13"),
+        "stale fresh-asset trade should reject as EngineStale, got: {fresh_err}"
+    );
+    assert!(
+        !fresh_err.contains("exceeded CUs"),
+        "stale fresh-asset trade must reject before the CU cliff: {fresh_err}"
+    );
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap(),
+        market_before,
+        "refused fresh-asset trade leaves market bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&long_account).unwrap(),
+        long_before,
+        "refused fresh-asset trade leaves the taker portfolio bytes unchanged"
+    );
+    assert_eq!(
+        env.svm.get_account(&short_account).unwrap(),
+        short_before,
+        "refused fresh-asset trade leaves the counterparty portfolio bytes unchanged"
+    );
     let long = state::read_portfolio(&env.svm.get_account(&long_account).unwrap().data).unwrap();
-    assert!(has_active_leg_for_asset(&long, LEG_CAP - 1), "the fresh asset leg must have opened");
-    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32);
+    assert!(
+        !has_active_leg_for_asset(&long, LEG_CAP - 1),
+        "the refused trade must not have opened the fresh asset"
+    );
+    assert_eq!(percolator::active_bitmap_count_ones(long.active_bitmap), LEG_CAP as u32 - 1);
 }
 
 /// Builds a 14-asset market with a REAL `percolator-match` matcher registered on the LP portfolio
@@ -12967,6 +13047,7 @@ fn ecu_send_trade_cpi(
     )
 }
 
+// S10-X1: rebuilt at the wrapper leg cap; the pre-crank guard (`WRAPPER_PRE_CRANK_MIN_LEGS` = cap - 1) engages again, so EngineStale with bytes unchanged is asserted as in the original.
 // FIX E-CU-R on the CPI route -- upstream `cfb78578`'s own shape, whose test was named
 // `v16_attack_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff`. Upstream landed it
 // on 2026-06-24 and reverted it in full on 2026-06-27 (`13b0a2cf`; the companion `BatchTradeCpi`
@@ -12974,24 +13055,48 @@ fn ecu_send_trade_cpi(
 // reverts commit ...". Measured on prog `origin/fix/W-19` at engine `a90fb27f` before this fix:
 // the untrusted matcher is invoked (`invoke [2]` in the logs) and the instruction then dies with
 // `exceeded CUs meter`.
-// S10-X1: rebuilt for the wrapper leg cap. The original asserted that a STALE 13/14-leg portfolio is
-// refused (EngineStale) before the matcher CPI / the CU cliff. That guard
-// (`ensure_trade_portfolio_current_for_requests_view`) only engages from 8 active legs
-// (`active_bitmap_count_ones < 8` returns early), and with the cap at 4 no portfolio can reach it, so the
-// refusal can no longer be produced. What the guard protected is the 1.4M budget; the rebuilt test pins
-// that: the same stale shapes at cap-1 / cap legs now execute inside the 10% rule.
 #[test]
-fn v16_bpf_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff() {
+fn v16_bpf_stale_capminus1_leg_fresh_asset_tradecpi_rejects_before_cu_cliff() {
     let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
     env.seed_n_leg_position_for_benchmark(taker_account, lp_account, LEG_CAP - 1);
     env.accrue_asset_for_benchmark(LEG_CAP - 1, 16, 95);
     env.svm.warp_to_slot(16);
-    let cu = ecu_send_trade_cpi(&mut env, matcher_program, &taker, taker_account, lp_account, ctx, delegate, (LEG_CAP - 1) as u16, POS_SCALE as i128)
-        .expect("a stale (cap-1)-leg portfolio opening the fresh asset via TradeCpi must execute inside the budget");
-    println!("v16 stale (cap-1)-leg TradeCpi (fresh asset) executed at CU: {cu}");
-    assert!(cu <= X1_CRANK_CU_LIMIT, "{cu} CU > {X1_CRANK_CU_LIMIT}");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        (LEG_CAP - 1) as u16,
+        POS_SCALE as i128,
+    )
+    .expect_err("a (cap-1)-leg stale portfolio must pre-crank before a fresh-asset matcher-CPI trade");
+    println!(
+        "v16 stale (cap-1)-leg TradeCpi (fresh asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale fresh-asset CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale fresh-asset CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale fresh-asset CPI trade must reject BEFORE the matcher CPI: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
 }
 
+// S10-X1: rebuilt at the wrapper leg cap; the pre-crank guard (`WRAPPER_PRE_CRANK_MIN_LEGS` = cap - 1) engages again, so EngineStale with bytes unchanged is asserted as in the original.
 // FIX E-CU-C, the fork-only half: our CPI trade routes ran upstream's per-asset lifecycle gate but
 // not its currentness gate. Upstream's `ensure_cpi_trade_portfolios_current_before_matcher`
 // (`upstream/main:src/v16_program.rs:14560`) runs both before invoking the matcher -- it added the
@@ -13005,21 +13110,49 @@ fn v16_bpf_stale_thirteen_leg_fresh_asset_tradecpi_rejects_before_cu_cliff() {
 // rejected the fill. That is exactly the argument our own `3a189159` made for adopting the
 // lifecycle half. The `invoke [2]` assertion is what makes this test non-vacuous: a failed
 // transaction is rolled back, so "accounts unchanged" alone would hold either way.
-// S10-X1: rebuilt for the wrapper leg cap. The original asserted that a STALE 13/14-leg portfolio is
-// refused (EngineStale) before the matcher CPI / the CU cliff. That guard
-// (`ensure_trade_portfolio_current_for_requests_view`) only engages from 8 active legs
-// (`active_bitmap_count_ones < 8` returns early), and with the cap at 4 no portfolio can reach it, so the
-// refusal can no longer be produced. What the guard protected is the 1.4M budget; the rebuilt test pins
-// that: the same stale shapes at cap-1 / cap legs now execute inside the 10% rule.
 #[test]
-fn v16_bpf_stale_thirteen_leg_existing_asset_tradecpi_rejects_before_matcher_cpi() {
+fn v16_bpf_stale_capminus1_leg_existing_asset_tradecpi_rejects_before_matcher_cpi() {
     let (mut env, matcher_program, taker, taker_account, lp_account, ctx, delegate) = ecu_cpi_env();
     env.seed_n_leg_position_for_benchmark(taker_account, lp_account, LEG_CAP - 1);
     env.svm.warp_to_slot(16);
-    let cu = ecu_send_trade_cpi(&mut env, matcher_program, &taker, taker_account, lp_account, ctx, delegate, 0, -(POS_SCALE as i128))
-        .expect("a stale (cap-1)-leg portfolio trading an existing asset via TradeCpi must execute inside the budget");
-    println!("v16 stale (cap-1)-leg TradeCpi (existing asset) executed at CU: {cu}");
-    assert!(cu <= X1_CRANK_CU_LIMIT, "{cu} CU > {X1_CRANK_CU_LIMIT}");
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker_account).unwrap();
+    let lp_before = env.svm.get_account(&lp_account).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+
+    let cpi_err = ecu_send_trade_cpi(
+        &mut env,
+        matcher_program,
+        &taker,
+        taker_account,
+        lp_account,
+        ctx,
+        delegate,
+        0,
+        -(POS_SCALE as i128),
+    )
+    .expect_err("a (cap-1)-leg stale portfolio must pre-crank before a matcher-CPI trade");
+    println!(
+        "v16 stale (cap-1)-leg TradeCpi (existing asset) refused at CU: {}",
+        cu_consumed_from_err(&cpi_err)
+    );
+    assert!(
+        cpi_err.contains("Custom(19)") || cpi_err.contains("custom program error: 0x13"),
+        "stale CPI trade should reject as EngineStale, got: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("exceeded CUs"),
+        "stale CPI trade must reject before the CU cliff: {cpi_err}"
+    );
+    assert!(
+        !cpi_err.contains("invoke [2]"),
+        "stale CPI trade must reject BEFORE the untrusted matcher is invoked: {cpi_err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker_account).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp_account).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
 }
 
 // THE CONTROL THAT KEEPS THE THREE TESTS ABOVE FROM BEING A REFUSE-EVERYTHING GATE. The gate now
@@ -18136,7 +18269,7 @@ fn batch_trade_cpi_tail_fanout_budget_case(matcher_program: Pubkey, growth_v3: b
     // not need a 12-slot market.
     const LEGS: usize = LEG_CAP;
     const PRICE: u64 = 100;
-    const OVER_LEGS: usize = 12; // one past MATCHER_BATCH_MAX_LEGS=11 -> leg bound fires.
+    const OVER_LEGS: usize = MAX_LEGS + 1; // one past MATCHER_BATCH_MAX_LEGS (= min(11, cap)) -> leg bound fires.
     const MAX_LEGS: usize = if LEG_CAP < 11 { LEG_CAP } else { 11 }; // the bound itself must still work.
     const REJECT_TAIL: usize = 64 / MAX_LEGS + 1; // MAX_LEGS * tail > 64 -> the PRODUCT bound fires (<=32 legal alone).
     const ALLOW_TAIL: usize = 64 / MAX_LEGS; // MAX_LEGS * tail <= 64 -> product is legal; only compute limits it.
@@ -26606,4 +26739,240 @@ fn v22_bpf_worst_shapes_at_the_leg_cap() {
         assert!(settle.max(counterparty) + X1_STRANDED_BACKING_CU <= X1_CRANK_CU_LIMIT, "shape {shape} n={n}: refresh-type crank {settle}/{counterparty} + {X1_STRANDED_BACKING_CU} exceeds {X1_CRANK_CU_LIMIT}");
         assert!(liq <= X1_CRANK_CU_LIMIT, "shape {shape} n={n}: liquidation crank {liq} exceeds {X1_CRANK_CU_LIMIT}");
     }
+}
+
+fn x1h_host<R>(env: &mut V16CuEnv, keys: &[Pubkey], f: impl FnOnce(&mut state::MarketViewMutV16<'_>, &mut [percolator::PortfolioV16ViewMut<'_>]) -> R) -> R {
+    let mut market_account = env.svm.get_account(&env.market).expect("market account");
+    let mut datas: Vec<Account> = keys.iter().map(|k| env.svm.get_account(k).expect("portfolio")).collect();
+    let (_, _, max_market_slots, _) = state::read_market_config_mode_and_capacity(&market_account.data).unwrap();
+    let r;
+    {
+        let (_, mut group) = state::market_view_mut(&mut market_account.data).unwrap();
+        let mut views: Vec<percolator::PortfolioV16ViewMut<'_>> = datas
+            .iter_mut()
+            .map(|d| state::portfolio_view_mut_for_market_slots(&mut d.data, max_market_slots).unwrap())
+            .collect();
+        r = f(&mut group, &mut views);
+    }
+    env.svm.set_account(env.market, market_account).unwrap();
+    for (k, d) in keys.iter().zip(datas.into_iter()) {
+        env.svm.set_account(*k, d).unwrap();
+    }
+    r
+}
+
+/// 2n-domain reversal (round-1 shape 3) with optional REAL liens (fresh counterparty backing in
+/// every domain + a risk-increasing trade whose initial margin capital cannot carry) and an
+/// optional REAL ADL event on the target's side of every asset (a thin third account on the
+/// other side is liquidated unilaterally) before the final loss move. `extra` idle asset slots
+/// are appended after creation (needs X1H_CAPACITY >= n + extra).
+fn x1h_shape(n: u16, adl: bool, liens: bool, extra: u16, trade_instead_of_crank: bool) -> (u64, u64, u64, bool) {
+    let tag = format!("adl={adl} liens={liens} extra={extra} n={n}");
+    let (mut env, funding) = x1_env(n, true);
+    let admin = env.admin.pubkey();
+    for i in 0..extra {
+        let r = env.try_activate_asset_with_authorities(n + i, 2, 100, admin, admin, admin, admin);
+        println!("X1H {tag}: append asset {} -> {}", n + i, match &r { Ok(_) => "ok".to_string(), Err(e) => e.chars().take(160).collect() });
+    }
+    let (_, _, slots, capacity) = state::read_market_config_mode_and_capacity(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    println!("X1H {tag}: market slots={slots} capacity={capacity}");
+    let owners: Vec<Keypair> = (0..4).map(|_| Keypair::new()).collect();
+    let keys: Vec<Pubkey> = owners.iter().map(|o| env.create_portfolio(o)).collect();
+    let nn = n as usize;
+    env.deposit(&owners[0], keys[0], 500_000_000); // T target
+    env.deposit(&owners[1], keys[1], 2_000_000_000); // C counterparty
+    env.deposit(&owners[2], keys[2], 290_000 * nn as u128); // V thin victim (long)
+    env.deposit(&owners[3], keys[3], 500_000_000); // H victim's counterparty
+    let q = (100_000 * POS_SCALE) as i128;
+    let qv = (25_000 * POS_SCALE) as i128;
+    let mut slot = 0u64; // asset slot_last starts at 0 and accrual is capped at 1 slot per step: start in sync, else every open is LossStale
+    x1h_host(&mut env, &keys, |group, views| {
+        let [t, c, v, h] = views else { panic!("four views") };
+        let mut step = |group: &mut state::MarketViewMutV16<'_>, price: u64| {
+            slot += 1;
+            for asset_index in 0..nn {
+                group.accrue_asset_to_not_atomic(asset_index, slot, price, funding, true).unwrap();
+                group.markets[asset_index].engine.asset.raw_oracle_target_price = percolator::V16PodU64::new(price);
+            }
+        };
+        let tr = |group: &mut state::MarketViewMutV16<'_>, long: &mut percolator::PortfolioV16ViewMut<'_>, short: &mut percolator::PortfolioV16ViewMut<'_>, asset_index: usize, size_q: i128, exec_price: u64| {
+            group.execute_trade_with_fee_loss_stale_scoped_not_atomic(long, short, TradeRequestV16 { asset_index, size_q, exec_price, fee_bps: 0 }, true)
+        };
+        for a in 0..nn { tr(group, t, c, a, q, 100).unwrap(); }
+        for p in [104u64, 108] { step(group, p); }
+        group.full_account_refresh_not_atomic(c).unwrap();
+        group.full_account_refresh_not_atomic(t).unwrap();
+        for a in 0..nn { tr(group, c, t, a, 2 * q, 108).unwrap(); } // flip: T short q, C long q
+        if adl {
+            for a in 0..nn {
+                let r = tr(group, v, h, a, qv, 108);
+                println!("X1H {tag}: victim open asset {a}: {:?}", r.as_ref().map(|_| ()));
+            }
+        }
+        for p in [104u64, 100] { step(group, p); }
+        group.full_account_refresh_not_atomic(c).unwrap();
+        group.full_account_refresh_not_atomic(t).unwrap();
+        if adl {
+            println!("X1H {tag}: refresh V {:?} H {:?}", group.full_account_refresh_not_atomic(v).map(|x| x.certified_liq_deficit), group.full_account_refresh_not_atomic(h).map(|x| x.certified_liq_deficit));
+        }
+        let occupied = t.header.source_domains.iter().filter(|d| d.is_occupied()).count();
+        println!("X1H {tag}: target occupied source domains = {occupied}");
+        if liens {
+            for d in 0..(2 * nn) {
+                let r = group.deposit_fresh_counterparty_backing_not_atomic(d, 3_000_000, u64::MAX / 2);
+                if r.is_err() { println!("X1H {tag}: backing deposit domain {d}: {r:?}"); }
+            }
+            // the target keeps only the capital its current legs need: the increase below must be
+            // carried by liens on its claims
+            let keep = 1_050_000u128 * nn as u128;
+            let old = t.header.capital.get();
+            t.header.capital = percolator::V16PodU128::new(keep);
+            let c_tot = group.header.c_tot.get();
+            group.header.c_tot = percolator::V16PodU128::new(c_tot - old + keep);
+            let vault = group.header.vault.get();
+            group.header.vault = percolator::V16PodU128::new(vault - old + keep);
+            for a in 0..nn {
+                let mut done = false;
+                for num in [15i128, 10, 6, 3, 1] {
+                    let r = tr(group, c, t, a, q * num / 10, 100);
+                    if r.is_ok() { println!("X1H {tag}: lien-carried increase asset {a}: +{num}/10 q ok"); done = true; break; }
+                    else { println!("X1H {tag}: lien-carried increase asset {a}: +{num}/10 q -> {:?}", r.err()); }
+                }
+                if !done { println!("X1H {tag}: NO increase on asset {a}"); }
+            }
+            let liened = t.header.source_domains.iter().filter(|d| d.source_claim_liened_num.get() != 0).count();
+            let reserved: u128 = t.header.source_domains.iter().map(|d| d.source_lien_effective_reserved.get()).sum();
+            println!("X1H {tag}: target domains with a lien = {liened}, effective reserved = {reserved}, capital = {}", t.header.capital.get());
+        }
+        if adl {
+            for a in 0..nn {
+                let r = group.liquidate_account_not_atomic(v, percolator::LiquidationRequestV16 { asset_index: a });
+                let asset = group.markets[a].engine.asset.try_to_runtime().unwrap();
+                println!("X1H {tag}: liquidate victim asset {a}: {:?} a_long={} a_short={} (ADL_ONE={})", r.map(|o| o.closed_q), asset.a_long, asset.a_short, percolator::ADL_ONE);
+            }
+            let scaled = (0..nn).filter(|a| { let s = group.markets[*a].engine.asset.try_to_runtime().unwrap(); s.a_short != percolator::ADL_ONE || s.a_long != percolator::ADL_ONE }).count();
+            println!("X1H {tag}: assets with a scaled A = {scaled} of {nn}");
+        }
+        for p in [104u64, 108, 112, 116] { step(group, p); }
+        println!("X1H {tag}: counterparty refresh before the cranks: {:?}", group.full_account_refresh_not_atomic(c).map(|_| ()));
+        for p in [117u64] { step(group, p); }
+    });
+    if !liens {
+        env.force_portfolio_capital_for_benchmark(keys[0], 1_000);
+    }
+    env.svm.warp_to_slot(slot + 1);
+    if trade_instead_of_crank {
+        // F7 gap: one TradeNoCpi between the two STALE accounts (both settle inside the trade)
+        env.svm.expire_blockhash();
+        let r = env.try_trade_asset_with_cu(0, &owners[1], keys[1], &owners[0], keys[0], -(POS_SCALE as i128), 117, 0);
+        println!("X1HSUM {tag} STALE-PAIR TRADE (reduce 1 unit on asset 0): {}", match &r { Ok(cu) => format!("OK {cu} CU"), Err(e) => format!("ERR {}", e.chars().take(170).collect::<String>()) });
+        return (0, 0, 0, false);
+    }
+    let mut max_settle = 0u64;
+    let mut max_liq = 0u64;
+    let mut failed = false;
+    let mut errs = 0;
+    for i in 0..(3 * nn + 10) {
+        let before = x1g_legs(&env, keys[0]);
+        let r = x1g_crank(&mut env, keys[0], slot + 1);
+        let after = x1g_legs(&env, keys[0]);
+        match &r {
+            Ok(cu) => { errs = 0; if after < before { max_liq = max_liq.max(*cu); } else { max_settle = max_settle.max(*cu); } println!("X1HCU {tag} TARGET call {i}: {cu} CU legs {before}->{after}"); }
+            Err(e) => { errs += 1; let s: String = e.chars().take(150).collect(); println!("X1HCU {tag} TARGET call {i}: ERR {s}"); if !s.contains("Custom(22)") { failed = true; } if errs >= 2 { break; } }
+        }
+        if after == 0 { break; }
+    }
+    let left = x1g_legs(&env, keys[0]);
+    if left != 0 { failed = true; println!("X1H target did not end flat: {left} legs left"); }
+    let mut max_cp = 0u64;
+    errs = 0;
+    for i in 0..(2 * nn + 8) {
+        let before = x1g_legs(&env, keys[1]);
+        let r = x1g_crank(&mut env, keys[1], slot + 1);
+        let after = x1g_legs(&env, keys[1]);
+        match &r {
+            Ok(cu) => { errs = 0; max_cp = max_cp.max(*cu); println!("X1HCU {tag} COUNTERPARTY call {i}: {cu} CU legs {before}->{after}"); }
+            Err(e) => { errs += 1; let s: String = e.chars().take(150).collect(); println!("X1HCU {tag} COUNTERPARTY call {i}: ERR {s}"); if !s.contains("Custom(22)") { failed = true; } if errs >= 2 { break; } }
+        }
+    }
+    let mut max_h = 0u64;
+    if adl {
+        for who in [3usize, 2] {
+            for i in 0..4 {
+                let r = x1g_crank(&mut env, keys[who], slot + 1);
+                match &r { Ok(cu) => { max_h = max_h.max(*cu); println!("X1HCU {tag} BYSTANDER{who} call {i}: {cu} CU"); } Err(e) => { println!("X1HCU {tag} BYSTANDER{who} call {i}: ERR {}", e.chars().take(120).collect::<String>()); break; } }
+            }
+        }
+    }
+    println!("X1HSUM {tag} max_settle={max_settle} max_liq={max_liq} max_counterparty={max_cp} max_bystander={max_h} target_legs_left={left} any_non22_error={failed}");
+    (max_settle, max_liq, max_cp, failed)
+}
+
+
+/// Fill-event allowance on the liquidation call (#543 measured +3.5k at 11 legs; +2.1k reviewer figure at 4).
+const X1_FILL_EVENT_CU: u64 = 2_100;
+
+/// S10-X1 round 2 (N2): the heaviest legitimately constructible shape at the cap - 2n-domain reversal with
+/// REAL liens (fresh counterparty backing in every domain) and a REAL ADL event on every asset. The settle
+/// crank + the +66k #287 allowance must stay under the 10% line (1,260,000); the liquidation + the fill-event
+/// allowance too; the target must end flat. Ported from the security reviewer's `sx2_shape`.
+#[test]
+fn v22_bpf_lien_adl_worst_shape_at_the_leg_cap() {
+    let n = LEG_CAP as u16;
+    let (settle, liq, counterparty, failed) = x1h_shape(n, true, true, 0, false);
+    println!("X1GATE lien+adl n={n} settle={settle} liq={liq} counterparty={counterparty}");
+    assert!(!failed, "a crank failed with something other than NonProgress");
+    assert!(settle > 0 && liq > 0 && counterparty > 0, "a phase never ran");
+    assert!(settle.max(counterparty) + X1_STRANDED_BACKING_CU <= X1_CRANK_CU_LIMIT, "settle {settle} / counterparty {counterparty} + 66k exceeds {X1_CRANK_CU_LIMIT}");
+    assert!(liq + X1_FILL_EVENT_CU <= X1_CRANK_CU_LIMIT, "liquidation {liq} + fill event exceeds {X1_CRANK_CU_LIMIT}");
+}
+
+/// Batch route above the cap on BPF (BatchTradeNoCpi shares `handle_batch_execute_zero_copy`
+/// with BatchTradeCpi): cap-2 market + appended third asset.
+#[test]
+fn v22_batch_above_cap_is_refused_on_bpf() {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        system_created_market: true,
+        max_portfolio_assets: 2,
+        maintenance_margin_bps: 1_000,
+        initial_margin_bps: 1_000,
+        max_price_move_bps_per_slot: 500,
+        ..V16CuMarketParams::default()
+    });
+    let admin = env.admin.pubkey();
+    env.try_activate_asset_with_authorities(2, 5, 100, admin, admin, admin, admin).expect("append asset 2");
+    let a_owner = Keypair::new();
+    let b_owner = Keypair::new();
+    let a = env.create_portfolio(&a_owner);
+    let b = env.create_portfolio(&b_owner);
+    env.deposit(&a_owner, a, 500_000_000);
+    env.deposit(&b_owner, b, 500_000_000);
+    let mid = |env: &V16CuEnv, asset: usize| state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, asset).unwrap().3;
+    let send = |env: &mut V16CuEnv, assets: &[u16]| {
+        env.svm.expire_blockhash();
+        let (a_id, _, a_pe) = env.portfolio_identity(a);
+        let (b_id, _, b_pe) = env.portfolio_identity(b);
+        let legs = assets.iter().map(|&x| percolator_prog::ix::BatchTradeLeg { market_id: mid(env, x as usize), asset_index: x, size_q: (1_000 * POS_SCALE) as i128, exec_price: 100, fee_bps: 0 }).collect();
+        env.send(
+            ProgInstruction::BatchTradeNoCpi { account_a_portfolio_id: a_id, account_a_position_epoch: a_pe, account_b_portfolio_id: b_id, account_b_position_epoch: b_pe, legs },
+            vec![AccountMeta::new(a_owner.pubkey(), true), AccountMeta::new(b_owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(a, false), AccountMeta::new(b, false)],
+            &[&a_owner, &b_owner],
+        )
+    };
+    let snap = |env: &V16CuEnv| (env.svm.get_account(&env.market).unwrap(), env.svm.get_account(&a).unwrap(), env.svm.get_account(&b).unwrap());
+    let before = snap(&env);
+    let r = send(&mut env, &[0, 1, 2]);
+    println!("X1HCAP batch of 3 legs on a cap-2 market from flat: {}", match &r { Ok(cu) => format!("OK {cu}"), Err(e) => e.chars().take(120).collect() });
+    assert!(r.is_err() && snap(&env) == before, "3-leg batch above the cap must be refused with state unchanged");
+    let r = send(&mut env, &[0, 1]);
+    println!("X1HCAP batch of 2 legs: {}", match &r { Ok(cu) => format!("OK {cu}"), Err(e) => e.chars().take(120).collect() });
+    assert!(r.is_ok());
+    assert_eq!(x1g_legs(&env, a), 2);
+    let before = snap(&env);
+    let r = send(&mut env, &[2]);
+    println!("X1HCAP 1-leg batch on a third asset with 2 legs held: {}", match &r { Ok(cu) => format!("OK {cu}"), Err(e) => e.chars().take(120).collect() });
+    let e = r.expect_err("the leg above the cap must be refused on the batch route");
+    assert!(e.contains("Custom(17)"), "expected HiddenLeg (Custom 17), got {e}");
+    assert!(snap(&env) == before, "refused batch left state changed");
+    assert_eq!(x1g_legs(&env, a), 2);
 }
