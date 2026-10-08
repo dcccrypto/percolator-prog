@@ -64,7 +64,7 @@ fn swordcat() -> LiveMarket {
         name: "swordcat",
         // tag 0 InitMarket, 3LKdrk6m… (slot 507,031,028)
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_625,
@@ -119,7 +119,7 @@ fn backpack() -> LiveMarket {
     LiveMarket {
         name: "backpack",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1_000,
             h_max: 100_000,
             initial_price: 2_794,
@@ -994,7 +994,7 @@ fn r2_market() -> LiveMarket {
     LiveMarket {
         name: "r2",
         params: V16CuMarketParams {
-            max_portfolio_assets: 14,
+            max_portfolio_assets: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             h_min: 1,
             h_max: 10,
             initial_price: 1_000_000,
@@ -1585,7 +1585,8 @@ struct TerminalWorld {
     engine_residual_before: i128,
 }
 
-/// (InitMarket with 14 slots configures all 14 assets, as on every live slab; asset 0 trades.)
+/// (InitMarket with `max_portfolio_assets` slots configures all of them; asset 0 trades. The live slabs have 14
+/// slots; since S10-X1 the largest creatable slab is `WRAPPER_MAX_PORTFOLIO_ASSETS`.)
 fn terminal_flat_world() -> TerminalWorld {
     resolved_world(Closing::All)
 }
@@ -3848,19 +3849,13 @@ fn sec_bust_persistence(tag: &str, chunk: u64) {
     eprintln!("SEC-R3 [{tag}] signed exit with full refresh: {:?}", res.as_ref().map(|x| x.0).map_err(|e| custom_code(e)));
 }
 
-/// S10-X1: `r2_market()` at the wrapper leg cap (InitMarket refuses more than the cap).
-fn r2_market_at_cap() -> LiveMarket {
-    let mut m = r2_market();
-    m.params.max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
-    m
-}
 
 /// S10-X1 cap-aware equivalent of `a6_fourteen_leg_refreshes_are_leg_weighted_and_fit_the_budget`:
 /// the same scenario at the wrapper leg cap (8). The leg-weighted budget (3 + legs per refresh,
 /// <= 38) now refuses 4 x 8-leg refreshes (44) and admits 3 x 8-leg (33) + the 77.
 #[test]
 fn a6_cap_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
-    let mut r = Replay::new(r2_market_at_cap());
+    let mut r = Replay::new(r2_market());
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
     let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
@@ -3935,7 +3930,7 @@ fn a6_cap_leg_refreshes_are_leg_weighted_and_fit_the_budget() {
 /// S10-X1 cap-aware equivalent of `a6_two_liquidating_fourteen_leg_refreshes_cu` (cap = 8 legs).
 #[test]
 fn a6_two_liquidating_cap_leg_refreshes_cu() {
-    let mut r = Replay::new(r2_market_at_cap());
+    let mut r = Replay::new(r2_market());
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
     let assets: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
