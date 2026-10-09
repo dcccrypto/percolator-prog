@@ -27,8 +27,8 @@ killed); then `mutant.py restore` and the clean check again (a dirty tree stops 
 
 Status per (mutant, target):
   MUTANT-ERROR       build/compile error, timeout, OOM or any other non-verdict (NOT a kill)
-  KILLED             any VERIFICATION FAILED; or, on a cover-targeted row (expected-kill text mentions
-                     "cover", and always S10-G1, W4-S, BND-C2), sum x < sum y of the cover summaries
+  KILLED             any VERIFICATION FAILED; or, on a cover-targeted row (always S10-G1, W4-S, BND-C2, and any
+                     row whose expected-kill text says "unsatisfied"/"unsatisfiable", word match), sum x < sum y
   SURVIVED           SUCCESSFUL with all covers satisfied (or no covers)
   SURVIVED-COVERLOSS SUCCESSFUL, covers lost, but the row is not cover-targeted (not a kill; review it)
   EXPECTED-SURVIVOR  S10-G2 surviving (10-09 ruling); a kill of S10-G2 is logged KILLED and goes back
@@ -141,8 +141,14 @@ def resolve(row, queue):
     return names, cand
 
 
+UNSAT = re.compile(r"\bunsatisf(ied|iable)\b", re.I)
+
+
 def cover_targeted(row):
-    return row["id"] in COVER_ALWAYS or "cover" in row["expected"].lower()
+    """Review round 2 N4: a row is cover-targeted only when its designed kill IS a cover becoming
+    unsatisfied: the ids in COVER_ALWAYS, or an expected-kill text that says "unsatisfied" /
+    "unsatisfiable" (word match). A text that merely names a cover state is NOT cover-targeted."""
+    return row["id"] in COVER_ALWAYS or bool(UNSAT.search(row["expected"]))
 
 
 def mutant_status(row, verdict, x, y):

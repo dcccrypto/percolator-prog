@@ -778,17 +778,21 @@ fn kani_v22_wb5_rent_rate_fail_closed() {
 // Wave D
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// W-D-1 (L-RES, I-RS1): rescue no dilution. u32/u64 operands, the real `mul_div_floor` (no stub, BOUNDED). Assumes the vault impaired (`v < c`) and the rescue admitted. Mutant: `rescue_shares`
-/// with div_ceil. Cost L (real 128-bit divider; review addendum W3).
+/// W-D-1 (L-RES, I-RS1): rescue no dilution, on the real `rescue_shares` / `rescue_claim_delta` and
+/// the real `mul_div_floor`, u16 operands (review round 2 N6: the u32 x u64 version bit-blasted a full
+/// 128-bit divider at a width likely to time out). At u16 the admission floor (`RESCUE_MIN_ATOMS` =
+/// 1e8) is unreachable, so the harness assumes the impaired shape `v > 0, s > 0, v < c, 0 < x <= 10v`
+/// that `rescue_admitted` implies, not admission itself: the no-dilution facts depend only on the
+/// floor rounding, not on the floor / size gates (those are W-D-3, at x < 2^34). Labelled BOUNDED.
+/// Mutant: `rescue_shares` with div_ceil. Cost M.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn kani_v22_wd1_rescue_no_dilution() {
-    let v = kani::any::<u32>() as u128;
-    let c = kani::any::<u32>() as u128;
-    let s = kani::any::<u32>() as u128;
-    let x = kani::any::<u64>() as u128;
-    kani::assume(v > 0 && s > 0 && v < c && x <= 10 * v);
-    kani::assume(p4::rescue_admitted(x, v, c, s).is_ok());
+    let v = kani::any::<u16>() as u128;
+    let c = kani::any::<u16>() as u128;
+    let s = kani::any::<u16>() as u128;
+    let x = kani::any::<u16>() as u128;
+    kani::assume(v > 0 && s > 0 && v < c && x > 0 && x <= 10 * v);
     let m = p4::rescue_shares(x, s, v).unwrap();
     let dc = p4::rescue_claim_delta(m, c, s).unwrap();
     assert!(p4::rescue_value_no_dilution(v, x, s, m));
@@ -858,24 +862,29 @@ fn kani_v22_wd4_units_mint_burn_no_dilution() {
 }
 
 /// W-D-5 (W-1): an admitted top-up (`x > 0`, rev 2 R1.9) mints `m > 0`, does not dilute, loses at
-/// most 1 bp + 1 atom; genesis needs `INS_UNITS_GENESIS_MIN_ATOMS`. u32 operands, the real `mul_div_floor` (bounded).
-/// Mutant: drop `minted == 0` refusal. Cost M-L (real `mul_div_floor`, bounded; review addendum W3).
+/// most 1 bp + 1 atom; genesis needs `INS_UNITS_GENESIS_MIN_ATOMS`. Review round 2 N6: the general
+/// arm runs at u16 operands on the real `ins_units_for_topup` / `mul_div_floor` (BOUNDED); the genesis
+/// arm has no division (`m == x`) and keeps a u32 `x` so both sides of the 1e6 genesis minimum are
+/// reachable. Mutant: drop `minted == 0` refusal. Cost M.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn kani_v22_wd5_admitted_mint_positive_and_bounded() {
-    let u = kani::any::<u32>() as u128;
-    let i = kani::any::<u32>() as u128;
-    let x = kani::any::<u32>() as u128;
-    kani::assume(x > 0);
-    if u == 0 {
-        let m = p4::ins_units_for_topup(x, u, i).unwrap();
+    let genesis: bool = kani::any();
+    if genesis {
+        let x = kani::any::<u32>() as u128;
+        kani::assume(x > 0);
+        let i = kani::any::<u32>() as u128;
+        let m = p4::ins_units_for_topup(x, 0, i).unwrap();
         assert_eq!(m, x);
-        assert_eq!(p4::ins_mint_admissible(x, m, u, i), x >= p4::INS_UNITS_GENESIS_MIN_ATOMS);
+        assert_eq!(p4::ins_mint_admissible(x, m, 0, i), x >= p4::INS_UNITS_GENESIS_MIN_ATOMS);
         kani::cover!(x >= p4::INS_UNITS_GENESIS_MIN_ATOMS, "genesis admitted");
         kani::cover!(x < p4::INS_UNITS_GENESIS_MIN_ATOMS, "dust genesis refused");
         return;
     }
-    kani::assume(i > 0);
+    let u = kani::any::<u16>() as u128;
+    let i = kani::any::<u16>() as u128;
+    let x = kani::any::<u16>() as u128;
+    kani::assume(x > 0 && u > 0 && i > 0);
     let m = p4::ins_units_for_topup(x, u, i).unwrap();
     if p4::ins_mint_admissible(x, m, u, i) {
         assert!(m > 0);

@@ -24,6 +24,9 @@ cd $dir
   done
   cargo kani --version; } > $OUT/$lab.log
 cargo kani list "$@" --format json >> $OUT/$lab.log 2>&1; cp kani-list.json $OUT/$lab-kani-list.json 2>/dev/null
+# review round 2 B3: never leave kani-list.json behind in the frozen tree (the engine root tracks one:
+# restore it; elsewhere remove it)
+if git ls-files --error-unmatch kani-list.json >/dev/null 2>&1; then git checkout -- kani-list.json; else rm -f kani-list.json; fi
 python3 -I $HERE/compare_list.py $QUEUE $OUT/$lab-kani-list.json $dir $FLAVOUR >> $OUT/$lab.log 2>&1
 cl=$?
 echo "compare_list rc=$cl" >> $OUT/$lab.log
@@ -42,3 +45,11 @@ wait $pid; rc=$?
 echo "rc=$rc cbmc_seen=$saw" >> $OUT/$lab.log
 find $CARGO_TARGET_DIR -name '*.out' -size +0 -exec stat -f '%z %N' {} \; 2>/dev/null | sort -n > $OUT/$lab-goto-sizes.txt
 [ -n "${NOCOVER:-}" ] && [ -f "$NOCOVER" ] && { echo "# PASS_NOCOVER allow-list (frozen)"; cat "$NOCOVER"; } >> $OUT/$lab.log
+# review round 2 B3: the frozen trees must be exactly as frozen when the preflight ends
+dirty=0
+for r in percolator percolator-prog percolator-stake percolator-match percolator-nft; do
+  st=$(git -C $ROOT/$r status --porcelain 2>/dev/null)
+  if [ -n "$st" ]; then dirty=1; { echo "DIRTY after preflight: $r"; echo "$st"; } >> $OUT/$lab.log; fi
+done
+echo "frozen trees clean at exit: $(( dirty == 0 ))" >> $OUT/$lab.log
+if (( dirty )); then echo "preflight $lab: a frozen tree is dirty (see $OUT/$lab.log)" >&2; exit 4; fi
