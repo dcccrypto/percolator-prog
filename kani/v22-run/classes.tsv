@@ -166,3 +166,6 @@ kani_growth_r11_capacity_invariant_inductive	S	percolator-prog_kani_growth:kani_
 kani_growth_r11b_ungated_transitions	S	percolator-prog_kani_growth:kani_growth_c_mul_div_ceil
 st5_last_junior_full_burn_pays_exactly_ejb	M	-
 kani_v22_st6b_tranche_floor_never_decreases	M	-
+kani_v22_st7b_floor_flags_track_dead_shares	M	-
+kani_v22_st7c_no_real_lp_nothing_booked	M	-
+kani_v22_st7d_book_fee_delta_routes_to_real_holders	L	-

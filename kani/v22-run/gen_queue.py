@@ -38,6 +38,7 @@ CRATES = [
     ("percolator-stake", ["tests/kani.rs", "tests/kani_v5.rs"], "", "none", "--tests"),
     # stake NEW-1 (b83ddf9): cfg(kani) child module of processor, hooked at the END of src/processor.rs
     ("percolator-stake", ["src/kani_v22_new1.rs"], "processor::kani_v22_new1::", "none", "--lib"),
+    ("percolator-stake", ["src/kani_v22_r1.rs"], "processor::kani_v22_r1::", "none", "--lib"),
     ("percolator-stake/kani/v5-units", ["src/proofs.rs"], "proofs::", "devnet", PATHC_DEV),
     ("percolator-match", ["src/v2.rs"], "v2::proofs::", "none", PATHC),
     ("percolator-match", ["src/vamm.rs"], "vamm::proofs::", "none", PATHC),

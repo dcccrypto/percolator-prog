@@ -729,6 +729,10 @@ percolator-stake:port_flush_full_return_conservation	S	/Users/khubair/percolator
 percolator-stake:port_flush_conservation_lp_value	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_flush_conservation_lp_value	--tests
 percolator-stake:kani_v22_st6a_minimum_liquidity_lock	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_new1::kani_v22_st6a_minimum_liquidity_lock	--lib
 percolator-stake:kani_v22_st6b_tranche_floor_never_decreases	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_new1::kani_v22_st6b_tranche_floor_never_decreases	--lib
+percolator-stake:kani_v22_st7a_real_gate_tranche_aware	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_r1::kani_v22_st7a_real_gate_tranche_aware	--lib
+percolator-stake:kani_v22_st7b_floor_flags_track_dead_shares	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_r1::kani_v22_st7b_floor_flags_track_dead_shares	--lib
+percolator-stake:kani_v22_st7c_no_real_lp_nothing_booked	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_r1::kani_v22_st7c_no_real_lp_nothing_booked	--lib
+percolator-stake:kani_v22_st7d_book_fee_delta_routes_to_real_holders	L	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	processor::kani_v22_r1::kani_v22_st7d_book_fee_delta_routes_to_real_holders	--lib
 percolator-stake_kani_v5-units:st3_topup_units_match_wrapper	M	/Users/khubair/percolator-ops/kani-work/percolator-stake/kani/v5-units	devnet	-	proofs::st3_topup_units_match_wrapper	--features devnet -Z function-contracts -Z stubbing
 percolator-stake_kani_v5-units:st3_recover_burn_matches_wrapper	M	/Users/khubair/percolator-ops/kani-work/percolator-stake/kani/v5-units	devnet	-	proofs::st3_recover_burn_matches_wrapper	--features devnet -Z function-contracts -Z stubbing
 percolator-match:proof_adaptive_fee_bounded	S	/Users/khubair/percolator-ops/kani-work/percolator-match	none	-	v2::proofs::proof_adaptive_fee_bounded	-Z function-contracts -Z stubbing
