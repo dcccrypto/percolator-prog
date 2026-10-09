@@ -10,7 +10,14 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+# v2.2 (kani v22-final, design rev 2 R2.3): vault_lp_v18.rs:714 reads crate::growth_v19, which calls
+# percolator::band_rent (growth_v19.rs:810).
+[dependencies]
+percolator = { path = "../../../percolator", features = ["fork-facade"] }  # same engine features as the wrapper (Cargo.toml:70)
+
 [features]
+# Deployed flavour (v2.2 is devnet only).
+devnet = []
 # Negative controls: swap in mutants/vault_lp_v18_mutant.rs (same as --cfg p3_mutant).
 p3_mutant = []
 

@@ -1959,6 +1959,9 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
     kani::assume(tag != 80); // CloseLpVault
     kani::assume(tag != 81); // CancelRedemption (zero-payload; P-K81)
     kani::assume(tag != 87); // WithdrawInsuranceReserveToStake (zero-payload; P-K81)
+    // v2.2 (kani v22-final, design P-3): two more zero-payload tags decode from one byte.
+    kani::assume(tag != 116); // InitInsuranceUnits (Wave D)
+    kani::assume(tag != 121); // CommitG9FeedAllowlist (R-10 timelock)
     assert!(Instruction::decode(&[tag]).is_err());
 
     let deposit_tag_only = [3u8];

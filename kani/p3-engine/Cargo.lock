@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "growth-v19-proofs"
+name = "p3-skew-engine-proofs"
 version = "0.1.0"
 dependencies = [
  "percolator",

@@ -1,0 +1,7 @@
+# rev 2 R2.2: flavour-dependent harnesses re-run without --features devnet
+kani_v22_wa3_profile_shape
+kani_v22_wa19_exit_requires_loss_current_flavour
+kani_v22_wb2_band_lambda_and_alpha_caps
+kani_v22_wd15_g9_oracle_allowed_truth_table
+kani_v22_wd30_switchboard_program_predicate
+kani_v22_lp3_share_uri_shape

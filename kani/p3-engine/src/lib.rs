@@ -6,5 +6,9 @@
 #[path = "../../../src/vault_lp_v18.rs"]
 pub mod vault_lp_v18;
 
+// v2.2 (Wave B): vault_lp_v18 reads crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS; the real file.
+#[path = "../../../src/growth_v19.rs"]
+pub mod growth_v19;
+
 #[cfg(kani)]
 mod proofs;

@@ -482,39 +482,109 @@ fn kani_growth_t1_required_imr_bounds() {
     kani::cover!(crowd && !g.crowd_blocked && r.is_ok_and(|x| x > g.ceil_imr_bps), "dyn Some above the kink");
 }
 
-/// V4: the composition `growth_margin_required` for EVERY leg value: `leg_im_req` is an
-/// arbitrary function of its IMR (the two legs share notional and min). Full width.
+/// W-G-1 (design rev 2 R1.11, P-6 ruling 2026-10-09; label: BOUNDED, u16 operands): the composition
+/// `growth_margin_required` with the REAL `leg_im_req` (and its real ceil primitive; no stub, the R5
+/// pattern), so the two legs are computed values, not two free stub instances. The rev-6c FAILED
+/// verdict (6 s) was the harness: with `leg_static` the dyn and engine legs were unrelated, so
+/// `r >= cert` could not hold. The gate only ever passes `dy >= eng`: `growth_required_imr_bps`
+/// refuses `ceil < engine` and returns `base` or `dyn_imr_bps(.., base, ..) >= base` (W-G-2, W-G-3).
+/// Mutant W-G-1-M1 (swap `eng_leg`/`dyn_leg` in `growth_margin_required`) must turn assertion 1 red.
 #[kani::proof]
-#[kani::stub(crate::growth_v19::leg_im_req, leg_static)]
+#[kani::solver(cadical)]
 fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
-    let n: u128 = kani::any();
-    let eng: u64 = kani::any();
-    let dy: u64 = kani::any();
-    let m: u128 = kani::any();
+    let n = kani::any::<u16>() as u128;
+    let eng = kani::any::<u16>() as u64;
+    let dy = kani::any::<u16>() as u64;
+    let m = kani::any::<u16>() as u128;
     let cert: Option<u128> = kani::any();
-    unsafe {
-        LEG_KEY = eng;
-        LEG_AT_KEY = kani::any();
-        LEG_OTHER = kani::any();
-    }
-    let dyn_leg = leg_static(n, dy, m);
-    let eng_leg = leg_static(n, eng, m);
+    kani::assume(eng <= 10_000 && dy <= 10_000);
+    // growth_required_imr_bps never returns an IMR below the engine IMR (W-G-2).
+    kani::assume(dy >= eng);
+    let dyn_leg = leg_im_req(n, dy, m);
+    let eng_leg = leg_im_req(n, eng, m);
     let r = growth_margin_required(cert, n, eng, dy, m);
     if let Some(r) = r {
         assert!(dyn_leg.is_some_and(|d| r >= d), "never below the per-asset (dyn) leg");
-        if let (Some(c), Some(e)) = (cert, eng_leg) {
-            if c >= e {
-                assert!(r >= c, "never below the engine certificate");
-            }
+        if let (Some(c), Some(_e)) = (cert, eng_leg) {
+            assert!(r >= c, "never below the engine certificate");
         }
     } else {
-        // None -> the gate refuses (LeverageExceeded): a missing leg or an overflow
-        assert!(dyn_leg.is_none() || (cert.is_some() && (eng_leg.is_none() || cert.unwrap().saturating_sub(eng_leg.unwrap()).checked_add(dyn_leg.unwrap()).is_none())));
+        // None -> the gate refuses: only an overflow of cert - eng + dyn.
+        assert!(cert.is_some() && cert.unwrap().saturating_sub(eng_leg.unwrap()).checked_add(dyn_leg.unwrap()).is_none());
     }
-    kani::cover!(cert.is_some_and(|c| eng_leg.is_some_and(|e| c >= e)) && r.is_some(), "cert path");
-    kani::cover!(cert.is_none() && r.is_some(), "no cert");
+    kani::cover!(cert.is_some() && dy > eng && r.is_some_and(|x| x > cert.unwrap()), "cert path, dyn above engine");
     kani::cover!(cert.is_some_and(|c| eng_leg.is_some_and(|e| c < e)) && r.is_some(), "saturating path");
-    kani::cover!(r.is_none(), "None refused");
+    kani::cover!(cert.is_none() && r.is_some() && n > 0, "no cert");
+    kani::cover!(r.is_none(), "None refused (overflow)");
+}
+
+/// W-G-3 (design rev 2 R1.11; label: BOUNDED, u8 lp / n_cap, u16 dials): `dyn_imr_bps` never returns
+/// below its base and never above MAX_IMR_BPS. Real function and real ceil primitive (no stub).
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_growth_w_g3_dyn_imr_not_below_base() {
+    let lp = kani::any::<u8>() as u128;
+    let n = kani::any::<u8>() as u128;
+    let base = kani::any::<u16>() as u64;
+    let kink: u16 = kani::any();
+    let r = dyn_imr_bps(lp, n, base, kink);
+    if let Some(x) = r {
+        assert!(x >= base, "dyn IMR >= base");
+        assert!(x <= MAX_IMR_BPS);
+    }
+    kani::cover!(r == Some(base) && lp > 0, "at or below the kink");
+    kani::cover!(r.is_some_and(|x| x > base), "above the kink");
+    kani::cover!(r.is_none(), "refused");
+}
+
+/// W-G-2 (design rev 2 R1.11; label: BOUNDED): `growth_required_imr_bps(g) == Ok(r)` implies
+/// `r >= g.engine_imr_bps` (and `<= MAX_IMR_BPS`), on the REAL `n_cap_q` and `dyn_imr_bps` (no stubs)
+/// at bounded operands (u8 equity / lambda / price / pos_scale / users OI, u16 IMR dials). This is the
+/// premise W-G-1 assumes.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_growth_w_g2_required_imr_not_below_engine() {
+    let lp_some: bool = kani::any();
+    let lp = if lp_some {
+        Some(GrowthLpIn {
+            before_q: kani::any::<i8>() as i128,
+            mid_q: kani::any::<i8>() as i128,
+            after_q: kani::any::<i8>() as i128,
+            eff_after_abs_q: kani::any::<u8>() as u128,
+            users_oi_side_after_q: kani::any::<u8>() as u128,
+            equity: kani::any::<u8>() as u128,
+        })
+    } else {
+        None
+    };
+    let g = GrowthGateIn {
+        taker_before_q: kani::any::<i8>() as i128,
+        taker_after_q: kani::any::<i8>() as i128,
+        taker_eff_after_abs_q: kani::any::<u8>() as u128,
+        taker_equity: kani::any::<u8>() as u128,
+        taker_cert_initial_req: None,
+        lp,
+        price_e6: kani::any::<u8>() as u64,
+        pos_scale: kani::any::<u8>() as u128,
+        engine_imr_bps: kani::any::<u16>() as u64,
+        min_nonzero_im_req: 0,
+        ceil_imr_bps: kani::any::<u16>() as u64,
+        lambda_bps: kani::any::<u8>() as u32,
+        kink_bps: kani::any::<u16>(),
+        crowd_blocked: kani::any(),
+        asset_bound: true,
+    };
+    let r = growth_required_imr_bps(&g);
+    if let Ok(x) = r {
+        assert!(x >= g.engine_imr_bps, "never below the engine IMR");
+        assert!(x <= MAX_IMR_BPS);
+    }
+    let crowd = g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q));
+    kani::cover!(r.is_ok() && g.lp.is_none(), "no LP: ceiling");
+    kani::cover!(r.is_ok() && g.lp.is_some() && !crowd, "thin open: ceiling");
+    kani::cover!(r.is_ok_and(|x| x > g.ceil_imr_bps) && crowd, "crowd above the kink");
+    kani::cover!(r == Err(GrowthVerdict::LeverageExceeded), "ceil below engine refused");
+    kani::cover!(r == Err(GrowthVerdict::CapacityFull), "capacity refused");
 }
 
 // ── Target 2 ──────────────────────────────────────────────────────────────────────────────
