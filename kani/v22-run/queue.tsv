@@ -507,11 +507,11 @@ percolator-prog:kani_v22_wb2_band_lambda_and_alpha_caps@mainnet	S	/Users/khubair
 percolator-prog:kani_v22_wb3_graduation_requires_band_and_depth	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wb3_graduation_requires_band_and_depth	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wb4_c_launch_floor	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wb4_c_launch_floor	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wb5_rent_rate_fail_closed	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wb5_rent_rate_fail_closed	--tests --features devnet -Z function-contracts -Z stubbing
-percolator-prog:kani_v22_wd1_rescue_no_dilution	L	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd1_rescue_no_dilution	--tests --features devnet -Z function-contracts -Z stubbing
+percolator-prog:kani_v22_wd1_rescue_no_dilution	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd1_rescue_no_dilution	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd2_rescue_par_per_share	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd2_rescue_par_per_share	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd3_rescue_refuses_floor	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd3_rescue_refuses_floor	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd4_units_mint_burn_no_dilution	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd4_units_mint_burn_no_dilution	--tests --features devnet -Z function-contracts -Z stubbing
-percolator-prog:kani_v22_wd5_admitted_mint_positive_and_bounded	L	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd5_admitted_mint_positive_and_bounded	--tests --features devnet -Z function-contracts -Z stubbing
+percolator-prog:kani_v22_wd5_admitted_mint_positive_and_bounded	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd5_admitted_mint_positive_and_bounded	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd6_loss_pro_rata	M	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd6_loss_pro_rata	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd7_backstop_bounded	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd7_backstop_bounded	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog:kani_v22_wd8_backstop_only_after_seniors	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wd8_backstop_only_after_seniors	--tests --features devnet -Z function-contracts -Z stubbing
@@ -719,6 +719,7 @@ percolator-stake:port_senior_balance_never_underflows	M	/Users/khubair/percolato
 percolator-stake:port_tranche_decomposition	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_tranche_decomposition	--tests
 percolator-stake:port_169_mode1_no_false_underflow_brick	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_169_mode1_no_false_underflow_brick	--tests
 percolator-stake:port_161_recovery_never_windfalls_protected_senior	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_161_recovery_never_windfalls_protected_senior	--tests
+percolator-stake:st5_last_junior_full_burn_pays_exactly_ejb	M	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	st5_last_junior_full_burn_pays_exactly_ejb	--tests
 percolator-stake:port_flush_preserves_value	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_flush_preserves_value	--tests
 percolator-stake:port_flush_reduces_value_exactly	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_flush_reduces_value_exactly	--tests
 percolator-stake:port_returns_increase_value	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	port_returns_increase_value	--tests
