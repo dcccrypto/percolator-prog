@@ -12,13 +12,12 @@
 //!   kani_v22_wd30_switchboard_program_predicate. Their assertions branch on
 //!   `cfg!(feature = "devnet")`, so the same harness is right in both builds.
 //!
-//! Width policy (rev 2 R2.4): add/sub/min/compare at full width; any symbolic `*` or `/` either at
-//! bounded operands (stated per harness) or through `stub_verified(vault_lp_v18::mul_div_floor)`,
-//! whose contract is proved in THIS crate by `kani_v22_mul_div_floor_contract` (u8 operands +
-//! paper width-lift). A harness using it is PASS only if that contract harness PASSes in the same
-//! run, else CONDITIONAL. `p4_rescue_ins::mul_div_ceil` carries no contract: every harness calls it
-//! for real at u16 operands, and `kani_v22_mul_div_ceil_lemma` proves it exact on that domain
-//! (rev 2's checked model is not needed at u16 and is not used; domains match by construction).
+//! Width policy (rev 2 R2.4 as resolved in review addendum W3): add/sub/min/compare at full width;
+//! any symbolic `*` or `/` runs through the REAL primitive at the bounded operands stated per
+//! harness (`vault_lp_v18::mul_div_floor` and `p4_rescue_ins::mul_div_ceil` are called, never
+//! stubbed): no harness depends on a `proof_for_contract` of a dependency-crate function from an
+//! integration test (the same policy as `tests/v22_kani_cfl.rs`). Results are labelled BOUNDED.
+//! `kani_v22_mul_div_ceil_lemma` proves `mul_div_ceil` exact on the u16 domain its callers use.
 //!
 //! Every harness carries `kani::cover!` on each claimed branch; SUCCESSFUL with an unsatisfied
 //! cover is VACUOUS (a failure). Mutant ids refer to rev 2 R4.5 / `kani/mutants/v22/wrapper_ad.tsv`.
@@ -42,21 +41,6 @@ use solana_program::pubkey::Pubkey;
 // Contract / lemma harnesses (run FIRST: dependants are CONDITIONAL on them)
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// Contract of `vault_lp_v18::mul_div_floor` (`src/vault_lp_v18.rs:19`) in this crate, so that
-/// `stub_verified` below has a verified contract. u8 operands; the width-lift is the paper lemma
-/// recorded with `kani_growth_c_mul_div_floor` (the function has no width-dependent branch beyond
-/// `checked_mul`). Cost M (rev-6c: 209 s for the same domain).
-#[kani::proof_for_contract(percolator_prog::vault_lp_v18::mul_div_floor)]
-#[kani::solver(cadical)]
-fn kani_v22_mul_div_floor_contract() {
-    let a = kani::any::<u8>() as u128;
-    let b = kani::any::<u8>() as u128;
-    let d = kani::any::<u8>() as u128;
-    let r = vlp::mul_div_floor(a, b, d);
-    kani::cover!(d == 0, "d == 0 -> None");
-    kani::cover!(r.is_some_and(|q| q * d < a * b), "inexact floor");
-    kani::cover!(r.is_some_and(|q| d != 0 && q * d == a * b), "exact");
-}
 
 /// rev 2 R2.4: `p4_rescue_ins::mul_div_ceil` (`src/p4_rescue_ins.rs:31`) is the exact ceiling on
 /// `a, b, d: u16`, `None` iff `d == 0` there (no overflow at this width). Every Wave D caller of it
@@ -661,10 +645,15 @@ fn kani_v22_wa19_exit_requires_loss_current_flavour() {
     let p = profile_with(mode, pad);
     let bit = pad[constants::PROFILE_P4_FLAGS_IDX] & constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT != 0;
     let r = state::profile_exit_requires_loss_current(&p);
-    if cfg!(feature = "devnet") {
+    // review addendum W2: statement-level #[cfg] so each build carries only its own covers (an
+    // `if cfg!(..)` branch left the other flavour's cover unreachable in every build).
+    #[cfg(feature = "devnet")]
+    {
         assert_eq!(r, bit);
         kani::cover!(!r, "devnet: flag off -> not required");
-    } else {
+    }
+    #[cfg(not(feature = "devnet"))]
+    {
         assert!(r);
         kani::cover!(!bit, "mainnet forces it on without the flag");
     }
@@ -697,7 +686,9 @@ fn kani_v22_wb1_rent_rate_kink_cap_monotone() {
         if u1 * 10_000 <= kink as u128 * n {
             assert_eq!(a, 0);
         }
-        if u1 >= n {
+        // review addendum W1: at kink = 10_000 and u1 == n the below-kink rule (rate 0) applies,
+        // so "at capacity => max" holds only strictly above the kink.
+        if u1 >= n && u1 * 10_000 > kink as u128 * n {
             assert_eq!(a, max);
         }
         if u2 >= u1 {
@@ -708,7 +699,8 @@ fn kani_v22_wb1_rent_rate_kink_cap_monotone() {
     kani::cover!(n == 0, "no capacity");
     kani::cover!(n > 0 && u1 * 10_000 <= kink as u128 * n, "below kink");
     kani::cover!(n > 0 && u1 * 10_000 > kink as u128 * n && u1 < n && max > 0, "kink region");
-    kani::cover!(n > 0 && u1 >= n && max > 0, "at capacity");
+    kani::cover!(n > 0 && u1 >= n && u1 * 10_000 > kink as u128 * n && max > 0, "at capacity, above the kink");
+    kani::cover!(n > 0 && u1 == n && kink == 10_000, "kink = 100%: at capacity is still below the kink");
 }
 
 /// W-B-2 (rev 2 R1.7): `band_lambda_max_bps` (`src/growth_v19.rs:818`) is `<=
@@ -786,11 +778,9 @@ fn kani_v22_wb5_rent_rate_fail_closed() {
 // Wave D
 // ════════════════════════════════════════════════════════════════════════════════════════════
 
-/// W-D-1 (L-RES, I-RS1): rescue no dilution. u32 operands, `mul_div_floor` by its verified
-/// contract. Assumes the vault impaired (`v < c`) and the rescue admitted. Mutant: `rescue_shares`
-/// with div_ceil. Cost M, CONDITIONAL on `kani_v22_mul_div_floor_contract`.
+/// W-D-1 (L-RES, I-RS1): rescue no dilution. u32/u64 operands, the real `mul_div_floor` (no stub, BOUNDED). Assumes the vault impaired (`v < c`) and the rescue admitted. Mutant: `rescue_shares`
+/// with div_ceil. Cost L (real 128-bit divider; review addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd1_rescue_no_dilution() {
     let v = kani::any::<u32>() as u128;
@@ -808,9 +798,8 @@ fn kani_v22_wd1_rescue_no_dilution() {
 }
 
 /// W-D-2 (I-RS2): par per share not raised by a rescue; falls by less than one atom per share.
-/// Mutant: `rescue_claim_delta` with div_ceil. Cost M, CONDITIONAL on the floor contract.
+/// Mutant: `rescue_claim_delta` with div_ceil. Cost M-L (real `mul_div_floor`, bounded; review addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd2_rescue_par_per_share() {
     let c = kani::any::<u32>() as u128;
@@ -847,10 +836,9 @@ fn kani_v22_wd3_rescue_refuses_floor() {
 
 /// W-D-4 (I-S3): unit mint and burn never dilute; a dust top-up mints 0. u16 operands (the burn
 /// path calls the real `mul_div_ceil`, inside `kani_v22_mul_div_ceil_lemma`'s domain); the mint
-/// uses the floor contract. Mutants: topup div_ceil; burn floor. Cost M, CONDITIONAL on the floor
-/// contract.
+/// uses the real `mul_div_floor`. Mutants: topup div_ceil; burn floor. Cost M-L (bounded; review
+/// addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd4_units_mint_burn_no_dilution() {
     let i = kani::any::<u16>() as u128;
@@ -870,10 +858,9 @@ fn kani_v22_wd4_units_mint_burn_no_dilution() {
 }
 
 /// W-D-5 (W-1): an admitted top-up (`x > 0`, rev 2 R1.9) mints `m > 0`, does not dilute, loses at
-/// most 1 bp + 1 atom; genesis needs `INS_UNITS_GENESIS_MIN_ATOMS`. u32 operands, floor contract.
-/// Mutant: drop `minted == 0` refusal. Cost M, CONDITIONAL on the floor contract.
+/// most 1 bp + 1 atom; genesis needs `INS_UNITS_GENESIS_MIN_ATOMS`. u32 operands, the real `mul_div_floor` (bounded).
+/// Mutant: drop `minted == 0` refusal. Cost M-L (real `mul_div_floor`, bounded; review addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd5_admitted_mint_positive_and_bounded() {
     let u = kani::any::<u32>() as u128;
@@ -902,10 +889,9 @@ fn kani_v22_wd5_admitted_mint_positive_and_bounded() {
 }
 
 /// W-D-6 (I-S3, losses): a loss is shared pro rata between two classes, within the floor
-/// rounding (u16, real `ins_units_value` via the floor contract). Mutant: per-class denominators.
-/// Cost M, CONDITIONAL on the floor contract.
+/// rounding (u16, real `ins_units_value` and real `mul_div_floor`). Mutant: per-class denominators.
+/// Cost M-L (real `mul_div_floor`, bounded; review addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd6_loss_pro_rata() {
     let us = kani::any::<u16>() as u128;
@@ -1061,7 +1047,8 @@ fn kani_v22_wd13_combined_reading_is_min_sum() {
 /// (`vault_lp_draw_halts(mirror, FILL) == (mirror != 0)`). NOT implementable as designed for the
 /// mirror itself: `vault_lp_halt_mirror` is a private processor fn (`src/v16_program.rs:32606`);
 /// a shim would move panic locations (P-7). Its body (`drawn_outstanding + backstop`, saturating)
-/// stays with LiteSVM (W-9 no-seniors vault test). Cost S.
+/// stays with LiteSVM: `tests/p4_wave_d.rs:2627` `sec_d6_fill_halt_counts_the_backstop`, killed-by row
+/// `LS-W9` of `kani/mutants/v22/wrapper_litesvm.tsv`. Cost S.
 #[kani::proof]
 fn kani_v22_wd14_halt_on_mirror() {
     let mirror: u128 = kani::any();
@@ -1168,9 +1155,8 @@ fn kani_v22_wd17_full_exit_loss_below_one_unit() {
 }
 
 /// W-D-18 (R-2): burn then re-mint never nets more units than burned (u8). Mutants: topup
-/// div_ceil; burn floor. Cost M, CONDITIONAL on the floor contract.
+/// div_ceil; burn floor. Cost M-L (real `mul_div_floor`, bounded; review addendum W3).
 #[kani::proof]
-#[kani::stub_verified(percolator_prog::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_v22_wd18_burn_then_mint_no_gain() {
     let u = kani::any::<u8>() as u128;

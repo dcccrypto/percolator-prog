@@ -10,7 +10,8 @@
 //! the REAL primitive at bounded operands (u8 / u16, stated per harness) instead of `stub_verified`:
 //! a `proof_for_contract` of a dependency-crate function from an integration-test crate is not an
 //! established Kani path, and the real primitive at bounded width removes the CONDITIONAL dependency.
-//! Every such result is labelled "bounded" in the results table.
+//! Every such result is labelled "bounded" in the results table. `tests/v22_kani_ad.rs` follows the same
+//! policy (review addendum W3): no harness in this crate uses `stub_verified` or `proof_for_contract`.
 //!
 //! Evidence labels used below: PROOF, BOUNDED, MODEL-LEVEL (proves a proof-only model of the lazy bond
 //! representation, not a production path), CONDITIONAL(on <harness>).

@@ -63,7 +63,6 @@ kani_band_position_cap_census	M	-
 kani_band_width_ok_exact	M	-
 kani_band_reanchor_never_narrow	M	-
 kani_band_trade_shape_cap_and_min_notional_exempt	M	-
-kani_v22_mul_div_floor_contract	M	-
 kani_v22_mul_div_ceil_lemma	M	-
 kani_v22_wa1_lot_floor_guarantees_progress	M	-
 kani_v22_wa9_t9_p3_dip_model	M	-
@@ -92,12 +91,12 @@ kani_v22_fe4_emit_fills_chunking	M	-
 kani_v22_fe8_liquidation_event_view_n1_n2	M	-
 kani_v22_lp4_metadata_instruction_data	M	-
 kani_v22_lp6_record_state_total	M	-
-kani_v22_wd1_rescue_no_dilution	M	percolator-prog:kani_v22_mul_div_floor_contract
-kani_v22_wd2_rescue_par_per_share	M	percolator-prog:kani_v22_mul_div_floor_contract
-kani_v22_wd4_units_mint_burn_no_dilution	M	percolator-prog:kani_v22_mul_div_floor_contract
-kani_v22_wd5_admitted_mint_positive_and_bounded	M	percolator-prog:kani_v22_mul_div_floor_contract
-kani_v22_wd6_loss_pro_rata	M	percolator-prog:kani_v22_mul_div_floor_contract
-kani_v22_wd18_burn_then_mint_no_gain	M	percolator-prog:kani_v22_mul_div_floor_contract
+kani_v22_wd1_rescue_no_dilution	L	-
+kani_v22_wd2_rescue_par_per_share	M	-
+kani_v22_wd4_units_mint_burn_no_dilution	M	-
+kani_v22_wd5_admitted_mint_positive_and_bounded	L	-
+kani_v22_wd6_loss_pro_rata	M	-
+kani_v22_wd18_burn_then_mint_no_gain	M	-
 kani_v22_lp1_base58_encode_bounds_alphabet	L	-
 kani_v22_lp2_ticker_name_symbol_bounds	M	percolator-prog:kani_v22_lp1_base58_encode_bounds_alphabet
 kani_v22_lp3_share_uri_shape	M	percolator-prog:kani_v22_lp1_base58_encode_bounds_alphabet

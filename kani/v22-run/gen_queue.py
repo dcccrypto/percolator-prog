@@ -43,8 +43,57 @@ CRATES = [
 # flavour-dependent wrapper harnesses also run in the mainnet flavour (rev 2 R2.2/R2.3)
 MAINNET_TOO = {l.strip() for l in open(os.path.join(here, "mainnet_secondary.txt")) if l.strip() and not l.startswith("#")}
 
-pat = re.compile(r"#\[kani::proof(?:_for_contract\([^)]*\))?\]")
-fnpat = re.compile(r"fn\s+([A-Za-z_0-9]+)\s*\(")
+# Only real attributes count: the attribute must open a source line (leading whitespace only), and lines
+# inside `//` comments or `/* */` blocks are skipped (M6: a doc-comment `#[kani::proof]` queued a non-harness).
+attr = re.compile(r"^\s*#\[kani::(?:proof|proof_for_contract\([^)]*\))\]")
+fnline = re.compile(r"^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const|async|unsafe|extern\s+\"[^\"]*\")\s+)*fn\s+([A-Za-z_0-9]+)\s*[(<]")
+
+
+def code_lines(txt):
+    """Yield (lineno, line) for source lines outside comments (whole-line `//` comments and `/* */` blocks)."""
+    in_block = False
+    for i, line in enumerate(txt.split("\n"), 1):
+        st = line.strip()
+        if in_block:
+            if "*/" in st:
+                in_block = False
+            continue
+        if st.startswith("//"):
+            continue
+        if st.startswith("/*"):
+            in_block = "*/" not in st[2:]
+            continue
+        yield i, line
+
+
+def harnesses(txt, path):
+    """[(name, attr_lineno)] for every real #[kani::proof] / #[kani::proof_for_contract(..)] item."""
+    out, pending, depth = [], None, 0
+    for i, line in code_lines(txt):
+        st = line.strip()
+        if depth > 0:  # continuation of a multi-line attribute, e.g. #[kani::stub(\n a,\n b\n)]
+            depth += st.count("[") - st.count("]")
+            continue
+        if attr.match(line):
+            pending = pending or i  # stacked kani attributes still name one fn
+            continue
+        if pending is None:
+            continue
+        m = fnline.match(line)
+        if m:
+            out.append((m.group(1), pending))
+            pending = None
+        elif st.startswith("#["):
+            depth = st.count("[") - st.count("]")  # other attributes (unwind, stub, solver, cfg)
+        elif not st:
+            continue
+        else:
+            sys.exit(f"{path}:{pending}: kani attribute not followed by a fn (line {i}: {st[:80]})")
+    if pending is not None:
+        sys.exit(f"{path}:{pending}: kani attribute at end of file")
+    return out
+
+
 print("# id\tclass\tworkdir\tflavour\tdeps\tharness\targs")
 for wd, files, prefix, flav, args in CRATES:
     absd = os.path.join(root, wd)
@@ -55,8 +104,7 @@ for wd, files, prefix, flav, args in CRATES:
             sys.stderr.write(f"missing {p}\n")
             continue
         txt = open(p).read()
-        for m in pat.finditer(txt):
-            n = fnpat.search(txt, m.end()).group(1)
+        for n, _ln in harnesses(txt, p):
             if n in seen:
                 # the same name in two test targets of one crate: --exact runs BOTH under one
                 # invocation (same fully qualified name); the second entry is recorded, not re-queued

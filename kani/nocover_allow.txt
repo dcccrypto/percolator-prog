@@ -1,39 +1,69 @@
-kani_v16_premium_funding_rate_is_clamped_and_signed
-kani_v16_init_market_decode_preserves_wire_fields
-kani_v16_deposit_withdraw_decode_preserves_wire_fields
-kani_v16_convert_and_cure_decode_preserves_wire_fields
-kani_v16_top_up_insurance_decode_preserves_wire_fields
-kani_v16_domain_insurance_decode_preserves_wire_fields
-kani_v16_recovery_close_progress_decode_preserves_wire_fields
-kani_v16_top_up_backing_bucket_decode_preserves_wire_fields
-kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields
-kani_v16_asset_lifecycle_decode_preserves_wire_fields
-kani_v16_tradenocpi_decode_preserves_wire_fields
-kani_v16_tradecpi_decode_preserves_wire_fields
-kani_v16_permissionless_crank_rejects_legacy_close_q_fee_bps_wire_payload
-kani_v16_update_authority_decode_preserves_wire_fields
-kani_v16_set_lp_vault_paused_decode_preserves_wire_fields
-kani_v16_update_liquidation_fee_policy_decode_preserves_wire_fields
-kani_v16_update_maintenance_fee_policy_decode_preserves_wire_fields
-kani_v16_update_backing_fee_policy_decode_preserves_wire_fields
-kani_v16_update_trade_fee_policy_decode_preserves_wire_fields
-kani_v16_update_fee_redirect_policy_decode_preserves_wire_fields
-kani_v16_update_market_init_fee_policy_decode_preserves_wire_fields
-kani_v16_base_unit_payloads_decode_preserves_wire_fields
-kani_v16_permissionless_resolve_decode_preserves_wire_fields
-kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields
-kani_v16_ewma_mark_decode_preserves_wire_fields
-kani_v16_decode_rejects_trailing_bytes
-kani_v16_init_market_payload_rejects_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_custody_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_trade_and_crank_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_admin_policy_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_oracle_asset_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_resolved_recovery_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
-kani_v16_zero_length_decode_rejects
-kani_v16_every_active_payload_rejects_one_byte_truncation
-kani_e2_auth_accept_implies_all_gates
-kani_e2_auth_reject_fake_pda_owner
-kani_e2_auth_reject_noncanonical_pda
-kani_e2_auth_reject_uninitialized_ata
-kani_fee_split_no_leg_exceeds_fee
+# PASS_NOCOVER allow-list, frozen for the Kani v2.2 final run (design rev 2 R3.3 / rev 2.1 item 8; review M7).
+# Entries are queue ids `<crate id>:<harness>` (gen_queue.py ids); summarize.py also still accepts bare names.
+# Text after `#` is ignored.
+#
+# == wrapper: generated, python3 -I kani/nocover_allow.py --id-prefix percolator-prog tests/v16_kani.rs
+#    (no cover / assume / return in the body, and at least one assert outside an if/else block)
+#    removed vs 5facf1c1: kani_e2_auth_accept_implies_all_gates (all 8 asserts sit under
+#    `if nft_holder_auth_decision(..)`, so a decision that never accepts would pass vacuously).
+percolator-prog:kani_v16_premium_funding_rate_is_clamped_and_signed
+percolator-prog:kani_v16_init_market_decode_preserves_wire_fields
+percolator-prog:kani_v16_deposit_withdraw_decode_preserves_wire_fields
+percolator-prog:kani_v16_convert_and_cure_decode_preserves_wire_fields
+percolator-prog:kani_v16_top_up_insurance_decode_preserves_wire_fields
+percolator-prog:kani_v16_domain_insurance_decode_preserves_wire_fields
+percolator-prog:kani_v16_recovery_close_progress_decode_preserves_wire_fields
+percolator-prog:kani_v16_top_up_backing_bucket_decode_preserves_wire_fields
+percolator-prog:kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields
+percolator-prog:kani_v16_asset_lifecycle_decode_preserves_wire_fields
+percolator-prog:kani_v16_tradenocpi_decode_preserves_wire_fields
+percolator-prog:kani_v16_tradecpi_decode_preserves_wire_fields
+percolator-prog:kani_v16_permissionless_crank_rejects_legacy_close_q_fee_bps_wire_payload
+percolator-prog:kani_v16_update_authority_decode_preserves_wire_fields
+percolator-prog:kani_v16_set_lp_vault_paused_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_liquidation_fee_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_maintenance_fee_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_backing_fee_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_trade_fee_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_fee_redirect_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_update_market_init_fee_policy_decode_preserves_wire_fields
+percolator-prog:kani_v16_base_unit_payloads_decode_preserves_wire_fields
+percolator-prog:kani_v16_permissionless_resolve_decode_preserves_wire_fields
+percolator-prog:kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields
+percolator-prog:kani_v16_ewma_mark_decode_preserves_wire_fields
+percolator-prog:kani_v16_decode_rejects_trailing_bytes
+percolator-prog:kani_v16_init_market_payload_rejects_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_custody_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_trade_and_crank_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_admin_policy_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_oracle_asset_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_resolved_recovery_payloads_reject_trailing_byte	# helpers: assert_rejects_trailing_byte
+percolator-prog:kani_v16_zero_length_decode_rejects
+percolator-prog:kani_v16_every_active_payload_rejects_one_byte_truncation
+percolator-prog:kani_e2_auth_reject_fake_pda_owner
+percolator-prog:kani_e2_auth_reject_noncanonical_pda
+percolator-prog:kani_e2_auth_reject_uninitialized_ata
+percolator-prog:kani_fee_split_no_leg_exceeds_fee
+#
+# == stake: added by design (R3.3), hand-checked (tests/kani.rs)
+percolator-stake:proof_pool_value_no_panic	# panic-freedom only (no assert): symbolic u64 pair, no assume/return/cover
+percolator-stake:proof_pool_value_none_iff_overdrawn	# both asserts sit in an EXHAUSTIVE if/else on symbolic u64s (every input reaches one arm), so not the M7 vacuity shape; the generator rule alone would skip it
+#
+# == engine: rows of artifacts/kani-2026-08-24/nocover_reachability.tsv re-checked by name in
+#    percolator/tests/*.rs @ 80912781 with
+#    nocover_allow.py --check <names> --id-prefix percolator tests/*.rs
+#    (exists, no kani::cover!, no kani::assume, no return, asserts not all under if/else). Included:
+percolator:proof_v17_lp_vault_deposit_redeem_no_profit
+percolator:proof_v17_stress_envelope_clear_resets_fields
+percolator:proof_v17_stress_envelope_epoch_reset
+percolator:proof_v17_stress_envelope_validate_shape_pairing
+# Excluded (and why):
+#   proof_v16_liquidation_selector_is_healthy_locally_minimal_or_full_close  has kani::assume
+#   proof_v16_terminal_realization_floored_rate_pays_zero_and_moves_nothing  has kani::cover! (needs no allow entry)
+#   proof_v17_apply_fee_policy_update_persists                               has kani::assume
+#   proof_v17_apply_fee_policy_update_validates_bounds                       has kani::assume; all 4 asserts under if/else
+#   proof_v17_fee_policy_update_no_other_field_mutation                      has kani::assume
+#   proof_v17_lp_vault_redemption_round_down                                 has kani::assume
+#   proof_v17_lp_vault_shares_round_down_no_over_issue                       has kani::assume
+#   proof_v17_stress_envelope_activation_threshold                           has kani::assume
+#   proof_v17_stress_envelope_writer_monotonic                               has kani::assume

@@ -1,5 +1,5 @@
 id	file	line	original	replacement	target	expected_kill
-A-M7-1	tests/v22_kani_ad.rs	131	kani::assume(p >= 10_000 && target >= 1	kani::assume(p >= 9_999 && target >= 1	kani_v22_wa1_lot_floor_guarantees_progress	assert `next != p` at p = 9_999, cap 1, dt 1 (harness-precondition mutant: sharpness witness)
+A-M7-1	tests/v22_kani_ad.rs	115	kani::assume(p >= 10_000 && target >= 1	kani::assume(p >= 9_999 && target >= 1	kani_v22_wa1_lot_floor_guarantees_progress	assert `next != p` at p = 9_999, cap 1, dt 1 (harness-precondition mutant: sharpness witness)
 A-M7-3	src/v16_program.rs	4480	        let lot_mode_ok = lot_exp == 0	        let lot_mode_ok = true || lot_exp == 0	kani_v22_wa3_profile_shape	assert_eq (lot on Hybrid accepted)
 A-M7-4	src/v16_program.rs	4508	        out[crate::constants::PROFILE_P4_FLAGS_IDX] = profile_p4_flags(existing);	        out = NEW_PROFILE_PADDING0;	kani_v22_wa4_lot_carry_is_identity_or_119	`Ok(pad)` identity (lot 6 / flags lost)
 A-M7-5	src/wave_a_v22.rs	27	    growth && mark_e6 < LOT_PRICE_FLOOR_E6	    false && mark_e6 < LOT_PRICE_FLOOR_E6	kani_v22_wa5_lot_floor_predicate	assert_eq; cover 'below floor' still reached
