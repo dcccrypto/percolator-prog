@@ -7,7 +7,6 @@
 #
 # PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
 # never allowed to grow; each should be brought under 3840 in its own change):
-4032 percolator_prog::processor::handle_execute_redemption
 3968 percolator_prog::processor::handle_lp_vault_crank_fees pin
 #
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
