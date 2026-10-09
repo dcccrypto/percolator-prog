@@ -1031,6 +1031,7 @@ impl CrosscutEnv {
                 AccountMeta::new(self.lp_mint, false),
                 AccountMeta::new_readonly(system_program::ID, false),
                 AccountMeta::new_readonly(spl_token_classic_id(), false),
+                AccountMeta::new_readonly(self.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         )
@@ -1388,7 +1389,7 @@ fn portfolio_data(
         ..Default::default()
     };
     let pod_len = core::mem::size_of::<PortfolioAccountV16Account>();
-    let mut data = vec![0u8; HEADER_LEN + pod_len];
+    let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
     data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
     data[8..10].copy_from_slice(&VERSION.to_le_bytes());
     data[10] = KIND_PORTFOLIO;
@@ -1909,9 +1910,9 @@ fn x6_ledger_collateral_conservation_across_lifecycle() {
 // genuine version skew the whole time. #441 is the same skew one version later.
 // ════════════════════════════════════════════════════════════════════════════
 
-const STAKE_POOL_SIZE: usize = 408;
+const STAKE_POOL_SIZE: usize = 480; // v5 (Phase 4 item 6)
 const STAKE_POOL_DISCRIMINATOR: &[u8; 8] = b"SPOOL_V1";
-const STAKE_POOL_VERSION: u8 = 4;
+const STAKE_POOL_VERSION: u8 = 5;
 
 /// Hand-craft a v16 StakePool in insurance-LP mode (pool_mode=0), bound to
 /// `market` + `percolator_program`, with `vault` funded for flush. Mirrors the
@@ -1942,6 +1943,7 @@ fn craft_stake_pool_bytes(
                                                               // d[280] pool_mode = 0 (insurance LP) — already zero.
     d[320..328].copy_from_slice(STAKE_POOL_DISCRIMINATOR);
     d[328] = STAKE_POOL_VERSION;
+    d[408] = 1; // v5 risk_mode = FIRST_LOSS
     d
 }
 
@@ -2137,7 +2139,9 @@ impl CrosscutEnv {
 /// MAINNET to bind the insurance authority to its vault_auth PDA, then flushes
 /// collateral stake_vault -> wrapper vault and credits insurance. THE greenfield
 /// de-risk (stake was loaded by zero wrapper tests before now).
-#[test]
+/// v4 history: stake v5 (Phase 4 item 6) removed the creator-admin flush (and refuses
+/// insurance-authority rotation on first-loss pools); see the `x0_stake_flush_to_insurance_at_mainnet_v5` replacement below.
+#[allow(dead_code)]
 fn x0_stake_flush_to_insurance_at_mainnet() {
     let mut env = CrosscutEnv::new();
     let flush_amount: u64 = 1_000_000;
@@ -2174,7 +2178,9 @@ fn x0_stake_flush_to_insurance_at_mainnet() {
 /// (the wrapper's TopUpInsurance Live-gate, v16_program.rs:7566), atomically. Plus
 /// the flush-conservation invariant on the Live flush (insurance += exactly the
 /// flushed amount; vault conserved).
-#[test]
+/// v4 history: stake v5 (Phase 4 item 6) removed the creator-admin flush (and refuses
+/// insurance-authority rotation on first-loss pools); see the `x2_flush_race_resolved_market_reverts_mode_not_live_v5` replacement below.
+#[allow(dead_code)]
 fn x2_flush_race_resolved_market_reverts_mode_not_live() {
     let mut env = CrosscutEnv::new();
     let ctx = env.setup_stake_pool(2_000_000);
@@ -2236,7 +2242,9 @@ fn x2_flush_race_resolved_market_reverts_mode_not_live() {
 /// a signable wallet, resolve, then that wallet reclaims EXACTLY the flushed
 /// insurance. This is the highest-value gate check: does terminal-reclaim liveness
 /// hold in the assembled system?
-#[test]
+/// v4 history: stake v5 (Phase 4 item 6) removed the creator-admin flush (and refuses
+/// insurance-authority rotation on first-loss pools); see the `x5_terminal_reclaim_liveness_via_rotate_no_lockout_v5` replacement below.
+#[allow(dead_code)]
 fn x5_terminal_reclaim_liveness_via_rotate_no_lockout() {
     let mut env = CrosscutEnv::new();
     let amount: u64 = 1_000_000;
@@ -2985,4 +2993,56 @@ fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
         "escrowed capital untouched"
     );
     assert_eq!(env.token_amount(dest), 0, "no funds moved to the attacker");
+}
+
+// ── Phase 4 item 6 (stake v5): the v4 flush / rotate-out flows above are REMOVED by design. ──
+// Deployment is the permissionless SyncInsuranceDeployment (stake tag 31), exercised against the
+// real stake v5 .so in `tests/p4_wave_d.rs` (xprog_*). These replacements pin the removal in the
+// assembled 5-program system: nothing moves.
+
+const STAKE_DEPRECATED_V5: u32 = 34;
+const STAKE_NOT_SUPPORTED_ON_FIRST_LOSS: u32 = 41;
+
+/// I-S1: after a real bind, the admin flush is refused (DeprecatedV5) and moves nothing.
+#[test]
+fn x0_stake_flush_to_insurance_at_mainnet_v5() {
+    let mut env = CrosscutEnv::new();
+    let ctx = env.setup_stake_pool(1_000_000);
+    env.stake_bind(&ctx).expect("BindInsuranceAuthority");
+    let (ins, vault, stake) = (env.group().insurance, env.token_amount(env.vault), env.token_amount(ctx.stake_vault));
+    assert_custom(env.stake_flush(&ctx, 1_000_000), STAKE_DEPRECATED_V5, "v5: admin flush removed");
+    assert_eq!(env.group().insurance, ins);
+    assert_eq!(env.token_amount(env.vault), vault);
+    assert_eq!(env.token_amount(ctx.stake_vault), stake);
+}
+
+/// The removed flush is refused identically in Live and after resolution.
+#[test]
+fn x2_flush_race_resolved_market_reverts_mode_not_live_v5() {
+    let mut env = CrosscutEnv::new();
+    let ctx = env.setup_stake_pool(2_000_000);
+    env.stake_bind(&ctx).expect("bind");
+    assert_custom(env.stake_flush(&ctx, 1_000_000), STAKE_DEPRECATED_V5, "Live");
+    env.warp(100);
+    env.resolve_market().expect("resolve market");
+    let stake = env.token_amount(ctx.stake_vault);
+    assert_custom(env.stake_flush(&ctx, 1_000_000), STAKE_DEPRECATED_V5, "Resolved");
+    assert_eq!(env.token_amount(ctx.stake_vault), stake);
+}
+
+/// I-S1: on a FIRST_LOSS pool the admin may not rotate the insurance authority off the pool
+/// (it would strand the stakers' insurance units); terminal recovery is stake tag 29 + wrapper
+/// tag 41 through the units ledger instead.
+#[test]
+fn x5_terminal_reclaim_liveness_via_rotate_no_lockout_v5() {
+    let mut env = CrosscutEnv::new();
+    let ctx = env.setup_stake_pool(1_000_000);
+    env.stake_bind(&ctx).expect("bind");
+    let target = Keypair::new();
+    env.svm.airdrop(&target.pubkey(), 1_000_000_000).unwrap();
+    assert_custom(
+        env.stake_rotate(&ctx, &target),
+        STAKE_NOT_SUPPORTED_ON_FIRST_LOSS,
+        "v5: admin rotation refused on a first-loss pool",
+    );
 }

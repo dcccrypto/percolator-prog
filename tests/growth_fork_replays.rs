@@ -23,6 +23,9 @@
 //!   growth record only: every open is refused, 97). The live engine may refuse first (h-lock,
 //!   loss-stale, ADL); every outcome is printed and the assertions are exactly what the
 //!   bytes support.
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, POS_SCALE};
 use percolator_prog::{
@@ -98,26 +101,40 @@ fn load(name: &str) -> Fixture {
         WRAPPER_ID.to_string()
     );
     let clock: Clock = bincode::deserialize(&b64(v["clock_sysvar_b64"].as_str().unwrap())).unwrap();
-    let accounts = v["accounts"]
+    let accounts: Vec<(Pubkey, Account)> = v["accounts"]
         .as_array()
         .unwrap()
         .iter()
         .map(|a| {
             (
                 a["pubkey"].as_str().unwrap().parse().unwrap(),
-                Account {
-                    lamports: a["lamports"].as_u64().unwrap(),
-                    data: b64(a["data_b64"].as_str().unwrap()),
-                    owner: a["owner"].as_str().unwrap().parse().unwrap(),
-                    executable: a["executable"].as_bool().unwrap(),
-                    rent_epoch: 0,
+                {
+                    let raw = b64(a["data_b64"].as_str().unwrap());
+                    let raw_len = raw.len();
+                    // v2.2: the captured deployed bytes are re-encoded for this layout: the
+                    // funding-scale drift tail and the band/rent words are inserted as zeros
+                    // (what a fresh slab starts with); nothing else moves. The grown account is
+                    // kept rent-exempt (~6,960 lamports per byte-year x2).
+                    let data = v21_upgrade::upgrade_v21_account(
+                        &WRAPPER_ID,
+                        &a["owner"].as_str().unwrap().parse().unwrap(),
+                        raw,
+                    );
+                    Account {
+                        lamports: a["lamports"].as_u64().unwrap() + 7_000 * (data.len() - raw_len) as u64,
+                        data,
+                        owner: a["owner"].as_str().unwrap().parse().unwrap(),
+                        executable: a["executable"].as_bool().unwrap(),
+                        rent_epoch: 0,
+                    }
                 },
             )
         })
         .collect();
+    let slab: Pubkey = v["slab"].as_str().unwrap().parse().unwrap();
     Fixture {
         name: name.to_string(),
-        slab: v["slab"].as_str().unwrap().parse().unwrap(),
+        slab,
         clock,
         accounts,
     }
@@ -923,3 +940,4 @@ fn p2b_fork_percolator_earn_raises_ncap() {
         assert!(grew + 1 >= expect && grew <= expect + 1, "N_cap grew {grew}, expected ~{expect}");
     }
 }
+

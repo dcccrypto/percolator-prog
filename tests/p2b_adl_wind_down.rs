@@ -17,6 +17,9 @@
 //! Negative controls are in-test (the same fork, one input changed): not yet armed, armed but
 //! not expired, after the reset (no ADL), loosening the bound, a non-upgrade-authority signer,
 //! and tag 93 rewriting the P1 limits (must not touch the episode).
+#[path = "common/v21_upgrade.rs"]
+mod v21_upgrade;
+
 use litesvm::LiteSVM;
 use percolator::{SideV16, ADL_ONE};
 use percolator_prog::{
@@ -36,6 +39,14 @@ use solana_sdk::{
     transaction::{Transaction, TransactionError},
 };
 use std::path::PathBuf;
+
+#[path = "support/fill_events.rs"]
+mod fill_events;
+
+thread_local! {
+    /// v2.2 fill events: logs of the last transaction (success or failure) sent by this thread.
+    static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
 
 const WRAPPER_ID: Pubkey = pubkey!("ETDLAdiAyWnEUngspYczTXUceT6X8f92eZQvr8nmSkWB");
 const E_NON_PROGRESS: u32 = 22;
@@ -103,10 +114,17 @@ fn fork() -> Fork {
     let mut portfolios = Vec::new();
     for a in v["accounts"].as_array().unwrap() {
         let k: Pubkey = a["pubkey"].as_str().unwrap().parse().unwrap();
+        let raw = b64(a["data_b64"].as_str().unwrap());
+        let owner: Pubkey = a["owner"].as_str().unwrap().parse().unwrap();
+        let raw_len = raw.len();
+        // v2.2: the captured deployed bytes are re-encoded for this layout: the funding-scale
+        // drift tail (zero) and the band/rent words (zero) are inserted, nothing else moves.
+        let data = v21_upgrade::upgrade_v21_account(&WRAPPER_ID, &owner, raw);
+        let lamports = a["lamports"].as_u64().unwrap() + 7_000 * (data.len() - raw_len) as u64;
         let acc = Account {
-            lamports: a["lamports"].as_u64().unwrap(),
-            data: b64(a["data_b64"].as_str().unwrap()),
-            owner: a["owner"].as_str().unwrap().parse().unwrap(),
+            lamports,
+            data,
+            owner,
             executable: a["executable"].as_bool().unwrap(),
             rent_epoch: 0,
         };
@@ -187,10 +205,16 @@ impl Fork {
         tx.signatures =
             vec![Signature::default(); tx.message.header.num_required_signatures as usize];
         tx.partial_sign(&[&payer], self.svm.latest_blockhash());
-        self.svm
-            .send_transaction(tx)
-            .map(|_| ())
-            .map_err(|f| f.err)
+        match self.svm.send_transaction(tx) {
+            Ok(m) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = m.logs.clone());
+                Ok(())
+            }
+            Err(f) => {
+                LAST_LOGS.with(|l| *l.borrow_mut() = f.meta.logs.clone());
+                Err(f.err)
+            }
+        }
     }
 
     fn warp(&mut self, slots: u64) {
@@ -444,8 +468,36 @@ fn p2b_tag104_arms_then_waits_for_the_episode_bound() {
     );
     assert_eq!(f.leg(&target), leg0);
     // The correct binding closes it.
+    let leg_before = state::read_portfolio(&f.data(&target))
+        .unwrap()
+        .legs
+        .iter()
+        .find(|l| l.active && l.asset_index == 0)
+        .cloned()
+        .expect("open leg");
+    let asset_before = f.group().assets[0].clone();
     f.wind_down_settled(&target).expect("bound met");
     assert!(f.leg(&target).is_none(), "closed at the mark once the episode bound is met");
+    // v2.2 fill events: the closing call emitted ONE REDUCE (tag 104, reason 2): the whole leg's
+    // ADL-EFFECTIVE size on this A-scaled close-only market (not the raw basis), a short being
+    // covered by a positive size, at the asset's effective price.
+    let evs = fill_events::wrapper_events(&LAST_LOGS.with(|l| l.borrow().clone()), &WRAPPER_ID);
+    assert_eq!(evs.len(), 1, "{evs:?}");
+    let fill_events::Event::Reduce { ix_tag, portfolio, counterparty, asset_index, reason, signed_reduced_q, price_e6, .. } =
+        &evs[0]
+    else {
+        panic!("expected REDUCE: {evs:?}")
+    };
+    assert_eq!((*ix_tag, *portfolio, *counterparty, *asset_index, *reason), (104, target, Pubkey::default(), 0, 2));
+    let effective = percolator_prog::risk_limits_v17::adl_effective_abs_q(
+        leg_before.basis_pos_q.unsigned_abs(),
+        leg_before.a_basis,
+        asset_before.a_short,
+    )
+    .expect("effective size");
+    assert_eq!(*signed_reduced_q, effective as i128, "the effective size closed, short covered");
+    assert!(*signed_reduced_q > 0);
+    assert_eq!(*price_e6, f.group().assets[0].effective_price);
 }
 
 #[test]
@@ -782,3 +834,4 @@ fn p2b_tag93_preserves_both_owned_ranges_of_the_risk_limits_tail() {
     assert_eq!(after.lp_floor_atoms, 7, "tag 93 applied the P1 limits");
     assert_eq!(&d[off + 42..off + 64], &tail_before[..], "tag 93 preserved bytes 42..64 exactly");
 }
+

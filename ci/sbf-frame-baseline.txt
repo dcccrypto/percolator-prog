@@ -7,8 +7,7 @@
 #
 # PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
 # never allowed to grow; each should be brought under 3840 in its own change):
-4032 percolator_prog::processor::handle_execute_redemption
-3968 percolator_prog::processor::handle_lp_vault_crank_fees
+3968 percolator_prog::processor::handle_lp_vault_crank_fees pin
 #
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
 # handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the

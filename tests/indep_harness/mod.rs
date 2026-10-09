@@ -427,6 +427,13 @@ impl Default for V16CuMarketParams {
     }
 }
 
+/// A refused InitMarket (S10-X1): the error string and whether the market account is unchanged.
+#[derive(Debug)]
+pub struct InitRefusal {
+    pub error: String,
+    pub market_unchanged: bool,
+}
+
 impl V16CuEnv {
     pub fn new() -> Self {
         Self::new_with_market_params_and_price_move(1, 10_000, 10_000, 10_000)
@@ -465,6 +472,28 @@ impl V16CuEnv {
     }
 
     pub fn new_with_init_params(params: V16CuMarketParams) -> Self {
+        match Self::try_new_with_init_params(params) {
+            Ok(env) => env,
+            Err(refusal) => panic!("init market: {}", refusal.error),
+        }
+    }
+
+    /// Fallible form (S10-X1): InitMarket's error string and whether the market account was left
+    /// byte-identical, instead of a panic.
+    pub fn try_new_with_init_params(params: V16CuMarketParams) -> Result<Self, InitRefusal> {
+        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`. Fixtures
+        // that study sub-floor chunk dynamics (B-settlement chunking, the C-7 immediate-Recovery
+        // path) init at the floor and then set the requested chunk by a test-only STATE POKE of
+        // the engine config (no instruction can set it; this reproduces pre-v2.2 markets).
+        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
+        if params.public_b_chunk_atoms < floor {
+            let mut env = Self::new_with_init_params(V16CuMarketParams {
+                public_b_chunk_atoms: floor,
+                ..params
+            });
+            env.poke_public_b_chunk_atoms(params.public_b_chunk_atoms);
+            return Ok(env);
+        }
         let mut svm = LiteSVM::new();
         let program_id = harness_program_id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -510,7 +539,7 @@ impl V16CuEnv {
                 data: vec![
                     0u8;
                     state::market_account_len_for_capacity(
-                        params.max_portfolio_assets as usize
+                        (params.max_portfolio_assets as usize).clamp(1, 16)
                     )
                     .unwrap()
                 ],
@@ -521,7 +550,8 @@ impl V16CuEnv {
         )
         .unwrap();
 
-        send_tx(
+        let market_before = svm.get_account(&market).map(|a| a.data).unwrap_or_default();
+        let init_result = send_tx(
             &mut svm,
             program_id,
             &payer,
@@ -555,9 +585,30 @@ impl V16CuEnv {
                 AccountMeta::new_readonly(mint, false),
             ],
             &[&admin],
-        )
-        .expect("init market");
-        Self {
+        );
+        if let Err(e) = &init_result {
+            if !e.contains("InvalidAccountData") {
+                let market_after = svm.get_account(&market).map(|a| a.data).unwrap_or_default();
+                return Err(InitRefusal { error: e.clone(), market_unchanged: market_before == market_after });
+            }
+        }
+        init_result.unwrap_or_else(|e| {
+            // v2.2: name the fixture skew instead of a bare InvalidAccountData. The account is
+            // sized from THIS library; a wrapper .so built from another layout refuses it.
+            if e.contains("InvalidAccountData") {
+                panic!(
+                    "init market: InvalidAccountData -- wrapper .so {:?} does not match this tree's \
+                     layout (VERSION {}, market len {}). Rebuild it with `cargo build-sbf \
+                     --features devnet` or point INDEP_WRAPPER_SO at a v2.2 build. ({e})",
+                    program_path(),
+                    percolator_prog::constants::VERSION,
+                    state::market_account_len_for_capacity(params.max_portfolio_assets as usize)
+                        .unwrap()
+                )
+            }
+            panic!("init market: {e}")
+        });
+        Ok(Self {
             svm,
             program_id,
             payer,
@@ -570,11 +621,33 @@ impl V16CuEnv {
                 params.max_portfolio_assets as usize,
             )
             .unwrap(),
-        }
+        })
     }
 
     pub fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.create_portfolio_with_cu(owner).0
+    }
+
+    /// Test-only STATE POKE: set the engine config's `public_b_chunk_atoms` (sub-floor
+    /// fixtures; see `new_with_init_params`). Byte-surgical: only the bytes that differ between
+    /// a no-op rewrite and the mutated rewrite are copied back.
+    pub fn poke_public_b_chunk_atoms(&mut self, chunk: u128) {
+        let original = self.svm.get_account(&self.market).expect("market");
+        let (cfg, mut g) = state::read_market(&original.data).expect("read market");
+        let mut noop = original.data.clone();
+        state::write_market(&mut noop, &cfg, &g).unwrap();
+        g.config.public_b_chunk_atoms = chunk;
+        let mut mutated = original.data.clone();
+        state::write_market(&mut mutated, &cfg, &g).unwrap();
+        let mut acct = original;
+        for i in 0..acct.data.len() {
+            if mutated[i] != noop[i] {
+                acct.data[i] = mutated[i];
+            }
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+        let (_, check) = state::read_market(&self.svm.get_account(&self.market).unwrap().data).unwrap();
+        assert_eq!(check.config.public_b_chunk_atoms, chunk, "chunk poke applied");
     }
 
     pub fn create_portfolio_with_cu(&mut self, owner: &Keypair) -> (Pubkey, u64) {
@@ -3662,6 +3735,27 @@ impl V16CuEnv {
     }
 }
 
+thread_local! {
+    /// v2.2 fill events: logs of the last transaction (success or failure) sent by this thread.
+    pub static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Logs of the last transaction sent through `send_tx` / `send_raw_tx` on this thread.
+#[allow(dead_code)]
+pub fn last_logs() -> Vec<String> {
+    LAST_LOGS.with(|l| l.borrow().clone())
+}
+
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 pub fn send_tx(
     svm: &mut LiteSVM,
     program_id: Pubkey,
@@ -3676,6 +3770,7 @@ pub fn send_tx(
         accounts,
         data: ix.encode(),
     };
+    let __d = instruction.data.clone();
     let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
     signer_refs.push(payer);
     signer_refs.extend_from_slice(extra_signers);
@@ -3687,13 +3782,18 @@ pub fn send_tx(
     );
     let r = svm.send_transaction(tx)
         .map(|meta| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
             if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
             }
+            cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
-        .map_err(|e| format!("{e:?}"));
+        .map_err(|e| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            format!("{e:?}")
+        });
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }
@@ -3729,6 +3829,7 @@ pub fn send_raw_tx(
     extra_signers: &[&Keypair],
 ) -> Result<u64, String> {
     let touched: Vec<Pubkey> = instruction.accounts.iter().map(|m| m.pubkey).collect();
+    let __d = instruction.data.clone();
     let mut signer_refs = Vec::with_capacity(1 + extra_signers.len());
     signer_refs.push(payer);
     signer_refs.extend_from_slice(extra_signers);
@@ -3740,13 +3841,18 @@ pub fn send_raw_tx(
     );
     let r = svm.send_transaction(tx)
         .map(|meta| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = meta.logs.clone());
             if std::env::var("INDEP_LOG_OK").map_or(false, |v| v == "1") {
                 let l: Vec<&String> = meta.logs.iter().filter(|x| x.starts_with("Program log: 0x")).collect();
                 if !l.is_empty() { eprintln!("OK-LOGS {:?}", l); }
             }
+            cu_rec(&__d, meta.compute_units_consumed);
             meta.compute_units_consumed
         })
-        .map_err(|e| format!("{e:?}"));
+        .map_err(|e| {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            format!("{e:?}")
+        });
     if r.is_ok() {
         gc_zero_lamport_accounts(svm, &touched);
     }

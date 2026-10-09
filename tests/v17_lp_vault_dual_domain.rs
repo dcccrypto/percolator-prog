@@ -302,6 +302,7 @@ fn create_lp_vault(env: &mut Env, registry: Pubkey, mint: Pubkey) {
             AccountMeta::new(mint, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(env.collateral_mint, false), // [6] collateral mint (prog#542)
         ],
         &[&admin],
     )

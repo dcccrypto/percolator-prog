@@ -1562,7 +1562,7 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 *max_account_b_settlement_chunks = 3;
                 *max_bankrupt_close_chunks = 4;
                 *max_bankrupt_close_lifetime_slots = 50;
-                *public_b_chunk_atoms = 12_345;
+                *public_b_chunk_atoms = 1_000_012_345; // >= PUBLIC_B_CHUNK_ATOMS_MIN (v2.2)
                 *maintenance_fee_per_slot = 7;
             }
         }),
@@ -1589,7 +1589,7 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
     assert_eq!(group.config.max_account_b_settlement_chunks, 3);
     assert_eq!(group.config.max_bankrupt_close_chunks, 4);
     assert_eq!(group.config.max_bankrupt_close_lifetime_slots, 50);
-    assert_eq!(group.config.public_b_chunk_atoms, 12_345);
+    assert_eq!(group.config.public_b_chunk_atoms, 1_000_012_345);
 }
 
 #[test]
@@ -5217,7 +5217,7 @@ fn v16_wrapper_existing_portfolio_with_growth_capacity_survives_market_append() 
 #[test]
 fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
     let mut admin = signer();
-    let mut market = market_account_with_capacity(14);
+    let mut market = market_account_with_capacity(percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize);
     init_market_with_ix(
         &mut admin,
         &mut market,
@@ -5227,16 +5227,16 @@ fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
             }
         }),
     );
 
-    assert_eq!(state::market_slot_capacity(&market.data).unwrap(), 14);
+    assert_eq!(state::market_slot_capacity(&market.data).unwrap(), percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize);
     let (_, group) = state::read_market(&market.data).unwrap();
-    assert_eq!(group.config.max_market_slots, 14);
+    assert_eq!(group.config.max_market_slots, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as u32);
 
-    let mut too_small = market_account_with_capacity(13);
+    let mut too_small = market_account_with_capacity(percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize - 1);
     let mut mint = mint_account();
     let res = run_ix(
         init_market_ix_with(|ix| {
@@ -5245,7 +5245,7 @@ fn v16_wrapper_market_account_capacity_is_declared_by_account_length() {
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
             }
         }),
         &mut [&mut admin, &mut too_small, &mut mint],
@@ -5836,6 +5836,8 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
@@ -5844,6 +5846,10 @@ fn v16_wrapper_prediction_asset_can_drain_retire_and_reactivate_without_closing_
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale_long.active_bitmap = active_bitmap_with(&[0, 1]);
     state::write_portfolio(&mut long_account.data, &stale_long).unwrap();
@@ -6410,6 +6416,8 @@ Instruction::PermissionlessCrank {
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: prediction_q,
@@ -6418,6 +6426,10 @@ Instruction::PermissionlessCrank {
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale_prediction_leg.active_bitmap = active_bitmap_with(&[0, 1, 2]);
     state::write_portfolio(&mut long_account.data, &stale_prediction_leg).unwrap();
@@ -6547,6 +6559,8 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
         a_basis: percolator::ADL_ONE,
         k_snap: 0,
         f_snap: 0,
+        k_rem_num: 0,
+        f_rem_num: 0,
         kf_epoch_snap: 0,
         epoch_snap: 0,
         loss_weight: POS_SCALE,
@@ -6555,6 +6569,10 @@ fn v16_wrapper_security_sweep_reused_asset_market_ids_fail_closed() {
         b_epoch_snap: 0,
         b_stale: false,
         stale: false,
+        band_epoch_snap: 0,
+        band_liq_pending: false,
+        rent_snap: 0,
+        rent_carry: 0,
     };
     stale.active_bitmap = active_bitmap_with(&[0]);
     state::write_portfolio(&mut long_account.data, &stale).unwrap();
@@ -6940,9 +6958,17 @@ fn v16_wrapper_account_layout_constants_match_serialized_state() {
         "PORTFOLIO_ACCOUNT_LEN covers fixed engine+matcher header plus the TB-1a identity trailer \
          (portfolio_id + expected_sequence + expiry_slot, 8B each)"
     );
+    // v2.2 Wave B: every one of the `V16_MAX_PORTFOLIO_ASSETS_N` (16) `PortfolioLegV16Account`
+    // slots grew by 33 B (band_epoch_snap u64, band_liq_pending u8, rent_snap u128,
+    // rent_carry u64): 9563 + 16 * 33 = 10091.
     assert_eq!(
-        PORTFOLIO_ACCOUNT_LEN, 9563,
-        "TB-1a: canonical portfolio account length is now 9563 (was 9539)"
+        PORTFOLIO_ACCOUNT_LEN, 10603,
+        "v2.2 combined (-rem): canonical portfolio account length is 10603 (9563 TB-1a + 528 band/rent + 512 K/F remainders)"
+    );
+    assert_eq!(
+        PORTFOLIO_ACCOUNT_LEN,
+        9563 + percolator::V16_MAX_PORTFOLIO_ASSETS_N * (33 + 32),
+        "the whole v2.2 growth is the per-leg band/rent words and the K/F remainders"
     );
     // portfolio_account_len_for_market_slots returns PORTFOLIO_ACCOUNT_LEN regardless of slots.
     assert_eq!(
@@ -13711,7 +13737,7 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
                 ..
             } = ix
             {
-                *max_portfolio_assets = 14;
+                *max_portfolio_assets = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
                 *max_trading_fee_bps = 10_000;
                 *max_price_move_bps_per_slot = 10_000;
             }
@@ -13721,20 +13747,20 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
         &mut admin,
         &mut market,
         processor::ASSET_ACTION_ACTIVATE,
-        14,
+        percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
         1,
         100,
     )
     .unwrap();
     run_ix(
         Instruction::ConfigureEwmaMark {
-            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
-            asset_index: 14,
+            market_id: state::read_market_trade_preflight(&market.data, (percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS) as usize).unwrap().3,
+            asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             now_slot: 1,
             initial_mark_e6: 100,
             mark_ewma_halflife_slots: 1,
             mark_min_fee: 0,
-            observation_sequence: state::read_asset_control_sequences(&market.data, 14)
+            observation_sequence: state::read_asset_control_sequences(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize)
                 .unwrap()
                 .oracle_observation
                 + 1,
@@ -13751,12 +13777,12 @@ fn v16_wrapper_price_managed_asset_above_portfolio_limit_still_updates_mark_afte
     run_ix(
 Instruction::PermissionlessCrank {
             now_slot: 2,
-            observations: vec![CrankObservationHint { asset_index: 14, oracle_accounts: 0 }],
+            observations: vec![CrankObservationHint { asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS, oracle_accounts: 0 }],
         },
         &mut [&mut cranker, &mut market, &mut crank_account],
     )
     .unwrap();
-    let before_profile = state::read_asset_oracle_profile(&market.data, 14).unwrap();
+    let before_profile = state::read_asset_oracle_profile(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize).unwrap();
     assert_eq!(before_profile.mark_ewma_e6, 100);
     assert_eq!(before_profile.mark_ewma_last_slot, 1);
 
@@ -13766,8 +13792,8 @@ Instruction::PermissionlessCrank {
             account_a_position_epoch: portfolio_identity(&long_account).2,
             account_b_portfolio_id: portfolio_identity(&short_account).0,
             account_b_position_epoch: portfolio_identity(&short_account).2,
-            market_id: state::read_market_trade_preflight(&market.data, (14) as usize).unwrap().3,
-            asset_index: 14,
+            market_id: state::read_market_trade_preflight(&market.data, (percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS) as usize).unwrap().3,
+            asset_index: percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS,
             size_q: POS_SCALE as i128,
             exec_price: 200,
             fee_bps: 0,
@@ -13784,7 +13810,7 @@ Instruction::PermissionlessCrank {
     .unwrap();
 
     let base_profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
-    let after_profile = state::read_asset_oracle_profile(&market.data, 14).unwrap();
+    let after_profile = state::read_asset_oracle_profile(&market.data, percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize).unwrap();
     assert_eq!(base_profile.oracle_mode, ORACLE_MODE_MANUAL);
     assert_eq!(
         after_profile.mark_ewma_e6, 150,
@@ -24322,13 +24348,13 @@ fn f01_w19_fixture() -> (TestAccount, TestAccount, TestAccount, TestAccount, Pub
 fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
     assert_eq!(
         percolator_prog::constants::VERSION,
-        18,
-        "W-19: src/v16_program.rs:50"
+        19,
+        "W-19 policy, v2.2 Wave B bump 18 -> 19 (src/v16_program.rs constants::VERSION)"
     );
     assert_eq!(
         percolator::V16_LAYOUT_DISCRIMINATOR,
-        18,
-        "engine 2c38570a:src/v16.rs — the layout bump this VERSION tracks"
+        19,
+        "engine feat/v22-band-rent:src/v16.rs — the layout bump this VERSION tracks"
     );
 
     let (_admin, _owner, market, portfolio, _mint) = f01_w19_fixture();
@@ -24337,12 +24363,12 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
     // the wrapper creates, which is why a PARTIAL re-seed hard-fails.
     assert_eq!(
         f01_w19_read_header_version(&market.data),
-        18,
+        percolator_prog::constants::VERSION,
         "KIND_MARKET header stamped with the new VERSION"
     );
     assert_eq!(
         f01_w19_read_header_version(&portfolio.data),
-        18,
+        percolator_prog::constants::VERSION,
         "KIND_PORTFOLIO header stamped with the new VERSION"
     );
     assert_eq!(market.data[10], percolator_prog::constants::KIND_MARKET);
@@ -24350,7 +24376,7 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
         portfolio.data[10],
         percolator_prog::constants::KIND_PORTFOLIO
     );
-    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), percolator::V16_LAYOUT_DISCRIMINATOR);
     println!(
         "[w19] fresh accounts: market version={} kind={} | portfolio version={} kind={} disc={}",
         f01_w19_read_header_version(&market.data),
@@ -24511,7 +24537,7 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     //     can object, and it does. At VERSION 17 this image was fully accepted.
     portfolio.data = healthy.clone();
     f01_w19_set_header_version(&mut portfolio.data, F01W19_PRE18_WRAPPER_VERSION);
-    assert_eq!(f01_w19_read_disc(&portfolio.data), 18);
+    assert_eq!(f01_w19_read_disc(&portfolio.data), percolator::V16_LAYOUT_DISCRIMINATOR);
     let a = run_ix_no_rollback(
         Instruction::ClosePortfolio {
             portfolio_id,
@@ -24533,7 +24559,8 @@ fn f01_w19_custom1_fires_before_the_engine_custom16() {
     //     satisfied and the refusal is the ENGINE's provenance check, Custom(16).
     portfolio.data = healthy.clone();
     f01_w19_set_disc(&mut portfolio.data, F01W19_PRE18_LAYOUT_DISCRIMINATOR);
-    assert_eq!(f01_w19_read_header_version(&portfolio.data), 18);
+    assert_eq!(f01_w19_read_header_version(&portfolio.data), percolator_prog::constants::VERSION);
+    assert_eq!(percolator_prog::constants::VERSION, 19);
     assert_eq!(
         state::check_portfolio_kind(&portfolio.data),
         Ok(()),
@@ -24594,6 +24621,32 @@ fn f01_w19_old_f01_assertion_must_now_fail() {
         "W-19: VERSION is still 17, so the wrapper's own gate does NOT refuse the old layout \
          — the refusal below is the ENGINE's discriminator check, not wrapper policy. \
          (Under the negative control, VERSION=18, this line is what flips.)"
+    );
+}
+
+/// v2.2 Wave B: an image the v2.1 wrapper stamped (VERSION 18, discriminator 18) is
+/// refused by the wrapper's own gate, Custom(1), before the engine is reached.
+#[test]
+fn v22_v21_stamped_portfolio_is_refused_with_invalid_version() {
+    let (_admin, mut owner, mut market, mut portfolio, _mint) = f01_w19_fixture();
+    let (portfolio_id, expected_sequence, position_epoch) = portfolio_identity(&portfolio);
+    f01_w19_set_disc(&mut portfolio.data, 18);
+    f01_w19_set_header_version(&mut portfolio.data, 18);
+    assert_eq!(
+        state::check_portfolio_kind(&portfolio.data),
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
+    );
+    let r = run_ix_no_rollback(
+        Instruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    assert_eq!(
+        r,
+        Err(percolator_prog::error::PercolatorError::InvalidVersion.into()),
     );
 }
 
@@ -28307,12 +28360,19 @@ fn wgenl_legacy_ledger_is_protected_from_the_next_flip_once_stamped() {
 #[test]
 fn wgenl_w19_version18_refuses_a_version17_ledger_before_the_generation_branch() {
     let s = wgenl_stage_generation_one();
-    // Sanity: it reads at VERSION 18.
+    // Sanity: it reads at the current VERSION (18 at W-19, 19 since v2.2 Wave B).
     assert!(state::read_backing_domain_ledger(&s.ledger.data).is_ok());
     assert_eq!(
         u16::from_le_bytes([s.ledger.data[8], s.ledger.data[9]]),
-        18,
-        "W-19 header version"
+        19,
+        "header version (W-19 policy, v2.2 bump)"
+    );
+    // v2.2: a ledger the v2.1 wrapper wrote (VERSION 18) is refused the same way.
+    let mut v21_image = s.ledger.data.clone();
+    v21_image[8..10].copy_from_slice(&18u16.to_le_bytes());
+    assert_eq!(
+        state::read_backing_domain_ledger(&v21_image),
+        Err(ProgramError::Custom(1)),
     );
 
     let mut old_image = s.ledger.data.clone();

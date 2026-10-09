@@ -437,7 +437,7 @@ mod e2e {
         };
 
         let pod_len = core::mem::size_of::<PortfolioAccountV16Account>();
-        let mut data = vec![0u8; HEADER_LEN + pod_len];
+        let mut data = vec![0u8; percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN];
         data[0..8].copy_from_slice(&MAGIC.to_le_bytes());
         data[8..10].copy_from_slice(&VERSION.to_le_bytes());
         data[10] = KIND_PORTFOLIO;

@@ -38,6 +38,16 @@ const MATCHER_CONTEXT_LEN: usize = 320;
 const CANONICAL_MATCHER: Pubkey = solana_program::pubkey!("DfTxJUT5BbERs1tR33dP82kaUJ1NLymRxXErXAYXcDam");
 const PRICE: u64 = 1_000_000; // $1.00 e6
 
+#[allow(dead_code)]
+pub fn cu_rec(data: &[u8], cu: u64) {
+    if let Ok(path) = std::env::var("CU_LOG") {
+        use std::io::Write;
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+            let _ = f.write_all(format!("CUREC {} {}\n", data.first().copied().unwrap_or(255), cu).as_bytes());
+        }
+    }
+}
+
 fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
@@ -144,6 +154,9 @@ struct Params {
     funding: u64,
     /// growth-v19: `Some((r_gap_bps, l_launch_x100))` => InitMarket carries the growth block.
     growth: Option<(u16, u16)>,
+    /// Initial per-lot mark (e6). v2.2 Wave A: a growth market must open at >= 10^7 (the lot
+    /// precision floor), so `growth_params` prices a LOT of 10 tokens at $10 (`GPRICE`).
+    price: u64,
 }
 
 impl Default for Params {
@@ -157,6 +170,7 @@ impl Default for Params {
             maint_fee: 0,
             funding: 0,
             growth: None,
+            price: PRICE,
         }
     }
 }
@@ -181,6 +195,8 @@ struct Env {
     slot: u64,
     paid_in: u128,
     paid_out: u128,
+    /// The market's initial per-lot mark (`Params::price`).
+    price: u64,
 }
 
 #[allow(dead_code)]
@@ -284,6 +300,7 @@ impl Env {
             slot: 1,
             paid_in: 0,
             paid_out: 0,
+            price: p.price,
         };
         env.svm.warp_to_slot(1);
         let admin = env.admin.insecure_clone();
@@ -291,7 +308,7 @@ impl Env {
                 max_portfolio_assets: p.assets,
                 h_min: 0,
                 h_max: 10,
-                initial_price: PRICE,
+                initial_price: p.price,
                 min_nonzero_mm_req: 1,
                 min_nonzero_im_req: 2,
                 maintenance_margin_bps: p.mm_bps,
@@ -335,7 +352,7 @@ impl Env {
                 market_id: 1,
                 asset_index: 0,
                 now_slot: 1,
-                initial_mark_e6: PRICE,
+                initial_mark_e6: p.price,
                 observation_sequence: seq,
             },
             vec![
@@ -359,6 +376,7 @@ impl Env {
                 AccountMeta::new(lp_mint, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(env.mint, false), // [6] collateral mint (prog#542)
             ],
             &[&admin],
         )
@@ -400,9 +418,10 @@ impl Env {
             &signers,
             self.svm.latest_blockhash(),
         );
+        let __d = instructions.last().map(|i| i.data.clone()).unwrap_or_default();
         self.svm
             .send_transaction(tx)
-            .map(|_| ())
+            .map(|m| { cu_rec(&__d, m.compute_units_consumed); })
             .map_err(|e| format!("{e:?}"))
     }
 
@@ -1145,6 +1164,26 @@ fn p3_init_vault_lp_binds_a_registry_owned_lp_and_seeds_senior_claim_at_nav() {
     // Re-bind refused.
     let admin = env.admin.insecure_clone();
     err_has(&env.init_vault_lp_as(&admin, 1_000), PercolatorError::VaultLpAlreadyBound);
+}
+
+/// v2.2 (10,603 B portfolios): InitVaultLp REFUSES a pre-created lp portfolio whose length is not
+/// exactly `PORTFOLIO_ACCOUNT_LEN` (InvalidAccountLen) instead of attempting a realloc that the
+/// program's entrypoint bridge cannot perform above 10,240 B; the exact length binds. The
+/// refused account is untouched (no silent resize).
+#[test]
+fn v22_init_vault_lp_refuses_a_wrong_portfolio_length_and_never_reallocs() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 5_000_000, None).expect("pre-bind earn deposit");
+    let admin = env.admin.insecure_clone();
+    let exact = env.plen;
+    for bad in [0usize, 10_240, exact - 1, exact + 1, exact + 10_240] {
+        env.plen = bad;
+        let r = env.init_vault_lp_as(&admin, 1_000);
+        err_has(&r, PercolatorError::InvalidAccountLen);
+    }
+    env.plen = exact;
+    env.init_vault_lp_as(&admin, 1_000).expect("the exact length binds");
 }
 
 #[test]
@@ -3470,8 +3509,19 @@ fn ctx_u64(env: &Env, ctx: Pubkey, off: usize) -> u64 {
 /// charge is what the wrapper computes, never more than this signed maximum).
 const GROWTH_FEE: u64 = 10_000;
 
+/// v2.2 Wave A item 7: growth markets are priced per LOT of 10 tokens at $10 (the 10^7
+/// precision floor). `tok(env_price, n)` is the Q of n $1-tokens at that lot price, so every
+/// notional, capacity and fee in the growth tests is unchanged (`tok(GPRICE, n) * GPRICE /
+/// POS_SCALE == n * 1e6`).
+const GPRICE: u64 = 10_000_000;
+
+fn tok(price: u64, tokens: i128) -> i128 {
+    tokens * 1_000_000 * PRICE as i128 / price as i128
+}
+
 fn growth_params() -> Params {
     Params {
+        price: GPRICE,
         funding: 1,
         growth: Some((400, 1_000)),
         // L-2: r_gap 400 must clear max_price_move x 50 slots (4 x 50 = 200).
@@ -3537,8 +3587,8 @@ fn growth_v19_bound_quote_depth_scales_with_capital() {
         let t = env.new_trader(1_000_000_000);
         // G4: a growth bind turns the fee channel on (50 bps cap), so the taker signs a fee
         // that covers base + the matcher's requested fee.
-        env.trade_signing_fee(&t, &lp, 100 * 1_000_000, GROWTH_FEE).expect("fill 100 units");
-        assert_eq!(env.position(t.portfolio), 100 * 1_000_000, "filled in full");
+        env.trade_signing_fee(&t, &lp, tok(env.price, 100), GROWTH_FEE).expect("fill 100 units");
+        assert_eq!(env.position(t.portfolio), tok(env.price, 100), "filled in full");
         ctx_u64(&env, lp.ctx, CTX_LAST_EXEC_OFF)
     }
     let thin = last_exec_after_fill(growth_params(), 1_000_000_000); // $1k junior
@@ -3566,19 +3616,19 @@ fn growth_v19_bound_capacity_full_and_thin_side_open() {
     let n_cap = |env: &Env| -> u128 {
         let p = env.portfolio(lp.portfolio);
         let c_m = percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap();
-        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, PRICE, POS as u128).unwrap()
+        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, env.price, POS as u128).unwrap()
     };
     let cap_before = n_cap(&env);
-    assert_eq!(cap_before, 1_000 * 1_000_000);
-    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("clipped to u == 1");
+    assert_eq!(cap_before, tok(env.price, 1_000) as u128);
+    env.trade_signing_fee(&whale, &lp, tok(env.price, 5_000), GROWTH_FEE).expect("clipped to u == 1");
     assert_eq!(env.position(lp.portfolio).unsigned_abs(), cap_before, "|LP| == N_cap (pre-fill C_m) exactly");
     for _ in 0..3 {
-        env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd at capacity");
+        env.trade_signing_fee(&whale, &lp, tok(env.price, 5_000), GROWTH_FEE).expect("crowd at capacity");
         assert!(env.position(lp.portfolio).unsigned_abs() <= n_cap(&env), "never above N_cap(C_m)");
     }
     let thin = env.new_trader(20_000_000);
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin side open");
-    assert_eq!(env.position(thin.portfolio), -(100 * 1_000_000));
+    env.trade_signing_fee(&thin, &lp, -tok(env.price, 100), GROWTH_FEE).expect("thin side open");
+    assert_eq!(env.position(thin.portfolio), -tok(env.price, 100));
 }
 
 const CTX_KIND_OFF: usize = 64 + 12;
@@ -3627,7 +3677,7 @@ fn growth_v19_lp_floor_default_halts_before_zero() {
         let admin = env.admin.insecure_clone();
         env.junior_deposit_as(&admin, lp.portfolio, 500_000).expect("junior $0.50");
         let t = env.new_trader(10_000_000);
-        env.trade_signing_fee(&t, &lp, 100_000, fee)
+        env.trade_signing_fee(&t, &lp, tok(env.price, 1) / 10, fee)
     };
     let r = run(growth_params(), 100);
     assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(69)")), "growth: LpFloorHalt, got {r:?}");
@@ -3645,7 +3695,7 @@ fn growth_v19_fee_channel_on_requires_taker_consent() {
         let admin = env.admin.insecure_clone();
         env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior");
         let t = env.new_trader(100_000_000);
-        env.trade_signing_fee(&t, &lp, 10 * 1_000_000, fee)
+        env.trade_signing_fee(&t, &lp, tok(env.price, 10), fee)
     };
     let r = run(growth_params(), 0);
     assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(9)")), "requested fee refused without consent: {r:?}");
@@ -3685,19 +3735,19 @@ fn growth_v19_m1_bound_close_at_capacity_and_in_closed_mode() {
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
     let whale = env.new_trader(100_000_000_000);
     let thin = env.new_trader(100_000_000);
-    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, GROWTH_FEE).expect("crowd 900");
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin short 100");
-    env.trade_signing_fee(&whale, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd to capacity");
+    env.trade_signing_fee(&whale, &lp, tok(env.price, 900), GROWTH_FEE).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -tok(env.price, 100), GROWTH_FEE).expect("thin short 100");
+    env.trade_signing_fee(&whale, &lp, tok(env.price, 5_000), GROWTH_FEE).expect("crowd to capacity");
     // close at capacity
-    env.trade_signing_fee(&thin, &lp, 40 * 1_000_000, GROWTH_FEE).expect("partial close at capacity");
-    assert_eq!(env.position(thin.portfolio), -(60 * 1_000_000), "filled in full");
+    env.trade_signing_fee(&thin, &lp, tok(env.price, 40), GROWTH_FEE).expect("partial close at capacity");
+    assert_eq!(env.position(thin.portfolio), -tok(env.price, 60), "filled in full");
     // closed mode
     let mut m = env.svm.get_account(&env.market).unwrap();
     let (cfg, mut group) = state::read_market(&m.data).unwrap();
     group.bankruptcy_hlock_active = true;
     state::write_market(&mut m.data, &cfg, &group).unwrap();
     env.svm.set_account(env.market, m).unwrap();
-    env.trade_signing_fee(&thin, &lp, 60 * 1_000_000, GROWTH_FEE).expect("close in closed mode");
+    env.trade_signing_fee(&thin, &lp, tok(env.price, 60), GROWTH_FEE).expect("close in closed mode");
     assert_eq!(env.position(thin.portfolio), 0, "never trapped");
 }
 
@@ -3712,15 +3762,15 @@ fn growth_v19_m1_bound_close_in_closed_mode_with_ext_mode_0() {
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
     let whale = env.new_trader(100_000_000_000);
     let thin = env.new_trader(100_000_000);
-    env.trade_signing_fee(&whale, &lp, 900 * 1_000_000, GROWTH_FEE).expect("crowd 900");
-    env.trade_signing_fee(&thin, &lp, -(100 * 1_000_000), GROWTH_FEE).expect("thin short 100");
+    env.trade_signing_fee(&whale, &lp, tok(env.price, 900), GROWTH_FEE).expect("crowd 900");
+    env.trade_signing_fee(&thin, &lp, -tok(env.price, 100), GROWTH_FEE).expect("thin short 100");
     env.set_fee_channel(0, 0).expect("UA: ext mode 0, fee channel off");
     let mut m = env.svm.get_account(&env.market).unwrap();
     let (cfg, mut group) = state::read_market(&m.data).unwrap();
     group.bankruptcy_hlock_active = true;
     state::write_market(&mut m.data, &cfg, &group).unwrap();
     env.svm.set_account(env.market, m).unwrap();
-    env.trade_signing_fee(&thin, &lp, 100 * 1_000_000, 0).expect("close in closed mode, mode 0");
+    env.trade_signing_fee(&thin, &lp, tok(env.price, 100), 0).expect("close in closed mode, mode 0");
     assert_eq!(env.position(thin.portfolio), 0, "never trapped");
 }
 
@@ -3738,7 +3788,7 @@ fn growth_v19_n1_bound_thin_cycles_cannot_push_lp_past_ncap() {
     let n_cap = |env: &Env| -> u128 {
         let p = env.portfolio(lp.portfolio);
         let c_m = percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap();
-        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, PRICE, POS as u128).unwrap()
+        percolator_prog::growth_v19::n_cap_q(c_m, 10_000, env.price, POS as u128).unwrap()
     };
     let t = env.new_trader(5_000_000_000);
     let mut crowd: Vec<Pubkey> = Vec::new();
@@ -3746,14 +3796,14 @@ fn growth_v19_n1_bound_thin_cycles_cannot_push_lp_past_ncap() {
         let c = env.new_trader(100_000_000_000);
         let users_before: u128 = crowd.iter().map(|p| env.position(*p).max(0).unsigned_abs()).sum();
         let room = n_cap(&env).saturating_sub(users_before);
-        env.trade_signing_fee(&c, &lp, 5_000 * 1_000_000, GROWTH_FEE).expect("crowd request (clipped)");
+        env.trade_signing_fee(&c, &lp, tok(env.price, 5_000), GROWTH_FEE).expect("crowd request (clipped)");
         if cycle > 0 {
             // C_m grows with the fee channel (the N-2 utilisation fee the thin open paid at
             // u = 1 included), so the fee-funded room opens; never the N_cap a thin open used
             // to free.
             let filled = env.position(c.portfolio).unsigned_abs();
             assert!(
-                filled <= room && filled < 200 * 1_000_000,
+                filled <= room && filled < tok(env.price, 200) as u128,
                 "cycle {cycle}: the thin side frees no crowd room (filled {filled}, fee room {room})"
             );
         }
@@ -3795,7 +3845,7 @@ fn sec3_hedged_lockout_of_both_sides() {
     let lp = env.bind(2_000);
     let admin = env.admin.insecure_clone();
     env.junior_deposit_as(&admin, lp.portfolio, 1_000_000_000).expect("junior $1k");
-    let n = 1_000 * POS;
+    let n = tok(env.price, 1_000);
     let c_m = |env: &Env| -> u128 {
         let p = env.portfolio(lp.portfolio);
         percolator_prog::vault_lp_v18::conservative_equity(p.capital, p.pnl, p.fee_credits).unwrap()
@@ -3807,9 +3857,9 @@ fn sec3_hedged_lockout_of_both_sides() {
     let mut actor_deposits: u128 = 0;
     let mut actors: Vec<Pubkey> = Vec::new();
     for i in 0..10 {
-        let n_cap = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap();
+        let n_cap = gv::n_cap_q(c_m(&env), 10_000, env.price, POS as u128).unwrap();
         let bps = gv::utilisation_fee_bps(users_long + (n / 10) as u128, n_cap, 5_000, 500).unwrap();
-        expected_util += (n as u128 / 10) * bps as u128 / 10_000; // notional at $1 = units
+        expected_util += (n as u128 / 10) * env.price as u128 / POS as u128 * bps as u128 / 10_000; // notional atoms
         let mut dep: u64 = 10_000_000;
         loop {
             let c = env.new_trader(dep);
@@ -3824,9 +3874,9 @@ fn sec3_hedged_lockout_of_both_sides() {
         }
         users_long += (n / 10) as u128;
     }
-    let n_cap = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap();
+    let n_cap = gv::n_cap_q(c_m(&env), 10_000, env.price, POS as u128).unwrap();
     let bps = gv::utilisation_fee_bps(n as u128, n_cap, 5_000, 500).unwrap();
-    expected_util += n as u128 * bps as u128 / 10_000;
+    expected_util += n as u128 * env.price as u128 / POS as u128 * bps as u128 / 10_000;
     let mut sdep: u64 = 100_000_000;
     let s = loop {
         let s = env.new_trader(sdep);
@@ -3851,9 +3901,9 @@ fn sec3_hedged_lockout_of_both_sides() {
     assert!(lp_gain >= expected_util, "LP earned {lp_gain} < utilisation fee {expected_util}");
     // fresh users still cannot open (the lock-out exists; it is now paid for)
     // ...except for the room the lock-out's OWN fees added to C_m (they fund the LP)
-    let room = gv::n_cap_q(c_m(&env), 10_000, PRICE, POS as u128).unwrap() - n as u128;
+    let room = gv::n_cap_q(c_m(&env), 10_000, env.price, POS as u128).unwrap() - n as u128;
     let u = env.new_trader(1_000_000_000);
-    let r1 = env.trade_signing_fee(&u, &lp, 100 * POS, FEE);
+    let r1 = env.trade_signing_fee(&u, &lp, tok(env.price, 100), FEE);
     eprintln!("SEC3 fresh long 100 -> filled {} (fee-funded room {room})", env.position(u.portfolio));
     assert!(r1.is_ok() && env.position(u.portfolio) as u128 <= room, "crowd full: {r1:?}");
     // a close never pays the utilisation fee: base + matcher request only (<= 2% here)
@@ -4305,15 +4355,15 @@ fn p2b_growth_ncap_grows_with_earn() {
         }
         let cap = env.n_cap(lp.portfolio);
         let whale = env.new_trader(100_000 * U);
-        env.trade_signing_fee(&whale, &lp, 4_000 * UQ, GROWTH_FEE).expect("crowd order");
+        env.trade_signing_fee(&whale, &lp, tok(GPRICE, 4_000), GROWTH_FEE).expect("crowd order");
         (cap, env.position(whale.portfolio))
     };
     let (cap_off, pos_off) = fill(false);
     let (cap_on, pos_on) = fill(true);
-    assert_eq!(cap_off, 1_000 * POS as u128, "junior-only N_cap");
-    assert_eq!(cap_on, 6_000 * POS as u128, "junior + 50% of Earn");
-    assert_eq!(pos_off, 1_000 * UQ, "control: clipped at the junior-only capacity");
-    assert_eq!(pos_on, 4_000 * UQ, "Earn-backed capacity fills the whole order");
+    assert_eq!(cap_off, tok(GPRICE, 1_000) as u128, "junior-only N_cap");
+    assert_eq!(cap_on, tok(GPRICE, 6_000) as u128, "junior + 50% of Earn");
+    assert_eq!(pos_off, tok(GPRICE, 1_000), "control: clipped at the junior-only capacity");
+    assert_eq!(pos_on, tok(GPRICE, 4_000), "Earn-backed capacity fills the whole order");
 }
 
 /// Skew-funding defaults (plan §2.4): a bind on a market with a funding cap pins
@@ -4658,4 +4708,307 @@ fn p2b_l3_allocation_needs_a_minimum_junior() {
     err_has(&env.allocate(lp.portfolio, u128::MAX), PercolatorError::VaultLpAllocateRefused);
     let (mut env, lp, _d) = p2b_world(Params::default(), 10_000, 500);
     env.allocate(lp.portfolio, u128::MAX).expect("control: 5% junior allocates");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// v2.2 Wave B, round-2 security re-review N-7: the lag gates are BAND-market rules.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+/// On a band-OFF market with a 1 bp/slot cap, ordinary staircase lag (target != mark) is the
+/// normal state. The v2.2 lag gates (tag 103 senior allocation, junior deposit, recall,
+/// release surplus, ...) must not fire there: v2.1 behaviour, exactly. (Before the scoping,
+/// each of these answered Custom(21) while the mark lagged.)
+#[test]
+fn v22_n7_band_off_lagged_market_keeps_the_keeper_paths_alive() {
+    let (mut env, lp, _d) = p2b_world(Params { move_bps: 1, ..Params::default() }, 10_000, 2_000);
+    let t = env.new_trader(1_000 * U);
+    env.trade(&t, &lp, 100 * UQ).expect("open: the asset is exposed");
+    // One push of +10% and ONE crank: at 1 bp/slot the mark is far behind its target.
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let admin = env.admin.insecure_clone();
+    let seq = env.oracle_seq() + 1;
+    let (m, slot) = (env.market, env.slot);
+    env.send(
+        ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: 1_100_000, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("push");
+    env.crank(t.portfolio).expect("crank trader");
+    env.crank(lp.portfolio).expect("crank lp");
+    let (_, g) = env.market_state();
+    assert_eq!(g.config.band_bps, 0, "band off");
+    assert_ne!(g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, "the mark lags");
+    assert!(g.assets[0].oi_eff_long_q != 0, "and the asset is exposed");
+    let lock = code(PercolatorError::EngineLockActive);
+    // Tag 103 (senior allocation) and the junior deposit land while lagged.
+    env.allocate(lp.portfolio, u128::MAX).expect("103 allocate while lagged on a band-off market");
+    env.junior_deposit_as(&admin, lp.portfolio, 1_000 * U).expect("junior deposit while lagged");
+    // Recall and release-surplus may refuse for their own reasons, never for the lag.
+    for (what, r) in [
+        ("recall", env.recall_ext(lp.portfolio, 1_000 * U as u128, 0)),
+        ("release surplus", env.release_surplus(&admin, lp.portfolio, 1, 0)),
+    ] {
+        if let Err(e) = &r {
+            assert!(!e.contains(&lock), "{what} refused with the lag gate on a band-off market: {e}");
+        }
+    }
+    env.assert_conserved("band-off lagged keeper paths");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// S10 re-review cb568a4f, finding 1: the engine's provider-principal mirror must follow EVERY
+// Earn / LP-vault pot funding and draw (the wrapper's inline helpers), not only tag 50.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+const S10_SC: u128 = percolator::BOUND_SCALE;
+
+/// (engine mirror in atoms, wrapper vault-owned counter in atoms) of pot `domain` (asset 0).
+fn s10_mirror_and_owned(env: &Env, domain: usize) -> (u128, u128) {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let mirror = if domain == 0 { eng.provider_principal_long.get() } else { eng.provider_principal_short.get() };
+    let owned = state::vault_pot_owned_from_wrapper_bytes(&group.markets[0].wrapper[..], domain % 2).unwrap();
+    (mirror / S10_SC, owned)
+}
+
+fn s10_assert_mirror(env: &Env, what: &str) {
+    for d in 0..2 {
+        let (m, o) = s10_mirror_and_owned(env, d);
+        assert_eq!(m, o, "{what}: pot {d}: engine provider mirror {m} != wrapper vault-owned {o}");
+    }
+}
+
+/// Fresh backing and the engine mirror of pot `domain`, in atoms.
+fn s10_fresh(env: &Env, domain: usize) -> u128 {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::market_view_mut(&mut data).unwrap();
+    let eng = &group.markets[0].engine;
+    let b = if domain == 0 { eng.backing_long } else { eng.backing_short };
+    b.try_to_runtime().unwrap().fresh_unliened_backing_num / S10_SC
+}
+
+#[test]
+fn s10_every_pot_funding_and_draw_drives_the_mirror() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    s10_assert_mirror(&env, "after bind");
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 10_000_000, Some(lp.portfolio)).expect("earn deposit (tag 75)");
+    s10_assert_mirror(&env, "after tag 75 deposit");
+    let (m, _) = s10_mirror_and_owned(&env, 0);
+    let (m1, _) = s10_mirror_and_owned(&env, 1);
+    assert!(m + m1 > 0, "the Earn deposit is provider principal in the mirror (a mutant that skips the setter leaves 0)");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior tranche deposit");
+    s10_assert_mirror(&env, "after junior tranche deposit");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    s10_assert_mirror(&env, "after fills");
+    env.crank_fees(true).expect("fee crank");
+    s10_assert_mirror(&env, "after the fee crank");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 5_000_000, Some(lp.portfolio)).expect("second deposit");
+    s10_assert_mirror(&env, "after the second deposit");
+    let sh = env.lp_shares(&d2);
+    env.earn_request(&d2, sh);
+    env.earn_execute(&d2, Some(lp.portfolio)).expect("redemption (tag 77)");
+    s10_assert_mirror(&env, "after the redemption draw");
+    let sh1 = env.lp_shares(&d1);
+    env.earn_request(&d1, sh1);
+    env.earn_execute(&d1, Some(lp.portfolio)).expect("redemption of the genesis depositor");
+    s10_assert_mirror(&env, "after the last redemption");
+}
+
+/// A forced deficit in the opposite domain must never take the pot's principal: loser cash is
+/// poked into the pot beside the Earn principal, a claim shortfall into the sibling domain, and the
+/// refresh crank (the only entry point with a move budget) runs; the pot keeps at least its owned
+/// principal and the Earn withdrawal still succeeds.
+#[test]
+fn s10_forced_deficit_never_moves_earn_pot_principal() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 50_000_000, Some(lp.portfolio)).expect("earn deposit");
+    s10_assert_mirror(&env, "funded");
+    let (own0, own1) = (s10_mirror_and_owned(&env, 0).1, s10_mirror_and_owned(&env, 1).1);
+    let pot = if own0 >= own1 { 0usize } else { 1 };
+    let principal = s10_mirror_and_owned(&env, pot).1;
+    assert!(principal > 0);
+    // poke: 5M of loser cash in the pot, 40M of unbacked claims in the other domain
+    {
+        let mut acct = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, mut group) = state::market_view_mut(&mut acct.data).unwrap();
+            let l = 5_000_000u128 * S10_SC;
+            let c = 40_000_000u128 * S10_SC;
+            {
+                let e = &mut group.markets[0].engine;
+                let (src, bk, os) = if pot == 0 {
+                    (&mut e.source_credit_long, &mut e.backing_long, &mut e.source_credit_short)
+                } else {
+                    (&mut e.source_credit_short, &mut e.backing_short, &mut e.source_credit_long)
+                };
+                let mut b = bk.try_to_runtime().unwrap();
+                b.fresh_unliened_backing_num += l;
+                *bk = percolator::BackingBucketV16Account::from_runtime(&b);
+                let mut s = src.try_to_runtime().unwrap();
+                s.fresh_reserved_backing_num += l;
+                s.credit_rate_num = percolator::CREDIT_RATE_SCALE;
+                *src = percolator::SourceCreditStateV16Account::from_runtime(&s);
+                let mut o = os.try_to_runtime().unwrap();
+                o.positive_claim_bound_num += c;
+                o.credit_rate_num = (o.fresh_reserved_backing_num * percolator::CREDIT_RATE_SCALE) / o.positive_claim_bound_num;
+                *os = percolator::SourceCreditStateV16Account::from_runtime(&o);
+            }
+            group.header.source_fresh_backing_total_num = percolator::V16PodU128::new(group.header.source_fresh_backing_total_num.get() + l);
+            group.header.source_claim_bound_total_num = percolator::V16PodU128::new(group.header.source_claim_bound_total_num.get() + c);
+            group.header.pnl_pos_bound_tot_num = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() + c);
+            group.header.pnl_pos_bound_tot = percolator::V16PodU128::new(group.header.pnl_pos_bound_tot_num.get() / S10_SC);
+            group.header.vault = percolator::V16PodU128::new(group.header.vault.get() + 5_000_000);
+        }
+        env.svm.set_account(env.market, acct).unwrap();
+    }
+    let before = s10_fresh(&env, pot);
+    let r = env.crank(lp.portfolio);
+    println!("S10POT crank result {r:?}");
+    let after = s10_fresh(&env, pot);
+    println!("S10POT principal {principal} fresh before {before} after {after}");
+    assert!(after >= principal, "the pot's principal was moved: fresh {after} < owned {principal}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// S10 round 4: the engine mirror against the WRAPPER LEDGER principal.
+//
+// `s10_assert_mirror` above compares the engine mirror with the vault-owned counter, and both are
+// moved by the same helper (`vault_pot_owned_adjust`), so a wrong SIGN at one call site moves
+// both the same way and that comparison still passes (reviewer mutant W2: the redemption adjust
+// flipped). The ledger's `total_principal_atoms` is written by different code, so comparing with
+// it catches a call site that drives the mirror the wrong way.
+// ─────────────────────────────────────────────────────────────────────────────
+
+fn s10_ledger_principal(env: &Env, key: Pubkey) -> u128 {
+    env.svm
+        .get_account(&key)
+        .and_then(|a| state::read_backing_domain_ledger(&a.data).ok())
+        .map(|l| l.total_principal_atoms)
+        .unwrap_or(0)
+}
+
+/// Engine mirror == wrapper ledger principal for both pots (and == the vault-owned counter).
+/// Returns the two principals so a caller can assert a step really changed something.
+fn s10_assert_mirror_equals_ledger(env: &Env, what: &str) -> (u128, u128) {
+    let (m0, o0) = s10_mirror_and_owned(env, 0);
+    let (m1, o1) = s10_mirror_and_owned(env, 1);
+    let (l0, l1) = (s10_ledger_principal(env, env.ledger), s10_ledger_principal(env, env.sibling));
+    println!("S10LEDGER {what}: mirror ({m0},{m1}) ledger principal ({l0},{l1}) owned ({o0},{o1})");
+    assert_eq!((m0, m1), (l0, l1), "{what}: engine mirror != wrapper ledger principal");
+    assert_eq!((m0, m1), (o0, o1), "{what}: engine mirror != vault-owned counter");
+    (l0, l1)
+}
+
+/// Bind, tag-75 deposit, junior deposit, real fills, fee crank, second deposit and two
+/// redemptions (tag 77, lower the pots): after every step the engine mirror equals the ledger
+/// principal of each pot. Kills the "redemption adjust sign flipped" mutant.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_the_earn_lifecycle() {
+    let mut env = Env::new(Params { fee_bps: 30, ..Params::default() });
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    s10_assert_mirror_equals_ledger(&env, "bind");
+    let d1 = env.new_depositor();
+    env.earn_deposit(&d1, 10_000_000, Some(lp.portfolio)).expect("deposit");
+    let a = s10_assert_mirror_equals_ledger(&env, "deposit 1");
+    assert!(a.0 + a.1 >= 10_000_000, "vacuity: the deposit is pot principal");
+    env.junior_deposit_as(&admin, lp.portfolio, 60_000_000).expect("junior");
+    s10_assert_mirror_equals_ledger(&env, "junior deposit");
+    let t = env.new_trader(20_000_000);
+    env.trade(&t, &lp, 50 * POS).expect("open");
+    env.trade(&t, &lp, -50 * POS).expect("close");
+    s10_assert_mirror_equals_ledger(&env, "fills");
+    env.crank_fees(true).expect("fee crank");
+    s10_assert_mirror_equals_ledger(&env, "fee crank");
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 5_000_000, Some(lp.portfolio)).expect("deposit 2");
+    let after_recall = s10_assert_mirror_equals_ledger(&env, "deposit 2");
+    let sh = env.lp_shares(&d2);
+    env.earn_request(&d2, sh);
+    env.earn_execute(&d2, Some(lp.portfolio)).expect("redeem 2");
+    let after_r2 = s10_assert_mirror_equals_ledger(&env, "redeem 2");
+    assert!(after_r2.0 + after_r2.1 < after_recall.0 + after_recall.1, "vacuity: the redemption drew pot principal");
+    let sh1 = env.lp_shares(&d1);
+    env.earn_request(&d1, sh1);
+    env.earn_execute(&d1, Some(lp.portfolio)).expect("redeem 1");
+    s10_assert_mirror_equals_ledger(&env, "redeem 1");
+}
+
+/// Resolved wind-down past `settle_resolved`: the settle refills a senior shortfall into the
+/// pot, the settled vault LP is deregistered, the junior's terminal sweep (tag 102) draws its
+/// residual, and the Earn holder's Resolved redemption empties the pot. The mirror equals the
+/// ledger principal after every step.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_the_resolved_wind_down() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    poke_senior_claim(&mut env, 13_000_000);
+    let before = s10_assert_mirror_equals_ledger(&env, "before resolve");
+    env.resolve();
+    s10_assert_mirror_equals_ledger(&env, "resolved");
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("settle");
+    let settled = s10_assert_mirror_equals_ledger(&env, "settle_resolved");
+    assert!(settled.0 + settled.1 > before.0 + before.1, "vacuity: the settle returned the vault LP's payout to the pots");
+    let (pid_, seq, epoch) = env.identity(lp.portfolio);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::ClosePortfolio { portfolio_id: pid_, expected_sequence: seq, position_epoch: epoch },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(lp.portfolio, false),
+        ],
+        &[&admin],
+    )
+    .expect("terminal cleanup of the settled vault LP");
+    s10_assert_mirror_equals_ledger(&env, "vault LP deregistered");
+    let swept = env.junior_terminal_sweep(&admin, lp.portfolio, junior_dest);
+    let after_sweep = s10_assert_mirror_equals_ledger(&env, "junior terminal sweep");
+    println!("S10LEDGER junior swept {swept:?}");
+    assert!(after_sweep.0 + after_sweep.1 < settled.0 + settled.1, "vacuity: the junior sweep drew pot principal");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.earn_execute(&d, Some(lp.portfolio)).expect("resolved redemption");
+    let end = s10_assert_mirror_equals_ledger(&env, "resolved Earn redemption");
+    assert!(end.0 + end.1 < after_sweep.0 + after_sweep.1, "vacuity: the resolved redemption drew pot principal");
+}
+
+/// The recall path (tag 98): a senior liquidity shortfall (STATE POKE, see `poke_senior_claim`)
+/// lets anyone move junior capital into the pot. The recalled amount is pot principal: mirror,
+/// ledger and vault-owned counter all rise by it, and the seniors' redemption afterwards keeps
+/// them equal.
+#[test]
+fn s10_mirror_equals_ledger_principal_through_a_recall() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 30_000_000).expect("junior");
+    let before = s10_assert_mirror_equals_ledger(&env, "before recall");
+    poke_senior_claim(&mut env, 14_000_000);
+    env.recall(lp.portfolio, 4_000_000, DOMAIN).expect("recall exactly the shortfall");
+    let after = s10_assert_mirror_equals_ledger(&env, "recall");
+    assert_eq!(after.0 + after.1, before.0 + before.1 + 4_000_000, "vacuity: the recall added pot principal");
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.earn_execute(&d, Some(lp.portfolio)).expect("redeem after the recall");
+    let end = s10_assert_mirror_equals_ledger(&env, "redeem after recall");
+    assert!(end.0 + end.1 < after.0 + after.1, "vacuity: the redemption drew pot principal");
 }
