@@ -35,7 +35,10 @@ CRATES = [
     ("percolator-prog/kani/growth", ["src/proofs.rs"], "proofs::", "devnet", PATHC_DEV),
     ("percolator-prog/kani/p3", ["src/proofs.rs"], "proofs::", "devnet", PATHC_DEV),
     ("percolator-prog/kani/p3-engine", ["src/proofs.rs"], "proofs::", "devnet", PATHC_DEV),
-    ("percolator-stake", ["tests/kani.rs", "tests/kani_v5.rs"], "", "none", "--tests"),
+    # review round 3 B4: every tests/kani.rs harness sits in `#[cfg(kani)] mod kani_proofs { .. }`, and the
+    # runner passes `--exact --harness <full path>`; kani_v5.rs harnesses are at the test-crate root
+    ("percolator-stake", ["tests/kani.rs"], "kani_proofs::", "none", "--tests"),
+    ("percolator-stake", ["tests/kani_v5.rs"], "", "none", "--tests"),
     # stake NEW-1 (b83ddf9): cfg(kani) child module of processor, hooked at the END of src/processor.rs
     ("percolator-stake", ["src/kani_v22_new1.rs"], "processor::kani_v22_new1::", "none", "--lib"),
     ("percolator-stake", ["src/kani_v22_r1.rs"], "processor::kani_v22_r1::", "none", "--lib"),
@@ -98,9 +101,10 @@ def harnesses(txt, path):
 
 
 print("# id\tclass\tworkdir\tflavour\tdeps\tharness\targs")
+SEEN = {}  # per (workdir, args): one crate's test targets may be split over several CRATES entries (B4)
 for wd, files, prefix, flav, args in CRATES:
     absd = os.path.join(root, wd)
-    seen = set()
+    seen = SEEN.setdefault((wd, args), set())
     for f in files:
         p = os.path.join(absd, f)
         if not os.path.exists(p):

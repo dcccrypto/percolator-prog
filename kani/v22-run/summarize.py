@@ -51,7 +51,9 @@ for hid, q in queue.items():
 extra = [h for h in res if h not in queue]
 alert = os.path.join(outdir, "ALERT")
 print(f"# queue ids: {len(queue)}; results rows: {len(rows)}; not in queue: {len(extra)}")
-print("# ALERT: " + ("PRESENT (" + open(alert).read().strip().splitlines()[-1] + ")" if os.path.exists(alert) else "absent"))
+# review round 3: an EMPTY ALERT file is still an alert (no IndexError)
+alert_lines = open(alert).read().strip().splitlines() if os.path.exists(alert) else None
+print("# ALERT: " + ("absent" if alert_lines is None else "PRESENT (" + (alert_lines[-1] if alert_lines else "empty ALERT file") + ")"))
 for k, v in sorted(counts.items()):
     print(f"# {k}: {v}")
 for h in extra:

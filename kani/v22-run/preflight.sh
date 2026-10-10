@@ -4,7 +4,8 @@
 #   [QUEUE=<queue.tsv>] [FLAVOUR=<none|devnet|mainnet>] preflight.sh <crate dir> <label> <cargo-kani args...>
 # After `cargo kani list` the queue is diffed name for name against the list (compare_list.py, review M6):
 # QUEUE defaults to queue.tsv next to this script; FLAVOUR is required (the queue's flavour column for
-# this invocation). Any difference stops the preflight (exit 2) before codegen.
+# this invocation). Any difference stops the preflight (exit 2) before codegen; a failed list exits 3
+# (after kani-list.json is restored/removed). The cargo-kani args must equal the queue rows' args column.
 # The HEADs of all five sibling worktrees under the kani-work root (KANI_WORK_ROOT, default: the directory
 # holding percolator-prog, three levels above this script) are written to the log.
 set -u
@@ -23,11 +24,19 @@ cd $dir
     echo "#   $r $(git -C $ROOT/$r rev-parse HEAD 2>/dev/null || echo MISSING) dirty=$(git -C $ROOT/$r status --porcelain 2>/dev/null | wc -l | tr -d ' ')"
   done
   cargo kani --version; } > $OUT/$lab.log
-cargo kani list "$@" --format json >> $OUT/$lab.log 2>&1; cp kani-list.json $OUT/$lab-kani-list.json 2>/dev/null
+# review round 3: start from no kani-list.json (the engine tracks a stale copy, restored below), and a
+# failed `cargo kani list` stops the preflight instead of comparing a stale or missing file
+rm -f kani-list.json $OUT/$lab-kani-list.json
+cargo kani list "$@" --format json >> $OUT/$lab.log 2>&1
+lrc=$?
+echo "cargo kani list rc=$lrc" >> $OUT/$lab.log
+[ -f kani-list.json ] && cp kani-list.json $OUT/$lab-kani-list.json
 # review round 2 B3: never leave kani-list.json behind in the frozen tree (the engine root tracks one:
 # restore it; elsewhere remove it)
 if git ls-files --error-unmatch kani-list.json >/dev/null 2>&1; then git checkout -- kani-list.json; else rm -f kani-list.json; fi
-python3 -I $HERE/compare_list.py $QUEUE $OUT/$lab-kani-list.json $dir $FLAVOUR >> $OUT/$lab.log 2>&1
+if (( lrc != 0 )) || [ ! -s $OUT/$lab-kani-list.json ]; then echo "preflight $lab: cargo kani list failed (rc=$lrc) or wrote no list; codegen not started" >&2; exit 3; fi
+# review round 3: the selection key includes this invocation's args (queue args column)
+python3 -I $HERE/compare_list.py $QUEUE $OUT/$lab-kani-list.json $dir $FLAVOUR "$*" >> $OUT/$lab.log 2>&1
 cl=$?
 echo "compare_list rc=$cl" >> $OUT/$lab.log
 if (( cl != 0 )); then echo "preflight $lab: queue != cargo kani list (see $OUT/$lab.log); codegen not started" >&2; exit 2; fi
