@@ -27,7 +27,8 @@ cd $dir
 # review round 3: start from no kani-list.json (the engine tracks a stale copy, restored below), and a
 # failed `cargo kani list` stops the preflight instead of comparing a stale or missing file
 rm -f kani-list.json $OUT/$lab-kani-list.json
-cargo kani list "$@" --format json >> $OUT/$lab.log 2>&1
+# cargo-kani 0.67: cargo options go BEFORE the subcommand (`cargo kani list --tests` is rejected, rc 2)
+cargo kani "$@" list --format json >> $OUT/$lab.log 2>&1
 lrc=$?
 echo "cargo kani list rc=$lrc" >> $OUT/$lab.log
 [ -f kani-list.json ] && cp kani-list.json $OUT/$lab-kani-list.json
