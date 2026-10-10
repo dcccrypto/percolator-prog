@@ -35,3 +35,5 @@ percolator:closure_expired_counterparty_lien_cannot_remain_favorable_account_cre
 percolator:proof_v22_leg_cap_validator
 percolator:kani_band_trade_shape_cap_and_min_notional_exempt
 percolator:kani_band_bilateral_close_preserves_a
+# B1 (r2 review 2026-10-10): decodes all 16 legs via account_touches_pending_domain_loss_barrier (unwind 24)
+percolator:proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope

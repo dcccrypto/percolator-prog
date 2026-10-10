@@ -1,4 +1,4 @@
-# subset-queue r2: 36 first-freeze rows (r2_ids.txt) + 1 new (r2_new.txt) = 37
+# subset-queue r2: 37 first-freeze rows (r2_ids.txt) + 1 new (r2_new.txt) = 38
 # id	class	workdir	flavour	deps	harness	args
 percolator:proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	--tests --features fuzz -Z stubbing
 percolator:proof_v16_public_materialized_portfolio_register_is_value_neutral	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_public_materialized_portfolio_register_is_value_neutral	--tests --features fuzz -Z stubbing
@@ -36,4 +36,5 @@ percolator:closure_expired_counterparty_lien_cannot_remain_favorable_account_cre
 percolator:proof_v22_leg_cap_validator	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v22_leg_cap_validator	--tests --features fuzz -Z stubbing
 percolator:kani_band_trade_shape_cap_and_min_notional_exempt	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_trade_shape_cap_and_min_notional_exempt	--tests --features fuzz -Z stubbing
 percolator:kani_band_bilateral_close_preserves_a	L	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_bilateral_close_preserves_a	--tests --features fuzz -Z stubbing
+percolator:proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope	--tests --features fuzz -Z stubbing
 percolator:proof_v22_empty_leg_bytes_eq_fieldwise	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v22_empty_leg_bytes_eq_fieldwise	--tests --features fuzz -Z stubbing

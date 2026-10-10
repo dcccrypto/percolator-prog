@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Second-freeze (r2) queue: EXACTLY the rows named in r2_ids.txt (the 36 diag-table engine rows, which
-must already be in queue.tsv) plus the NEW harnesses in r2_new.txt (which must NOT be in queue.tsv).
+"""Second-freeze (r2) queue: EXACTLY the rows named in r2_ids.txt (the 36 diag-table engine rows, the r2
+review B1 row, and any row r2_catchall.py adds before the freeze; all must already be in queue.tsv) plus the NEW harnesses in r2_new.txt (which must NOT be in queue.tsv).
 
-  python3 gen_queue_r2.py <source root> [<workdir root>] > queue-r2.tsv
+  python3 gen_queue_r2.py <source root> <workdir root> > queue-r2.tsv
 
 <source root> holds the r2 proof trees (harness names are read from source by gen_queue.py, so the new
-harness is found); workdir paths are rewritten to <workdir root> (default: the first-freeze kani-work root,
-where the second freeze is checked out), so every r2 row is byte-identical to its queue.tsv row
+harness is found); workdir paths are rewritten to <workdir root> (required: the kani-work root where the
+second freeze is checked out, e.g. /Users/khubair/percolator-ops/kani-work), so every r2 row is byte-identical to its queue.tsv row
 (id, class, workdir, flavour, deps, harness, args). Any id missing, duplicated, or differing aborts.
 The output starts with `# subset-queue`, which tells compare_list.py the queue is a deliberate subset
 (every queued name must be listed exactly; list names not queued are not a difference).
@@ -14,8 +14,9 @@ The output starts with `# subset-queue`, which tells compare_list.py the queue i
 import os, subprocess, sys
 
 here = os.path.dirname(os.path.abspath(__file__))
-src = os.path.abspath(sys.argv[1])
-dst = os.path.abspath(sys.argv[2]) if len(sys.argv) > 2 else os.path.abspath(os.path.join(here, "..", "..", ".."))
+if len(sys.argv) != 3:
+    sys.exit(__doc__)
+src, dst = os.path.abspath(sys.argv[1]), os.path.abspath(sys.argv[2])
 ids = lambda f: [l.strip() for l in open(os.path.join(here, f)) if l.strip() and not l.startswith("#")]
 want_old, want_new = ids("r2_ids.txt"), ids("r2_new.txt")
 gen = subprocess.run([sys.executable, "-I", os.path.join(here, "gen_queue.py"), src], capture_output=True, text=True, check=True).stdout
