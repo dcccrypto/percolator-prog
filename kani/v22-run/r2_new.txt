@@ -1,0 +1,2 @@
+# Second-freeze (r2) NEW harness ids (not in the first-freeze queue.tsv).
+percolator:proof_v22_empty_leg_bytes_eq_fieldwise

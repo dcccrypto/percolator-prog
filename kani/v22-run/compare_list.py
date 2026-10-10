@@ -21,6 +21,9 @@ args column equals <args> are selected (review round 3: a stake `--lib` prefligh
 alone); a list name queued in the same workdir and flavour under OTHER args is reported as
 `other-args (ok)`, not as a difference (a `--tests` build also lists the lib's harnesses).
 
+A queue file whose leading comment lines include `# subset-queue` (the r2 second-freeze queue,
+gen_queue_r2.py) is treated like the mainnet flavour: a deliberate subset.
+
 Exit 0 only when the two sets are equal. Exception: the `mainnet` flavour is a deliberate SUBSET re-run
 (mainnet_secondary.txt), so for it every queued name must be listed, and extra list names are reported
 but are not a difference. Any other difference, an empty selection, or a bad JSON exits 1.
@@ -30,6 +33,18 @@ import os
 import sys
 
 SUBSET_FLAVOURS = {"mainnet"}
+
+
+def is_subset_queue(path):
+    """r2: a queue whose header carries `# subset-queue` (gen_queue_r2.py) is a deliberate subset re-run:
+    every queued name must be listed (exactly, when the list name has a module path); list names that are
+    not queued are reported, not a difference."""
+    for line in open(path):
+        if not line.startswith("#"):
+            return False
+        if line.startswith("# subset-queue"):
+            return True
+    return False
 
 
 def names_from_list(path):
@@ -105,7 +120,7 @@ def main():
         print(f"  QUEUE-ONLY {qb[b][0]}  (queued but not a harness per cargo kani list)")
     for n, want in pathmis:
         print(f"  PATH-MISMATCH queue {n!r} != cargo kani list {want}  (--exact would match nothing)")
-    subset = flav in SUBSET_FLAVOURS
+    subset = flav in SUBSET_FLAVOURS or is_subset_queue(qpath)
     only_l_other = [b for b in only_l if b in other_b]
     only_l = [b for b in only_l if b not in other_b]
     for b in only_l_other:
