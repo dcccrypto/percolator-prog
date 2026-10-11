@@ -1,4 +1,4 @@
-# subset-queue r2: 51 first-freeze rows (r2_ids.txt) + 2 new (r2_new.txt) = 53
+# subset-queue r2: 52 first-freeze rows (r2_ids.txt) + 2 new (r2_new.txt) = 54
 # id	class	workdir	flavour	deps	harness	args
 percolator:proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	--tests --features fuzz -Z stubbing
 percolator:proof_v16_public_materialized_portfolio_register_is_value_neutral	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_public_materialized_portfolio_register_is_value_neutral	--tests --features fuzz -Z stubbing
@@ -51,5 +51,6 @@ percolator-stake:proof_withdrawal_rounds_down	S	/Users/khubair/percolator-ops/ka
 percolator-prog:kani_v22_wa7_min_payout	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wa7_min_payout	--tests --features devnet -Z function-contracts -Z stubbing
 percolator-prog_kani_growth:kani_growth_t2_dyn_shape_in_lp	L	/Users/khubair/percolator-ops/kani-work/percolator-prog/kani/growth	devnet	percolator-prog_kani_growth:kani_growth_c_mul_div_ceil	proofs::kani_growth_t2_dyn_shape_in_lp	--features devnet -Z function-contracts -Z stubbing
 percolator-prog_kani_p3-engine:kani_p3e_skew_funding_conserves_const_divisor	S	/Users/khubair/percolator-ops/kani-work/percolator-prog/kani/p3-engine	devnet	-	proofs::kani_p3e_skew_funding_conserves_const_divisor	--features devnet -Z function-contracts -Z stubbing
+percolator:proof_v22_s10_retry_hook_guard_m	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v22_s10_retry_hook_guard_m	--tests --features fuzz -Z stubbing
 percolator:proof_v22_empty_leg_bytes_eq_fieldwise	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v22_empty_leg_bytes_eq_fieldwise	--tests --features fuzz -Z stubbing
 percolator-match:proof_passive_zero_price_bid_refused	S	/Users/khubair/percolator-ops/kani-work/percolator-match	none	-	vamm::proofs::proof_passive_zero_price_bid_refused	-Z function-contracts -Z stubbing
