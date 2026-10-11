@@ -39,3 +39,5 @@ percolator:kani_band_bilateral_close_preserves_a
 percolator:proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope
 # catch-all (r2_catchall.py, 2026-10-11): memcmp.unwind.0 at iteration 16 from the derived 16-byte Pod == in is_zero_fill_or_canonical_disabled_slot (kf_drift), not the leg compare; engine r2 raises its unwind 16 -> 17
 percolator:proof_v16_dynamic_market_extension_slots_must_be_zero_fill
+# diagnosed stale-harness FAIL (2026-10-11, ledger/kani-v22-run-diag-scaled-adl-2026-10-11.md): expected value fixed in engine r2
+percolator:proof_v16_scaled_adl_delta_fast_matches_aligned_reference_and_fails_closed
