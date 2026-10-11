@@ -684,7 +684,7 @@ fn kani_growth_t2_dyn_shape_in_lp() {
         }
     }
     kani::cover!(r1.is_none() && lp1 <= n && lp1.checked_mul(10_000).is_none(), "E1: lp*1e4 overflow");
-    kani::cover!(r1.is_none() && lp1 <= n && lp1.checked_mul(10_000).is_some() && n.checked_mul(10_000 - k as u128).is_some() && base <= 10_000 && k <= 10_000, "E1: span*num overflow");
+    kani::cover!(r1.is_none() && lp1 <= n && lp1.checked_mul(10_000).is_some() && 10_000u128.checked_sub(k as u128).is_some_and(|f| n.checked_mul(f).is_some()) && base <= 10_000 && k <= 10_000, "E1: span*num overflow");
     kani::cover!(r1.is_some() && r2.is_none() && lp2 > n, "E1: lp > n");
     kani::cover!(r1.is_some_and(|a| a > base) && r2.is_some_and(|b| b > base), "both stepped");
 }

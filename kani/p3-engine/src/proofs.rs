@@ -157,8 +157,15 @@ fn kani_p3e_skew_funding_conserves_const_divisor() {
     #[cfg(feature = "neg_flat_a")]
     let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
     let q = q as i128;
-    let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
-    let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+    // r2 (rule 2026-10-12, proof-code arithmetic): `q * dF` is harness arithmetic; with no bound on `rate`
+    // it can exceed i128 (rate = i32::MAX, dt = u16::MAX, price = q = u32::MAX). Checked, not an assume:
+    // every input whose product fits keeps the property unchanged.
+    let (Some(nl), Some(ns)) = (q.checked_mul(f_long), q.checked_mul(f_short)) else {
+        kani::cover!(true, "q*dF exceeds i128 (outside the i128 realize model)");
+        return;
+    };
+    let long_pnl = floor_div_signed_conservative_i128(nl, a_long * POS_SCALE);
+    let short_pnl = floor_div_signed_conservative_i128(ns, a_short * POS_SCALE);
     let net = long_pnl + short_pnl;
     kani::cover!(fid != 0 && long_pnl < -1_000, "material transfer, longs pay");
     kani::cover!(fid < 0 && short_pnl < -1_000, "material transfer, shorts pay");

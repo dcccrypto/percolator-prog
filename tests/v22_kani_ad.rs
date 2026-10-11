@@ -280,7 +280,7 @@ fn kani_v22_wa7_min_payout() {
     kani::cover!(wire > stored, "wire binds");
     kani::cover!(stored > wire, "stored binds");
     kani::cover!(atoms == m as u128, "boundary admitted");
-    kani::cover!(m > 0 && atoms + 1 == m as u128, "one below refused");
+    kani::cover!(m > 0 && atoms.checked_add(1) == Some(m as u128), "one below refused");
 }
 
 /// W-A-8 (K8-3): `loss_current <=>` all nine counters zero. Mutant: drop the barrier terms.
