@@ -1,4 +1,4 @@
-# subset-queue r2: 39 first-freeze rows (r2_ids.txt) + 1 new (r2_new.txt) = 40
+# subset-queue r2: 51 first-freeze rows (r2_ids.txt) + 2 new (r2_new.txt) = 53
 # id	class	workdir	flavour	deps	harness	args
 percolator:proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_in_place_account_init_clears_hidden_risk_state_and_validates	--tests --features fuzz -Z stubbing
 percolator:proof_v16_public_materialized_portfolio_register_is_value_neutral	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_public_materialized_portfolio_register_is_value_neutral	--tests --features fuzz -Z stubbing
@@ -39,4 +39,17 @@ percolator:kani_band_bilateral_close_preserves_a	L	/Users/khubair/percolator-ops
 percolator:proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope	--tests --features fuzz -Z stubbing
 percolator:proof_v16_dynamic_market_extension_slots_must_be_zero_fill	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_dynamic_market_extension_slots_must_be_zero_fill	--tests --features fuzz -Z stubbing
 percolator:proof_v16_scaled_adl_delta_fast_matches_aligned_reference_and_fails_closed	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_scaled_adl_delta_fast_matches_aligned_reference_and_fails_closed	--tests --features fuzz -Z stubbing
+percolator:kani_band_reanchor_never_narrow	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_reanchor_never_narrow	--tests --features fuzz -Z stubbing
+percolator:kani_band_unarmed_fails_closed	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_unarmed_fails_closed	--tests --features fuzz -Z stubbing
+percolator:kani_band_accrue_rejects_before_mutation	L	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_accrue_rejects_before_mutation	--tests --features fuzz -Z stubbing
+percolator:kani_rent_settle_idempotent_and_attach_snap	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_rent_settle_idempotent_and_attach_snap	--tests --features fuzz -Z stubbing
+percolator:kani_band_width_ok_exact	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	kani_band_width_ok_exact	--tests --features fuzz -Z stubbing
+percolator:proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend	M	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend	--tests --features fuzz -Z stubbing
+percolator-match:proof_passive_spread_never_negative	S	/Users/khubair/percolator-ops/kani-work/percolator-match	none	-	vamm::proofs::proof_passive_spread_never_negative	-Z function-contracts -Z stubbing
+percolator-stake:proof_lp_rounds_down	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	kani_proofs::proof_lp_rounds_down	--tests
+percolator-stake:proof_withdrawal_rounds_down	S	/Users/khubair/percolator-ops/kani-work/percolator-stake	none	-	kani_proofs::proof_withdrawal_rounds_down	--tests
+percolator-prog:kani_v22_wa7_min_payout	S	/Users/khubair/percolator-ops/kani-work/percolator-prog	devnet	-	kani_v22_wa7_min_payout	--tests --features devnet -Z function-contracts -Z stubbing
+percolator-prog_kani_growth:kani_growth_t2_dyn_shape_in_lp	L	/Users/khubair/percolator-ops/kani-work/percolator-prog/kani/growth	devnet	percolator-prog_kani_growth:kani_growth_c_mul_div_ceil	proofs::kani_growth_t2_dyn_shape_in_lp	--features devnet -Z function-contracts -Z stubbing
+percolator-prog_kani_p3-engine:kani_p3e_skew_funding_conserves_const_divisor	S	/Users/khubair/percolator-ops/kani-work/percolator-prog/kani/p3-engine	devnet	-	proofs::kani_p3e_skew_funding_conserves_const_divisor	--features devnet -Z function-contracts -Z stubbing
 percolator:proof_v22_empty_leg_bytes_eq_fieldwise	S	/Users/khubair/percolator-ops/kani-work/percolator	none	-	proof_v22_empty_leg_bytes_eq_fieldwise	--tests --features fuzz -Z stubbing
+percolator-match:proof_passive_zero_price_bid_refused	S	/Users/khubair/percolator-ops/kani-work/percolator-match	none	-	vamm::proofs::proof_passive_zero_price_bid_refused	-Z function-contracts -Z stubbing

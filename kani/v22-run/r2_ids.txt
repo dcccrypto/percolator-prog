@@ -41,3 +41,18 @@ percolator:proof_v16_historical_bankruptcy_hlock_does_not_override_account_scope
 percolator:proof_v16_dynamic_market_extension_slots_must_be_zero_fill
 # diagnosed stale-harness FAIL (2026-10-11, ledger/kani-v22-run-diag-scaled-adl-2026-10-11.md): expected value fixed in engine r2
 percolator:proof_v16_scaled_adl_delta_fast_matches_aligned_reference_and_fails_closed
+# batch-3 diagnosed stale harnesses (2026-10-12, ledger/kani-v22-run-diag-batch3-2026-10-12.md); leg_cap_validator already listed
+percolator:kani_band_reanchor_never_narrow
+percolator:kani_band_unarmed_fails_closed
+percolator:kani_band_accrue_rejects_before_mutation
+percolator:kani_rent_settle_idempotent_and_attach_snap
+percolator:kani_band_width_ok_exact
+percolator:proof_v16_view_domain_budget_caps_bankruptcy_insurance_spend
+percolator-match:proof_passive_spread_never_negative
+# stake N7 restatement + wa7 cover (2026-10-12, ledger/kani-v22-run-diag-stake-wa7-2026-10-12.md)
+percolator-stake:proof_lp_rounds_down
+percolator-stake:proof_withdrawal_rounds_down
+percolator-prog:kani_v22_wa7_min_payout
+# proof-code arithmetic sweep (rule 2026-10-12, rev2.10): hits in rows not yet passed
+percolator-prog_kani_growth:kani_growth_t2_dyn_shape_in_lp
+percolator-prog_kani_p3-engine:kani_p3e_skew_funding_conserves_const_divisor
