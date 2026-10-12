@@ -452,7 +452,7 @@ fn rd<const N: usize>(b: &[u8], o: usize) -> [u8; N] {
 /// documented offset (the spec decoder below reads the bytes back, so decode∘encode is the identity).
 /// Mutant FE-M3 (requested/executed swapped).
 #[kani::proof]
-#[kani::unwind(13)]
+#[kani::unwind(33)] // three 32-byte key compares (memcmp 32 + 1); the record loops are <= 11
 fn kani_v22_fe2_encode_fill_layout() {
     assert_eq!(fe::FILL_FIXED_LEN, 100);
     assert_eq!(fe::FILL_REC_LEN, 75);
