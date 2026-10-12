@@ -2441,6 +2441,8 @@ fn kani_e2_auth_accept_implies_all_gates() {
         assert!(amt == 1, "authorized ⟹ holds exactly one");
         assert!(init, "authorized ⟹ token account initialized");
     }
+    // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+    kani::cover!(nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init), "an authorized input exists (the implication is not vacuous)");
 }
 
 // ── Each gate LOAD-BEARING: its failure ⟹ reject, for ALL other inputs ──

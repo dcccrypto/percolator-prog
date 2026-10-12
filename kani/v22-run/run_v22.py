@@ -32,6 +32,8 @@ WATCHDOG = {"S": 600, "M": 1800, "L": 4000}
 RSS_CAP_KB = {"S": 8 << 20, "M": 8 << 20, "L": 16 << 20}
 LANES = 3
 MEM_GATE_ALL_GB = None  # --mem-gate-gb: free-memory gate (GB) applied before EVERY row (default: 24 GB, L rows only)
+RUNNING = {}            # lane -> (root pid, class) of the row in flight (for the multi-lane memory reserve)
+startlock = threading.Lock()  # with --mem-gate-gb: serialises "gate check -> spawn" so two lanes cannot both pass on the same free memory
 GB = 1 << 30
 
 WAIT_LOG_S = 600
@@ -93,13 +95,20 @@ def gate_state(cls, outdir, max_load=16):
     l, d = load5(), disk_free_gb(outdir)
     m = mem_free_gb() if (cls == "L" or MEM_GATE_ALL_GB is not None) else None
     mem_min = MEM_GATE_ALL_GB if MEM_GATE_ALL_GB is not None else 24
+    if MEM_GATE_ALL_GB is not None and RUNNING:
+        # reserve what the rows already in flight may still grow to (their cap minus their current RSS)
+        reserve = 0
+        for pid, rcls in list(RUNNING.values()):
+            pids, rss, _ = tree_pids(pid)
+            reserve += max(0, RSS_CAP_KB[rcls] - sum(rss.get(q, 0) for q in pids))
+        mem_min += reserve / (1 << 20)
     why = []
     if l > max_load:
         why.append(f"load5={l:.1f}>{max_load}")
     if d < 40:
         why.append(f"disk={d:.1f}GB<40")
     if m is not None and m < mem_min:
-        why.append(f"mem={m:.1f}GB<{mem_min}")
+        why.append(f"mem={m:.1f}GB<{mem_min:.1f}")
     vals = f"load5={l:.1f} disk={d:.1f}GB" + (f" mem={m:.1f}GB" if m is not None else "")
     return (not why), ("; ".join(why) + " | " + vals)
 
@@ -165,18 +174,27 @@ def run_one(job, outdir, lane):
     hid, cls, wd, flav, deps, harness, args = job
     if cls == "L":
         heavy.acquire()  # at most one L; its free-memory gate is checked only once it holds the slot
+    serial = MEM_GATE_ALL_GB is not None
+    if serial:
+        startlock.acquire()
     try:
-        if not wait_gates(cls, outdir, f"lane{lane} {hid}"):
-            return
-        env = dict(os.environ, CARGO_BUILD_JOBS="2",
-                   CARGO_TARGET_DIR=os.path.join(outdir, "target", f"lane{lane}", os.path.basename(wd.rstrip('/')) + "-" + flav))
-        cmd = ["cargo", "kani"] + args + ["--exact", "--harness", harness]
-        logp = os.path.join(outdir, "logs", hid + ".log")
-        t0 = time.time()
-        with open(logp, "w") as lf:
+        try:
+            if not wait_gates(cls, outdir, f"lane{lane} {hid}"):
+                return
+            env = dict(os.environ, CARGO_BUILD_JOBS="2",
+                       CARGO_TARGET_DIR=os.path.join(outdir, "target", f"lane{lane}", os.path.basename(wd.rstrip('/')) + "-" + flav))
+            cmd = ["cargo", "kani"] + args + ["--exact", "--harness", harness]
+            logp = os.path.join(outdir, "logs", hid + ".log")
+            t0 = time.time()
+            lf = open(logp, "w")
             lf.write("# cmd: " + " ".join(cmd) + "\n# cwd: " + wd + "\n")
             lf.flush()
             p = subprocess.Popen(cmd, cwd=wd, env=env, stdout=lf, stderr=subprocess.STDOUT)
+            RUNNING[lane] = (p.pid, cls)
+        finally:
+            if serial:
+                startlock.release()
+        with lf:
             timed_out = oom = False
             while p.poll() is None:
                 time.sleep(5)
@@ -203,6 +221,7 @@ def run_one(job, outdir, lane):
                 rf.write("\t".join(row) + "\n")
             print(f"[{time.strftime('%H:%M:%S')}] lane{lane} {hid} {status} {row[5]} {wall}s", flush=True)
     finally:
+        RUNNING.pop(lane, None)
         if cls == "L":
             heavy.release()
 
@@ -258,6 +277,15 @@ def main():
         LANES = a.lanes
     if a.mem_gate_gb:
         MEM_GATE_ALL_GB = a.mem_gate_gb
+    if not a.dry_run:
+        # a 32 GB row never runs alongside another row: refuse to start if another runner is alive, and
+        # refuse any start while a >= 32 GB runner is alive
+        ps = subprocess.run(["ps", "-A", "-o", "pid=,command="], capture_output=True, text=True).stdout
+        others = [l.strip() for l in ps.splitlines() if "run_v22.py" in l and "--queue" in l and int(l.split()[0]) != os.getpid()]
+        big = lambda c: (m := re.search(r"--rss-cap-gb[ =](\d+)", c)) is not None and int(m.group(1)) >= 32
+        if others and ((a.rss_cap_gb or 0) >= 32 or any(big(o) for o in others)):
+            print("REFUSED (exit 5): another run_v22.py is alive and one of the two has --rss-cap-gb >= 32:\n  " + "\n  ".join(others), flush=True)
+            sys.exit(5)
     print(f"caps: watchdog={WATCHDOG} rss_cap_gb={ {k: v >> 20 for k, v in RSS_CAP_KB.items()} } lanes={LANES} "
           f"mem_gate_all_gb={MEM_GATE_ALL_GB}", flush=True)
     os.makedirs(os.path.join(a.out, "logs"), exist_ok=True)
