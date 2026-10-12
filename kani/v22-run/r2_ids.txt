@@ -58,3 +58,5 @@ percolator-prog_kani_growth:kani_growth_t2_dyn_shape_in_lp
 percolator-prog_kani_p3-engine:kani_p3e_skew_funding_conserves_const_divisor
 # batch-3 §8 rule (header aggregates refreshed before the shape assume): skip covers unreachable natively before the fix
 percolator:proof_v22_s10_retry_hook_guard_m
+# diag §10 (catch-all: memcmp cut on 32-byte key compares, unwind 13 -> 33)
+percolator-prog:kani_v22_fe2_encode_fill_layout
