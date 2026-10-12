@@ -31,6 +31,7 @@ import argparse, os, re, shutil, signal, subprocess, sys, threading, time
 WATCHDOG = {"S": 600, "M": 1800, "L": 4000}
 RSS_CAP_KB = {"S": 8 << 20, "M": 8 << 20, "L": 16 << 20}
 LANES = 3
+MEM_GATE_ALL_GB = None  # --mem-gate-gb: free-memory gate (GB) applied before EVERY row (default: 24 GB, L rows only)
 GB = 1 << 30
 
 WAIT_LOG_S = 600
@@ -90,14 +91,15 @@ def kill_tree(root):
 def gate_state(cls, outdir, max_load=16):
     """(ok, reason) for the machine gates. mem is checked only for L (call it AFTER heavy.acquire())."""
     l, d = load5(), disk_free_gb(outdir)
-    m = mem_free_gb() if cls == "L" else None
+    m = mem_free_gb() if (cls == "L" or MEM_GATE_ALL_GB is not None) else None
+    mem_min = MEM_GATE_ALL_GB if MEM_GATE_ALL_GB is not None else 24
     why = []
     if l > max_load:
         why.append(f"load5={l:.1f}>{max_load}")
     if d < 40:
         why.append(f"disk={d:.1f}GB<40")
-    if m is not None and m < 24:
-        why.append(f"mem={m:.1f}GB<24")
+    if m is not None and m < mem_min:
+        why.append(f"mem={m:.1f}GB<{mem_min}")
     vals = f"load5={l:.1f} disk={d:.1f}GB" + (f" mem={m:.1f}GB" if m is not None else "")
     return (not why), ("; ".join(why) + " | " + vals)
 
@@ -239,7 +241,25 @@ def main():
     ap.add_argument("--frozen", required=True,
                     help="repo dir name -> frozen sha, written by freeze.py at freeze time (outside the repos: a\n"
                          "file committed here could never hold its own commit's sha)")
+    # pre-registered NO-VERDICT re-run (run ledger 2026-10-10): same code, args and locks; only these caps change
+    ap.add_argument("--watchdog-s", type=int, help="watchdog (s) for EVERY class (re-run: 8000)")
+    ap.add_argument("--rss-cap-gb", type=int, help="RSS cap (GB) on the runner's own process tree for EVERY class (re-run: 32)")
+    ap.add_argument("--lanes", type=int, help="number of lanes (re-run: 1 = one row at a time)")
+    ap.add_argument("--mem-gate-gb", type=int, help="free physical memory (GB) required before EVERY row (re-run: 36)")
     a = ap.parse_args()
+    global LANES, MEM_GATE_ALL_GB
+    if a.watchdog_s:
+        for k in WATCHDOG:
+            WATCHDOG[k] = a.watchdog_s
+    if a.rss_cap_gb:
+        for k in RSS_CAP_KB:
+            RSS_CAP_KB[k] = a.rss_cap_gb << 20
+    if a.lanes:
+        LANES = a.lanes
+    if a.mem_gate_gb:
+        MEM_GATE_ALL_GB = a.mem_gate_gb
+    print(f"caps: watchdog={WATCHDOG} rss_cap_gb={ {k: v >> 20 for k, v in RSS_CAP_KB.items()} } lanes={LANES} "
+          f"mem_gate_all_gb={MEM_GATE_ALL_GB}", flush=True)
     os.makedirs(os.path.join(a.out, "logs"), exist_ok=True)
     jobs = []
     ids = set()
