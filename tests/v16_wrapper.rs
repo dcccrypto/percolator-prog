@@ -16775,7 +16775,13 @@ fn v16_wrapper_liquidation_uses_configured_fee_not_permissionless_caller_fee() {
 
     // Two bounded steps: the first re-certifies the account (discovering the deficit), the
     // second liquidates using that now-current certificate.
-    for _ in 0..2 {
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the crank's refresh of an account it
+    // leaves materially below maintenance now continues into the engine's Liquidate step in the SAME
+    // instruction (the follow-on is the legacy second crank, byte for byte). So ONE crank re-certifies
+    // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
+    // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
+    // now met by the refresh-triggered path.
+    for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 1,
@@ -16926,7 +16932,13 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     // selectable, so the first call re-certifies (discovering the deficit) and the second call
     // liquidates. The first call generates no fee (no insurance movement), so it cannot affect
     // the cranker-split assertions below.
-    for _ in 0..2 {
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the crank's refresh of an account it
+    // leaves materially below maintenance now continues into the engine's Liquidate step in the SAME
+    // instruction (the follow-on is the legacy second crank, byte for byte). So ONE crank re-certifies
+    // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
+    // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
+    // now met by the refresh-triggered path.
+    for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 100,
@@ -17172,7 +17184,13 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     // the now-landed price, discovering the deficit), and only the SECOND call's cert is
     // current with that deficit recorded, making Liquidate selectable. Verified empirically
     // (2 calls: certify, then liquidate; a 3rd call correctly errors, nothing left to do).
-    for _ in 0..2 {
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the crank's refresh of an account it
+    // leaves materially below maintenance now continues into the engine's Liquidate step in the SAME
+    // instruction (the follow-on is the legacy second crank, byte for byte). So ONE crank re-certifies
+    // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
+    // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
+    // now met by the refresh-triggered path.
+    for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 100,
@@ -17298,7 +17316,13 @@ fn v16_wrapper_liquidation_reward_never_spends_insurance_needed_for_losses() {
 
     // Two bounded steps: the first re-certifies the account (discovering the deficit), the
     // second liquidates using that now-current certificate.
-    for _ in 0..2 {
+    // v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): the crank's refresh of an account it
+    // leaves materially below maintenance now continues into the engine's Liquidate step in the SAME
+    // instruction (the follow-on is the legacy second crank, byte for byte). So ONE crank re-certifies
+    // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
+    // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
+    // now met by the refresh-triggered path.
+    for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 1,

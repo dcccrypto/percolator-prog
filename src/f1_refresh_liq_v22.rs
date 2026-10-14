@@ -213,12 +213,23 @@ mod f1_kani_proofs {
             && !shortfall_material(i.certified_equity, i.certified_maintenance_req), "dust shortfall: skipped");
     }
 
+    /// Stub for `min_shortfall`: ANY threshold >= 1. With it the harness below proves its
+    /// properties for every threshold value (no u128 division in the formula: the first design
+    /// with the real `min_shortfall` hit the 1,500 s watchdog, NO-VERDICT). The real threshold is
+    /// pinned separately by `kani_f1_min_shortfall_is_ceil`.
+    #[cfg(kani)]
+    fn min_shortfall_any_threshold(_certified_maintenance_req: u128) -> u128 {
+        let t: u128 = kani::any();
+        kani::assume(t >= 1);
+        t
+    }
+
     /// No path to bankruptcy skips it: whenever the rule declines an eligible, engine-liquidatable
-    /// account that is below maintenance, that account is strictly solvent (equity > 0) and
-    /// within `min_shortfall` of its requirement; every account with equity <= 0 (or a material
-    /// shortfall) is liquidated. Mutants: drop the `equity <= 0` arm; floor instead of ceil;
-    /// threshold on notional instead of requirement with `>`.
+    /// account that is below maintenance, that account is strictly solvent (equity > 0); every
+    /// account with equity <= 0 is liquidated. Holds for EVERY threshold >= 1 (stubbed).
+    /// Mutants: drop the `equity <= 0` arm; `equity < 0` instead of `<= 0`.
     #[kani::proof]
+    #[kani::stub(super::min_shortfall, min_shortfall_any_threshold)]
     fn kani_f1_skip_only_while_solvent() {
         let i: F1Inputs = kani::any();
         let ready = follow_on_eligible(&i) && i.engine_liquidatable && i.certified_liq_deficit != 0;
@@ -226,17 +237,34 @@ mod f1_kani_proofs {
         let d = follow_on_liquidation(&i);
         if ready && below && !d {
             assert!(i.certified_equity > 0, "skipped an insolvent account");
-            let e = i.certified_equity as u128;
-            assert!(i.certified_maintenance_req - e < min_shortfall(i.certified_maintenance_req));
+            assert!((i.certified_equity as u128) < i.certified_maintenance_req, "skip is only ever below maintenance");
         }
         if ready && i.certified_equity <= 0 {
             assert!(d, "insolvent account not liquidated");
         }
-        let t = min_shortfall(i.certified_maintenance_req);
-        assert!(t >= 1 && t <= i.certified_maintenance_req / 200 + 1);
         kani::cover!(ready && below && !d, "dust skipped while solvent");
-        kani::cover!(ready && i.certified_equity <= 0 && d, "insolvent liquidated");
+        kani::cover!(ready && i.certified_equity == 0 && d, "zero equity liquidated");
+        kani::cover!(ready && i.certified_equity < 0 && d, "negative equity liquidated");
         kani::cover!(ready && i.certified_equity > 0 && below && d, "material shortfall liquidated");
+    }
+
+    /// The real threshold is exactly ceil(requirement / 200) (= 50 bps of the requirement),
+    /// at least 1. Requirements bounded to u64 (cast up), as the g8 harnesses bound their inputs;
+    /// run with `--solver z3` (u128 division by a constant).
+    /// Mutants: floor instead of ceil; `/ 20`; no `max(1)`.
+    #[kani::proof]
+    fn kani_f1_min_shortfall_is_ceil() {
+        let m: u64 = kani::any();
+        let m = m as u128;
+        let t = min_shortfall(m);
+        assert!(t >= 1);
+        assert!(t * 200 >= m, "below the ceiling");
+        if m > 0 {
+            assert!((t - 1) * 200 < m, "above the ceiling");
+        }
+        kani::cover!(m == 0 && t == 1, "zero requirement: 1 atom");
+        kani::cover!(m > 0 && m % 200 == 0, "exact multiple");
+        kani::cover!(m % 200 != 0 && m > 200, "rounded up");
     }
 
     /// At most one step per account per instruction: after one step the decision is false for

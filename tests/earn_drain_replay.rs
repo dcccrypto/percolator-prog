@@ -3482,7 +3482,9 @@ fn a5_explore_real_chunked_bankruptcy() {
             break;
         }
     }
-    assert_eq!(modes, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery -> Resolved within 3 cranks: {modes:?}");
+    // v2.2 F1: the bust's FIRST crank now refreshes AND takes the liquidation step (equity <= 0 always
+    // continues), which declares Recovery; the next finalises it. Same path, one crank earlier.
+    assert_eq!(modes, vec!["Recovery", "Resolved"], "Live -> Recovery -> Resolved within 2 cranks: {modes:?}");
     let _ = bk;
 }
 
@@ -3524,11 +3526,13 @@ fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
     let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
     assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
     let mut seen = vec![];
-    for _ in 0..3 {
+    // v2.2 F1: the first crank refreshes AND declares Recovery (its follow-on liquidation step); the
+    // second finalises. The sequence is the same, one crank earlier.
+    for _ in 0..2 {
         r.crank_pf(bp);
         seen.push(mode(&r));
     }
-    assert_eq!(seen, vec!["Live", "Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
+    assert_eq!(seen, vec!["Recovery", "Resolved"], "Live -> Recovery (declared) -> Resolved (finalised): {seen:?}");
     // the Live-style crank is refused on a terminal market: this is the Custom(14) the Wave A
     // exploration read as a wedge
     let payer = r.env.payer.pubkey();
@@ -3734,7 +3738,11 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     r.trade(&bk, bp, qb).expect("levered long");
     r.request_76(&h, h_ata, None).expect("H 76");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    r.crank_pf(bp);
+    // v2.2 F1: the gate is exercised in the state a REFRESH-ONLY crank leaves (Live, deficit pending);
+    // a full-budget crank now continues into the liquidation that declares Recovery (see
+    // `a5_explore_real_chunked_bankruptcy`). That state stays reachable (a tight keeper transaction),
+    // so the 118 gate must still hold there.
+    crank_refresh_only(&mut r, bp);
     eprintln!("A5 real: {}", r.loss_snapshot());
     let (_, g) = r.env.market_state();
     assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
@@ -4097,8 +4105,11 @@ fn a6_liquidating_refreshes_cu(legs: &[u16]) -> u64 {
     crank_all(&mut r);
     // one plain refresh each first: with a CURRENT certificate the engine plan selects Liquidate for the
     // inline refresh of the 77 (with a stale one it only refreshes)
+    // v2.2 F1: refresh ONLY (a tight-compute keeper refresh): a full-budget crank would now liquidate
+    // here, in the setup, and leave nothing for the 77's inline refreshes to liquidate (the CU worst
+    // case this test measures). The tag-77 prelude itself has no follow-on (unchanged by F1).
     for p in &tr {
-        r.crank_pf(*p);
+        crank_refresh_only(&mut r, *p);
     }
     // a liquidation may be partial (the leg count need not drop): total absolute position must shrink
     let count = |r: &Replay, p: Pubkey| r.env.portfolio_state(p).legs.iter().map(|l| l.basis_pos_q.unsigned_abs()).sum::<u128>();
@@ -4128,4 +4139,46 @@ fn a6_liquidating_mix_of_cap_and_single_leg_refreshes_cu() {
     let cap = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
     let cu = a6_liquidating_refreshes_cu(&[cap, cap, 1, 1, 1]);
     eprintln!("A6-LIQ 2 x cap + 3 x 1-leg: {cu} CU");
+}
+
+/// v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a plain refresh crank of `p` that does NOT
+/// continue into liquidation. Since F1 a refresh that leaves an account materially below maintenance
+/// liquidates in the same instruction when >= `F1_FOLLOW_ON_MIN_CU` compute is left; a keeper refresh
+/// in a tight transaction still refreshes only, which is the state these tests need (a current,
+/// liquidatable certificate). The compute limit is stepped up 50k at a time from 150k: a starved
+/// attempt fails WITHOUT a program code and rolls back, so the first landing limit leaves at most
+/// ~50k + the post-step tail at the follow-on gate (< 520k): refresh only, by construction.
+fn crank_refresh_only(r: &mut Replay, p: Pubkey) {
+    let payer = r.env.payer.pubkey();
+    let ix = solana_sdk::instruction::Instruction {
+        program_id: r.env.program_id,
+        accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(r.env.market, false), AccountMeta::new(p, false)],
+        data: ProgInstruction::PermissionlessCrank {
+            now_slot: 0,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+        }
+        .encode(),
+    };
+    let mut limit: u32 = 150_000;
+    loop {
+        r.env.svm.expire_blockhash();
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &[heap_ix(), solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(limit), ix.clone()],
+            Some(&payer),
+            &[&r.env.payer],
+            r.env.svm.latest_blockhash(),
+        );
+        match r.env.svm.send_transaction(tx) {
+            Ok(_) => return,
+            Err(e) => {
+                let s = format!("{:?}", e.err);
+                if s.contains("Custom(22)") {
+                    return;
+                }
+                assert!(!s.contains("Custom("), "refresh refused: {s}");
+                limit += 50_000;
+                assert!(limit <= 1_400_000, "refresh does not fit a transaction: {s}");
+            }
+        }
+    }
 }
