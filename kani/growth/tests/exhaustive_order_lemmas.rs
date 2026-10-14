@@ -69,3 +69,17 @@ fn l1_negative_control_plateau_exists() {
     }
     assert!(plateau);
 }
+
+/// LEGMONO (consumed by kani_growth_wn_g1_*): for every u16 notional n and IMR i in 0..1e4,
+/// ceil(n·i/1e4) <= ceil(n·(i+1)/1e4) (adjacent ⇒ all pairs by transitivity). 6.5e8 evaluations.
+#[test]
+fn legmono_ceil_bps_monotone_in_imr_all_u16() {
+    for n in 0..=65_535u128 {
+        let mut prev = ceil(n, 0, 10_000).unwrap();
+        for i in 1..=10_000u128 {
+            let q = ceil(n, i, 10_000).unwrap();
+            assert!(prev <= q, "n={n} i={i}");
+            prev = q;
+        }
+    }
+}

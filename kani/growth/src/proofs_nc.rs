@@ -1140,3 +1140,139 @@ fn kani_growth_r15bn_util_fee_monotone_in_max_dom() {
     kani::cover!(a.is_none() && n == 0, "E1: n == 0");
     kani::cover!(a.is_some_and(|x| b.is_some_and(|y| x < y)), "raised dial charges more");
 }
+
+/// = kani_growth_t5_at_capacity_costs_full_margin at its ORIGINAL bound (u8 N_cap): the real gate
+/// and real `dyn_imr_bps`, N_cap by the ∀-stub set to n (as the original), ceil primitive by its
+/// shape contract (at u == 1, num == den and the range facts force ceil == span).
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_q, n_cap_any)]
+#[kani::stub(crate::growth_v19::mul_div_ceil_u128, ceil_shape)]
+fn kani_growth_t5n_at_capacity_costs_full_margin() {
+    let n = kani::any::<u8>() as u128;
+    kani::assume(n > 0);
+    unsafe { G_NCAP = Some(n) };
+    let lb: i8 = kani::any();
+    let la: i8 = kani::any();
+    let g = GrowthGateIn {
+        taker_before_q: 0,
+        taker_after_q: 1,
+        taker_eff_after_abs_q: 1,
+        taker_equity: 0,
+        taker_cert_initial_req: None,
+        lp: Some(GrowthLpIn {
+            before_q: lb as i128,
+            mid_q: lb as i128,
+            after_q: la as i128,
+            eff_after_abs_q: (la as i128).unsigned_abs(),
+            users_oi_side_after_q: n,
+            equity: 0,
+        }),
+        price_e6: 1,
+        pos_scale: 1,
+        engine_imr_bps: kani::any::<u16>() as u64,
+        min_nonzero_im_req: 0,
+        ceil_imr_bps: kani::any::<u16>() as u64,
+        lambda_bps: 10_000,
+        kink_bps: kani::any(),
+        crowd_blocked: false,
+        asset_bound: true,
+    };
+    kani::assume(joins_crowd(lb as i128, la as i128));
+    kani::assume(g.kink_bps < 10_000 && g.ceil_imr_bps <= 10_000 && g.ceil_imr_bps >= g.engine_imr_bps);
+    let r = growth_required_imr_bps(&g);
+    assert_eq!(r, Ok(10_000));
+    kani::cover!(r == Ok(10_000) && g.ceil_imr_bps < 10_000 && g.kink_bps > 0, "full margin at capacity");
+}
+
+/// = kani_growth_w_g2_required_imr_not_below_engine, FULL width (original: u8 operands, real
+/// n_cap_q / dyn_imr_bps): `Ok(x) ⇒ engine <= x <= MAX` for EVERY N_cap value (∀-stub) and every
+/// gate field; dyn by S5d. No assumption on engine_imr_bps. Same covers as the original.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_q, n_cap_any)]
+#[kani::stub(crate::growth_v19::risk_notional_ceil, risk_any)]
+#[kani::stub(crate::growth_v19::leg_im_req, leg_any)]
+#[kani::stub(crate::growth_v19::dyn_imr_bps, dyn_any_guarded)]
+fn kani_growth_wn_g2_required_imr_not_below_engine() {
+    let g = any_gate_nc(kani::any());
+    let r = growth_required_imr_bps(&g);
+    if let Ok(x) = r {
+        assert!(x >= g.engine_imr_bps, "never below the engine IMR");
+        assert!(x <= MAX_IMR_BPS);
+    }
+    let crowd = g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q));
+    kani::cover!(r.is_ok() && g.lp.is_none(), "no LP: ceiling");
+    kani::cover!(r.is_ok() && g.lp.is_some() && !crowd, "thin open: ceiling");
+    kani::cover!(r.is_ok_and(|x| x > g.ceil_imr_bps) && crowd, "crowd above the kink");
+    kani::cover!(r == Err(GrowthVerdict::LeverageExceeded), "ceil below engine refused");
+    kani::cover!(r == Err(GrowthVerdict::CapacityFull), "capacity refused");
+}
+
+// ── W-G-1 split: growth_margin_required with two legs related ONLY by proven facts ────────────
+// leg_mono: a MEMOISED ∀-value stub (same args ⇒ same value, so the harness's legs and the
+// production call's legs are the same values), constrained only by
+//   S4: n == 0 ⇒ Some(0); imr > 1e4 ⇒ None; else max(ceil(n·imr/1e4), m) >= m, and None only on
+//       overflow, which cannot happen at u16 operands (ceil contract: None ⇔ a·b overflows);
+//   LEGMONO: ceil(n·i/1e4) monotone in i (exhaustive native test
+//       legmono_ceil_bps_monotone_in_imr_all_u16, NOT a Kani verdict), and max(., m) keeps order.
+static mut LM: [(bool, u128, u64, u128, u128); 2] = [(false, 0, 0, 0, 0); 2];
+fn leg_mono(n: u128, imr: u64, m: u128) -> Option<u128> {
+    if n == 0 {
+        return Some(0);
+    }
+    if imr > MAX_IMR_BPS {
+        return None;
+    }
+    unsafe {
+        for e in LM.iter() {
+            if e.0 && e.1 == n && e.2 == imr && e.3 == m {
+                return Some(e.4);
+            }
+        }
+        let v: u128 = kani::any();
+        kani::assume(v >= m);
+        for e in LM.iter() {
+            if e.0 && e.1 == n && e.3 == m {
+                if imr >= e.2 {
+                    kani::assume(v >= e.4);
+                }
+                if imr <= e.2 {
+                    kani::assume(v <= e.4);
+                }
+            }
+        }
+        let slot = if LM[0].0 { 1 } else { 0 };
+        assert!(!LM[slot].0, "at most two distinct leg calls");
+        LM[slot] = (true, n, imr, m, v);
+        Some(v)
+    }
+}
+
+/// = kani_growth_t1_requirement_never_below_engine_or_per_asset (same bounds: u16 notional /
+/// IMRs / min; same assertions and covers) on the REAL growth_margin_required, legs by S4 + LEGMONO.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::leg_im_req, leg_mono)]
+fn kani_growth_wn_g1_requirement_never_below_engine_or_per_asset() {
+    unsafe { LM = [(false, 0, 0, 0, 0); 2] };
+    let n = kani::any::<u16>() as u128;
+    let eng = kani::any::<u16>() as u64;
+    let dy = kani::any::<u16>() as u64;
+    let m = kani::any::<u16>() as u128;
+    let cert: Option<u128> = kani::any();
+    kani::assume(eng <= 10_000 && dy <= 10_000);
+    kani::assume(dy >= eng);
+    let dyn_leg = leg_im_req(n, dy, m);
+    let eng_leg = leg_im_req(n, eng, m);
+    let r = growth_margin_required(cert, n, eng, dy, m);
+    if let Some(r) = r {
+        assert!(dyn_leg.is_some_and(|d| r >= d), "never below the per-asset (dyn) leg");
+        if let (Some(c), Some(_e)) = (cert, eng_leg) {
+            assert!(r >= c, "never below the engine certificate");
+        }
+    } else {
+        assert!(cert.is_some() && cert.unwrap().saturating_sub(eng_leg.unwrap()).checked_add(dyn_leg.unwrap()).is_none());
+    }
+    kani::cover!(cert.is_some() && dy > eng && r.is_some_and(|x| x > cert.unwrap()), "cert path, dyn above engine");
+    kani::cover!(cert.is_some_and(|c| eng_leg.is_some_and(|e| c < e)) && r.is_some(), "saturating path");
+    kani::cover!(cert.is_none() && r.is_some() && n > 0, "no cert");
+    kani::cover!(r.is_none(), "None refused (overflow)");
+}
