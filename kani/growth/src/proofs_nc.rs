@@ -481,6 +481,9 @@ fn kani_growth_t4n_overflow_fails_closed() {
     kani::cover!(gate_ok && risk().is_none() && v == GrowthVerdict::LeverageExceeded, "notional None refused");
     kani::cover!(gate_ok && risk().is_some() && unsafe { G_LEG_OTHER.is_none() && g.ceil_imr_bps != G_LEG_KEY } && v == GrowthVerdict::LeverageExceeded, "leg None refused");
     kani::cover!(gate_ok && crowd && ncap().is_some_and(|n| n > u64::MAX as u128 && l.users_oi_side_after_q <= n) && v == GrowthVerdict::Allow, "full-width admit");
+    // review 2026-10-14: asserted-path covers (inc && Allow) on the thin branch / wide notional
+    kani::cover!(gate_ok && !crowd && ncap().is_some_and(|n| n > u64::MAX as u128 && l.users_oi_side_after_q > u64::MAX as u128) && v == GrowthVerdict::Allow, "rv: full-width thin admit");
+    kani::cover!(inc && v == GrowthVerdict::Allow && risk().is_some_and(|x| x > u64::MAX as u128), "rv: full-width notional admit");
 }
 
 /// = kani_growth_t5_capacity_invariant (same assertion and covers), dyn by S5d.
@@ -503,6 +506,11 @@ fn kani_growth_t5n_capacity_invariant() {
     kani::cover!(v == GrowthVerdict::CapacityFull && ncap().is_some_and(|n| l.users_oi_side_after_q > n) && !crowd, "thin past N_cap");
     kani::cover!(v == GrowthVerdict::CapacityFull && ncap() == Some(0) && g.asset_bound, "N_cap 0 refuses");
     kani::cover!(v == GrowthVerdict::CapacityFull && ncap().is_none(), "N_cap None refuses");
+    // review 2026-10-14: covers on the ASSERTED path (v == Allow), one per gate branch
+    kani::cover!(v == GrowthVerdict::Allow && !crowd && ncap() == Some(l.users_oi_side_after_q) && l.users_oi_side_after_q > 0, "rv: thin open lands exactly on N_cap (Q3)");
+    kani::cover!(v == GrowthVerdict::Allow && crowd && ncap() == Some(l.users_oi_side_after_q) && l.users_oi_side_after_q > 0, "rv: crowd open lands exactly on N_cap");
+    kani::cover!(v == GrowthVerdict::Allow && ncap().is_some_and(|n| n > u64::MAX as u128) && l.users_oi_side_after_q > u64::MAX as u128, "rv: full-width admit");
+    kani::cover!(v == GrowthVerdict::Allow && g.taker_cert_initial_req.is_some(), "rv: admitted through the cert path");
 }
 
 /// = kani_growth_r2_r12_every_open_faces_the_bound_vault_lp (same assertions and covers).
@@ -525,6 +533,8 @@ fn kani_growth_r2n_r12_every_open_faces_the_bound_vault_lp() {
     kani::cover!(opens && !g.asset_bound, "unbound refused");
     kani::cover!(!opens && g.lp.is_none() && g.taker_after_q != g.taker_before_q, "close without LP allowed");
     kani::cover!(opens && v == GrowthVerdict::Allow, "admitted open");
+    kani::cover!(opens && v == GrowthVerdict::Allow && g.lp.is_some_and(|l| !joins_crowd(l.mid_q, l.after_q)), "rv: admitted thin open");
+    kani::cover!(opens && v == GrowthVerdict::Allow && g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q)), "rv: admitted crowd open");
     kani::cover!(opens && g.asset_bound && g.price_e6 != 0 && g.lp.is_some_and(|l| joins_crowd(l.mid_q, l.after_q) && ncap().is_some_and(|n| l.users_oi_side_after_q > n)) && !g.crowd_blocked && v == GrowthVerdict::CapacityFull, "dyn None refused");
     kani::cover!(opens && g.asset_bound && g.price_e6 == 0 && g.lp.is_some() && v == GrowthVerdict::LeverageExceeded, "price 0 refused before n_cap_q");
 }
@@ -573,7 +583,12 @@ fn admits(p: &[i128; 3], i: usize, d: i128, n: u128) -> bool {
             mid_q: lp_mid_q(lp, before, after).unwrap(),
             after_q: lp - d,
             eff_after_abs_q: (lp - d).unsigned_abs(),
+            // review 2026-10-14: the lpnet_mutant hook of the original r11 (pre-N-1 |LP| net
+            // measure), restored so the nc twin can be watched FAILING on it.
+            #[cfg(not(feature = "lpnet_mutant"))]
             users_oi_side_after_q: side_oi(&q, after > 0),
+            #[cfg(feature = "lpnet_mutant")]
+            users_oi_side_after_q: (lp - d).unsigned_abs(),
             equity: n,
         }),
         price_e6: 1,
@@ -617,6 +632,9 @@ fn kani_growth_r11n_capacity_invariant_inductive() {
     let crowd = joins_crowd(lp_mid_q(lp, p[i], q[i]).unwrap(), lp - d);
     kani::cover!(!ok && crowd && taker_risk_increasing(p[i], q[i]), "dyn -> None (crowd open past N_cap)");
     kani::cover!(ok && crowd && taker_risk_increasing(p[i], q[i]), "dyn -> Some (crowd open admitted)");
+    // review 2026-10-14: asserted-path covers for the THIN branch and a tight two-sided state
+    kani::cover!(ok && !crowd && taker_risk_increasing(p[i], q[i]) && side_oi(&q, q[i] > 0) == n && n > 0, "rv: thin open lands on N_cap");
+    kani::cover!(ok && taker_risk_increasing(p[i], q[i]) && side_oi(&q, true) == n && side_oi(&q, false) == n && n > 0, "rv: both sides full after an admitted open");
 }
 
 // ── relational shape harnesses (originals NO-VERDICT): primitives by their SHAPE contract ──
@@ -1275,4 +1293,144 @@ fn kani_growth_wn_g1_requirement_never_below_engine_or_per_asset() {
     kani::cover!(cert.is_some_and(|c| eng_leg.is_some_and(|e| c < e)) && r.is_some(), "saturating path");
     kani::cover!(cert.is_none() && r.is_some() && n > 0, "no cert");
     kani::cover!(r.is_none(), "None refused (overflow)");
+    // review 2026-10-14: tight cases of both asserted bounds
+    kani::cover!(cert.is_some() && dy == eng && n > 0 && r.is_some_and(|x| x == cert.unwrap()), "rv: equal IMRs, r == cert (cert bound tight)");
+    kani::cover!(cert.is_some() && n > 0 && r.is_some_and(|x| dyn_leg == Some(x) && x > 0), "rv: saturating, r == dyn leg (per-asset bound tight)");
+}
+
+// ── Review 2026-10-14 (growth lane): new harnesses ─────────────────────────────────────────
+
+/// F5 link (ledger v22-market-simulations F5: N_cap applies to GROSS user OI per side). The
+/// production `users_side_oi_q` (growth_v19.rs:525), fed the engine's per-side effective OI (the
+/// sum over EVERY account on that side, users and the vault LP) and the vault LP's own effective
+/// position, equals the GROSS users OI of that side -- exactly the measure `side_oi` that
+/// r11n / R11 use as their model. Before this harness no growth proof referenced
+/// `users_side_oi_q`, so a defect there (LP net, LP on the wrong side) survived every harness.
+/// Bound: i64 positions (same as r11n), 3 users + the LP.
+#[kani::proof]
+fn kani_growth_rv_f5_users_side_oi_is_gross_users_oi() {
+    let p = [kani::any::<i64>() as i128, kani::any::<i64>() as i128, kani::any::<i64>() as i128];
+    let lp = kani::any::<i64>() as i128;
+    let all = [p[0], p[1], p[2], lp];
+    let mut oi_l = 0u128;
+    let mut oi_s = 0u128;
+    for x in all.iter() {
+        if *x > 0 {
+            oi_l += x.unsigned_abs();
+        } else if *x < 0 {
+            oi_s += x.unsigned_abs();
+        }
+    }
+    let ul = users_side_oi_q(oi_l, lp, true);
+    let us = users_side_oi_q(oi_s, lp, false);
+    assert_eq!(ul, side_oi(&p, true), "long side: gross users OI");
+    assert_eq!(us, side_oi(&p, false), "short side: gross users OI");
+    let net = (p[0] + p[1] + p[2]).unsigned_abs();
+    kani::cover!(lp > 0 && ul > 0 && us > 0, "LP long, both user sides open");
+    kani::cover!(lp < 0 && ul > 0 && us > 0, "LP short, both user sides open");
+    kani::cover!(lp == 0 && ul == us && ul > 0, "balanced book: both sides still count (F5)");
+    kani::cover!(ul.max(us) != net, "gross per side differs from the users' net");
+}
+
+/// The primitive contracts (`kani_growth_c_mul_div_*`) run at u8 operands, where `a*b` NEVER
+/// overflows, so their `None <=> d == 0 || a*b overflows` branch was never exercised. The
+/// `*_shape` stubs and every overflow -> None composition step rely on it. Full u128 width here.
+#[kani::proof]
+fn kani_growth_rv_primitives_none_iff_full_width() {
+    let a: u128 = kani::any();
+    let b: u128 = kani::any();
+    let d: u128 = kani::any();
+    let ov = a.checked_mul(b).is_none();
+    let f = crate::vault_lp_v18::mul_div_floor(a, b, d);
+    let c = mul_div_ceil_u128(a, b, d);
+    assert_eq!(f.is_none(), d == 0 || ov, "floor: None iff d == 0 or overflow");
+    assert_eq!(c.is_none(), d == 0 || ov, "ceil: None iff d == 0 or overflow");
+    kani::cover!(ov && d != 0 && f.is_none() && c.is_none(), "overflow -> None (unreachable at u8)");
+    kani::cover!(!ov && d != 0 && a > u64::MAX as u128 && f.is_some() && c.is_some(), "wide, no overflow -> Some");
+    kani::cover!(d == 0 && f.is_none(), "d == 0 -> None");
+}
+
+/// The range facts the compositions C15/C16/C17/R18 and the `*_shape` stubs use, at FULL u128
+/// width (the v22 contracts prove them at u8 only + a paper width lift).
+#[kani::proof]
+fn kani_growth_rv_primitive_range_facts_full_width() {
+    let a: u128 = kani::any();
+    let b: u128 = kani::any();
+    let d: u128 = kani::any();
+    let f = crate::vault_lp_v18::mul_div_floor(a, b, d);
+    let c = mul_div_ceil_u128(a, b, d);
+    if let Some(q) = f {
+        if b <= d {
+            assert!(q <= a, "floor fact b <= d => q <= a");
+        }
+    }
+    if let Some(q) = c {
+        if b <= d {
+            assert!(q <= a, "ceil fact b <= d => q <= a");
+        }
+        if b >= d {
+            assert!(q >= a, "ceil fact b >= d => q >= a");
+        }
+    }
+    kani::cover!(f.is_some_and(|q| b < d && q < a && a > u64::MAX as u128), "floor fact, wide");
+    kani::cover!(c.is_some_and(|q| b > d && q > a && a > u64::MAX as u128), "ceil fact b > d, wide");
+    kani::cover!(c.is_some_and(|q| b == d && q == a && a > 0), "ceil b == d");
+}
+
+// ── Review 2026-10-14: division-free order lemmas (one decisive attempt for L1/L3/L4) ───────
+// L_i ⇐ (u8 primitive contract `kani_growth_c_mul_div_*`, PASS: the result satisfies the exact
+// remainder relation) ∧ the lemma below, which states the order fact over ANY quotients that
+// satisfy that relation -- multiplications of a u32 quotient by a u8 divisor only, no divider in
+// the model. L2 = L1 by commutativity of `a.checked_mul(b)` (f(a, b, d) = f(b, a, d)).
+fn rv_ceil_rel(p: u32, d: u32, q: u32) -> bool {
+    // = spec::ceil_rel on this domain (d > 0): q·d >= p and (q − 1)·d < p (q == 0 iff p == 0)
+    q.checked_mul(d).is_some_and(|x| x >= p) && (q == 0 || (q - 1) * d < p)
+}
+fn rv_floor_rel(p: u32, d: u32, q: u32) -> bool {
+    q.checked_mul(d).is_some_and(|x| x <= p && p - x < d)
+}
+
+#[kani::proof]
+fn kani_growth_rv_l1d_ceil_monotone_in_b_rel() {
+    let (a, b1, b2, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    let (q1, q2): (u32, u32) = (kani::any(), kani::any());
+    kani::assume(b1 <= b2 && d > 0 && q1 <= 65_025 && q2 <= 65_025);
+    kani::assume(rv_ceil_rel(a * b1, d, q1) && rv_ceil_rel(a * b2, d, q2));
+    assert!(q1 <= q2);
+    kani::cover!(q1 < q2, "strict");
+    kani::cover!(q1 == q2 && b1 < b2 && a > 0, "plateau");
+}
+
+#[kani::proof]
+fn kani_growth_rv_l3d_ceil_antitone_in_d_rel() {
+    let (a, b, d1, d2) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    let (q1, q2): (u32, u32) = (kani::any(), kani::any());
+    kani::assume(d1 > 0 && d1 <= d2 && q1 <= 65_025 && q2 <= 65_025);
+    kani::assume(rv_ceil_rel(a * b, d1, q1) && rv_ceil_rel(a * b, d2, q2));
+    assert!(q2 <= q1);
+    kani::cover!(q2 < q1, "strict");
+    kani::cover!(q2 == q1 && d1 < d2 && a * b > 0, "plateau");
+}
+
+#[kani::proof]
+fn kani_growth_rv_l4d_floor_monotone_in_a_rel() {
+    let (a1, a2, b, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    let (q1, q2): (u32, u32) = (kani::any(), kani::any());
+    kani::assume(a1 <= a2 && d > 0 && q1 <= 65_025 && q2 <= 65_025);
+    kani::assume(rv_floor_rel(a1 * b, d, q1) && rv_floor_rel(a2 * b, d, q2));
+    assert!(q1 <= q2);
+    kani::cover!(q1 < q2, "strict");
+    kani::cover!(q1 == q2 && a1 < a2 && b > 0, "plateau");
+}
+
+/// Negative control for the relation lemmas (must FAIL): same as L1d with the order reversed
+/// on the inputs (b1 >= b2), proving the relation model admits counterexamples.
+#[cfg(feature = "negctl")]
+#[kani::proof]
+fn kani_growth_rv_neg_l1d_reversed() {
+    let (a, b1, b2, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    let (q1, q2): (u32, u32) = (kani::any(), kani::any());
+    kani::assume(b1 >= b2 && d > 0 && q1 <= 65_025 && q2 <= 65_025);
+    kani::assume(rv_ceil_rel(a * b1, d, q1) && rv_ceil_rel(a * b2, d, q2));
+    assert!(q1 <= q2);
 }
