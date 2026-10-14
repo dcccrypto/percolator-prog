@@ -21569,6 +21569,15 @@ pub mod processor {
             DOMAIN_WITHDRAW_AUTH_BACKING => authorities.backing_bucket_authority,
             _ => return Err(PercolatorError::InvalidInstruction.into()),
         };
+        // P3-H1, extended to the domain withdrawals: when the beneficiary is this market's
+        // LP-vault registry PDA (an Earn vault's backing authority), the payout would land in a
+        // registry-owned token account that no instruction can spend from (the registry signs
+        // only for its LP mint and the pinned redemption escrow), stranding the Earn depositors'
+        // principal. Earn backing leaves only through the vault paths (77/78/101), exactly as
+        // CloseResolved (30) and ClaimResolvedPayoutTopup (46) already require.
+        if beneficiary == state::derive_lp_vault_registry(program_id, market_ai.key).0.to_bytes() {
+            return Err(PercolatorError::VaultLpUseSettleResolved.into());
+        }
         let local_authorized = live_authority_matches(&beneficiary, authority.key);
         if !local_authorized && !live_authority_matches(&cfg.marketauth, authority.key) {
             return Err(PercolatorError::Unauthorized.into());
