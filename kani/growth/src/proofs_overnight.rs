@@ -398,3 +398,64 @@ fn kani_growth_wc_g1_requirement_never_below_engine_or_per_asset_u64() {
     kani::cover!(cert.is_none() && r.is_some() && n > u32::MAX as u128, "no cert, wide notional");
     kani::cover!(r.is_none(), "None refused (overflow)");
 }
+
+// ── negative controls (`--features negctl`): each MUST FAIL under the same solver/stubs ────
+#[cfg(feature = "negctl")]
+mod neg {
+    use crate::growth_v19::*;
+
+    /// lc1 with the inequality made strict: the ceil plateau is a counterexample.
+    #[kani::proof]
+    #[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+    fn neg_lc1_strict() {
+        let a = kani::any::<u8>() as u128;
+        let b1 = kani::any::<u8>() as u128;
+        let b2 = kani::any::<u8>() as u128;
+        let d = kani::any::<u8>() as u128;
+        kani::assume(b1 < b2 && d > 0);
+        let q1 = mul_div_ceil_u128(a, b1, d).unwrap();
+        let q2 = mul_div_ceil_u128(a, b2, d).unwrap();
+        assert!(q1 < q2);
+    }
+
+    /// t7c without the fee in the rule (mmr >= r only): gap solvency must break.
+    #[kani::proof]
+    #[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+    #[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+    fn neg_t7c_rule_without_fee() {
+        let n = kani::any::<u64>() as u128;
+        let r: u16 = kani::any();
+        let f: u16 = kani::any();
+        let mmr: u16 = kani::any();
+        kani::assume(r <= 10_000 && f <= 10_000 && mmr <= 10_000 && mmr >= r);
+        let mm = mul_div_ceil_u128(n, mmr as u128, 10_000).unwrap();
+        let gap = crate::vault_lp_v18::mul_div_floor(n, r as u128, 10_000).unwrap();
+        let fee = mul_div_ceil_u128(n, f as u128, 10_000).unwrap();
+        assert!(mm >= gap + fee);
+    }
+
+    /// wc_g3 with `> base`: the below-kink branch returns exactly base.
+    #[kani::proof]
+    #[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+    fn neg_wc_g3_strict() {
+        let lp: u128 = kani::any();
+        let n: u128 = kani::any();
+        let base: u64 = kani::any();
+        let kink: u16 = kani::any();
+        if let Some(x) = dyn_imr_bps(lp, n, base, kink) {
+            assert!(x > base);
+        }
+    }
+
+    /// cz_leg_im_req's claim with a floor-style relation: ceil != floor on inexact products.
+    #[kani::proof]
+    #[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+    fn neg_leg_is_floor() {
+        let n: u128 = kani::any();
+        let imr: u64 = kani::any();
+        kani::assume(n > 0 && imr <= 10_000 && n.checked_mul(imr as u128).is_some());
+        if let Some(v) = leg_im_req(n, imr, 0) {
+            assert!(v.checked_mul(10_000).is_some_and(|x| x <= n * imr as u128));
+        }
+    }
+}
