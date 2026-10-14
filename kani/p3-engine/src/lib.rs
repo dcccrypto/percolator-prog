@@ -12,3 +12,7 @@ pub mod growth_v19;
 
 #[cfg(kani)]
 mod proofs;
+
+// v2.2 Kani overnight 2026-10-14: split replacements for the no-verdict skew-funding rows.
+#[cfg(kani)]
+mod proofs_split;
