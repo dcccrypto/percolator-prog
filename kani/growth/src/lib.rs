@@ -2,15 +2,26 @@
 //! rev 5/6). `growth_v19` / `vault_lp_v18` ARE the production files unless built with
 //! `--features growth_mutant` / `vlp_mutant`, in which case `mutants/*_mutant.rs` (one deliberate
 //! defect, written by run_mutants.py) is compiled instead so the named harness can be watched FAILING.
+//! `--features nc` (overnight 2026-10-14) compiles `nc/*.rs`: the production files minus their
+//! cfg(kani)-only contract attributes (`gen_nc.sh --check` proves that is the ONLY difference), so
+//! the structural lemmas in `proofs_nc` can `#[kani::stub]` the arithmetic primitives.
 #![cfg_attr(not(test), no_std)]
 
-#[cfg_attr(not(feature = "vlp_mutant"), path = "../../../src/vault_lp_v18.rs")]
+#[cfg_attr(all(not(feature = "vlp_mutant"), not(feature = "nc")), path = "../../../src/vault_lp_v18.rs")]
 #[cfg_attr(feature = "vlp_mutant", path = "../mutants/vault_lp_v18_mutant.rs")]
+#[cfg_attr(all(feature = "nc", not(feature = "vlp_mutant")), path = "../nc/vault_lp_v18.rs")]
 pub mod vault_lp_v18;
 
-#[cfg_attr(not(feature = "growth_mutant"), path = "../../../src/growth_v19.rs")]
+#[cfg_attr(all(not(feature = "growth_mutant"), not(feature = "nc")), path = "../../../src/growth_v19.rs")]
 #[cfg_attr(feature = "growth_mutant", path = "../mutants/growth_v19_mutant.rs")]
+#[cfg_attr(all(feature = "nc", not(feature = "growth_mutant")), path = "../nc/growth_v19.rs")]
 pub mod growth_v19;
 
-#[cfg(kani)]
+#[cfg(all(kani, not(feature = "nc")))]
 mod proofs;
+
+#[cfg(all(kani, not(feature = "nc")))]
+mod proofs_overnight;
+
+#[cfg(all(kani, feature = "nc"))]
+mod proofs_nc;
