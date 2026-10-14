@@ -831,11 +831,13 @@ fn kani_growth_r6_tag93_split_d_zero_util_refused() {
 }
 
 // ═══════════════════════════════════ NEGATIVE CONTROLS (expected FAIL) ═══════════════════════════════
+// cfg-GATED OFF after their one run (`#[cfg(any())]` = never compiled); to re-run, delete the gate.
 // Each mutates ONE relation of a replacement harness above to show it can fail. Run once each; results in
 // ~/wt-v22-kani2/reports/wrapper.md. Not release-gate harnesses.
 
 /// NC for W-C-9 split (a): the BOND-BLIND two-tranche gate (the BOND-MP5 bug class: the junior gate
 /// ignores bonds) must violate "a junior withdrawal never reaches bond value". Expected: FAIL.
+#[cfg(any())]
 #[kani::proof]
 #[kani::stub(percolator_prog::vault_lp_v18::bps_ceil, bps_ceil_memo)]
 fn negctrl_wc9_bond_blind_gate() {
@@ -856,10 +858,12 @@ fn negctrl_wc9_bond_blind_gate() {
 }
 
 /// NC for W-C-8a split (a): coupon model WITHOUT the 50% leg cap (BOND-MP8 class). Expected: FAIL.
+#[cfg(any())]
 fn bond_coupon_split_nocap(available: u128, due: u128) -> (u128, u128) {
     let c = if due < available { due } else { available };
     (c, available - c)
 }
+#[cfg(any())]
 #[kani::proof]
 #[kani::stub(percolator_prog::bond_v20::bond_coupon_split, bond_coupon_split_nocap)]
 #[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_memo)]
@@ -875,6 +879,7 @@ fn negctrl_wc8a_no_leg_cap() {
 }
 
 /// NC for R6 tag 93 split (a): a spec with lambda and kink swapped must not match encode. Expected: FAIL.
+#[cfg(any())]
 #[kani::proof]
 #[kani::unwind(56)]
 fn negctrl_tag93_swapped_layout() {
@@ -896,6 +901,7 @@ fn negctrl_tag93_swapped_layout() {
 
 /// NC for W-C-5 split (b): a CEIL-rounded mint (`m * value < amount * b + value`, i.e. rounded up allowed)
 /// must dilute incumbents somewhere. Expected: FAIL.
+#[cfg(any())]
 #[kani::proof]
 #[kani::solver(kissat)]
 fn negctrl_wc5_ceil_mint_dilutes() {
