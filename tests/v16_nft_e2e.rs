@@ -159,7 +159,7 @@ mod e2e {
         p.push("target/deploy/percolator_prog.so");
         assert!(
             p.exists(),
-            "wrapper BPF missing — run `cargo build-sbf` first: {}",
+            "wrapper BPF missing — run `cargo build-sbf --features devnet` first (the NFT tests need the devnet NFT pin): {}",
             p.display()
         );
         p

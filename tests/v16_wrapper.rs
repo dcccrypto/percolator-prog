@@ -29192,3 +29192,40 @@ fn creator_registered_nft_program_cannot_seize_a_trader_portfolio() {
          (vault {vault_before} -> {vault_after}, victim capital now {capital_after})"
     );
 }
+
+// GH#548: a registry that already names a non-pinned program (e.g. written before the pin
+// existed) must not let that program unwrap an escrowed portfolio. The signer here is the bogus
+// program's REAL ["mint_authority"] PDA (the native harness models its invoke_signed), so the
+// rejection can only come from the pin check, not from a mint-authority mismatch.
+#[test]
+fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
+    let mut creator = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut creator, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+
+    let bogus = Pubkey::new_unique();
+    assert_ne!(bogus, percolator_prog::constants::NFT_PROGRAM_ID);
+    let bogus_mint_auth = state::derive_nft_mint_authority(&bogus).0;
+    escrow_portfolio_under(&mut portfolio, &bogus_mint_auth);
+    let mut registry = nft_registry_account(&market, &bogus);
+    let mut signer_pda =
+        TestAccount::new(bogus_mint_auth, solana_program::system_program::ID, 0).signer();
+
+    let before = portfolio.data.clone();
+    let res = run_ix(
+        Instruction::UnwrapEscrowedPortfolio {
+            new_owner: Pubkey::new_unique().to_bytes(),
+        },
+        &mut [&mut signer_pda, &mut portfolio, &mut registry],
+    );
+    assert_eq!(
+        res,
+        Err(percolator_prog::error::PercolatorError::NftInvalidMintAuthority.into()),
+        "a non-pinned registry is not a trust root, even when its own PDA signs"
+    );
+    assert_eq!(portfolio.data, before, "ownership unchanged");
+}

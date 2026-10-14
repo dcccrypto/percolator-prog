@@ -676,7 +676,7 @@ mod litesvm_tests {
         p.push("target/deploy/percolator_prog.so");
         assert!(
             p.exists(),
-            "wrapper BPF missing — run `cargo build-sbf` first"
+            "wrapper BPF missing — run `cargo build-sbf --features devnet` first (the NFT tests need the devnet NFT pin)"
         );
         p
     }
@@ -954,6 +954,10 @@ mod litesvm_tests {
 
         // Re-point attempt — must now be REJECTED (set-once trust root): the NFT
         // program id is the custody trust root and is immutable after creation.
+        // Both writes name the pinned program, so the second transaction would be
+        // byte-identical to the first: expire the blockhash so it is re-signed and
+        // actually reaches SetNftProgramId instead of failing as AlreadyProcessed.
+        svm.expire_blockhash();
         let result = send(
             &mut svm,
             program_id,
@@ -970,9 +974,13 @@ mod litesvm_tests {
             ],
             &[&admin],
         );
+        let set_once_err = format!(
+            "Custom({})",
+            percolator_prog::error::PercolatorError::AlreadyInitialized as u32
+        );
         assert!(
-            result.is_err(),
-            "set-once: a second SetNftProgramId (re-point) must be rejected, got {:?}",
+            matches!(&result, Err(e) if e.contains(&set_once_err)),
+            "set-once: a second SetNftProgramId must be rejected with AlreadyInitialized ({set_once_err}), got {:?}",
             result
         );
 
