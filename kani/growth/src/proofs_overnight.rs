@@ -459,3 +459,116 @@ mod neg {
         }
     }
 }
+
+// ── T7 split (original kani_growth_t7_rule_implies_gap_solvency NO-VERDICT; t7c* NO-VERDICT) ──
+// T7 ⇐ E1 ∧ E2 ∧ T7m by substitution: E1/E2 pin the REAL primitives at the t7 operands (u8
+// notional, bps <= 1e4, divisor the constant 1e4) to exact u32 arithmetic; T7m is the inequality
+// in u32 arithmetic.
+
+/// E1: mul_div_ceil_u128(n, x, 1e4) == ceil(n·x / 1e4) computed in u32, n u8, x <= 1e4.
+#[kani::proof]
+fn kani_growth_t7e1_ceil_bps_exact_u8() {
+    let n = kani::any::<u8>() as u32;
+    let x = kani::any::<u16>() as u32;
+    kani::assume(x <= 10_000);
+    let r = mul_div_ceil_u128(n as u128, x as u128, 10_000);
+    assert_eq!(r, Some((n * x).div_ceil(10_000) as u128));
+    kani::cover!(r.is_some_and(|q| q > 0 && (n * x) % 10_000 != 0), "rounds up");
+    kani::cover!(r.is_some_and(|q| q > 0 && (n * x) % 10_000 == 0), "exact");
+}
+
+/// E2: mul_div_floor(n, x, 1e4) == floor(n·x / 1e4) computed in u32, n u8, x <= 1e4.
+#[kani::proof]
+fn kani_growth_t7e2_floor_bps_exact_u8() {
+    let n = kani::any::<u8>() as u32;
+    let x = kani::any::<u16>() as u32;
+    kani::assume(x <= 10_000);
+    let r = crate::vault_lp_v18::mul_div_floor(n as u128, x as u128, 10_000);
+    assert_eq!(r, Some(((n * x) / 10_000) as u128));
+    kani::cover!(r.is_some_and(|q| q > 0 && (n * x) % 10_000 != 0), "rounds down");
+}
+
+/// T7m: mmr >= r + f ⇒ ceil(n·mmr/1e4) >= floor(n·r/1e4) + ceil(n·f/1e4), u32 arithmetic,
+/// n u8, bps <= 1e4 (the original t7 domain).
+#[kani::proof]
+fn kani_growth_t7m_gap_solvency_math_u8() {
+    let n = kani::any::<u8>() as u32;
+    let r = kani::any::<u16>() as u32;
+    let f = kani::any::<u16>() as u32;
+    let mmr = kani::any::<u16>() as u32;
+    kani::assume(r <= 10_000 && f <= 10_000 && mmr <= 10_000 && mmr >= r + f);
+    let mm = (n * mmr).div_ceil(10_000);
+    let gap = (n * r) / 10_000;
+    let fee = (n * f).div_ceil(10_000);
+    assert!(mm >= gap + fee);
+    kani::cover!(mm == gap + fee && n > 0 && r > 0 && f > 0, "tight");
+    kani::cover!(mm > gap + fee, "slack");
+}
+
+// ── L1–L4 split (originals NO-VERDICT; lc* NO-VERDICT): L_i ⇐ EL ∧ L_i m by substitution ─────
+// EL1/EL2: the REAL primitives equal exact u32 arithmetic on the original u8 domain (one 128-bit
+// divider each, as in kani_growth_c_mul_div_*). L1m–L4m: the order facts in u32 arithmetic.
+
+/// EL1: mul_div_ceil_u128(a, b, d) == ceil(a·b/d) in u32, every u8 a, b, d > 0.
+#[kani::proof]
+fn kani_growth_el1_ceil_exact_u8() {
+    let a = kani::any::<u8>() as u32;
+    let b = kani::any::<u8>() as u32;
+    let d = kani::any::<u8>() as u32;
+    kani::assume(d > 0);
+    let r = mul_div_ceil_u128(a as u128, b as u128, d as u128);
+    assert_eq!(r, Some((a * b).div_ceil(d) as u128));
+    kani::cover!(r.is_some_and(|q| q > 0 && (a * b) % d != 0), "rounds up");
+}
+
+/// EL2: mul_div_floor(a, b, d) == floor(a·b/d) in u32, every u8 a, b, d > 0.
+#[kani::proof]
+fn kani_growth_el2_floor_exact_u8() {
+    let a = kani::any::<u8>() as u32;
+    let b = kani::any::<u8>() as u32;
+    let d = kani::any::<u8>() as u32;
+    kani::assume(d > 0);
+    let r = crate::vault_lp_v18::mul_div_floor(a as u128, b as u128, d as u128);
+    assert_eq!(r, Some(((a * b) / d) as u128));
+    kani::cover!(r.is_some_and(|q| q > 0 && (a * b) % d != 0), "rounds down");
+}
+
+fn c32(a: u32, b: u32, d: u32) -> u32 {
+    (a * b).div_ceil(d)
+}
+
+#[kani::proof]
+fn kani_growth_l1m_ceil_monotone_in_b_u8() {
+    let (a, b1, b2, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    kani::assume(b1 <= b2 && d > 0);
+    assert!(c32(a, b1, d) <= c32(a, b2, d));
+    kani::cover!(c32(a, b1, d) < c32(a, b2, d), "strict");
+    kani::cover!(c32(a, b1, d) == c32(a, b2, d) && b1 < b2 && a > 0, "plateau");
+}
+
+#[kani::proof]
+fn kani_growth_l2m_ceil_monotone_in_a_u8() {
+    let (a1, a2, b, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    kani::assume(a1 <= a2 && d > 0);
+    assert!(c32(a1, b, d) <= c32(a2, b, d));
+    kani::cover!(c32(a1, b, d) < c32(a2, b, d), "strict");
+    kani::cover!(c32(a1, b, d) == c32(a2, b, d) && a1 < a2 && b > 0, "plateau");
+}
+
+#[kani::proof]
+fn kani_growth_l3m_ceil_antitone_in_d_u8() {
+    let (a, b, d1, d2) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    kani::assume(d1 > 0 && d1 <= d2);
+    assert!(c32(a, b, d2) <= c32(a, b, d1));
+    kani::cover!(c32(a, b, d2) < c32(a, b, d1), "strict");
+    kani::cover!(c32(a, b, d2) == c32(a, b, d1) && d1 < d2 && a * b > 0, "plateau");
+}
+
+#[kani::proof]
+fn kani_growth_l4m_floor_monotone_in_a_u8() {
+    let (a1, a2, b, d) = (kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32, kani::any::<u8>() as u32);
+    kani::assume(a1 <= a2 && d > 0);
+    assert!(a1 * b / d <= a2 * b / d);
+    kani::cover!(a1 * b / d < a2 * b / d, "strict");
+    kani::cover!(a1 * b / d == a2 * b / d && a1 < a2 && b > 0, "plateau");
+}
