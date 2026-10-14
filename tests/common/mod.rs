@@ -42,8 +42,11 @@ use std::path::PathBuf;
 /// stake allowlists fail-closed to this key.
 pub const PERCOLATOR_MAINNET: Pubkey = pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
 
-/// NFT program id (derived from `percolator_nft-keypair.json`).
-pub const NFT_PROGRAM_ID: Pubkey = pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45SVFRmKYU");
+/// NFT program id. MUST be the wrapper's pinned `constants::NFT_PROGRAM_ID` (GH#548):
+/// tags 72/73/82 and NFT-holder auth only trust that program. percolator-nft has no
+/// `declare_id!` and runs at whatever address it is mounted, so the harness mounts it at
+/// the pin. Was `2kYRqex…` (the local `percolator_nft-keypair.json`).
+pub const NFT_PROGRAM_ID: Pubkey = percolator_prog::constants::NFT_PROGRAM_ID;
 
 /// Stake program id. MUST equal the wrapper's pinned
 /// `constants::STAKE_PROGRAM_ID` — tag 87 (`WithdrawInsuranceReserveToStake`)

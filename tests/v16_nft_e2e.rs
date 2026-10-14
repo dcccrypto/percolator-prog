@@ -120,8 +120,9 @@ mod e2e {
     // verify_portfolio_program allowlist only accepts these two keys.
     const PERCOLATOR_MAINNET: Pubkey = pubkey!("ESa89R5Es3rJ5mnwGybVRG1GrNt9etP11Z5V2QWD4edv");
 
-    // NFT program ID derived from ../percolator-nft/target/deploy/percolator_nft-keypair.json
-    const NFT_PROGRAM_ID: Pubkey = pubkey!("2kYRqexMf5JnwTK15Vj8qxQX3qkBDzBZvH45SVFRmKYU");
+    // The wrapper's pinned NFT program (GH#548): tags 72/73/82 only trust this id, and
+    // percolator-nft runs at whatever address it is mounted.
+    const NFT_PROGRAM_ID: Pubkey = percolator_prog::constants::NFT_PROGRAM_ID;
 
     // Token-2022 program ID (loaded via with_spl_programs()).
     const TOKEN_2022: Pubkey = pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");

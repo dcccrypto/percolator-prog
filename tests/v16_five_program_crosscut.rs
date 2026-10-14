@@ -1663,7 +1663,7 @@ impl CrosscutEnv {
         self.set_nft_program_id(NFT_PROGRAM_ID)
     }
 
-    /// SetNftProgramId with an arbitrary id (for X7's wrong-id negative).
+    /// SetNftProgramId (the wrapper only accepts its pinned NFT program, GH#548).
     fn set_nft_program_id(&mut self, nft_program_id: Pubkey) -> Pubkey {
         let (registry, _) = nft_registry_pda(&self.market);
         let admin = self.admin.insecure_clone();
@@ -2522,14 +2522,51 @@ fn x8_matcher_delegate_scoped_per_maker_rejects_mismatch() {
 fn x7_registry_wrong_nft_program_id_rejects() {
     let mut env = CrosscutEnv::new();
 
-    // (1) Registry PDA derives byte-identically on both sides (pre-condition check).
+    // (1) GH#548: SetNftProgramId itself now refuses any program other than the pinned one,
+    //     so marketauth (the permissionless market creator) cannot register a bogus program.
     let bogus = Pubkey::new_unique();
-    let registry = env.set_nft_program_id(bogus);
-    assert_eq!(
-        registry,
-        nft_registry_pda(&env.market).0,
-        "registry PDA derives byte-identically (wrapper == NFT side)"
+    let (registry, registry_bump) = nft_registry_pda(&env.market);
+    let admin = env.admin.insecure_clone();
+    let refused = env.try_wrapper(
+        ProgInstruction::SetNftProgramId {
+            nft_program_id: bogus.to_bytes(),
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(registry, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+        ],
+        &[&admin],
     );
+    assert!(refused.is_err(), "SetNftProgramId must refuse an unpinned NFT program: {refused:?}");
+
+    // (2) A registry that ALREADY names a bogus program (e.g. written before the pin existed)
+    //     must not be a trust root either. Plant one exactly as SetNftProgramId writes it.
+    let mut reg_data = vec![0u8; percolator_prog::state::nft_registry_account_len()];
+    percolator_prog::state::init_nft_registry(
+        &mut reg_data,
+        &percolator_prog::state::NftRegistryV16 {
+            market_group: env.market.to_bytes(),
+            nft_program_id: bogus.to_bytes(),
+            version: percolator_prog::constants::NFT_REGISTRY_VERSION,
+            bump: registry_bump,
+            _padding: [0u8; 6],
+        },
+    )
+    .unwrap();
+    env.svm
+        .set_account(
+            registry,
+            Account {
+                lamports: 10_000_000_000,
+                data: reg_data,
+                owner: PERCOLATOR_MAINNET,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
 
     // Build a minimal portfolio with owner = NFT program's real mint_auth PDA
     // (the escrow state that UnwrapEscrowedPortfolio expects as a precondition).
