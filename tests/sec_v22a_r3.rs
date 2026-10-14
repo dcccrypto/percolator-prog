@@ -3589,18 +3589,21 @@ fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     r.trade(&bk, bp, qb).expect("levered long");
     r.request_76(&h, h_ata, None).expect("H 76");
     walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    // v2.2 F1: the gate is exercised in the state a REFRESH-ONLY crank leaves (Live, deficit pending);
-    // a full-budget crank now continues into the liquidation that declares Recovery (see
-    // `a5_explore_real_chunked_bankruptcy`). That state stays reachable (a tight keeper transaction),
-    // so the 118 gate must still hold there.
-    crank_refresh_only(&mut r, bp);
+    // v2.2 F1: the bust's crank now refreshes AND takes the liquidation step (equity <= 0 always
+    // continues), whose residual exceeds a single step: the market goes Live -> Recovery in this crank.
+    // The Live-with-pending-deficit window this test used to probe no longer exists for a tag-5 crank;
+    // the property under test is unchanged: with the loss unabsorbed (now in Recovery) the
+    // redeemer-signed exit is refused 118 and nothing moves.
+    r.crank_pf(bp);
     eprintln!("A5 real: {}", r.loss_snapshot());
     let (_, g) = r.env.market_state();
-    assert!(g.negative_pnl_account_count > 0, "non-vacuity: an unabsorbed deficit is pending");
+    assert_eq!(format!("{:?}", g.mode), "Recovery", "F1: the bust's crank declared Recovery");
     assert!(!r.no_genuine_loss_now());
     let before = r.exit_state(&h.pubkey());
     let res = r.execute_77(&h, None, true);
-    assert_eq!(code(&res), Some(ERR_NOT_LOSS_CURRENT), "A5 real: {res:?}");
+    // v2.2 F1: in Recovery the exit is refused one gate earlier, by the engine lock (21
+    // EngineLockActive), not by the loss-current gate (118): no exit of any kind, so no dip fallback.
+    assert_eq!(code(&res), Some(21), "A5 real: {res:?}");
     assert_eq!(r.exit_state(&h.pubkey()), before);
 }
 
@@ -3881,17 +3884,19 @@ fn a6_liquidating_refreshes_cu(legs: &[u16]) -> u64 {
         tr.push(p);
     }
     let lp = r.lp;
-    walk_only(&mut r, 850_000, &[lp]);
+    // v2.2 F1: cross maintenance with a DUST shortfall (see `walk_to_dust_crossing`): the refreshes stay
+    // refresh-only, so the 77's inline refreshes still meet a current, liquidatable certificate.
+    walk_to_dust_crossing(&mut r, &tr, lp);
     r.request_76(&h, h_ata, Some((1, 1))).expect("H 76 keeper_ok");
     r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
     crank_all(&mut r);
     // one plain refresh each first: with a CURRENT certificate the engine plan selects Liquidate for the
     // inline refresh of the 77 (with a stale one it only refreshes)
-    // v2.2 F1: refresh ONLY (a tight-compute keeper refresh): a full-budget crank would now liquidate
-    // here, in the setup, and leave nothing for the 77's inline refreshes to liquidate (the CU worst
-    // case this test measures). The tag-77 prelude itself has no follow-on (unchanged by F1).
+    // v2.2 F1: a dust shortfall does not continue into liquidation; one that grew material during the
+    // cooldown is liquidated here by its refresh (measured: one cap-leg trader). The test needs at least
+    // one INLINE liquidation in the 77 (asserted below). The tag-77 prelude itself has no follow-on.
     for p in &tr {
-        crank_refresh_only(&mut r, *p);
+        r.crank_pf(*p);
     }
     // a liquidation may be partial (the leg count need not drop): total absolute position must shrink
     let count = |r: &Replay, p: Pubkey| r.env.portfolio_state(p).legs.iter().map(|l| l.basis_pos_q.unsigned_abs()).sum::<u128>();
@@ -3923,44 +3928,43 @@ fn a6_liquidating_mix_of_cap_and_single_leg_refreshes_cu() {
     eprintln!("A6-LIQ 2 x cap + 3 x 1-leg: {cu} CU");
 }
 
-/// v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): a plain refresh crank of `p` that does NOT
-/// continue into liquidation. Since F1 a refresh that leaves an account materially below maintenance
-/// liquidates in the same instruction when >= `F1_FOLLOW_ON_MIN_CU` compute is left; a keeper refresh
-/// in a tight transaction still refreshes only, which is the state these tests need (a current,
-/// liquidatable certificate). The compute limit is stepped up 50k at a time from 150k: a starved
-/// attempt fails WITHOUT a program code and rolls back, so the first landing limit leaves at most
-/// ~50k + the post-step tail at the follow-on gate (< 520k): refresh only, by construction.
-fn crank_refresh_only(r: &mut Replay, p: Pubkey) {
-    let payer = r.env.payer.pubkey();
-    let ix = solana_sdk::instruction::Instruction {
-        program_id: r.env.program_id,
-        accounts: vec![AccountMeta::new(payer, true), AccountMeta::new(r.env.market, false), AccountMeta::new(p, false)],
-        data: ProgInstruction::PermissionlessCrank {
-            now_slot: 0,
-            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+/// v2.2 F1 (ledger v22-f1-refresh-liquidation-2026-10-14): walk asset 0 down until some trader is
+/// first certified below maintenance, crossing in 0.2 bp steps at the end so the shortfall is DUST
+/// (< 0.5% of the requirement): the tag-5 refresh then does NOT continue into liquidation and the
+/// certificate stays current and liquidatable (the precondition A6 needs; since F1 a material
+/// shortfall is liquidated by the refresh itself). Coarse steps use each trader's own certificate:
+/// a price fall of d (fraction) on asset-0 notional N moves equity by -N d and the requirement by
+/// -mmr N d, so it crosses at d* = (E - R) / (N (1 - mmr)); steps stay at half of d*. Panics if the
+/// setup ever liquidates (positions are checked after every refresh).
+fn walk_to_dust_crossing(r: &mut Replay, tr: &[Pubkey], lp: Pubkey) {
+    let mmr = r.lm.params.maintenance_margin_bps as f64 / 10_000.0;
+    let total = |r: &Replay, p: Pubkey| r.env.portfolio_state(p).legs.iter().map(|l| l.basis_pos_q.unsigned_abs()).sum::<u128>();
+    let pos0: Vec<u128> = tr.iter().map(|p| total(r, *p)).collect();
+    for _ in 0..2_000 {
+        for p in tr {
+            r.crank_pf(*p);
         }
-        .encode(),
-    };
-    let mut limit: u32 = 150_000;
-    loop {
-        r.env.svm.expire_blockhash();
-        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
-            &[heap_ix(), solana_sdk::compute_budget::ComputeBudgetInstruction::set_compute_unit_limit(limit), ix.clone()],
-            Some(&payer),
-            &[&r.env.payer],
-            r.env.svm.latest_blockhash(),
-        );
-        match r.env.svm.send_transaction(tx) {
-            Ok(_) => return,
-            Err(e) => {
-                let s = format!("{:?}", e.err);
-                if s.contains("Custom(22)") {
-                    return;
-                }
-                assert!(!s.contains("Custom("), "refresh refused: {s}");
-                limit += 50_000;
-                assert!(limit <= 1_400_000, "refresh does not fit a transaction: {s}");
+        for (p, b) in tr.iter().zip(pos0.iter()) {
+            assert_eq!(total(r, *p), *b, "setup liquidated {p} (shortfall was not dust)");
+        }
+        if tr.iter().any(|p| r.env.portfolio_state(*p).health_cert.certified_liq_deficit != 0) {
+            return;
+        }
+        let eff = r.env.market_state().1.assets[0].effective_price;
+        let mut d_star = f64::MAX;
+        for p in tr {
+            let st = r.env.portfolio_state(*p);
+            let q0 = st.legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| l.basis_pos_q.unsigned_abs()).unwrap_or(0);
+            let n0 = q0 as f64 * eff as f64 / percolator::POS_SCALE as f64;
+            let c = st.health_cert;
+            let head = c.certified_equity as f64 - c.certified_maintenance_req as f64;
+            if n0 > 0.0 {
+                d_star = d_star.min(head / (n0 * (1.0 - mmr)));
             }
         }
+        let step = (d_star * 0.5).clamp(0.000_02, 0.02);
+        let target = ((eff as f64) * (1.0 - step)).floor() as u64;
+        walk_only(r, target.min(eff - 1), &[lp]);
     }
+    panic!("walk_to_dust_crossing did not cross");
 }

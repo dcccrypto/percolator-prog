@@ -29208,20 +29208,6 @@ pub mod processor {
         cranker_in_tail: bool,
     }
 
-    /// Compute units left in this instruction (host builds: unbounded, so native tests exercise
-    /// the same decision as BPF with ample compute).
-    #[inline(always)]
-    fn f1_remaining_cu() -> u64 {
-        #[cfg(target_os = "solana")]
-        {
-            solana_program::compute_units::sol_remaining_compute_units()
-        }
-        #[cfg(not(target_os = "solana"))]
-        {
-            u64::MAX
-        }
-    }
-
     /// v2.2 F1: gather the decision inputs (read-only) after the first step and ask the kernel.
     #[inline(never)]
     fn f1_follow_on_wanted(
@@ -29232,10 +29218,6 @@ pub mod processor {
         now_slot: u64,
     ) -> Result<bool, ProgramError> {
         let _ = program_id;
-        let remaining_cu = f1_remaining_cu();
-        if remaining_cu < crate::f1_refresh_liq_v22::F1_FOLLOW_ON_MIN_CU {
-            return Ok(false);
-        }
         let authenticated_now_slot = authenticated_slot_or_fallback(now_slot);
         let mut market_data = market_ai.try_borrow_mut_data()?;
         let (_cfg, group) = state::market_view_mut(&mut market_data)?;
@@ -29302,7 +29284,6 @@ pub mod processor {
             band_on,
             vault_lp,
             legs_reducible,
-            remaining_cu,
         };
         Ok(crate::f1_refresh_liq_v22::follow_on_liquidation(&inputs))
     }

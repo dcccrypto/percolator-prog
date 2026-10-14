@@ -3293,30 +3293,6 @@ fn v22_f1_two_crank_shape_is_the_follow_on_byte_for_byte() {
     assert!(!f1_hlock(&patched));
 }
 
-/// The legacy second-crank path still works when the follow-on does not run: a refresh whose
-/// instruction has less than `F1_FOLLOW_ON_MIN_CU` left refreshes ONLY (the transaction lands,
-/// no compute failure), and a separate crank of T in the same slot liquidates (the engine
-/// selects `Liquidate` from the current certificate, as before).
-#[test]
-fn v22_f1_compute_gate_skips_the_follow_on_and_the_second_crank_still_liquidates() {
-    let (mut env, lp, long) = f1_to_crossing(None);
-    let pos0 = env.pos(long.1);
-    let ixs = vec![f1_crank_ix(&env, lp.account, true), f1_crank_ix(&env, long.1, false)];
-    // Enough for the observation crank and the refresh (~272k), not enough to leave the gate's
-    // reserve after them.
-    let limit = 272_000 + percolator_prog::f1_refresh_liq_v22::F1_FOLLOW_ON_MIN_CU as u32 - 50_000;
-    let cu = f1_send(&mut env, &ixs, limit).expect("refresh lands under the compute gate");
-    assert_eq!(env.pos(long.1), pos0, "follow-on must be skipped with too little compute left");
-    let (eq, mm, def) = f1_cert(&env, long.1);
-    assert!(def != 0 && (eq < 0 || (eq as u128) < mm), "certified below maintenance by the refresh");
-    let ix = f1_crank_ix(&env, long.1, false);
-    let cu2 = f1_send(&mut env, &[ix], 1_400_000).expect("second crank, same slot, liquidates");
-    assert!(env.pos(long.1).unsigned_abs() < pos0.unsigned_abs(), "second crank liquidates");
-    let (_, _, def) = f1_cert(&env, long.1);
-    assert_eq!(def, 0, "maintenance restored");
-    println!("F1GATE refresh-only tx {cu} CU (limit {limit}), second crank {cu2} CU");
-}
-
 /// Compute + liveness: the deployed sweep's batched shape `[observation crank, refresh x8]`
 /// (keeper `sweep.ts`: weight budget 32, a single-leg refresh weighs 4), all eight longs
 /// crossing maintenance together and the price falling on for 80 more slots, so they re-cross

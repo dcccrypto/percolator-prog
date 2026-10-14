@@ -20,14 +20,14 @@
 //! observations (exactly the second instruction of the two-crank shape), which the engine's own
 //! plan selector turns into its existing `Liquidate` step with its existing partial sizing.
 
-/// Compute that must be left in the instruction before the follow-on is attempted. If less
-/// remains, the refresh lands alone and a later crank liquidates; the follow-on never turns a
-/// landing refresh into a compute failure of its own instruction. Measured worst case of the
-/// follow-on at the wrapper leg cap (4 legs, pending K + F + maintenance fee on every leg):
-/// 369,633 CU (crank 1,098,281 with it vs 728,648 without, `tests/v16_cu.rs` x1 worst shape).
-/// 520,000 = that + the repo's 10% rule (140,000: no crank above 1,260,000 of the 1.4M budget)
-/// + margin, so a refresh crank with its follow-on stays inside the 10% rule.
-pub const F1_FOLLOW_ON_MIN_CU: u64 = 520_000;
+/// Compute. No run-time compute gate: the `sol_remaining_compute_units` syscall is NOT active on
+/// devnet (feature 5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP inactive; a build that called it
+/// failed every follow-on crank with "unsupported BPF instruction" on a devnet clone). The bound is
+/// static instead: the follow-on is ONE engine liquidation step, measured at most 369,633 CU at the
+/// wrapper leg cap (4 legs, worst pending K + F + fee), so a refresh crank with its follow-on is at
+/// most 1,098,281 CU (+66k stranded-backing hook = 1.164M), inside the repo's 10% rule (1,260,000 of
+/// 1.4M). A batched keeper transaction that overruns fails with no program code and is shrunk by the
+/// keeper's simulate-first rule (`sweep.ts`); nothing lands partially.
 
 /// Minimum progress (hysteresis): below maintenance, the follow-on runs only when the shortfall
 /// `requirement - equity` is at least this many bps OF THE REQUIREMENT (or equity is <= 0). An
@@ -93,8 +93,6 @@ pub struct F1Inputs {
     /// and no pending domain-loss barrier sits on either side of its asset (the engine's
     /// liquidation would refuse otherwise, which would fail the whole instruction).
     pub legs_reducible: bool,
-    /// Compute units left in the instruction.
-    pub remaining_cu: u64,
 }
 
 /// Strictly below maintenance: `equity < maintenance_req`, compared without overflow.
@@ -133,7 +131,6 @@ pub fn follow_on_eligible(i: &F1Inputs) -> bool {
         && !i.band_on
         && !i.vault_lp
         && i.legs_reducible
-        && i.remaining_cu >= F1_FOLLOW_ON_MIN_CU
 }
 
 /// The decision: one liquidation step iff the account is eligible, the engine classifies it
@@ -189,7 +186,7 @@ mod f1_kani_proofs {
     }
 
     /// Always attempt when below maintenance and eligible (liveness of the fix), and only then.
-    /// Mutants: an extra veto; `steps_taken <= 1`; CU threshold inverted.
+    /// Mutants: an extra veto; `steps_taken <= 1`; drop the legs-reducible veto.
     #[kani::proof]
     fn kani_f1_always_when_below_and_eligible() {
         let i: F1Inputs = kani::any();
@@ -200,14 +197,14 @@ mod f1_kani_proofs {
         if follow_on_liquidation(&i) {
             assert!(i.live && i.first_step_certified_refresh && !i.band_on && !i.vault_lp);
             assert!(!i.b_stale && !i.pending_close && !i.expired_close && !i.recovery_eligible && !i.resolved_winner);
-            assert!(i.remaining_cu >= F1_FOLLOW_ON_MIN_CU && i.legs_reducible && i.steps_taken == 0);
+            assert!(i.legs_reducible && i.steps_taken == 0);
         }
         kani::cover!(want, "below and eligible: attempted");
         kani::cover!(below && i.engine_liquidatable && i.certified_liq_deficit != 0 && !follow_on_eligible(&i),
             "below but ineligible: not attempted");
         kani::cover!(below && follow_on_eligible(&i) && !i.engine_liquidatable, "engine disagrees: not attempted");
         kani::cover!(i.band_on && below && i.engine_liquidatable, "band market: never");
-        kani::cover!(i.remaining_cu == F1_FOLLOW_ON_MIN_CU - 1 && !follow_on_eligible(&i), "one CU short: skipped");
+        kani::cover!(!i.legs_reducible && below && i.engine_liquidatable && i.certified_liq_deficit != 0, "a leg not reducible: never");
         kani::cover!(follow_on_eligible(&i) && i.engine_liquidatable && i.certified_liq_deficit != 0
             && below_maintenance(i.certified_equity, i.certified_maintenance_req)
             && !shortfall_material(i.certified_equity, i.certified_maintenance_req), "dust shortfall: skipped");
