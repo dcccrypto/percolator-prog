@@ -66,6 +66,8 @@ thread_local! {
     static INIT_PRICE: std::cell::Cell<u64> = const { std::cell::Cell::new(PRICE) };
     /// G8 tests: the growth block's `l_launch` of the next `Env::new` on this thread.
     static L_LAUNCH: std::cell::Cell<u16> = const { std::cell::Cell::new(1_000) };
+    /// v2.2 F1 tests: `max_abs_funding_e9_per_slot` of the next `Env::new` on this thread.
+    static FUNDING_E9: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
 #[allow(dead_code)]
@@ -82,7 +84,16 @@ fn code(e: PercolatorError) -> String {
     format!("Custom({})", e as u32)
 }
 
+thread_local! {
+    /// v2.2 F1 differential tests: the wrapper binary of the next `Env::new` on this thread
+    /// (None = the usual `GROWTH_WRAPPER_SO` / `target/deploy` choice).
+    static PROG_SO: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
+
 fn program_path() -> PathBuf {
+    if let Some(p) = PROG_SO.with(|p| p.borrow().clone()) {
+        return p;
+    }
     if let Some(p) = std::env::var_os("GROWTH_WRAPPER_SO") {
         return PathBuf::from(p);
     }
@@ -229,7 +240,7 @@ fn init_market_ix(c: &Cfg) -> ProgInstruction {
         min_liquidation_abs: 0,
         max_price_move_bps_per_slot: 4,
         max_accrual_dt_slots: 1,
-        max_abs_funding_e9_per_slot: 1,
+        max_abs_funding_e9_per_slot: FUNDING_E9.with(|f| f.get()),
         min_funding_lifetime_slots: 1,
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
@@ -2847,4 +2858,720 @@ fn g8_wl2_two_same_slot_pushes_are_one_sample() {
     assert_eq!((g.depth_e6, g.depth_prev_e6), (600 * USD as u64, 400 * USD as u64));
     env.settle_rent(lp.account, lp.account).expect("tag 106");
     assert_eq!(env.growth().rent_n_cap_q, 200 * Q as u64, "two slots: min $400 at κ 0.5 -> 200 units");
+}
+
+// ---------------------------------------------------------------------------
+// v2.2 F1 (2026-10-14): a permissionless refresh that leaves an account below maintenance
+// continues into ONE liquidation step in the same instruction (ledger
+// `v22-f1-refresh-liquidation-2026-10-14.md`). Negative controls run the DEPLOYED bytes
+// (`F1_BASE_SO`, wrapper 8dbcd47a = sha bebb5237...) through the same transactions.
+// ---------------------------------------------------------------------------
+
+/// The deployed wrapper for the differential / negative-control tests. Those tests are
+/// `#[ignore]`d in the default suite (the path is machine-local) and are run explicitly with
+/// `F1_BASE_SO=<deployed .so> cargo test ... -- --ignored v22_f1_`; a missing path is a FAILURE,
+/// never a pass.
+fn f1_base_so() -> PathBuf {
+    let p = PathBuf::from(std::env::var_os("F1_BASE_SO").expect("F1_BASE_SO (the deployed wrapper .so) must be set"));
+    assert!(p.exists(), "F1_BASE_SO {p:?} does not exist");
+    p
+}
+
+fn f1_env(so: Option<PathBuf>, cfg: Cfg) -> Env {
+    PROG_SO.with(|p| *p.borrow_mut() = so);
+    let env = Env::new(cfg);
+    PROG_SO.with(|p| *p.borrow_mut() = None);
+    env
+}
+
+/// An off-band v2.2 market (phase-4 block, band off, no rent): the deployed SOL/JUP/... shape.
+fn f1_off_band_cfg() -> Cfg {
+    Cfg { slots: 1, phase4: Some(phase4(0, 0)), r_gap: 400 }
+}
+
+fn f1_crank_ix(env: &Env, portfolio: Pubkey, observe: bool) -> Instruction {
+    Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        data: ProgInstruction::PermissionlessCrank {
+            now_slot: env.slot,
+            observations: if observe { vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] } else { vec![] },
+        }
+        .encode(),
+    }
+}
+
+/// One transaction of crank instructions (after the heap + CU-limit budget instructions, so the
+/// first crank is instruction 2).
+fn f1_send(env: &mut Env, ixs: &[Instruction], cu_limit: u32) -> Result<u64, String> {
+    env.svm.expire_blockhash();
+    let mut all = vec![
+        ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+        ComputeBudgetInstruction::set_compute_unit_limit(cu_limit),
+    ];
+    all.extend_from_slice(ixs);
+    let tx = Transaction::new_signed_with_payer(&all, Some(&env.payer.pubkey()), &[&env.payer], env.svm.latest_blockhash());
+    match env.svm.send_transaction(tx) {
+        Ok(m) => {
+            LAST_LOGS.with(|l| *l.borrow_mut() = m.logs.clone());
+            Ok(m.compute_units_consumed)
+        }
+        Err(e) => {
+            LAST_LOGS.with(|l| *l.borrow_mut() = e.meta.logs.clone());
+            Err(format!("{:?}", e.err))
+        }
+    }
+}
+
+fn f1_hlock(env: &Env) -> bool {
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, g) = state::market_view_mut(&mut data).unwrap();
+    g.header.bankruptcy_hlock_active != 0
+}
+
+fn f1_insurance(env: &Env) -> u128 {
+    env.engine_header().2
+}
+
+/// (certified equity, certified maintenance requirement, certified deficit) of `p`.
+fn f1_cert(env: &Env, p: Pubkey) -> (i128, u128, u128) {
+    let c = env.portfolio_state(p).health_cert;
+    (c.certified_equity, c.certified_maintenance_req, c.certified_liq_deficit)
+}
+
+/// Margin (equity / notional at the effective price) in bps, from the account's certificate.
+fn f1_margin_bps(env: &Env, p: Pubkey) -> i128 {
+    let pos = env.pos(p).unsigned_abs();
+    let eff = env.engine_asset().effective_price as u128;
+    let notional = pos * eff / POS_SCALE;
+    if notional == 0 {
+        return i128::MAX;
+    }
+    f1_cert(env, p).0 * 10_000 / notional as i128
+}
+
+/// Advance one slot and push the mark `step_bps` below the current effective price (inside the
+/// 4 bps/slot clamp, so the effective price follows with no target lag: liquidation is driven
+/// by price, not by the lag penalty).
+fn f1_step_price(env: &mut Env, step_bps: u64) {
+    env.warp(1);
+    let eff = env.engine_asset().effective_price;
+    env.push(eff * (10_000 - step_bps) / 10_000);
+}
+
+/// The deployed v2.2 sweep's transaction for one round (`cross-cluster/v22/sweep.ts`:
+/// `[observation crank, refresh xN]`): the observation crank goes through the vault LP (the
+/// accrue target) and every trader gets ONE plain refresh crank. A refresh refused NonProgress
+/// (Custom 22) at a known index is pruned and the rest re-sent, as the keeper does.
+fn f1_sweep(env: &mut Env, lp: Pubkey, traders: &[Pubkey]) -> Result<u64, String> {
+    f1_sweep_counted(env, lp, traders).map(|(cu, _)| cu)
+}
+
+/// `f1_sweep`, also returning how many refreshes the keeper's no-code rule DEFERRED: a failure
+/// without a program code (compute exhaustion) cuts the tail by ceil(n/4), at most 3 times
+/// (`sweep.ts` shrink); the cut refreshes wait for the next round.
+fn f1_sweep_counted(env: &mut Env, lp: Pubkey, traders: &[Pubkey]) -> Result<(u64, usize), String> {
+    let mut targets: Vec<Pubkey> = traders.to_vec();
+    let mut shrinks = 0;
+    let mut deferred = 0usize;
+    loop {
+        let mut ixs = vec![f1_crank_ix(env, lp, true)];
+        ixs.extend(targets.iter().map(|t| f1_crank_ix(env, *t, false)));
+        match f1_send(env, &ixs, 1_400_000) {
+            Ok(cu) => return Ok((cu, deferred)),
+            Err(e) => {
+                let pruned = (0..targets.len()).find(|i| e.contains(&format!("InstructionError({}, Custom(22))", i + 3)));
+                let no_code = !e.contains("Custom(");
+                match pruned {
+                    Some(i) => {
+                        targets.remove(i);
+                    }
+                    None if no_code && targets.len() > 1 && shrinks < 3 => {
+                        shrinks += 1;
+                        let cut = targets.len().div_ceil(4);
+                        targets.truncate(targets.len() - cut);
+                        deferred += cut;
+                    }
+                    None => return Err(e),
+                }
+            }
+        }
+    }
+}
+
+/// Outcome of walking one ~8.3x long down 4 bps a slot on an off-band market, one deployed
+/// sweep per slot.
+#[derive(Debug)]
+struct F1Walk {
+    /// Slot index of the first reduction of the long (None = never reduced while solvent).
+    reduced_at: Option<usize>,
+    /// Margin (bps) the long was certified at in the round BEFORE the reduction.
+    margin_before_bps: i128,
+    /// Margin (bps) right after the reduction.
+    margin_after_bps: i128,
+    /// Size before / after the first reduction.
+    pos_before: i128,
+    pos_after: i128,
+    /// Certified equity went negative before any reduction.
+    bankrupt: bool,
+    hlock: bool,
+    insurance_delta: i128,
+    rounds: usize,
+    max_sweep_cu: u64,
+}
+
+fn f1_open_long(env: &mut Env, deposit_usd: u128, units: i128) -> (Lp, (Keypair, Pubkey)) {
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let long = env.trader(deposit_usd * USD);
+    env.trade_cpi(&long.0, long.1, &lp, units * Q).expect("open long");
+    // The keeper's catch-up: the asset clock reaches the wall clock before the walk starts
+    // (LiteSVM's clock starts at 0 while `env.slot` starts at 1: sync it first).
+    env.warp(0);
+    env.crank_current(lp.account);
+    assert!(env.engine_asset().slot_last >= env.slot, "asset clock caught up");
+    (lp, long)
+}
+
+fn f1_walk(so: Option<PathBuf>, cfg: Cfg, max_rounds: usize) -> F1Walk {
+    let mut env = f1_env(so, cfg);
+    let (lp, long) = f1_open_long(&mut env, 12, 100);
+    let mmr_bps = MMR as i128;
+    let ins0 = f1_insurance(&env) as i128;
+    let mut out = F1Walk {
+        reduced_at: None,
+        margin_before_bps: 0,
+        margin_after_bps: 0,
+        pos_before: env.pos(long.1),
+        pos_after: env.pos(long.1),
+        bankrupt: false,
+        hlock: false,
+        insurance_delta: 0,
+        rounds: 0,
+        max_sweep_cu: 0,
+    };
+    let mut prev_margin = f1_margin_bps(&env, long.1);
+    for i in 0..max_rounds {
+        out.rounds = i + 1;
+        f1_step_price(&mut env, 4);
+        let pos_before = env.pos(long.1);
+        let cu = f1_sweep(&mut env, lp.account, &[long.1]).unwrap_or_else(|e| panic!("round {i}: sweep failed: {e}\n{:#?}", LAST_LOGS.with(|l| l.borrow().clone())));
+        out.max_sweep_cu = out.max_sweep_cu.max(cu);
+        let pos = env.pos(long.1);
+        let (eq, _, _) = f1_cert(&env, long.1);
+        if pos.unsigned_abs() < pos_before.unsigned_abs() {
+            out.reduced_at = Some(i);
+            out.margin_before_bps = prev_margin;
+            out.margin_after_bps = f1_margin_bps(&env, long.1);
+            out.pos_before = pos_before;
+            out.pos_after = pos;
+            break;
+        }
+        if eq < 0 {
+            out.bankrupt = true;
+        }
+        if f1_hlock(&env) {
+            out.hlock = true;
+        }
+        if out.bankrupt && out.hlock {
+            break;
+        }
+        prev_margin = f1_margin_bps(&env, long.1);
+        if std::env::var_os("F1_TRACE").is_some() && i % 50 == 0 {
+            let a = env.engine_asset();
+            println!("F1TRACE round {i} eff {} target {} margin {prev_margin} cert {:?} cu {cu}", a.effective_price, a.raw_oracle_target_price, f1_cert(&env, long.1));
+        }
+        let _ = mmr_bps;
+    }
+    out.hlock |= f1_hlock(&env);
+    out.insurance_delta = f1_insurance(&env) as i128 - ins0;
+    env.assert_conservation();
+    out
+}
+
+/// F1 fixed: with ONE plain refresh per round (the deployed keeper's shape), the long is
+/// liquidated in the first round it is certified below maintenance (MMR 5%), partially (the
+/// engine's own sizing restores maintenance), with no h-lock and no bankruptcy.
+#[test]
+fn v22_f1_off_band_one_refresh_per_round_liquidates_at_maintenance() {
+    let w = f1_walk(None, f1_off_band_cfg(), 600);
+    println!("F1WALK patched {w:?}");
+    let at = w.reduced_at.unwrap_or_else(|| panic!("never liquidated: {w:?}"));
+    assert!(!w.bankrupt, "went bankrupt before the liquidation: {w:?}");
+    assert!(!w.hlock, "bankruptcy h-lock latched: {w:?}");
+    // The minimum-progress rule lets the shortfall reach 0.5% of the requirement (2.5 bps of
+    // notional at MMR 5%) first: the liquidation lands within a few bps of maintenance.
+    assert!(w.margin_before_bps >= MMR as i128 - 5, "liquidated late, well below maintenance: {w:?}");
+    assert!(w.margin_before_bps < MMR as i128 + 100, "liquidated far above maintenance: {w:?}");
+    assert!(w.pos_after != 0 && w.pos_after.unsigned_abs() < w.pos_before.unsigned_abs(), "partial close expected: {w:?}");
+    assert!(w.margin_after_bps >= MMR as i128, "the liquidation must restore maintenance: {w:?}");
+    assert!(w.insurance_delta > 0, "the liquidation fee reaches insurance: {w:?}");
+    assert!(at > 10, "vacuity: the long must start healthy: {w:?}");
+}
+
+/// NEGATIVE CONTROL on the deployed bytes: the same transactions never liquidate; the long runs
+/// to negative equity and the bankruptcy h-lock latches (F1 as found on devnet).
+#[test]
+#[ignore = "negative control: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_negative_control_deployed_bytes_run_to_bankruptcy() {
+    let w = f1_walk(Some(f1_base_so()), f1_off_band_cfg(), 600);
+    println!("F1WALK deployed {w:?}");
+    assert!(w.reduced_at.is_none(), "deployed bytes liquidated with one crank per round: {w:?}");
+    assert!(w.bankrupt, "expected the long to go bankrupt: {w:?}");
+    assert!(w.hlock, "expected the bankruptcy h-lock: {w:?}");
+}
+
+/// Every account a differential test compares: the market and the given portfolios.
+fn f1_state(env: &Env, keys: &[Pubkey]) -> Vec<Vec<u8>> {
+    let mut v = vec![env.svm.get_account(&env.market).unwrap().data];
+    v.extend(keys.iter().map(|k| env.svm.get_account(k).unwrap().data));
+    v
+}
+
+/// Differential walk, deployed bytes vs patched bytes, same seeded keys and the same
+/// transactions: one deployed-shape sweep per slot over `traders` (opened long at `deposit_usd`
+/// each). Returns the first round whose post-state differs (None = identical throughout), the
+/// number of rounds in which any trader was reduced (patched run), and whether any trader was
+/// ever certified below maintenance (non-vacuity).
+fn f1_diff_walk(cfg: fn() -> Cfg, deposits: &[u128], step_bps: u64, rounds: usize, stop_at_divergence: bool) -> (Option<usize>, usize, bool) {
+    f1_diff_walk_with(cfg, deposits, step_bps, rounds, stop_at_divergence, false)
+}
+
+/// `f1_diff_walk`; with `second_crank`, every round also sends each trader a lone crank in the
+/// same slot after the sweep (separate transactions: the legacy second-crank liquidation path),
+/// and state is compared after the sweep AND after the second cranks.
+fn f1_diff_walk_with(cfg: fn() -> Cfg, deposits: &[u128], step_bps: u64, rounds: usize, stop_at_divergence: bool, second_crank: bool) -> (Option<usize>, usize, bool) {
+    let mut runs: Vec<(Env, Lp, Vec<Pubkey>)> = Vec::new();
+    for so in [Some(f1_base_so()), None] {
+        let mut env = f1_env(so, cfg());
+        env.auth_mark();
+        let lp = env.lp(10_000 * USD);
+        let mut traders = Vec::new();
+        for d in deposits {
+            let t = env.trader(*d * USD);
+            env.trade_cpi(&t.0, t.1, &lp, 100 * Q).expect("open long");
+            traders.push(t.1);
+        }
+        env.warp(0);
+        env.crank_current(lp.account);
+        runs.push((env, lp, traders));
+    }
+    let mut first_div = None;
+    let mut reductions = 0usize;
+    let mut ever_below = false;
+    for r in 0..rounds {
+        let mut outs = Vec::new();
+        let mut mids = Vec::new();
+        let all: Vec<Pubkey> = runs[0].2.iter().copied().chain(std::iter::once(runs[0].1.account)).collect();
+        for (env, lp, traders) in runs.iter_mut() {
+            f1_step_price(env, step_bps);
+            let before: Vec<i128> = traders.iter().map(|t| env.pos(*t)).collect();
+            let mut res = f1_sweep(env, lp.account, traders).map(|_| ());
+            mids.push(f1_state(env, &all));
+            if second_crank {
+                for t in traders.iter() {
+                    let ix = f1_crank_ix(env, *t, false);
+                    let r2 = f1_send(env, &[ix], 1_400_000).map(|_| ());
+                    if res.is_ok() {
+                        res = r2.or_else(|e| if e.contains("Custom(22)") { Ok(()) } else { Err(e) });
+                    }
+                }
+            }
+            let reduced = traders.iter().zip(before.iter()).any(|(t, b)| env.pos(*t).unsigned_abs() < b.unsigned_abs());
+            outs.push((res, reduced));
+        }
+        let (base_env, _, keys) = &runs[0];
+        for t in keys {
+            let (eq, mm, _) = f1_cert(base_env, *t);
+            if eq < 0 || (eq as u128) < mm {
+                ever_below = true;
+            }
+        }
+        if outs[1].1 {
+            reductions += 1;
+        }
+        let same = outs[0].0 == outs[1].0 && mids[0] == mids[1] && f1_state(&runs[0].0, &all) == f1_state(&runs[1].0, &all);
+        if !same && first_div.is_none() {
+            first_div = Some(r);
+            if stop_at_divergence {
+                break;
+            }
+        }
+    }
+    (first_div, reductions, ever_below)
+}
+
+/// Healthy accounts are unchanged: three longs that stay above maintenance through a 6% fall
+/// get byte-identical market and portfolio state, round by round, on the deployed and the
+/// patched bytes (the follow-on never fires on a healthy account).
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_healthy_accounts_are_byte_identical_to_the_deployed_bytes() {
+    let (div, reductions, below) = f1_diff_walk(f1_off_band_cfg, &[40, 60, 100], 4, 150, false);
+    assert!(!below, "vacuity guard: every account must stay healthy in this test");
+    assert_eq!(reductions, 0);
+    assert_eq!(div, None, "healthy state diverged from the deployed bytes at round {div:?}");
+}
+
+/// The patched bytes diverge from the deployed bytes EXACTLY at the first round an account is
+/// certified below maintenance, never earlier.
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_divergence_starts_exactly_at_the_first_below_maintenance_round() {
+    let crossing = f1_walk(None, f1_off_band_cfg(), 600).reduced_at.expect("patched liquidates");
+    let (div, _, below) = f1_diff_walk(f1_off_band_cfg, &[12], 4, 600, true);
+    assert!(below, "vacuity: the long must go below maintenance");
+    assert_eq!(div, Some(crossing), "first divergence {div:?} vs first below-maintenance round {crossing}");
+}
+
+/// Band markets are unchanged: on a band market the band's own pass liquidates (a pinned
+/// accrual keeps certificates current across transactions), and the patched bytes produce
+/// byte-identical state round by round, liquidations included (no double liquidation).
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_band_market_is_byte_identical_including_its_liquidations() {
+    // Band markets are single-slot (105) and so carry funding (94); while pinned the funding keeps
+    // un-currenting certificates, so the band market's liquidation is the SECOND crank of a slot
+    // (here a separate same-slot transaction per trader). State is compared after the sweep
+    // transaction (the follow-on must NOT have fired there) and after the second cranks (the
+    // band liquidations, identical on both builds: nothing liquidated twice).
+    let (div, reductions, below) = f1_diff_walk_with(band_cfg, &[12, 13], 4, 300, false, true);
+    println!("F1BAND div {div:?} reductions {reductions} below {below}");
+    assert!(below, "vacuity: a long must go below maintenance on the band market");
+    assert!(reductions >= 1, "vacuity: the band pass must liquidate at least once");
+    assert_eq!(div, None, "band market diverged from the deployed bytes at round {div:?}");
+}
+
+/// Walk a single ~8.3x long to the round BEFORE it would cross maintenance; returns
+/// (env, lp, long) with the price for the crossing round pushed but nothing cranked.
+fn f1_to_crossing(so: Option<PathBuf>) -> (Env, Lp, (Keypair, Pubkey)) {
+    f1_to_crossing_with(so, |_| {})
+}
+
+fn f1_to_crossing_with(so: Option<PathBuf>, setup: impl FnOnce(&mut Env)) -> (Env, Lp, (Keypair, Pubkey)) {
+    let crossing = f1_walk(None, f1_off_band_cfg(), 600).reduced_at.expect("patched liquidates");
+    let mut env = f1_env(so, f1_off_band_cfg());
+    setup(&mut env);
+    let (lp, long) = f1_open_long(&mut env, 12, 100);
+    for _ in 0..crossing {
+        f1_step_price(&mut env, 4);
+        f1_sweep(&mut env, lp.account, &[long.1]).expect("sweep");
+    }
+    f1_step_price(&mut env, 4);
+    (env, lp, long)
+}
+
+/// The legacy two-crank transaction `[observation, refresh T, crank T]`:
+/// - deployed bytes: the second crank of T liquidates (the only way it ever could);
+/// - patched bytes: the FIRST crank of T already liquidated, so the second answers
+///   NonProgress (Custom 22) at its index and the transaction fails atomically; the keeper's
+///   prune (drop the refused index, re-send) lands `[observation, refresh T]`;
+/// - and that pruned patched transaction leaves state BYTE-IDENTICAL to the deployed bytes'
+///   two-crank transaction: the follow-on is exactly the legacy second crank.
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_two_crank_shape_is_the_follow_on_byte_for_byte() {
+    let (mut base, blp, blong) = f1_to_crossing(Some(f1_base_so()));
+    let (mut patched, plp, plong) = f1_to_crossing(None);
+    let three = |env: &Env, lp: Pubkey, t: Pubkey| vec![f1_crank_ix(env, lp, true), f1_crank_ix(env, t, false), f1_crank_ix(env, t, false)];
+    let ixs = three(&base, blp.account, blong.1);
+    let pos0 = base.pos(blong.1);
+    f1_send(&mut base, &ixs, 1_400_000).expect("deployed: the two-crank shape lands");
+    assert!(base.pos(blong.1).unsigned_abs() < pos0.unsigned_abs(), "deployed: second crank liquidates");
+    let ixs = three(&patched, plp.account, plong.1);
+    let e = f1_send(&mut patched, &ixs, 1_400_000).expect_err("patched: the second crank of T has nothing left");
+    assert!(e.contains("InstructionError(4, Custom(22))"), "patched: expected NonProgress at the second crank of T: {e}");
+    assert_eq!(patched.pos(plong.1), pos0, "the failed transaction rolled back");
+    let pruned = vec![f1_crank_ix(&patched, plp.account, true), f1_crank_ix(&patched, plong.1, false)];
+    f1_send(&mut patched, &pruned, 1_400_000).expect("patched: the pruned shape lands");
+    let keys = [blong.1, blp.account];
+    assert_eq!(f1_state(&base, &keys), f1_state(&patched, &keys), "follow-on != legacy second crank");
+    assert!(!f1_hlock(&patched));
+}
+
+/// The legacy second-crank path still works when the follow-on does not run: a refresh whose
+/// instruction has less than `F1_FOLLOW_ON_MIN_CU` left refreshes ONLY (the transaction lands,
+/// no compute failure), and a separate crank of T in the same slot liquidates (the engine
+/// selects `Liquidate` from the current certificate, as before).
+#[test]
+fn v22_f1_compute_gate_skips_the_follow_on_and_the_second_crank_still_liquidates() {
+    let (mut env, lp, long) = f1_to_crossing(None);
+    let pos0 = env.pos(long.1);
+    let ixs = vec![f1_crank_ix(&env, lp.account, true), f1_crank_ix(&env, long.1, false)];
+    // Enough for the observation crank and the refresh (~272k), not enough to leave the gate's
+    // reserve after them.
+    let limit = 272_000 + percolator_prog::f1_refresh_liq_v22::F1_FOLLOW_ON_MIN_CU as u32 - 50_000;
+    let cu = f1_send(&mut env, &ixs, limit).expect("refresh lands under the compute gate");
+    assert_eq!(env.pos(long.1), pos0, "follow-on must be skipped with too little compute left");
+    let (eq, mm, def) = f1_cert(&env, long.1);
+    assert!(def != 0 && (eq < 0 || (eq as u128) < mm), "certified below maintenance by the refresh");
+    let ix = f1_crank_ix(&env, long.1, false);
+    let cu2 = f1_send(&mut env, &[ix], 1_400_000).expect("second crank, same slot, liquidates");
+    assert!(env.pos(long.1).unsigned_abs() < pos0.unsigned_abs(), "second crank liquidates");
+    let (_, _, def) = f1_cert(&env, long.1);
+    assert_eq!(def, 0, "maintenance restored");
+    println!("F1GATE refresh-only tx {cu} CU (limit {limit}), second crank {cu2} CU");
+}
+
+/// Compute + liveness: the deployed sweep's batched shape `[observation crank, refresh x8]`
+/// (keeper `sweep.ts`: weight budget 32, a single-leg refresh weighs 4), all eight longs
+/// crossing maintenance together and the price falling on for 80 more slots, so they re-cross
+/// every round after each partial liquidation. Ordering as `settle-pairing.ts` (`heaviestFirst`:
+/// equal weights, then larger position first, then key), no-code failures shrunk as `sweep.ts`.
+/// Every transaction lands under 1.4M; nobody goes bankrupt; no h-lock; every long is liquidated.
+#[test]
+fn v22_f1_keeper_batch_of_eight_crossing_together_stays_live() {
+    let run = |so: Option<PathBuf>, rounds_after: usize| {
+        let mut env = f1_env(so, f1_off_band_cfg());
+        env.auth_mark();
+        let lp = env.lp(20_000 * USD);
+        let mut traders = Vec::new();
+        for _ in 0..8 {
+            let t = env.trader(12 * USD);
+            env.trade_cpi(&t.0, t.1, &lp, 100 * Q).expect("open long");
+            traders.push(t.1);
+        }
+        env.warp(0);
+        env.crank_current(lp.account);
+        let mut max_cu = 0u64;
+        let mut first = None;
+        let mut liquidated = std::collections::BTreeSet::new();
+        let mut deferred_total = 0usize;
+        let mut min_margin = i128::MAX;
+        let mut bankrupt = false;
+        for r in 0..(191 + rounds_after) {
+            f1_step_price(&mut env, 4);
+            let mut order = traders.clone();
+            order.sort_by(|a, b| env.pos(*b).cmp(&env.pos(*a)).then(a.to_string().cmp(&b.to_string())));
+            let before: Vec<i128> = traders.iter().map(|t| env.pos(*t)).collect();
+            let (cu, deferred) = f1_sweep_counted(&mut env, lp.account, &order)
+                .unwrap_or_else(|e| panic!("round {r}: batched sweep failed: {e}"));
+            max_cu = max_cu.max(cu);
+            deferred_total += deferred;
+            for (t, b) in traders.iter().zip(before.iter()) {
+                if env.pos(*t).unsigned_abs() < b.unsigned_abs() {
+                    liquidated.insert(*t);
+                    first.get_or_insert(r);
+                }
+                let (eq, _, _) = f1_cert(&env, *t);
+                bankrupt |= eq < 0;
+                if first.is_some() {
+                    min_margin = min_margin.min(f1_margin_bps(&env, *t));
+                }
+            }
+        }
+        env.assert_conservation();
+        (first, liquidated.len(), deferred_total, max_cu, min_margin, bankrupt, f1_hlock(&env))
+    };
+    let (first, n, deferred, max_cu, min_margin, bankrupt, hlock) = run(None, 80);
+    println!("F1BATCH patched: first liquidation round {first:?}, longs liquidated {n}/8, refreshes deferred by the keeper shrink {deferred}, max tx CU {max_cu}, min margin after the first liquidation {min_margin} bps (MMR {MMR}), bankrupt {bankrupt}, hlock {hlock}");
+    assert!(max_cu <= 1_400_000);
+    assert_eq!(n, 8, "every long liquidated");
+    assert!(!bankrupt && !hlock);
+    assert!(min_margin > 0, "nobody reaches zero equity");
+}
+
+/// NEGATIVE CONTROL for the batch: the deployed bytes, same eight longs, same sweeps: nobody is
+/// liquidated and the market latches the bankruptcy h-lock.
+#[test]
+#[ignore = "negative control: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_negative_control_keeper_batch_on_deployed_bytes() {
+    let mut env = f1_env(Some(f1_base_so()), f1_off_band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000 * USD);
+    let mut traders = Vec::new();
+    for _ in 0..8 {
+        let t = env.trader(12 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 100 * Q).expect("open long");
+        traders.push(t.1);
+    }
+    env.warp(0);
+    env.crank_current(lp.account);
+    let mut reduced = false;
+    let mut max_cu = 0;
+    for r in 0..340 {
+        f1_step_price(&mut env, 4);
+        let before: Vec<i128> = traders.iter().map(|t| env.pos(*t)).collect();
+        let (cu, _) = f1_sweep_counted(&mut env, lp.account, &traders).unwrap_or_else(|e| panic!("round {r}: {e}"));
+        max_cu = max_cu.max(cu);
+        reduced |= traders.iter().zip(before.iter()).any(|(t, b)| env.pos(*t).unsigned_abs() < b.unsigned_abs());
+    }
+    println!("F1BATCH deployed: reduced {reduced}, hlock {}, max tx CU {max_cu}", f1_hlock(&env));
+    assert!(!reduced);
+    assert!(f1_hlock(&env));
+}
+
+/// Residual (recorded, NOT changed by F1, which leaves band markets alone by instruction): on a
+/// band market whose funding (or rent) moves while the price is pinned, every accrual bumps
+/// `funding_epoch`, so a below-maintenance long stays `band_liq_pending` and a one-crank sweep
+/// never liquidates it -- on the deployed bytes and the patched bytes alike (byte-identical).
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_residual_band_with_live_funding_stalls_identically_on_both_builds() {
+    let (div, reductions, below) = f1_diff_walk(band_cfg, &[12], 4, 400, false);
+    println!("F1BANDFUND div {div:?} reductions {reductions} below {below}");
+    assert!(below, "vacuity: the long goes below maintenance");
+    assert_eq!(reductions, 0, "the stall: no liquidation on either build");
+    assert_eq!(div, None, "band behaviour must be identical on both builds");
+}
+
+/// The cranker-reward tail: with a liquidation cranker share on, a refresh crank that carries
+/// the caller's reward portfolio as its last account pays the follow-on's reward to it, exactly
+/// as the legacy `[refresh T + cranker, crank T + cranker]` pair does on the deployed bytes
+/// (byte-identical market, trader, LP and cranker state), and the reward is nonzero.
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_cranker_reward_tail_matches_the_legacy_pair_byte_for_byte() {
+    let setup = |env: &mut Env| {
+        let admin = env.admin.insecure_clone();
+        let m = env.market;
+        let data = env.svm.get_account(&m).unwrap().data;
+        let seq = state::read_asset_control_sequences(&data, 0).unwrap().liquidation_fee + 1;
+        env.send(
+            ProgInstruction::UpdateLiquidationFeePolicy { cranker_share_bps: 2_000, policy_sequence: seq },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("cranker share on");
+    };
+    let (mut base, blp, blong) = f1_to_crossing_with(Some(f1_base_so()), setup);
+    let (mut patched, plp, plong) = f1_to_crossing_with(None, setup);
+    let payer = base.payer.insecure_clone();
+    let bc = base.portfolio(&payer, 0);
+    let pc = patched.portfolio(&payer, 0);
+    assert_eq!(bc, pc);
+    let with_cranker = |env: &Env, t: Pubkey| {
+        let mut ix = f1_crank_ix(env, t, false);
+        ix.accounts.push(AccountMeta::new(bc, false));
+        ix
+    };
+    let cap0 = base.portfolio_state(bc).capital;
+    let ixs = vec![f1_crank_ix(&base, blp.account, true), with_cranker(&base, blong.1), with_cranker(&base, blong.1)];
+    f1_send(&mut base, &ixs, 1_400_000).expect("deployed: legacy pair with reward tails");
+    let ixs = vec![f1_crank_ix(&patched, plp.account, true), with_cranker(&patched, plong.1)];
+    f1_send(&mut patched, &ixs, 1_400_000).expect("patched: one refresh with the reward tail");
+    let keys = [blong.1, blp.account, bc];
+    assert_eq!(f1_state(&base, &keys), f1_state(&patched, &keys), "reward follow-on != legacy pair");
+    let cap1 = patched.portfolio_state(pc).capital;
+    println!("F1REWARD cranker capital {cap0} -> {cap1}");
+    assert!(cap1 > cap0, "vacuity: the cranker must be paid");
+}
+
+/// The bound vault LP keeps its own P3 path: the follow-on never runs on it. An LP walked below
+/// maintenance (price up against its short) gets byte-identical state on both builds, round by
+/// round, including the keeper's legacy same-slot second crank (its senior draw + liquidation).
+#[test]
+#[ignore = "differential: needs F1_BASE_SO=<deployed wrapper .so>"]
+fn v22_f1_vault_lp_is_excluded_and_byte_identical() {
+    let mut runs: Vec<(Env, Lp, Pubkey)> = Vec::new();
+    for so in [Some(f1_base_so()), None] {
+        let mut env = f1_env(so, f1_off_band_cfg());
+        env.auth_mark();
+        let lp = env.lp(14 * USD);
+        let t = env.trader(1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 100 * Q).expect("open long against a thin LP");
+        env.warp(0);
+        env.crank_current(lp.account);
+        // The vault LP's capacity cap keeps it far from maintenance; a TEST-ONLY state poke
+        // (identical on both builds) sets its capital to 50,000 atoms above its requirement,
+        // conserving vault >= C_tot + I (C_tot and the vault ledger move together).
+        let (eq, mm, _) = f1_cert(&env, lp.account);
+        let mut mk = env.svm.get_account(&env.market).unwrap();
+        let mut pk = env.svm.get_account(&lp.account).unwrap();
+        let (cfg, mut g) = state::read_market(&mk.data).unwrap();
+        let mut pf = state::read_portfolio(&pk.data).unwrap();
+        let cut = (eq as u128).saturating_sub(mm + 50_000);
+        pf.capital -= cut;
+        g.c_tot -= cut;
+        g.vault -= cut;
+        pf.health_cert.valid = false;
+        state::write_market(&mut mk.data, &cfg, &g).unwrap();
+        state::write_portfolio(&mut pk.data, &pf).unwrap();
+        env.svm.set_account(env.market, mk).unwrap();
+        env.svm.set_account(lp.account, pk).unwrap();
+        runs.push((env, lp, t.1));
+    }
+    let mut lp_below = false;
+    let mut lp_reduced = 0;
+    for r in 0..120 {
+        let mut st = Vec::new();
+        for (env, lp, t) in runs.iter_mut() {
+            env.warp(1);
+            let eff = env.engine_asset().effective_price;
+            env.push(eff * 10_004 / 10_000);
+            let p0 = env.pos(lp.account);
+            let a = f1_sweep(env, lp.account, &[*t]).map(|_| ());
+            let mid = f1_state(env, &[lp.account, *t]);
+            let ix = f1_crank_ix(env, lp.account, false);
+            let b = f1_send(env, &[ix], 1_400_000).map(|_| ());
+            if env.pos(lp.account).unsigned_abs() < p0.unsigned_abs() {
+                lp_reduced += 1;
+            }
+            st.push((a, mid, b.map_err(|e| e.contains("Custom(22)")), f1_state(env, &[lp.account, *t])));
+        }
+        let (eq, mm, _) = f1_cert(&runs[0].0, runs[0].1.account);
+        lp_below |= eq < 0 || (eq as u128) < mm;
+        if std::env::var_os("F1_TRACE").is_some() && r % 25 == 0 {
+            println!("F1TRACE r {r} lp cert {:?} pos {} eff {} res {:?}", f1_cert(&runs[0].0, runs[0].1.account), runs[0].0.pos(runs[0].1.account), runs[0].0.engine_asset().effective_price, st[0].0);
+        }
+        assert_eq!(st[0], st[1], "vault LP diverged at round {r}");
+        if runs[0].0.pos(runs[0].1.account) == 0 {
+            break;
+        }
+    }
+    println!("F1VAULTLP lp_below {lp_below} lp reductions (both builds) {}", lp_reduced / 2);
+    assert!(lp_below, "vacuity: the vault LP must go below maintenance");
+}
+
+/// Minimum progress (dust): once a liquidation restored the long exactly to its requirement, a
+/// slow drift (1 bp of price a slot) puts it a dust amount under maintenance every round. The
+/// refresh then does NOT liquidate while the shortfall is under 0.5% of the requirement (the
+/// account stays solvent and the engine still classifies it liquidatable, so the legacy second
+/// crank keeps working), and liquidates as soon as the shortfall is material.
+#[test]
+fn v22_f1_dust_shortfall_waits_for_material_progress() {
+    let (mut env, lp, long) = f1_to_crossing(None);
+    f1_sweep(&mut env, lp.account, &[long.1]).expect("crossing sweep");
+    // Drive to the first liquidation (4 bps steps).
+    let mut guard = 0;
+    while f1_cert(&env, long.1).2 != 0 || env.pos(long.1) == 100 * Q {
+        f1_step_price(&mut env, 4);
+        f1_sweep(&mut env, lp.account, &[long.1]).expect("sweep");
+        guard += 1;
+        assert!(guard < 20, "no first liquidation");
+    }
+    let mut dust_rounds = 0usize;
+    let mut liquidations = Vec::new();
+    for r in 0..60 {
+        f1_step_price(&mut env, 1);
+        let p0 = env.pos(long.1);
+        f1_sweep(&mut env, lp.account, &[long.1]).expect("sweep");
+        let (eq, mm, def) = f1_cert(&env, long.1);
+        if env.pos(long.1).unsigned_abs() < p0.unsigned_abs() {
+            liquidations.push(r);
+        } else if def != 0 {
+            dust_rounds += 1;
+            assert!(eq > 0, "skipped while insolvent");
+            let short = mm - eq as u128;
+            assert!(short < percolator_prog::f1_refresh_liq_v22::min_shortfall(mm), "a material shortfall was skipped: {short} of {mm}");
+        }
+    }
+    println!("F1DUST dust rounds skipped {dust_rounds}, liquidation rounds {liquidations:?}");
+    assert!(dust_rounds >= 5, "vacuity: dust shortfalls must occur");
+    assert!(liquidations.len() >= 3, "material shortfalls still liquidate");
+    assert!(liquidations.windows(2).all(|w| w[1] - w[0] >= 2), "never a liquidation every round on a 1 bp drift");
+    // The legacy second crank still liquidates a dust shortfall (engine predicate unchanged).
+    f1_step_price(&mut env, 1);
+    f1_sweep(&mut env, lp.account, &[long.1]).expect("sweep");
+    if f1_cert(&env, long.1).2 != 0 {
+        let p0 = env.pos(long.1);
+        let ix = f1_crank_ix(&env, long.1, false);
+        f1_send(&mut env, &[ix], 1_400_000).expect("legacy second crank");
+        assert!(env.pos(long.1).unsigned_abs() < p0.unsigned_abs());
+    }
+    assert!(!f1_hlock(&env));
 }
