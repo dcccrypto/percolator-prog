@@ -205,3 +205,23 @@ fn kani_p3e_split_s5_chain_q_u8_fixed_a() {
     kani::cover!(fid != 0 && long_pnl < -1_000, "material transfer, longs pay");
     kani::cover!(fid < 0 && short_pnl < -1_000, "material transfer, shorts pay");
 }
+
+/// Review 2026-10-14: S4 restricted to the chain's actual domain |K| = |q * fid| < 2^82 (q u32, |fid| < 2^50,
+/// S1). The unbounded S4 has no verdict (z3 300 s overnight, kissat 400 s in review).
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_p3e_rev_s4_sign_pair_k82() {
+    let k: i128 = kani::any();
+    kani::assume(k.unsigned_abs() < (1u128 << 82)); // BOUNDED: the chain's |q * fid|
+    let p = POS_SCALE;
+    let long_pnl = fdiv(-k, p);
+    let short_pnl = fdiv(k, p);
+    let net = long_pnl + short_pnl;
+    assert!(net <= 0 && net >= -1);
+    if k > 0 {
+        assert!(long_pnl <= 0 && short_pnl >= 0, "the paying side never gains");
+    }
+    kani::cover!(net == -1, "one atom of dust destroyed");
+    kani::cover!(net == 0 && k != 0, "exact transfer");
+    kani::cover!(long_pnl < -1_000, "material transfer");
+}
