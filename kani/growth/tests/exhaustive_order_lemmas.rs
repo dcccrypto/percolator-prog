@@ -83,3 +83,29 @@ fn legmono_ceil_bps_monotone_in_imr_all_u16() {
         }
     }
 }
+
+/// T7m (consumed by the T7 split; kani_growth_t7m NO-VERDICT): for every n in u8 and r, f with
+/// r + f <= 1e4: ceil(n(r+f)/1e4) >= floor(nr/1e4) + ceil(nf/1e4). mmr > r + f reduces to this by
+/// LEGMONO (ceil(n·i/1e4) monotone in i). Run on the REAL primitives. 1.3e10 cases, 8 threads.
+#[test]
+fn t7m_gap_solvency_all_u8_notional() {
+    let hs: Vec<_> = (0..8u128)
+        .map(|t| {
+            std::thread::spawn(move || {
+                for n in (0..=255u128).filter(|n| n % 8 == t) {
+                    for r in 0..=10_000u128 {
+                        let gap = floor(n, r, 10_000).unwrap();
+                        for f in 0..=(10_000 - r) {
+                            let mm = ceil(n, r + f, 10_000).unwrap();
+                            let fee = ceil(n, f, 10_000).unwrap();
+                            assert!(mm >= gap + fee, "n={n} r={r} f={f}");
+                        }
+                    }
+                }
+            })
+        })
+        .collect();
+    for h in hs {
+        h.join().unwrap();
+    }
+}
