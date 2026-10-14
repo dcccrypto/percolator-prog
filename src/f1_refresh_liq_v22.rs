@@ -20,14 +20,14 @@
 //! observations (exactly the second instruction of the two-crank shape), which the engine's own
 //! plan selector turns into its existing `Liquidate` step with its existing partial sizing.
 
-/// Compute. No run-time compute gate: the `sol_remaining_compute_units` syscall is NOT active on
-/// devnet (feature 5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP inactive; a build that called it
-/// failed every follow-on crank with "unsupported BPF instruction" on a devnet clone). The bound is
-/// static instead: the follow-on is ONE engine liquidation step, measured at most 369,633 CU at the
-/// wrapper leg cap (4 legs, worst pending K + F + fee), so a refresh crank with its follow-on is at
-/// most 1,098,281 CU (+66k stranded-backing hook = 1.164M), inside the repo's 10% rule (1,260,000 of
-/// 1.4M). A batched keeper transaction that overruns fails with no program code and is shrunk by the
-/// keeper's simulate-first rule (`sweep.ts`); nothing lands partially.
+// Compute. No run-time compute gate: the `sol_remaining_compute_units` syscall is NOT active on
+// devnet (feature 5TuppMutoyzhUSfuYdhgzD47F92GL1g89KpCZQKqedxP inactive; a build that called it
+// failed every follow-on crank with "unsupported BPF instruction" on a devnet clone). The bound is
+// static instead: the follow-on is ONE engine liquidation step, measured at most 369,633 CU at the
+// wrapper leg cap (4 legs, worst pending K + F + fee), so a refresh crank with its follow-on is at
+// most 1,098,281 CU (+66k stranded-backing hook = 1.164M), inside the repo's 10% rule (1,260,000 of
+// 1.4M). A batched keeper transaction that overruns fails with no program code and is shrunk by the
+// keeper's simulate-first rule (`sweep.ts`); nothing lands partially.
 
 /// Minimum progress (hysteresis): below maintenance, the follow-on runs only when the shortfall
 /// `requirement - equity` is at least this many bps OF THE REQUIREMENT (or equity is <= 0). An
