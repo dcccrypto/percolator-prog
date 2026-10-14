@@ -239,11 +239,19 @@ mod f1_kani_proofs {
             assert!(i.certified_equity > 0, "skipped an insolvent account");
             assert!((i.certified_equity as u128) < i.certified_maintenance_req, "skip is only ever below maintenance");
         }
-        if ready && i.certified_equity <= 0 {
+        // Below maintenance with equity <= 0 always liquidates. (First run FAILED on this assertion
+        // without the `below` premise: equity 0 with requirement 0 is AT maintenance, which
+        // `kani_f1_never_at_or_above_maintenance` proves must not liquidate. Equity < 0 is always
+        // below maintenance since the requirement is unsigned.)
+        if ready && below && i.certified_equity <= 0 {
             assert!(d, "insolvent account not liquidated");
+        }
+        if ready && i.certified_equity < 0 {
+            assert!(d, "negative equity not liquidated");
         }
         kani::cover!(ready && below && !d, "dust skipped while solvent");
         kani::cover!(ready && i.certified_equity == 0 && d, "zero equity liquidated");
+        kani::cover!(ready && i.certified_equity == 0 && i.certified_maintenance_req == 0 && !d, "zero equity AT a zero requirement: not liquidated");
         kani::cover!(ready && i.certified_equity < 0 && d, "negative equity liquidated");
         kani::cover!(ready && i.certified_equity > 0 && below && d, "material shortfall liquidated");
     }
