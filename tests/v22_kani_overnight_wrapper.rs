@@ -217,6 +217,48 @@ fn kani_v22_bps_floor_range_lemma() {
     kani::cover!(bps < 10_000 && r.is_some_and(|v| v < x), "partial share");
 }
 
+/// u32 form of the range lemma (the ORIGINAL W-C-8a domain is u32). kissat.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_v22_bps_floor_range_lemma_u32() {
+    let x = kani::any::<u32>() as u128;
+    let bps: u16 = kani::any();
+    let r = bps_floor(x, bps);
+    if bps as u128 > 10_000 {
+        assert!(r.is_none());
+    } else {
+        assert!(r.unwrap() <= x);
+    }
+    kani::cover!(bps == 10_000 && r == Some(x) && x > 0, "full share");
+    kani::cover!(bps < 10_000 && r.is_some_and(|v| v < x), "partial share");
+}
+
+/// W-C-8a split (a) on the ORIGINAL u32 domain (CONDITIONAL on `kani_v22_bps_floor_range_lemma_u32` and
+/// W-C-12); otherwise identical to `kani_v22_wc8a_split_a_waterfall_structure`.
+#[kani::proof]
+#[kani::stub(percolator_prog::bond_v20::bond_coupon_split, bond_coupon_split_model)]
+#[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_memo)]
+#[kani::stub(percolator_prog::vault_lp_v18::bps_ceil, bps_ceil_memo)]
+fn kani_v22_wc8a_split_a_waterfall_structure_u32() {
+    let avail = kani::any::<u32>() as u128;
+    let due = kani::any::<u32>() as u128;
+    let share: u16 = kani::any();
+    let target: u16 = kani::any();
+    let c_eff = kani::any::<u32>() as u128;
+    let level = kani::any::<u32>() as u128;
+    kani::assume(share <= 10_000 && target <= 10_000); // the original's assume
+    let (cp, cu, se) = fee_waterfall3(avail, due, share, target, c_eff, level).unwrap();
+    assert_eq!(cp + cu + se, avail, "conservation");
+    assert_eq!(cp, min2(due, avail / 2), "coupon = min(due, half the leg)");
+    assert!(cu <= bps_floor(avail - cp, share).unwrap(), "cushion only sees the rest");
+    if share == 0 || target == 0 {
+        assert_eq!(cu, 0);
+    }
+    kani::cover!(due > 0 && cp == due && cp < avail / 2, "coupon below the leg cap");
+    kani::cover!(cp == avail / 2 && due > cp, "leg cap binds (thin leg)");
+    kani::cover!(cp > 0 && cu > 0, "cushion engaged after the coupon");
+}
+
 // ═══════════════════════════════════ W-C-9 (junior gates exclude bonds) ══════════════════════════════
 
 /// Replaces W-C-9 `kani_v22_wc9_junior_gates_exclude_bonds` (NO-VERDICT 8002 s). STUB-MEMO `bps_ceil`
@@ -354,6 +396,61 @@ fn kani_v22_wc5_split_b_no_dilution_algebra() {
     kani::cover!(m * value < amount * b && m > 0, "floored");
 }
 
+/// W-C-5 split (a) narrowed to u8 amount (FALLBACK: the u16-amount split (a) has no verdict at 600 s
+/// under z3). BOUNDED: amount, shares, value all u8. kissat.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_v22_wc5_split_a_deposit_floor_u8() {
+    let amount = kani::any::<u8>() as u128;
+    let b = kani::any::<u8>() as u128;
+    let value = kani::any::<u8>() as u128;
+    kani::assume(amount > 0); // the original's assume
+    let m = bond_shares_for_deposit(amount, b, value);
+    if b == 0 {
+        assert_eq!(m, Some(amount), "genesis 1:1");
+    } else if value == 0 {
+        assert!(m.is_none(), "zero value with shares outstanding fails closed");
+    } else {
+        let m = m.unwrap();
+        assert!(m * value <= amount * b, "rounds down");
+        assert!(amount * b < m * value + value, "exact floor");
+        kani::cover!((amount * b) % value == 0 && m > 0, "exact");
+        kani::cover!((amount * b) % value != 0, "floored");
+    }
+    kani::cover!(b == 0, "genesis");
+}
+
+/// W-C-5 split (b) at u8 amount (pairs with split (a) u8). kissat.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_v22_wc5_split_b_no_dilution_algebra_u8() {
+    let amount = kani::any::<u8>() as u64;
+    let b = kani::any::<u8>() as u64;
+    let value = kani::any::<u8>() as u64;
+    let m = kani::any::<u16>() as u64;
+    kani::assume(amount > 0 && b > 0 && value > 0); // the branch split (a) leaves to this lemma
+    kani::assume(m * value <= amount * b); // split (a)'s floor fact
+    assert!((value + amount) * b >= value * (b + m), "incumbents not diluted");
+    kani::cover!(m * value == amount * b && m > 0, "exact");
+    kani::cover!(m * value < amount * b && m > 0, "floored");
+}
+
+/// W-C-5 split (b) at u8 amount, computed in u32 (every product < 2^25, so u32 is exact; narrower
+/// circuits than the u64 form, which had no verdict at 600 s). kissat.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_v22_wc5_split_b_no_dilution_algebra_u8_w32() {
+    let amount = kani::any::<u8>() as u32;
+    let b = kani::any::<u8>() as u32;
+    let value = kani::any::<u8>() as u32;
+    let m = kani::any::<u16>() as u32;
+    kani::assume(amount > 0 && b > 0 && value > 0); // the branch split (a) leaves to this lemma
+    kani::assume(m * value <= amount * b); // split (a)'s floor fact
+    assert!((value + amount) * b >= value * (b + m), "incumbents not diluted");
+    kani::cover!(m * value == amount * b && m > 0, "exact");
+    kani::cover!(m * value < amount * b && m > 0, "floored");
+}
+
 // ═══════════════════════════════════ W-C-6 (bond redemption) ═════════════════════════════════════════
 
 /// W-C-6 split (a): FLOOR facts of the real `bond_atoms_for_redemption` / `bond_claim_after_redemption`
@@ -402,6 +499,38 @@ fn kani_v22_wc6_split_b_redemption_algebra() {
     kani::assume(pay * b <= sh * value && sh * value < pay * b + b); // split (a), payout floor
     kani::assume(slice * b <= sh * cb && sh * cb < slice * b + b); // split (a), slice floor
     kani::assume(slice <= cb); // split (a): cb2 = cb - slice is Some
+    let cb2 = cb - slice;
+    assert!(pay <= value && pay * b <= sh * value);
+    if sh == b {
+        assert_eq!(cb2, 0, "full redemption clears C_b");
+    } else {
+        assert!(cb2 * b >= cb * (b - sh), "remaining claim per share not lowered");
+        assert!((value - pay) * b >= value * (b - sh), "remaining value per share not lowered");
+        if cb > 0 {
+            assert!(cb2 > 0, "C_b == 0 <=> B == 0 preserved");
+        }
+    }
+    kani::cover!(sh < b && value == cb && cb > 0 && sh > 0, "whole tranche");
+    kani::cover!(sh < b && value < cb && sh > 0, "impaired tranche");
+    kani::cover!(sh == b && cb > 0, "full redemption");
+}
+
+/// W-C-6 split (b) computed in u32 (all products < 2^17). kissat.
+#[kani::proof]
+#[kani::solver(kissat)]
+fn kani_v22_wc6_split_b_redemption_algebra_w32() {
+    let (b, sh, cb, value) = (
+        kani::any::<u8>() as u32,
+        kani::any::<u8>() as u32,
+        kani::any::<u8>() as u32,
+        kani::any::<u8>() as u32,
+    );
+    let pay = kani::any::<u8>() as u32; // pay <= value <= 255 and slice <= cb <= 255 (split (a))
+    let slice = kani::any::<u8>() as u32;
+    kani::assume(b > 0 && value <= cb && sh <= b);
+    kani::assume(pay * b <= sh * value && sh * value < pay * b + b);
+    kani::assume(slice * b <= sh * cb && sh * cb < slice * b + b);
+    kani::assume(slice <= cb);
     let cb2 = cb - slice;
     assert!(pay <= value && pay * b <= sh * value);
     if sh == b {
