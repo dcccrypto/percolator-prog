@@ -3046,3 +3046,383 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout_v5() {
         "v5: admin rotation refused on a first-loss pool",
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// GH#407 — NFT holders trading an ESCROWED portfolio through the matcher CPI paths.
+//
+// Pre-fix, TradeCpi / BatchTradeCpi read the NFT-holder proof trio at [7..10) AND started the
+// matcher tail at 7, so the program-owned NftRegistry landed in the tail and
+// `validate_matcher_tail` rejected it (InvalidInstruction); independently the shared executor
+// was handed `signer_a.key` as the taker's owner, which never equals an escrowed portfolio's
+// stored owner (the NFT mint-authority PDA). Layout now: trio at [7..10) iff the taker's stored
+// owner != signer; the tail follows it. Owner path: no trio, tail at 7 (unchanged).
+// ════════════════════════════════════════════════════════════════════════════
+
+const E_UNAUTHORIZED: &str = "Custom(8)";
+const E_INVALID_INSTRUCTION: &str = "Custom(9)";
+
+#[derive(Clone, Copy, PartialEq)]
+enum CpiKind {
+    Single,
+    Batch,
+}
+
+struct EscrowedTaker {
+    holder: Keypair,
+    taker: Pubkey,
+    maker: Pubkey,
+    ctx: Pubkey,
+    delegate: Pubkey,
+    registry: Pubkey,
+    nft_pda: Pubkey,
+    holder_ata: Pubkey,
+    mint_auth: Pubkey,
+}
+
+/// A funded holder portfolio escrowed under the NFT mint-authority PDA with its bound NFT held
+/// by `holder`, a funded maker with a registered passive matcher, and the NFT registry set.
+fn escrowed_taker_env(env: &mut CrosscutEnv) -> EscrowedTaker {
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let holder = Keypair::new();
+    env.svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+    let maker_owner = Keypair::new();
+    let taker = env.create_portfolio(&holder);
+    let maker = env.create_portfolio(&maker_owner);
+    env.deposit(&holder, taker, 1_000_000);
+    env.deposit(&maker_owner, maker, 1_000_000);
+    let (ctx, delegate) = env.init_matcher_context(maker, &maker_owner);
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        CROSSCUT_ASSET as usize,
+    )
+    .unwrap()
+    .3;
+    let (nft_pda, _mint, holder_ata) = attach_nft_to_portfolio(env, &holder, taker, market_id);
+    reown_portfolio(env, taker, &mint_auth.to_bytes());
+    EscrowedTaker {
+        holder,
+        taker,
+        maker,
+        ctx,
+        delegate,
+        registry,
+        nft_pda,
+        holder_ata,
+        mint_auth,
+    }
+}
+
+/// Send a TradeCpi / BatchTradeCpi by `signer` for `account_a` with `extra` appended after the
+/// 7 fixed accounts (trio and/or matcher tail, exactly as the caller lays them out).
+fn send_cpi_trade(
+    env: &mut CrosscutEnv,
+    kind: CpiKind,
+    signer: &Keypair,
+    account_a: Pubkey,
+    account_b: Pubkey,
+    ctx: Pubkey,
+    delegate: Pubkey,
+    size_q: i128,
+    extra: Vec<AccountMeta>,
+) -> Result<(), TransactionError> {
+    let (a_id, _, a_epoch) = env.portfolio_identity(account_a);
+    let (b_id, b_seq, b_epoch) = env.portfolio_identity(account_b);
+    let market_id = state::read_market_trade_preflight(
+        &env.svm.get_account(&env.market).unwrap().data,
+        CROSSCUT_ASSET as usize,
+    )
+    .unwrap()
+    .3;
+    let data = match kind {
+        CpiKind::Single => ProgInstruction::TradeCpi {
+            account_a_portfolio_id: a_id,
+            account_a_position_epoch: a_epoch,
+            account_b_portfolio_id: b_id,
+            account_b_position_epoch: b_epoch,
+            market_id,
+            account_b_matcher_sequence: b_seq,
+            asset_index: CROSSCUT_ASSET,
+            size_q,
+            fee_bps: 100,
+            limit_price: 0,
+            backing_fee_cap_bps: 10_000,
+        }
+        .encode(),
+        CpiKind::Batch => ProgInstruction::BatchTradeCpi {
+            account_a_portfolio_id: a_id,
+            account_a_position_epoch: a_epoch,
+            account_b_portfolio_id: b_id,
+            account_b_position_epoch: b_epoch,
+            account_b_matcher_sequence: b_seq,
+            max_slippage_atoms: u128::MAX,
+            max_fee_atoms: u128::MAX,
+            legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                asset_index: CROSSCUT_ASSET,
+                market_id,
+                size_q,
+                fee_bps: 100,
+                limit_price: 0,
+            }],
+        }
+        .encode(),
+    };
+    let mut accounts = vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(account_a, false),
+        AccountMeta::new(account_b, false),
+        AccountMeta::new_readonly(env.matcher_program, false),
+        AccountMeta::new(ctx, false),
+        AccountMeta::new_readonly(delegate, false),
+    ];
+    accounts.extend(extra);
+    let ix = Instruction {
+        program_id: env.program_id,
+        accounts,
+        data,
+    };
+    send_ixs(&mut env.svm, &env.payer, vec![ix], &[signer])
+}
+
+fn trio(t: &EscrowedTaker) -> Vec<AccountMeta> {
+    vec![
+        AccountMeta::new_readonly(t.registry, false),
+        AccountMeta::new_readonly(t.nft_pda, false),
+        AccountMeta::new_readonly(t.holder_ata, false),
+    ]
+}
+
+fn assert_err_contains(res: Result<(), TransactionError>, code: &str, what: &str) {
+    let err = res.expect_err(what);
+    assert!(
+        format!("{err:?}").contains(code),
+        "{what}: expected {code}, got {err:?}"
+    );
+}
+
+fn nft_holder_matcher_trade_succeeds(kind: CpiKind) {
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    let size = (10 * POS_SCALE) as i128;
+    send_cpi_trade(
+        &mut env, kind, &t.holder, t.taker, t.maker, t.ctx, t.delegate, size, trio(&t),
+    )
+    .expect("the NFT holder must trade an escrowed portfolio through the matcher CPI path");
+    assert_eq!(
+        active_leg_basis(&env.portfolio(t.taker), CROSSCUT_ASSET),
+        size,
+        "escrowed taker opened long"
+    );
+    assert_eq!(
+        active_leg_basis(&env.portfolio(t.maker), CROSSCUT_ASSET),
+        -size,
+        "maker opened short"
+    );
+    // The escrow is untouched: the portfolio is still owned by the mint-authority PDA.
+    assert_eq!(
+        read_portfolio_owner(&env.account_data(t.taker)),
+        t.mint_auth.to_bytes(),
+        "owner stays the escrow PDA"
+    );
+    let g = env.group();
+    assert_eq!(g.c_tot + g.insurance, g.vault, "conservation");
+}
+
+#[test]
+fn gh407_tradecpi_nft_holder_trades_escrowed_portfolio() {
+    nft_holder_matcher_trade_succeeds(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_nft_holder_trades_escrowed_portfolio() {
+    nft_holder_matcher_trade_succeeds(CpiKind::Batch);
+}
+
+fn nft_holder_with_clean_matcher_tail_succeeds(kind: CpiKind) {
+    // The tail after the trio is still a real matcher tail: non-signer, non-program-owned.
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    let extra_acct = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            extra_acct,
+            Account {
+                lamports: 1_000_000,
+                data: vec![],
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let mut metas = trio(&t);
+    metas.push(AccountMeta::new_readonly(extra_acct, false));
+    send_cpi_trade(
+        &mut env,
+        kind,
+        &t.holder,
+        t.taker,
+        t.maker,
+        t.ctx,
+        t.delegate,
+        (5 * POS_SCALE) as i128,
+        metas,
+    )
+    .expect("trio + clean tail");
+}
+
+#[test]
+fn gh407_tradecpi_nft_holder_with_clean_tail_succeeds() {
+    nft_holder_with_clean_matcher_tail_succeeds(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_nft_holder_with_clean_tail_succeeds() {
+    nft_holder_with_clean_matcher_tail_succeeds(CpiKind::Batch);
+}
+
+fn non_holder_with_trio_refused(kind: CpiKind) {
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    let attacker = Keypair::new();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+    // The attacker signs and presents the real holder's proof trio.
+    let res = send_cpi_trade(
+        &mut env,
+        kind,
+        &attacker,
+        t.taker,
+        t.maker,
+        t.ctx,
+        t.delegate,
+        (10 * POS_SCALE) as i128,
+        trio(&t),
+    );
+    assert_err_contains(res, E_UNAUTHORIZED, "a non-holder must be refused");
+    assert!(
+        env.portfolio(t.taker).legs.iter().all(|l| !l.active),
+        "no position opened"
+    );
+}
+
+#[test]
+fn gh407_tradecpi_non_holder_with_trio_refused() {
+    non_holder_with_trio_refused(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_non_holder_with_trio_refused() {
+    non_holder_with_trio_refused(CpiKind::Batch);
+}
+
+fn holder_without_trio_refused(kind: CpiKind) {
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    // Escrowed portfolio, signer is not the stored owner, no proof accounts.
+    let res = send_cpi_trade(
+        &mut env,
+        kind,
+        &t.holder,
+        t.taker,
+        t.maker,
+        t.ctx,
+        t.delegate,
+        (10 * POS_SCALE) as i128,
+        vec![],
+    );
+    assert_err_contains(res, E_UNAUTHORIZED, "no trio on an escrowed portfolio");
+}
+
+#[test]
+fn gh407_tradecpi_escrowed_without_trio_refused() {
+    holder_without_trio_refused(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_escrowed_without_trio_refused() {
+    holder_without_trio_refused(CpiKind::Batch);
+}
+
+fn holder_cannot_hide_program_owned_account_in_tail(kind: CpiKind) {
+    // The tail after the trio is still validated: a program-owned account (here the registry
+    // listed a second time) is rejected, so the trio exemption cannot be abused to forward it.
+    let mut env = CrosscutEnv::new();
+    let t = escrowed_taker_env(&mut env);
+    let mut metas = trio(&t);
+    metas.push(AccountMeta::new_readonly(t.registry, false));
+    let res = send_cpi_trade(
+        &mut env,
+        kind,
+        &t.holder,
+        t.taker,
+        t.maker,
+        t.ctx,
+        t.delegate,
+        (10 * POS_SCALE) as i128,
+        metas,
+    );
+    assert_err_contains(res, E_INVALID_INSTRUCTION, "program-owned account in tail");
+}
+
+#[test]
+fn gh407_tradecpi_tail_after_trio_still_validated() {
+    holder_cannot_hide_program_owned_account_in_tail(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_tail_after_trio_still_validated() {
+    holder_cannot_hide_program_owned_account_in_tail(CpiKind::Batch);
+}
+
+fn plain_owner_layout_unchanged(kind: CpiKind) {
+    // Owner == signer: NO trio; the tail begins at [7] exactly as before. A clean tail account
+    // is accepted, and a registry-shaped (program-owned) account at [7] is still rejected.
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let taker_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let maker = env.create_portfolio(&maker_owner);
+    env.deposit(&taker_owner, taker, 1_000_000);
+    env.deposit(&maker_owner, maker, 1_000_000);
+    let (ctx, delegate) = env.init_matcher_context(maker, &maker_owner);
+    let res = send_cpi_trade(
+        &mut env,
+        kind,
+        &taker_owner,
+        taker,
+        maker,
+        ctx,
+        delegate,
+        (10 * POS_SCALE) as i128,
+        vec![AccountMeta::new_readonly(registry, false)],
+    );
+    assert_err_contains(res, E_INVALID_INSTRUCTION, "owner path: program-owned tail account");
+    send_cpi_trade(
+        &mut env,
+        kind,
+        &taker_owner,
+        taker,
+        maker,
+        ctx,
+        delegate,
+        (10 * POS_SCALE) as i128,
+        vec![],
+    )
+    .expect("owner path with an empty tail");
+    assert_eq!(
+        read_portfolio_owner(&env.account_data(taker)),
+        taker_owner.pubkey().to_bytes()
+    );
+}
+
+#[test]
+fn gh407_tradecpi_plain_owner_layout_unchanged() {
+    plain_owner_layout_unchanged(CpiKind::Single);
+}
+
+#[test]
+fn gh407_batchtradecpi_plain_owner_layout_unchanged() {
+    plain_owner_layout_unchanged(CpiKind::Batch);
+}
