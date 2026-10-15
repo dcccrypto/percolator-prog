@@ -425,7 +425,7 @@ fn p1p2_ext1_stale_mark_flip_is_not_treated_as_reducing() {
 #[test]
 fn p1p2_fee_request_is_capped_by_taker_fee_bps_and_paid_to_lp() {
     let mut w = W::new(0);
-    // Wide spread so the requested fee (= ceil(|exec-oracle|·1e4/oracle)) is clearly > 0.
+    // Wide spread so the requested fee (= floor(|exec-oracle|·1e4/oracle), match #37) is clearly > 0.
     let lp = w.lp_kind2(20_000_000, 100);
     let (t, tp) = w.user(50_000_000);
     w.set_limits(0, 0, 0, 0, Some(1), Some(200)).expect("tag 93 ext 1 + fee channel 200 bps");
