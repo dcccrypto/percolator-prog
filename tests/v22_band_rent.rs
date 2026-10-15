@@ -3551,3 +3551,222 @@ fn v22_f1_dust_shortfall_waits_for_material_progress() {
     }
     assert!(!f1_hlock(&env));
 }
+
+// ---------------------------------------------------------------------------
+// ROLLBACK build (rollback/v22-f1-tolerant-growth-r2): f6e7180d's logic that ACCEPTS every growth
+// record the v2.2 combined (growth round 2, 153c62fc) can write. The combined's byte patterns
+// below are the ones observed on the clone (ledger `v22-combined-upgrade-simulation-2026-10-14.md`
+// §4.1): byte 44 = 0x04 after a 35 B push (DEPTH_PREV_REAL), 0x85 after a 44 B push
+// (DEPTH_EVER | DEPTH_PREV_REAL | source 1), plus last-good depth @80..96, rise stamp @114..118,
+// `collateral_decimals + 1` @46. A real differential (records written by the combined BPF, then
+// the program swapped for this build) is `rollback_differential_from_combined_bpf` (ignored; needs
+// COMBINED_SO).
+// ---------------------------------------------------------------------------
+
+impl Env {
+    /// STATE POKE: overwrite bytes of the growth record at `off` (record-relative).
+    fn poke_growth(&mut self, off: usize, bytes: &[u8]) {
+        let mut acc = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&acc.data, 0).unwrap();
+        acc.data[r.start + off..r.start + off + bytes.len()].copy_from_slice(bytes);
+        self.svm.set_account(self.market, acc).unwrap();
+    }
+
+    /// The raw 120-byte growth record.
+    fn growth_bytes(&self) -> Vec<u8> {
+        let acc = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&acc.data, 0).unwrap();
+        acc.data[r].to_vec()
+    }
+
+    /// Everything a rollback must accept on the market: a 35 B push, a 44 B push, a crank, a
+    /// rent settlement (reads the record) and a trade (reads the cap).
+    fn rollback_exercise(&mut self, lp: &Lp, tag: &str) {
+        self.warp(1);
+        self.push(PRICE);
+        self.warp(1);
+        self.push_depth(PRICE, 1, 600 * USD as u64).unwrap_or_else(|e| panic!("{tag}: 44 B push refused: {e}"));
+        self.crank(lp.account).unwrap_or_else(|e| panic!("{tag}: crank refused: {e}"));
+        self.crank_current(lp.account); // catch the asset clock up (a market with an open position lags)
+        self.settle_rent(lp.account, lp.account).unwrap_or_else(|e| panic!("{tag}: tag 106 refused: {e}"));
+        let t = self.trader(1_000 * USD);
+        self.trade_cpi(&t.0, t.1, lp, 10 * Q).unwrap_or_else(|e| panic!("{tag}: trade refused: {e}"));
+        self.assert_conservation();
+    }
+}
+
+/// The combined's record after ONE 35 B push on a market that had attested depth (live pumpswap
+/// markets: byte 44 was 1): byte 44 = 0x04, the live record otherwise unchanged.
+#[test]
+fn rollback_accepts_combined_record_after_35b_push() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    env.warp(1);
+    env.push(PRICE); // the 35 B push (f6e7180d form: source 0, depth 0, prev 600)
+    // STATE POKE: what the combined leaves: DEPTH_PREV_REAL on a source-NONE sample; decimals + 1.
+    env.poke_growth(44, &[0x04]);
+    env.poke_growth(46, &[7]);
+    assert_eq!(env.growth().depth_source, 0x04);
+    env.rollback_exercise(&lp, "35 B");
+    // The record still decodes and the combined-only bytes are untouched.
+    let b = env.growth_bytes();
+    assert_eq!(b[46], 7, "collateral decimals + 1 round-trips");
+    // A refused-before / accepted-now control: the unmodified validator would read 0x04 as corrupt.
+    assert!(!percolator_prog::growth_v19::depth_source_byte_tolerant_ok(0x08));
+}
+
+/// The combined's record after a 44 B push: byte 44 = 0x85, last-good depth @80..96, the rise
+/// stamp @114..118; then the rollback's own pushes / cranks / trades. DEPTH_EVER and the
+/// combined-only bytes survive every rollback write (a re-upgrade finds them), DEPTH_PREV_REAL is
+/// dropped (re-derived by the combined's next push).
+#[test]
+fn rollback_accepts_combined_record_after_44b_push_and_preserves_it() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    let slot = env.clock_slot();
+    // STATE POKE: the combined's extra fields for this sample.
+    env.poke_growth(44, &[0x85]);
+    env.poke_growth(46, &[7]);
+    env.poke_growth(80, &(600 * USD as u64).to_le_bytes());
+    env.poke_growth(88, &slot.to_le_bytes());
+    env.poke_growth(114, &((slot / 64) as u32).to_le_bytes());
+    let before = env.growth_bytes();
+    assert_eq!(before[44], 0x85);
+    env.rollback_exercise(&lp, "44 B");
+    let after = env.growth_bytes();
+    assert_eq!(after[44] & 0x80, 0x80, "DEPTH_EVER survives the rollback's pushes");
+    assert_eq!(after[44] & 0x04, 0, "DEPTH_PREV_REAL is not claimed by the rollback");
+    assert_eq!(after[44] & 0x03, 1, "the rollback's own attested source");
+    for (name, r) in [("decimals+1", 46..47usize), ("last good e6 + slot", 80..96), ("tier table", 96..114), ("rise stamp", 114..118)] {
+        assert_eq!(&after[r.clone()], &before[r.clone()], "{name} untouched by the rollback");
+    }
+}
+
+/// W-M1: a market the combined saw a depth on (DEPTH_EVER, last-good $600) is never uncapped by a
+/// missing depth: the 35 B form (depth absent) keeps the sticky cap (300 units at kappa 0.5) while
+/// the control without DEPTH_EVER has today's full capacity; the sticky cap halves per 9,000
+/// stale slots and a fully decayed one is a cap of 0, never "uncapped".
+#[test]
+fn rollback_missing_depth_never_switches_the_cap_off_once_the_combined_saw_one() {
+    let full = 1_000 * Q as u64;
+    // Control: no DEPTH_EVER -> no cap on a missing depth (f6e7180d exactly).
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.warp(1);
+    env.push(PRICE);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, full, "control: never had a depth, no cap");
+    // DEPTH_EVER + last good $600 (the combined's sticky state), depth absent now.
+    let slot = env.clock_slot();
+    env.poke_growth(44, &[0x80]);
+    env.poke_growth(80, &(600 * USD as u64).to_le_bytes());
+    env.poke_growth(88, &slot.to_le_bytes());
+    env.warp(1);
+    env.push(PRICE);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "EVER + absent depth: the sticky $600 caps at kappa 0.5");
+    let t = env.trader(1_000 * USD);
+    let _ = env.trade_cpi(&t.0, t.1, &lp, 400 * Q);
+    assert!(env.pos(t.1) <= 300 * Q, "a trade past the sticky cap: {}", env.pos(t.1));
+    // One staleness epoch later the sticky depth has halved.
+    env.warp(9_000);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    env.settle_rent(lp.account, lp.account).expect("tag 106");
+    assert_eq!(env.growth().rent_n_cap_q, 150 * Q as u64, "one epoch: $300 -> 150 units");
+}
+
+/// The combined's on-chain DEX depth (source 2) and a custom tier table: this build reads the
+/// source as NONE (tier 0) but accepts and cranks the market; a mode-2 push is refused cleanly with
+/// DepthInputInvalid (128) and changes nothing; and a fresh DEX-sourced depth still caps (kappa 0.5).
+#[test]
+fn rollback_dex_source_and_custom_tier_table_are_accepted_and_held_at_tier_zero() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    // STATE POKE: source 2 (DEX) | PREV_REAL | EVER; a custom table (L1 = 3x) and T1 = $50k.
+    env.poke_growth(44, &[0x86]);
+    env.poke_growth(46, &[7]);
+    env.poke_growth(45, &[2]); // attested_max_tier 2
+    env.poke_growth(96, &50_000u32.to_le_bytes());
+    env.poke_growth(108, &300u16.to_le_bytes());
+    env.settle_rent(lp.account, lp.account).expect("tag 106 on a DEX-sourced record");
+    assert_eq!(env.growth().rent_n_cap_q, 300 * Q as u64, "fresh DEX depth $600 still caps at kappa 0.5");
+    let before = env.growth_bytes();
+    let seq = env.oracle_seq();
+    let r = env.push_depth(PRICE, 2, 0);
+    assert_err(&r, &code(PercolatorError::DepthInputInvalid), "mode 2 is refused cleanly");
+    assert_eq!(env.oracle_seq(), seq, "a refused push changes nothing");
+    assert_eq!(env.growth_bytes(), before, "and no growth byte moves");
+    env.rollback_exercise(&lp, "DEX/custom");
+    assert_eq!(env.growth_bytes()[96..114], before[96..114], "the custom tier table round-trips");
+    assert_eq!(env.growth_bytes()[45], 2, "attested_max_tier round-trips");
+}
+
+/// A corrupt combined-range record is still refused (fail closed): byte 44 with a bit outside
+/// {0,1,2,7}, source 3, attested_max_tier 4, decimals + 1 of 14, a non-zero byte 47.
+#[test]
+fn rollback_still_refuses_records_the_combined_cannot_write() {
+    for (off, val, what) in [(44usize, 0x08u8, "bit 3"), (44, 0x03, "source 3"), (44, 0x40, "bit 6"), (45, 4, "attested_max_tier 4"), (46, 14, "decimals+1 14"), (47, 1, "byte 47")] {
+        let mut env = Env::new(band_cfg());
+        env.auth_mark();
+        let lp = env.lp(1_000 * USD);
+        env.warp(1);
+        env.crank(lp.account).expect("control: the unpoked record cranks");
+        env.poke_growth(off, &[val]);
+        env.warp(1);
+        let r = env.crank(lp.account);
+        assert!(r.as_ref().is_err_and(|e| e.contains("InvalidAccountData")), "{what}: a record the combined cannot write must be refused: {r:?}");
+    }
+}
+
+/// DIFFERENTIAL (ignored; `COMBINED_SO` = the combined wrapper at RC IDs, `GROWTH_WRAPPER_SO` or
+/// target/deploy = this build): the market is created and driven by the combined BPF (35 B and 44 B
+/// pushes, cranks, a trade), then the PROGRAM IS SWAPPED for this build in the same LiteSVM and the
+/// same operations must still land; finally the combined is swapped back (re-upgrade) and lands.
+#[test]
+#[ignore]
+fn rollback_differential_from_combined_bpf() {
+    let combined = PathBuf::from(std::env::var_os("COMBINED_SO").expect("COMBINED_SO"));
+    let rollback = std::fs::read(program_path()).expect("rollback .so");
+    let mut env = f1_env(Some(combined.clone()), band_cfg());
+    let comb = std::fs::read(&combined).unwrap();
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    env.warp(1);
+    env.push(PRICE);
+    let g = env.growth_bytes();
+    println!("combined after 35 B push: byte44={:#04x} {:?}", g[44], &g[80..120]);
+    assert_ne!(g[44] & 0x04, 0, "the combined set DEPTH_PREV_REAL: this really is its record");
+    env.depth_twice(600 * USD as u64);
+    env.warp(1);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("third attested push (previous sample now real)");
+    let g = env.growth_bytes();
+    println!("combined after 44 B pushes: byte44={:#04x} {:?}", g[44], &g[80..120]);
+    assert_eq!(g[44], 0x85);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("trade on the combined");
+    // Swap to the rollback build (an in-place program upgrade).
+    env.svm.add_program(env.program_id, &rollback);
+    env.rollback_exercise(&lp, "combined -> rollback");
+    let g = env.growth_bytes();
+    println!("rollback after its pushes: byte44={:#04x} {:?}", g[44], &g[80..120]);
+    assert_eq!(g[44] & 0x80, 0x80);
+    // Re-upgrade to the combined.
+    env.svm.add_program(env.program_id, &comb);
+    env.warp(1);
+    env.push(PRICE);
+    env.warp(1);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("combined 44 B push after the round trip");
+    env.crank(lp.account).expect("combined crank after the round trip");
+    env.crank_current(lp.account);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("combined trade after the round trip");
+}

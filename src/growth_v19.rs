@@ -1051,6 +1051,125 @@ pub fn depth_tier(effective_depth_e6: u64, source: u8) -> u8 {
     }
 }
 
+// ── ROLLBACK (tolerant of the v2.2 combined / growth round 2 record) ───────────────────────
+// This build is the rollback target for the combined wrapper (growth round 2). The combined
+// writes more into the growth record than f6e7180d knows: byte 44 bit 2 (`DEPTH_PREV_REAL`),
+// bit 7 (`DEPTH_EVER`), source 2 (on-chain DEX), bytes 45..47 (`attested_max_tier`, collateral
+// decimals + 1), 80..96 (`depth_last_good_*`), 96..114 (tier table) and 114..118 (rise stamp).
+// Nothing below changes what an f6e7180d-written record does; it only (a) lets the validator
+// accept the combined's records, (b) reads every source this build does not know as NO source,
+// and (c) never lets a missing depth switch the kappa cap off once the combined saw one (W-M1).
+
+/// Byte 44 bits 0-1: the source of the stored `depth_e6`.
+pub const DEPTH_SOURCE_MASK: u8 = 0x03;
+/// Byte 44 bit 2 (combined): the PREVIOUS sample was a real reading.
+pub const DEPTH_PREV_REAL: u8 = 0x04;
+/// Byte 44 bit 7 (combined, sticky): a fresh effective depth was seen once on this market.
+pub const DEPTH_EVER: u8 = 0x80;
+/// The largest source value the combined writes (2 = on-chain DEX).
+pub const DEPTH_SOURCE_DEX: u8 = 2;
+/// Combined `attested_max_tier` bound, and `collateral_decimals_p1` bound (12 + 1).
+pub const ROLLBACK_ATTESTED_MAX_TIER: u8 = 3;
+pub const ROLLBACK_DECIMALS_P1_MAX: u8 = 13;
+/// The combined's sticky cap halves once per ratchet epoch of staleness.
+pub const ROLLBACK_STICKY_EPOCH_SLOTS: u64 = RATCHET_EPOCH_SLOTS;
+
+/// Validator for byte 44: only bits 0-1 (source 0..=2), bit 2 and bit 7 may be set.
+pub fn depth_source_byte_tolerant_ok(b: u8) -> bool {
+    b & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_EVER) == 0
+        && (b & DEPTH_SOURCE_MASK) <= DEPTH_SOURCE_DEX
+}
+
+/// The source this build understands: keeper-attested (1) is itself; none (0), the on-chain DEX
+/// (2) and anything else read as NONE (tier 0). Flag bits are ignored.
+pub fn depth_source_known(b: u8) -> u8 {
+    if b & DEPTH_SOURCE_MASK == DEPTH_SOURCE_ATTESTED {
+        DEPTH_SOURCE_ATTESTED
+    } else {
+        DEPTH_SOURCE_NONE
+    }
+}
+
+/// The new byte 44 after a PushAuthMark: `new_source` (this build's own 0 / 1) with the combined's
+/// sticky `DEPTH_EVER` carried through untouched, so a later re-upgrade still sees that a
+/// depth was once seen (W-M1). `DEPTH_PREV_REAL` is cleared: this build keeps no previous-real
+/// claim (it reads `depth_prev_e6 != 0`), and the combined re-derives the bit on its first push
+/// from the stored source bits; a clear bit only reads the pair as absent (sticky cap / no new
+/// cap), never as a stale "real" one. For a record this build wrote alone the byte is exactly
+/// f6e7180d's (0 / 1).
+pub fn depth_source_after_push(old: u8, new_source: u8) -> u8 {
+    (new_source & DEPTH_SOURCE_MASK) | (old & DEPTH_EVER)
+}
+
+/// The combined's sticky depth: `last_good >> floor((now - last_good_slot) / 9,000)`, 0 from 64
+/// epochs on. A `last_good_slot` after `now` reads as age 0 (no decay: still a cap).
+pub fn rollback_sticky_depth_e6(last_good_e6: u64, last_good_slot: u64, now_slot: u64) -> u64 {
+    let k = now_slot.saturating_sub(last_good_slot) / ROLLBACK_STICKY_EPOCH_SLOTS;
+    if k >= 64 {
+        0
+    } else {
+        last_good_e6 >> k
+    }
+}
+
+/// The depth the kappa cap on `N_cap` reads (0 = no cap, as `depth_cap_q`). W-M1: a missing
+/// depth never switches the cap off once the combined saw one.
+/// * a fresh effective depth (this build's own `effective_depth_e6`): itself, whatever source
+///   wrote it (a DEX reading caps at tier 0, kappa 0.5: tighter than ignoring it);
+/// * a fresh REAL zero (source bits non-zero, `depth_e6 == 0`, stamp fresh): 1 atom, i.e. a cap
+///   of 0 (opens closed), as the combined. f6e7180d never stores this (a 0 is source NONE);
+/// * none fresh but `DEPTH_EVER`: the sticky depth, floored at 1 atom (a decayed sticky depth is
+///   a cap of 0, never "uncapped");
+/// * otherwise 0: never had a depth, no depth cap (f6e7180d exactly).
+pub fn rollback_cap_depth_e6(
+    effective_depth_e6: u64,
+    depth_source_byte: u8,
+    depth_e6: u64,
+    depth_slot: u64,
+    last_good_e6: u64,
+    last_good_slot: u64,
+    now_slot: u64,
+) -> u64 {
+    if effective_depth_e6 > 0 {
+        return effective_depth_e6;
+    }
+    let fresh = matches!(now_slot.checked_sub(depth_slot), Some(age) if age <= DEPTH_MAX_AGE_SLOTS);
+    if fresh && depth_source_byte & DEPTH_SOURCE_MASK != 0 && depth_e6 == 0 {
+        return 1;
+    }
+    if depth_source_byte & DEPTH_EVER != 0 {
+        let s = rollback_sticky_depth_e6(last_good_e6, last_good_slot, now_slot);
+        return if s == 0 { 1 } else { s };
+    }
+    0
+}
+
+/// Whether the combined's tier table is the protocol default: thresholds `[0|25k, 0|100k,
+/// 0|500k]` whole tokens, leverage `[0|500, 0|1000, 0|2000]` and 6-decimal collateral (stored
+/// decimals + 1 of 0 or 7). Only then does this build's fixed tier table apply; a market with a
+/// custom table (or other decimals) is held at tier 0 (launch leverage, the minimum of any
+/// table), because this build cannot honour the custom table and must never be looser than it.
+pub fn rollback_tier_config_is_default(
+    threshold_usd: [u32; 3],
+    leverage_x100: [u16; 3],
+    collateral_decimals_p1: u8,
+) -> bool {
+    if collateral_decimals_p1 != 0 && collateral_decimals_p1 != 7 {
+        return false;
+    }
+    let mut i = 0;
+    while i < 3 {
+        if threshold_usd[i] != 0 && threshold_usd[i] != [25_000u32, 100_000, 500_000][i] {
+            return false;
+        }
+        if leverage_x100[i] != 0 && leverage_x100[i] != [500u16, 1_000, 2_000][i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// `L_depth` (x100): tier 0 -> `L_launch`, 1 -> 5x, 2 -> 10x, 3 -> 20x.
 pub fn l_depth_x100(tier: u8, l_launch_x100: u16) -> u16 {
     match tier {
@@ -1904,6 +2023,103 @@ mod tests {
         assert!(graduation_on(true, 130, 1));
         assert!(!graduation_on(false, 130, 1), "no clamp, no graduation");
         assert!(!graduation_on(true, 130, 0), "tier 0 (absent depth), no graduation");
+    }
+
+    // ── ROLLBACK build: the combined's byte-44 / sticky / tier-table rules ──────────────────
+    #[test]
+    fn rollback_depth_source_byte_validator_matches_the_combined() {
+        // Every byte the combined can write is accepted; everything else is refused.
+        for b in 0u16..=255 {
+            let b = b as u8;
+            let combined = b & !(0x03 | 0x04 | 0x80) == 0 && (b & 0x03) <= 2;
+            assert_eq!(depth_source_byte_tolerant_ok(b), combined, "byte {b:#04x}");
+        }
+        for ok in [0x00u8, 0x01, 0x02, 0x04, 0x05, 0x06, 0x80, 0x81, 0x82, 0x84, 0x85, 0x86] {
+            assert!(depth_source_byte_tolerant_ok(ok), "{ok:#04x}");
+        }
+        for bad in [0x03u8, 0x07, 0x08, 0x10, 0x40, 0x83, 0xFF] {
+            assert!(!depth_source_byte_tolerant_ok(bad), "{bad:#04x}");
+        }
+    }
+
+    #[test]
+    fn rollback_unknown_sources_are_no_source() {
+        for b in [0x00u8, 0x02, 0x04, 0x06, 0x80, 0x84, 0x86, 0x82] {
+            assert_eq!(depth_source_known(b), DEPTH_SOURCE_NONE, "{b:#04x}");
+            assert_eq!(depth_tier(DEPTH_TIER3_E6, depth_source_known(b)), 0, "tier 0: {b:#04x}");
+        }
+        for b in [0x01u8, 0x05, 0x81, 0x85] {
+            assert_eq!(depth_source_known(b), DEPTH_SOURCE_ATTESTED, "{b:#04x}");
+            assert_eq!(depth_tier(DEPTH_TIER3_E6, depth_source_known(b)), 1, "I-D3 cap: {b:#04x}");
+        }
+    }
+
+    #[test]
+    fn rollback_push_keeps_ever_and_never_claims_prev_real() {
+        for old in [0x00u8, 0x01, 0x04, 0x05, 0x80, 0x81, 0x84, 0x85, 0x82, 0x86, 0x02] {
+            for src in [DEPTH_SOURCE_NONE, DEPTH_SOURCE_ATTESTED] {
+                let n = depth_source_after_push(old, src);
+                assert_eq!(n & DEPTH_SOURCE_MASK, src);
+                assert_eq!(n & DEPTH_EVER, old & DEPTH_EVER, "EVER is sticky");
+                assert_eq!(n & DEPTH_PREV_REAL, 0);
+                assert!(depth_source_byte_tolerant_ok(n));
+            }
+        }
+        // A record this build wrote alone is f6e7180d's byte exactly.
+        assert_eq!(depth_source_after_push(0, 1), 1);
+        assert_eq!(depth_source_after_push(1, 0), 0);
+    }
+
+    #[test]
+    fn rollback_sticky_depth_halves_per_epoch_and_decays_to_zero() {
+        assert_eq!(rollback_sticky_depth_e6(800, 1_000, 1_000), 800);
+        assert_eq!(rollback_sticky_depth_e6(800, 1_000, 1_000 + 8_999), 800);
+        assert_eq!(rollback_sticky_depth_e6(800, 1_000, 1_000 + 9_000), 400);
+        assert_eq!(rollback_sticky_depth_e6(800, 1_000, 1_000 + 27_000), 100);
+        assert_eq!(rollback_sticky_depth_e6(800, 1_000, 1_000 + 9_000 * 64), 0);
+        assert_eq!(rollback_sticky_depth_e6(800, 5_000, 1_000), 800, "a future stamp reads as age 0");
+        // matches the combined's formula over a sweep
+        for k in 0u64..70 {
+            let want = if k >= 64 { 0 } else { 123_456_789u64 >> k };
+            assert_eq!(rollback_sticky_depth_e6(123_456_789, 10, 10 + k * 9_000), want);
+        }
+    }
+
+    #[test]
+    fn rollback_cap_depth_never_uncaps_a_market_the_combined_saw_a_depth_on() {
+        let now = 1_000_000u64;
+        // fresh effective depth: itself, whatever the source
+        assert_eq!(rollback_cap_depth_e6(7, 0x86, 9, now, 5, 5, now), 7);
+        // never had a depth (no EVER), nothing fresh: no cap (f6e7180d)
+        assert_eq!(rollback_cap_depth_e6(0, 0x00, 0, 0, 0, 0, now), 0);
+        assert_eq!(rollback_cap_depth_e6(0, 0x01, 100, now, 0, 0, now), 0, "first sample of a pair");
+        // EVER, nothing fresh: the sticky cap, never 0 (= uncapped)
+        assert_eq!(rollback_cap_depth_e6(0, 0x80, 0, now - 10_000, 800, now - 100, now), 800);
+        assert_eq!(rollback_cap_depth_e6(0, 0x80, 0, 0, 800, now - 9_100, now), 400);
+        assert_eq!(rollback_cap_depth_e6(0, 0x84, 0, 0, 800, 0, now), 1, "fully decayed: a cap of 0, not none");
+        assert_eq!(rollback_cap_depth_e6(0, 0x80, 0, 0, 0, 0, now), 1, "EVER with last good 0");
+        // a fresh REAL zero (the combined's "opens closed at once"), with or without EVER
+        assert_eq!(rollback_cap_depth_e6(0, 0x01, 0, now - 3, 0, 0, now), 1);
+        assert_eq!(rollback_cap_depth_e6(0, 0x82, 0, now, 800, now, now), 1);
+        // the same zero but stale (> 150 slots) is just absent
+        assert_eq!(rollback_cap_depth_e6(0, 0x01, 0, now - 151, 0, 0, now), 0);
+        // depth cap with the mapped value: 1 atom caps at 0 notional at every tier-0 kappa
+        assert_eq!(depth_cap_q(0, 1, 10_000_000, 1_000_000), 0);
+    }
+
+    #[test]
+    fn rollback_tier_config_default_predicate() {
+        let d_t = [0u32, 0, 0];
+        let d_l = [0u16, 0, 0];
+        assert!(rollback_tier_config_is_default(d_t, d_l, 0));
+        assert!(rollback_tier_config_is_default(d_t, d_l, 7));
+        assert!(rollback_tier_config_is_default([25_000, 100_000, 500_000], [500, 1_000, 2_000], 7));
+        assert!(rollback_tier_config_is_default([25_000, 0, 500_000], [0, 1_000, 0], 0));
+        assert!(!rollback_tier_config_is_default([50_000, 0, 0], d_l, 7), "custom T1");
+        assert!(!rollback_tier_config_is_default(d_t, [300, 0, 0], 7), "custom L1");
+        assert!(!rollback_tier_config_is_default([0, 0, 600_000], d_l, 7), "custom T3");
+        assert!(!rollback_tier_config_is_default(d_t, d_l, 10), "9-decimal collateral");
+        assert!(!rollback_tier_config_is_default(d_t, d_l, 1), "0-decimal collateral");
     }
 
     #[test]

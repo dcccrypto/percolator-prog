@@ -7566,6 +7566,9 @@ pub mod state {
         /// push, or never pushed), 1 = keeper-attested (capped at tier 1, I-D3). Nothing else is
         /// accepted until an on-chain pool reader exists.
         pub depth_source: u8, // 44
+        /// ROLLBACK build: bytes 45..48 are written by the v2.2 combined (growth round 2) as
+        /// `[attested_max_tier, collateral_decimals + 1, 0]`. Kept as raw bytes here (the record
+        /// round-trips them untouched); see `r2_*` accessors below.
         pub _reserved0: [u8; 3], // 45..48
         /// v2.2 item 2: snapshot of the bound vault LP's `N_cap` (engine Q, clamped to the
         /// engine position limit), refreshed wherever the LP's equity is in hand (post-fill,
@@ -7579,7 +7582,11 @@ pub mod state {
         /// G8: the depth of the push BEFORE the last one. The effective depth is
         /// `min(depth_e6, depth_prev_e6)`, so a one-push spike buys nothing.
         pub depth_prev_e6: u64, // 72..80
+        /// ROLLBACK build: 80..104 = combined `depth_last_good_e6` u64 LE, `depth_last_good_slot`
+        /// u64 LE, tier thresholds T1 T2 (u32 LE each).
         pub _reserved1: [u8; 24],    // 80..104
+        /// ROLLBACK build: 104..120 = combined T3 (u32 LE), leverage L1 L2 L3 (u16 LE each at
+        /// 108..114), rise stamp (u32 LE at 114..118), 2 reserved.
         pub _reserved2: [u8; 16],    // 104..120
     }
     const _: () =
@@ -7598,6 +7605,29 @@ pub mod state {
     const _: () = assert!(core::mem::offset_of!(AssetGrowthV19, _reserved2) == 104);
 
     impl AssetGrowthV19 {
+        /// ROLLBACK build: the combined's `(depth_last_good_e6, depth_last_good_slot)` (80..96).
+        pub fn r2_last_good(&self) -> (u64, u64) {
+            let mut a = [0u8; 8];
+            a.copy_from_slice(&self._reserved1[0..8]);
+            let mut b = [0u8; 8];
+            b.copy_from_slice(&self._reserved1[8..16]);
+            (u64::from_le_bytes(a), u64::from_le_bytes(b))
+        }
+
+        /// ROLLBACK build: whether the combined's tier table (96..114) and collateral decimals
+        /// (46) are the protocol default (`growth_v19::rollback_tier_config_is_default`).
+        pub fn r2_tier_config_is_default(&self) -> bool {
+            let r1 = &self._reserved1;
+            let r2 = &self._reserved2;
+            let u32_at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+            let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+            crate::growth_v19::rollback_tier_config_is_default(
+                [u32_at(r1, 16), u32_at(r1, 20), u32_at(r2, 0)],
+                [u16_at(r2, 4), u16_at(r2, 6), u16_at(r2, 8)],
+                self._reserved0[1],
+            )
+        }
+
         /// The graduation / depth fields (`growth_v19::GraduationFields`).
         pub fn graduation(&self) -> crate::growth_v19::GraduationFields {
             crate::growth_v19::GraduationFields {
@@ -7661,13 +7691,17 @@ pub mod state {
             .ok_or(ProgramError::InvalidAccountData)?;
         if g.version != crate::growth_v19::GROWTH_VERSION
             || g.flags != 0
-            || g._reserved0 != [0u8; 3]
-            // G8 (§1.3): the depth bytes 44 and 56..80 carry data; only the two known sources.
-            || g.depth_source > crate::growth_v19::DEPTH_SOURCE_ATTESTED
+            // ROLLBACK (tolerant of the v2.2 combined's record): 45 = attested_max_tier (<= 3),
+            // 46 = collateral decimals + 1 (<= 13), 47 = 0 -- the combined's own bounds. Bytes 80..120
+            // (last good depth, tier table, rise stamp) are not validated here: this build reads
+            // them only through `r2_*` and a garbage value can only hold the tier at 0 / cap.
+            || g._reserved0[0] > crate::growth_v19::ROLLBACK_ATTESTED_MAX_TIER
+            || g._reserved0[1] > crate::growth_v19::ROLLBACK_DECIMALS_P1_MAX
+            || g._reserved0[2] != 0
+            // G8 (§1.3) + combined: byte 44 = source 0..=2 (bits 0-1), bit 2 PREV_REAL, bit 7 EVER.
+            || !crate::growth_v19::depth_source_byte_tolerant_ok(g.depth_source)
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
-            || g._reserved1 != [0u8; 24]
-            || g._reserved2 != [0u8; 16]
             || g.alloc_alpha_bps != 0
             || g.alloc_buffer_bps != 0
             || g.cushion_target_bps != 0
@@ -27853,12 +27887,16 @@ pub mod processor {
         g.depth_e6 = d;
         g.depth_prev_e6 = prev;
         g.depth_slot = slot;
-        // The source describes the stored `depth_e6`: none once it is 0.
-        g.depth_source = if d == 0 {
-            growth_v19::DEPTH_SOURCE_NONE
-        } else {
-            source
-        };
+        // The source describes the stored `depth_e6`: none once it is 0. ROLLBACK: the
+        // combined's sticky DEPTH_EVER bit is carried through (`depth_source_after_push`).
+        g.depth_source = growth_v19::depth_source_after_push(
+            g.depth_source,
+            if d == 0 {
+                growth_v19::DEPTH_SOURCE_NONE
+            } else {
+                source
+            },
+        );
         let ctx = growth_g8_ctx_view(group, asset_index, &g)?;
         if ctx.clamp {
             let (ceil, slot) = growth_v19::graduation_fall_only(
@@ -42005,7 +42043,8 @@ pub mod processor {
         graduation: bool,
         /// `growth_v19::depth_tier(effective depth, source)`; 0 off the clamp.
         tier: u8,
-        /// `growth_v19::effective_depth_e6(..)`; 0 off the clamp.
+        /// ROLLBACK: the kappa cap's depth input (`growth_v19::rollback_cap_depth_e6`: the fresh
+        /// `effective_depth_e6(..)`, else the sticky / real-zero cap); 0 = no cap, and 0 off the clamp.
         effective_depth_e6: u64,
         /// §1.2 force-down: a senior draw / G9 backstop outstanding (the fill-time halt mirror
         /// or unbooked moved atoms), the bankruptcy h-lock latched, or ADL on either side.
@@ -42033,9 +42072,27 @@ pub mod processor {
             });
         }
         let now = authenticated_market_slot_or_fallback_view(group);
-        let effective_depth_e6 =
+        let fresh_depth_e6 =
             growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, now);
-        let tier = growth_v19::depth_tier(effective_depth_e6, g.depth_source);
+        // ROLLBACK: a source this build does not know (the combined's on-chain DEX) is NO source
+        // (tier 0), and a custom combined tier table / non-6-decimal collateral holds tier 0.
+        let tier = if g.r2_tier_config_is_default() {
+            growth_v19::depth_tier(fresh_depth_e6, growth_v19::depth_source_known(g.depth_source))
+        } else {
+            0
+        };
+        // ROLLBACK (W-M1): the kappa cap's depth input; a missing depth never uncaps a market
+        // the combined saw a depth on (sticky `DEPTH_EVER` cap from the last good depth).
+        let (last_good_e6, last_good_slot) = g.r2_last_good();
+        let effective_depth_e6 = growth_v19::rollback_cap_depth_e6(
+            fresh_depth_e6,
+            g.depth_source,
+            g.depth_e6,
+            g.depth_slot,
+            last_good_e6,
+            last_good_slot,
+            now,
+        );
         let market = group
             .markets
             .get(asset_index)
@@ -48044,6 +48101,55 @@ mod g8_kani_proofs {
         kani::cover!(src == DEPTH_SOURCE_ATTESTED && d >= DEPTH_TIER3_E6 && t == 1, "tier-3 depth capped at 1");
         kani::cover!(src == DEPTH_SOURCE_ATTESTED && d == DEPTH_TIER1_E6 - 1 && t == 0, "just below tier 1");
         kani::cover!(src == 2 && d >= DEPTH_TIER3_E6 && t == 0, "unbuilt on-chain source fails closed");
+    }
+
+    /// ROLLBACK W-M1: once the combined set DEPTH_EVER, a missing depth is never "no cap"
+    /// (`rollback_cap_depth_e6 > 0`); a fresh effective depth passes through unchanged; with no
+    /// EVER, no fresh real zero and nothing fresh the cap is off exactly as f6e7180d.
+    /// Mutants: drop the sticky branch; return 0 for a decayed sticky depth; ignore EVER.
+    #[kani::proof]
+    fn kani_rollback_cap_depth_never_uncaps_after_ever() {
+        let eff: u64 = kani::any();
+        let b: u8 = kani::any();
+        let d: u64 = kani::any();
+        let ds: u64 = kani::any();
+        let lg: u64 = kani::any();
+        let lgs: u64 = kani::any();
+        let now: u64 = kani::any();
+        let c = rollback_cap_depth_e6(eff, b, d, ds, lg, lgs, now);
+        if eff > 0 {
+            assert_eq!(c, eff);
+        } else if b & DEPTH_EVER != 0 {
+            assert!(c > 0, "EVER: a missing depth never switches the cap off");
+        } else if c == 0 {
+            assert!(b & DEPTH_EVER == 0);
+        }
+        kani::cover!(eff == 0 && b & DEPTH_EVER != 0 && c == 1, "decayed or zero sticky -> cap of 0");
+        kani::cover!(eff == 0 && b & DEPTH_EVER != 0 && c > 1, "sticky depth caps");
+        kani::cover!(eff == 0 && b & DEPTH_EVER == 0 && c == 0, "never had a depth: no cap");
+    }
+
+    /// ROLLBACK: whatever byte 44 holds, the source this build reads is NONE or attested, so the
+    /// tier is at most 1 (I-D3) and any non-attested source is tier 0; the push writer keeps EVER
+    /// and writes a byte the validator accepts.
+    /// Mutants: pass the raw source through; clear EVER on a push; keep PREV_REAL on a push.
+    #[kani::proof]
+    fn kani_rollback_unknown_source_is_tier_zero() {
+        let b: u8 = kani::any();
+        let d: u64 = kani::any();
+        let t = depth_tier(d, depth_source_known(b));
+        assert!(t <= 1);
+        if b & DEPTH_SOURCE_MASK != DEPTH_SOURCE_ATTESTED {
+            assert_eq!(t, 0);
+        }
+        let new_src: u8 = kani::any();
+        kani::assume(new_src <= DEPTH_SOURCE_ATTESTED);
+        let n = depth_source_after_push(b, new_src);
+        assert_eq!(n & DEPTH_EVER, b & DEPTH_EVER);
+        assert_eq!(n & DEPTH_PREV_REAL, 0);
+        assert!(depth_source_byte_tolerant_ok(n));
+        kani::cover!(b & DEPTH_SOURCE_MASK == 2 && d >= DEPTH_TIER3_E6, "DEX source");
+        kani::cover!(b & DEPTH_EVER != 0, "EVER carried");
     }
 
     /// I-D1: stale (> 150 slots), future-stamped or absent (either read 0) depth is effective 0,
