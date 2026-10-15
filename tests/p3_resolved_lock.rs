@@ -4779,7 +4779,11 @@ impl World {
     fn escrow_portfolio(&mut self, u: usize, holder: Option<Pubkey>, nft_amount: u64, sweep: bool) -> Pubkey {
         let pid = self.env.program_id;
         let m = self.env.market;
-        let nft_prog = Pubkey::new_unique();
+        // GH#548 pin (prog#550): an escrowed portfolio can only exist under the protocol's
+        // pinned NFT program — tag 72/82 and the NFT-holder auth now refuse any other. Mount
+        // this escrow fixture at the pin so the modelled holder sweep reaches the engine, as
+        // the NFT test suites already do. (Was `Pubkey::new_unique()`, which the pin rejects.)
+        let nft_prog = Pubkey::new_from_array(percolator_prog::constants::NFT_PROGRAM_ID.to_bytes());
         let (reg_key, bump) = state::derive_nft_registry(&pid, &m);
         let mut rd = vec![0u8; state::nft_registry_account_len()];
         state::init_nft_registry(
