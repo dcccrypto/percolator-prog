@@ -7991,6 +7991,13 @@ pub mod ix {
             /// symmetrically to account_a and account_b.
             backing_fee_cap_bps: u16,
         },
+        /// ACCOUNT LAYOUT (GH#407, TradeCpi): `[0]` signer_a (w, signer), `[1]` market (w), `[2]` account_a (w),
+        /// `[3]` account_b (w), `[4]` matcher_prog, `[5]` matcher_ctx (w), `[6]` matcher_delegate,
+        /// then, ONLY when account_a's stored owner != signer_a (an NFT-escrowed portfolio), the
+        /// NFT-holder proof trio `[7]` nft_registry, `[8]` PositionNft PDA, `[9]` signer NFT ATA,
+        /// then the optional matcher tail (non-signer, non-program-owned accounts). When
+        /// account_a's owner == signer_a there is no trio and the tail starts at `[7]`
+        /// (unchanged). The discriminator is the on-chain stored owner, never a caller flag.
         TradeCpi {
             account_a_portfolio_id: u64,
             account_a_position_epoch: u64,
@@ -8027,6 +8034,13 @@ pub mod ix {
         },
         /// Atomic multi-leg batch routed through an external matcher: one batched matcher CPI fills
         /// every leg against a single LP, then all fills apply with one end-state margin check.
+        /// ACCOUNT LAYOUT (GH#407, BatchTradeCpi): `[0]` signer_a (w, signer), `[1]` market (w), `[2]` account_a (w),
+        /// `[3]` account_b (w), `[4]` matcher_prog, `[5]` matcher_ctx (w), `[6]` matcher_delegate,
+        /// then, ONLY when account_a's stored owner != signer_a (an NFT-escrowed portfolio), the
+        /// NFT-holder proof trio `[7]` nft_registry, `[8]` PositionNft PDA, `[9]` signer NFT ATA,
+        /// then the optional matcher tail (non-signer, non-program-owned accounts). When
+        /// account_a's owner == signer_a there is no trio and the tail starts at `[7]`
+        /// (unchanged). The discriminator is the on-chain stored owner, never a caller flag.
         BatchTradeCpi {
             account_a_portfolio_id: u64,
             account_a_position_epoch: u64,
@@ -18045,12 +18059,21 @@ pub mod processor {
             .map_err(map_v16_error)
     }
 
+    /// First matcher-tail account index of TradeCpi / BatchTradeCpi when the taker is the
+    /// portfolio owner (accounts 0..=6 are the fixed accounts).
+    const MATCHER_TAIL_BASE: usize = 7;
+    /// Number of NFT-holder proof accounts (registry, PositionNft PDA, signer NFT ATA) that sit
+    /// at `[MATCHER_TAIL_BASE .. MATCHER_TAIL_BASE + 3)` of TradeCpi / BatchTradeCpi when the
+    /// taker portfolio is escrowed (owner != signer). The matcher tail follows them (GH#407).
+    const NFT_HOLDER_PROOF_ACCOUNTS: usize = 3;
+
     fn matcher_tail_start_or_verify_lp_config<'a>(
         account_b_ai: &AccountInfo<'a>,
         expected_matcher_sequence: u64,
         matcher_prog_key: &Pubkey,
         matcher_ctx_key: &Pubkey,
         matcher_delegate_key: &Pubkey,
+        tail_start: usize,
     ) -> Result<(usize, u16), ProgramError> {
         let account_b_data = account_b_ai.try_borrow_data()?;
         // W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
@@ -18087,7 +18110,7 @@ pub mod processor {
         if !state::matcher_capability_is_live(expiry_slot, authenticated_slot_or_fallback(0)) {
             return Err(PercolatorError::Unauthorized.into());
         }
-        Ok((7, cfg.trade_fee_cap_bps()))
+        Ok((tail_start, cfg.trade_fee_cap_bps()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18240,16 +18263,30 @@ pub mod processor {
         )?;
         // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
         // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
-        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
-        let nft = optional_nft_holder_accounts(accounts, 7);
+        // GH#407 ABI: the NFT-holder proof trio `[7]=nft_registry [8]=PositionNft PDA
+        // [9]=signer NFT ATA` is present IFF the taker portfolio's stored owner is not the
+        // signer (an escrowed portfolio), and the matcher tail then starts at 10. When
+        // owner == signer there is NO trio and the tail starts at 7 (byte-identical to the
+        // pre-fix layout). The discriminator is the on-chain stored owner, which the caller
+        // cannot influence, so the layout is never caller-selected and no account can be
+        // shifted across the trio/tail boundary.
+        let taker_is_owner = account_a_owner == signer_a.key.to_bytes();
         authorize_owner_or_nft_holder_raw(
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
             signer_a.key,
-            nft,
+            if taker_is_owner {
+                None
+            } else {
+                optional_nft_holder_accounts(accounts, MATCHER_TAIL_BASE)
+            },
             program_id,
         )?;
+        // Authorization succeeded, so `account_a_owner` is exactly what was verified: the
+        // signer itself, or the escrow owner (NFT mint-authority PDA) whose NFT the signer
+        // holds. The shared execution path binds the portfolio to THIS owner, not to the
+        // signer key (which never matches an escrowed portfolio's stored owner).
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -18266,6 +18303,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE + if taker_is_owner { 0 } else { NFT_HOLDER_PROOF_ACCOUNTS },
         )?;
         // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): the taker's own
         // fee_bps consent (checked above) is independent of the LP's matcher capability
@@ -18510,7 +18548,7 @@ pub mod processor {
         )?;
         let fill = handle_trade_nocpi_zero_copy(
             program_id,
-            signer_a.key,
+            &Pubkey::new_from_array(account_a_owner),
             &account_b_owner_key,
             market_ai,
             account_a_ai,
@@ -19089,6 +19127,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE,
         )?;
 
         // The lp_account_id stored in the matcher context is the first 8 bytes of
@@ -19420,16 +19459,30 @@ pub mod processor {
         }
         // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
         // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
-        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
-        let nft = optional_nft_holder_accounts(accounts, 7);
+        // GH#407 ABI: the NFT-holder proof trio `[7]=nft_registry [8]=PositionNft PDA
+        // [9]=signer NFT ATA` is present IFF the taker portfolio's stored owner is not the
+        // signer (an escrowed portfolio), and the matcher tail then starts at 10. When
+        // owner == signer there is NO trio and the tail starts at 7 (byte-identical to the
+        // pre-fix layout). The discriminator is the on-chain stored owner, which the caller
+        // cannot influence, so the layout is never caller-selected and no account can be
+        // shifted across the trio/tail boundary.
+        let taker_is_owner = account_a_owner == signer_a.key.to_bytes();
         authorize_owner_or_nft_holder_raw(
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
             signer_a.key,
-            nft,
+            if taker_is_owner {
+                None
+            } else {
+                optional_nft_holder_accounts(accounts, MATCHER_TAIL_BASE)
+            },
             program_id,
         )?;
+        // Authorization succeeded, so `account_a_owner` is exactly what was verified: the
+        // signer itself, or the escrow owner (NFT mint-authority PDA) whose NFT the signer
+        // holds. The shared execution path binds the portfolio to THIS owner, not to the
+        // signer key (which never matches an escrowed portfolio's stored owner).
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -19446,6 +19499,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE + if taker_is_owner { 0 } else { NFT_HOLDER_PROOF_ACCOUNTS },
         )?;
         // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): see the mirror
         // check in handle_trade_cpi -- the taker's per-leg fee_bps consent (checked above)
@@ -19669,7 +19723,7 @@ pub mod processor {
         let mut fills: Vec<FillOut> = Vec::new();
         handle_batch_execute_zero_copy(
             program_id,
-            signer_a.key,
+            &Pubkey::new_from_array(account_a_owner),
             &account_b_owner_key,
             market_ai,
             account_a_ai,
