@@ -220,10 +220,12 @@ fn passive_price(oracle: u64, total_bps: u128, taker_buys: bool) -> u64 {
     }) as u64
 }
 
-/// The P2 request: ceil(|exec - oracle| * 1e4 / oracle), capped at 1023.
+/// The P2 request: floor(|exec - oracle| * 1e4 / oracle), capped at 1023 (percolator-match #37 /
+/// GH#36: the exec price is already rounded away from the taker, so the floor recovers the quoted
+/// total exactly; the pre-#37 ceil reported total + 1 at a non-round oracle).
 fn requested_bps(oracle: u64, exec: u64) -> u64 {
     let d = (exec as u128).abs_diff(oracle as u128);
-    div_ceil(d * 10_000, oracle as u128).min(1023) as u64
+    (d * 10_000 / oracle as u128).min(1023) as u64
 }
 
 fn split(fee: u128) -> policy_v16::FeeSplitParts {
@@ -927,8 +929,8 @@ fn p2_fee_channel_off_fills_without_request_bits_and_splits_base_fee_like_legacy
     assert_eq!(ret1.exec_size, size);
     assert_eq!(
         requested_bps(PRICE_ODD, exec),
-        31,
-        "fixture: the quote WOULD request 31 bps"
+        30,
+        "fixture: the quote WOULD request 30 bps (exactly the quote)"
     );
     // ...but without ACCEPTS_FEE_REQUEST the bits 22..31 are never set.
     assert_eq!(
@@ -984,10 +986,11 @@ fn p2_fee_channel_on_charges_requested_fee_to_taker_and_credits_lp_exactly() {
     );
     env.set_limits(0, 1, 100);
 
-    // Open (taker buys): ask = ceil(o*(1+30bps)) -> request 31 bps (ceil of 30.002).
+    // Open (taker buys): ask = ceil(o*(1+30bps)) -> request exactly 30 bps (floor of 30.002;
+    // the pre-#37 matcher's ceil reported 31).
     let exec_buy = passive_price(PRICE_ODD, spread as u128, true);
     let req_buy = requested_bps(PRICE_ODD, exec_buy);
-    assert_eq!(req_buy, 31);
+    assert_eq!(req_buy, 30);
     let before = env.money(ta, &lp);
     env.trade_cpi(&taker, ta, &lp, size, BASE_BPS + req_buy)
         .expect("taker signs base + requested exactly: fills");
@@ -998,7 +1001,7 @@ fn p2_fee_channel_on_charges_requested_fee_to_taker_and_credits_lp_exactly() {
     assert_eq!(
         ret.requested_fee_bits() as u64,
         req_buy,
-        "ACCEPTS_FEE_REQUEST sent: matcher returns ceil(|exec-o|*1e4/o) in bits 22..31"
+        "ACCEPTS_FEE_REQUEST sent: matcher returns floor(|exec-o|*1e4/o) in bits 22..31"
     );
     assert_eq!(env.pos(ta), size);
     assert_eq!(env.pos(lp.account), -size);
@@ -1053,7 +1056,7 @@ fn p2_fee_channel_refuses_without_taker_consent_or_above_protocol_max() {
         MatcherParams::passive(spread, 100),
     );
     let req = requested_bps(PRICE_ODD, passive_price(PRICE_ODD, spread as u128, true));
-    assert_eq!(req, 31);
+    assert_eq!(req, 30);
     let keys = [env.market, ta, lp.account, lp.ctx];
 
     // (a) taker signs one bps short of base + requested.
