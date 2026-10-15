@@ -13321,7 +13321,7 @@ pub mod lag_policy {
             Instruction::WithdrawInsuranceAsset { .. } => entry("WithdrawInsuranceAsset", LagPolicy::Gated, "custody domain-withdraw gate"),
             Instruction::CureAndCancelClose { .. } => entry("CureAndCancelClose", LagPolicy::MarkDriven, "close-ledger cure at P_last (engine liquidation machinery)"),
             Instruction::ForfeitRecoveryLeg { .. } => entry("ForfeitRecoveryLeg", LagPolicy::MarkDriven, "recovery-mode forfeit (engine)"),
-            Instruction::RebalanceReduce { .. } => entry("RebalanceReduce", LagPolicy::MarkDriven, "engine-driven reduction"),
+            Instruction::RebalanceReduce { .. } => entry("RebalanceReduce", LagPolicy::Gated, "owner-signed, owner-sized reduce: favourable-side close refused while lagged (band markets), as TradeNoCpi"),
             Instruction::FinalizeResetSide { .. } => entry("FinalizeResetSide", LagPolicy::MarkDriven, "engine side reset"),
             Instruction::ClaimResolvedPayoutTopup => entry("ClaimResolvedPayoutTopup", LagPolicy::FlatOnly, "resolved market: no live mark"),
             Instruction::RefineResolvedUnreceiptedBound { .. } => entry("RefineResolvedUnreceiptedBound", LagPolicy::FlatOnly, "resolved market: no live mark"),
@@ -25200,6 +25200,23 @@ pub mod processor {
             // Best effort: reading the side must never change the instruction's error behaviour.
             let position_before =
                 signed_position_for_asset_view(group, portfolio, asset_index as usize).ok();
+            // GH#552: a rebalance-reduce is a USER-chosen close -- the owner signs it, picks
+            // `reduce_q` and picks the moment -- so the band's favourable-side rule binds it
+            // exactly as it binds the trade executors. Without this, the app's own exit path
+            // could realise the pinned gap that TradeNoCpi/TradeCpi refuse with Custom 104,
+            // taking `(P_last - target) x q` from the opposite side and the bound vault LP.
+            // Fails closed: if the band is armed and the leg cannot be read, refuse.
+            if group.header.config.band_bps.get() != 0 {
+                let pos = position_before.ok_or(V16Error::InvalidLeg)?;
+                let magnitude =
+                    i128::try_from(reduce_q.min(pos.unsigned_abs())).unwrap_or(i128::MAX);
+                let delta = if pos > 0 { magnitude.saturating_neg() } else { magnitude };
+                if band_favourable_close_refused_view(group, asset_index as usize, pos, delta)
+                    .map_err(|_| V16Error::InvalidLeg)?
+                {
+                    return Err(V16Error::BandPinned);
+                }
+            }
             let outcome = group
                 .rebalance_reduce_position_not_atomic(
                     portfolio,
@@ -45000,14 +45017,19 @@ pub mod processor {
     /// v2.1 off-band path is byte-for-byte unchanged). `position_before` is the account's
     /// signed position, `delta` its signed change. Custom(104).
     #[inline(never)]
-    fn reject_band_favourable_close_view(
+    /// GH#552: the favourable-close decision, as a predicate, so every path that performs a
+    /// user-chosen reduce shares ONE copy of the rule. `reject_band_favourable_close_view`
+    /// below is the `ProgramResult` form used by the trade executors;
+    /// `handle_rebalance_reduce` calls this one directly because its closure returns
+    /// `V16Error` (it maps the refusal onto `V16Error::BandPinned`, the same Custom 104).
+    fn band_favourable_close_refused_view(
         group: &state::MarketViewMutV16<'_>,
         asset_index: usize,
         position_before: i128,
         delta: i128,
-    ) -> ProgramResult {
+    ) -> Result<bool, ProgramError> {
         if group.header.config.band_bps.get() == 0 {
-            return Ok(());
+            return Ok(false);
         }
         // Only the REDUCING part matters: a reduce, a close, or the closing part of a flip.
         let after = position_before.saturating_add(delta);
@@ -45016,14 +45038,14 @@ pub mod processor {
                 || (after > 0) != (position_before > 0)
                 || after.unsigned_abs() < position_before.unsigned_abs());
         if !reduces || !asset_price_lagged_view(group, asset_index)? {
-            return Ok(());
+            return Ok(false);
         }
         // Re-review N-2: at the narrow-band floor the anchor can no longer advance, so the lag
         // never resolves before BandPinExpired settles everyone at P_last anyway. Exits stay
         // open at P_last (reduce-only: attaches are refused by the engine there) instead of
         // trapping the favourable side until the forced resolution at the same price.
         if band_floor_stuck_view(group, asset_index)? {
-            return Ok(());
+            return Ok(false);
         }
         let asset = &group.markets[asset_index].engine.asset;
         let target = asset.raw_oracle_target_price.get();
@@ -45035,7 +45057,16 @@ pub mod processor {
         } else {
             target > p_last
         };
-        if favourable {
+        Ok(favourable)
+    }
+
+    fn reject_band_favourable_close_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        position_before: i128,
+        delta: i128,
+    ) -> ProgramResult {
+        if band_favourable_close_refused_view(group, asset_index, position_before, delta)? {
             return Err(PercolatorError::PriceBandPinned.into());
         }
         Ok(())

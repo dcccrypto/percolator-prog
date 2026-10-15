@@ -710,6 +710,33 @@ impl Env {
     }
 
     /// One permissionless crank of `portfolio` at the current slot.
+    /// GH#552: the owner-signed exit (tag 44) -- the close the app actually sends.
+    fn rebalance_reduce(
+        &mut self,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        reduce_q: u128,
+    ) -> Result<u64, String> {
+        let data = self.svm.get_account(&portfolio).unwrap().data;
+        let portfolio_id = state::read_portfolio_id(&data).unwrap();
+        let position_epoch = state::read_portfolio_position_epoch(&data).unwrap();
+        let m = self.market;
+        self.send(
+            ProgInstruction::RebalanceReduce {
+                portfolio_id,
+                position_epoch,
+                asset_index: 0,
+                reduce_q,
+            },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[owner],
+        )
+    }
+
     fn crank(&mut self, portfolio: Pubkey) -> Result<u64, String> {
         let (payer, m, slot) = (self.payer.pubkey(), self.market, self.slot);
         self.send(
@@ -1316,6 +1343,50 @@ fn sec_pinned_close_flip_and_open_variants() {
     let _ = (pin, &long);
 }
 
+/// GH#552: the band's favourable-side close rule must bind the OWNER-SIGNED reduce (tag 44),
+/// not only the trade executors. Tag 44 is the exit the app sends, and the owner picks its
+/// size and its moment, so it is a user-chosen close in exactly the sense the rule governs —
+/// it was classified `MarkDriven` ("engine-driven reduction") and so escaped the gate.
+///
+/// Same world as `sec_pinned_close_flip_and_open_variants` above: pinned, target ABOVE
+/// P_last, so the SHORT is the favourable side. Without the fix every reduce below lands and
+/// takes `(P_last - target) x q` from the opposite side and the bound vault LP.
+#[test]
+fn sec_pinned_close_refused_for_the_owner_signed_rebalance_reduce() {
+    let mut env = Env::new(band_cfg());
+    let (lp, long, short) = band_book(&mut env);
+    let target = PRICE * 13 / 10;
+    for _ in 0..60 {
+        env.warp(1);
+        env.push(target);
+        env.crank(short.1).expect("crank short");
+        env.crank(lp.account).expect("crank lp");
+    }
+    assert!(env.engine_asset().band_pin_since_slot != 0, "pinned");
+    let pin = code(PercolatorError::PriceBandPinned);
+
+    // The short (-100) buys back at the stale-low P_last while the true target is above it:
+    // favourable. Full, partial and dust reduces are all refused, as on the trade path.
+    for q in [100 * Q, 50 * Q, Q] {
+        let r = env.rebalance_reduce(&short.0, short.1, q as u128);
+        eprintln!("GH#552 pinned short tag-44 reduce {q}: {r:?}");
+        assert!(
+            r.is_err() && r.as_ref().unwrap_err().contains(&pin),
+            "tag 44 must refuse the favourable-side exit at the pinned price: q={q}, {r:?}"
+        );
+    }
+    assert_eq!(env.pos(short.1), -100 * Q, "the refused reduces left the position untouched");
+
+    // Control: the LONG is the UNFAVOURABLE side here, so the rule must not touch it. Assert
+    // only that it is not refused BY THE BAND — an unrelated engine refusal is not this gate.
+    let r = env.rebalance_reduce(&long.0, long.1, (10 * Q) as u128);
+    eprintln!("GH#552 pinned long tag-44 reduce (control): {r:?}");
+    assert!(
+        r.is_ok() || !r.as_ref().unwrap_err().contains(&pin),
+        "the unfavourable side must not be refused by the band rule: {r:?}"
+    );
+}
+
 #[test]
 fn sec_v21_stamped_accounts_are_refused() {
     let mut env = Env::new(band_cfg());
@@ -1549,7 +1620,11 @@ fn v22_d1_every_lag_consumer_uses_the_shared_predicate() {
     assert!(body("asset_target_differs_view").contains("raw_oracle_target_price.get() != asset.effective_price.get()"));
     assert!(body("asset_price_lagged_view").contains("asset_target_differs_view(asset)"));
     for (consumer, uses) in [
-        ("reject_band_favourable_close_view", "asset_price_lagged_view("),
+        // GH#552: the rule is now a predicate (`band_favourable_close_refused_view`) so the
+        // trade executors and the owner-signed reduce (tag 44) share ONE copy of it. The lag
+        // call lives in the predicate; the `ProgramResult` form delegates to it.
+        ("band_favourable_close_refused_view", "asset_price_lagged_view("),
+        ("reject_band_favourable_close_view", "band_favourable_close_refused_view("),
         ("reject_exposed_target_effective_lag_view", "asset_price_lagged_view("),
         ("vault_lp_equity_lag_bounds_ro", "asset_price_lagged_view("),
         ("reject_portfolio_pending_price_managed_mark_view", "asset_target_differs_view("),
