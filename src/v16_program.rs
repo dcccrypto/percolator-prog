@@ -1244,6 +1244,35 @@ pub mod constants {
     #[cfg(feature = "mainnet-ids")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
         crate::mainnet_ids::MAINNET_STAKE_PROGRAM_ID;
+
+    // GH#548: the ONE percolator-nft program whose ["mint_authority"] PDA may move a
+    // portfolio's owner (tag 72), unwrap an escrow (tag 82) or authorize as an NFT holder.
+    // It used to be whatever `marketauth` wrote with SetNftProgramId, and marketauth is
+    // whoever ran the permissionless InitMarket, so a market creator could register a
+    // program it controls and seize every trader's portfolio (set-once, #309, only stopped
+    // the re-point). Same compile-time-absent / runtime-fail-closed pattern as
+    // STAKE_PROGRAM_ID: a devnet build pins the devnet NFT program (v2.2 fresh set), and an
+    // SBF build without `devnet` has NO pin, so tags 72/73/82 and NFT-holder auth fail closed
+    // until a mainnet NFT id is added (alongside the other `mainnet_ids` RELEASE-STEPs).
+    // Host builds (`cargo test`, never deployed) use the devnet id so the native suite
+    // exercises the same pinned path the devnet binary runs.
+    #[cfg(any(feature = "devnet", not(target_os = "solana")))]
+    pub const NFT_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        solana_program::pubkey!("27LWmR72Ru1NCkbN2xgxB7BgYcTUrU7qeEJoV3D8sZh1");
+
+    /// `true` iff `nft_program_id` is this build's pinned NFT program (GH#548). Always
+    /// `false` in a build with no pin.
+    pub fn is_pinned_nft_program(nft_program_id: &[u8; 32]) -> bool {
+        #[cfg(any(feature = "devnet", not(target_os = "solana")))]
+        {
+            *nft_program_id == NFT_PROGRAM_ID.to_bytes()
+        }
+        #[cfg(not(any(feature = "devnet", not(target_os = "solana"))))]
+        {
+            let _ = nft_program_id;
+            false
+        }
+    }
     /// The wrapper's own pinned mainnet id: the entrypoint refuses to run under any other.
     #[cfg(feature = "mainnet-ids")]
     pub const WRAPPER_PROGRAM_ID: solana_program::pubkey::Pubkey =
@@ -40118,6 +40147,11 @@ pub mod processor {
         if admin.key.to_bytes() != cfg.marketauth {
             return Err(PercolatorError::Unauthorized.into());
         }
+        // GH#548: marketauth is the (untrusted) market creator, so it may only register the
+        // protocol's pinned NFT program, never one of its own.
+        if !crate::constants::is_pinned_nft_program(&nft_program_id) {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
 
         let (expected_pda, bump) = state::derive_nft_registry(program_id, market_ai.key);
         expect_key(registry_ai, &expected_pda)?;
@@ -40226,6 +40260,11 @@ pub mod processor {
         }
 
         // Derive expected mint-authority PDA from the registered NFT program.
+        // GH#548: only the pinned NFT program is a trust root, even if this market's registry
+        // was set to another program before the pin existed.
+        if !crate::constants::is_pinned_nft_program(&registry.nft_program_id) {
+            return Err(PercolatorError::NftInvalidMintAuthority.into());
+        }
         let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
         let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
         if mint_auth_ai.key != &expected_mint_auth {
@@ -40305,6 +40344,11 @@ pub mod processor {
         // Derive expected mint-authority PDA from the registered NFT program;
         // this is BOTH the required signer AND the escrow owner the portfolio
         // must currently have.
+        // GH#548: only the pinned NFT program is a trust root, even if this market's registry
+        // was set to another program before the pin existed.
+        if !crate::constants::is_pinned_nft_program(&registry.nft_program_id) {
+            return Err(PercolatorError::NftInvalidMintAuthority.into());
+        }
         let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
         let (expected_mint_auth, _) = state::derive_nft_mint_authority(&nft_program_id);
         if mint_auth_ai.key != &expected_mint_auth {
@@ -40707,6 +40751,11 @@ pub mod processor {
         expect_owner(nft.registry, program_id)?;
         let registry = state::read_nft_registry(&nft.registry.try_borrow_data()?)
             .map_err(|_| PercolatorError::NftRegistryNotFound)?;
+        // GH#548: only the pinned NFT program is a trust root, even if this market's registry
+        // was set to another program before the pin existed.
+        if !crate::constants::is_pinned_nft_program(&registry.nft_program_id) {
+            return Err(PercolatorError::NftInvalidMintAuthority.into());
+        }
         let nft_program_id = Pubkey::new_from_array(registry.nft_program_id);
 
         // After the registry trust-root is validated above, `nft_program_id` is

@@ -28694,7 +28694,8 @@ fn v16_wrapper_close_resolved_refuses_unsigned_payout_for_nft_escrowed_portfolio
     let mut portfolio = portfolio_account();
     let mint = resolved_market_with_payout(&mut admin, &mut market, &mut owner, &mut portfolio);
 
-    let nft_program_id = Pubkey::new_unique();
+    // The real NFT program: tag 82 (UnwrapEscrowedPortfolio) only trusts the pinned id (GH#548).
+    let nft_program_id = percolator_prog::constants::NFT_PROGRAM_ID;
     let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
     let mut registry = nft_registry_account(&market, &nft_program_id);
     escrow_portfolio_under(&mut portfolio, &escrow);
@@ -28936,7 +28937,8 @@ fn v16_wrapper_claim_resolved_payout_topup_refuses_unsigned_payout_for_nft_escro
         state::write_portfolio(&mut portfolio.data, &account).unwrap();
     }
 
-    let nft_program_id = Pubkey::new_unique();
+    // The real NFT program: tag 82 (UnwrapEscrowedPortfolio) only trusts the pinned id (GH#548).
+    let nft_program_id = percolator_prog::constants::NFT_PROGRAM_ID;
     let escrow = state::derive_nft_mint_authority(&nft_program_id).0;
     let mut registry = nft_registry_account(&market, &nft_program_id);
     escrow_portfolio_under(&mut portfolio, &escrow);
@@ -29060,4 +29062,136 @@ fn v16_wrapper_escrowed_terminal_payout_guard_rejects_foreign_registry_accounts(
         engine_vault_and_capital(&market, &portfolio),
         (1_000, 1_000)
     );
+}
+
+// GH#548: a market creator registers an NFT program it controls (SetNftProgramId is gated only by
+// `cfg.marketauth`, and its first and only write is the creator's choice). Its ["mint_authority"]
+// PDA then signs TransferPortfolioOwnership for a trader's portfolio — no consent from the owner,
+// no escrow — and the creator withdraws the trader's collateral. The native harness models the
+// attacker program's `invoke_signed` by marking its PDA a signer; the registry bytes are exactly
+// what SetNftProgramId writes.
+#[test]
+fn creator_registered_nft_program_cannot_seize_a_trader_portfolio() {
+    let mut creator = signer(); // cfg.marketauth: whoever ran the permissionless InitMarket
+    let mut market = market_account();
+    let mut victim = signer();
+    let mut victim_pf = portfolio_account();
+    let mut counterparty = signer();
+    let mut counterparty_pf = portfolio_account();
+    let mut attacker = signer(); // the creator's second wallet, used to unwind
+    let mut attacker_pf = portfolio_account();
+
+    init_market(&mut creator, &mut market);
+    init_portfolio(&mut victim, &mut market, &mut victim_pf);
+    init_portfolio(&mut counterparty, &mut market, &mut counterparty_pf);
+    init_portfolio(&mut attacker, &mut market, &mut attacker_pf);
+    deposit(&mut victim, &mut market, &mut victim_pf, 1_000_000);
+    deposit(&mut counterparty, &mut market, &mut counterparty_pf, 1_000_000);
+    deposit(&mut attacker, &mut market, &mut attacker_pf, 1_000_000);
+
+    // The victim opens an ordinary long.
+    run_ix(
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&victim_pf).0,
+            account_a_position_epoch: portfolio_identity(&victim_pf).2,
+            account_b_portfolio_id: portfolio_identity(&counterparty_pf).0,
+            account_b_position_epoch: portfolio_identity(&counterparty_pf).2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        &mut [&mut victim, &mut counterparty, &mut market, &mut victim_pf, &mut counterparty_pf],
+    )
+    .unwrap();
+    let victim_capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    assert!(victim_capital > 0);
+
+    // Registry as SetNftProgramId writes it, pointing at a program the creator controls.
+    let creator_program = Pubkey::new_unique();
+    let mut registry = nft_registry_account(&market, &creator_program);
+    let mut creator_mint_auth = TestAccount::new(
+        state::derive_nft_mint_authority(&creator_program).0,
+        solana_program::system_program::ID,
+        0,
+    )
+    .signer();
+    let seized = run_ix(
+        Instruction::TransferPortfolioOwnership {
+            new_owner: attacker.key.to_bytes(),
+            asset_index: 0,
+        },
+        &mut [&mut creator_mint_auth, &mut victim_pf, &mut registry],
+    );
+    if seized.is_err() {
+        // Fixed behaviour: a registry that is not the pinned NFT program is not a trust root.
+        assert_eq!(state::read_portfolio(&victim_pf.data).unwrap().owner, victim.key.to_bytes());
+        return;
+    }
+    // Vulnerable behaviour: ownership moved without the victim, and the collateral leaves.
+    assert_eq!(state::read_portfolio(&victim_pf.data).unwrap().owner, attacker.key.to_bytes());
+    let mut attacker_as_owner = TestAccount::new(attacker.key, attacker.owner, 0).signer();
+    run_ix(
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&victim_pf).0,
+            account_a_position_epoch: portfolio_identity(&victim_pf).2,
+            account_b_portfolio_id: portfolio_identity(&attacker_pf).0,
+            account_b_position_epoch: portfolio_identity(&attacker_pf).2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: -(POS_SCALE as i128),
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        &mut [&mut attacker_as_owner, &mut attacker, &mut market, &mut victim_pf, &mut attacker_pf],
+    )
+    .unwrap();
+    let capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    let (vault_before, _) = engine_vault_and_capital(&market, &victim_pf);
+    withdraw(&mut attacker_as_owner, &mut market, &mut victim_pf, capital);
+    let (vault_after, capital_after) = engine_vault_and_capital(&market, &victim_pf);
+    panic!(
+        "SEIZED: the creator took the victim's portfolio and withdrew {capital} of {victim_capital} \
+         (vault {vault_before} -> {vault_after}, victim capital now {capital_after})"
+    );
+}
+
+// GH#548: a registry that already names a non-pinned program (e.g. written before the pin
+// existed) must not let that program unwrap an escrowed portfolio. The signer here is the bogus
+// program's REAL ["mint_authority"] PDA (the native harness models its invoke_signed), so the
+// rejection can only come from the pin check, not from a mint-authority mismatch.
+#[test]
+fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
+    let mut creator = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut creator, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+
+    let bogus = Pubkey::new_unique();
+    assert_ne!(bogus, percolator_prog::constants::NFT_PROGRAM_ID);
+    let bogus_mint_auth = state::derive_nft_mint_authority(&bogus).0;
+    escrow_portfolio_under(&mut portfolio, &bogus_mint_auth);
+    let mut registry = nft_registry_account(&market, &bogus);
+    let mut signer_pda =
+        TestAccount::new(bogus_mint_auth, solana_program::system_program::ID, 0).signer();
+
+    let before = portfolio.data.clone();
+    let res = run_ix(
+        Instruction::UnwrapEscrowedPortfolio {
+            new_owner: Pubkey::new_unique().to_bytes(),
+        },
+        &mut [&mut signer_pda, &mut portfolio, &mut registry],
+    );
+    assert_eq!(
+        res,
+        Err(percolator_prog::error::PercolatorError::NftInvalidMintAuthority.into()),
+        "a non-pinned registry is not a trust root, even when its own PDA signs"
+    );
+    assert_eq!(portfolio.data, before, "ownership unchanged");
 }

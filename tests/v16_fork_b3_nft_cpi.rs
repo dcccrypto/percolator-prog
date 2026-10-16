@@ -676,7 +676,7 @@ mod litesvm_tests {
         p.push("target/deploy/percolator_prog.so");
         assert!(
             p.exists(),
-            "wrapper BPF missing — run `cargo build-sbf` first"
+            "wrapper BPF missing — run `cargo build-sbf --features devnet` first (the NFT tests need the devnet NFT pin)"
         );
         p
     }
@@ -841,7 +841,7 @@ mod litesvm_tests {
             market,
         } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
-        let nft_prog = [0xABu8; 32];
+        let nft_prog = percolator_prog::constants::NFT_PROGRAM_ID.to_bytes();
 
         let result = send(
             &mut svm,
@@ -873,6 +873,50 @@ mod litesvm_tests {
         assert_eq!(reg.version, NFT_REGISTRY_VERSION);
     }
 
+    /// GH#548: marketauth is whoever ran the permissionless InitMarket, so the first (and only)
+    /// SetNftProgramId must not let it register a program it controls — that program's
+    /// mint-authority PDA would be trusted by tag 72 to move any trader's portfolio.
+    #[test]
+    fn set_nft_program_id_rejects_a_program_other_than_the_pinned_one() {
+        let env = setup();
+        let Env {
+            mut svm,
+            program_id,
+            payer,
+            admin,
+            market,
+        } = env;
+        let (registry, _) = derive_nft_registry(&program_id, &market);
+        let creator_program = Pubkey::new_unique().to_bytes();
+        assert_ne!(creator_program, percolator_prog::constants::NFT_PROGRAM_ID.to_bytes());
+
+        let result = send(
+            &mut svm,
+            program_id,
+            &payer,
+            ProgInstruction::SetNftProgramId {
+                nft_program_id: creator_program,
+            }
+            .encode(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(market, false),
+                AccountMeta::new(registry, false),
+                AccountMeta::new_readonly(system_program::ID, false),
+            ],
+            &[&admin],
+        );
+        assert!(
+            result.is_err(),
+            "marketauth must not be able to register its own NFT program: {:?}",
+            result
+        );
+        assert!(
+            svm.get_account(&registry).map_or(true, |a| a.data.is_empty()),
+            "a refused SetNftProgramId must not create the registry"
+        );
+    }
+
     #[test]
     fn set_nft_program_id_reject_update_set_once() {
         let env = setup();
@@ -884,8 +928,10 @@ mod litesvm_tests {
             market,
         } = env;
         let (registry, _) = derive_nft_registry(&program_id, &market);
-        let nft_prog_v1 = [0x11u8; 32];
-        let nft_prog_v2 = [0x22u8; 32];
+        // Both writes name the pinned program (GH#548), so the second is refused by
+        // set-once itself, not by the pin.
+        let nft_prog_v1 = percolator_prog::constants::NFT_PROGRAM_ID.to_bytes();
+        let nft_prog_v2 = percolator_prog::constants::NFT_PROGRAM_ID.to_bytes();
 
         // Create.
         send(
@@ -908,6 +954,10 @@ mod litesvm_tests {
 
         // Re-point attempt — must now be REJECTED (set-once trust root): the NFT
         // program id is the custody trust root and is immutable after creation.
+        // Both writes name the pinned program, so the second transaction would be
+        // byte-identical to the first: expire the blockhash so it is re-signed and
+        // actually reaches SetNftProgramId instead of failing as AlreadyProcessed.
+        svm.expire_blockhash();
         let result = send(
             &mut svm,
             program_id,
@@ -924,9 +974,13 @@ mod litesvm_tests {
             ],
             &[&admin],
         );
+        let set_once_err = format!(
+            "Custom({})",
+            percolator_prog::error::PercolatorError::AlreadyInitialized as u32
+        );
         assert!(
-            result.is_err(),
-            "set-once: a second SetNftProgramId (re-point) must be rejected, got {:?}",
+            matches!(&result, Err(e) if e.contains(&set_once_err)),
+            "set-once: a second SetNftProgramId must be rejected with AlreadyInitialized ({set_once_err}), got {:?}",
             result
         );
 
@@ -1070,7 +1124,7 @@ mod litesvm_tests {
 
         // Create the NFT registry.
         let (registry, _) = derive_nft_registry(&program_id, &market);
-        let nft_prog = [0xAAu8; 32];
+        let nft_prog = percolator_prog::constants::NFT_PROGRAM_ID.to_bytes();
         send(
             &mut svm,
             program_id,
