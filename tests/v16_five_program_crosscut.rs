@@ -3083,3 +3083,47 @@ fn x5_terminal_reclaim_liveness_via_rotate_no_lockout_v5() {
         "v5: admin rotation refused on a first-loss pool",
     );
 }
+
+// ── S1 audit 2026-10-17, F-NFT-1: a STALE Position NFT of an earlier incarnation of the
+// same portfolio KEYPAIR authorizes the NFT-holder path on the current incarnation.
+//
+// Real-code setup: the NFT-holder auth (`authorize_owner_or_nft_holder_raw`) binds the
+// PositionNft PDA to the portfolio ACCOUNT KEY only. A closed portfolio leaves its PositionNft
+// PDA behind (ClosePortfolio never touches the NFT program), the keypair can be re-created and
+// re-escrowed, and the old NFT (held by the seller) still satisfies every conjunct of
+// `nft_holder_auth_decision`. Here the stale NFT1 (market_id 3, held by `attacker`) and the live
+// NFT2 (market_id 7, sold to `victim`) both bind portfolio P; P's collateral belongs to the
+// current NFT2 holder.
+#[test]
+fn s1_stale_nft_of_a_previous_incarnation_must_not_authorize_the_current_portfolio() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let victim = Keypair::new();
+    let attacker = Keypair::new();
+    env.svm.airdrop(&victim.pubkey(), 10_000_000_000).unwrap();
+    env.svm.airdrop(&attacker.pubkey(), 10_000_000_000).unwrap();
+
+    let portfolio = env.create_portfolio(&victim);
+    let amount = 1_000u128;
+    env.deposit(&victim, portfolio, amount);
+    // NFT2: the NFT of the CURRENT incarnation, sold to the victim.
+    let (_nft2_pda, _m2, _victim_ata) = attach_nft_to_portfolio(&mut env, &victim, portfolio, 7);
+    // NFT1: left over from the seller's earlier incarnation of the same keypair, still held by him.
+    let (nft1_pda, _m1, attacker_ata) = attach_nft_to_portfolio(&mut env, &attacker, portfolio, 3);
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+
+    let dest = make_dest_ata(&mut env, attacker.pubkey());
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw { portfolio_id, expected_sequence, amount },
+        e2_withdraw_accounts(&env, &attacker, portfolio, dest, registry, nft1_pda, attacker_ata),
+        &[&attacker],
+    );
+    assert!(
+        res.is_err() && env.token_amount(dest) == 0,
+        "S1 F-NFT-1: the stale NFT1 holder drained the current holder's collateral: {res:?}, \
+         attacker received {} atoms",
+        env.token_amount(dest)
+    );
+}

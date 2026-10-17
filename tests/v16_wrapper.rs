@@ -29229,7 +29229,6 @@ fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
     );
     assert_eq!(portfolio.data, before, "ownership unchanged");
 }
-}
 
 /// GH#555: the #464 checkpoint must apply on EVERY collection route, not just
 /// `SyncMaintenanceFee`.
