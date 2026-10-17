@@ -3302,3 +3302,64 @@ fn r3_item7_fee_crank_is_a_ratchet_site() {
         }
     }
 }
+
+// N-6 probe (CTRL-PREP 2026-10-17): compute units of the tag-5 PermissionlessCrank on the BOUND
+// VAULT LP (where `growth_ratchet_touch` runs: valuation, conservative equity, G8 ctx, ratchet and
+// a growth-record write) against the same crank on a plain trader portfolio (the touch is a
+// no-op). Ignored: prints numbers, asserts only the 1.4M budget with margin.
+impl Env {
+    fn crank_cu(&mut self, portfolio: Pubkey) -> Result<u64, String> {
+        let payer_key = self.payer.pubkey();
+        let instructions = vec![
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            Instruction {
+                program_id: self.pid,
+                accounts: vec![
+                    AccountMeta::new(payer_key, true),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                data: ProgInstruction::PermissionlessCrank {
+                    now_slot: self.slot,
+                    observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+                }
+                .encode(),
+            },
+        ];
+        self.svm.expire_blockhash();
+        let tx = Transaction::new_signed_with_payer(&instructions, Some(&payer_key), &[&self.payer], self.svm.latest_blockhash());
+        self.svm.send_transaction(tx).map(|m| m.compute_units_consumed).map_err(|e| format!("{e:?}"))
+    }
+}
+
+#[test]
+#[ignore]
+fn n6_tag5_lp_crank_cu_probe() {
+    let p = Params { band: Some(100), growth: Some((400, 500)), fee_bps: 100, ..growth_params() };
+    let (mut env, lp, _d) = p2b_world(p, 10_000, 1_000);
+    let admin = env.admin.insecure_clone();
+    env.set_p2b_dials(&admin, [5_000, 3_000, 0, 0]).expect("ext");
+    let t = env.new_trader(5_000 * U);
+    env.trade_signing_fee(&t, &lp, 100 * UQ, GROWTH_FEE).expect("open");
+    // Control: the crank on the trader portfolio (no touch).
+    let ctl = env.crank_cu(t.portfolio);
+    println!("CU tag5 crank trader (no ratchet touch): {ctl:?}");
+    // Worst case for the touch: the stored ceiling is far above the target, so the ratchet WRITES.
+    for (label, poke_ceil) in [("ratchet writes (ceil poked to 800)", true), ("ratchet no-op (ceil at target)", false)] {
+        if poke_ceil {
+            let mut acc = env.svm.get_account(&env.market).unwrap();
+            let mut g = state::read_asset_growth(&acc.data, 0, 1_000).unwrap().expect("growth on");
+            g.ceil_x100 = 800;
+            state::write_asset_growth(&mut acc.data, 0, &g, 1_000).unwrap();
+            env.svm.set_account(env.market, acc).unwrap();
+        }
+        env.slot += 1;
+        let r = env.crank_cu(lp.portfolio);
+        let c = state::read_asset_growth(&env.svm.get_account(&env.market).unwrap().data, 0, 1_000).unwrap().unwrap().ceil_x100;
+        println!("CU tag5 crank on the bound vault LP, {label}: {r:?} (ceil after {c})");
+        if let Ok(cu) = r {
+            assert!(cu < 1_200_000, "within the 1.4M budget with margin");
+        }
+    }
+}
