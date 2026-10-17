@@ -13,5 +13,10 @@
 )]
 pub mod vault_lp_v18;
 
+// v2.2: vault_lp_v18.rs:714 reads crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS, so the real production
+// growth_v19.rs is path-included too (not a copy).
+#[path = "../../../src/growth_v19.rs"]
+pub mod growth_v19;
+
 #[cfg(kani)]
 mod proofs;

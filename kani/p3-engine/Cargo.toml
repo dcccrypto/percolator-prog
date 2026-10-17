@@ -15,6 +15,8 @@ path = "src/lib.rs"
 percolator = { path = "../../../percolator", features = ["fork-facade"] }
 
 [features]
+# v2.2: the deployed (devnet) values of growth_v19's flavour constants.
+devnet = []
 # Negative control: replace the engine kernel output with the pre-#114 flat-A model
 # (f = -/+ fid * ADL_ONE per side). With asymmetric A this must FAIL the zero-sum assertion.
 neg_flat_a = []
