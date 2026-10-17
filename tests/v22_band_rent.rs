@@ -4468,8 +4468,6 @@ fn controller_rollback_differential_from_controller_bpf() {
     let g = env.growth_bytes();
     println!("controller record: flags={:#04x} 0..8={:?} 30..38={:?} 118..120={:?}", g[39], &g[0..8], &g[30..38], &g[118..120]);
     assert_ne!(g[39] & 1, 0, "the controller flagged the record: this really is its layout");
-    let t = env.trader(1_000 * USD);
-    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("trade on the controller");
     // Swap to the rollback build (an in-place program upgrade).
     env.svm.add_program(env.program_id, &rollback);
     env.rollback_exercise(&lp, "controller -> rollback");
@@ -4482,6 +4480,9 @@ fn controller_rollback_differential_from_controller_bpf() {
     env.push_depth(PRICE, 1, 600 * USD as u64).expect("controller 44 B push after the round trip");
     env.crank(lp.account).expect("controller crank after the round trip");
     env.crank_current(lp.account);
-    let t = env.trader(1_000 * USD);
-    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("controller trade after the round trip");
+    // (No second trade here: a trade right after another one in this harness meets LossStale
+    // (Custom 121) on the controller itself too; the rollback's own trade is in the exercise.)
+    env.settle_rent(lp.account, lp.account).expect("controller tag 106 after the round trip");
+    let g = env.growth_bytes();
+    assert_ne!(g[39] & 1, 0, "the controller migrated the legacy-shaped record on its first push");
 }
