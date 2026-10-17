@@ -5445,3 +5445,74 @@ fn p3_h1_domain_backing_withdrawals_refuse_the_registry_beneficiary() {
     err_has(&r52, PercolatorError::VaultLpUseSettleResolved);
     assert_eq!(env.tok(env.vault_token), vault_before, "the vault keeps the Earn backing");
 }
+
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// prog#551: the P3-H1 registry guard also covers the domain backing withdrawals (tags 50
+// and 52). The Earn vault's domain has `backing_bucket_authority` = the LP-vault registry PDA,
+// and on a Resolved market those withdrawals need no signature (W4-PAYOUT), so before the
+// fix a stranger could pay the Earn depositors' backing into a registry-owned token account
+// that no instruction can ever spend from. Earn backing must leave through 77/78/101 only.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn domain_withdraw_unsigned_as_registry(&mut self, earnings: bool, amount: u128) -> (Result<(), String>, Pubkey) {
+        let dest = self.token_account(self.mint, self.registry, 0);
+        let data = self.svm.get_account(&self.market).unwrap().data;
+        let market_id = state::read_market_trade_preflight(&data, (DOMAIN as usize) / 2).unwrap().3;
+        let authority_epoch =
+            state::read_asset_control_sequences(&data, (DOMAIN as usize) / 2).unwrap().authority_epoch;
+        let (ix, accounts) = if earnings {
+            (
+                ProgInstruction::WithdrawBackingBucketEarnings { domain: DOMAIN, market_id, amount, authority_epoch },
+                vec![
+                    AccountMeta::new_readonly(self.registry, false),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(self.ledger, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+            )
+        } else {
+            (
+                ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, market_id, amount, authority_epoch },
+                vec![
+                    AccountMeta::new_readonly(self.registry, false),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new(self.ledger, false),
+                ],
+            )
+        };
+        (self.send(ix, accounts, &[]), dest)
+    }
+}
+
+/// prog#551 PoC: Earn principal on a Resolved market cannot be pushed into a registry-owned
+/// token account through tag 50 (or 52) by an unsigned stranger. Fails on the unfixed program
+/// (the tag-50 payout lands in the registry-owned account) and passes on the fix.
+#[test]
+fn p3_h1_domain_backing_withdrawals_refuse_the_registry_beneficiary() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, None).expect("earn");
+    let reg = env.registry;
+    let profile = state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap();
+    assert_eq!(profile.backing_bucket_authority, reg.to_bytes(), "premise: the Earn domain's backing authority is the registry PDA");
+    env.resolve();
+    let vault_before = env.tok(env.vault_token);
+    let (r50, stuck50) = env.domain_withdraw_unsigned_as_registry(false, 10_000_000);
+    println!("prog#551 tag 50 into registry-owned ATA: {r50:?}; stranded {}", env.tok(stuck50));
+    assert_eq!(env.tok(stuck50), 0, "nothing may reach a registry-owned token account via tag 50");
+    err_has(&r50, PercolatorError::VaultLpUseSettleResolved);
+    let (r52, stuck52) = env.domain_withdraw_unsigned_as_registry(true, 1);
+    println!("prog#551 tag 52 into registry-owned ATA: {r52:?}; stranded {}", env.tok(stuck52));
+    assert_eq!(env.tok(stuck52), 0, "nothing may reach a registry-owned token account via tag 52");
+    err_has(&r52, PercolatorError::VaultLpUseSettleResolved);
+    assert_eq!(env.tok(env.vault_token), vault_before, "the vault keeps the Earn backing");
+}

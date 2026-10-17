@@ -8410,6 +8410,13 @@ pub mod ix {
             /// symmetrically to account_a and account_b.
             backing_fee_cap_bps: u16,
         },
+        /// ACCOUNT LAYOUT (GH#407, TradeCpi): `[0]` signer_a (w, signer), `[1]` market (w), `[2]` account_a (w),
+        /// `[3]` account_b (w), `[4]` matcher_prog, `[5]` matcher_ctx (w), `[6]` matcher_delegate,
+        /// then, ONLY when account_a's stored owner != signer_a (an NFT-escrowed portfolio), the
+        /// NFT-holder proof trio `[7]` nft_registry, `[8]` PositionNft PDA, `[9]` signer NFT ATA,
+        /// then the optional matcher tail (non-signer, non-program-owned accounts). When
+        /// account_a's owner == signer_a there is no trio and the tail starts at `[7]`
+        /// (unchanged). The discriminator is the on-chain stored owner, never a caller flag.
         TradeCpi {
             account_a_portfolio_id: u64,
             account_a_position_epoch: u64,
@@ -8446,6 +8453,13 @@ pub mod ix {
         },
         /// Atomic multi-leg batch routed through an external matcher: one batched matcher CPI fills
         /// every leg against a single LP, then all fills apply with one end-state margin check.
+        /// ACCOUNT LAYOUT (GH#407, BatchTradeCpi): `[0]` signer_a (w, signer), `[1]` market (w), `[2]` account_a (w),
+        /// `[3]` account_b (w), `[4]` matcher_prog, `[5]` matcher_ctx (w), `[6]` matcher_delegate,
+        /// then, ONLY when account_a's stored owner != signer_a (an NFT-escrowed portfolio), the
+        /// NFT-holder proof trio `[7]` nft_registry, `[8]` PositionNft PDA, `[9]` signer NFT ATA,
+        /// then the optional matcher tail (non-signer, non-program-owned accounts). When
+        /// account_a's owner == signer_a there is no trio and the tail starts at `[7]`
+        /// (unchanged). The discriminator is the on-chain stored owner, never a caller flag.
         BatchTradeCpi {
             account_a_portfolio_id: u64,
             account_a_position_epoch: u64,
@@ -14868,9 +14882,15 @@ pub mod processor {
         if group.header.mode != 0 || cfg.maintenance_fee_per_slot == 0 {
             return Ok(0);
         }
-        let charged = group
-            .sync_account_fee_to_slot_not_atomic(portfolio, now_slot, cfg.maintenance_fee_per_slot)
-            .map_err(map_v16_error)?;
+        // GH#555: bill through the CHECKPOINTED path, as `SyncMaintenanceFee` does. The raw
+        // `sync_account_fee_to_slot_not_atomic` bills the whole `[last_fee_slot, now]` window at
+        // the CURRENT rate and then advances `last_fee_slot` past the checkpoint, which is the
+        // #444 retroactivity that #464 removed -- so leaving it here meant one rate raise was
+        // still retroactive on every route but SyncMaintenanceFee (Withdraw, the trade paths,
+        // PermissionlessCrank, the tranche/vault/bond withdrawals). Identical behaviour whenever
+        // there is no checkpoint (`checkpoint == 0`) or the account is already past it.
+        let charged =
+            sync_maintenance_fee_checkpointed(group, cfg, portfolio, now_slot, cfg.maintenance_fee_per_slot)?;
         credit_maintenance_fee_to_active_market_budgets_view(cfg, group, charged)?;
         Ok(charged)
     }
@@ -18755,12 +18775,21 @@ pub mod processor {
             .map_err(map_v16_error)
     }
 
+    /// First matcher-tail account index of TradeCpi / BatchTradeCpi when the taker is the
+    /// portfolio owner (accounts 0..=6 are the fixed accounts).
+    const MATCHER_TAIL_BASE: usize = 7;
+    /// Number of NFT-holder proof accounts (registry, PositionNft PDA, signer NFT ATA) that sit
+    /// at `[MATCHER_TAIL_BASE .. MATCHER_TAIL_BASE + 3)` of TradeCpi / BatchTradeCpi when the
+    /// taker portfolio is escrowed (owner != signer). The matcher tail follows them (GH#407).
+    const NFT_HOLDER_PROOF_ACCOUNTS: usize = 3;
+
     fn matcher_tail_start_or_verify_lp_config<'a>(
         account_b_ai: &AccountInfo<'a>,
         expected_matcher_sequence: u64,
         matcher_prog_key: &Pubkey,
         matcher_ctx_key: &Pubkey,
         matcher_delegate_key: &Pubkey,
+        tail_start: usize,
     ) -> Result<(usize, u16), ProgramError> {
         let account_b_data = account_b_ai.try_borrow_data()?;
         // W3-matcher (ADOPT upstream `edc8ce74`, "bind cpi trades to matcher
@@ -18797,7 +18826,7 @@ pub mod processor {
         if !state::matcher_capability_is_live(expiry_slot, authenticated_slot_or_fallback(0)) {
             return Err(PercolatorError::Unauthorized.into());
         }
-        Ok((7, cfg.trade_fee_cap_bps()))
+        Ok((tail_start, cfg.trade_fee_cap_bps()))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -18950,16 +18979,30 @@ pub mod processor {
         )?;
         // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
         // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
-        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
-        let nft = optional_nft_holder_accounts(accounts, 7);
+        // GH#407 ABI: the NFT-holder proof trio `[7]=nft_registry [8]=PositionNft PDA
+        // [9]=signer NFT ATA` is present IFF the taker portfolio's stored owner is not the
+        // signer (an escrowed portfolio), and the matcher tail then starts at 10. When
+        // owner == signer there is NO trio and the tail starts at 7 (byte-identical to the
+        // pre-fix layout). The discriminator is the on-chain stored owner, which the caller
+        // cannot influence, so the layout is never caller-selected and no account can be
+        // shifted across the trio/tail boundary.
+        let taker_is_owner = account_a_owner == signer_a.key.to_bytes();
         authorize_owner_or_nft_holder_raw(
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
             signer_a.key,
-            nft,
+            if taker_is_owner {
+                None
+            } else {
+                optional_nft_holder_accounts(accounts, MATCHER_TAIL_BASE)
+            },
             program_id,
         )?;
+        // Authorization succeeded, so `account_a_owner` is exactly what was verified: the
+        // signer itself, or the escrow owner (NFT mint-authority PDA) whose NFT the signer
+        // holds. The shared execution path binds the portfolio to THIS owner, not to the
+        // signer key (which never matches an escrowed portfolio's stored owner).
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -18976,6 +19019,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE + if taker_is_owner { 0 } else { NFT_HOLDER_PROOF_ACCOUNTS },
         )?;
         // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): the taker's own
         // fee_bps consent (checked above) is independent of the LP's matcher capability
@@ -19220,7 +19264,7 @@ pub mod processor {
         )?;
         let fill = handle_trade_nocpi_zero_copy(
             program_id,
-            signer_a.key,
+            &Pubkey::new_from_array(account_a_owner),
             &account_b_owner_key,
             market_ai,
             account_a_ai,
@@ -19800,6 +19844,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE,
         )?;
 
         // The lp_account_id stored in the matcher context is the first 8 bytes of
@@ -20131,16 +20176,30 @@ pub mod processor {
         }
         // E2: the taker (account_a) — owner==signer OR signer holds the bound NFT.
         // Pre-view path: use the scalar auth core with the preflight (owner, market_group).
-        // Optional trailing accounts [7]=nft_registry [8]=PositionNft PDA [9]=signer NFT ATA.
-        let nft = optional_nft_holder_accounts(accounts, 7);
+        // GH#407 ABI: the NFT-holder proof trio `[7]=nft_registry [8]=PositionNft PDA
+        // [9]=signer NFT ATA` is present IFF the taker portfolio's stored owner is not the
+        // signer (an escrowed portfolio), and the matcher tail then starts at 10. When
+        // owner == signer there is NO trio and the tail starts at 7 (byte-identical to the
+        // pre-fix layout). The discriminator is the on-chain stored owner, which the caller
+        // cannot influence, so the layout is never caller-selected and no account can be
+        // shifted across the trio/tail boundary.
+        let taker_is_owner = account_a_owner == signer_a.key.to_bytes();
         authorize_owner_or_nft_holder_raw(
             &account_a_owner,
             account_a_ai.key,
             &account_a_header.market_group_id,
             signer_a.key,
-            nft,
+            if taker_is_owner {
+                None
+            } else {
+                optional_nft_holder_accounts(accounts, MATCHER_TAIL_BASE)
+            },
             program_id,
         )?;
+        // Authorization succeeded, so `account_a_owner` is exactly what was verified: the
+        // signer itself, or the escrow owner (NFT mint-authority PDA) whose NFT the signer
+        // holds. The shared execution path binds the portfolio to THIS owner, not to the
+        // signer key (which never matches an escrowed portfolio's stored owner).
         let account_b_owner_key = Pubkey::new_from_array(account_b_owner);
         let (delegate, bump) = derive_matcher_delegate(
             program_id,
@@ -20157,6 +20216,7 @@ pub mod processor {
             matcher_prog.key,
             matcher_ctx.key,
             matcher_delegate.key,
+            MATCHER_TAIL_BASE + if taker_is_owner { 0 } else { NFT_HOLDER_PROOF_ACCOUNTS },
         )?;
         // FIX (upstream 6b627b43, "require LP consent for CPI base fees"): see the mirror
         // check in handle_trade_cpi -- the taker's per-leg fee_bps consent (checked above)
@@ -20380,7 +20440,7 @@ pub mod processor {
         let mut fills: Vec<FillOut> = Vec::new();
         handle_batch_execute_zero_copy(
             program_id,
-            signer_a.key,
+            &Pubkey::new_from_array(account_a_owner),
             &account_b_owner_key,
             market_ai,
             account_a_ai,
@@ -26425,6 +26485,12 @@ pub mod processor {
             profile.insurance_operator = existing_profile.insurance_operator;
             profile.backing_bucket_authority = existing_profile.backing_bucket_authority;
             profile.oracle_authority = existing_profile.oracle_authority;
+            // S1 A-3/A-2 (2026-10-17): a restart keeps the permanent portfolio-id allocator (ids are
+            // never reused: replay binding), the creator-fee claim and the fee checkpoint.
+            profile.next_portfolio_id = existing_profile.next_portfolio_id;
+            profile.creator_fee_claimable_atoms = existing_profile.creator_fee_claimable_atoms;
+            profile.maintenance_fee_checkpoint_slot = existing_profile.maintenance_fee_checkpoint_slot;
+            profile.maintenance_fee_previous_rate = existing_profile.maintenance_fee_previous_rate;
             if asset_index == 0 {
                 mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
             }
@@ -27357,6 +27423,22 @@ pub mod processor {
             return Err(PercolatorError::EngineLockActive.into());
         }
         expect_live_authority(&cfg.marketauth, admin.key)?;
+        // S1 A-1 (2026-10-17): the rate may only be RAISED while no portfolio is materialized.
+        // The market authority is the (untrusted) creator on a permissionless market and the cap
+        // is `MAX_PROTOCOL_FEE_ABS` (1e36), so a raise after depositors exist can be turned into
+        // a drain: the GH#444 checkpoint keeps only ONE `(slot, previous_rate)` pair, so a raise
+        // and a revert in the same slot make the next crank bill each account's whole age at the
+        // raised rate, and tag 49 can route 100% of it to a cranker portfolio the creator owns.
+        // With portfolios present the rate can only fall: billing a pre-change window at an
+        // equal-or-higher previous rate can then only under-collect, never confiscate. Depositors
+        // therefore consent to any raise by depositing into a market that already carries it.
+        if maintenance_fee_per_slot > cfg.maintenance_fee_per_slot {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (_cfg_view, group) = state::market_view_mut(&mut data)?;
+            if group.header.materialized_portfolio_count.get() != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+        }
         // v2.2 band: the maintenance fee is an absolute per-slot debit with no health check,
         // which the Band Safety Law does not price; band markets keep it at 0 (105).
         if maintenance_fee_per_slot != 0 && state::market_band_bps(&market_ai.try_borrow_data()?)? != 0 {
@@ -27850,9 +27932,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh Hybrid
                 // reconfiguration has no committed mark yet -- `price` isn't
                 // known until `read_external_price_e6_profile` runs below, so
@@ -28022,9 +28106,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh EWMA_MARK
                 // reconfiguration commits `initial_mark_e6` immediately (unlike
                 // Hybrid, no external oracle read is needed), so seed the
@@ -28167,9 +28253,11 @@ pub mod processor {
                 insurance_authority: existing_profile.insurance_authority,
                 insurance_operator: existing_profile.insurance_operator,
                 asset_admin: existing_profile.asset_admin,
-                creator_fee_claimable_atoms: 0,
-                maintenance_fee_checkpoint_slot: 0,
-                maintenance_fee_previous_rate: 0,
+                // S1 A-2/A-1 (2026-10-17): an oracle reconfiguration must not erase the creator-fee claim or the
+                // maintenance-fee non-retroactivity checkpoint of this asset.
+                creator_fee_claimable_atoms: existing_profile.creator_fee_claimable_atoms,
+                maintenance_fee_checkpoint_slot: existing_profile.maintenance_fee_checkpoint_slot,
+                maintenance_fee_previous_rate: existing_profile.maintenance_fee_previous_rate,
                 // FIX (ADOPT upstream 06192caa, adapted): a fresh AUTH_MARK
                 // reconfiguration commits `initial_mark_e6` immediately, so seed
                 // the checkpoint directly from it (same convention as the

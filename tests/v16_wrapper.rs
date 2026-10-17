@@ -1699,29 +1699,22 @@ fn v16_wrapper_raising_the_maintenance_rate_is_not_retroactive() {
     )
     .unwrap();
 
-    // NOW raise the rate, and crank immediately — the bundled attack.
-    run_ix(
+    // NOW try to raise the rate and crank immediately — the bundled attack. S1 A-1 (2026-10-17):
+    // a raise is refused outright once a portfolio is materialized, so nothing can be billed
+    // retroactively (the checkpoint alone could be bypassed by a second change in the same slot).
+    let raised = run_ix(
         Instruction::UpdateMaintenanceFeePerSlot {
             maintenance_fee_per_slot: 5,
         },
         &mut [&mut admin, &mut market],
-    )
-    .unwrap();
+    );
+    assert_eq!(raised, Err(ProgramError::Custom(21)), "raise with a portfolio present is refused");
     sync_maintenance_fee(&mut market, &mut portfolio, 1_010).unwrap();
 
     let account = state::read_portfolio(&portfolio.data).unwrap();
-    // Only the 10 slots AFTER the raise may be billed: 10 * 5 = 50.
-    //
-    // Without the checkpoint this charged 5 * ~910 = 4_550, clamped to the
-    // account's entire 1_000 capital — i.e. everything.
     assert_eq!(
-        account.capital, 950,
-        "#444: only the window AFTER the rate change may be billed; the 900 slots \
-         at rate 0 must not be billed at the new rate"
-    );
-    assert_ne!(
-        account.capital, 0,
-        "#444: the account must not be drained by a rate raise"
+        account.capital, 1_000,
+        "#444 / S1 A-1: a refused raise bills nothing, the 900 idle slots stay free"
     );
 }
 
@@ -29228,4 +29221,326 @@ fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
         "a non-pinned registry is not a trust root, even when its own PDA signs"
     );
     assert_eq!(portfolio.data, before, "ownership unchanged");
+}
+
+
+// GH#548: a market creator registers an NFT program it controls (SetNftProgramId is gated only by
+// `cfg.marketauth`, and its first and only write is the creator's choice). Its ["mint_authority"]
+// PDA then signs TransferPortfolioOwnership for a trader's portfolio — no consent from the owner,
+// no escrow — and the creator withdraws the trader's collateral. The native harness models the
+// attacker program's `invoke_signed` by marking its PDA a signer; the registry bytes are exactly
+// what SetNftProgramId writes.
+#[test]
+fn creator_registered_nft_program_cannot_seize_a_trader_portfolio() {
+    let mut creator = signer(); // cfg.marketauth: whoever ran the permissionless InitMarket
+    let mut market = market_account();
+    let mut victim = signer();
+    let mut victim_pf = portfolio_account();
+    let mut counterparty = signer();
+    let mut counterparty_pf = portfolio_account();
+    let mut attacker = signer(); // the creator's second wallet, used to unwind
+    let mut attacker_pf = portfolio_account();
+
+    init_market(&mut creator, &mut market);
+    init_portfolio(&mut victim, &mut market, &mut victim_pf);
+    init_portfolio(&mut counterparty, &mut market, &mut counterparty_pf);
+    init_portfolio(&mut attacker, &mut market, &mut attacker_pf);
+    deposit(&mut victim, &mut market, &mut victim_pf, 1_000_000);
+    deposit(&mut counterparty, &mut market, &mut counterparty_pf, 1_000_000);
+    deposit(&mut attacker, &mut market, &mut attacker_pf, 1_000_000);
+
+    // The victim opens an ordinary long.
+    run_ix(
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&victim_pf).0,
+            account_a_position_epoch: portfolio_identity(&victim_pf).2,
+            account_b_portfolio_id: portfolio_identity(&counterparty_pf).0,
+            account_b_position_epoch: portfolio_identity(&counterparty_pf).2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        &mut [&mut victim, &mut counterparty, &mut market, &mut victim_pf, &mut counterparty_pf],
+    )
+    .unwrap();
+    let victim_capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    assert!(victim_capital > 0);
+
+    // Registry as SetNftProgramId writes it, pointing at a program the creator controls.
+    let creator_program = Pubkey::new_unique();
+    let mut registry = nft_registry_account(&market, &creator_program);
+    let mut creator_mint_auth = TestAccount::new(
+        state::derive_nft_mint_authority(&creator_program).0,
+        solana_program::system_program::ID,
+        0,
+    )
+    .signer();
+    let seized = run_ix(
+        Instruction::TransferPortfolioOwnership {
+            new_owner: attacker.key.to_bytes(),
+            asset_index: 0,
+        },
+        &mut [&mut creator_mint_auth, &mut victim_pf, &mut registry],
+    );
+    if seized.is_err() {
+        // Fixed behaviour: a registry that is not the pinned NFT program is not a trust root.
+        assert_eq!(state::read_portfolio(&victim_pf.data).unwrap().owner, victim.key.to_bytes());
+        return;
+    }
+    // Vulnerable behaviour: ownership moved without the victim, and the collateral leaves.
+    assert_eq!(state::read_portfolio(&victim_pf.data).unwrap().owner, attacker.key.to_bytes());
+    let mut attacker_as_owner = TestAccount::new(attacker.key, attacker.owner, 0).signer();
+    run_ix(
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&victim_pf).0,
+            account_a_position_epoch: portfolio_identity(&victim_pf).2,
+            account_b_portfolio_id: portfolio_identity(&attacker_pf).0,
+            account_b_position_epoch: portfolio_identity(&attacker_pf).2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: -(POS_SCALE as i128),
+            exec_price: 100,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        &mut [&mut attacker_as_owner, &mut attacker, &mut market, &mut victim_pf, &mut attacker_pf],
+    )
+    .unwrap();
+    let capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    let (vault_before, _) = engine_vault_and_capital(&market, &victim_pf);
+    withdraw(&mut attacker_as_owner, &mut market, &mut victim_pf, capital);
+    let (vault_after, capital_after) = engine_vault_and_capital(&market, &victim_pf);
+    panic!(
+        "SEIZED: the creator took the victim's portfolio and withdrew {capital} of {victim_capital} \
+         (vault {vault_before} -> {vault_after}, victim capital now {capital_after})"
+    );
+}
+
+// GH#548: a registry that already names a non-pinned program (e.g. written before the pin
+// existed) must not let that program unwrap an escrowed portfolio. The signer here is the bogus
+// program's REAL ["mint_authority"] PDA (the native harness models its invoke_signed), so the
+// rejection can only come from the pin check, not from a mint-authority mismatch.
+#[test]
+fn unwrap_rejects_a_registry_that_names_a_non_pinned_program() {
+    let mut creator = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut creator, &mut market);
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+
+    let bogus = Pubkey::new_unique();
+    assert_ne!(bogus, percolator_prog::constants::NFT_PROGRAM_ID);
+    let bogus_mint_auth = state::derive_nft_mint_authority(&bogus).0;
+    escrow_portfolio_under(&mut portfolio, &bogus_mint_auth);
+    let mut registry = nft_registry_account(&market, &bogus);
+    let mut signer_pda =
+        TestAccount::new(bogus_mint_auth, solana_program::system_program::ID, 0).signer();
+
+    let before = portfolio.data.clone();
+    let res = run_ix(
+        Instruction::UnwrapEscrowedPortfolio {
+            new_owner: Pubkey::new_unique().to_bytes(),
+        },
+        &mut [&mut signer_pda, &mut portfolio, &mut registry],
+    );
+    assert_eq!(
+        res,
+        Err(percolator_prog::error::PercolatorError::NftInvalidMintAuthority.into()),
+        "a non-pinned registry is not a trust root, even when its own PDA signs"
+    );
+    assert_eq!(portfolio.data, before, "ownership unchanged");
+}
+
+/// S1 audit 2026-10-17, A-2: reconfiguring an asset's oracle (tags 34 / 35 / 62) rebuilt the whole
+/// `AssetOracleProfileV16` and zeroed `creator_fee_claimable_atoms`, so the oracle authority (a
+/// different role from the creator's `asset_admin`) could erase the creator's accrued fee claim.
+/// Also pins that the maintenance-fee checkpoint survives the rebuild.
+#[test]
+fn s1_oracle_reconfiguration_keeps_the_creator_fee_claim_and_fee_checkpoint() {
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    {
+        let mut profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+        profile.creator_fee_claimable_atoms = 777;
+        profile.maintenance_fee_checkpoint_slot = 55;
+        profile.maintenance_fee_previous_rate = 3;
+        state::write_asset_oracle_profile(&mut market.data, 0, &profile).unwrap();
+    }
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 100, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let profile = state::read_asset_oracle_profile(&market.data, 0).unwrap();
+    assert_eq!(profile.creator_fee_claimable_atoms, 777, "S1 A-2: creator fee claim erased by tag 35");
+    assert_eq!(profile.maintenance_fee_checkpoint_slot, 55, "S1 A-1: fee checkpoint wiped by tag 35");
+    assert_eq!(profile.maintenance_fee_previous_rate, 3, "S1 A-1: previous rate wiped by tag 35");
+}
+
+
+/// GH#555: the #464 checkpoint must apply on EVERY collection route, not just
+/// `SyncMaintenanceFee`.
+///
+/// Reworked for S1 A-1 (rates can only FALL once a portfolio exists): the market carries rate 10
+/// while the account idles, the rate is then lowered to 5, and the fee is crystallized through
+/// `Withdraw`. The pre-change window must be billed at the rate that was in force (10); billing
+/// the whole window at the new rate (5) under-collects.
+#[test]
+fn v16_wrapper_maintenance_fee_checkpoint_applies_on_the_withdraw_route() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 10;
+            }
+        }),
+    );
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 100_000);
+
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 1_000,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    withdraw(&mut owner, &mut market, &mut portfolio, 100);
+
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    assert_eq!(
+        account.capital,
+        100_000 - 100 - 900 * 10,
+        "GH#555: Withdraw must bill the pre-change window at the rate in force (10), not at the \
+         new rate (5): before the fix this was 100_000 - 100 - 900 * 5"
+    );
+}
+
+/// S1 audit 2026-10-17, A-1: the market authority (marketauth, the untrusted creator on a
+/// permissionless market) takes a depositor's whole idle capital through the maintenance fee,
+/// bypassing the GH#444/#464 "not retroactive" checkpoint with two rate changes (0 -> R, R -> 0)
+/// in the same slot, a 100% cranker share (tag 49) and a cranker portfolio it owns (tag 48).
+#[test]
+fn s1_marketauth_cannot_drain_idle_depositors_through_the_maintenance_fee() {
+    let mut admin = signer(); // cfg.marketauth
+    let mut market = market_account();
+    let mut victim = signer();
+    let mut victim_pf = portfolio_account();
+    let mut cranker_owner = signer(); // the creator's second wallet
+    let mut cranker_pf = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket { maintenance_fee_per_slot, .. } = ix {
+                *maintenance_fee_per_slot = 0;
+            }
+        }),
+    );
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 100, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    init_portfolio(&mut victim, &mut market, &mut victim_pf);
+    deposit(&mut victim, &mut market, &mut victim_pf, 1_000_000);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker_pf);
+    deposit(&mut cranker_owner, &mut market, &mut cranker_pf, 1);
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 1_000, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // Step 1: 100% cranker share.
+    run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap().maintenance_fee + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    // Steps 2-3: raise to a huge rate and back to 0 in the same slot. The raise must be refused
+    // (S1 A-1 fix); before the fix both succeeded and the crank below confiscated everything.
+    for rate in [1_000_000_000_000u128, 0u128] {
+        let _ = run_ix(
+            Instruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: rate },
+            &mut [&mut admin, &mut market],
+        );
+    }
+    // Step 4: crank the victim, reward to the creator's own cranker portfolio.
+    let _ = run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 1_000 },
+        &mut [&mut market, &mut victim_pf, &mut cranker_pf, &mut cranker_owner],
+    );
+    let victim_capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    let cranker_capital = state::read_portfolio(&cranker_pf.data).unwrap().capital;
+    assert!(
+        victim_capital == 1_000_000 && cranker_capital == 1,
+        "S1 A-1: victim capital {victim_capital} (was 1_000_000), creator's cranker capital {cranker_capital} (was 1)"
+    );
 }
