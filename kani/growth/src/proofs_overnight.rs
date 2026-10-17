@@ -276,6 +276,7 @@ fn kani_growth_t5c_at_capacity_costs_full_margin() {
         kink_bps: kani::any(),
         crowd_blocked: false,
         asset_bound: true,
+        depth_cap_q: u128::MAX, // audit-1017: head GrowthGateIn gained G8 depth_cap_q; MAX = "no depth cap" = the semantics these harnesses proved
     };
     kani::assume(joins_crowd(lb as i128, la as i128));
     kani::assume(g.kink_bps < 10_000 && g.ceil_imr_bps <= 10_000 && g.ceil_imr_bps >= g.engine_imr_bps);
@@ -328,6 +329,7 @@ fn kani_growth_wc_g2_required_imr_not_below_engine() {
         kink_bps: kani::any(),
         crowd_blocked: kani::any(),
         asset_bound: kani::any(),
+        depth_cap_q: u128::MAX, // audit-1017: head GrowthGateIn gained G8 depth_cap_q; MAX = "no depth cap" = the semantics these harnesses proved
     };
     let r = growth_required_imr_bps(&g);
     if let Ok(x) = r {

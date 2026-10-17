@@ -576,6 +576,7 @@ fn kani_growth_w_g2_required_imr_not_below_engine() {
         kink_bps: kani::any::<u16>(),
         crowd_blocked: kani::any(),
         asset_bound: true,
+        depth_cap_q: u128::MAX, // audit-1017: head GrowthGateIn gained G8 depth_cap_q (head proofs.rs missed this literal); MAX = no depth cap
     };
     let r = growth_required_imr_bps(&g);
     if let Ok(x) = r {

@@ -64,5 +64,12 @@ pub mod state {
     pub const MINIMUM_LIQUIDITY: u64 = 1_000;
 }
 
+// audit-1017: the production growth_v19.rs (:1005) reads `crate::depth_src_v22::DEPTH_MODE_DEX`. The real
+// depth_src_v22.rs needs solana-program; this crate reads only that one const, which is checked equal to
+// src/depth_src_v22.rs:602 by kani/check_depth_stub.sh. Nothing else of that module is referenced.
+pub mod depth_src_v22 {
+    pub const DEPTH_MODE_DEX: u8 = 2;
+}
+
 #[cfg(kani)]
 mod proofs;
