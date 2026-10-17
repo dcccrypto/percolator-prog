@@ -4289,3 +4289,84 @@ fn v22_f1_dust_shortfall_waits_for_material_progress() {
     }
     assert!(!f1_hlock(&env));
 }
+
+// ---- LIQ-DIAG (2026-10-17): bankrupt, never-refreshed account on an off-band AuthMark market ----
+
+fn liq_diag_state(env: &Env, t: Pubkey, tag: &str) {
+    let a = env.engine_asset();
+    let (eq, mm, def) = f1_cert(env, t);
+    println!(
+        "LD {tag}: slot {} slot_last {} eff {} target {} pos {} stale_long {} cert(eq {eq} mm {mm} def {def}) hlock {} oi_l {}",
+        env.slot, a.slot_last, a.effective_price, a.raw_oracle_target_price, env.pos(t),
+        a.stale_account_count_long, f1_hlock(env), a.oi_eff_long_q
+    );
+}
+
+#[test]
+fn liq_diag_bankrupt_unrefreshed_long() {
+    let mut env = f1_env(None, f1_off_band_cfg());
+    let (lp, long) = f1_open_long(&mut env, 12, 100);
+    liq_diag_state(&env, long.1, "opened");
+    // Peer refreshes stop. Mark gaps -21% in one push; LP-observe cranks only.
+    env.warp(1);
+    let eff = env.engine_asset().effective_price;
+    let new_mark = eff * 79 / 100;
+    env.push(new_mark);
+    for i in 0..400 {
+        env.warp(1);
+        env.push(new_mark);
+        let ix0 = f1_crank_ix(&env, lp.account, true);
+        let r = f1_send(&mut env, &[ix0], 1_400_000);
+        if i % 40 == 0 || r.is_err() {
+            liq_diag_state(&env, long.1, &format!("lp-observe round {i} -> {r:?}"));
+        }
+        if env.engine_asset().effective_price == new_mark { liq_diag_state(&env, long.1, "caught up"); break; }
+    }
+    let shapes: Vec<(&str, Vec<(bool, bool)>)> = vec![
+        ("refresh alone", vec![(false, false)]),
+        ("observe via trader", vec![(false, true)]),
+        ("lp observe + refresh", vec![(true, true), (false, false)]),
+        ("lp observe + refresh + refresh", vec![(true, true), (false, false), (false, false)]),
+        ("trader obs + trader obs", vec![(false, true), (false, true)]),
+    ];
+    for (n, spec) in shapes {
+        for k in 0..4 {
+            env.warp(1);
+            env.push(new_mark);
+            let ixs: Vec<Instruction> = spec.iter().map(|(is_lp, obs)| f1_crank_ix(&env, if *is_lp { lp.account } else { long.1 }, *obs)).collect();
+            let pos0 = env.pos(long.1);
+            let r = f1_send(&mut env, &ixs, 1_400_000);
+            liq_diag_state(&env, long.1, &format!("shape '{n}' try {k}: {r:?} pos0 {pos0}"));
+            assert_eq!(env.pos(long.1), pos0, "no single-catch-up-short shape may liquidate while the asset lags more than one window");
+        }
+    }
+}
+
+#[test]
+fn liq_diag_bankrupt_unrefreshed_catchup_then_refresh() {
+    let mut env = f1_env(None, f1_off_band_cfg());
+    let (lp, long) = f1_open_long(&mut env, 12, 100);
+    env.warp(1);
+    let eff = env.engine_asset().effective_price;
+    let new_mark = eff * 79 / 100;
+    env.push(new_mark);
+    for _ in 0..400 {
+        env.warp(1);
+        env.push(new_mark);
+        let ix0 = f1_crank_ix(&env, lp.account, true);
+        f1_send(&mut env, &[ix0], 1_400_000).unwrap();
+    }
+    env.warp(30);
+    env.push(new_mark);
+    liq_diag_state(&env, long.1, "after 30-slot gap");
+    let gap = env.slot - env.engine_asset().slot_last;
+    for n_obs in [gap as usize, gap as usize + 1, gap as usize + 3] {
+        let mut ixs: Vec<Instruction> = (0..n_obs).map(|_| f1_crank_ix(&env, lp.account, true)).collect();
+        ixs.push(f1_crank_ix(&env, long.1, false));
+        let pos0 = env.pos(long.1);
+        let r = f1_send(&mut env, &ixs, 1_400_000);
+        liq_diag_state(&env, long.1, &format!("{n_obs} lp observes + refresh: {r:?} pos0 {pos0}"));
+        if env.pos(long.1) != pos0 { break; }
+    }
+    assert_eq!(env.pos(long.1), 0, "N observe cranks (N = ceil(gap / max_accrual_dt)) + one refresh liquidates the bankrupt, never-refreshed long");
+}
