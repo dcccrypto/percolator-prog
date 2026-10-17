@@ -29061,3 +29061,88 @@ fn v16_wrapper_escrowed_terminal_payout_guard_rejects_foreign_registry_accounts(
         (1_000, 1_000)
     );
 }
+
+/// GH#555: the #464 checkpoint must apply on EVERY collection route, not just
+/// `SyncMaintenanceFee`.
+///
+/// Same world as `v16_wrapper_maintenance_fee_rate_raise_is_not_retroactive` above — rate 0
+/// for a long idle window, then a raise — but the fee is crystallized through `Withdraw`
+/// instead. Withdraw reaches `collect_maintenance_fee_before_value_debit_view`, which called
+/// the raw `sync_account_fee_to_slot_not_atomic` and so billed the whole pre-raise window at
+/// the new rate: the #444 confiscation, on the route the victim invokes themselves.
+#[test]
+fn v16_wrapper_maintenance_fee_checkpoint_applies_on_the_withdraw_route() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket {
+                maintenance_fee_per_slot,
+                ..
+            } = ix
+            {
+                *maintenance_fee_per_slot = 0;
+            }
+        }),
+    );
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 100,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
+    deposit(&mut owner, &mut market, &mut portfolio, 1_000);
+
+    // A long idle window at rate 0. Nothing is owed for it.
+    let observation_sequence =
+        state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: 1_000,
+            initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1,
+            mark_min_fee: 0,
+            observation_sequence,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    run_ix(
+        Instruction::UpdateMaintenanceFeePerSlot {
+            maintenance_fee_per_slot: 5,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // The victim's OWN withdrawal crystallizes the fee. Only the post-raise window is owed,
+    // which is 0 slots here (the raise and the withdraw are in the same market slot), so the
+    // withdrawal must take exactly what was asked for and nothing else.
+    withdraw(&mut owner, &mut market, &mut portfolio, 100);
+
+    let account = state::read_portfolio(&portfolio.data).unwrap();
+    assert_eq!(
+        account.capital, 900,
+        "GH#555: Withdraw must not bill the pre-raise window at the new rate; \
+         before the fix the ~900 idle slots were charged at 5/slot and capped at capital"
+    );
+}

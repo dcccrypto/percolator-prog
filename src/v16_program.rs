@@ -14258,9 +14258,15 @@ pub mod processor {
         if group.header.mode != 0 || cfg.maintenance_fee_per_slot == 0 {
             return Ok(0);
         }
-        let charged = group
-            .sync_account_fee_to_slot_not_atomic(portfolio, now_slot, cfg.maintenance_fee_per_slot)
-            .map_err(map_v16_error)?;
+        // GH#555: bill through the CHECKPOINTED path, as `SyncMaintenanceFee` does. The raw
+        // `sync_account_fee_to_slot_not_atomic` bills the whole `[last_fee_slot, now]` window at
+        // the CURRENT rate and then advances `last_fee_slot` past the checkpoint, which is the
+        // #444 retroactivity that #464 removed -- so leaving it here meant one rate raise was
+        // still retroactive on every route but SyncMaintenanceFee (Withdraw, the trade paths,
+        // PermissionlessCrank, the tranche/vault/bond withdrawals). Identical behaviour whenever
+        // there is no checkpoint (`checkpoint == 0`) or the account is already past it.
+        let charged =
+            sync_maintenance_fee_checkpointed(group, cfg, portfolio, now_slot, cfg.maintenance_fee_per_slot)?;
         credit_maintenance_fee_to_active_market_budgets_view(cfg, group, charged)?;
         Ok(charged)
     }
