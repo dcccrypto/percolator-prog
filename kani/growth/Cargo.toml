@@ -25,6 +25,10 @@ growth_mutant = []
 vlp_mutant = []
 # R11 negative control: the view's pre-N-1 capacity measure (LP net) in the harness model.
 lpnet_mutant = []
+# Overnight 2026-10-14: production files minus cfg(kani) contract attrs (gen_nc.sh), for stubbing.
+nc = []
+# Overnight negative controls (proofs_overnight::neg): each asserts a slightly FALSE claim; must FAIL.
+negctl = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
