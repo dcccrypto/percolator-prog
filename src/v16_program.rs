@@ -7813,6 +7813,19 @@ pub mod state {
             crate::growth_v19::tier_leverage(self.tier_leverage_x100, self.l_launch_x100, self.l_tier_x100)
         }
 
+        /// CONTROLLER ROLLBACK: drop the controller-only bytes (see
+        /// `asset_growth_from_wrapper_bytes`). Bytes 0..8 become `c_launch_atoms = 0`
+        /// (unrecorded), 30..38 and 118..120 zero together (no window), flags 0.
+        pub fn normalize_controller_record(&mut self) {
+            self.c_launch_atoms = 0;
+            self.alloc_alpha_bps = 0;
+            self.alloc_buffer_bps = 0;
+            self.cushion_target_bps = 0;
+            self.cushion_share_bps = 0;
+            self._reserved1 = [0u8; 2];
+            self.flags = 0;
+        }
+
         pub fn set_graduation(&mut self, f: crate::growth_v19::GraduationFields) {
             self.c_launch_atoms = f.c_launch_atoms;
             self.ceil_x100 = f.ceil_x100;
@@ -7852,6 +7865,12 @@ pub mod state {
     /// (off). `version == 0` with ANY other non-zero byte is corrupt (fail closed), as is an
     /// unknown version, a non-zero reserved / phase-2 byte, `l_launch` outside [1x, l_tier],
     /// a tier looser than the engine IMR, `lambda` outside [1, MAX], or a kink above 100%.
+    /// CONTROLLER ROLLBACK: the flags byte (39) values the controller writes: 0x01 (R3 layout) and
+    /// 0x03 (R3 layout + volatility data). Bit 1 alone, or any other bit, is refused.
+    pub fn rollback_controller_flags_ok(flags: u8) -> bool {
+        flags == 0x01 || flags == 0x03
+    }
+
     pub fn validate_asset_growth(
         g: &AssetGrowthV19,
         engine_imr_bps: u64,
@@ -7918,7 +7937,19 @@ pub mod state {
         let bytes = wrapper
             .get(off..off + crate::constants::ASSET_GROWTH_LEN)
             .ok_or(PercolatorError::InvalidAccountLen)?;
-        let g: AssetGrowthV19 = bytemuck::pod_read_unaligned(bytes);
+        let mut g: AssetGrowthV19 = bytemuck::pod_read_unaligned(bytes);
+        // CONTROLLER ROLLBACK (tolerant build): a record written by the adaptive growth
+        // controller carries flags bits 0..1, the volatility / rent-stamp pair at 0..8 (where
+        // this line keeps `c_launch_atoms`) and the depth window at 30..38 / 118..120 (where this
+        // line validates zero). Read it as the combined-shaped record it degrades to: c_launch
+        // unrecorded (0), no window, flags 0. The next write stores that shape; nothing here
+        // can loosen a limit (fail-closed: unrecorded c_launch re-snapshots, window absent).
+        if g.flags != 0 {
+            if !rollback_controller_flags_ok(g.flags) {
+                return Err(ProgramError::InvalidAccountData);
+            }
+            g.normalize_controller_record();
+        }
         validate_asset_growth(&g, engine_imr_bps)?;
         Ok(Some(g))
     }
