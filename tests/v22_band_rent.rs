@@ -4422,3 +4422,199 @@ fn v22_f1_dust_shortfall_waits_for_material_progress() {
     }
     assert!(!f1_hlock(&env));
 }
+
+// ---------------------------------------------------------------------------
+// CONTROLLER ROLLBACK build (fix/v22-controller-rollback-2026-10-17): the deployed v2.2 line
+// (aca02ba6 / c659c91d) made tolerant of every growth record the adaptive controller
+// (666df893 + ports) can write. The controller's byte patterns (security review
+// `security-review-v22-growth-controller-2026-10-15.md` F-3): flags (39) = 0x01 / 0x03, bytes 0..4
+// the volatility variance and 4..8 the rent stamp (NOT c_launch), 30..34 / 34..38 the depth
+// window (cur / prev) and 118..120 its bucket. A real differential (records written by the real
+// controller BPF, then the program swapped for this build) is
+// `controller_rollback_differential_from_controller_bpf` (ignored; needs CONTROLLER_SO).
+// ---------------------------------------------------------------------------
+
+impl Env {
+    /// STATE POKE: overwrite bytes of the growth record at `off` (record-relative).
+    fn poke_growth_raw(&mut self, off: usize, bytes: &[u8]) {
+        let mut acc = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&acc.data, 0).unwrap();
+        acc.data[r.start + off..r.start + off + bytes.len()].copy_from_slice(bytes);
+        self.svm.set_account(self.market, acc).unwrap();
+    }
+
+    /// The raw 120-byte growth record.
+    fn growth_bytes(&self) -> Vec<u8> {
+        let acc = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&acc.data, 0).unwrap();
+        acc.data[r].to_vec()
+    }
+
+    /// Whether the growth record of asset 0 decodes (the production reader).
+    fn growth_decodes(&self) -> bool {
+        let acc = self.svm.get_account(&self.market).unwrap();
+        state::read_asset_growth(&acc.data, 0, self.engine_imr).is_ok()
+    }
+
+    /// Everything a rollback must accept: a 35 B push, a 44 B push, a crank, a rent settlement
+    /// (reads the record) and a trade (reads the cap).
+    fn rollback_exercise(&mut self, lp: &Lp, tag: &str) {
+        self.warp(1);
+        self.push(PRICE);
+        self.warp(1);
+        self.push_depth(PRICE, 1, 600 * USD as u64).unwrap_or_else(|e| panic!("{tag}: 44 B push refused: {e}"));
+        self.crank(lp.account).unwrap_or_else(|e| panic!("{tag}: crank refused: {e}"));
+        self.crank_current(lp.account);
+        self.settle_rent(lp.account, lp.account).unwrap_or_else(|e| panic!("{tag}: tag 106 refused: {e}"));
+        let t = self.trader(1_000 * USD);
+        self.trade_cpi(&t.0, t.1, lp, 10 * Q).unwrap_or_else(|e| panic!("{tag}: trade refused: {e}"));
+        self.assert_conservation();
+    }
+
+    /// STATE POKE: the shape the controller leaves after a push: flags, variance + rent stamp at
+    /// 0..8 (not a c_launch), the depth window at 30..38 and its bucket at 118..120.
+    fn poke_controller_record(&mut self, flags: u8) {
+        self.poke_growth_raw(0, &1_234_567u32.to_le_bytes()); // variance x100
+        self.poke_growth_raw(4, &777u32.to_le_bytes()); // rent stamp
+        self.poke_growth_raw(30, &600u32.to_le_bytes()); // window cur
+        self.poke_growth_raw(34, &550u32.to_le_bytes()); // window prev
+        self.poke_growth_raw(39, &[flags]);
+        self.poke_growth_raw(118, &4242u16.to_le_bytes()); // bucket
+    }
+}
+
+fn assert_controller_bytes_dropped(b: &[u8], tag: &str) {
+    assert_eq!(b[39], 0, "{tag}: flags cleared on the rollback's write");
+    assert_eq!(&b[30..38], &[0u8; 8], "{tag}: window cur/prev zeroed");
+    assert_eq!(&b[118..120], &[0u8; 2], "{tag}: window bucket zeroed together with the window");
+}
+
+/// The unmodified (deployed aca02ba6) validator reads these records as corrupt (flags != 0,
+/// non-zero 30..38 / 118..120): push, crank, rent and trade all fail InvalidAccountData. The
+/// rollback accepts them, runs every core instruction, and its first write drops the controller
+/// bytes (zeroing 30..38 and 118..120 together, flags back to 0).
+#[test]
+fn controller_rollback_accepts_flags_1_record() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    env.poke_controller_record(0x01);
+    assert!(env.growth_decodes(), "the tolerant reader decodes a flags-1 record");
+    let before = env.growth_bytes();
+    env.rollback_exercise(&lp, "flags 1");
+    let after = env.growth_bytes();
+    assert_controller_bytes_dropped(&after, "flags 1");
+    // Everything else (configuration, ceiling, tier table, decimals) is carried over.
+    for (name, r) in [("lambda..r_gap", 16..30usize), ("version", 38..39), ("decimals+1", 46..47), ("tier table", 96..114)] {
+        assert_eq!(&after[r.clone()], &before[r.clone()], "{name} untouched");
+    }
+    assert!(env.growth().ceil_x100 >= 100, "ceiling intact and decodable");
+}
+
+#[test]
+fn controller_rollback_accepts_flags_3_record() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    env.poke_controller_record(0x03);
+    assert!(env.growth_decodes());
+    env.rollback_exercise(&lp, "flags 3");
+    assert_controller_bytes_dropped(&env.growth_bytes(), "flags 3");
+}
+
+/// A controller record on a market the controller also stamped DEPTH_EVER (the sticky bit the
+/// combined line keeps): the rollback keeps the sticky bit (no cap-off) while dropping the window.
+#[test]
+fn controller_rollback_keeps_depth_ever_and_last_good_from_a_controller_record() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    let slot = env.clock_slot();
+    env.poke_controller_record(0x03);
+    env.poke_growth_raw(44, &[0x85]);
+    env.poke_growth_raw(80, &(600 * USD as u64).to_le_bytes());
+    env.poke_growth_raw(88, &slot.to_le_bytes());
+    env.poke_growth_raw(114, &((slot / 64) as u32).to_le_bytes());
+    env.rollback_exercise(&lp, "flags 3 + EVER");
+    let b = env.growth_bytes();
+    assert_eq!(b[44] & 0x80, 0x80, "DEPTH_EVER survives");
+    assert_eq!(&b[80..88], &(600 * USD as u64).to_le_bytes(), "last-good depth survives");
+    assert_controller_bytes_dropped(&b, "flags 3 + EVER");
+}
+
+/// Bytes the controller never writes stay refused: flags bit 1 alone, any other flag bit, and a
+/// non-zero window on a record whose flags are 0 (the combined shape).
+#[test]
+fn controller_rollback_still_refuses_records_the_controller_cannot_write() {
+    for (flags, why) in [(0x02u8, "bit 1 without bit 0"), (0x04, "bit 2"), (0x05, "bits 0 + 2"), (0x80, "bit 7"), (0xff, "all bits")] {
+        let mut env = Env::new(band_cfg());
+        env.auth_mark();
+        let _lp = env.lp(1_000 * USD);
+        assert!(env.growth_decodes(), "control: unpoked record decodes");
+        env.poke_growth_raw(39, &[flags]);
+        assert!(!env.growth_decodes(), "flags {flags:#04x} ({why}) must be refused");
+    }
+    // flags 0 with a non-zero window is NOT a controller record: still refused.
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let _lp = env.lp(1_000 * USD);
+    env.poke_growth_raw(30, &9u32.to_le_bytes());
+    assert!(!env.growth_decodes(), "flags 0 + window bytes is refused as before");
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let _lp = env.lp(1_000 * USD);
+    env.poke_growth_raw(118, &9u16.to_le_bytes());
+    assert!(!env.growth_decodes(), "flags 0 + bucket is refused as before");
+    // A controller record whose other invariants are broken (ceiling above the tier) is refused.
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let _lp = env.lp(1_000 * USD);
+    env.poke_controller_record(0x01);
+    env.poke_growth_raw(24, &u16::MAX.to_le_bytes());
+    assert!(!env.growth_decodes(), "the remaining validator clauses still bind");
+}
+
+/// DIFFERENTIAL (ignored; `CONTROLLER_SO` = the controller wrapper at the IDs this test env
+/// mounts, `GROWTH_WRAPPER_SO` or target/deploy = this rollback build): the market is created and
+/// driven by the real controller BPF (35 B and 44 B pushes, which write flags / window / variance,
+/// cranks, a trade), then the PROGRAM IS SWAPPED for this build in the same LiteSVM and every
+/// operation must still land; finally the controller is swapped back (re-upgrade) and lands.
+#[test]
+#[ignore]
+fn controller_rollback_differential_from_controller_bpf() {
+    let controller = PathBuf::from(std::env::var_os("CONTROLLER_SO").expect("CONTROLLER_SO"));
+    let rollback = std::fs::read(program_path()).expect("rollback .so");
+    let mut env = f1_env(Some(controller.clone()), band_cfg());
+    let ctrl = std::fs::read(&controller).unwrap();
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    for _ in 0..3 {
+        env.warp(2);
+        env.push(PRICE);
+        env.warp(2);
+        env.push_depth(PRICE, 1, 600 * USD as u64).expect("controller 44 B push");
+    }
+    let g = env.growth_bytes();
+    println!("controller record: flags={:#04x} 0..8={:?} 30..38={:?} 118..120={:?}", g[39], &g[0..8], &g[30..38], &g[118..120]);
+    assert_ne!(g[39] & 1, 0, "the controller flagged the record: this really is its layout");
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("trade on the controller");
+    // Swap to the rollback build (an in-place program upgrade).
+    env.svm.add_program(env.program_id, &rollback);
+    env.rollback_exercise(&lp, "controller -> rollback");
+    assert_controller_bytes_dropped(&env.growth_bytes(), "after the rollback's writes");
+    // Re-upgrade to the controller: the legacy-shaped record migrates on the first push.
+    env.svm.add_program(env.program_id, &ctrl);
+    env.warp(2);
+    env.push(PRICE);
+    env.warp(2);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("controller 44 B push after the round trip");
+    env.crank(lp.account).expect("controller crank after the round trip");
+    env.crank_current(lp.account);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("controller trade after the round trip");
+}
