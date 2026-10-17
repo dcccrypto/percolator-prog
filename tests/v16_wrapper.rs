@@ -29314,3 +29314,79 @@ fn v16_wrapper_maintenance_fee_checkpoint_applies_on_the_withdraw_route() {
          before the fix the ~900 idle slots were charged at 5/slot and capped at capital"
     );
 }
+
+/// S1 audit 2026-10-17, A-1: the market authority (marketauth, the untrusted creator on a
+/// permissionless market) takes a depositor's whole idle capital through the maintenance fee,
+/// bypassing the GH#444/#464 "not retroactive" checkpoint with two rate changes (0 -> R, R -> 0)
+/// in the same slot, a 100% cranker share (tag 49) and a cranker portfolio it owns (tag 48).
+#[test]
+fn s1_marketauth_cannot_drain_idle_depositors_through_the_maintenance_fee() {
+    let mut admin = signer(); // cfg.marketauth
+    let mut market = market_account();
+    let mut victim = signer();
+    let mut victim_pf = portfolio_account();
+    let mut cranker_owner = signer(); // the creator's second wallet
+    let mut cranker_pf = portfolio_account();
+
+    init_market_with_ix(
+        &mut admin,
+        &mut market,
+        init_market_ix_with(|ix| {
+            if let Instruction::InitMarket { maintenance_fee_per_slot, .. } = ix {
+                *maintenance_fee_per_slot = 0;
+            }
+        }),
+    );
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 100, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    init_portfolio(&mut victim, &mut market, &mut victim_pf);
+    deposit(&mut victim, &mut market, &mut victim_pf, 1_000_000);
+    init_portfolio(&mut cranker_owner, &mut market, &mut cranker_pf);
+    deposit(&mut cranker_owner, &mut market, &mut cranker_pf, 1);
+    let seq = state::read_asset_control_sequences(&market.data, 0).unwrap().oracle_observation + 1;
+    run_ix(
+        Instruction::ConfigureEwmaMark {
+            market_id: 1, asset_index: 0, now_slot: 1_000, initial_mark_e6: 100,
+            mark_ewma_halflife_slots: 1, mark_min_fee: 0, observation_sequence: seq,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+
+    // Step 1: 100% cranker share.
+    run_ix(
+        Instruction::UpdateMaintenanceFeePolicy {
+            cranker_share_bps: 10_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap().maintenance_fee + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    // Steps 2-3: raise to a huge rate and back to 0 in the same slot.
+    for rate in [1_000_000_000_000u128, 0u128] {
+        run_ix(
+            Instruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: rate },
+            &mut [&mut admin, &mut market],
+        )
+        .unwrap();
+    }
+    // Step 4: crank the victim, reward to the creator's own cranker portfolio.
+    let _ = run_ix(
+        Instruction::SyncMaintenanceFee { now_slot: 1_000 },
+        &mut [&mut market, &mut victim_pf, &mut cranker_pf, &mut cranker_owner],
+    );
+    let victim_capital = state::read_portfolio(&victim_pf.data).unwrap().capital;
+    let cranker_capital = state::read_portfolio(&cranker_pf.data).unwrap().capital;
+    assert!(
+        victim_capital == 1_000_000 && cranker_capital == 1,
+        "S1 A-1: victim capital {victim_capital} (was 1_000_000), creator's cranker capital {cranker_capital} (was 1)"
+    );
+}
