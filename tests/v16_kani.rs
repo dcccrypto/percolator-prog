@@ -1959,6 +1959,9 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
     kani::assume(tag != 80); // CloseLpVault
     kani::assume(tag != 81); // CancelRedemption (zero-payload; P-K81)
     kani::assume(tag != 87); // WithdrawInsuranceReserveToStake (zero-payload; P-K81)
+    // v2.2 (kani v22-final, design P-3): two more zero-payload tags decode from one byte.
+    kani::assume(tag != 116); // InitInsuranceUnits (Wave D)
+    kani::assume(tag != 121); // CommitG9FeedAllowlist (R-10 timelock)
     assert!(Instruction::decode(&[tag]).is_err());
 
     let deposit_tag_only = [3u8];
@@ -2438,6 +2441,8 @@ fn kani_e2_auth_accept_implies_all_gates() {
         assert!(amt == 1, "authorized ⟹ holds exactly one");
         assert!(init, "authorized ⟹ token account initialized");
     }
+    // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
+    kani::cover!(nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init), "an authorized input exists (the implication is not vacuous)");
 }
 
 // ── Each gate LOAD-BEARING: its failure ⟹ reject, for ALL other inputs ──

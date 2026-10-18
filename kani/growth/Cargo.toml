@@ -11,13 +11,24 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+# v2.2 (kani v22-final, design rev 2 R2.3): growth_v19.rs:810 calls percolator::band_rent; the
+# path-included production files are compiled with this crate's `devnet` feature (growth_v19.rs:833/854).
+[dependencies]
+percolator = { path = "../../../percolator", features = ["fork-facade"] }  # same engine features as the wrapper (Cargo.toml:70)
+
 [features]
+# Deployed flavour (v2.2 is devnet only): selects the devnet BAND_LAMBDA_CAP_BPS / ALLOC_ALPHA_MAX_BAND_BPS.
+devnet = []
 # Negative controls: swap in mutants/growth_v19_mutant.rs.
 growth_mutant = []
 # Primitive negative controls: swap in mutants/vault_lp_v18_mutant.rs (mul_div_floor).
 vlp_mutant = []
 # R11 negative control: the view's pre-N-1 capacity measure (LP net) in the harness model.
 lpnet_mutant = []
+# Overnight 2026-10-14: production files minus cfg(kani) contract attrs (gen_nc.sh), for stubbing.
+nc = []
+# Overnight negative controls (proofs_overnight::neg): each asserts a slightly FALSE claim; must FAIL.
+negctl = []
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

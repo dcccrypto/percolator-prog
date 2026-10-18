@@ -1,0 +1,41 @@
+[package]
+name = "money-paths-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Kani 2026-10-14 money paths: bond / rescue / insurance-unit no-dilution at FULL width on the EXACT production files (primitives replaced by their proven contracts), plus stake<->wrapper unit-math equivalence."
+
+# Standalone (not a workspace member) so `stub_verified` / `proof_for_contract` can target the
+# path-included production functions (an integration-test crate cannot) and so mutants rebuild
+# without the wrapper.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# growth_v19.rs (vault_lp_v18 reads its flavour constants) calls percolator::band_rent.
+percolator = { path = "../../../percolator", features = ["fork-facade"] }
+
+[dev-dependencies]
+proptest = "1.4"
+
+[features]
+# Deployed flavour (v2.2 is devnet only).
+devnet = []
+# Planted mutants (one deliberate defect each, a COPY of the production file in mutants/):
+mut_bond_deposit = []
+mut_bond_redeem = []
+mut_rescue_shares = []
+mut_rescue_claim = []
+mut_ins_topup = []
+mut_ins_burn = []
+mut_p4_ceil = []
+mut_vlp_floor = []
+mut_stake_topup = []
+mut_ins_value = []
+mut_stake_burn = []
+mut_stake_value = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

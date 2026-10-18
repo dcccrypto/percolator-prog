@@ -1,0 +1,3 @@
+id	file	line	original	replacement	target	expected_kill
+# LiteSVM (NOT Kani) mutant rows: build the devnet .so with the mutant applied (mutant.py apply), run `cargo test --features devnet --test <file> <test>`; KILLED = the test fails. Not driven by run_mutants.py.
+LS-W9	src/v16_program.rs	32608	.saturating_add(st.backstop_outstanding_atoms as u128)	.saturating_add(0)	litesvm:p4_wave_d::sec_d6_fill_halt_counts_the_backstop	the fill is not refused while the backstop is owed (halt mirror drops the backstop)
