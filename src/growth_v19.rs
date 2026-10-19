@@ -1862,7 +1862,7 @@ pub const CURVE_ANCHOR0_DIV: u64 = 4;
 /// floor at every step. MONOTONE NON-DECREASING in `x` (a larger mantissa squares to a larger
 /// or equal value at every step, so its digit string is lexicographically >=), exact at powers
 /// of two, and below the true value by < 2^-16 + the mantissa truncation. All products are
-/// `< 2^32 * 2^32` (checked anyway: an impossible overflow fails closed to `None`).
+/// `< 2^32 * 2^32 = 2^64` (the mantissa invariant), so none can wrap.
 pub fn log2_q16(x: u64) -> Option<u32> {
     if x == 0 {
         return None;
@@ -1873,7 +1873,13 @@ pub fn log2_q16(x: u64) -> Option<u32> {
     let mut frac: u32 = 0;
     let mut i = 0;
     while i < LOG2_FRAC_BITS {
-        m = m.checked_mul(m)? >> 31; // in [2^31, 2^33)
+        // m < 2^32 (loop invariant: it starts in [2^31, 2^32) and is halved whenever it reaches
+        // 2^32), so m * m < 2^64 never wraps; `wrapping_mul` is the native SBF multiply
+        // (`checked_mul` lowers to a 128-bit overflow-checked multiply; measured on the CU
+        // probe `contlev_cu_probe_controller_paths`: a vault-LP open cost +20,260 CU over the
+        // base with it, +3,802 CU with this).
+        debug_assert!(m < 1u64 << 32);
+        m = m.wrapping_mul(m) >> 31; // in [2^31, 2^33)
         frac <<= 1;
         if m >= 1u64 << 32 {
             frac |= 1;
@@ -1961,9 +1967,18 @@ pub fn curve_value(p: CurvePos, t: [u64; 4]) -> u64 {
             if p.den == 0 || hi == lo {
                 return lo;
             }
-            // (hi - lo) * num / den <= hi - lo; u64 * u32 < 2^96: no overflow in u128.
-            let add = ((hi - lo) as u128) * (p.num as u128) / (p.den as u128);
-            lo + add as u64
+            // (hi - lo) * num / den <= hi - lo. Every program table spans < 2^32 (x100 / bps), so
+            // the product fits u64 (u32 * u32) and the native u64 divide is used (SBF has no
+            // native u128 divide; this path saved 3,762 CU on the probe's vault-LP open); a
+            // wider span (never produced) takes the exact u128 form, u64 * u32 < 2^96.
+            let span = hi - lo;
+            let add = if span <= u32::MAX as u64 {
+                // span < 2^32 and num <= den < 2^32: the product is < 2^64 (no wrap).
+                span.wrapping_mul(p.num as u64) / (p.den as u64)
+            } else {
+                ((span as u128) * (p.num as u128) / (p.den as u128)) as u64
+            };
+            lo + add
         }
         _ => t[0],
     }

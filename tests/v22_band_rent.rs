@@ -3232,8 +3232,11 @@ fn r2_attested_max_tier_1_vs_3() {
 }
 
 /// R2.1 §3: tier = min(venue, book). Venue tier 3 (attested $600k, attested_max_tier 3) but the
-/// LP book is $30k (book tier 1): target L1 = 5x = launch, no climb. Deposit to $120k (book tier
-/// 2): the ceiling steps to 6x. CONTROL: book tier 3 with venue tier 0 (no depth) never climbs.
+/// LP book is $30k (book tier 1). Continuous leverage (2026-10-19): the target is the curve at
+/// min(venue, book) = $30k, 5x + 5x * log2(1.2)/2 = 5.65x (round 2: L1 = 5x = launch, no climb),
+/// so the book holds the ceiling at 5.65x. Deposit to $120k: the target is the curve at $120k
+/// (11.13x) and the ceiling steps +1x to 6.65x. CONTROL: book tier 3 with venue tier 0 (no
+/// depth) never climbs.
 #[test]
 fn r2_book_tier_limits_venue_tier() {
     let mut env = env_with_launch(band_cfg(), 500);
@@ -3245,13 +3248,16 @@ fn r2_book_tier_limits_venue_tier() {
     env.settle_rent(lp.account, lp.account).expect("snapshot");
     // seven held windows: the rate-limited venue depth reaches ~$200k (tier 2) from T1 / 16; the
     // book tier 1 holds
+    let mut last = 0;
     for _ in 0..7 {
-        assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 500, "book tier 1 holds the venue at 5x");
+        last = env.epoch_step(&lp, 600_000 * USD_E6);
+        assert!(last <= 565, "the $30k book holds the venue at the curve's 5.65x: {last}");
     }
+    assert_eq!(last, 565, "the $30k book: curve 5.65x");
     assert!(env.growth().depth_last_good_e6 >= percolator_prog::growth_v19::DEPTH_TIER2_E6);
     env.deposit_to(&owner, lp.account, 90_000 * USD);
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 600, "book tier 2: one step toward 10x");
+    assert_eq!(env.growth().ceil_x100, 665, "$120k book: one +1x step toward the curve's 11.13x");
     // control: a $600k book with no venue depth never graduates
     let mut c = env_with_launch(band_cfg(), 500);
     c.auth_mark();
@@ -3267,9 +3273,11 @@ fn r2_book_tier_limits_venue_tier() {
 /// R2.1 + R2.0: a tiered band market (engine IMR 500 = 20x, MMR 250, liquidation fee 50 bps,
 /// band 60 bps: G(60) = 182, 182 + ~1 + ~51 <= 250 passes the Band Safety Law), launch 5x, UA
 /// tier table at the floors ($5k / $20k / $100k, default 5x/10x/20x) with attested_max_tier 3,
-/// LP book $150k (book tier 3). Venue tier 2 ($50k): 5x -> 10x one step per 9,000 slots, holds
-/// at 10x; venue tier 3 ($150k): 10x -> 20x one step per epoch, holds at 20x (L_tier); the gate
-/// follows (10.5x refused at 10x, 19x admitted at 20x). Depth loss (35 B push): straight back to
+/// LP book $150k (book tier 3). Venue $50k (continuous leverage, 2026-10-19: the curve between
+/// T2 $20k / 10x and T3 $100k / 20x, 10x + 10x * log2(2.5)/log2(5) = 15.69x; round 2: the 10x
+/// step): 5x -> 15.69x one step per 9,000 slots, holds there; venue $150k (past T3): -> 20x one
+/// step per epoch, holds at 20x (L_tier); the gate follows (16x refused at 15.69x, 19x admitted
+/// at 20x). Depth loss (35 B push): straight back to
 /// 5x, and 5.5x is refused (security review F-1 fix A: down at once).
 #[test]
 fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
@@ -3294,18 +3302,18 @@ fn r2_band_market_graduates_5x_10x_20x_and_drops_on_depth_loss() {
     // R2-M1 + round 3 D-I1: the usable depth starts at T1 / 16 ($312.49) and doubles per held
     // window ($5k: tier 1 = 5x = launch after four, $40k: tier 2 after seven), so the climb
     // starts in the seventh window; the ceiling never moves more than +1x per epoch.
-    let steps = env.climb_to(&lp, tier2, 1_000, 16);
-    assert!(steps >= 11, "six windows of depth warm-up + five +1x steps: {steps}");
-    assert_eq!(env.epoch_step(&lp, tier2), 1_000, "venue tier 2: holds at 10x");
+    let steps = env.climb_to(&lp, tier2, 1_569, 24);
+    assert!(steps >= 11, "5x -> 15.69x: ten +1x steps and a partial one: {steps}");
+    assert_eq!(env.epoch_step(&lp, tier2), 1_569, "venue $50k: holds at the curve's 15.69x");
     let t = env.trader(100 * USD);
-    let r = env.trade_cpi(&t.0, t.1, &lp, 1_050 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "10.5x over 10x");
-    env.trade_cpi(&t.0, t.1, &lp, 950 * Q).expect("9.5x under 10x");
+    let r = env.trade_cpi(&t.0, t.1, &lp, 1_600 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "16x over 15.69x");
+    env.trade_cpi(&t.0, t.1, &lp, 1_500 * Q).expect("15x under 15.69x");
     // close it (a leg left uncertified across band epochs would block the market: 121)
-    env.trade_cpi(&t.0, t.1, &lp, -950 * Q).expect("close");
+    env.trade_cpi(&t.0, t.1, &lp, -1_500 * Q).expect("close");
     // $50k -> $100k (= T3) in one epoch, then +1x per epoch to 20x
     let steps = env.climb_to(&lp, tier3, 2_000, 14);
-    assert!(steps >= 10, "ten +1x steps: {steps}");
+    assert!(steps >= 5, "four +1x steps and a partial one: {steps}");
     assert_eq!(env.epoch_step(&lp, tier3), 2_000, "holds at L_tier 20x");
     let t2 = env.trader(100 * USD);
     env.trade_cpi(&t2.0, t2.1, &lp, 1_900 * Q).expect("19x under the graduated 20x");
@@ -3357,6 +3365,9 @@ fn r2_old_5x_market_stays_at_5x() {
 /// R2.1 §2: a tier table change never JUMPS the ceiling: raising L2 moves the target and the
 /// ratchet climbs +1x per epoch; lowering it takes effect at the next read (the gate applies
 /// min(stored, live target); security review F-1 fix A) and the next writer stores it.
+/// Continuous leverage (2026-10-19): the $150k book sits between T2 ($100k) and T3 ($500k), so
+/// the target is the curve there: [5x, 6x, 10x] -> 7.00x, [5x, 10x, 10x] -> 10x, [5x, 5x, 10x]
+/// -> 6.25x (round 2: L2 = 6x / 10x / 5x).
 #[test]
 fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     let mut env = env_with_launch(band_cfg(), 500);
@@ -3365,18 +3376,20 @@ fn r2_tier_table_change_moves_the_target_not_the_ceiling() {
     let lp = env.lp(150_000 * USD);
     env.depth_twice(600_000 * USD_E6);
     env.settle_rent(lp.account, lp.account).expect("snapshot");
-    env.climb_to(&lp, 600_000 * USD_E6, 600, 10);
-    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 600, "held at L2 = 6x");
+    env.climb_to(&lp, 600_000 * USD_E6, 700, 10);
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 700, "held at the curve's 7x");
     env.set_tiers([0; 3], [500, 1_000, 1_000], 3).expect("L2 = 10x");
     let g = env.growth();
-    assert_eq!(g.ceil_x100, 600, "the setter does not move the ceiling");
-    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 700, "then +1x per epoch");
+    assert_eq!(g.ceil_x100, 700, "the setter does not move the ceiling");
+    assert_eq!(env.epoch_step(&lp, 600_000 * USD_E6), 800, "then +1x per epoch");
     env.set_tiers([0; 3], [500, 500, 1_000], 3).expect("L2 = 5x");
     let t = env.trader(100 * USD);
-    let r = env.trade_cpi(&t.0, t.1, &lp, 550 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at once (stored 7x)");
+    let r = env.trade_cpi(&t.0, t.1, &lp, 650 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "lowered table binds at once (stored 8x, curve 6.25x)");
+    env.trade_cpi(&t.0, t.1, &lp, 600 * Q).expect("control: 6x under 6.25x");
+    env.trade_cpi(&t.0, t.1, &lp, -600 * Q).expect("close");
     env.settle_rent(lp.account, lp.account).expect("tag 106");
-    assert_eq!(env.growth().ceil_x100, 500, "the next writer stores the fall");
+    assert_eq!(env.growth().ceil_x100, 625, "the next writer stores the fall");
 }
 
 /// Coordinator ruling (most conservative wins): an attested (mode 1) reading of 0 is a REAL zero
