@@ -180,6 +180,9 @@ pub fn stress_level(draw_outstanding: bool, real_adl: bool, hlock: bool) -> u8 {
 /// for `s` = 1 (draw) and 2 (real ADL) -- `s` knots below the current tier, floored at tier 0
 /// (launch); launch (`table[0]`) under the h-lock. Monotone non-increasing in `stress`,
 /// non-decreasing in `tier`, and never above `L_table(tier)` once `stress >= 1`.
+/// Continuous leverage (2026-10-19): no program reader calls this any more (it stepped at the
+/// anchors); they read `stress_cap_curve_x100`, which equals it at every anchor. Kept for the
+/// tests and Kani harnesses that use it as the reference step.
 pub fn stress_cap_x100(stress: u8, tier: u8, table: [u16; 4]) -> u16 {
     if stress == STRESS_NONE {
         return u16::MAX;
@@ -1869,7 +1872,16 @@ pub fn log2_q16(x: u64) -> Option<u32> {
     }
     let k = 63 - x.leading_zeros();
     // m in [2^31, 2^32): Q.31 mantissa of x / 2^k.
-    let mut m: u64 = if k >= 31 { x >> (k - 31) } else { x << (31 - k) };
+    let m: u64 = if k >= 31 { x >> (k - 31) } else { x << (31 - k) };
+    Some((k << LOG2_FRAC_BITS) | log2_frac_q16(m))
+}
+
+/// The 16 fractional binary digits of `log2(m / 2^31)` for a Q.31 mantissa `m in [2^31, 2^32)`
+/// (`log2_q16`'s fraction; a named function so Kani can replace it by its proven properties).
+/// Result `< 2^16`, monotone non-decreasing in `m`, 0 at `m = 2^31`. Requires `m < 2^32`
+/// (`log2_q16` passes the normalised mantissa): every product below is then `< 2^64`.
+#[inline(always)]
+pub fn log2_frac_q16(mut m: u64) -> u32 {
     let mut frac: u32 = 0;
     let mut i = 0;
     while i < LOG2_FRAC_BITS {
@@ -1887,7 +1899,7 @@ pub fn log2_q16(x: u64) -> Option<u32> {
         }
         i += 1;
     }
-    Some((k << LOG2_FRAC_BITS) | frac)
+    frac
 }
 
 /// The four curve anchors (atoms) of a market's thresholds: `[T1 / 4, T1, T2, T3]`.
@@ -1967,26 +1979,67 @@ pub fn curve_value(p: CurvePos, t: [u64; 4]) -> u64 {
             if p.den == 0 || hi == lo {
                 return lo;
             }
-            // (hi - lo) * num / den <= hi - lo. Every program table spans < 2^32 (x100 / bps), so
-            // the product fits u64 (u32 * u32) and the native u64 divide is used (SBF has no
-            // native u128 divide; this path saved 3,762 CU on that probe's vault-LP open); a
-            // wider span (never produced) takes the exact u128 form, u64 * u32 < 2^96.
-            let span = hi - lo;
-            let add = if span <= u32::MAX as u64 {
-                // span < 2^32 and num <= den < 2^32: the product is < 2^64 (no wrap).
-                span.wrapping_mul(p.num as u64) / (p.den as u64)
-            } else {
-                ((span as u128) * (p.num as u128) / (p.den as u128)) as u64
-            };
-            lo + add
+            lo + curve_interp(hi - lo, p.num, p.den)
         }
         _ => t[0],
+    }
+}
+
+/// `floor(span * num / den)` for `num <= den`, `den > 0` (`curve_value`'s interpolation step; a
+/// named function so Kani can replace it by its proven properties). Then the result is `<= span`
+/// (so `lo + result <= hi` never overflows), 0 at `num = 0`, `span` at `num = den`, monotone in
+/// `num`, and monotone and 1-Lipschitz in `span`. Every program table spans < 2^32 (x100 / bps),
+/// so the product fits u64 (u32 * u32) and the native u64 divide is used (SBF has no native u128
+/// divide; this path saved 3,762 CU on that probe's vault-LP open); a wider span (never
+/// produced) takes the exact u128 form, u64 * u32 < 2^96.
+#[inline(always)]
+pub fn curve_interp(span: u64, num: u32, den: u32) -> u64 {
+    if span <= u32::MAX as u64 {
+        // span < 2^32 and num <= den < 2^32: the product is < 2^64 (no wrap).
+        span.wrapping_mul(num as u64) / (den as u64)
+    } else {
+        ((span as u128) * (num as u128) / (den as u128)) as u64
     }
 }
 
 /// `curve_value(curve_pos(d, th), t)`.
 pub fn curve_u64(d: u64, thresholds_e6: [u64; 3], t: [u64; 4]) -> u64 {
     curve_value(curve_pos(d, thresholds_e6), t)
+}
+
+/// The graded stress cap on the CONTINUOUS curve (x100; 2026-10-19, replaces the stepped
+/// `stress_cap_x100` in every program reader): the leverage curve read `s` segments down at the
+/// SAME fractional position, i.e. with the tier coordinate `x = seg - 1 + num / den` of the
+/// position `p`, `curve(max(x - s, 0))`:
+/// * level 0: no cap (`u16::MAX`); the h-lock (level >= 3): launch (`table[0]`), unchanged;
+/// * a draw (s = 1) / real ADL (s = 2) at `seg in 1..=3` with `seg - 1 >= s`: `table[seg-1-s] +
+///   floor((table[seg-s] - table[seg-1-s]) * num / den)`; at or past T3 (`seg == 4`):
+///   `table[3 - s]`; below that (`seg - 1 < s`, incl. below anchor 0): `table[0]`;
+/// * an arithmetic-failure position (`CURVE_POS_FAIL`): `table[0]` (fail closed).
+///
+/// At every anchor (`num = 0`) it equals the stepped cap `stress_cap_x100(s, tier, table)`;
+/// between anchors it lies in `[stepped cap at this tier, stepped cap at the next tier]` and is
+/// continuous in the depth (no jump at the anchors any more). On a monotone table (every
+/// `tier_leverage`) it is never above the unstressed curve `curve_value(p, table)`, monotone
+/// non-increasing in the stress level and non-decreasing in the depth (Kani
+/// `kani_contlev_stress_cap_curve`). The cut still applies at once: the target is
+/// `min(signal, this)` in the same call (`target_ceiling_x100`) and the ceiling in force is
+/// `min(stored, target)`.
+pub fn stress_cap_curve_x100(stress: u8, p: CurvePos, table: [u16; 4]) -> u16 {
+    if stress == STRESS_NONE {
+        return u16::MAX;
+    }
+    if stress >= STRESS_HLOCK {
+        return table[0];
+    }
+    let t = [table[0] as u64, table[1] as u64, table[2] as u64, table[3] as u64];
+    let shifted = match p.seg {
+        4 => CurvePos { seg: 4 - stress, num: 0, den: 0 },
+        1..=3 if p.seg > stress => CurvePos { seg: p.seg - stress, num: p.num, den: p.den },
+        _ => CurvePos { seg: 0, num: 0, den: 0 },
+    };
+    // <= t[3] <= u16::MAX (`curve_value` never exceeds the largest table entry)
+    curve_value(shifted, t) as u16
 }
 
 // ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
@@ -2140,11 +2193,26 @@ pub fn smooth_dials_and_venue_l(
     thresholds_e6: [u64; 3],
     l_table_x100: [u16; 4],
 ) -> (SmoothDials, u16) {
+    let (d, vl, _, _) = smooth_dials_venue_l_and_pos(venue_depth_e6, book_depth_e6, thresholds_e6, l_table_x100);
+    (d, vl)
+}
+
+/// `smooth_dials_and_venue_l` plus the two curve positions it used, for the continuous stress
+/// cap (`stress_cap_curve_x100`): the SIGNAL position (of the smaller depth, `min(venue, book)`;
+/// the curve is monotone in the depth, so the curve there is the min of the two curves) and the
+/// VENUE position (the push writer's fall-only bound). No extra `log2`.
+pub fn smooth_dials_venue_l_and_pos(
+    venue_depth_e6: u64,
+    book_depth_e6: u64,
+    thresholds_e6: [u64; 3],
+    l_table_x100: [u16; 4],
+) -> (SmoothDials, u16, CurvePos, CurvePos) {
     let lt = [l_table_x100[0] as u64, l_table_x100[1] as u64, l_table_x100[2] as u64, l_table_x100[3] as u64];
     let pv = curve_pos(venue_depth_e6, thresholds_e6);
     let pb = curve_pos(book_depth_e6, thresholds_e6);
     let m2 = |t: [u64; 4]| core::cmp::min(curve_value(pv, t), curve_value(pb, t));
     let venue_l = curve_value(pv, lt);
+    let ps = if venue_depth_e6 <= book_depth_e6 { pv } else { pb };
     (
         SmoothDials {
             l_signal_x100: m2(lt) as u16,
@@ -2152,6 +2220,8 @@ pub fn smooth_dials_and_venue_l(
             lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
         },
         venue_l as u16,
+        ps,
+        pv,
     )
 }
 
@@ -2350,8 +2420,9 @@ pub fn growth_matcher_caps_g8_dials(
 /// the volatility term; it equals `L_table(tier)` at each anchor and lies between the two
 /// neighbouring table values elsewhere, so I-D2 below now reads "never above `L_tier` or
 /// `max(launch, signal)`") and `stress_cap_x100` the
-/// graded stress cap (`stress_cap_x100`: none / one tier down for a draw / two for real ADL);
-/// the h-lock is launch.
+/// graded stress cap (none / one segment down for a draw / two for real ADL; every program
+/// caller passes the continuous `stress_cap_curve_x100` since 2026-10-19, the stepped
+/// `stress_cap_x100` "one tier down" equals it at each anchor); the h-lock is launch.
 /// with `tier = min(venue_tier, book_tier)` (the book tier IS the capital term now: absolute LP
 /// book depth vs the per-market thresholds) and `l_table_tier_x100 = L_table(tier)`
 /// (`tier_leverage`). Round 1's doublings term `L_launch + floor(log2(C_m / C_launch))·1x` is

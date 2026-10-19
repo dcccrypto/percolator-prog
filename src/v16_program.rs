@@ -28570,7 +28570,7 @@ pub mod processor {
                 g.l_launch_x100,
                 g.l_tier_x100,
                 ctx.venue_l_x100,
-                growth_v19::stress_cap_x100(ctx.stress, ctx.venue_tier, ctx.l_table),
+                growth_v19::stress_cap_curve_x100(ctx.stress, ctx.venue_pos, ctx.l_table),
                 ctx.now,
             );
             g.ceil_x100 = ceil;
@@ -43154,8 +43154,6 @@ pub mod processor {
         clamp: bool,
         /// `growth_v19::graduation_on(clamp, band_bps, tier)`.
         graduation: bool,
-        /// R2.1 §3: `min(venue_tier, book_tier)`; 0 off the clamp.
-        tier: u8,
         /// R2.1 §3: the venue tier alone (the push writer's fall-only upper bound); 0 off the
         /// clamp.
         venue_tier: u8,
@@ -43179,12 +43177,18 @@ pub mod processor {
         dials: growth_v19::SmoothDials,
         /// The venue-only leverage curve value (the push writer's fall-only upper bound).
         venue_l_x100: u16,
+        /// Continuous stress cap (2026-10-19): the curve position of the SIGNAL depth
+        /// (`min(venue, book)`) and of the venue depth alone (`smooth_dials_venue_l_and_pos`).
+        /// Below anchor 0 (tier-0 values) off the clamp, where they are never read.
+        pos: growth_v19::CurvePos,
+        venue_pos: growth_v19::CurvePos,
     }
 
     impl GrowthG8Ctx {
-        /// The graded stress cap at the combined tier (`growth_v19::stress_cap_x100`).
+        /// The graded stress cap on the continuous curve at the signal position
+        /// (`growth_v19::stress_cap_curve_x100`; equal to the stepped cap at every anchor).
         fn stress_cap(&self) -> u16 {
-            growth_v19::stress_cap_x100(self.stress, self.tier, self.l_table)
+            growth_v19::stress_cap_curve_x100(self.stress, self.pos, self.l_table)
         }
     }
 
@@ -43204,7 +43208,6 @@ pub mod processor {
             return Ok(GrowthG8Ctx {
                 clamp: false,
                 graduation: false,
-                tier: 0,
                 venue_tier: 0,
                 cap_depth_e6: None,
                 stress: growth_v19::STRESS_NONE,
@@ -43216,6 +43219,8 @@ pub mod processor {
                     lambda_depth_bps: growth_v19::LAMBDA_DEPTH_TABLE_BPS[0] as u32,
                 },
                 venue_l_x100: 0,
+                pos: growth_v19::CurvePos { seg: 0, num: 0, den: 0 },
+                venue_pos: growth_v19::CurvePos { seg: 0, num: 0, den: 0 },
             });
         }
         let now = authenticated_market_slot_or_fallback_view(group);
@@ -43243,8 +43248,8 @@ pub mod processor {
             Some(c) => growth_v19::book_depth_e6(c, g.lambda_bps),
             None => 0,
         };
-        let (mut dials, venue_l_x100) =
-            growth_v19::smooth_dials_and_venue_l(venue_depth, book_depth, thresholds, l_table);
+        let (mut dials, venue_l_x100, pos, venue_pos) =
+            growth_v19::smooth_dials_venue_l_and_pos(venue_depth, book_depth, thresholds, l_table);
         // Round 3 item 6 (GAP-6): L_vol = floor(1e4 / max(IMR, z * sigma_H + liq fee)) over
         // H = two band epochs (the Band Safety Law horizon); no data -> launch (fails closed).
         let vol = if g.vol_has_data() {
@@ -43282,7 +43287,6 @@ pub mod processor {
         Ok(GrowthG8Ctx {
             clamp,
             graduation: growth_v19::graduation_on(clamp, band_bps, tier),
-            tier,
             venue_tier,
             cap_depth_e6,
             stress: growth_v19::stress_level(draw_out, adl, hlock),
@@ -43290,6 +43294,8 @@ pub mod processor {
             l_table,
             dials,
             venue_l_x100,
+            pos,
+            venue_pos,
         })
     }
 
@@ -50240,103 +50246,10 @@ mod r3_kani_proofs {
         kani::cover!(slot >= lgs as u64 + 2 * 9_000 && lg > 3 && base == (lg as u64) >> 2, "held value decays");
     }
 
-    /// Continuous leverage (2026-10-19), harness 1 of 3 (design: ledger
-    /// v22-continuous-leverage-build-2026-10-19.md §Kani; NOT YET RUN -- one run on final code):
-    /// `log2_q16` is total on x > 0 and MONOTONE NON-DECREASING; its integer part is exact.
-    /// Mutants: `>= 1 << 31` for the digit test; mantissa normalised to 31 bits (k >= 30);
-    /// `frac |= 1` without the halving.
-    #[kani::proof]
-    #[kani::unwind(17)]
-    fn kani_contlev_log2_monotone() {
-        let x: u64 = kani::any();
-        let y: u64 = kani::any();
-        kani::assume(x >= 1 && x <= y);
-        let lx = log2_q16(x).unwrap();
-        let ly = log2_q16(y).unwrap();
-        assert!(lx <= ly, "monotone");
-        assert_eq!(lx >> LOG2_FRAC_BITS, 63 - x.leading_zeros(), "integer part exact");
-        kani::cover!(x < y && lx == ly, "distinct inputs, equal logs (truncation)");
-        kani::cover!(x < y && lx < ly && (x.leading_zeros() == y.leading_zeros()), "same octave, strictly ordered");
-    }
-
-    /// Continuous leverage, harness 2 of 3: on monotone thresholds / tables the curve equals the
-    /// table AT every anchor, lies in `[t[seg-1], t[seg]]` on each segment, is `t[0]` below
-    /// anchor 0 and `t[3]` at or past T3, never above `t[3]` (so never above L_tier), and a
-    /// saturated next anchor is flat. Mutants: interpolating toward the saturated anchor;
-    /// `ceil` instead of floor; `num` not capped at `den`; anchor 0 = T1.
-    #[kani::proof]
-    #[kani::unwind(17)]
-    fn kani_contlev_curve_anchors_and_bounds() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        kani::assume(a >= 4 && b >= 1 && c >= 1);
-        let th = [a as u64, a as u64 + b as u64, a as u64 + b as u64 + c as u64];
-        let t0: u16 = kani::any();
-        let t1: u16 = kani::any();
-        let t2: u16 = kani::any();
-        let t3: u16 = kani::any();
-        let t = [t0 as u64, t0 as u64 + t1 as u64, t0 as u64 + t1 as u64 + t2 as u64, t0 as u64 + t1 as u64 + t2 as u64 + t3 as u64];
-        let anc = curve_anchors(th);
-        let i: usize = kani::any();
-        kani::assume(i < 4);
-        if anc[i] > 0 && (i == 0 || anc[i] > anc[i - 1]) {
-            assert_eq!(curve_u64(anc[i], th, t), t[i], "equal to the table at each anchor");
-        }
-        let d: u64 = kani::any();
-        let p = curve_pos(d, th);
-        let v = curve_value(p, t);
-        assert!(v <= t[3], "never above the last table value");
-        assert!(v >= t[0]);
-        if p.seg >= 1 && p.seg <= 3 {
-            assert!(p.num <= p.den);
-            assert!(v >= t[(p.seg - 1) as usize] && v <= t[p.seg as usize]);
-        }
-        if d < anc[0] {
-            assert_eq!(v, t[0], "below anchor 0: launch");
-        }
-        if d >= th[2] {
-            assert_eq!(v, t[3]);
-        }
-        if d >= a as u64 {
-            assert_eq!(curve_u64(d, [a as u64, u64::MAX, u64::MAX], t), t[1], "saturated T2: flat at L1 from T1");
-        }
-        kani::cover!(p.seg == 2 && v > t[1] && v < t[2], "strictly between two anchors");
-        kani::cover!(p.seg == 1 && v > t[0], "the anchor-0 segment is live (kappa)");
-        kani::cover!(p.seg == 4, "past T3");
-        kani::cover!(p.seg == 0 && d > 0, "below anchor 0");
-    }
-
-    /// Continuous leverage, harness 3 of 3: MONOTONE in the depth, and the dials are the min of
-    /// the venue and book curves (so <= the venue-only fall-only bound, I-D2 for the push writer).
-    /// Mutants: `max` of the two curves; venue_l from the book depth; segment chosen bottom-up.
-    #[kani::proof]
-    #[kani::unwind(17)]
-    fn kani_contlev_curve_monotone_and_min() {
-        let a: u32 = kani::any();
-        let b: u32 = kani::any();
-        let c: u32 = kani::any();
-        kani::assume(a >= 4 && b >= 1 && c >= 1);
-        let th = [a as u64, a as u64 + b as u64, a as u64 + b as u64 + c as u64];
-        let t0: u8 = kani::any();
-        let t1: u8 = kani::any();
-        let t2: u8 = kani::any();
-        let t3: u8 = kani::any();
-        let tab = [t0 as u16, t0 as u16 + t1 as u16, t0 as u16 + t1 as u16 + t2 as u16, t0 as u16 + t1 as u16 + t2 as u16 + t3 as u16];
-        let t = [tab[0] as u64, tab[1] as u64, tab[2] as u64, tab[3] as u64];
-        let d: u64 = kani::any();
-        let e: u64 = kani::any();
-        kani::assume(d <= e);
-        assert!(curve_u64(d, th, t) <= curve_u64(e, th, t), "monotone");
-        let (dials, vl) = smooth_dials_and_venue_l(d, e, th, tab);
-        assert_eq!(dials.l_signal_x100 as u64, curve_u64(d, th, t), "min(venue, book) = the smaller depth");
-        assert!(dials.l_signal_x100 <= vl || d > e);
-        let (dials2, vl2) = smooth_dials_and_venue_l(e, d, th, tab);
-        assert_eq!(dials2, dials, "symmetric");
-        assert!(dials2.l_signal_x100 <= vl2, "venue-only bound >= signal");
-        kani::cover!(d < e && curve_u64(d, th, t) < curve_u64(e, th, t), "strictly increasing pair");
-        kani::cover!(d < e && curve_pos(d, th).seg != curve_pos(e, th).seg, "across an anchor");
-    }
+    // Continuous leverage (2026-10-19): the `kani_contlev_*` harnesses live in the standalone
+    // proofs crate `kani/contlev` (it compiles THIS crate's `src/growth_v19.rs` /
+    // `src/vault_lp_v18.rs` verbatim, so a run does not codegen the whole program); design and
+    // results: ledger v22-continuous-leverage-build-2026-10-19.md §8 and §10.
 
     /// Item 6 (GAP-6): the volatility term. A sample is `ceil(min(move, cap)^2 * 100 / dt)` and
     /// none for `dt == 0` or no previous mark; the first EWMA value is >= the seed (no data -> no
