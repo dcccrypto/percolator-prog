@@ -1875,9 +1875,9 @@ pub fn log2_q16(x: u64) -> Option<u32> {
     while i < LOG2_FRAC_BITS {
         // m < 2^32 (loop invariant: it starts in [2^31, 2^32) and is halved whenever it reaches
         // 2^32), so m * m < 2^64 never wraps; `wrapping_mul` is the native SBF multiply
-        // (`checked_mul` lowers to a 128-bit overflow-checked multiply; measured on the CU
-        // probe `contlev_cu_probe_controller_paths`: a vault-LP open cost +20,260 CU over the
-        // base with it, +3,802 CU with this).
+        // (`checked_mul` lowers to a 128-bit overflow-checked multiply; measured on a first,
+        // one-live-position version of the CU probe `contlev_cu_probe_controller_paths`: a
+        // vault-LP open cost +20,260 CU over the base with it, +3,802 CU with this).
         debug_assert!(m < 1u64 << 32);
         m = m.wrapping_mul(m) >> 31; // in [2^31, 2^33)
         frac <<= 1;
@@ -1969,7 +1969,7 @@ pub fn curve_value(p: CurvePos, t: [u64; 4]) -> u64 {
             }
             // (hi - lo) * num / den <= hi - lo. Every program table spans < 2^32 (x100 / bps), so
             // the product fits u64 (u32 * u32) and the native u64 divide is used (SBF has no
-            // native u128 divide; this path saved 3,762 CU on the probe's vault-LP open); a
+            // native u128 divide; this path saved 3,762 CU on that probe's vault-LP open); a
             // wider span (never produced) takes the exact u128 form, u64 * u32 < 2^96.
             let span = hi - lo;
             let add = if span <= u32::MAX as u64 {

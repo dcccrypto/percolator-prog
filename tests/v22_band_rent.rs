@@ -4565,9 +4565,10 @@ fn r3_item5_ceiling_target_is_smooth_across_t2() {
 /// Continuous leverage CU probe: the controller paths that evaluate the depth curve, on a
 /// clamp-enforced 20x market with BOTH depths strictly inside an interpolating segment (venue
 /// $50k in [$25k, $100k), book $150k in [$100k, $500k): every curve call runs all three logs).
-/// Prints one `CONTLEV_CU <label> <cu>` line per instruction; run against the base `.so` and the
-/// head `.so` (`GROWTH_WRAPPER_SO`) for the delta. The sequence and the trade sizes are inside
-/// both builds' ceilings (launch 5x), so the two runs execute the same instructions.
+/// The venue depth is warmed first (eight held epochs). Prints one `CONTLEV_CU <label> <cu>` line
+/// per instruction; run against the base `.so` and the head `.so` (`GROWTH_WRAPPER_SO`) for the
+/// delta. The trades (3x) are inside both builds' ceilings, so the two runs execute the same
+/// instructions (the stored ceilings differ: the base ramp vs the curve).
 #[test]
 fn contlev_cu_probe_controller_paths() {
     let mut env = env_tiered(500, 250, 50, 100, 60, 500);
@@ -4575,6 +4576,15 @@ fn contlev_cu_probe_controller_paths() {
     env.set_tiers([0; 3], [0; 3], 3).expect("UA tier table: defaults, attested max tier 3");
     let lp = env.lp(150_000 * USD);
     let d = 50_000 * USD_E6;
+    // warm the rate-limited usable depth (starts at T1 / 16, doubles per held window) past T1,
+    // so the venue really is inside [$25k, $100k) when measured
+    env.depth_twice(d);
+    env.settle_rent(lp.account, lp.account).expect("snapshot");
+    for _ in 0..8 {
+        env.epoch_step(&lp, d);
+    }
+    let g = env.growth();
+    assert!(g.depth_last_good_e6 >= percolator_prog::growth_v19::DEPTH_TIER1_E6, "venue warmed past T1");
     let p1 = env.push_depth(PRICE, 1, d).expect("push 1");
     env.warp(1);
     let p2 = env.push_depth(PRICE, 1, d).expect("push 2 (fall-only writer, curve at venue)");
