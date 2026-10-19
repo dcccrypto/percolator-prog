@@ -43172,11 +43172,12 @@ pub mod processor {
         now: u64,
         /// R2.1 §2: the market's leverage table `[L0..L3]` (`growth_v19::tier_leverage`).
         l_table: [u16; 4],
-        /// Round 3 item 5 (GAP-3): the SMOOTHED leverage signal / κ / λ_depth
-        /// (`growth_v19::smooth_dials` at min(venue ramp, book ramp)); never looser than the step
-        /// values at `tier`. Neutral (tier-0 steps) off the clamp, where they are never read.
+        /// Continuous leverage (2026-10-19): the leverage signal / κ / λ_depth on the
+        /// log-interpolated depth curve (`growth_v19::smooth_dials_and_venue_l`, min(venue curve,
+        /// book curve)); equal to the tier table at each anchor and looser than the step between
+        /// anchors by design. Neutral (tier-0 values) off the clamp, where they are never read.
         dials: growth_v19::SmoothDials,
-        /// The venue-only leverage ramp (the push writer's fall-only upper bound).
+        /// The venue-only leverage curve value (the push writer's fall-only upper bound).
         venue_l_x100: u16,
     }
 
@@ -43233,7 +43234,8 @@ pub mod processor {
             None => 0,
         };
         let tier = growth_v19::combined_tier(venue_tier, book_tier);
-        // Round 3 item 5: the same two depths, smoothed (ramps never above the step values).
+        // Continuous leverage (2026-10-19): the same two depths on the log-interpolated curve
+        // (equal to the tier table at each anchor, continuous between them).
         let l_table = g.tier_table_x100();
         let venue_depth =
             growth_v19::venue_depth_capped(fresh.unwrap_or(0), g.depth_source, thresholds, g.attested_max_tier);
@@ -43241,9 +43243,8 @@ pub mod processor {
             Some(c) => growth_v19::book_depth_e6(c, g.lambda_bps),
             None => 0,
         };
-        let mut dials = growth_v19::smooth_dials(venue_depth, book_depth, thresholds, l_table);
-        let lt64 = [l_table[0] as u64, l_table[1] as u64, l_table[2] as u64, l_table[3] as u64];
-        let venue_l_x100 = growth_v19::tier_ramp_u64(venue_depth, thresholds, lt64) as u16;
+        let (mut dials, venue_l_x100) =
+            growth_v19::smooth_dials_and_venue_l(venue_depth, book_depth, thresholds, l_table);
         // Round 3 item 6 (GAP-6): L_vol = floor(1e4 / max(IMR, z * sigma_H + liq fee)) over
         // H = two band epochs (the Band Safety Law horizon); no data -> launch (fails closed).
         let vol = if g.vol_has_data() {
@@ -50239,48 +50240,102 @@ mod r3_kani_proofs {
         kani::cover!(slot >= lgs as u64 + 2 * 9_000 && lg > 3 && base == (lg as u64) >> 2, "held value decays");
     }
 
-    /// Item 5 (GAP-3): the tier ramp is NEVER above the step table, equals it past each 25%
-    /// ramp, starts each ramp at the previous table value (continuous), and is monotone in the
-    /// depth; the smoothed dials are each <= their step at min(venue tier, book tier).
-    /// Mutants: ramp before the threshold (the design's knots: looser below T_i); ramp end not
-    /// capped at the next threshold; `ceil` instead of floor on the ramp; `max` of the two ramps.
+    /// Continuous leverage (2026-10-19), harness 1 of 3 (design: ledger
+    /// v22-continuous-leverage-build-2026-10-19.md §Kani; NOT YET RUN -- one run on final code):
+    /// `log2_q16` is total on x > 0 and MONOTONE NON-DECREASING; its integer part is exact.
+    /// Mutants: `>= 1 << 31` for the digit test; mantissa normalised to 31 bits (k >= 30);
+    /// `frac |= 1` without the halving.
     #[kani::proof]
-    #[kani::unwind(4)]
-    fn kani_r3_item5_ramp_never_looser() {
-        let a: u16 = kani::any();
-        let b: u16 = kani::any();
-        let c: u16 = kani::any();
-        kani::assume(a >= 1 && b >= 1 && c >= 1);
+    #[kani::unwind(17)]
+    fn kani_contlev_log2_monotone() {
+        let x: u64 = kani::any();
+        let y: u64 = kani::any();
+        kani::assume(x >= 1 && x <= y);
+        let lx = log2_q16(x).unwrap();
+        let ly = log2_q16(y).unwrap();
+        assert!(lx <= ly, "monotone");
+        assert_eq!(lx >> LOG2_FRAC_BITS, 63 - x.leading_zeros(), "integer part exact");
+        kani::cover!(x < y && lx == ly, "distinct inputs, equal logs (truncation)");
+        kani::cover!(x < y && lx < ly && (x.leading_zeros() == y.leading_zeros()), "same octave, strictly ordered");
+    }
+
+    /// Continuous leverage, harness 2 of 3: on monotone thresholds / tables the curve equals the
+    /// table AT every anchor, lies in `[t[seg-1], t[seg]]` on each segment, is `t[0]` below
+    /// anchor 0 and `t[3]` at or past T3, never above `t[3]` (so never above L_tier), and a
+    /// saturated next anchor is flat. Mutants: interpolating toward the saturated anchor;
+    /// `ceil` instead of floor; `num` not capped at `den`; anchor 0 = T1.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn kani_contlev_curve_anchors_and_bounds() {
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let c: u32 = kani::any();
+        kani::assume(a >= 4 && b >= 1 && c >= 1);
+        let th = [a as u64, a as u64 + b as u64, a as u64 + b as u64 + c as u64];
+        let t0: u16 = kani::any();
+        let t1: u16 = kani::any();
+        let t2: u16 = kani::any();
+        let t3: u16 = kani::any();
+        let t = [t0 as u64, t0 as u64 + t1 as u64, t0 as u64 + t1 as u64 + t2 as u64, t0 as u64 + t1 as u64 + t2 as u64 + t3 as u64];
+        let anc = curve_anchors(th);
+        let i: usize = kani::any();
+        kani::assume(i < 4);
+        if anc[i] > 0 && (i == 0 || anc[i] > anc[i - 1]) {
+            assert_eq!(curve_u64(anc[i], th, t), t[i], "equal to the table at each anchor");
+        }
+        let d: u64 = kani::any();
+        let p = curve_pos(d, th);
+        let v = curve_value(p, t);
+        assert!(v <= t[3], "never above the last table value");
+        assert!(v >= t[0]);
+        if p.seg >= 1 && p.seg <= 3 {
+            assert!(p.num <= p.den);
+            assert!(v >= t[(p.seg - 1) as usize] && v <= t[p.seg as usize]);
+        }
+        if d < anc[0] {
+            assert_eq!(v, t[0], "below anchor 0: launch");
+        }
+        if d >= th[2] {
+            assert_eq!(v, t[3]);
+        }
+        if d >= a as u64 {
+            assert_eq!(curve_u64(d, [a as u64, u64::MAX, u64::MAX], t), t[1], "saturated T2: flat at L1 from T1");
+        }
+        kani::cover!(p.seg == 2 && v > t[1] && v < t[2], "strictly between two anchors");
+        kani::cover!(p.seg == 1 && v > t[0], "the anchor-0 segment is live (kappa)");
+        kani::cover!(p.seg == 4, "past T3");
+        kani::cover!(p.seg == 0 && d > 0, "below anchor 0");
+    }
+
+    /// Continuous leverage, harness 3 of 3: MONOTONE in the depth, and the dials are the min of
+    /// the venue and book curves (so <= the venue-only fall-only bound, I-D2 for the push writer).
+    /// Mutants: `max` of the two curves; venue_l from the book depth; segment chosen bottom-up.
+    #[kani::proof]
+    #[kani::unwind(17)]
+    fn kani_contlev_curve_monotone_and_min() {
+        let a: u32 = kani::any();
+        let b: u32 = kani::any();
+        let c: u32 = kani::any();
+        kani::assume(a >= 4 && b >= 1 && c >= 1);
         let th = [a as u64, a as u64 + b as u64, a as u64 + b as u64 + c as u64];
         let t0: u8 = kani::any();
         let t1: u8 = kani::any();
         let t2: u8 = kani::any();
         let t3: u8 = kani::any();
-        let t = [t0 as u64, t0 as u64 + t1 as u64, t0 as u64 + t1 as u64 + t2 as u64, t0 as u64 + t1 as u64 + t2 as u64 + t3 as u64];
-        let d: u32 = kani::any();
-        let e: u32 = kani::any();
-        let (d, e) = (d as u64, e as u64);
-        let f = tier_ramp_u64(d, th, t);
-        let i = depth_tier_for(d, th) as usize;
-        assert!(f <= t[i], "never looser than the step");
-        if i > 0 {
-            assert!(f >= t[i - 1]);
-            let lo_x = th[i - 1];
-            let end = core::cmp::min(lo_x + lo_x / TIER_RAMP_DIV, if i < 3 { th[i] } else { u64::MAX });
-            if d >= end {
-                assert_eq!(f, t[i]);
-            }
-            assert_eq!(tier_ramp_u64(lo_x, th, t), t[i - 1], "ramp starts at the value below");
-        } else {
-            assert_eq!(f, t[0]);
-        }
-        if d <= e {
-            assert!(f <= tier_ramp_u64(e, th, t), "monotone");
-        }
-        kani::cover!(i == 2 && f > t[1] && f < t[2], "strictly inside a ramp");
-        kani::cover!(i == 3 && f == t[3] && t[3] > t[2], "past the last ramp");
-        kani::cover!(i == 1 && b < a / 4 && d + 1 == th[1], "ramp capped at the next threshold");
-        kani::cover!(i == 0, "below T1");
+        let tab = [t0 as u16, t0 as u16 + t1 as u16, t0 as u16 + t1 as u16 + t2 as u16, t0 as u16 + t1 as u16 + t2 as u16 + t3 as u16];
+        let t = [tab[0] as u64, tab[1] as u64, tab[2] as u64, tab[3] as u64];
+        let d: u64 = kani::any();
+        let e: u64 = kani::any();
+        kani::assume(d <= e);
+        assert!(curve_u64(d, th, t) <= curve_u64(e, th, t), "monotone");
+        let (dials, vl) = smooth_dials_and_venue_l(d, e, th, tab);
+        assert_eq!(dials.l_signal_x100 as u64, curve_u64(d, th, t), "min(venue, book) = the smaller depth");
+        assert!(dials.l_signal_x100 <= vl || d > e);
+        let (dials2, vl2) = smooth_dials_and_venue_l(e, d, th, tab);
+        assert_eq!(dials2, dials, "symmetric");
+        assert!(dials2.l_signal_x100 <= vl2, "venue-only bound >= signal");
+        kani::cover!(d < e && curve_u64(d, th, t) < curve_u64(e, th, t), "strictly increasing pair");
+        kani::cover!(d < e && curve_pos(d, th).seg != curve_pos(e, th).seg, "across an anchor");
     }
 
     /// Item 6 (GAP-6): the volatility term. A sample is `ceil(min(move, cap)^2 * 100 / dt)` and

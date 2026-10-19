@@ -1839,43 +1839,139 @@ pub fn attested_max_tier_ok(v: u8) -> bool {
     v <= MAX_TIER
 }
 
-// ── v2.2 round 3 item 5 (design GAP-3): smooth leverage / κ / λ_depth across the thresholds ──
+// ── v2.2 continuous leverage (2026-10-19, Khubair: "it should be able to go to 6x etc"):
+// leverage / κ / λ_depth as ONE continuous curve of depth, interpolated on log2(depth) between
+// the tier anchors. Replaces round 3 item 5's 25% ramps (which were "never looser than the step
+// table"); this curve IS looser than the step table between anchors (e.g. ~7.4x at $50k on the
+// default 5x / 10x / 20x table vs the 5x step) -- the decided trade-off -- and equal to it AT
+// every anchor.
 
-/// The ramp above each threshold `T_i` spans `T_i / TIER_RAMP_DIV` (25%), capped at the next
-/// threshold.
-pub const TIER_RAMP_DIV: u64 = 4;
+/// Fractional bits of the fixed-point `log2` (`log2_q16`).
+pub const LOG2_FRAC_BITS: u32 = 16;
 
-/// Piecewise-linear "tier ramp" of a monotone 4-entry table (index = tier) at depth `d` over
-/// thresholds `th` (atoms). With `i = depth_tier_for(d, th)`:
-/// * `i == 0`: `table[0]`;
-/// * on the ramp `[T_i, E_i)`, `E_i = min(T_i + T_i / 4, T_{i+1})` (T_4 = infinity): linear from
-///   `table[i-1]` at `T_i` up to `table[i]` at `E_i` (floor);
-/// * past the ramp, up to the next threshold: `table[i]` (today's step value exactly).
-///
-/// NEVER LOOSER than today's step table anywhere (`<= table[tier(d)]` for every `d`), equal to it
-/// everywhere outside the 25% ramp above each threshold, CONTINUOUS (the value just below `T_i`
-/// is `table[i-1]`, the ramp starts there), and monotone non-decreasing in `d`. Khubair's "equal
-/// to today's table AT each threshold, never looser anywhere" cannot both hold for a continuous
-/// curve (the step jumps at `T_i`); never-looser is kept, so the jump at `T_i` becomes a ramp
-/// that reaches the table value 25% later. A pool oscillating ±2% around a threshold moves the
-/// target by <= 8% of that step, not the whole step. A non-monotone table (never produced by
-/// `tier_leverage`, whose output is monotone) returns the step value on its ramps.
-pub fn tier_ramp_u64(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
-    let i = depth_tier_for(d, th) as usize;
-    if i == 0 {
-        return table[0];
+/// The implicit anchor 0 sits `T1 / CURVE_ANCHOR0_DIV` (one default tier spacing, 4x, below T1).
+/// It carries the tier-0 value of each table (launch leverage, κ 0.5, λ 1x), so the κ term rises
+/// continuously from 0.5 at `T1 / 4` to 1 at `T1` instead of doubling at `T1`. Leverage is not
+/// loosened below `T1` by it: graduation still needs the discrete tier >= 1 (`graduation_on`),
+/// i.e. both depths >= `T1`, so the leverage target below `T1` stays launch.
+pub const CURVE_ANCHOR0_DIV: u64 = 4;
+
+/// Fixed-point `log2(x)` in Q.16 (`(floor(log2 x) << 16) | 16 fractional bits`), `None` for 0.
+/// The integer part is exact (leading zeros); the fraction is the first 16 binary digits of
+/// `log2(m)` for the 32-bit normalised mantissa `m in [1, 2)`, by repeated squaring with a
+/// floor at every step. MONOTONE NON-DECREASING in `x` (a larger mantissa squares to a larger
+/// or equal value at every step, so its digit string is lexicographically >=), exact at powers
+/// of two, and below the true value by < 2^-16 + the mantissa truncation. All products are
+/// `< 2^32 * 2^32` (checked anyway: an impossible overflow fails closed to `None`).
+pub fn log2_q16(x: u64) -> Option<u32> {
+    if x == 0 {
+        return None;
     }
-    let lo_x = th[i - 1];
-    let next = if i < 3 { th[i] } else { u64::MAX };
-    let ramp_end = core::cmp::min(lo_x.saturating_add(lo_x / TIER_RAMP_DIV), next);
-    let (lo, hi) = (table[i - 1], table[i]);
-    if d >= ramp_end || ramp_end <= lo_x || hi <= lo {
-        return hi;
+    let k = 63 - x.leading_zeros();
+    // m in [2^31, 2^32): Q.31 mantissa of x / 2^k.
+    let mut m: u64 = if k >= 31 { x >> (k - 31) } else { x << (31 - k) };
+    let mut frac: u32 = 0;
+    let mut i = 0;
+    while i < LOG2_FRAC_BITS {
+        m = m.checked_mul(m)? >> 31; // in [2^31, 2^33)
+        frac <<= 1;
+        if m >= 1u64 << 32 {
+            frac |= 1;
+            m >>= 1;
+        }
+        i += 1;
     }
-    // lo + (hi - lo) * (d - lo_x) / (ramp_end - lo_x), floor; < hi because d < ramp_end
-    let num = ((hi - lo) as u128) * ((d - lo_x) as u128);
-    let add = num / ((ramp_end - lo_x) as u128);
-    lo + add as u64
+    Some((k << LOG2_FRAC_BITS) | frac)
+}
+
+/// The four curve anchors (atoms) of a market's thresholds: `[T1 / 4, T1, T2, T3]`.
+pub fn curve_anchors(thresholds_e6: [u64; 3]) -> [u64; 4] {
+    [thresholds_e6[0] / CURVE_ANCHOR0_DIV, thresholds_e6[0], thresholds_e6[1], thresholds_e6[2]]
+}
+
+/// Where a depth sits on the curve: `seg` = how many anchors it has met (0 = below anchor 0,
+/// 4 = at or past T3); for `seg in 1..=3` the value is `t[seg-1] + (t[seg] - t[seg-1]) * num /
+/// den` (floor) with `num <= den`; `den == 0` means "flat at `t[seg-1]`" (a saturated or
+/// non-increasing next anchor: fail closed to the lower value). `seg == 0xFF` = an arithmetic
+/// failure: the curve reads `t[0]` (launch, κ 0.5, λ 1x).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CurvePos {
+    pub seg: u8,
+    pub num: u32,
+    pub den: u32,
+}
+
+/// `CurvePos` of a failed computation (reads `t[0]`).
+pub const CURVE_POS_FAIL: CurvePos = CurvePos { seg: 0xFF, num: 0, den: 0 };
+
+/// The curve position of depth `d` (atoms) over `thresholds_e6`. An anchor is met when
+/// `d >= anchor` and the anchor is not saturated (`u64::MAX`, D-L1: never met, as
+/// `depth_tier_for`); a depth of 0 meets nothing. Interpolation is on `log2`: `num = log2(d) -
+/// log2(a_lo)`, `den = log2(a_hi) - log2(a_lo)` (Q.16), so the value is EXACTLY `t[i]` at every
+/// anchor `a_i` (`num = 0` there).
+pub fn curve_pos(d: u64, thresholds_e6: [u64; 3]) -> CurvePos {
+    let a = curve_anchors(thresholds_e6);
+    let met = |x: u64| x != u64::MAX && x != 0 && d >= x;
+    if d == 0 {
+        return CurvePos { seg: 0, num: 0, den: 0 };
+    }
+    // highest anchor met (top-down, the same order as `depth_tier_for`)
+    let seg: u8 = if met(a[3]) {
+        4
+    } else if met(a[2]) {
+        3
+    } else if met(a[1]) {
+        2
+    } else if met(a[0]) {
+        1
+    } else {
+        0
+    };
+    if seg == 0 || seg == 4 {
+        return CurvePos { seg, num: 0, den: 0 };
+    }
+    let lo = a[(seg - 1) as usize];
+    let hi = a[seg as usize];
+    if hi == u64::MAX || hi <= lo {
+        return CurvePos { seg, num: 0, den: 0 };
+    }
+    let (Some(ld), Some(llo), Some(lhi)) = (log2_q16(d), log2_q16(lo), log2_q16(hi)) else {
+        return CURVE_POS_FAIL;
+    };
+    let (Some(num), Some(den)) = (ld.checked_sub(llo), lhi.checked_sub(llo)) else {
+        return CURVE_POS_FAIL;
+    };
+    CurvePos { seg, num: if num < den { num } else { den }, den }
+}
+
+/// The curve value of a 4-entry table (index = tier) at a position. Monotone tables (every
+/// table the program uses: `tier_leverage`, `KAPPA_TABLE_BPS`, `LAMBDA_DEPTH_TABLE_BPS`) give a
+/// value in `[t[seg-1], t[seg]]`; a decreasing pair (never produced) reads the smaller of the
+/// two. Never above `max(t)`, so the leverage curve is never above `L_tier` (`tier_leverage`
+/// clamps every entry to it).
+pub fn curve_value(p: CurvePos, t: [u64; 4]) -> u64 {
+    match p.seg {
+        0 => t[0],
+        4 => t[3],
+        1..=3 => {
+            let (lo, hi) = (t[(p.seg - 1) as usize], t[p.seg as usize]);
+            if hi < lo {
+                return hi;
+            }
+            if p.den == 0 || hi == lo {
+                return lo;
+            }
+            // (hi - lo) * num / den <= hi - lo; u64 * u32 < 2^96: no overflow in u128.
+            let add = ((hi - lo) as u128) * (p.num as u128) / (p.den as u128);
+            lo + add as u64
+        }
+        _ => t[0],
+    }
+}
+
+/// `curve_value(curve_pos(d, th), t)`.
+pub fn curve_u64(d: u64, thresholds_e6: [u64; 3], t: [u64; 4]) -> u64 {
+    curve_value(curve_pos(d, thresholds_e6), t)
 }
 
 // ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
@@ -1985,10 +2081,10 @@ pub const KAPPA_TABLE_BPS: [u64; 4] = [5_000, 10_000, 10_000, 20_000];
 pub const LAMBDA_DEPTH_TABLE_BPS: [u64; 4] = [10_000, 10_000, 20_000, 30_000];
 const _: () = assert!(KAPPA_TABLE_BPS[0] == 5_000 && KAPPA_TABLE_BPS[3] == 20_000);
 
-/// Round 3 item 5: the venue depth the ramps read: a DEX reading as is; a keeper-attested one
-/// clamped to just below the threshold above `attested_max_tier` (`T_{m+1} - 1`, so its ramp
-/// value never exceeds `L_m` -- the same cap `venue_tier` applies to the tier integer); no
-/// source: 0.
+/// The venue depth the curve reads: a DEX reading as is; a keeper-attested one clamped to the
+/// anchor of `attested_max_tier` (`T_m`, so the curve value never exceeds `L_m` -- the same cap
+/// `venue_tier` applies to the tier integer; continuous leverage: the cap is the anchor itself,
+/// where the curve equals the table); no source: 0.
 pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresholds_e6: [u64; 3], attested_max_tier_stored: u8) -> u64 {
     match depth_source_of(depth_source_byte) {
         DEPTH_SOURCE_DEX => effective_depth_e6,
@@ -1997,7 +2093,8 @@ pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresh
             if m >= MAX_TIER as usize {
                 effective_depth_e6
             } else {
-                let cap = thresholds_e6[m].saturating_sub(1);
+                // m >= 1 (`attested_max_tier_eff`): anchor m is T_m = thresholds_e6[m - 1].
+                let cap = thresholds_e6[m - 1];
                 if effective_depth_e6 < cap {
                     effective_depth_e6
                 } else {
@@ -2009,9 +2106,10 @@ pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresh
     }
 }
 
-/// The smoothed growth dials of one market at a (venue, book) depth pair: the leverage signal
-/// `min(ramp_L(venue), ramp_L(book))` (x100), and κ / λ_depth as the same min of ramps. Each is
-/// <= its step value at `min(venue tier, book tier)`, so never looser than round 2.
+/// The growth dials of one market at a (venue, book) depth pair: the leverage signal
+/// `min(curve_L(venue), curve_L(book))` (x100), and κ / λ_depth as the same min of curves
+/// (continuous leverage: log-interpolated between the anchors, equal to the tier table at each
+/// anchor, so looser than the round-2 step between anchors by design).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmoothDials {
     pub l_signal_x100: u16,
@@ -2019,22 +2117,31 @@ pub struct SmoothDials {
     pub lambda_depth_bps: u32,
 }
 
-pub fn smooth_dials(venue_depth_e6: u64, book_depth_e6: u64, thresholds_e6: [u64; 3], l_table_x100: [u16; 4]) -> SmoothDials {
+/// `smooth_dials` plus the venue-only leverage curve value (the push writer's fall-only upper
+/// bound: `>= l_signal_x100`). Two curve positions (venue, book) serve all four values.
+pub fn smooth_dials_and_venue_l(
+    venue_depth_e6: u64,
+    book_depth_e6: u64,
+    thresholds_e6: [u64; 3],
+    l_table_x100: [u16; 4],
+) -> (SmoothDials, u16) {
     let lt = [l_table_x100[0] as u64, l_table_x100[1] as u64, l_table_x100[2] as u64, l_table_x100[3] as u64];
-    let m2 = |t: [u64; 4]| {
-        let a = tier_ramp_u64(venue_depth_e6, thresholds_e6, t);
-        let b = tier_ramp_u64(book_depth_e6, thresholds_e6, t);
-        if a < b {
-            a
-        } else {
-            b
-        }
-    };
-    SmoothDials {
-        l_signal_x100: m2(lt) as u16,
-        kappa_bps: m2(KAPPA_TABLE_BPS) as u32,
-        lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
-    }
+    let pv = curve_pos(venue_depth_e6, thresholds_e6);
+    let pb = curve_pos(book_depth_e6, thresholds_e6);
+    let m2 = |t: [u64; 4]| core::cmp::min(curve_value(pv, t), curve_value(pb, t));
+    let venue_l = curve_value(pv, lt);
+    (
+        SmoothDials {
+            l_signal_x100: m2(lt) as u16,
+            kappa_bps: m2(KAPPA_TABLE_BPS) as u32,
+            lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
+        },
+        venue_l as u16,
+    )
+}
+
+pub fn smooth_dials(venue_depth_e6: u64, book_depth_e6: u64, thresholds_e6: [u64; 3], l_table_x100: [u16; 4]) -> SmoothDials {
+    smooth_dials_and_venue_l(venue_depth_e6, book_depth_e6, thresholds_e6, l_table_x100).0
 }
 
 /// `N_cap` with explicit (smoothed) dials: `min(n_cap_q(C_m, min(stored λ, λ_depth)), κ·depth/P)`
@@ -2223,7 +2330,11 @@ pub fn growth_matcher_caps_g8_dials(
 /// graduation on, stress < h-lock: min(L_tier, max(L_launch, min(L_signal, stress_cap)))
 /// otherwise:                      min(L_launch, L_tier)
 /// ```
-/// `l_table_tier_x100` is the SIGNAL leverage (today `L_table(tier)`) and `stress_cap_x100` the
+/// `l_table_tier_x100` is the SIGNAL leverage (continuous leverage, 2026-10-19: every program
+/// caller passes the log-interpolated depth curve `smooth_dials(..).l_signal_x100`, capped by
+/// the volatility term; it equals `L_table(tier)` at each anchor and lies between the two
+/// neighbouring table values elsewhere, so I-D2 below now reads "never above `L_tier` or
+/// `max(launch, signal)`") and `stress_cap_x100` the
 /// graded stress cap (`stress_cap_x100`: none / one tier down for a draw / two for real ADL);
 /// the h-lock is launch.
 /// with `tier = min(venue_tier, book_tier)` (the book tier IS the capital term now: absolute LP
@@ -2812,35 +2923,58 @@ mod tests {
         assert!(!growth_flags_ok(2) && !growth_flags_ok(4));
     }
 
-    /// Round 3 item 5 (GAP-3): the tier ramp.
+    /// Continuous leverage (2026-10-19): the log-interpolated depth curve.
     #[test]
-    fn r3_item5_tier_ramp() {
+    fn contlev_curve_unit() {
+        // log2 Q.16: exact integer part, exact at powers of two, None at 0
+        assert_eq!(log2_q16(0), None);
+        assert_eq!(log2_q16(1), Some(0));
+        assert_eq!(log2_q16(2), Some(1 << 16));
+        assert_eq!(log2_q16(3), Some(103_872), "floor(log2(3) * 2^16) = 103,872");
+        assert_eq!(log2_q16(1_024), Some(10 << 16));
+        assert_eq!(log2_q16(u64::MAX), Some((63 << 16) | 0xFFFF));
         let th = [25_000u64, 100_000, 500_000];
         let l = [500u64, 500, 1_000, 2_000];
-        // below T1, and the step value past each ramp
-        assert_eq!(tier_ramp_u64(0, th, l), 500);
-        assert_eq!(tier_ramp_u64(24_999, th, l), 500);
-        assert_eq!(tier_ramp_u64(99_999, th, l), 500);
-        assert_eq!(tier_ramp_u64(125_000, th, l), 1_000, "T2 + 25%: the table value");
-        assert_eq!(tier_ramp_u64(499_999, th, l), 1_000);
-        assert_eq!(tier_ramp_u64(625_000, th, l), 2_000);
-        assert_eq!(tier_ramp_u64(u64::MAX, th, l), 2_000);
-        // on the ramp: linear from the tier below (never the step's higher value)
-        assert_eq!(tier_ramp_u64(100_000, th, l), 500, "AT T2: the value just below (continuous)");
-        assert_eq!(tier_ramp_u64(110_000, th, l), 700, "T2 + 10%: 5x + 5x * 0.4");
-        assert_eq!(tier_ramp_u64(124_999, th, l), 999);
-        // a ramp capped at a close next threshold
-        assert_eq!(tier_ramp_u64(110, [100, 120, 1_000], [1, 2, 3, 4]), 1, "floor of 1 + 1 * 10/20");
-        assert_eq!(tier_ramp_u64(119, [100, 120, 1_000], [1, 2, 3, 4]), 1);
-        assert_eq!(tier_ramp_u64(120, [100, 120, 1_000], [1, 2, 3, 4]), 2, "next ramp starts at the table value");
-        // venue cap: attested (default tier 1) clamps to T2 - 1 -> never above L1
-        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 0), 99_999);
+        // below anchor 0 (T1 / 4) and past T3: the end values
+        assert_eq!(curve_u64(0, th, l), 500);
+        assert_eq!(curve_u64(6_249, th, l), 500);
+        assert_eq!(curve_u64(u64::MAX, th, l), 2_000);
+        // AT each anchor: exactly the table
+        assert_eq!(curve_u64(25_000, th, l), 500);
+        assert_eq!(curve_u64(100_000, th, l), 1_000);
+        assert_eq!(curve_u64(500_000, th, l), 2_000);
+        // between anchors: log-interpolated (the step table reads 5x / 5x / 10x here)
+        assert_eq!(curve_u64(50_000, th, l), 750, "half-way in log between $25k and $100k: 7.5x");
+        assert_eq!(curve_u64(99_999, th, l), 999);
+        assert_eq!(curve_u64(110_000, th, l), 1_059);
+        assert_eq!(curve_u64(200_000, th, l), 1_430);
+        // κ rises 0.5 -> 1 between T1 / 4 and T1 (no doubling at T1)
+        assert_eq!(curve_u64(6_250, th, KAPPA_TABLE_BPS), 5_000);
+        assert_eq!(curve_u64(10_000, th, KAPPA_TABLE_BPS), 6_695);
+        assert_eq!(curve_u64(24_999, th, KAPPA_TABLE_BPS), 9_999);
+        assert_eq!(curve_u64(25_000, th, KAPPA_TABLE_BPS), 10_000);
+        assert_eq!(curve_u64(50_000, th, LAMBDA_DEPTH_TABLE_BPS), 15_000);
+        // fail closed: a saturated next anchor is flat at the lower value (never met, D-L1)
+        assert_eq!(curve_u64(u64::MAX - 1, [25_000, u64::MAX, u64::MAX], l), 500);
+        assert_eq!(curve_u64(u64::MAX, [25_000, u64::MAX, u64::MAX], l), 500);
+        assert_eq!(curve_u64(u64::MAX, [u64::MAX; 3], l), 500);
+        // a non-increasing pair of thresholds: flat (never produced by `tier_config_ok`)
+        assert_eq!(curve_u64(150, [100, 100, 1_000], [1, 2, 3, 4]), 3);
+        assert_eq!(curve_value(CURVE_POS_FAIL, l), 500, "arithmetic failure reads t[0]");
+        // venue cap: attested (default max tier 1) clamps to the anchor T1 -> exactly L1
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 0), 25_000);
+        assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 2), 100_000);
+        assert_eq!(venue_depth_capped(20_000, DEPTH_SOURCE_ATTESTED, th, 1), 20_000);
         assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_DEX, th, 0), 600_000);
         assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_ATTESTED, th, 3), 600_000);
         assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_NONE, th, 3), 0);
-        // the dials: min of the two ramps
-        let d = smooth_dials(110_000, 600_000, th, [500, 500, 1_000, 2_000]);
-        assert_eq!(d, SmoothDials { l_signal_x100: 700, kappa_bps: 10_000, lambda_depth_bps: 14_000 });
+        // the dials: min of the two curves; the venue-only value for the fall-only writer
+        let (d, vl) = smooth_dials_and_venue_l(110_000, 600_000, th, [500, 500, 1_000, 2_000]);
+        assert_eq!(d, SmoothDials { l_signal_x100: 1_059, kappa_bps: 10_592, lambda_depth_bps: 20_592 });
+        assert_eq!(vl, 1_059);
+        let (d, vl) = smooth_dials_and_venue_l(600_000, 50_000, th, [500, 500, 1_000, 2_000]);
+        assert_eq!(d, SmoothDials { l_signal_x100: 750, kappa_bps: 10_000, lambda_depth_bps: 15_000 }, "book binds");
+        assert_eq!(vl, 2_000, "venue alone");
         // the step functions are the dials at a tier
         for t in 0..=3u8 {
             assert_eq!(n_cap_g8_q(true, 1_000_000, 30_000, t, Some(777), 1_000_000, PS), n_cap_g8_q_dials(true, 1_000_000, 30_000, lambda_depth_bps(t), kappa_depth_bps(t), Some(777), 1_000_000, PS));

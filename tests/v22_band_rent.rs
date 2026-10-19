@@ -3073,7 +3073,8 @@ impl Env {
             let n = self.epoch_step(lp, depth);
             let g = self.growth();
             eprintln!("climb step {k}: ceil {c} -> {n}, last_good {} window {:?}", g.depth_last_good_e6, g.depth_tw_min_e6());
-            assert!(n == c || n == c + 100, "step {k}: {c} -> {n} (at most +1x per epoch)");
+            // continuous leverage: the last step to a non-integer target is < +1x
+            assert!(n >= c && n <= c + 100, "step {k}: {c} -> {n} (at most +1x per epoch)");
             c = n;
             if c == target {
                 return k;
@@ -4506,13 +4507,15 @@ fn r3_item4_flash_must_be_held_over_the_window() {
     assert!(after > before && after <= 2 * before, "held: one doubling ({before} -> {after})");
 }
 
-/// Round 3 item 5 (GAP-3): the leverage target is SMOOTH across a threshold and never looser
-/// than the round-2 step. 20x band market, UA thresholds at the floors ($5k / $20k / $100k),
-/// default table [5x, 5x, 10x, 20x], LP book $150k, attested_max_tier 3. A pool held at $22k
-/// (T2 + 10%) targets 5x + 5x * 0.4 = 7x (round 2: the full 10x step), so the ceiling climbs to 7x
-/// and holds; at $25k (past the 25% ramp) it continues to 10x. A depth oscillating ±2% around T2
-/// moves the target by at most 0.4x, not 5x. NEGATIVE CONTROL (file copy): the step table
-/// (round 2) climbs to 10x at $22k.
+/// Continuous leverage (2026-10-19; replaces round 3 item 5's "never looser than the step"
+/// ramp): the leverage target is the log-interpolated depth curve, continuous across a
+/// threshold and EQUAL to the table at it. 20x band market, UA thresholds at the floors
+/// ($5k / $20k / $100k), default table [5x, 5x, 10x, 20x], LP book $150k, attested_max_tier 3.
+/// A pool held at $22k (T2 + 10%) targets 10x + 10x * log2(1.1)/log2(5) = 10.59x (round 2: the
+/// 10x step; round 3: a 7x ramp), so the ceiling climbs +1x per epoch to 10x, then +0.59x to
+/// 10.59x and holds; at $25k it continues to 11.38x. A depth oscillating ±2% around T2 moves the
+/// target by at most 0.4x. NEGATIVE CONTROL: on the base controller (caf062bd, the r3 ramp) the
+/// ceiling holds at 7x at $22k and `climb_to(.., 1_000)` panics.
 #[test]
 fn r3_item5_ceiling_target_is_smooth_across_t2() {
     let mut env = env_tiered(500, 250, 50, 100, 60, 500);
@@ -4522,25 +4525,55 @@ fn r3_item5_ceiling_target_is_smooth_across_t2() {
     let d = 22_000 * USD_E6;
     env.depth_twice(d);
     env.settle_rent(lp.account, lp.account).expect("snapshot");
-    let steps = env.climb_to(&lp, d, 700, 20);
-    assert!(steps >= 7);
+    let steps = env.climb_to(&lp, d, 1_000, 20);
+    assert!(steps >= 5);
+    assert_eq!(env.epoch_step(&lp, d), 1_059, "the last, partial step to the curve's 10.59x");
     for _ in 0..2 {
-        assert_eq!(env.epoch_step(&lp, d), 700, "holds at the smoothed 7x");
+        assert_eq!(env.epoch_step(&lp, d), 1_059, "holds at the curve's 10.59x");
     }
     let t = env.trader(100 * USD);
-    let r = env.trade_cpi(&t.0, t.1, &lp, 750 * Q);
-    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "7.5x over the smoothed 7x");
-    env.trade_cpi(&t.0, t.1, &lp, 650 * Q).expect("6.5x under 7x");
-    env.trade_cpi(&t.0, t.1, &lp, -650 * Q).expect("close");
-    // past the ramp: the table value, one step per epoch
-    env.climb_to(&lp, 25_000 * USD_E6, 1_000, 8);
+    let r = env.trade_cpi(&t.0, t.1, &lp, 1_080 * Q);
+    assert_err(&r, &code(PercolatorError::GrowthLeverageExceeded), "10.8x over the curve's 10.59x");
+    env.trade_cpi(&t.0, t.1, &lp, 1_040 * Q).expect("10.4x under 10.59x");
+    env.trade_cpi(&t.0, t.1, &lp, -1_040 * Q).expect("close");
+    // further up the curve, one step per epoch
+    env.climb_to(&lp, 25_000 * USD_E6, 1_138, 8);
     // the pure function: ±2% around T2 moves the target by <= 0.4x
     let th = env.growth().tier_thresholds_e6();
     let tab = env.growth().tier_table_x100();
     let lt = [tab[0] as u64, tab[1] as u64, tab[2] as u64, tab[3] as u64];
-    let lo = percolator_prog::growth_v19::tier_ramp_u64(th[1] * 98 / 100, th, lt);
-    let hi = percolator_prog::growth_v19::tier_ramp_u64(th[1] * 102 / 100, th, lt);
+    let lo = percolator_prog::growth_v19::curve_u64(th[1] * 98 / 100, th, lt);
+    let hi = percolator_prog::growth_v19::curve_u64(th[1] * 102 / 100, th, lt);
+    assert_eq!((lo, hi), (992, 1_012));
     assert!(hi - lo <= 40, "a ±2% oscillation moves the target by {} x100", hi - lo);
+    env.assert_conservation();
+}
+
+/// Continuous leverage CU probe: the controller paths that evaluate the depth curve, on a
+/// clamp-enforced 20x market with BOTH depths strictly inside an interpolating segment (venue
+/// $50k in [$25k, $100k), book $150k in [$100k, $500k): every curve call runs all three logs).
+/// Prints one `CONTLEV_CU <label> <cu>` line per instruction; run against the base `.so` and the
+/// head `.so` (`GROWTH_WRAPPER_SO`) for the delta. The sequence and the trade sizes are inside
+/// both builds' ceilings (launch 5x), so the two runs execute the same instructions.
+#[test]
+fn contlev_cu_probe_controller_paths() {
+    let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+    env.auth_mark();
+    env.set_tiers([0; 3], [0; 3], 3).expect("UA tier table: defaults, attested max tier 3");
+    let lp = env.lp(150_000 * USD);
+    let d = 50_000 * USD_E6;
+    let p1 = env.push_depth(PRICE, 1, d).expect("push 1");
+    env.warp(1);
+    let p2 = env.push_depth(PRICE, 1, d).expect("push 2 (fall-only writer, curve at venue)");
+    let s1 = env.settle_rent(lp.account, lp.account).expect("tag 106: ratchet writer + rent snapshot");
+    let t = env.trader(1_000 * USD);
+    let o = env.trade_cpi(&t.0, t.1, &lp, 3_000 * Q).expect("open 3x: gate + clip + ext-v3 caps");
+    env.warp(1);
+    let p3 = env.push_depth(PRICE, 1, d).expect("push 3");
+    let c = env.trade_cpi(&t.0, t.1, &lp, -3_000 * Q).expect("close");
+    for (k, v) in [("push1", p1), ("push2", p2), ("settle_rent_lp", s1), ("trade_open", o), ("push3", p3), ("trade_close", c)] {
+        println!("CONTLEV_CU {k} {v}");
+    }
     env.assert_conservation();
 }
 

@@ -237,18 +237,192 @@ fn r3_item4_mutants_are_caught() {
     assert_eq!(first, 24_999 / 16);
 }
 
-// ── item 5 (GAP-3): smooth tier ramps, never looser than the step table ─────────────────────
+// ── continuous leverage (2026-10-19): log-interpolated curve over the tier anchors ─────────
+// Replaces round 3 item 5's "never looser than the step" ramps (Khubair 10-19: "it's not truly
+// dynamic if it's 5x/10x -- it should be able to go to 6x etc"). The curve equals the tier table
+// AT each anchor (T1/4, T1, T2, T3) and is continuous and monotone between them.
 
-/// MUTANT (the design's knots (T1/2, L0)..(T3, L3)): ramp UP TO each threshold -- looser than the
-/// step just below it.
-fn ramp_mutant_before(d: u64, th: [u64; 3], t: [u64; 4]) -> u64 {
-    let knots = [(th[0] / 2, t[0]), (th[0], t[1]), (th[1], t[2]), (th[2], t[3])];
-    if d <= knots[0].0 { return t[0]; }
-    for w in knots.windows(2) {
-        let ((x0, y0), (x1, y1)) = (w[0], w[1]);
-        if d <= x1 { return y0 + (y1 - y0) * (d - x0) / (x1 - x0).max(1); }
+/// The round-2 STEP table (the NEGATIVE CONTROL for continuity: it jumps at every threshold).
+fn step_table(d: u64, th: [u64; 3], t: [u64; 4]) -> u64 {
+    t[gv::depth_tier_for(d, th) as usize]
+}
+
+/// The round-3 item-5 25% ramp, verbatim (removed from src; kept here as the NEGATIVE CONTROL
+/// for "equal to the table at each anchor": it reads the LOWER value at T_i).
+fn r3_ramp_removed(d: u64, th: [u64; 3], table: [u64; 4]) -> u64 {
+    let i = gv::depth_tier_for(d, th) as usize;
+    if i == 0 {
+        return table[0];
+    }
+    let lo_x = th[i - 1];
+    let next = if i < 3 { th[i] } else { u64::MAX };
+    let ramp_end = core::cmp::min(lo_x.saturating_add(lo_x / 4), next);
+    let (lo, hi) = (table[i - 1], table[i]);
+    if d >= ramp_end || ramp_end <= lo_x || hi <= lo {
+        return hi;
+    }
+    lo + ((((hi - lo) as u128) * ((d - lo_x) as u128)) / ((ramp_end - lo_x) as u128)) as u64
+}
+
+/// MUTANT: linear in depth (not log) between anchors -- still continuous, but its value at the
+/// geometric mid-point differs (the log-interp witness below).
+fn linear_mutant(d: u64, th: [u64; 3], t: [u64; 4]) -> u64 {
+    let a = gv::curve_anchors(th);
+    if d < a[0] { return t[0]; }
+    for i in 1..4 {
+        if d < a[i] {
+            return t[i - 1] + (t[i] - t[i - 1]) * (d - a[i - 1]) / (a[i] - a[i - 1]);
+        }
     }
     t[3]
+}
+
+/// The largest jump of `f` between neighbouring sample depths of a fine sweep over
+/// `[lo, hi]` with step `max(1, x >> shift)` (relative resolution 2^-shift), plus the exact
+/// atom-adjacent pairs `(a - 1, a)` and `(a, a + 1)` at each anchor.
+fn max_jump(f: &dyn Fn(u64) -> u64, lo: u64, hi: u64, shift: u32, anchors: &[u64]) -> (u64, u64) {
+    let mut worst = (0u64, 0u64);
+    let mut x = lo;
+    let mut prev = f(x);
+    while x < hi {
+        let nx = x + core::cmp::max(1, x >> shift);
+        let v = f(nx);
+        let j = v.abs_diff(prev);
+        if j > worst.0 { worst = (j, nx); }
+        prev = v;
+        x = nx;
+    }
+    for &a in anchors {
+        if a == 0 || a == u64::MAX { continue; }
+        for (p, q) in [(a - 1, a), (a, a + 1)] {
+            let j = f(q).abs_diff(f(p));
+            if j > worst.0 { worst = (j, q); }
+        }
+    }
+    worst
+}
+
+const USD: u64 = 1_000_000;
+
+/// Realistic per-market configs: the default thresholds, the UA floors, a wide spacing; on 6- and
+/// 9-decimal collateral.
+fn configs() -> Vec<[u64; 3]> {
+    let mut v = vec![];
+    for dec in [6u8, 9] {
+        for th in [[0u32; 3], [5_000, 20_000, 100_000], [10_000, 200_000, 5_000_000], [30_000, 40_000, 150_000]] {
+            v.push(gv::tier_thresholds(th, dec));
+        }
+    }
+    v
+}
+
+fn tables() -> Vec<[u16; 4]> {
+    vec![
+        gv::tier_leverage([0; 3], 500, 2_000),       // default 20x market launched at 5x
+        gv::tier_leverage([0; 3], 200, 2_000),       // launched at 2x
+        gv::tier_leverage([0; 3], 500, 500),         // a 5x market: flat
+        gv::tier_leverage([700, 2_500, 5_000], 300, 5_000), // a steep 50x table
+        gv::tier_leverage([1_000, 5_000, 10_000], 100, 10_000), // 100x table (max u16 headroom)
+    ]
+}
+
+fn u64t(t: [u16; 4]) -> [u64; 4] {
+    [t[0] as u64, t[1] as u64, t[2] as u64, t[3] as u64]
+}
+
+/// CONTINUITY at fine resolution: no jump > 1 (x100 for leverage, bps for κ / λ) between
+/// neighbouring depths (relative step 2^-20) anywhere on [T1/8, 2·T3], and across each anchor's
+/// atom-adjacent pairs, for every realistic config and table.
+#[test]
+fn contlev_continuous_at_fine_resolution() {
+    for th in configs() {
+        let anc = gv::curve_anchors(th);
+        for tab in tables() {
+            let t = u64t(tab);
+            for table in [t, gv::KAPPA_TABLE_BPS, gv::LAMBDA_DEPTH_TABLE_BPS] {
+                let f = |d: u64| gv::curve_u64(d, th, table);
+                let (j, at) = max_jump(&f, anc[0] / 2, th[2].saturating_mul(2), 20, &anc);
+                assert!(j <= 1, "jump {j} at depth {at} (th {th:?}, table {table:?})");
+            }
+        }
+    }
+}
+
+/// NEGATIVE CONTROL for the continuity test: the round-2 step table FAILS it (a 5x jump at T2
+/// and 10x at T3 on the default table; κ doubles at T1), and so would any regression to steps.
+#[test]
+fn contlev_negative_control_step_table_fails_continuity() {
+    let th = gv::tier_thresholds([0; 3], 6);
+    let anc = gv::curve_anchors(th);
+    let t = u64t(gv::tier_leverage([0; 3], 500, 2_000));
+    let f = |d: u64| step_table(d, th, t);
+    let (j, at) = max_jump(&f, anc[0] / 2, th[2] * 2, 20, &anc);
+    assert_eq!(j, 1_000, "the step table jumps 10x at T3");
+    assert!(at >= th[2] && at <= th[2] + (th[2] >> 19), "at T3 ({at})");
+    let fk = |d: u64| step_table(d, th, gv::KAPPA_TABLE_BPS);
+    assert!(max_jump(&fk, anc[0] / 2, th[2] * 2, 20, &anc).0 >= 5_000, "κ step doubles at T1");
+    // the removed r3 ramp is continuous but NOT equal to the table at the anchors
+    assert_eq!(r3_ramp_removed(th[1], th, t), 500, "r3 ramp reads 5x AT T2");
+    assert_eq!(gv::curve_u64(th[1], th, t), 1_000, "the curve reads the table (10x) AT T2");
+    // the linear-in-depth mutant: at the geometric mid-point $50k of [$25k, $100k] it reads 6.67x,
+    // the log curve 7.5x
+    assert_eq!(linear_mutant(50_000 * USD, th, t), 666);
+    assert_eq!(gv::curve_u64(50_000 * USD, th, t), 750);
+}
+
+/// The curve table of the ledger (default thresholds, 6 decimals, 20x market launched at 5x;
+/// and launched at 2x). Pins the numbers the ledger quotes.
+#[test]
+fn contlev_ledger_curve_table() {
+    let th = gv::tier_thresholds([0; 3], 6);
+    let l = u64t(gv::tier_leverage([0; 3], 500, 2_000));
+    let rows: [(u64, u64, u64, u64); 12] = [
+        // ($, L x100, κ bps, λ bps)
+        (5_000, 500, 5_000, 10_000),
+        (10_000, 500, 6_695, 10_000),
+        (20_000, 500, 9_195, 10_000),
+        (25_000, 500, 10_000, 10_000),
+        (40_000, 669, 10_000, 13_390),
+        (50_000, 750, 10_000, 15_000),
+        (75_000, 896, 10_000, 17_924),
+        (100_000, 1_000, 10_000, 20_000),
+        (200_000, 1_430, 14_306, 24_306),
+        (300_000, 1_682, 16_826, 26_826),
+        (500_000, 2_000, 20_000, 30_000),
+        (1_000_000, 2_000, 20_000, 30_000),
+    ];
+    for (usd, lx, k, lam) in rows {
+        let d = usd * USD;
+        assert_eq!(gv::curve_u64(d, th, l), lx, "L at ${usd}");
+        assert_eq!(gv::curve_u64(d, th, gv::KAPPA_TABLE_BPS), k, "κ at ${usd}");
+        assert_eq!(gv::curve_u64(d, th, gv::LAMBDA_DEPTH_TABLE_BPS), lam, "λ at ${usd}");
+    }
+}
+
+/// The one discontinuity the curve does NOT remove: GRADUATION (kept discrete, `graduation_on`
+/// needs tier >= 1 on BOTH depths). Below T1 the target is launch; at T1 it is L1. On a market
+/// launched at L1 (the default 5x memecoin config) the jump is 0; launched below L1 it is
+/// exactly L1 - launch (the ratchet still climbs it 1x per epoch; the fall is at once).
+#[test]
+fn contlev_graduation_step_is_the_only_jump() {
+    let th = gv::tier_thresholds([0; 3], 6);
+    let band = 64u64;
+    for (la, expect_jump) in [(500u16, 0u16), (200, 300)] {
+        let tab = gv::tier_leverage([0; 3], la, 2_000);
+        let target = |d: u64| {
+            let tier = gv::combined_tier(gv::depth_tier_for(d, th), gv::depth_tier_for(d, th));
+            let grad = gv::graduation_on(true, band, tier);
+            let dials = gv::smooth_dials(d, d, th, tab);
+            gv::target_ceiling_x100(grad, gv::STRESS_NONE, la, 2_000, dials.l_signal_x100, u16::MAX)
+        };
+        assert_eq!(target(th[0] - 1), la, "below T1: launch");
+        assert_eq!(target(th[0]), tab[1]);
+        assert_eq!(target(th[0]) - target(th[0] - 1), expect_jump);
+        // above T1 the effective target is continuous
+        let f = |d: u64| target(d) as u64;
+        let (j, _) = max_jump(&f, th[0], th[2] * 2, 20, &th[1..]);
+        assert!(j <= 1, "effective target continuous above T1: jump {j}");
+    }
 }
 
 fn arb_th() -> impl Strategy<Value = [u64; 3]> {
@@ -262,55 +436,80 @@ fn arb_table() -> impl Strategy<Value = [u64; 4]> {
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(4_096))]
 
-    /// Never looser than the step anywhere; equal to the step outside the 25% ramps; monotone;
-    /// continuous at every threshold (the value at T_i is the value just below it) and Lipschitz
-    /// on the ramp; the dials are each <= their step at min(venue tier, book tier).
+    /// log2_q16 is monotone and its integer part exact, at full u64 width.
     #[test]
-    fn item5_ramp(d in any::<u64>(), e in any::<u64>(), th in arb_th(), t in arb_table()) {
-        let step = |x: u64| t[gv::depth_tier_for(x, th) as usize];
-        let f = gv::tier_ramp_u64(d, th, t);
-        prop_assert!(f <= step(d), "never looser");
-        let i = gv::depth_tier_for(d, th) as usize;
-        if i > 0 {
-            let lo_x = th[i - 1];
-            let end = (lo_x + lo_x / 4).min(if i < 3 { th[i] } else { u64::MAX });
-            if d >= end { prop_assert_eq!(f, step(d)); }
-            prop_assert!(f >= t[i - 1]);
-            prop_assert_eq!(gv::tier_ramp_u64(lo_x, th, t), t[i - 1], "continuous at the threshold");
-            // the ramp starts where the band below ends: no jump at T_i beyond the band below's
-            // own value (when that band's ramp had room to complete)
-            if lo_x > 0 { prop_assert!(gv::tier_ramp_u64(lo_x - 1, th, t) <= gv::tier_ramp_u64(lo_x, th, t)); }
-            if i >= 2 && lo_x > (th[i - 2] + th[i - 2] / 4) {
-                prop_assert_eq!(gv::tier_ramp_u64(lo_x - 1, th, t), t[i - 1], "left limit == ramp start");
-            }
-        } else {
-            prop_assert_eq!(f, t[0]);
-        }
+    fn contlev_log2_monotone(x in 1u64.., y in 1u64..) {
+        let (a, b) = if x <= y { (x, y) } else { (y, x) };
+        let (la, lb) = (gv::log2_q16(a).unwrap(), gv::log2_q16(b).unwrap());
+        prop_assert!(la <= lb);
+        prop_assert_eq!(la >> gv::LOG2_FRAC_BITS, 63 - a.leading_zeros());
+        // within 2^-15 of the true value (below it)
+        let exact = (a as f64).log2() * 65_536.0;
+        prop_assert!((la as f64) <= exact + 1e-6 && exact - (la as f64) < 2.0, "{a}: {la} vs {exact}");
+    }
+
+    /// Monotone; between t[0] and t[3]; in [step(d), next step] (never tighter than the round-2
+    /// step, never looser than the next anchor's value); EQUAL to the table at each anchor;
+    /// t[0] below anchor 0 and t[3] from T3.
+    #[test]
+    fn contlev_curve_props(d in any::<u64>(), e in any::<u64>(), th in arb_th(), t in arb_table()) {
+        let f = |x: u64| gv::curve_u64(x, th, t);
         let (a, b) = if d <= e { (d, e) } else { (e, d) };
-        prop_assert!(gv::tier_ramp_u64(a, th, t) <= gv::tier_ramp_u64(b, th, t), "monotone");
+        prop_assert!(f(a) <= f(b), "monotone");
+        let v = f(d);
+        prop_assert!(v >= t[0] && v <= t[3]);
+        let i = gv::depth_tier_for(d, th) as usize;
+        prop_assert!(v >= step_table(d, th, t), "never below the step");
+        prop_assert!(v <= t[core::cmp::min(i + 1, 3)], "never above the next anchor's value");
+        let anc = gv::curve_anchors(th);
+        for k in 0..4 {
+            if anc[k] > 0 && (k == 0 || anc[k] > anc[k - 1]) {
+                prop_assert_eq!(f(anc[k]), t[k], "equal to the table at anchor {}", k);
+            }
+        }
+        if d < anc[0] { prop_assert_eq!(v, t[0]); }
+        if d >= th[2] { prop_assert_eq!(v, t[3]); }
     }
 
+    /// The dials: min(venue curve, book curve) for each table (so the smaller depth binds),
+    /// never above L_tier, never below launch, κ in [0.5, 2], λ in [1x, 3x]; the venue-only value
+    /// is >= the signal (the fall-only writer's upper bound).
     #[test]
-    fn item5_dials(v in any::<u64>(), b in any::<u64>(), th in arb_th(), la in 100u16..=2_000, lt in 100u16..=10_000, lev in any::<[u16; 3]>()) {
+    fn contlev_dials(v in any::<u64>(), b in any::<u64>(), th in arb_th(), la in 100u16..=2_000, lt in 100u16..=10_000, lev in any::<[u16; 3]>()) {
         let tab = gv::tier_leverage(lev, la.min(lt), lt);
-        let d = gv::smooth_dials(v, b, th, tab);
+        let (d, vl) = gv::smooth_dials_and_venue_l(v, b, th, tab);
+        let t = u64t(tab);
+        prop_assert_eq!(d.l_signal_x100 as u64, gv::curve_u64(v, th, t).min(gv::curve_u64(b, th, t)));
+        prop_assert_eq!(d.l_signal_x100 as u64, gv::curve_u64(v.min(b), th, t), "min(venue, book) = the smaller depth");
+        prop_assert_eq!(d.kappa_bps as u64, gv::curve_u64(v.min(b), th, gv::KAPPA_TABLE_BPS));
+        prop_assert_eq!(d.lambda_depth_bps as u64, gv::curve_u64(v.min(b), th, gv::LAMBDA_DEPTH_TABLE_BPS));
+        prop_assert_eq!(vl as u64, gv::curve_u64(v, th, t));
+        prop_assert!(vl >= d.l_signal_x100);
+        prop_assert!(d.l_signal_x100 <= lt && d.l_signal_x100 >= la.min(lt), "within [launch, L_tier]");
+        prop_assert!(d.kappa_bps >= 5_000 && d.kappa_bps <= 20_000);
+        prop_assert!(d.lambda_depth_bps >= 10_000 && d.lambda_depth_bps <= 30_000);
+        // the target built from it never exceeds L_tier
         let tier = gv::combined_tier(gv::depth_tier_for(v, th), gv::depth_tier_for(b, th));
-        prop_assert!(d.l_signal_x100 <= gv::l_table_x100(tier, tab));
-        prop_assert!(d.kappa_bps <= gv::kappa_depth_bps(tier));
-        prop_assert!(d.lambda_depth_bps <= gv::lambda_depth_bps(tier));
-        prop_assert!(d.l_signal_x100 >= tab[0] && d.kappa_bps >= 5_000 && d.lambda_depth_bps >= 10_000);
+        let tgt = gv::target_ceiling_x100(gv::graduation_on(true, 64, tier), 0, la, lt, d.l_signal_x100, u16::MAX);
+        prop_assert!(tgt <= lt);
+        if v.min(b) < th[0] { prop_assert_eq!(tgt, la.min(lt), "below T1: launch"); }
     }
-}
 
-#[test]
-fn r3_item5_mutants_are_caught() {
-    let th = [25_000u64, 100_000, 500_000];
-    let t = [500u64, 500, 1_000, 2_000];
-    // the design's ramp-before-threshold: at $90k (tier 1, step 5x) it already gives ~9.3x
-    assert!(ramp_mutant_before(90_000, th, t) > 500, "mutant witness: looser below T2");
-    assert_eq!(gv::tier_ramp_u64(90_000, th, t), 500);
-    // the pure step (no ramp): a 5x jump at T2; the ramp moves 0.2x for +1%
-    assert_eq!(gv::tier_ramp_u64(101_000, th, t), 520);
+    /// Fail closed: a saturated anchor is never met and a segment toward it is flat; a zero
+    /// depth reads t[0]; an attested venue depth never reads above L_m (m = attested_max_tier).
+    #[test]
+    fn contlev_fail_closed(d in any::<u64>(), th in arb_th(), t in arb_table(), m in 0u8..=3, eff in any::<u64>()) {
+        prop_assert_eq!(gv::curve_u64(0, th, t), t[0]);
+        let sat = [th[0], u64::MAX, u64::MAX];
+        prop_assert!(gv::curve_u64(d, sat, t) <= t[1], "saturated T2 / T3: never above L1");
+        prop_assert_eq!(gv::curve_u64(d, [u64::MAX; 3], t), t[0]);
+        prop_assert_eq!(gv::curve_value(gv::CURVE_POS_FAIL, t), t[0]);
+        let cap = gv::venue_depth_capped(eff, gv::DEPTH_SOURCE_ATTESTED, th, m);
+        let me = gv::attested_max_tier_eff(m) as usize;
+        prop_assert!(gv::curve_u64(cap, th, t) <= t[me], "attested cap at anchor {}", me);
+        if eff >= th[me.min(3) - 1] && me < 3 { prop_assert_eq!(gv::curve_u64(cap, th, t), t[me], "reaches L_m"); }
+        prop_assert_eq!(gv::venue_depth_capped(eff, gv::DEPTH_SOURCE_NONE, th, m), 0);
+    }
 }
 
 // ── item 6 (GAP-6): the volatility input ───────────────────────────────────────────────────
