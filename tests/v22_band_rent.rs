@@ -4465,6 +4465,38 @@ fn r3_item3_graded_stress_target_and_down_at_once() {
     assert_eq!(one(&mut env), 500, "h-lock: 20x -> 5x in one writer call");
 }
 
+/// Continuous leverage, security review M-2 (Khubair 10-19: the stress cap stays STEPPED): on the
+/// default thresholds ($25k / $100k / $500k), a 20x market launched at 5x, a $1M vault LP (the
+/// book never binds) and a venue depth of $200k / $300k / $400k, the ceiling first climbs to the
+/// unstressed CURVE (14.30x / 16.82x / 18.61x); then a draw outstanding (STATE POKE of the halt
+/// mirror) and one 44 B PushAuthMark (the fall-only writer, at the venue tier) store base
+/// caf062bd's stepped L_table(tier - 1) = 5x at once, and real ADL also 5x.
+/// NEGATIVE CONTROL (run, not in CI): with `GROWTH_WRAPPER_SO` = the 3198539a test-ID build
+/// (`~/wt-v22-contlev/out/contlev2-testIDs.so`, continuous stress cap) the draw stores 7.15x /
+/// 8.41x / 9.30x and this test FAILS.
+#[test]
+fn contlev_m2_draw_at_200k_300k_400k_stores_the_stepped_5x() {
+    for (usd, unstressed) in [(200_000u64, 1_430u16), (300_000, 1_682), (400_000, 1_861)] {
+        let mut env = env_tiered(500, 250, 50, 100, 60, 500);
+        env.auth_mark();
+        env.set_tiers([0; 3], [0; 3], 3).expect("UA tier table: defaults, attested max tier 3");
+        let lp = env.lp(1_000_000 * USD);
+        let d = usd * USD_E6;
+        env.depth_twice(d);
+        env.settle_rent(lp.account, lp.account).expect("snapshot");
+        env.climb_to(&lp, d, unstressed, 40);
+        assert_eq!(env.growth().ceil_x100, unstressed, "${usd}: climbed to the unstressed curve");
+        let climbed = env.svm.get_account(&env.market).unwrap();
+        env.poke_stress(None, None, None, Some(1));
+        env.push_depth(PRICE, 1, d).expect("44 B push (writer)");
+        assert_eq!(env.growth().ceil_x100, 500, "${usd}: a draw stores the stepped 5x (base caf062bd), not the curve one segment down");
+        env.svm.set_account(env.market, climbed).unwrap();
+        env.poke_stress(None, Some(1), None, None);
+        env.push_depth(PRICE, 1, d).expect("44 B push (writer)");
+        assert_eq!(env.growth().ceil_x100, 500, "${usd}: real ADL stores 5x");
+    }
+}
+
 /// Round 3 item 4 (design GAP-5 / sims (g)): a flash of liquidity must be HELD over the whole
 /// time-weighted window (>= one full 750-slot bucket of keeper samples) to count at all. A
 /// market at a steady $8k (keeper pushes every 10 slots) whose rise window is open sees a whale

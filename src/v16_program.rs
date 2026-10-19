@@ -28570,7 +28570,7 @@ pub mod processor {
                 g.l_launch_x100,
                 g.l_tier_x100,
                 ctx.venue_l_x100,
-                growth_v19::stress_cap_curve_x100(ctx.stress, ctx.venue_pos, ctx.l_table),
+                growth_v19::stress_cap_x100(ctx.stress, ctx.venue_tier, ctx.l_table),
                 ctx.now,
             );
             g.ceil_x100 = ceil;
@@ -43154,6 +43154,8 @@ pub mod processor {
         clamp: bool,
         /// `growth_v19::graduation_on(clamp, band_bps, tier)`.
         graduation: bool,
+        /// R2.1 §3: `min(venue_tier, book_tier)`; 0 off the clamp.
+        tier: u8,
         /// R2.1 §3: the venue tier alone (the push writer's fall-only upper bound); 0 off the
         /// clamp.
         venue_tier: u8,
@@ -43170,25 +43172,21 @@ pub mod processor {
         now: u64,
         /// R2.1 §2: the market's leverage table `[L0..L3]` (`growth_v19::tier_leverage`).
         l_table: [u16; 4],
-        /// Continuous leverage (2026-10-19): the leverage signal / κ / λ_depth on the
-        /// log-interpolated depth curve (`growth_v19::smooth_dials_and_venue_l`, min(venue curve,
-        /// book curve)); equal to the tier table at each anchor and looser than the step between
-        /// anchors by design. Neutral (tier-0 values) off the clamp, where they are never read.
+        /// Continuous leverage (2026-10-19): the leverage signal on the log-interpolated depth
+        /// curve (equal to the tier table at each anchor, looser than the step between anchors by
+        /// design) and κ / λ_depth on the LAGGING curve (security review M-1: continuous, never
+        /// looser than the step), each min(venue, book) (`growth_v19::smooth_dials_and_venue_l`).
+        /// The stress cap stays STEPPED (M-2, `stress_cap`). Neutral (tier-0 values) off the
+        /// clamp, where they are never read.
         dials: growth_v19::SmoothDials,
         /// The venue-only leverage curve value (the push writer's fall-only upper bound).
         venue_l_x100: u16,
-        /// Continuous stress cap (2026-10-19): the curve position of the SIGNAL depth
-        /// (`min(venue, book)`) and of the venue depth alone (`smooth_dials_venue_l_and_pos`).
-        /// Below anchor 0 (tier-0 values) off the clamp, where they are never read.
-        pos: growth_v19::CurvePos,
-        venue_pos: growth_v19::CurvePos,
     }
 
     impl GrowthG8Ctx {
-        /// The graded stress cap on the continuous curve at the signal position
-        /// (`growth_v19::stress_cap_curve_x100`; equal to the stepped cap at every anchor).
+        /// The graded stress cap at the combined tier (`growth_v19::stress_cap_x100`).
         fn stress_cap(&self) -> u16 {
-            growth_v19::stress_cap_curve_x100(self.stress, self.pos, self.l_table)
+            growth_v19::stress_cap_x100(self.stress, self.tier, self.l_table)
         }
     }
 
@@ -43208,6 +43206,7 @@ pub mod processor {
             return Ok(GrowthG8Ctx {
                 clamp: false,
                 graduation: false,
+                tier: 0,
                 venue_tier: 0,
                 cap_depth_e6: None,
                 stress: growth_v19::STRESS_NONE,
@@ -43219,8 +43218,6 @@ pub mod processor {
                     lambda_depth_bps: growth_v19::LAMBDA_DEPTH_TABLE_BPS[0] as u32,
                 },
                 venue_l_x100: 0,
-                pos: growth_v19::CurvePos { seg: 0, num: 0, den: 0 },
-                venue_pos: growth_v19::CurvePos { seg: 0, num: 0, den: 0 },
             });
         }
         let now = authenticated_market_slot_or_fallback_view(group);
@@ -43248,8 +43245,8 @@ pub mod processor {
             Some(c) => growth_v19::book_depth_e6(c, g.lambda_bps),
             None => 0,
         };
-        let (mut dials, venue_l_x100, pos, venue_pos) =
-            growth_v19::smooth_dials_venue_l_and_pos(venue_depth, book_depth, thresholds, l_table);
+        let (mut dials, venue_l_x100) =
+            growth_v19::smooth_dials_and_venue_l(venue_depth, book_depth, thresholds, l_table);
         // Round 3 item 6 (GAP-6): L_vol = floor(1e4 / max(IMR, z * sigma_H + liq fee)) over
         // H = two band epochs (the Band Safety Law horizon); no data -> launch (fails closed).
         let vol = if g.vol_has_data() {
@@ -43287,6 +43284,7 @@ pub mod processor {
         Ok(GrowthG8Ctx {
             clamp,
             graduation: growth_v19::graduation_on(clamp, band_bps, tier),
+            tier,
             venue_tier,
             cap_depth_e6,
             stress: growth_v19::stress_level(draw_out, adl, hlock),
@@ -43294,8 +43292,6 @@ pub mod processor {
             l_table,
             dials,
             venue_l_x100,
-            pos,
-            venue_pos,
         })
     }
 
@@ -50249,7 +50245,7 @@ mod r3_kani_proofs {
     // Continuous leverage (2026-10-19): the `kani_contlev_*` harnesses live in the standalone
     // proofs crate `kani/contlev` (it compiles THIS crate's `src/growth_v19.rs` /
     // `src/vault_lp_v18.rs` verbatim, so a run does not codegen the whole program); design and
-    // results: ledger v22-continuous-leverage-build-2026-10-19.md §8 and §10.
+    // results: ledger v22-continuous-leverage-build-2026-10-19.md §10.
 
     /// Item 6 (GAP-6): the volatility term. A sample is `ceil(min(move, cap)^2 * 100 / dt)` and
     /// none for `dt == 0` or no previous mark; the first EWMA value is >= the seed (no data -> no

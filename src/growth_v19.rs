@@ -180,9 +180,10 @@ pub fn stress_level(draw_outstanding: bool, real_adl: bool, hlock: bool) -> u8 {
 /// for `s` = 1 (draw) and 2 (real ADL) -- `s` knots below the current tier, floored at tier 0
 /// (launch); launch (`table[0]`) under the h-lock. Monotone non-increasing in `stress`,
 /// non-decreasing in `tier`, and never above `L_table(tier)` once `stress >= 1`.
-/// Continuous leverage (2026-10-19): no program reader calls this any more (it stepped at the
-/// anchors); they read `stress_cap_curve_x100`, which equals it at every anchor. Kept for the
-/// tests and Kani harnesses that use it as the reference step.
+/// Continuous leverage (2026-10-19, security review M-2, Khubair): STAYS STEPPED. Under stress
+/// the target is `min(leverage curve, this)` at the discrete combined tier (venue tier on the
+/// push path), exactly base caf062bd's stress cap: never above the unstressed curve (the curve is
+/// `>= L_table(tier)`), applied at once.
 pub fn stress_cap_x100(stress: u8, tier: u8, table: [u16; 4]) -> u16 {
     if stress == STRESS_NONE {
         return u16::MAX;
@@ -2007,39 +2008,51 @@ pub fn curve_u64(d: u64, thresholds_e6: [u64; 3], t: [u64; 4]) -> u64 {
     curve_value(curve_pos(d, thresholds_e6), t)
 }
 
-/// The graded stress cap on the CONTINUOUS curve (x100; 2026-10-19, replaces the stepped
-/// `stress_cap_x100` in every program reader): the leverage curve read `s` segments down at the
-/// SAME fractional position, i.e. with the tier coordinate `x = seg - 1 + num / den` of the
-/// position `p`, `curve(max(x - s, 0))`:
-/// * level 0: no cap (`u16::MAX`); the h-lock (level >= 3): launch (`table[0]`), unchanged;
-/// * a draw (s = 1) / real ADL (s = 2) at `seg in 1..=3` with `seg - 1 >= s`: `table[seg-1-s] +
-///   floor((table[seg-s] - table[seg-1-s]) * num / den)`; at or past T3 (`seg == 4`):
-///   `table[3 - s]`; below that (`seg - 1 < s`, incl. below anchor 0): `table[0]`;
-/// * an arithmetic-failure position (`CURVE_POS_FAIL`): `table[0]` (fail closed).
-///
-/// At every anchor (`num = 0`) it equals the stepped cap `stress_cap_x100(s, tier, table)`;
-/// between anchors it lies in `[stepped cap at this tier, stepped cap at the next tier]` and is
-/// continuous in the depth (no jump at the anchors any more). On a monotone table (every
-/// `tier_leverage`) it is never above the unstressed curve `curve_value(p, table)`, monotone
-/// non-increasing in the stress level and non-decreasing in the depth (Kani
-/// `kani_contlev_stress_cap_curve`). The cut still applies at once: the target is
-/// `min(signal, this)` in the same call (`target_ceiling_x100`) and the ceiling in force is
-/// `min(stored, target)`.
-pub fn stress_cap_curve_x100(stress: u8, p: CurvePos, table: [u16; 4]) -> u16 {
-    if stress == STRESS_NONE {
-        return u16::MAX;
+/// Capacity dials (κ, λ_depth) LAG the anchors (2026-10-19, security review M-1, Khubair: Toly's
+/// fail-closed principle): continuous but NEVER LOOSER than the round-2 step anywhere. The jump
+/// the step makes at `T_i` is spread over the NEXT segment instead: below T1 `t[0]`; on
+/// `[T1, T2)` log2-interpolated from `t[0]` up to `t[1]`; on `[T2, T3)` from `t[1]` up to `t[2]`;
+/// on `[T3, T3 * KAPPA_LAG_TOP_MUL)` from `t[2]` up to `t[3]`; `t[3]` from there. So the value is
+/// `<=` the step value of the segment it is in, equals the step value of the segment BELOW at
+/// each anchor (a continuous curve cannot equal a rising step at the anchor itself without
+/// being looser just below it), and reaches each step value at the next anchor.
+pub const KAPPA_LAG_TOP_MUL: u64 = 4;
+
+/// The lagging position (κ / λ_depth) of a depth `d`, from its LEADING position `lead =
+/// curve_pos(d, thresholds_e6)` (the leverage curve's). The lag anchors `[T1, T2, T3, 4·T3]` are
+/// the leading anchors `[T1/4, T1, T2, T3]` shifted one place, so for `lead.seg` in 1..=3 the lag
+/// position is the same interval and fraction one segment down (no `log2`); only `d >= T3`
+/// (`lead.seg == 4`) computes its place on `[T3, 4·T3)` (`4·T3` saturating: a saturated top
+/// anchor is never met and the segment is flat at `t[2]`, fail closed). The failure position
+/// stays the failure position (reads `t[0]`).
+pub fn curve_pos_lag(lead: CurvePos, d: u64, thresholds_e6: [u64; 3]) -> CurvePos {
+    match lead.seg {
+        1..=3 => CurvePos { seg: lead.seg - 1, num: lead.num, den: lead.den },
+        4 => {
+            let lo = thresholds_e6[2];
+            let hi = lo.saturating_mul(KAPPA_LAG_TOP_MUL);
+            if hi == u64::MAX || hi <= lo {
+                return CurvePos { seg: 3, num: 0, den: 0 };
+            }
+            if d >= hi {
+                return CurvePos { seg: 4, num: 0, den: 0 };
+            }
+            let (Some(ld), Some(llo), Some(lhi)) = (log2_q16(d), log2_q16(lo), log2_q16(hi)) else {
+                return CURVE_POS_FAIL;
+            };
+            let (Some(num), Some(den)) = (ld.checked_sub(llo), lhi.checked_sub(llo)) else {
+                return CURVE_POS_FAIL;
+            };
+            CurvePos { seg: 3, num: if num < den { num } else { den }, den }
+        }
+        0 => CurvePos { seg: 0, num: 0, den: 0 },
+        _ => CURVE_POS_FAIL,
     }
-    if stress >= STRESS_HLOCK {
-        return table[0];
-    }
-    let t = [table[0] as u64, table[1] as u64, table[2] as u64, table[3] as u64];
-    let shifted = match p.seg {
-        4 => CurvePos { seg: 4 - stress, num: 0, den: 0 },
-        1..=3 if p.seg > stress => CurvePos { seg: p.seg - stress, num: p.num, den: p.den },
-        _ => CurvePos { seg: 0, num: 0, den: 0 },
-    };
-    // <= t[3] <= u16::MAX (`curve_value` never exceeds the largest table entry)
-    curve_value(shifted, t) as u16
+}
+
+/// `curve_value(curve_pos_lag(curve_pos(d, th), d, th), t)`: the lagging capacity curve.
+pub fn curve_lag_u64(d: u64, thresholds_e6: [u64; 3], t: [u64; 4]) -> u64 {
+    curve_value(curve_pos_lag(curve_pos(d, thresholds_e6), d, thresholds_e6), t)
 }
 
 // ── v2.2 round 3 item 6 (design GAP-6): a volatility input to the leverage target ───────────
@@ -2186,42 +2199,29 @@ pub struct SmoothDials {
 }
 
 /// `smooth_dials` plus the venue-only leverage curve value (the push writer's fall-only upper
-/// bound: `>= l_signal_x100`). Two curve positions (venue, book) serve all four values.
+/// bound: `>= l_signal_x100`). Two leading curve positions (venue, book) serve all four values;
+/// κ / λ_depth read the LAGGING positions derived from them (`curve_pos_lag`, never looser than
+/// the step; extra `log2` only at or past T3).
 pub fn smooth_dials_and_venue_l(
     venue_depth_e6: u64,
     book_depth_e6: u64,
     thresholds_e6: [u64; 3],
     l_table_x100: [u16; 4],
 ) -> (SmoothDials, u16) {
-    let (d, vl, _, _) = smooth_dials_venue_l_and_pos(venue_depth_e6, book_depth_e6, thresholds_e6, l_table_x100);
-    (d, vl)
-}
-
-/// `smooth_dials_and_venue_l` plus the two curve positions it used, for the continuous stress
-/// cap (`stress_cap_curve_x100`): the SIGNAL position (of the smaller depth, `min(venue, book)`;
-/// the curve is monotone in the depth, so the curve there is the min of the two curves) and the
-/// VENUE position (the push writer's fall-only bound). No extra `log2`.
-pub fn smooth_dials_venue_l_and_pos(
-    venue_depth_e6: u64,
-    book_depth_e6: u64,
-    thresholds_e6: [u64; 3],
-    l_table_x100: [u16; 4],
-) -> (SmoothDials, u16, CurvePos, CurvePos) {
     let lt = [l_table_x100[0] as u64, l_table_x100[1] as u64, l_table_x100[2] as u64, l_table_x100[3] as u64];
     let pv = curve_pos(venue_depth_e6, thresholds_e6);
     let pb = curve_pos(book_depth_e6, thresholds_e6);
-    let m2 = |t: [u64; 4]| core::cmp::min(curve_value(pv, t), curve_value(pb, t));
+    let qv = curve_pos_lag(pv, venue_depth_e6, thresholds_e6);
+    let qb = curve_pos_lag(pb, book_depth_e6, thresholds_e6);
+    let m2 = |p: CurvePos, q: CurvePos, t: [u64; 4]| core::cmp::min(curve_value(p, t), curve_value(q, t));
     let venue_l = curve_value(pv, lt);
-    let ps = if venue_depth_e6 <= book_depth_e6 { pv } else { pb };
     (
         SmoothDials {
-            l_signal_x100: m2(lt) as u16,
-            kappa_bps: m2(KAPPA_TABLE_BPS) as u32,
-            lambda_depth_bps: m2(LAMBDA_DEPTH_TABLE_BPS) as u32,
+            l_signal_x100: m2(pv, pb, lt) as u16,
+            kappa_bps: m2(qv, qb, KAPPA_TABLE_BPS) as u32,
+            lambda_depth_bps: m2(qv, qb, LAMBDA_DEPTH_TABLE_BPS) as u32,
         },
         venue_l as u16,
-        ps,
-        pv,
     )
 }
 
@@ -2420,9 +2420,8 @@ pub fn growth_matcher_caps_g8_dials(
 /// the volatility term; it equals `L_table(tier)` at each anchor and lies between the two
 /// neighbouring table values elsewhere, so I-D2 below now reads "never above `L_tier` or
 /// `max(launch, signal)`") and `stress_cap_x100` the
-/// graded stress cap (none / one segment down for a draw / two for real ADL; every program
-/// caller passes the continuous `stress_cap_curve_x100` since 2026-10-19, the stepped
-/// `stress_cap_x100` "one tier down" equals it at each anchor); the h-lock is launch.
+/// graded stress cap (`stress_cap_x100`: none / one tier down for a draw / two for real ADL,
+/// stepped at the discrete tier); the h-lock is launch.
 /// with `tier = min(venue_tier, book_tier)` (the book tier IS the capital term now: absolute LP
 /// book depth vs the per-market thresholds) and `l_table_tier_x100 = L_table(tier)`
 /// (`tier_leverage`). Round 1's doublings term `L_launch + floor(log2(C_m / C_launch))·1x` is
@@ -3040,6 +3039,21 @@ mod tests {
         assert_eq!(curve_u64(24_999, th, KAPPA_TABLE_BPS), 9_999);
         assert_eq!(curve_u64(25_000, th, KAPPA_TABLE_BPS), 10_000);
         assert_eq!(curve_u64(50_000, th, LAMBDA_DEPTH_TABLE_BPS), 15_000);
+        // ...but the PROGRAM's κ / λ_depth LAG (security review M-1): t[0] up to T1, the step
+        // value of the segment below at each anchor, the next value at the next anchor, never
+        // above the step; the top segment is [T3, 4·T3)
+        assert_eq!(curve_lag_u64(24_999, th, KAPPA_TABLE_BPS), 5_000);
+        assert_eq!(curve_lag_u64(25_000, th, KAPPA_TABLE_BPS), 5_000);
+        assert_eq!(curve_lag_u64(50_000, th, KAPPA_TABLE_BPS), 7_500);
+        assert_eq!(curve_lag_u64(100_000, th, KAPPA_TABLE_BPS), 10_000);
+        assert_eq!(curve_lag_u64(500_000, th, KAPPA_TABLE_BPS), 10_000);
+        assert_eq!(curve_lag_u64(1_000_000, th, KAPPA_TABLE_BPS), 15_000);
+        assert_eq!(curve_lag_u64(2_000_000, th, KAPPA_TABLE_BPS), 20_000);
+        assert_eq!(curve_lag_u64(50_000, th, LAMBDA_DEPTH_TABLE_BPS), 10_000);
+        assert_eq!(curve_lag_u64(200_000, th, LAMBDA_DEPTH_TABLE_BPS), 14_306);
+        assert_eq!(curve_lag_u64(u64::MAX, th, LAMBDA_DEPTH_TABLE_BPS), 30_000);
+        // a saturating 4·T3 (T3 > u64::MAX / 4): flat at t[2] past T3, fail closed
+        assert_eq!(curve_lag_u64(u64::MAX - 1, [25_000, 100_000, u64::MAX / 2], KAPPA_TABLE_BPS), 10_000);
         // fail closed: a saturated next anchor is flat at the lower value (never met, D-L1)
         assert_eq!(curve_u64(u64::MAX - 1, [25_000, u64::MAX, u64::MAX], l), 500);
         assert_eq!(curve_u64(u64::MAX, [25_000, u64::MAX, u64::MAX], l), 500);
@@ -3056,10 +3070,10 @@ mod tests {
         assert_eq!(venue_depth_capped(600_000, DEPTH_SOURCE_NONE, th, 3), 0);
         // the dials: min of the two curves; the venue-only value for the fall-only writer
         let (d, vl) = smooth_dials_and_venue_l(110_000, 600_000, th, [500, 500, 1_000, 2_000]);
-        assert_eq!(d, SmoothDials { l_signal_x100: 1_059, kappa_bps: 10_592, lambda_depth_bps: 20_592 });
+        assert_eq!(d, SmoothDials { l_signal_x100: 1_059, kappa_bps: 10_000, lambda_depth_bps: 10_592 });
         assert_eq!(vl, 1_059);
         let (d, vl) = smooth_dials_and_venue_l(600_000, 50_000, th, [500, 500, 1_000, 2_000]);
-        assert_eq!(d, SmoothDials { l_signal_x100: 750, kappa_bps: 10_000, lambda_depth_bps: 15_000 }, "book binds");
+        assert_eq!(d, SmoothDials { l_signal_x100: 750, kappa_bps: 7_500, lambda_depth_bps: 10_000 }, "book binds");
         assert_eq!(vl, 2_000, "venue alone");
         // the step functions are the dials at a tier
         for t in 0..=3u8 {

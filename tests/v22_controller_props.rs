@@ -376,26 +376,32 @@ fn contlev_negative_control_step_table_fails_continuity() {
 fn contlev_ledger_curve_table() {
     let th = gv::tier_thresholds([0; 3], 6);
     let l = u64t(gv::tier_leverage([0; 3], 500, 2_000));
-    let rows: [(u64, u64, u64, u64); 12] = [
+    // κ / λ_depth on the LAGGING capacity curve (security review M-1): never looser than the step
+    let rows: [(u64, u64, u64, u64); 15] = [
         // ($, L x100, κ bps, λ bps)
         (5_000, 500, 5_000, 10_000),
-        (10_000, 500, 6_695, 10_000),
-        (20_000, 500, 9_195, 10_000),
-        (25_000, 500, 10_000, 10_000),
-        (40_000, 669, 10_000, 13_390),
-        (50_000, 750, 10_000, 15_000),
-        (75_000, 896, 10_000, 17_924),
-        (100_000, 1_000, 10_000, 20_000),
-        (200_000, 1_430, 14_306, 24_306),
-        (300_000, 1_682, 16_826, 26_826),
-        (500_000, 2_000, 20_000, 30_000),
-        (1_000_000, 2_000, 20_000, 30_000),
+        (10_000, 500, 5_000, 10_000),
+        (20_000, 500, 5_000, 10_000),
+        (24_999, 500, 5_000, 10_000),
+        (25_000, 500, 5_000, 10_000),
+        (40_000, 669, 6_695, 10_000),
+        (50_000, 750, 7_500, 10_000),
+        (75_000, 896, 8_962, 10_000),
+        (100_000, 1_000, 10_000, 10_000),
+        (200_000, 1_430, 10_000, 14_306),
+        (300_000, 1_682, 10_000, 16_826),
+        (500_000, 2_000, 10_000, 20_000),
+        (1_000_000, 2_000, 15_000, 25_000),
+        (2_000_000, 2_000, 20_000, 30_000),
+        (5_000_000, 2_000, 20_000, 30_000),
     ];
     for (usd, lx, k, lam) in rows {
         let d = usd * USD;
         assert_eq!(gv::curve_u64(d, th, l), lx, "L at ${usd}");
-        assert_eq!(gv::curve_u64(d, th, gv::KAPPA_TABLE_BPS), k, "κ at ${usd}");
-        assert_eq!(gv::curve_u64(d, th, gv::LAMBDA_DEPTH_TABLE_BPS), lam, "λ at ${usd}");
+        assert_eq!(gv::curve_lag_u64(d, th, gv::KAPPA_TABLE_BPS), k, "κ at ${usd}");
+        assert_eq!(gv::curve_lag_u64(d, th, gv::LAMBDA_DEPTH_TABLE_BPS), lam, "λ at ${usd}");
+        let dials = gv::smooth_dials(d, d, th, gv::tier_leverage([0; 3], 500, 2_000));
+        assert_eq!((dials.l_signal_x100 as u64, dials.kappa_bps as u64, dials.lambda_depth_bps as u64), (lx, k, lam), "dials at ${usd}");
     }
 }
 
@@ -425,114 +431,62 @@ fn contlev_graduation_step_is_the_only_jump() {
     }
 }
 
-// ── continuous STRESS cap (2026-10-19, second pass): the draw / real-ADL cap reads the same
-// curve `s` segments down at the same fractional position (`stress_cap_curve_x100`), instead of
-// the stepped `L_table(tier - s)` that jumped at the anchors.
+// ── security review M-1 / M-2 (2026-10-19, Khubair): STRESS stays STEPPED; κ / λ_depth LAG ──
+// M-2: under a draw / real ADL the target is min(curve, stress_cap_x100(s, combined tier)) --
+// base caf062bd's stepped cap. 3198539a's continuous stress cap (copied below verbatim) is the
+// negative control. M-1: κ and λ_depth are continuous but never looser than the round-2 step
+// (`curve_pos_lag`); 3198539a's κ / λ (the leading curve, `curve_u64`) is the negative control.
 
-/// The stepped stress cap (the round-3 reader, now reference only): the NEGATIVE CONTROL.
-fn stepped_stress_cap(s: u8, d: u64, th: [u64; 3], tab: [u16; 4]) -> u64 {
-    gv::stress_cap_x100(s, gv::depth_tier_for(d, th), tab) as u64
-}
-
-fn curve_stress_cap(s: u8, d: u64, th: [u64; 3], tab: [u16; 4]) -> u64 {
-    gv::stress_cap_curve_x100(s, gv::curve_pos(d, th), tab) as u64
-}
-
-/// CONTINUITY UNDER STRESS at fine resolution: for a draw (s = 1) and real ADL (s = 2), no jump
-/// > 1 (x100) between neighbouring depths (relative step 2^-20) on [T1/8, 2·T3] or across any
-/// anchor's atom-adjacent pairs, for every realistic config and table; and the effective
-/// stressed TARGET (graduated, `min(signal, stress cap)`) is continuous above T1 too.
-#[test]
-fn contlev_stress_cap_continuous_at_fine_resolution() {
-    for th in configs() {
-        let anc = gv::curve_anchors(th);
-        for tab in tables() {
-            for s in [gv::STRESS_DRAW, gv::STRESS_ADL] {
-                let f = |d: u64| curve_stress_cap(s, d, th, tab);
-                let (j, at) = max_jump(&f, anc[0] / 2, th[2].saturating_mul(2), 20, &anc);
-                assert!(j <= 1, "stress {s}: jump {j} at depth {at} (th {th:?}, table {tab:?})");
-                let target = |d: u64| {
-                    let dials = gv::smooth_dials(d, d, th, tab);
-                    gv::target_ceiling_x100(true, s, tab[0], tab[3], dials.l_signal_x100, curve_stress_cap(s, d, th, tab) as u16) as u64
-                };
-                let (j, at) = max_jump(&target, th[0], th[2].saturating_mul(2), 20, &th[1..]);
-                assert!(j <= 1, "stress {s}: target jump {j} at depth {at} (th {th:?}, table {tab:?})");
-            }
-        }
+/// 3198539a's continuous stress cap `stress_cap_curve_x100`, VERBATIM (removed from src).
+fn stress_cap_curve_3198539a(stress: u8, p: gv::CurvePos, table: [u16; 4]) -> u16 {
+    if stress == gv::STRESS_NONE {
+        return u16::MAX;
     }
+    if stress >= gv::STRESS_HLOCK {
+        return table[0];
+    }
+    let t = [table[0] as u64, table[1] as u64, table[2] as u64, table[3] as u64];
+    let shifted = match p.seg {
+        4 => gv::CurvePos { seg: 4 - stress, num: 0, den: 0 },
+        1..=3 if p.seg > stress => gv::CurvePos { seg: p.seg - stress, num: p.num, den: p.den },
+        _ => gv::CurvePos { seg: 0, num: 0, den: 0 },
+    };
+    gv::curve_value(shifted, t) as u16
 }
 
-/// NEGATIVE CONTROL for the continuity-under-stress test: the stepped stress cap FAILS it (a
-/// draw jumps 5x at T3 on the default 5x-launch table; real ADL jumps 3x at T3 on the 2x-launch
-/// table), while the continuous cap passes on the same inputs.
+/// The gate's live target on a graduated clamp market at depth `d` (venue = book = d), built as
+/// `growth_ceiling_x100` builds it, with the stress cap `cap(s, d)`.
+fn stressed_target(d: u64, th: [u64; 3], tab: [u16; 4], s: u8, cap: &dyn Fn(u8, u64) -> u16) -> u16 {
+    let tier = gv::combined_tier(gv::depth_tier_for(d, th), gv::depth_tier_for(d, th));
+    let dials = gv::smooth_dials(d, d, th, tab);
+    gv::target_ceiling_x100(gv::graduation_on(true, 64, tier), s, tab[0], tab[3], dials.l_signal_x100, cap(s, d))
+}
+
+/// M-2: a DRAW at $200k / $300k / $400k on the default config (20x market launched at 5x): the
+/// stressed target and the ceiling in force (from a stored 20x, in the same call) are base
+/// caf062bd's stepped 5x, while the unstressed target is the curve (14.30x / 16.82x / 18.61x).
+/// NEGATIVE CONTROL: 3198539a's continuous stress cap gives 7.15x / 8.41x / 9.30x.
 #[test]
-fn contlev_negative_control_stepped_stress_cap_fails_continuity() {
+fn contlev_m2_draw_keeps_the_stepped_stress_cap() {
     let th = gv::tier_thresholds([0; 3], 6);
-    let anc = gv::curve_anchors(th);
-    for (tab, s, jump) in [
-        (gv::tier_leverage([0; 3], 500, 2_000), gv::STRESS_DRAW, 500u64),
-        (gv::tier_leverage([0; 3], 200, 2_000), gv::STRESS_ADL, 300),
-        (gv::tier_leverage([0; 3], 200, 2_000), gv::STRESS_DRAW, 500),
-    ] {
-        let f = |d: u64| stepped_stress_cap(s, d, th, tab);
-        let (j, at) = max_jump(&f, anc[0] / 2, th[2] * 2, 20, &anc);
-        assert_eq!(j, jump, "stepped cap (stress {s}, table {tab:?})");
-        assert!(at >= th[2] && at <= th[2] + (th[2] >> 19), "at T3 ({at})");
-        let g = |d: u64| curve_stress_cap(s, d, th, tab);
-        assert!(max_jump(&g, anc[0] / 2, th[2] * 2, 20, &anc).0 <= 1, "the continuous cap passes");
+    let tab = gv::tier_leverage([0; 3], 500, 2_000);
+    let stepped = |s: u8, d: u64| gv::stress_cap_x100(s, gv::depth_tier_for(d, th), tab);
+    let cont = |s: u8, d: u64| stress_cap_curve_3198539a(s, gv::curve_pos(d, th), tab);
+    for (usd, unstressed, cont_draw) in [(200_000u64, 1_430u16, 715u16), (300_000, 1_682, 841), (400_000, 1_861, 930)] {
+        let d = usd * USD;
+        assert_eq!(stressed_target(d, th, tab, gv::STRESS_NONE, &stepped), unstressed, "unstressed at ${usd}");
+        let t = stressed_target(d, th, tab, gv::STRESS_DRAW, &stepped);
+        assert_eq!(t, 500, "draw at ${usd}: base caf062bd's stepped 5x");
+        assert_eq!(gv::ceiling_in_force_x100(true, 2_000, t, 500, 2_000), 500, "cut at once from a stored 20x");
+        assert_eq!(stressed_target(d, th, tab, gv::STRESS_ADL, &stepped), 500, "ADL at ${usd}");
+        // negative control: 3198539a's continuous cap
+        assert_eq!(stressed_target(d, th, tab, gv::STRESS_DRAW, &cont), cont_draw, "3198539a draw at ${usd}");
+        assert_ne!(cont_draw, 500);
     }
 }
 
-/// The stress-cap table of the ledger (default thresholds, 6 decimals, 20x market launched at 5x
-/// and at 2x): (USD, unstressed curve, draw stepped, draw curve, ADL stepped, ADL curve), x100.
-/// Pinned against an independent Python port of the integer algorithm.
-#[test]
-fn contlev_stress_cap_ledger_table() {
-    let th = gv::tier_thresholds([0; 3], 6);
-    let rows5: [(u64, u64, u64, u64, u64, u64); 12] = [
-        (10_000, 500, 500, 500, 500, 500),
-        (25_000, 500, 500, 500, 500, 500),
-        (40_000, 669, 500, 500, 500, 500),
-        (50_000, 750, 500, 500, 500, 500),
-        (75_000, 896, 500, 500, 500, 500),
-        (100_000, 1_000, 500, 500, 500, 500),
-        (150_000, 1_251, 500, 625, 500, 500),
-        (200_000, 1_430, 500, 715, 500, 500),
-        (300_000, 1_682, 500, 841, 500, 500),
-        (400_000, 1_861, 500, 930, 500, 500),
-        (500_000, 2_000, 1_000, 1_000, 500, 500),
-        (1_000_000, 2_000, 1_000, 1_000, 500, 500),
-    ];
-    let rows2: [(u64, u64, u64, u64, u64, u64); 12] = [
-        (10_000, 301, 200, 200, 200, 200),
-        (25_000, 500, 200, 200, 200, 200),
-        (40_000, 669, 200, 301, 200, 200),
-        (50_000, 750, 200, 350, 200, 200),
-        (75_000, 896, 200, 437, 200, 200),
-        (100_000, 1_000, 500, 500, 200, 200),
-        (150_000, 1_251, 500, 625, 200, 275),
-        (200_000, 1_430, 500, 715, 200, 329),
-        (300_000, 1_682, 500, 841, 200, 404),
-        (400_000, 1_861, 500, 930, 200, 458),
-        (500_000, 2_000, 1_000, 1_000, 500, 500),
-        (1_000_000, 2_000, 1_000, 1_000, 500, 500),
-    ];
-    for (la, rows) in [(500u16, rows5), (200, rows2)] {
-        let tab = gv::tier_leverage([0; 3], la, 2_000);
-        for (usd, l, ds, dc, as_, ac) in rows {
-            let d = usd * USD;
-            assert_eq!(gv::curve_u64(d, th, u64t(tab)), l, "L at ${usd} (launch {la})");
-            assert_eq!(stepped_stress_cap(gv::STRESS_DRAW, d, th, tab), ds, "draw stepped at ${usd} (launch {la})");
-            assert_eq!(curve_stress_cap(gv::STRESS_DRAW, d, th, tab), dc, "draw curve at ${usd} (launch {la})");
-            assert_eq!(stepped_stress_cap(gv::STRESS_ADL, d, th, tab), as_, "ADL stepped at ${usd} (launch {la})");
-            assert_eq!(curve_stress_cap(gv::STRESS_ADL, d, th, tab), ac, "ADL curve at ${usd} (launch {la})");
-        }
-    }
-}
-
-/// STRESSED <= UNSTRESSED at every depth of a fine sweep (relative step 2^-12 over
-/// [T1/16, 4·T3]; below T1/4 every level reads t[0]; depths 1..=64 too)
-/// for every realistic config and table and every stress level, plus the anchors' neighbours.
+/// M-2: the stepped stress cap is never above the unstressed curve (nor the stressed target
+/// above the unstressed one), at every depth of a fine sweep, every config / table / level.
 #[test]
 fn contlev_stressed_never_above_unstressed_sweep() {
     for th in configs() {
@@ -540,13 +494,16 @@ fn contlev_stressed_never_above_unstressed_sweep() {
         for tab in tables() {
             let t = u64t(tab);
             let check = |d: u64| {
-                let p = gv::curve_pos(d, th);
-                let u = gv::curve_value(p, t);
+                let u = gv::curve_u64(d, th, t);
+                let tier = gv::depth_tier_for(d, th);
+                let un = stressed_target(d, th, tab, gv::STRESS_NONE, &|s, _| gv::stress_cap_x100(s, tier, tab));
                 let mut prev = u;
                 for s in [gv::STRESS_DRAW, gv::STRESS_ADL, gv::STRESS_HLOCK] {
-                    let c = gv::stress_cap_curve_x100(s, p, tab) as u64;
+                    let c = gv::stress_cap_x100(s, tier, tab) as u64;
                     assert!(c <= prev, "stress {s} at {d}: {c} > {prev} (th {th:?}, table {tab:?})");
                     prev = c;
+                    let st = stressed_target(d, th, tab, s, &|s, _| gv::stress_cap_x100(s, tier, tab));
+                    assert!(st <= un, "stressed target above unstressed at {d}");
                 }
             };
             for d in 1..=64u64 {
@@ -564,6 +521,140 @@ fn contlev_stressed_never_above_unstressed_sweep() {
             }
         }
     }
+}
+
+fn lag_anchors(th: [u64; 3]) -> [u64; 4] {
+    [th[0], th[1], th[2], th[2].saturating_mul(gv::KAPPA_LAG_TOP_MUL)]
+}
+
+/// M-1: κ and λ_depth NEVER LOOSER than the round-2 step (and than base caf062bd's 25% ramp,
+/// verbatim) at every depth of a fine sweep (relative step 2^-16 over [T1/8, 8·T3] plus every
+/// anchor ±1 atom), every config; and for every realistic leverage table too.
+#[test]
+fn contlev_m1_kappa_lambda_never_looser_than_step() {
+    for th in configs() {
+        let mut tabs = vec![(gv::KAPPA_TABLE_BPS, true), (gv::LAMBDA_DEPTH_TABLE_BPS, true)];
+        tabs.extend(tables().into_iter().map(|t| (u64t(t), false)));
+        for (t, vs_ramp) in tabs {
+            let check = |d: u64| {
+                let v = gv::curve_lag_u64(d, th, t);
+                assert!(v <= step_table(d, th, t), "lag {v} above step {} at {d} (th {th:?}, t {t:?})", step_table(d, th, t));
+                assert!(!vs_ramp || v <= r3_ramp_removed(d, th, t), "lag {v} above base ramp {} at {d} (th {th:?}, t {t:?})", r3_ramp_removed(d, th, t));
+                assert!(v >= t[0]);
+            };
+            let mut d = th[0] / 8;
+            while d < th[2].saturating_mul(8) {
+                check(d);
+                d += core::cmp::max(1, d >> 16);
+            }
+            for a in lag_anchors(th).into_iter().chain(gv::curve_anchors(th)) {
+                for x in [a.saturating_sub(1), a, a.saturating_add(1)] {
+                    check(x);
+                }
+            }
+        }
+    }
+}
+
+/// M-1: the lagging κ / λ are CONTINUOUS (no jump > 1 bps at relative step 2^-20 over
+/// [T1/8, 8·T3], nor across any anchor's atom-adjacent pairs) and take the step value of the
+/// segment BELOW at each anchor: κ = 0.5 / 1 / 1 / 2 and λ = 1x / 1x / 2x / 3x at T1 / T2 / T3 /
+/// 4·T3; κ0 below T1, κ3 from 4·T3; monotone.
+#[test]
+fn contlev_m1_kappa_lambda_continuous_and_anchor_values() {
+    for th in configs() {
+        let la = lag_anchors(th);
+        for t in [gv::KAPPA_TABLE_BPS, gv::LAMBDA_DEPTH_TABLE_BPS] {
+            let f = |d: u64| gv::curve_lag_u64(d, th, t);
+            let (j, at) = max_jump(&f, th[0] / 8, th[2].saturating_mul(8), 20, &la);
+            assert!(j <= 1, "lag jump {j} at {at} (th {th:?}, t {t:?})");
+            assert_eq!(f(th[0] - 1), t[0]);
+            assert_eq!(f(th[0]), t[0], "at T1: the step value below T1");
+            assert_eq!(f(th[1]), t[1], "at T2");
+            assert_eq!(f(th[2]), t[2], "at T3");
+            assert_eq!(f(la[3]), t[3], "at 4·T3");
+            assert_eq!(f(u64::MAX), t[3]);
+            let mut d = 1u64;
+            let mut prev = f(0);
+            while d < th[2].saturating_mul(8) {
+                let v = f(d);
+                assert!(v >= prev, "monotone at {d}");
+                prev = v;
+                d += core::cmp::max(1, d >> 10);
+            }
+        }
+    }
+}
+
+/// M-1: N_cap (the gate / clip / rent capacity, `n_cap_g8_q_dials` on the production dials)
+/// NEVER ABOVE base caf062bd's (its ramp dials, verbatim) nor the round-2 step's
+/// (`n_cap_g8_q(tier)`), with the same C_m, stored λ, cap depth and price, at every venue depth
+/// of a sweep, for several LP sizes (so the book depth binds below, at and above the venue).
+/// This is why λ_depth lags too: with λ on the leading curve the capital term C_m·λ was up to
+/// 1.5x base at $50k when κ·depth did not bind (`contlev_negative_control_3198539a_capacity`).
+#[test]
+fn contlev_m1_n_cap_never_above_base() {
+    let ps = percolator::POS_SCALE;
+    for th in configs() {
+        let tab = gv::tier_leverage([0; 3], 500, 2_000);
+        for c_m_tokens in [1_000u128, 20_000, 150_000, 2_000_000] {
+            let c_m = c_m_tokens * (th[0] as u128) / 25_000; // scale the LP to the config's units
+            for stored in [5_000u32, 10_000, 30_000] {
+                for price in [1_000_000u64, 37_000_000] {
+                    let mut d = th[0] / 8;
+                    while d < th[2].saturating_mul(8) {
+                        let book = gv::book_depth_e6(c_m, stored);
+                        let new = gv::smooth_dials(d, book, th, tab);
+                        let nn = gv::n_cap_g8_q_dials(true, c_m, stored, new.lambda_depth_bps, new.kappa_bps, Some(d), price, ps).unwrap();
+                        let base_k = r3_ramp_removed(d, th, gv::KAPPA_TABLE_BPS).min(r3_ramp_removed(book, th, gv::KAPPA_TABLE_BPS));
+                        let base_l = r3_ramp_removed(d, th, gv::LAMBDA_DEPTH_TABLE_BPS).min(r3_ramp_removed(book, th, gv::LAMBDA_DEPTH_TABLE_BPS));
+                        let nb = gv::n_cap_g8_q_dials(true, c_m, stored, base_l as u32, base_k as u32, Some(d), price, ps).unwrap();
+                        let tier = gv::combined_tier(gv::depth_tier_for(d, th), gv::depth_tier_for(book, th));
+                        let ns = gv::n_cap_g8_q(true, c_m, stored, tier, Some(d), price, ps).unwrap();
+                        assert!(nn <= nb, "N_cap {nn} above base {nb} at venue {d} book {book} (th {th:?}, C_m {c_m}, λ {stored})");
+                        assert!(nn <= ns, "N_cap {nn} above step {ns} at venue {d}");
+                        d += core::cmp::max(1, d >> 8);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// NEGATIVE CONTROLS for M-1: 3198539a's κ / λ (the leading curve `curve_u64`) are LOOSER than
+/// the step: κ 0.9999 at $24,999 (step 0.5), κ 1.4306 at $200k (step 1), λ 1.5x at $50k (step
+/// 1x); and its N_cap exceeds base's: through κ at $20k and through λ (C_m·λ binds) at $50k.
+#[test]
+fn contlev_negative_control_3198539a_capacity() {
+    let th = gv::tier_thresholds([0; 3], 6);
+    let k = gv::KAPPA_TABLE_BPS;
+    let l = gv::LAMBDA_DEPTH_TABLE_BPS;
+    assert_eq!(gv::curve_u64(24_999 * USD, th, k), 9_999);
+    assert_eq!(step_table(24_999 * USD, th, k), 5_000);
+    assert_eq!(gv::curve_u64(200_000 * USD, th, k), 14_306);
+    assert_eq!(gv::curve_u64(50_000 * USD, th, l), 15_000);
+    assert_eq!(step_table(50_000 * USD, th, l), 10_000);
+    // the never-looser sweep of contlev_m1_* FAILS on the leading curve
+    let mut violations = 0;
+    let mut d = th[0] / 8;
+    while d < th[2] * 8 {
+        if gv::curve_u64(d, th, k) > step_table(d, th, k) || gv::curve_u64(d, th, l) > step_table(d, th, l) {
+            violations += 1;
+        }
+        d += core::cmp::max(1, d >> 16);
+    }
+    assert!(violations > 100_000, "{violations}");
+    // N_cap: κ binds (thin pool, big LP) at $20k; λ binds (small LP, stored 3x) at $50k
+    let ps = percolator::POS_SCALE;
+    let price = 1_000_000u64;
+    let n = |d: u64, c_m: u128, kb: u64, lb: u64| gv::n_cap_g8_q_dials(true, c_m, 30_000, lb as u32, kb as u32, Some(d), price, ps).unwrap();
+    let (d, c_m) = (20_000 * USD, 1_000_000 * USD as u128);
+    assert!(n(d, c_m, gv::curve_u64(d, th, k), gv::curve_u64(d, th, l)) > n(d, c_m, r3_ramp_removed(d, th, k), r3_ramp_removed(d, th, l)));
+    let (d, c_m) = (50_000 * USD, 10_000 * USD as u128);
+    assert!(n(d, c_m, gv::curve_u64(d, th, k), gv::curve_u64(d, th, l)) > n(d, c_m, r3_ramp_removed(d, th, k), r3_ramp_removed(d, th, l)));
+    // and the production (lagging) dials are not
+    let s = gv::smooth_dials(d, d, th, gv::tier_leverage([0; 3], 500, 2_000));
+    assert!(n(d, c_m, s.kappa_bps as u64, s.lambda_depth_bps as u64) <= n(d, c_m, r3_ramp_removed(d, th, k), r3_ramp_removed(d, th, l)));
 }
 
 fn arb_th() -> impl Strategy<Value = [u64; 3]> {
@@ -622,8 +713,8 @@ proptest! {
         let t = u64t(tab);
         prop_assert_eq!(d.l_signal_x100 as u64, gv::curve_u64(v, th, t).min(gv::curve_u64(b, th, t)));
         prop_assert_eq!(d.l_signal_x100 as u64, gv::curve_u64(v.min(b), th, t), "min(venue, book) = the smaller depth");
-        prop_assert_eq!(d.kappa_bps as u64, gv::curve_u64(v.min(b), th, gv::KAPPA_TABLE_BPS));
-        prop_assert_eq!(d.lambda_depth_bps as u64, gv::curve_u64(v.min(b), th, gv::LAMBDA_DEPTH_TABLE_BPS));
+        prop_assert_eq!(d.kappa_bps as u64, gv::curve_lag_u64(v.min(b), th, gv::KAPPA_TABLE_BPS));
+        prop_assert_eq!(d.lambda_depth_bps as u64, gv::curve_lag_u64(v.min(b), th, gv::LAMBDA_DEPTH_TABLE_BPS));
         prop_assert_eq!(vl as u64, gv::curve_u64(v, th, t));
         prop_assert!(vl >= d.l_signal_x100);
         prop_assert!(d.l_signal_x100 <= lt && d.l_signal_x100 >= la.min(lt), "within [launch, L_tier]");
@@ -652,44 +743,29 @@ proptest! {
         prop_assert_eq!(gv::venue_depth_capped(eff, gv::DEPTH_SOURCE_NONE, th, m), 0);
     }
 
-    /// The continuous stress cap at full width: stressed <= unstressed curve; monotone
-    /// non-increasing in the stress level and non-decreasing in the depth; inside [stepped cap at
-    /// this tier, stepped cap at the next tier]; EQUAL to the stepped cap at every anchor; none
-    /// at level 0, launch under the h-lock, t[0] on an arithmetic-failure position; the signal
-    /// position of `smooth_dials_venue_l_and_pos` is that of min(venue, book) and the venue
-    /// position that of the venue depth.
+    /// M-1 / M-2 at full width: the lagging κ / λ (any monotone table) are never above the step, never below t[0], monotone, t[i-1] at T_i; the dials equal the lagging
+    /// curve at min(venue, book) and are <= the step dials of the combined tier; the stepped
+    /// stress cap is <= the unstressed curve at the combined tier's smaller depth.
     #[test]
-    fn contlev_stress_cap_props(d in any::<u64>(), e in any::<u64>(), th in arb_th(), la in 100u16..=2_000, lt in 100u16..=10_000, lev in any::<[u16; 3]>()) {
-        let tab = gv::tier_leverage(lev, la.min(lt), lt);
-        let t = u64t(tab);
+    fn contlev_m1_m2_props(d in any::<u64>(), e in any::<u64>(), th in arb_th(), t in arb_table(), la in 100u16..=2_000, lt in 100u16..=10_000, lev in any::<[u16; 3]>()) {
+        let f = |x: u64| gv::curve_lag_u64(x, th, t);
         let (a, b) = if d <= e { (d, e) } else { (e, d) };
-        let (pa, pb) = (gv::curve_pos(a, th), gv::curve_pos(b, th));
-        prop_assert_eq!(gv::stress_cap_curve_x100(gv::STRESS_NONE, pa, tab), u16::MAX);
-        prop_assert_eq!(gv::stress_cap_curve_x100(gv::STRESS_HLOCK, pa, tab), tab[0]);
-        prop_assert_eq!(gv::stress_cap_curve_x100(gv::STRESS_DRAW, gv::CURVE_POS_FAIL, tab), tab[0]);
-        prop_assert_eq!(gv::stress_cap_curve_x100(gv::STRESS_ADL, gv::CURVE_POS_FAIL, tab), tab[0]);
-        let tier = gv::depth_tier_for(a, th);
-        for s in [gv::STRESS_DRAW, gv::STRESS_ADL] {
-            let c = gv::stress_cap_curve_x100(s, pa, tab) as u64;
-            prop_assert!(c <= gv::curve_value(pa, t), "stressed <= unstressed");
-            prop_assert!(c <= gv::stress_cap_curve_x100(s, pb, tab) as u64, "monotone in depth");
-            prop_assert!(c >= gv::stress_cap_x100(s, tier, tab) as u64, "never below the stepped cap");
-            prop_assert!(c <= gv::stress_cap_x100(s, core::cmp::min(tier + 1, 3), tab) as u64, "never above the next tier's stepped cap");
+        prop_assert!(f(a) <= f(b), "monotone");
+        prop_assert!(f(d) <= step_table(d, th, t), "never above the step");
+        prop_assert!(f(d) >= t[0]);
+        prop_assert_eq!(f(th[0]), t[0]);
+        prop_assert_eq!(f(th[1]), t[1]);
+        prop_assert_eq!(f(th[2]), t[2]);
+        let tab = gv::tier_leverage(lev, la.min(lt), lt);
+        let dials = gv::smooth_dials(d, e, th, tab);
+        prop_assert_eq!(dials.kappa_bps as u64, gv::curve_lag_u64(a, th, gv::KAPPA_TABLE_BPS));
+        prop_assert_eq!(dials.lambda_depth_bps as u64, gv::curve_lag_u64(a, th, gv::LAMBDA_DEPTH_TABLE_BPS));
+        let tier = gv::combined_tier(gv::depth_tier_for(d, th), gv::depth_tier_for(e, th));
+        prop_assert!(dials.kappa_bps <= gv::kappa_depth_bps(tier));
+        prop_assert!(dials.lambda_depth_bps <= gv::lambda_depth_bps(tier));
+        for s in [gv::STRESS_DRAW, gv::STRESS_ADL, gv::STRESS_HLOCK] {
+            prop_assert!(gv::stress_cap_x100(s, tier, tab) <= dials.l_signal_x100, "stepped stress cap <= unstressed curve");
         }
-        prop_assert!(gv::stress_cap_curve_x100(gv::STRESS_ADL, pa, tab) <= gv::stress_cap_curve_x100(gv::STRESS_DRAW, pa, tab));
-        let anc = gv::curve_anchors(th);
-        for k in 0..4 {
-            if anc[k] > 0 && (k == 0 || anc[k] > anc[k - 1]) {
-                let p = gv::curve_pos(anc[k], th);
-                let tr = gv::depth_tier_for(anc[k], th);
-                for s in [gv::STRESS_DRAW, gv::STRESS_ADL] {
-                    prop_assert_eq!(gv::stress_cap_curve_x100(s, p, tab), gv::stress_cap_x100(s, tr, tab), "equal to the stepped cap at anchor {}", k);
-                }
-            }
-        }
-        let (_, _, ps, pv) = gv::smooth_dials_venue_l_and_pos(d, e, th, tab);
-        prop_assert_eq!(ps, gv::curve_pos(d.min(e), th));
-        prop_assert_eq!(pv, gv::curve_pos(d, th));
     }
 }
 

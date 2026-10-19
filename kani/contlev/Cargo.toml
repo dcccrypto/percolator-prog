@@ -1,0 +1,25 @@
+[package]
+name = "contlev-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone proofs crate for the v2.2 continuous leverage curve + continuous stress cap
+# (ledger ~/percolator-ops/ledger/v22-continuous-leverage-build-2026-10-19.md §10). It compiles
+# the EXACT production files ../../src/growth_v19.rs and ../../src/vault_lp_v18.rs (no copy), so
+# a Kani run does not codegen the whole program. Not a member of the program's build.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "contlev_exhaustive"
+path = "src/bin/contlev_exhaustive.rs"
+
+[dependencies]
+# the engine sibling (growth_v19 reads percolator::band_rent), same path / features as the program
+percolator = { path = "../../../percolator", features = ["fork-facade"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
