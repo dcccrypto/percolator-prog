@@ -16,6 +16,9 @@ fn main() {
     assert!(cfg!(debug_assertions), "build with CARGO_PROFILE_RELEASE_DEBUG_ASSERTIONS=true");
     let src = include_str!("../../../../src/depth_src_v22.rs");
     assert!(src.contains("pub const DEPTH_MODE_DEX: u8 = 2;"), "the depth_src_v22 shim matches production");
+    let eng = include_str!("../../../../../percolator/src/lib.rs");
+    assert!(eng.contains("pub const POS_SCALE: u128 = 1_000_000;"), "engine-shim POS_SCALE matches the engine");
+    assert!(eng.contains("pub const MAX_ORACLE_PRICE: u64 = 1_000_000_000_000;"), "engine-shim MAX_ORACLE_PRICE matches the engine");
 
     // E1
     let t0 = Instant::now();

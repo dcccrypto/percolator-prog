@@ -137,6 +137,50 @@ fn interp_model(span: u64, num: u32, den: u32) -> u64 {
     r
 }
 
+// ── recording model of `n_cap_q`: any function monotone in (C_m, λ) for the same price and
+// scale, `None` iff the price is 0. It claims no overflow, so it asserts the bounds that make
+// that true (C_m < 2^64, λ < 2^32, scale < 2^32: C_m·λ·scale < 2^128). Lemma:
+// `kani_contlev_n_cap_q_monotone_lemma`.
+const NQ_CAP: usize = 8;
+static mut NQ_N: usize = 0;
+static mut NQ_C: [u128; NQ_CAP] = [0; NQ_CAP];
+static mut NQ_L: [u32; NQ_CAP] = [0; NQ_CAP];
+static mut NQ_P: [u64; NQ_CAP] = [0; NQ_CAP];
+static mut NQ_S: [u128; NQ_CAP] = [0; NQ_CAP];
+static mut NQ_R: [u128; NQ_CAP] = [0; NQ_CAP];
+
+fn n_cap_q_model(c_m: u128, lambda_bps: u32, price_e6: u64, pos_scale: u128) -> Option<u128> {
+    if price_e6 == 0 {
+        return None;
+    }
+    assert!(c_m <= u64::MAX as u128 && pos_scale <= u32::MAX as u128, "n_cap_q model: inside its no-overflow domain");
+    let r: u128 = kani::any();
+    unsafe {
+        let n = NQ_N;
+        assert!(n < NQ_CAP, "n_cap_q model capacity (harness sizing)");
+        let mut j = 0;
+        while j < n {
+            if NQ_P[j] == price_e6 && NQ_S[j] == pos_scale {
+                let (cj, lj, rj) = (NQ_C[j], NQ_L[j], NQ_R[j]);
+                if cj <= c_m && lj <= lambda_bps {
+                    kani::assume(rj <= r);
+                }
+                if cj >= c_m && lj >= lambda_bps {
+                    kani::assume(rj >= r);
+                }
+            }
+            j += 1;
+        }
+        NQ_C[n] = c_m;
+        NQ_L[n] = lambda_bps;
+        NQ_P[n] = price_e6;
+        NQ_S[n] = pos_scale;
+        NQ_R[n] = r;
+        NQ_N = n + 1;
+    }
+    Some(r)
+}
+
 /// Monotone thresholds as the program accepts them (`tier_config_ok`: T1 < T2 < T3), with
 /// T1 >= 4 so anchor 0 = T1/4 is a real (non-zero) anchor. u32 steps: every realistic config
 /// (6- and 9-decimal $ thresholds up to ~$4k-$4M per step on 6 decimals) and well past them;
@@ -222,7 +266,7 @@ fn kani_contlev_interp_facts() {
     let n2: u8 = kani::any();
     let d: u8 = kani::any();
     kani::assume(d >= 1 && n1 <= d && n2 <= d);
-    let (s1w, s2w, n1w, n2w, dw) = (s1 as u64, s2 as u64, n1 as u64, n2 as u64, d as u64);
+    let (s1w, s2w, n1w, dw) = (s1 as u64, s2 as u64, n1 as u64, d as u64);
     let a = curve_interp(s1w, n1 as u32, d as u32);
     assert!(a * dw <= s1w * n1w && s1w * n1w < (a + 1) * dw, "exact floor");
     assert!(a <= s1w);
@@ -261,7 +305,7 @@ fn kani_contlev_interp_facts() {
 #[kani::proof]
 #[kani::stub(crate::growth_v19::log2_q16, log2_model)]
 #[kani::stub(crate::growth_v19::curve_interp, interp_model)]
-#[kani::unwind(41)]
+#[kani::unwind(8)]
 fn kani_contlev_curve_anchors_and_bounds() {
     let th = any_thresholds();
     let tab = any_table();
@@ -311,8 +355,8 @@ fn kani_contlev_curve_anchors_and_bounds() {
 /// of `smooth_dials_and_venue_l`: L = the leverage curve at the smaller depth (venue <= book
 /// here), κ / λ_depth = the LAGGING curve there (`curve_pos_lag`), the venue-only value = the
 /// venue curve (>= the signal); symmetric in (venue, book).
-/// Mutants: `max` for `min` in `m2`: the equalities; venue_l from the book position: the
-/// symmetric call; κ read from the leading position (3198539a): the κ equality (and H7).
+/// Mutants: `max` for `min` in `m2`: the equalities; venue_l from the book position:
+/// `vl == vd`; κ read from the leading position (3198539a): the κ equality (and H7).
 #[kani::proof]
 #[kani::stub(crate::growth_v19::log2_q16, log2_model)]
 #[kani::stub(crate::growth_v19::curve_interp, interp_model)]
@@ -357,13 +401,14 @@ fn kani_contlev_curve_monotone_and_min() {
 /// The program wiring (the gate's ctx at the combined tier, the push writer at the venue tier)
 /// lives in v16_program.rs, outside this crate: the LiteSVM test
 /// `contlev_m2_draw_at_200k_300k_400k_stores_the_stepped_5x` pins it (and fails on 3198539a).
-/// Mutants: `stress_cap_x100` reading `tier - s + 1`: "never above" / "= base's stepped
-/// formula"; the h-lock floor dropped in `target_ceiling_x100`: the level-3 assert; the curve
-/// `>= L_table(tier)` broken (e.g. the leverage curve lagging like κ): the first assert.
+/// Mutants: `stress_cap_x100` reading `tier - s + 1`: "= base's stepped formula" (and "never
+/// above" at tier 0); the h-lock early return dropped in `target_ceiling_x100`: the h-lock call
+/// with no cap (`u16::MAX`) must still read launch; the curve `>= L_table(tier)` broken (e.g.
+/// the leverage curve lagging like κ): the first assert.
 #[kani::proof]
 #[kani::stub(crate::growth_v19::log2_q16, log2_model)]
 #[kani::stub(crate::growth_v19::curve_interp, interp_model)]
-#[kani::unwind(41)]
+#[kani::unwind(13)]
 fn kani_contlev_stress_cap_stepped_under_curve() {
     let th = any_thresholds();
     let tab = any_table();
@@ -390,7 +435,11 @@ fn kani_contlev_stress_cap_stepped_under_curve() {
         let stepped = tab[tier.saturating_sub(st) as usize];
         let want = if st == STRESS_NONE { sig } else { core::cmp::min(sig, stepped) };
         assert_eq!(t, core::cmp::min(core::cmp::max(launch, want), lt), "= base caf062bd's stepped formula");
+        if st == STRESS_DRAW || st == STRESS_ADL {
+            assert_eq!(t, core::cmp::min(core::cmp::max(launch, stepped), lt), "under stress the target does not depend on the curve");
+        }
     }
+    assert_eq!(target_ceiling_x100(grad, STRESS_HLOCK, launch, lt, sig, u16::MAX), launch, "h-lock: launch whatever the cap");
     let stored: u16 = kani::any();
     let f = ceiling_in_force_x100(true, stored, t, launch, lt);
     assert!(f <= t, "applied at once (in force <= target)");
@@ -415,11 +464,22 @@ fn kani_contlev_stress_cap_stepped_under_curve() {
 #[kani::proof]
 #[kani::stub(crate::growth_v19::log2_q16, log2_model)]
 #[kani::stub(crate::growth_v19::curve_interp, interp_model)]
-#[kani::unwind(41)]
+#[kani::unwind(13)]
 fn kani_contlev_kappa_lambda_lag_never_looser() {
     let th0 = any_thresholds();
-    let sat: bool = kani::any();
-    let th = if sat { [th0[0], th0[1], u64::MAX] } else { th0 };
+    // mode 0: realistic; 1: saturated T3; 2: saturated T2 and T3; 3: a T3 so large that 4·T3
+    // saturates (the top segment is flat at t[2], fail closed)
+    let mode: u8 = kani::any();
+    kani::assume(mode <= 3);
+    let big: u64 = kani::any();
+    kani::assume(big > u64::MAX / KAPPA_LAG_TOP_MUL && big < u64::MAX);
+    let th = match mode {
+        0 => th0,
+        1 => [th0[0], th0[1], u64::MAX],
+        2 => [th0[0], u64::MAX, u64::MAX],
+        _ => [th0[0], th0[1], big],
+    };
+    let sat = mode == 1 || mode == 2;
     let tab = any_table();
     let t = u64t(tab);
     let d: u64 = kani::any();
@@ -440,17 +500,20 @@ fn kani_contlev_kappa_lambda_lag_never_looser() {
     if d == th[0] {
         assert_eq!(v, t[0], "at T1: t0");
     }
-    if d == th[1] {
+    if mode != 2 && d == th[1] {
         assert_eq!(v, t[1], "at T2: t1");
     }
     if !sat && d == th[2] {
         assert_eq!(v, t[2], "at T3: t2");
     }
-    if sat {
-        assert!(v <= t[2], "saturated T3: never past t2");
+    if sat || mode == 3 {
+        assert!(v <= t[2], "saturated T3 / 4·T3: never past t2");
     }
-    let top = th0[2] * KAPPA_LAG_TOP_MUL; // th0 < 2^35: no overflow
-    if !sat && d >= top {
+    if mode == 2 {
+        assert!(v <= t[1], "saturated T2: never past t1");
+    }
+    let top = th0[2] * KAPPA_LAG_TOP_MUL; // th0[2] < 3·2^32: no overflow
+    if mode == 0 && d >= top {
         assert_eq!(v, t[3], "from 4·T3: t3");
     }
     if q.seg >= 1 && q.seg <= 3 && q.den > 0 && q.num == q.den {
@@ -459,8 +522,10 @@ fn kani_contlev_kappa_lambda_lag_never_looser() {
     let ve = curve_value(curve_pos_lag(curve_pos(e, th), e, th), t);
     assert!(v <= ve, "monotone");
     kani::cover!(q.seg == 1 && v > t[0] && v < t[1], "strictly inside [T1, T2)");
-    kani::cover!(q.seg == 3 && v > t[2] && v < t[3] && !sat, "strictly inside [T3, 4·T3)");
-    kani::cover!(!sat && d >= top && t[2] < t[3], "past 4·T3");
+    kani::cover!(q.seg == 3 && v > t[2] && v < t[3] && mode == 0, "strictly inside [T3, 4·T3)");
+    kani::cover!(mode == 0 && d >= top && t[2] < t[3], "past 4·T3");
+    kani::cover!(mode == 3 && p.seg == 4 && q.seg == 3 && q.den == 0, "4·T3 saturates: flat top segment");
+    kani::cover!(mode == 2 && d >= th[0] && v == t[0] && t[0] < t[1], "saturated T2: flat at t0 from T1");
     kani::cover!(tier == 3 && v < t[3], "past T3 but below the step (lagging)");
     kani::cover!(q.seg == 2 && q.den > 0 && q.num == q.den && t[1] < t[2], "top of [T2, T3), below T3");
     kani::cover!(sat && p.seg == 3 && q.seg == 2, "saturated T3");
@@ -469,45 +534,85 @@ fn kani_contlev_kappa_lambda_lag_never_looser() {
     kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
 }
 
-/// H8 (security review M-1). `N_cap` is MONOTONE in the dials it reads: with `λ1 <= λ2` and
-/// `κ1 <= κ2`, `n_cap_g8_q_dials(.., λ1, κ1, ..) <= n_cap_g8_q_dials(.., λ2, κ2, ..)` (same C_m,
-/// stored λ, cap depth, price, scale); and the step reader `n_cap_g8_q(tier)` IS
-/// `n_cap_g8_q_dials` at the step dials. With H7 (lagging κ <= κ_step, λ <= λ_step at the
-/// smaller depth, so <= the step dials of the combined tier) this gives N_cap_new <= N_cap_step,
-/// and the native sweep `contlev_m1_n_cap_never_above_base` checks N_cap_new <= base caf062bd's.
-/// Production functions at small operands (C_m, cap depth, price, scale u8; λ, κ u16): the
-/// monotonicity of `floor(x * b / d)` in `x` is width-independent; overflow needs C_m·λ·scale
-/// >= 2^128, unreachable for SPL amounts. `--solver z3` (u128 products / divides).
-/// Mutants: κ divided instead of multiplied in `depth_cap_q_kappa`: monotone FAILS; `max` for
-/// `min` between the two capacity terms: still monotone (not this harness's job: the gate tests).
+/// H8a (security review M-1). The step reader `n_cap_g8_q(tier)` IS `n_cap_g8_q_dials` at the
+/// step dials `(lambda_depth_bps(tier), kappa_depth_bps(tier))`, at full u128 width (same terms
+/// on both sides: run with `--solver z3`, which collapses them).
+/// Mutant: `n_cap_g8_q` passing κ and λ swapped: FAILS.
 #[kani::proof]
+fn kani_contlev_n_cap_step_identity() {
+    let c_m: u128 = kani::any();
+    let stored: u32 = kani::any();
+    let cap: Option<u64> = kani::any();
+    let price: u64 = kani::any();
+    let ps: u128 = kani::any();
+    let tier: u8 = kani::any();
+    kani::assume(tier <= MAX_TIER);
+    let a = n_cap_g8_q(true, c_m, stored, tier, cap, price, ps);
+    let b = n_cap_g8_q_dials(true, c_m, stored, lambda_depth_bps(tier), kappa_depth_bps(tier), cap, price, ps);
+    assert_eq!(a, b, "the step reader is the dials reader at the step dials");
+    kani::cover!(a.is_some_and(|x| x > 0) && tier == 3, "positive capacity at tier 3");
+    kani::cover!(a.is_none(), "fail closed (zero price / overflow)");
+}
+
+/// H8b (security review M-1). `N_cap` is MONOTONE in the dials it reads: with `λ1 <= λ2` and
+/// `κ1 <= κ2`, `n_cap_g8_q_dials(.., λ1, κ1, ..) <= n_cap_g8_q_dials(.., λ2, κ2, ..)` (same C_m,
+/// stored λ, cap depth, price, scale). `n_cap_q` is replaced by its
+/// recording model (monotone in (C_m, λ) for the same price / scale: the lemma H8c); what is
+/// left is `min`, the `κ·depth / 1e4` product (monotone in κ for the same depth) and
+/// `unwrap_or(0)` (cap depth u8, κ u16 <= 2x: the monotonicity of `floor(d·κ / 1e4)` in κ is
+/// width-independent; C_m <= 2^64 and scale <= 2^32 keep the model's no-overflow claim true:
+/// C_m·λ·scale < 2^128, asserted in the model). With H7 (lagging κ <= κ_step and λ <= λ_step at the smaller depth, hence <=
+/// the step dials of the combined tier) and H8a this gives N_cap_new <= N_cap_step; the native
+/// sweep `contlev_m1_n_cap_never_above_base` checks N_cap_new <= base caf062bd's too.
+/// Mutants: κ divided instead of multiplied in `depth_cap_q_kappa`: FAILS; `max` for the inner
+/// `min(stored λ, λ_depth)`: still monotone (the gate tests own it).
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_q, n_cap_q_model)]
+#[kani::unwind(5)]
 fn kani_contlev_n_cap_monotone_in_dials() {
-    let c_m: u8 = kani::any();
-    let stored: u16 = kani::any();
-    let l1: u16 = kani::any();
-    let l2: u16 = kani::any();
+    let c_m: u64 = kani::any();
+    let stored: u32 = kani::any();
+    let l1: u32 = kani::any();
+    let l2: u32 = kani::any();
     let k1: u16 = kani::any();
     let k2: u16 = kani::any();
-    kani::assume(l1 <= l2 && k1 <= k2);
+    kani::assume(l1 <= l2 && k1 <= k2 && k2 <= 20_000);
     let cap: Option<u8> = kani::any();
-    let price: u8 = kani::any();
-    let ps: u8 = kani::any();
-    kani::assume(price >= 1 && ps >= 1);
-    let n = |l: u16, k: u16| {
-        n_cap_g8_q_dials(true, c_m as u128, stored as u32, l as u32, k as u32, cap.map(|x| x as u64), price as u64, ps as u128)
+    let price: u64 = kani::any();
+    let ps: u32 = kani::any();
+    let n = |l: u32, k: u16| {
+        n_cap_g8_q_dials(true, c_m as u128, stored, l, k as u32, cap.map(|x| x as u64), price, ps as u128)
     };
     let a = n(l1, k1);
     let b = n(l2, k2);
-    assert!(a.is_some() && b.is_some(), "no overflow at these widths");
-    assert!(a.unwrap() <= b.unwrap(), "N_cap monotone in (λ_depth, κ)");
-    let tier: u8 = kani::any();
-    kani::assume(tier <= MAX_TIER);
-    assert_eq!(
-        n_cap_g8_q(true, c_m as u128, stored as u32, tier, cap.map(|x| x as u64), price as u64, ps as u128),
-        n(lambda_depth_bps(tier) as u16, kappa_depth_bps(tier) as u16),
-        "the step reader is the dials reader at the step dials"
-    );
-    kani::cover!(a.unwrap() < b.unwrap() && l1 == l2, "strictly larger through κ alone");
-    kani::cover!(a.unwrap() < b.unwrap() && k1 == k2, "strictly larger through λ alone");
-    kani::cover!(cap.is_some() && a.unwrap() > 0, "a depth cap in force, positive capacity");
+    assert_eq!(a.is_none(), price == 0, "None only on a zero price (model: no overflow)");
+    assert_eq!(b.is_none(), price == 0);
+    if let (Some(x), Some(y)) = (a, b) {
+        assert!(x <= y, "N_cap monotone in (λ_depth, κ)");
+    }
+    kani::cover!(a.is_some() && a < b && l1 == l2, "strictly larger through κ alone");
+    kani::cover!(a.is_some() && a < b && k1 == k2, "strictly larger through λ alone");
+    kani::cover!(cap.is_some() && a.is_some_and(|x| x > 0), "a depth cap in force, positive capacity");
+}
+
+/// H8c (lemma for H8b's model). `n_cap_q` is monotone in (C_m, λ) for the same price and scale
+/// (production function, u8 operands: `floor(c·λ·s / (1e4·p))` is monotone in `c·λ` at any
+/// width; the width only decides overflow, which needs C_m·λ·scale >= 2^128, unreachable for
+/// SPL amounts). `--solver z3`.
+/// Mutant: `checked_mul` of C_m by the price instead of λ: FAILS.
+#[kani::proof]
+fn kani_contlev_n_cap_q_monotone_lemma() {
+    let c1: u8 = kani::any();
+    let c2: u8 = kani::any();
+    let l1: u8 = kani::any();
+    let l2: u8 = kani::any();
+    kani::assume(c1 <= c2 && l1 <= l2);
+    let price: u8 = kani::any();
+    let ps: u8 = kani::any();
+    kani::assume(price >= 1);
+    let a = n_cap_q(c1 as u128, l1 as u32, price as u64, ps as u128).unwrap();
+    let b = n_cap_q(c2 as u128, l2 as u32, price as u64, ps as u128).unwrap();
+    assert!(a <= b, "monotone in (C_m, λ)");
+    assert!(n_cap_q(c1 as u128, l1 as u32, 0, ps as u128).is_none(), "zero price: None");
+    kani::cover!(a < b && a > 0, "strictly increasing, positive");
 }

@@ -18,8 +18,9 @@ name = "contlev_exhaustive"
 path = "src/bin/contlev_exhaustive.rs"
 
 [dependencies]
-# the engine sibling (growth_v19 reads percolator::band_rent), same path / features as the program
-percolator = { path = "../../../percolator", features = ["fork-facade"] }
+# growth_v19 reads percolator::band_rent: the engine's real band_rent.rs / wide_math.rs through
+# engine-shim (see its Cargo.toml for why not the engine crate itself).
+percolator = { path = "engine-shim" }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

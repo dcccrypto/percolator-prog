@@ -1,0 +1,16 @@
+[package]
+# Stands in for the engine crate `percolator` in the contlev proofs crate: the engine at
+# 23f609b3 does not compile under cfg(kani) (E0428: `kani_funding_index_deltas` is defined
+# twice in src/v16.rs, pre-existing). growth_v19 reads only `percolator::band_rent`, so this
+# crate compiles the engine's REAL src/band_rent.rs and src/wide_math.rs verbatim plus the two
+# constants band_rent reads (checked against the engine's lib.rs by contlev_exhaustive).
+name = "percolator"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "allow" }

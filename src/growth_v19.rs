@@ -2188,9 +2188,9 @@ pub fn venue_depth_capped(effective_depth_e6: u64, depth_source_byte: u8, thresh
 }
 
 /// The growth dials of one market at a (venue, book) depth pair: the leverage signal
-/// `min(curve_L(venue), curve_L(book))` (x100), and κ / λ_depth as the same min of curves
-/// (continuous leverage: log-interpolated between the anchors, equal to the tier table at each
-/// anchor, so looser than the round-2 step between anchors by design).
+/// `min(curve_L(venue), curve_L(book))` (x100; log-interpolated, equal to the table at each
+/// anchor, looser than the step between anchors by design), and κ / λ_depth as the same min of
+/// the LAGGING curves (`curve_pos_lag`: continuous, never looser than the step, review M-1).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SmoothDials {
     pub l_signal_x100: u16,
