@@ -726,7 +726,7 @@ mod p3 {
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             ];
-            self.send(ProgInstruction::RequestRedeemLpShares { shares }, metas, &[who])
+            self.send(ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 }, metas, &[who])
         }
 
         pub fn execute_redeem(&mut self, who: &Keypair) -> (Pubkey, Result<u64, String>) {

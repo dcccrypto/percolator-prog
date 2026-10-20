@@ -569,7 +569,7 @@ fn request(env: &mut Env, v: &Vault, shares: u128) {
         &mut env.svm,
         env.program_id,
         &payer,
-        ProgInstruction::RequestRedeemLpShares { shares },
+        ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(v.registry, false),

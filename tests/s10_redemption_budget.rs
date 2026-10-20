@@ -382,7 +382,7 @@ impl Replay {
         let red = self.redemption_pda(&who.pubkey());
         self.env.svm.expire_blockhash();
         let ix = match ext {
-            None => ProgInstruction::RequestRedeemLpShares { shares },
+            None => ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             Some((min_payout_atoms, keeper_ok)) => ProgInstruction::RequestRedeemLpSharesV22 {
                 shares,
                 min_payout_atoms,

@@ -558,7 +558,7 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
         pid,
         &payer,
         vec![(
-            ProgInstruction::RequestRedeemLpShares { shares: lp_amount },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares: lp_amount, min_payout_atoms: 1, keeper_ok: 0 },
             accts,
         )],
         &[&kp],
