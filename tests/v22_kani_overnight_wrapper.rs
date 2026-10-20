@@ -169,35 +169,23 @@ fn kani_v22_wc7_split_a_lock_any_capacity() {
 // ═══════════════════════════════════ W-C-8a (fee waterfall) ══════════════════════════════════════════
 
 /// Replaces W-C-8a `kani_v22_wc8a_fee_waterfall3_conserves_and_orders` (NO-VERDICT 1800 s).
-/// STUB-MODEL `bond_coupon_split` (CONDITIONAL on W-C-12 PASS, u64 domain) + STUB-MEMO `bps_floor`,
-/// `bps_ceil`. Composition: `fee_waterfall3` is the real composition (coupon split, then the real
-/// `cushion_split`); the only arithmetic left symbolic is `bps_floor`/`bps_ceil`, and the original
-/// assertions use them only through (i) their None-condition (kept exact) and (ii) "the cushion is at most
-/// `bps_floor(avail - cp, share)`", which compares two calls with the SAME arguments (memo-consistent =
-/// determinism). WIDER than the original: u64 amounts (original u32).
+/// weak-1020 D5 (row: "stubs bond_coupon_split; mutant MP8 survived"): the `bond_coupon_split` STUB-MODEL is
+/// GONE: the REAL `fee_waterfall3` runs the REAL `bond_coupon_split` and the REAL `cushion_split`; only the two
+/// bps primitives are replaced: `bps_floor` by `bps_floor_model` (exact at the coupon constant: L1; memo + range
+/// elsewhere: L2) and `bps_ceil` by its memo stub (determinism only). Amounts lifted to FULL u128.
+/// CONDITIONAL on `kani_weak_bps_floor_half_exact_u128` (L1) and `kani_weak_bps_floor_range_u128` (L2).
 #[kani::proof]
-#[kani::stub(percolator_prog::bond_v20::bond_coupon_split, bond_coupon_split_model)]
-#[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_memo)]
+#[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_model)]
 #[kani::stub(percolator_prog::vault_lp_v18::bps_ceil, bps_ceil_memo)]
 fn kani_v22_wc8a_split_a_waterfall_structure() {
-    let avail = kani::any::<u64>() as u128;
-    let due = kani::any::<u64>() as u128;
+    let avail: u128 = kani::any();
+    let due: u128 = kani::any();
     let share: u16 = kani::any();
     let target: u16 = kani::any();
-    let c_eff = kani::any::<u64>() as u128;
-    let level = kani::any::<u64>() as u128;
+    let c_eff: u128 = kani::any();
+    let level: u128 = kani::any();
     kani::assume(share <= 10_000 && target <= 10_000); // the original's assume (config bounds)
-    let r = fee_waterfall3(avail, due, share, target, c_eff, level);
-    let (cp, cu, se) = r.unwrap();
-    assert_eq!(cp + cu + se, avail, "conservation");
-    assert_eq!(cp, min2(due, avail / 2), "coupon = min(due, half the leg)");
-    assert!(cu <= bps_floor(avail - cp, share).unwrap(), "cushion only sees the rest");
-    if share == 0 || target == 0 {
-        assert_eq!(cu, 0);
-    }
-    kani::cover!(due > 0 && cp == due && cp < avail / 2, "coupon below the leg cap");
-    kani::cover!(cp == avail / 2 && due > cp, "leg cap binds (thin leg)");
-    kani::cover!(cp > 0 && cu > 0, "cushion engaged after the coupon");
+    wc8a_body(avail, due, share, target, c_eff, level);
 }
 
 /// Lemma for the bps_floor memo stub's range fact: the REAL `bps_floor(x, bps) <= x` and is `Some` for
@@ -233,11 +221,9 @@ fn kani_v22_bps_floor_range_lemma_u32() {
     kani::cover!(bps < 10_000 && r.is_some_and(|v| v < x), "partial share");
 }
 
-/// W-C-8a split (a) on the ORIGINAL u32 domain (CONDITIONAL on `kani_v22_bps_floor_range_lemma_u32` and
-/// W-C-12); otherwise identical to `kani_v22_wc8a_split_a_waterfall_structure`.
+/// W-C-8a on the ORIGINAL u32 domain; weak-1020 D5: same design as the u128 row (real `bond_coupon_split`).
 #[kani::proof]
-#[kani::stub(percolator_prog::bond_v20::bond_coupon_split, bond_coupon_split_model)]
-#[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_memo)]
+#[kani::stub(percolator_prog::vault_lp_v18::bps_floor, bps_floor_model)]
 #[kani::stub(percolator_prog::vault_lp_v18::bps_ceil, bps_ceil_memo)]
 fn kani_v22_wc8a_split_a_waterfall_structure_u32() {
     let avail = kani::any::<u32>() as u128;
@@ -247,16 +233,7 @@ fn kani_v22_wc8a_split_a_waterfall_structure_u32() {
     let c_eff = kani::any::<u32>() as u128;
     let level = kani::any::<u32>() as u128;
     kani::assume(share <= 10_000 && target <= 10_000); // the original's assume
-    let (cp, cu, se) = fee_waterfall3(avail, due, share, target, c_eff, level).unwrap();
-    assert_eq!(cp + cu + se, avail, "conservation");
-    assert_eq!(cp, min2(due, avail / 2), "coupon = min(due, half the leg)");
-    assert!(cu <= bps_floor(avail - cp, share).unwrap(), "cushion only sees the rest");
-    if share == 0 || target == 0 {
-        assert_eq!(cu, 0);
-    }
-    kani::cover!(due > 0 && cp == due && cp < avail / 2, "coupon below the leg cap");
-    kani::cover!(cp == avail / 2 && due > cp, "leg cap binds (thin leg)");
-    kani::cover!(cp > 0 && cu > 0, "cushion engaged after the coupon");
+    wc8a_body(avail, due, share, target, c_eff, level);
 }
 
 // ═══════════════════════════════════ W-C-9 (junior gates exclude bonds) ══════════════════════════════
@@ -912,4 +889,63 @@ fn negctrl_wc5_ceil_mint_dilutes() {
     kani::assume(amount > 0 && b > 0 && value > 0);
     kani::assume(m * value < amount * b + value); // MUTANT: ceil instead of floor
     assert!((value + amount) * b >= value * (b + m));
+}
+
+
+/// weak-1020 D5: model stub for `vault_lp_v18::bps_floor`, EXACT for the one constant the coupon uses
+/// (BOND_COUPON_MAX_LEG_BPS = 5000: floor(x * 5000 / 1e4) == x / 2, lemma L1) and memo-any with the range fact
+/// `v <= x` elsewhere (lemma L2), same None-condition as production. CONDITIONAL on L1 + L2 (below, full u128).
+fn bps_floor_model(x: u128, bps: u16) -> Option<u128> {
+    if bps as u128 > 10_000 {
+        return None;
+    }
+    if bps == BOND_COUPON_MAX_LEG_BPS {
+        return Some(x / 2);
+    }
+    bps_floor_memo(x, bps)
+}
+
+fn wc8a_body(avail: u128, due: u128, share: u16, target: u16, c_eff: u128, level: u128) {
+    let r = fee_waterfall3(avail, due, share, target, c_eff, level);
+    let (cp, cu, se) = r.unwrap();
+    assert_eq!(cp.checked_add(cu).and_then(|x| x.checked_add(se)), Some(avail), "conservation");
+    assert_eq!(cp, min2(due, avail / 2), "coupon = min(due, half the leg)");
+    assert!(cu <= bps_floor(avail - cp, share).unwrap(), "cushion only sees the rest");
+    if share == 0 || target == 0 {
+        assert_eq!(cu, 0);
+    }
+    kani::cover!(due > 0 && cp == due && cp < avail / 2, "coupon below the leg cap");
+    kani::cover!(cp == avail / 2 && due > cp, "leg cap binds (thin leg)");
+    kani::cover!(cp > 0 && cu > 0, "cushion engaged after the coupon");
+}
+
+/// weak-1020 D5 lemma L1: the REAL `bps_floor(x, BOND_COUPON_MAX_LEG_BPS)` is exactly `x / 2` for EVERY u128 x
+/// (the coupon leg cap). z3 (two 128-bit divisions by the constant 1e4).
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_weak_bps_floor_half_exact_u128() {
+    let x: u128 = kani::any();
+    assert_eq!(BOND_COUPON_MAX_LEG_BPS, 5_000);
+    let r = bps_floor(x, BOND_COUPON_MAX_LEG_BPS);
+    assert_eq!(r, Some(x / 2), "floor(x * 5000 / 1e4) == x / 2");
+    kani::cover!(x % 2 == 1 && x > u64::MAX as u128, "odd, above u64");
+    kani::cover!(x % 10_000 != 0 && x % 2 == 0, "remainder path, even");
+}
+
+/// weak-1020 D5 lemma L2: the REAL `bps_floor(x, b)` is Some and <= x for EVERY u128 x and b <= 10_000, None
+/// for b > 10_000 (the range fact of the memo stub, previously proven only for u64 / u32 x). z3.
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_weak_bps_floor_range_u128() {
+    let x: u128 = kani::any();
+    let bps: u16 = kani::any();
+    let r = bps_floor(x, bps);
+    if bps as u128 > 10_000 {
+        assert!(r.is_none());
+    } else {
+        assert!(r.unwrap() <= x);
+    }
+    kani::cover!(bps == 10_000 && r == Some(x) && x > u64::MAX as u128, "full share above u64");
+    kani::cover!(bps < 10_000 && r.is_some_and(|v| v < x), "partial share");
+    kani::cover!(bps > 10_000, "out-of-range bps refused");
 }

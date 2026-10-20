@@ -9,29 +9,16 @@ use percolator_prog::matcher_abi::{
 use percolator_prog::policy_v16;
 
 #[kani::proof]
+#[kani::solver(z3)]
 fn kani_v16_premium_funding_rate_is_clamped_and_signed() {
-    let mark_raw: u16 = kani::any();
-    let index_raw: u16 = kani::any();
-    let cap_raw: u16 = kani::any();
-    let mark = mark_raw as u64 + 1;
-    let index = index_raw as u64 + 1;
-    let cap = cap_raw as u64;
-
-    let rate = policy_v16::premium_funding_rate_e9(mark, index, cap).unwrap();
-    let abs_rate = if rate < 0 {
-        (-rate) as u128
-    } else {
-        rate as u128
-    };
-    assert!(abs_rate <= cap as u128);
-
-    if cap == 0 || mark == index {
-        assert_eq!(rate, 0);
-    } else if mark > index {
-        assert!(rate > 0);
-    } else {
-        assert!(rate < 0);
-    }
+    // weak-1020 D3: FULL u64 width (was u16+1), 0 allowed. Properties stated without the code's own shape:
+    // never None; |rate| <= cap; 0 when cap/mark/index is 0 or mark == index; weak sign (strict sign is FALSE at
+    // production width: a premium below 1e-9 of the index floors to 0, see the cover); magnitude = floor premium,
+    // clamped by cap, stated without division.
+    let mark: u64 = kani::any();
+    let index: u64 = kani::any();
+    let cap: u64 = kani::any();
+    premium_rate_spec(mark, index, cap);
 }
 
 #[kani::proof]
@@ -172,101 +159,76 @@ fn kani_v16_amount_instructions_decode_preserves_wire_fields() {
     kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
-/// TB-1b (ADOPT upstream cf0ce5d3/0492ebbc): Deposit/Withdraw now carry a
-/// leading `portfolio_id`/`expected_sequence` binding. Symbolic over every
-/// field via the `Instruction` encode/decode API (not a hand-built byte
-/// buffer), so this also proves the wire OFFSET/ORDER the encoder actually
-/// produces, not just an offset this proof assumes.
 #[kani::proof]
 fn kani_v16_deposit_withdraw_decode_preserves_wire_fields() {
+    // weak-1020 D1: spec layout (tag 3/4: portfolio_id u64 @1, expected_sequence u64 @9, amount u128 @17; 33 B),
+    // built WITHOUT encode(); encode() must reproduce it; exact length both ways.
     let portfolio_id: u64 = kani::any();
     let expected_sequence: u64 = kani::any();
     let amount: u128 = kani::any();
-
-    let deposit = Instruction::Deposit {
-        portfolio_id,
-        expected_sequence,
-        amount,
-    }
-    .encode();
-    match Instruction::decode(&deposit).unwrap() {
-        Instruction::Deposit {
-            portfolio_id: got_id,
-            expected_sequence: got_seq,
-            amount: got_amount,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_seq, expected_sequence);
-            assert_eq!(got_amount, amount);
+    let extra: u8 = kani::any();
+    for tag in [3u8, 4u8] {
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&expected_sequence.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 3 {
+            Instruction::Deposit { portfolio_id, expected_sequence, amount }.encode()
+        } else {
+            Instruction::Withdraw { portfolio_id, expected_sequence, amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::Deposit { portfolio_id: a, expected_sequence: b, amount: c } if tag == 3 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 3 decoded as Deposit");
+            }
+            Instruction::Withdraw { portfolio_id: a, expected_sequence: b, amount: c } if tag == 4 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 4 decoded as Withdraw");
+            }
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
     }
-
-    let withdraw = Instruction::Withdraw {
-        portfolio_id,
-        expected_sequence,
-        amount,
-    }
-    .encode();
-    match Instruction::decode(&withdraw).unwrap() {
-        Instruction::Withdraw {
-            portfolio_id: got_id,
-            expected_sequence: got_seq,
-            amount: got_amount,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_seq, expected_sequence);
-            assert_eq!(got_amount, amount);
-        }
-        _ => unreachable!(),
-    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0, "boundary: amount == 0");
+    kani::cover!(portfolio_id == u64::MAX && expected_sequence == 0, "boundary: id MAX, sequence 0");
 }
 
 /// TB-1b (ADOPT upstream 7453c7cd): ConvertReleasedPnl/CureAndCancelClose now
 /// carry a leading `portfolio_id`/`position_epoch` binding.
 #[kani::proof]
 fn kani_v16_convert_and_cure_decode_preserves_wire_fields() {
+    // weak-1020 D1: tag 28 / 42: portfolio_id u64 @1, position_epoch u64 @9, amount u128 @17; 33 B.
     let portfolio_id: u64 = kani::any();
     let position_epoch: u64 = kani::any();
     let amount: u128 = kani::any();
-
-    let convert = Instruction::ConvertReleasedPnl {
-        portfolio_id,
-        position_epoch,
-        amount,
-    }
-    .encode();
-    match Instruction::decode(&convert).unwrap() {
-        Instruction::ConvertReleasedPnl {
-            portfolio_id: got_id,
-            position_epoch: got_epoch,
-            amount: got_amount,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_epoch, position_epoch);
-            assert_eq!(got_amount, amount);
+    let extra: u8 = kani::any();
+    for tag in [28u8, 42u8] {
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 28 {
+            Instruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount }.encode()
+        } else {
+            Instruction::CureAndCancelClose { portfolio_id, position_epoch, optional_deposit: amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::ConvertReleasedPnl { portfolio_id: a, position_epoch: b, amount: c } if tag == 28 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 28 decoded as ConvertReleasedPnl");
+            }
+            Instruction::CureAndCancelClose { portfolio_id: a, position_epoch: b, optional_deposit: c } if tag == 42 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 42 decoded as CureAndCancelClose");
+            }
+            _ => unreachable!(),
         }
-        _ => unreachable!(),
     }
-
-    let cure = Instruction::CureAndCancelClose {
-        portfolio_id,
-        position_epoch,
-        optional_deposit: amount,
-    }
-    .encode();
-    match Instruction::decode(&cure).unwrap() {
-        Instruction::CureAndCancelClose {
-            portfolio_id: got_id,
-            position_epoch: got_epoch,
-            optional_deposit: got_amount,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_epoch, position_epoch);
-            assert_eq!(got_amount, amount);
-        }
-        _ => unreachable!(),
-    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0 && position_epoch == u64::MAX, "boundary: zero amount, epoch MAX");
 }
 
 /// INTEGRATION: TopUpInsurance (tag 9) locked wire order (runbook §4):
@@ -278,6 +240,7 @@ fn kani_v16_top_up_insurance_decode_preserves_wire_fields() {
     let intent_id: u64 = kani::any();
     let authority_epoch: u64 = kani::any();
     let amount: u128 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 41];
     data[0] = 9;
@@ -285,8 +248,9 @@ fn kani_v16_top_up_insurance_decode_preserves_wire_fields() {
     data[9..17].copy_from_slice(&intent_id.to_le_bytes());
     data[17..25].copy_from_slice(&authority_epoch.to_le_bytes());
     data[25..41].copy_from_slice(&amount.to_le_bytes());
+    let enc = Instruction::TopUpInsurance { market_id, intent_id, amount, authority_epoch }.encode();
 
-    match Instruction::decode(&data).unwrap() {
+    match wire_exact(&data, &enc, extra) {
         Instruction::TopUpInsurance {
             market_id: got_market_id,
             intent_id: got_intent_id,
@@ -297,9 +261,12 @@ fn kani_v16_top_up_insurance_decode_preserves_wire_fields() {
             assert_eq!(got_intent_id, intent_id);
             assert_eq!(got_amount, amount);
             assert_eq!(got_epoch, authority_epoch);
+            kani::cover!(true, "tag 9 decoded as TopUpInsurance");
         }
         _ => unreachable!(),
     }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(authority_epoch == u64::MAX && intent_id == 0, "boundary: epoch MAX, intent 0");
 }
 
 #[kani::proof]
@@ -312,6 +279,7 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
     let market_id: u64 = kani::any();
     let intent_id: u64 = kani::any();
     let authority_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     // TopUpInsuranceDomain: tag(1) + domain(u16=2) + market_id(u64=8) +
     // intent_id(u64=8) + authority_epoch(u64=8) + amount(u128=16) = 43 bytes.
@@ -322,7 +290,8 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
     top_up[11..19].copy_from_slice(&intent_id.to_le_bytes());
     top_up[19..27].copy_from_slice(&authority_epoch.to_le_bytes());
     top_up[27..43].copy_from_slice(&amount.to_le_bytes());
-    match Instruction::decode(&top_up).unwrap() {
+    let enc = Instruction::TopUpInsuranceDomain { market_id, intent_id, domain, amount, authority_epoch }.encode();
+    match wire_exact(&top_up, &enc, extra) {
         Instruction::TopUpInsuranceDomain {
             market_id: got_market_id,
             intent_id: got_intent_id,
@@ -335,13 +304,13 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
             assert_eq!(got_epoch, authority_epoch);
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
+            kani::cover!(true, "tag 56 decoded as TopUpInsuranceDomain");
         }
         _ => unreachable!(),
     }
 
     // v17: tag 57 is now WithdrawInsuranceAsset { asset_index: u16, amount: u128,
-    // authority_epoch: u64 }. (WithdrawInsuranceDomain was removed in the v17 auth
-    // overhaul.) W3A-1: tag(1) + asset_index(u16=2) + market_id(u64=8) +
+    // authority_epoch: u64 }. W3A-1: tag(1) + asset_index(u16=2) + market_id(u64=8) +
     // amount(u128=16) + authority_epoch(u64=8) = 35 bytes.
     let mut withdraw = [0u8; 35];
     let asset_index: u16 = kani::any();
@@ -351,7 +320,14 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
     withdraw[3..11].copy_from_slice(&market_id.to_le_bytes());
     withdraw[11..27].copy_from_slice(&amount.to_le_bytes());
     withdraw[27..35].copy_from_slice(&withdraw_authority_epoch.to_le_bytes());
-    match Instruction::decode(&withdraw).unwrap() {
+    let enc = Instruction::WithdrawInsuranceAsset {
+        market_id,
+        asset_index,
+        amount,
+        authority_epoch: withdraw_authority_epoch,
+    }
+    .encode();
+    match wire_exact(&withdraw, &enc, extra) {
         Instruction::WithdrawInsuranceAsset {
             market_id: got_market_id,
             asset_index: got_asset_index,
@@ -362,109 +338,108 @@ fn kani_v16_domain_insurance_decode_preserves_wire_fields() {
             assert_eq!(got_asset_index, asset_index);
             assert_eq!(got_amount, amount);
             assert_eq!(got_authority_epoch, withdraw_authority_epoch);
+            kani::cover!(true, "tag 57 decoded as WithdrawInsuranceAsset");
         }
         _ => unreachable!(),
     }
+    kani::cover!(domain == u16::MAX && amount == u128::MAX, "boundary: domain MAX, amount MAX");
 }
 
 #[kani::proof]
 fn kani_v16_recovery_close_progress_decode_preserves_wire_fields() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
     let asset_index: u16 = kani::any();
     let side: u8 = kani::any();
     let b_loss_atom_budget: u128 = kani::any();
     let reduce_q: u128 = kani::any();
     let close_q: u128 = kani::any();
     let now_slot: u64 = kani::any();
-    // TB-1b: ForfeitRecoveryLeg/RebalanceReduce now also bind portfolio_id +
-    // position_epoch.
     let portfolio_id: u64 = kani::any();
     let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
 
-    let forfeit = Instruction::ForfeitRecoveryLeg {
-        portfolio_id,
-        position_epoch,
-        asset_index,
-        b_loss_atom_budget,
-    }
-    .encode();
-    match Instruction::decode(&forfeit).unwrap() {
-        Instruction::ForfeitRecoveryLeg {
-            portfolio_id: got_id,
-            position_epoch: got_epoch,
-            asset_index: got_asset,
-            b_loss_atom_budget: got_budget,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_epoch, position_epoch);
-            assert_eq!(got_asset, asset_index);
-            assert_eq!(got_budget, b_loss_atom_budget);
+    let mut forfeit = [0u8; 35];
+    forfeit[0] = 43;
+    forfeit[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+    forfeit[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+    forfeit[17..19].copy_from_slice(&asset_index.to_le_bytes());
+    forfeit[19..35].copy_from_slice(&b_loss_atom_budget.to_le_bytes());
+    let enc = Instruction::ForfeitRecoveryLeg { portfolio_id, position_epoch, asset_index, b_loss_atom_budget }.encode();
+    match wire_exact(&forfeit, &enc, extra) {
+        Instruction::ForfeitRecoveryLeg { portfolio_id: a, position_epoch: b, asset_index: c, b_loss_atom_budget: d } => {
+            assert_eq!((a, b, c, d), (portfolio_id, position_epoch, asset_index, b_loss_atom_budget));
+            kani::cover!(true, "tag 43 decoded");
         }
         _ => unreachable!(),
     }
 
-    let rebalance = Instruction::RebalanceReduce {
-        portfolio_id,
-        position_epoch,
-        asset_index,
-        reduce_q,
-    }
-    .encode();
-    match Instruction::decode(&rebalance).unwrap() {
-        Instruction::RebalanceReduce {
-            portfolio_id: got_id,
-            position_epoch: got_epoch,
-            asset_index: got_asset,
-            reduce_q: got_reduce,
-        } => {
-            assert_eq!(got_id, portfolio_id);
-            assert_eq!(got_epoch, position_epoch);
-            assert_eq!(got_asset, asset_index);
-            assert_eq!(got_reduce, reduce_q);
+    let mut rebalance = [0u8; 35];
+    rebalance[0] = 44;
+    rebalance[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+    rebalance[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+    rebalance[17..19].copy_from_slice(&asset_index.to_le_bytes());
+    rebalance[19..35].copy_from_slice(&reduce_q.to_le_bytes());
+    let enc = Instruction::RebalanceReduce { portfolio_id, position_epoch, asset_index, reduce_q }.encode();
+    match wire_exact(&rebalance, &enc, extra) {
+        Instruction::RebalanceReduce { portfolio_id: a, position_epoch: b, asset_index: c, reduce_q: d } => {
+            assert_eq!((a, b, c, d), (portfolio_id, position_epoch, asset_index, reduce_q));
+            kani::cover!(true, "tag 44 decoded");
         }
         _ => unreachable!(),
     }
 
-    let finalize = Instruction::FinalizeResetSide { asset_index, side }.encode();
-    match Instruction::decode(&finalize).unwrap() {
-        Instruction::FinalizeResetSide {
-            asset_index: got_asset,
-            side: got_side,
-        } => {
-            assert_eq!(got_asset, asset_index);
-            assert_eq!(got_side, side);
+    let mut finalize = [0u8; 4];
+    finalize[0] = 45;
+    finalize[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    finalize[3] = side;
+    let enc = Instruction::FinalizeResetSide { asset_index, side }.encode();
+    match wire_exact(&finalize, &enc, extra) {
+        Instruction::FinalizeResetSide { asset_index: a, side: s } => {
+            assert_eq!((a, s), (asset_index, side));
+            kani::cover!(true, "tag 45 decoded");
         }
         _ => unreachable!(),
     }
 
-    let force_close = Instruction::ForceCloseAbandonedAsset {
-        asset_index,
-        now_slot,
-        close_q,
-    }
-    .encode();
-    match Instruction::decode(&force_close).unwrap() {
-        Instruction::ForceCloseAbandonedAsset {
-            asset_index: got_asset,
-            now_slot: got_slot,
-            close_q: got_close,
-        } => {
-            assert_eq!(got_asset, asset_index);
-            assert_eq!(got_slot, now_slot);
-            assert_eq!(got_close, close_q);
+    let mut force_close = [0u8; 27];
+    force_close[0] = 64;
+    force_close[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    force_close[3..11].copy_from_slice(&now_slot.to_le_bytes());
+    force_close[11..27].copy_from_slice(&close_q.to_le_bytes());
+    let enc = Instruction::ForceCloseAbandonedAsset { asset_index, now_slot, close_q }.encode();
+    match wire_exact(&force_close, &enc, extra) {
+        Instruction::ForceCloseAbandonedAsset { asset_index: a, now_slot: n, close_q: q } => {
+            assert_eq!((a, n, q), (asset_index, now_slot, close_q));
+            kani::cover!(true, "tag 64 decoded");
         }
         _ => unreachable!(),
     }
 
-    match Instruction::decode(&Instruction::ClaimResolvedPayoutTopup.encode()).unwrap() {
-        Instruction::ClaimResolvedPayoutTopup => {}
+    let claim = [46u8];
+    let enc = Instruction::ClaimResolvedPayoutTopup.encode();
+    match wire_exact(&claim, &enc, extra) {
+        Instruction::ClaimResolvedPayoutTopup => kani::cover!(true, "tag 46 decoded"),
         _ => unreachable!(),
     }
 
-    let sync_fee = Instruction::SyncMaintenanceFee { now_slot }.encode();
-    match Instruction::decode(&sync_fee).unwrap() {
-        Instruction::SyncMaintenanceFee { now_slot: got } => assert_eq!(got, now_slot),
+    let mut sync_fee = [0u8; 9];
+    sync_fee[0] = 48;
+    sync_fee[1..9].copy_from_slice(&now_slot.to_le_bytes());
+    let enc = Instruction::SyncMaintenanceFee { now_slot }.encode();
+    match wire_exact(&sync_fee, &enc, extra) {
+        Instruction::SyncMaintenanceFee { now_slot: got } => {
+            assert_eq!(got, now_slot);
+            kani::cover!(true, "tag 48 decoded");
+        }
         _ => unreachable!(),
     }
+    kani::cover!(close_q == u128::MAX && side == u8::MAX, "boundary: close_q MAX, side 255");
 }
 
 #[kani::proof]
@@ -479,6 +454,7 @@ fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
     let market_id: u64 = kani::any();
     let intent_id: u64 = kani::any();
     let authority_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 51];
     data[0] = 24;
@@ -488,8 +464,9 @@ fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
     data[19..27].copy_from_slice(&authority_epoch.to_le_bytes());
     data[27..43].copy_from_slice(&amount.to_le_bytes());
     data[43..51].copy_from_slice(&expiry_slot.to_le_bytes());
+    let enc = Instruction::TopUpBackingBucket { market_id, intent_id, domain, amount, expiry_slot, authority_epoch }.encode();
 
-    match Instruction::decode(&data).unwrap() {
+    match wire_exact(&data, &enc, extra) {
         Instruction::TopUpBackingBucket {
             market_id: got_market_id,
             intent_id: got_intent_id,
@@ -504,29 +481,31 @@ fn kani_v16_top_up_backing_bucket_decode_preserves_wire_fields() {
             assert_eq!(got_amount, amount);
             assert_eq!(got_expiry, expiry_slot);
             assert_eq!(got_epoch, authority_epoch);
+            kani::cover!(true, "tag 24 decoded as TopUpBackingBucket");
         }
         _ => unreachable!(),
     }
+    kani::cover!(amount == u128::MAX && expiry_slot == u64::MAX, "boundary: amount MAX, expiry MAX");
 }
 
 #[kani::proof]
 fn kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields() {
-    // v17: domain is u16.
+    // weak-1020 D1: tag 50: domain u16 @1, market_id u64 @3, amount u128 @11, authority_epoch u64 @27; 35 B.
     let domain: u16 = kani::any();
     let amount: u128 = kani::any();
     let market_id: u64 = kani::any();
-    // W3A-1 (upstream ade6f9fa): trailing authority_epoch CAS binding.
     let authority_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
 
-    let data = Instruction::WithdrawBackingBucket {
-        market_id,
-        domain,
-        amount,
-        authority_epoch,
-    }
-    .encode();
+    let mut spec = [0u8; 35];
+    spec[0] = 50;
+    spec[1..3].copy_from_slice(&domain.to_le_bytes());
+    spec[3..11].copy_from_slice(&market_id.to_le_bytes());
+    spec[11..27].copy_from_slice(&amount.to_le_bytes());
+    spec[27..35].copy_from_slice(&authority_epoch.to_le_bytes());
+    let enc = Instruction::WithdrawBackingBucket { market_id, domain, amount, authority_epoch }.encode();
 
-    match Instruction::decode(&data).unwrap() {
+    match wire_exact(&spec, &enc, extra) {
         Instruction::WithdrawBackingBucket {
             market_id: got_market_id,
             domain: got_domain,
@@ -537,9 +516,11 @@ fn kani_v16_withdraw_backing_bucket_decode_preserves_wire_fields() {
             assert_eq!(got_domain, domain);
             assert_eq!(got_amount, amount);
             assert_eq!(got_authority_epoch, authority_epoch);
+            kani::cover!(true, "tag 50 decoded as WithdrawBackingBucket");
         }
         _ => unreachable!(),
     }
+    kani::cover!(amount == u128::MAX && domain == u16::MAX, "boundary: amount MAX, domain MAX");
 }
 
 #[kani::proof]
@@ -1019,63 +1000,68 @@ fn kani_v16_update_authority_decode_preserves_wire_fields() {
 // Replaced by a proof for SetLpVaultPaused (tag 79) — a v17 LP vault instruction.
 #[kani::proof]
 fn kani_v16_set_lp_vault_paused_decode_preserves_wire_fields() {
+    // weak-1020 D1: tag 79: paused u8 @1; 2 B. Every u8 value decodes (the handler, not the decoder, validates it).
     let paused: u8 = kani::any();
-
-    let data = Instruction::SetLpVaultPaused { paused }.encode();
-
-    match Instruction::decode(&data).unwrap() {
+    let extra: u8 = kani::any();
+    let spec = [79u8, paused];
+    let enc = Instruction::SetLpVaultPaused { paused }.encode();
+    match wire_exact(&spec, &enc, extra) {
         Instruction::SetLpVaultPaused { paused: got } => {
             assert_eq!(got, paused);
+            kani::cover!(true, "tag 79 decoded as SetLpVaultPaused");
         }
         _ => unreachable!(),
     }
+    kani::cover!(paused == 0, "boundary: paused 0");
+    kani::cover!(paused > 1, "boundary: a non-bool byte decodes (handler validates)");
 }
 
 #[kani::proof]
 fn kani_v16_update_liquidation_fee_policy_decode_preserves_wire_fields() {
     let cranker_share_bps: u16 = kani::any();
-    // W3A-2 (upstream policy-sequence campaign): trailing replay-protection counter,
-    // matching the idiom used across the other single-field marketauth-gated policy
-    // setters (UpdateMaintenanceFeePolicy/UpdateFeeRedirectPolicy/etc).
+    // W3A-2 (upstream policy-sequence campaign): trailing replay-protection counter.
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 11];
     data[0] = 37;
     data[1..3].copy_from_slice(&cranker_share_bps.to_le_bytes());
     data[3..11].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateLiquidationFeePolicy { cranker_share_bps, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateLiquidationFeePolicy {
-            cranker_share_bps: got,
-            policy_sequence: got_seq,
-        } => {
+    match wire_exact(&data, &enc, extra) {
+        Instruction::UpdateLiquidationFeePolicy { cranker_share_bps: got, policy_sequence: got_seq } => {
             assert_eq!(got, cranker_share_bps);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 37 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(cranker_share_bps > 10_000, "boundary: out-of-range bps still decodes (handler validates)");
+    kani::cover!(policy_sequence == u64::MAX, "boundary: sequence MAX");
 }
 
 #[kani::proof]
 fn kani_v16_update_maintenance_fee_policy_decode_preserves_wire_fields() {
     let cranker_share_bps: u16 = kani::any();
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 11];
     data[0] = 49;
     data[1..3].copy_from_slice(&cranker_share_bps.to_le_bytes());
     data[3..11].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateMaintenanceFeePolicy { cranker_share_bps, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateMaintenanceFeePolicy {
-            cranker_share_bps: got,
-            policy_sequence: got_seq,
-        } => {
+    match wire_exact(&data, &enc, extra) {
+        Instruction::UpdateMaintenanceFeePolicy { cranker_share_bps: got, policy_sequence: got_seq } => {
             assert_eq!(got, cranker_share_bps);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 49 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(cranker_share_bps == u16::MAX && policy_sequence == 0, "boundary: bps MAX, sequence 0");
 }
 
 #[kani::proof]
@@ -1087,6 +1073,7 @@ fn kani_v16_update_backing_fee_policy_decode_preserves_wire_fields() {
     let insurance_share_bps: u16 = kani::any();
     let market_id: u64 = kani::any();
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 23];
     data[0] = 51;
@@ -1095,8 +1082,9 @@ fn kani_v16_update_backing_fee_policy_decode_preserves_wire_fields() {
     data[11..13].copy_from_slice(&fee_bps.to_le_bytes());
     data[13..15].copy_from_slice(&insurance_share_bps.to_le_bytes());
     data[15..23].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateBackingFeePolicy { market_id, domain, fee_bps, insurance_share_bps, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
+    match wire_exact(&data, &enc, extra) {
         Instruction::UpdateBackingFeePolicy {
             market_id: got_market_id,
             domain: got_domain,
@@ -1109,75 +1097,80 @@ fn kani_v16_update_backing_fee_policy_decode_preserves_wire_fields() {
             assert_eq!(got_fee_bps, fee_bps);
             assert_eq!(got_insurance_share_bps, insurance_share_bps);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 51 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(fee_bps != insurance_share_bps, "fee and insurance share distinguishable (field order observable)");
 }
 
 #[kani::proof]
 fn kani_v16_update_trade_fee_policy_decode_preserves_wire_fields() {
     let trade_fee_base_bps: u64 = kani::any();
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 17];
     data[0] = 55;
     data[1..9].copy_from_slice(&trade_fee_base_bps.to_le_bytes());
     data[9..17].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateTradeFeePolicy { trade_fee_base_bps, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateTradeFeePolicy {
-            trade_fee_base_bps: got,
-            policy_sequence: got_seq,
-        } => {
+    match wire_exact(&data, &enc, extra) {
+        Instruction::UpdateTradeFeePolicy { trade_fee_base_bps: got, policy_sequence: got_seq } => {
             assert_eq!(got, trade_fee_base_bps);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 55 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(trade_fee_base_bps == u64::MAX, "boundary: bps MAX");
 }
 
 #[kani::proof]
 fn kani_v16_update_fee_redirect_policy_decode_preserves_wire_fields() {
     let redirect_bps: u16 = kani::any();
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 11];
     data[0] = 58;
     data[1..3].copy_from_slice(&redirect_bps.to_le_bytes());
     data[3..11].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateFeeRedirectPolicy { redirect_bps, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateFeeRedirectPolicy {
-            redirect_bps: got,
-            policy_sequence: got_seq,
-        } => {
+    match wire_exact(&data, &enc, extra) {
+        Instruction::UpdateFeeRedirectPolicy { redirect_bps: got, policy_sequence: got_seq } => {
             assert_eq!(got, redirect_bps);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 58 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(redirect_bps == u16::MAX && policy_sequence == u64::MAX, "boundary: both MAX");
 }
 
 #[kani::proof]
 fn kani_v16_update_market_init_fee_policy_decode_preserves_wire_fields() {
     let min_init_fee: u128 = kani::any();
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut data = [0u8; 25];
     data[0] = 59;
     data[1..17].copy_from_slice(&min_init_fee.to_le_bytes());
     data[17..25].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::UpdateMarketInitFeePolicy { min_init_fee, policy_sequence }.encode();
 
-    match Instruction::decode(&data).unwrap() {
-        Instruction::UpdateMarketInitFeePolicy {
-            min_init_fee: got,
-            policy_sequence: got_seq,
-        } => {
+    match wire_exact(&data, &enc, extra) {
+        Instruction::UpdateMarketInitFeePolicy { min_init_fee: got, policy_sequence: got_seq } => {
             assert_eq!(got, min_init_fee);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 59 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(min_init_fee == u128::MAX, "boundary: fee MAX");
 }
 
 #[kani::proof]
@@ -1229,11 +1222,11 @@ fn kani_v16_permissionless_resolve_decode_preserves_wire_fields() {
     let stale_slots: u64 = kani::any();
     let force_close_delay_slots: u64 = kani::any();
     let now_slot: u64 = kani::any();
-    // Wave-2 TB-4: asset_generation_frontier: u64 is a LEADING field (before
-    // stale_slots), not trailing -- shifts the whole payload by +8 (17 -> 25).
+    // Wave-2 TB-4: asset_generation_frontier: u64 is a LEADING field (before stale_slots).
     let asset_generation_frontier: u64 = kani::any();
     // W3A-2: trailing policy_sequence replay-protection counter (25 -> 33).
     let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut configure = [0u8; 33];
     configure[0] = 38;
@@ -1241,7 +1234,14 @@ fn kani_v16_permissionless_resolve_decode_preserves_wire_fields() {
     configure[9..17].copy_from_slice(&stale_slots.to_le_bytes());
     configure[17..25].copy_from_slice(&force_close_delay_slots.to_le_bytes());
     configure[25..33].copy_from_slice(&policy_sequence.to_le_bytes());
-    match Instruction::decode(&configure).unwrap() {
+    let enc = Instruction::ConfigurePermissionlessResolve {
+        asset_generation_frontier,
+        stale_slots,
+        force_close_delay_slots,
+        policy_sequence,
+    }
+    .encode();
+    match wire_exact(&configure, &enc, extra) {
         Instruction::ConfigurePermissionlessResolve {
             asset_generation_frontier: got_frontier,
             stale_slots: got_stale,
@@ -1252,6 +1252,7 @@ fn kani_v16_permissionless_resolve_decode_preserves_wire_fields() {
             assert_eq!(got_stale, stale_slots);
             assert_eq!(got_delay, force_close_delay_slots);
             assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 38 decoded");
         }
         _ => unreachable!(),
     }
@@ -1259,12 +1260,15 @@ fn kani_v16_permissionless_resolve_decode_preserves_wire_fields() {
     let mut resolve = [0u8; 9];
     resolve[0] = 39;
     resolve[1..9].copy_from_slice(&now_slot.to_le_bytes());
-    match Instruction::decode(&resolve).unwrap() {
+    let enc = Instruction::ResolveStalePermissionless { now_slot }.encode();
+    match wire_exact(&resolve, &enc, extra) {
         Instruction::ResolveStalePermissionless { now_slot: got } => {
             assert_eq!(got, now_slot);
+            kani::cover!(true, "tag 39 decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(stale_slots != force_close_delay_slots, "the two u64 fields distinguishable");
 }
 
 #[kani::proof]
@@ -1358,22 +1362,19 @@ fn kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields() {
 #[kani::proof]
 fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     let asset_index: u16 = kani::any();
-    let mark_raw: u16 = kani::any();
-
     let now_slot: u64 = kani::any();
     let initial_mark_e6: u64 = kani::any();
     let mark_ewma_halflife_slots: u64 = kani::any();
     let mark_min_fee: u64 = kani::any();
     let push_mark_e6: u64 = kani::any();
-    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs,
-    // shifting the remaining fields by +8 each.
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs.
     let market_id: u64 = kani::any();
-    // TB-2a: trailing observation_sequence replay-protection counter on all four
-    // of these oracle-report ixs (+8 each).
+    // TB-2a: trailing observation_sequence replay-protection counter on all four (+8 each).
     let configure_ewma_seq: u64 = kani::any();
     let push_ewma_seq: u64 = kani::any();
     let configure_auth_seq: u64 = kani::any();
     let push_auth_seq: u64 = kani::any();
+    let extra: u8 = kani::any();
 
     let mut configure = [0u8; 51];
     configure[0] = 35;
@@ -1384,7 +1385,17 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     configure[27..35].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
     configure[35..43].copy_from_slice(&mark_min_fee.to_le_bytes());
     configure[43..51].copy_from_slice(&configure_ewma_seq.to_le_bytes());
-    match Instruction::decode(&configure).unwrap() {
+    let enc = Instruction::ConfigureEwmaMark {
+        market_id,
+        asset_index,
+        now_slot,
+        initial_mark_e6,
+        mark_ewma_halflife_slots,
+        mark_min_fee,
+        observation_sequence: configure_ewma_seq,
+    }
+    .encode();
+    match wire_exact(&configure, &enc, extra) {
         Instruction::ConfigureEwmaMark {
             market_id: got_market_id,
             asset_index: got_asset_index,
@@ -1401,6 +1412,7 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
             assert_eq!(got_halflife, mark_ewma_halflife_slots);
             assert_eq!(got_min_fee, mark_min_fee);
             assert_eq!(got_seq, configure_ewma_seq);
+            kani::cover!(true, "tag 35 decoded");
         }
         _ => unreachable!(),
     }
@@ -1412,7 +1424,15 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     push[11..19].copy_from_slice(&now_slot.to_le_bytes());
     push[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
     push[27..35].copy_from_slice(&push_ewma_seq.to_le_bytes());
-    match Instruction::decode(&push).unwrap() {
+    let enc = Instruction::PushEwmaMark {
+        market_id,
+        asset_index,
+        now_slot,
+        mark_e6: push_mark_e6,
+        observation_sequence: push_ewma_seq,
+    }
+    .encode();
+    match wire_exact(&push, &enc, extra) {
         Instruction::PushEwmaMark {
             market_id: got_market_id,
             asset_index: got_asset_index,
@@ -1425,6 +1445,7 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, push_mark_e6);
             assert_eq!(got_seq, push_ewma_seq);
+            kani::cover!(true, "tag 36 decoded");
         }
         _ => unreachable!(),
     }
@@ -1436,7 +1457,15 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     configure_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
     configure_auth[19..27].copy_from_slice(&initial_mark_e6.to_le_bytes());
     configure_auth[27..35].copy_from_slice(&configure_auth_seq.to_le_bytes());
-    match Instruction::decode(&configure_auth).unwrap() {
+    let enc = Instruction::ConfigureAuthMark {
+        market_id,
+        asset_index,
+        now_slot,
+        initial_mark_e6,
+        observation_sequence: configure_auth_seq,
+    }
+    .encode();
+    match wire_exact(&configure_auth, &enc, extra) {
         Instruction::ConfigureAuthMark {
             market_id: got_market_id,
             asset_index: got_asset_index,
@@ -1449,10 +1478,12 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, initial_mark_e6);
             assert_eq!(got_seq, configure_auth_seq);
+            kani::cover!(true, "tag 62 decoded");
         }
         _ => unreachable!(),
     }
 
+    // tag 63, the 35-byte form (the 44-byte G8 depth form is a separate layout; one extra byte is neither).
     let mut push_auth = [0u8; 35];
     push_auth[0] = 63;
     push_auth[1..3].copy_from_slice(&asset_index.to_le_bytes());
@@ -1460,7 +1491,15 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
     push_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
     push_auth[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
     push_auth[27..35].copy_from_slice(&push_auth_seq.to_le_bytes());
-    match Instruction::decode(&push_auth).unwrap() {
+    let enc = Instruction::PushAuthMark {
+        market_id,
+        asset_index,
+        now_slot,
+        mark_e6: push_mark_e6,
+        observation_sequence: push_auth_seq,
+    }
+    .encode();
+    match wire_exact(&push_auth, &enc, extra) {
         Instruction::PushAuthMark {
             market_id: got_market_id,
             asset_index: got_asset_index,
@@ -1473,16 +1512,33 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
             assert_eq!(got_now, now_slot);
             assert_eq!(got_mark, push_mark_e6);
             assert_eq!(got_seq, push_auth_seq);
+            kani::cover!(true, "tag 63 (35 B form) decoded");
         }
         _ => unreachable!(),
     }
+    kani::cover!(initial_mark_e6 != mark_min_fee && now_slot != market_id, "u64 fields distinguishable");
 }
 
 #[kani::proof]
 fn kani_v16_decode_rejects_trailing_bytes() {
+    // weak-1020 D1: every tag the decoder accepts from ONE byte (zero payload) refuses one extra byte, and the
+    // bare tag is accepted (so the refusal is due to the extra byte alone). Tag list read from the decoder.
     let extra: u8 = kani::any();
-    let data = [1u8, extra];
-    assert!(Instruction::decode(&data).is_err());
+    let k: u8 = kani::any();
+    let tags = [1u8, 46, 54, 80, 81, 87, 116, 121];
+    kani::assume((k as usize) < tags.len());
+    let tag = tags[k as usize];
+    assert!(Instruction::decode(&[tag]).is_ok(), "the bare zero-payload tag decodes");
+    let r = Instruction::decode(&[tag, extra]);
+    assert!(r.is_err(), "zero-payload tag + 1 byte is refused");
+    kani::cover!(tag == 1 && r.is_err(), "InitPortfolio + byte refused");
+    kani::cover!(tag == 46 && r.is_err(), "ClaimResolvedPayoutTopup + byte refused");
+    kani::cover!(tag == 54 && r.is_err(), "SyncInsuranceLedger + byte refused");
+    kani::cover!(tag == 80 && r.is_err(), "CloseLpVault + byte refused");
+    kani::cover!(tag == 81 && r.is_err(), "CancelRedemption + byte refused");
+    kani::cover!(tag == 87 && r.is_err(), "WithdrawInsuranceReserveToStake + byte refused");
+    kani::cover!(tag == 116 && r.is_err(), "InitInsuranceUnits + byte refused");
+    kani::cover!(tag == 121 && r.is_err(), "CommitG9FeedAllowlist + byte refused");
 }
 
 fn assert_rejects_trailing_byte(ix: Instruction, extra: u8) {
@@ -1526,74 +1582,39 @@ fn kani_v16_init_market_payload_rejects_trailing_byte() {
 #[kani::proof]
 fn kani_v16_custody_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
 
-    assert_rejects_trailing_byte(Instruction::InitPortfolio, extra);
-    assert_rejects_trailing_byte(
-        Instruction::Deposit {
-            portfolio_id: 1,
-            expected_sequence: 0,
-            amount: 1,
-        },
+    assert_rejects_trailing_byte_sym(Instruction::InitPortfolio, extra);
+    assert_rejects_trailing_byte_sym(Instruction::Deposit { portfolio_id: id, expected_sequence: seq, amount }, extra);
+    assert_rejects_trailing_byte_sym(Instruction::Withdraw { portfolio_id: id, expected_sequence: seq, amount }, extra);
+    assert_rejects_trailing_byte_sym(
+        Instruction::TopUpInsurance { market_id: id, intent_id: seq, amount, authority_epoch: epoch },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::Withdraw {
-            portfolio_id: 1,
-            expected_sequence: 0,
-            amount: 1,
-        },
-        extra,
-    );
-    assert_rejects_trailing_byte(
-        Instruction::TopUpInsurance {
-            market_id: 1,
-            intent_id: 1,
-            amount: 1,
-            authority_epoch: 1,
-        },
-        extra,
-    );
-    assert_rejects_trailing_byte(
+    assert_rejects_trailing_byte_sym(
         Instruction::TopUpBackingBucket {
-            market_id: 1,
-            intent_id: 1,
-            domain: 1,
-            amount: 1,
-            expiry_slot: 10,
-            authority_epoch: 1,
+            market_id: id,
+            intent_id: seq,
+            domain,
+            amount,
+            expiry_slot: epoch,
+            authority_epoch: epoch,
         },
         extra,
     );
-    // W3A-1: trailing authority_epoch CAS binding.
-    assert_rejects_trailing_byte(
-        Instruction::WithdrawBackingBucket {
-            market_id: 1,
-            domain: 1,
-            amount: 1,
-            authority_epoch: 1,
-        },
+    assert_rejects_trailing_byte_sym(
+        Instruction::WithdrawBackingBucket { market_id: id, domain, amount, authority_epoch: epoch },
         extra,
     );
-    assert_rejects_trailing_byte(Instruction::WithdrawInsurance { amount: 1 }, extra);
-    // v17: WithdrawInsuranceLimited removed; WithdrawInsuranceAsset replaces domain withdraw.
-    // W3A-1: trailing authority_epoch CAS binding.
-    assert_rejects_trailing_byte(
-        Instruction::WithdrawInsuranceAsset {
-            market_id: 1,
-            asset_index: 0,
-            amount: 1,
-            authority_epoch: 1,
-        },
+    assert_rejects_trailing_byte_sym(Instruction::WithdrawInsurance { amount }, extra);
+    assert_rejects_trailing_byte_sym(
+        Instruction::WithdrawInsuranceAsset { market_id: id, asset_index: domain, amount, authority_epoch: epoch },
         extra,
     );
-    // W3A-2: trailing authority_epoch CAS binding.
-    assert_rejects_trailing_byte(
-        Instruction::SwapSecondaryForPrimary {
-            amount: 1,
-            authority_epoch: 1,
-        },
-        extra,
-    );
+    assert_rejects_trailing_byte_sym(Instruction::SwapSecondaryForPrimary { amount, authority_epoch: epoch }, extra);
+    kani::cover!(amount == u128::MAX && extra == 0, "boundary: MAX amount, zero trailing byte");
 }
 
 #[kani::proof]
@@ -1840,75 +1861,40 @@ fn kani_v16_oracle_asset_payloads_reject_trailing_byte() {
 #[kani::proof]
 fn kani_v16_resolved_recovery_payloads_reject_trailing_byte() {
     let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
 
-    assert_rejects_trailing_byte(
-        Instruction::ConvertReleasedPnl {
-            portfolio_id: 1,
-            position_epoch: 0,
-            amount: 1,
-        },
+    assert_rejects_trailing_byte_sym(
+        Instruction::ConvertReleasedPnl { portfolio_id: id, position_epoch: epoch, amount },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::CloseResolved {
-            fee_rate_per_slot: 0,
-        },
+    assert_rejects_trailing_byte_sym(Instruction::CloseResolved { fee_rate_per_slot: amount }, extra);
+    assert_rejects_trailing_byte_sym(
+        Instruction::CureAndCancelClose { portfolio_id: id, position_epoch: epoch, optional_deposit: amount },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::CureAndCancelClose {
-            portfolio_id: 1,
-            position_epoch: 0,
-            optional_deposit: 1,
-        },
+    assert_rejects_trailing_byte_sym(
+        Instruction::ForfeitRecoveryLeg { portfolio_id: id, position_epoch: epoch, asset_index, b_loss_atom_budget: amount },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::ForfeitRecoveryLeg {
-            portfolio_id: 1,
-            position_epoch: 0,
-            asset_index: 0,
-            b_loss_atom_budget: 1,
-        },
+    assert_rejects_trailing_byte_sym(
+        Instruction::RebalanceReduce { portfolio_id: id, position_epoch: epoch, asset_index, reduce_q: amount },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::RebalanceReduce {
-            portfolio_id: 1,
-            position_epoch: 0,
-            asset_index: 0,
-            reduce_q: 1,
-        },
+    assert_rejects_trailing_byte_sym(Instruction::FinalizeResetSide { asset_index, side }, extra);
+    assert_rejects_trailing_byte_sym(
+        Instruction::ForceCloseAbandonedAsset { asset_index, now_slot: slot, close_q: amount },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::FinalizeResetSide {
-            asset_index: 0,
-            side: 0,
-        },
+    assert_rejects_trailing_byte_sym(Instruction::ClaimResolvedPayoutTopup, extra);
+    assert_rejects_trailing_byte_sym(Instruction::RefineResolvedUnreceiptedBound { decrease_num: amount }, extra);
+    assert_rejects_trailing_byte_sym(
+        Instruction::ClosePortfolio { portfolio_id: id, expected_sequence: slot, position_epoch: epoch },
         extra,
     );
-    assert_rejects_trailing_byte(
-        Instruction::ForceCloseAbandonedAsset {
-            asset_index: 0,
-            now_slot: 1,
-            close_q: 1,
-        },
-        extra,
-    );
-    assert_rejects_trailing_byte(Instruction::ClaimResolvedPayoutTopup, extra);
-    assert_rejects_trailing_byte(
-        Instruction::RefineResolvedUnreceiptedBound { decrease_num: 1 },
-        extra,
-    );
-    assert_rejects_trailing_byte(
-        Instruction::ClosePortfolio {
-            portfolio_id: 1,
-            expected_sequence: 0,
-            position_epoch: 0,
-        },
-        extra,
-    );
+    kani::cover!(amount == u128::MAX && side == u8::MAX, "boundary: MAX amount, side 255");
 }
 
 #[kani::proof]
@@ -1973,7 +1959,17 @@ fn kani_v16_unknown_or_truncated_tags_reject() {
 #[kani::proof]
 fn kani_v16_zero_length_decode_rejects() {
     let data: [u8; 0] = [];
-    assert!(Instruction::decode(&data).is_err());
+    let r = Instruction::decode(&data);
+    assert!(r.is_err());
+    kani::cover!(r.is_err(), "empty input reached Err");
+    // weak-1020 D1: and every payload-bearing tag refuses its bare tag byte (a 1-byte prefix of its payload).
+    let k: u8 = kani::any();
+    let tags = [3u8, 4, 9, 24, 28, 35, 36, 37, 38, 39, 42, 43, 44, 45, 48, 49, 50, 51, 55, 56, 57, 58, 59, 62, 63, 64, 79];
+    kani::assume((k as usize) < tags.len());
+    let bare = Instruction::decode(&[tags[k as usize]]);
+    assert!(bare.is_err(), "a payload-bearing tag with no payload is refused");
+    kani::cover!(tags[k as usize] == 3 && bare.is_err(), "Deposit tag alone refused");
+    kani::cover!(tags[k as usize] == 79 && bare.is_err(), "SetLpVaultPaused tag alone refused");
 }
 
 #[kani::proof]
@@ -2448,7 +2444,7 @@ fn kani_e2_auth_accept_implies_all_gates() {
         assert!(init, "authorized ⟹ token account initialized");
     }
     // r2 (amendment 2026-10-12 04:50): non-vacuity cover(s); no assume, assert, bound or fixture changed.
-    kani::cover!(nft_holder_auth_decision(po, ema, pob, ppa, pk, can, bm, am, sg, ao, amt, init), "an authorized input exists (the implication is not vacuous)");
+    kani::cover!(nft_holder_auth_decision(po, ema, pob, ppa, pk, can, pmg, lmg, pid, lid, bm, am, sg, ao, amt, init), "an authorized input exists (the implication is not vacuous)");
 }
 
 // ── Each gate LOAD-BEARING: its failure ⟹ reject, for ALL other inputs ──
@@ -2478,22 +2474,19 @@ fn kani_e2_auth_reject_not_escrowed() {
 
 #[kani::proof]
 fn kani_e2_auth_reject_fake_pda_owner() {
-    let ok = nft_holder_auth_decision(
-        kani::any(),
-        kani::any(),
-        false,
-        kani::any(),
-        kani::any(),
-        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any());
-    assert!(
-        !ok,
-        "PositionNft PDA not owned by the NFT program must reject"
+    // weak-1020 D2: S1-2 operands symbolic too (were constants); covers prove the call ran and that the
+    // rejection is due to THIS gate alone (every other conjunct true at once is reachable).
+    let (po, ema, ppa, pk, pmg, lmg, bm, am, sg, ao): (
+        [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32],
+    ) = (kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any());
+    let (can, init): (bool, bool) = (kani::any(), kani::any());
+    let (pid, lid, amt): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let ok = nft_holder_auth_decision(po, ema, false, ppa, pk, can, pmg, lmg, pid, lid, bm, am, sg, ao, amt, init);
+    assert!(!ok, "PositionNft PDA not owned by the NFT program must reject");
+    kani::cover!(!ok, "the verdict was computed (reject)");
+    kani::cover!(
+        po == ema && ppa == pk && can && pmg == lmg && lid != 0 && pid == lid && am == bm && ao == sg && amt == 1 && init,
+        "every OTHER gate holds: the fake PDA owner alone causes the reject"
     );
 }
 
@@ -2522,20 +2515,18 @@ fn kani_e2_auth_reject_wrong_portfolio() {
 
 #[kani::proof]
 fn kani_e2_auth_reject_noncanonical_pda() {
-    let ok = nft_holder_auth_decision(
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        false, [7u8; 32], [7u8; 32], 5, 5,
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any());
+    let (po, ema, ppa, pk, pmg, lmg, bm, am, sg, ao): (
+        [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32],
+    ) = (kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any());
+    let (pob, init): (bool, bool) = (kani::any(), kani::any());
+    let (pid, lid, amt): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let ok = nft_holder_auth_decision(po, ema, pob, ppa, pk, false, pmg, lmg, pid, lid, bm, am, sg, ao, amt, init);
     assert!(!ok, "a non-canonical PositionNft PDA must reject");
+    kani::cover!(!ok, "the verdict was computed (reject)");
+    kani::cover!(
+        po == ema && pob && ppa == pk && pmg == lmg && lid != 0 && pid == lid && am == bm && ao == sg && amt == 1 && init,
+        "every OTHER gate holds: non-canonical PDA alone causes the reject"
+    );
 }
 
 #[kani::proof]
@@ -2611,20 +2602,18 @@ fn kani_e2_auth_reject_amount_not_one() {
 
 #[kani::proof]
 fn kani_e2_auth_reject_uninitialized_ata() {
-    let ok = nft_holder_auth_decision(
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(), [7u8; 32], [7u8; 32], 5, 5,
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        kani::any(),
-        false);
+    let (po, ema, ppa, pk, pmg, lmg, bm, am, sg, ao): (
+        [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32], [u8; 32],
+    ) = (kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any());
+    let (pob, can): (bool, bool) = (kani::any(), kani::any());
+    let (pid, lid, amt): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let ok = nft_holder_auth_decision(po, ema, pob, ppa, pk, can, pmg, lmg, pid, lid, bm, am, sg, ao, amt, false);
     assert!(!ok, "an uninitialized token account must reject");
+    kani::cover!(!ok, "the verdict was computed (reject)");
+    kani::cover!(
+        po == ema && pob && ppa == pk && can && pmg == lmg && lid != 0 && pid == lid && am == bm && ao == sg && amt == 1,
+        "every OTHER gate holds: the uninitialized ATA alone causes the reject"
+    );
 }
 
 // ── F-1 / F-2 insurance-withdrawal policy proofs ────────────────────────────
@@ -3362,18 +3351,18 @@ fn kani_fee_split_conserves() {
     kani::cover!(true, "assume set satisfiable; asserted path reached");
 }
 
-/// No single leg may exceed the whole fee (guards a sign/overflow regression).
+/// weak-1020 D4: no leg exceeds the fee, full u128 fee, symbolic VALIDATED split (production `validate_fee_split`),
+/// protocol share = the production constant. Plus exact conservation and the floor facts of each bps leg.
 #[cfg(kani)]
 #[kani::proof]
+#[kani::solver(z3)]
 fn kani_fee_split_no_leg_exceeds_fee() {
-    let fee: u64 = kani::any();
-    let parts =
-        percolator_prog::policy_v16::split_trade_fee(fee as u128, 2_000, 1_600, 4_800, 1_600)
-            .unwrap();
-    assert!(parts.protocol <= fee as u128);
-    assert!(parts.creator <= fee as u128);
-    assert!(parts.lp <= fee as u128);
-    assert!(parts.insurance <= fee as u128);
+    let fee: u128 = kani::any();
+    let c: u16 = kani::any();
+    let l: u16 = kani::any();
+    let i: u16 = kani::any();
+    kani::assume(percolator_prog::policy_v16::validate_fee_split(c, l, i).is_ok());
+    fee_split_spec(fee, c, l, i);
 }
 
 
@@ -3418,4 +3407,121 @@ fn kani_s12_zero_live_id_rejects() {
         kani::any(), kani::any(), kani::any(), kani::any(), kani::any(), kani::any(),
     );
     assert!(!ok, "a zero portfolio id must never authorize");
+}
+
+
+/// weak-1020 D1 helper: the exact-length wire contract of ONE payload. `spec` is the layout built by hand from
+/// the runbook offsets (never from `encode()`); `encoded` is the production `encode()` of the same fields.
+/// Asserts: encode() == spec byte for byte; spec minus its last byte is refused; spec plus one symbolic byte is
+/// refused; spec decodes. Returns the decoded instruction (production `Instruction::decode`).
+fn wire_exact(spec: &[u8], encoded: &[u8], extra: u8) -> Instruction {
+    assert_eq!(encoded.len(), spec.len(), "encode() length == spec layout length");
+    let mut i = 0;
+    while i < spec.len() {
+        assert_eq!(encoded[i], spec[i], "encode() byte == spec layout byte");
+        i += 1;
+    }
+    let short = Instruction::decode(&spec[..spec.len() - 1]);
+    assert!(short.is_err(), "one byte short is refused");
+    let mut long = spec.to_vec();
+    long.push(extra);
+    let long_r = Instruction::decode(&long);
+    assert!(long_r.is_err(), "one trailing byte is refused");
+    kani::cover!(short.is_err() && long_r.is_err(), "both malformed lengths reached Err");
+    let ok = Instruction::decode(spec);
+    assert!(ok.is_ok(), "the exact spec layout decodes");
+    ok.unwrap()
+}
+
+/// weak-1020 D1: trailing byte refused for a payload with SYMBOLIC fields (not constants); the exact payload decodes.
+fn assert_rejects_trailing_byte_sym(ix: Instruction, extra: u8) {
+    let data = ix.encode();
+    assert!(Instruction::decode(&data).is_ok(), "exact-length payload decodes");
+    let mut long = data.clone();
+    long.push(extra);
+    let r = Instruction::decode(&long);
+    assert!(r.is_err(), "payload + 1 byte refused");
+    kani::cover!(r.is_err(), "trailing-byte refusal reached");
+}
+
+/// weak-1020 D3 twin (pre-planned): u32 inputs (index up to 4.29e9 > 1e9, so the zero-rounding case exists here too).
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_v16_premium_funding_rate_is_clamped_and_signed_u32() {
+    let mark = kani::any::<u32>() as u64;
+    let index = kani::any::<u32>() as u64;
+    let cap = kani::any::<u32>() as u64;
+    premium_rate_spec(mark, index, cap);
+}
+
+fn premium_rate_spec(mark: u64, index: u64, cap: u64) {
+    let r = policy_v16::premium_funding_rate_e9(mark, index, cap);
+    assert!(r.is_some(), "never None for any u64 inputs");
+    let rate = r.unwrap();
+    let mag = rate.unsigned_abs();
+    assert!(mag <= cap as u128, "|rate| <= cap");
+    if cap == 0 || mark == 0 || index == 0 || mark == index {
+        assert_eq!(rate, 0);
+    } else {
+        if mark > index {
+            assert!(rate >= 0, "mark above index: longs never receive");
+        } else {
+            assert!(rate <= 0, "mark below index: shorts never receive");
+        }
+        let num = (mark.abs_diff(index) as u128) * 1_000_000_000u128; // < 2^94
+        let den = index as u128;
+        assert!(mag * den <= num, "never above the exact premium");
+        assert!(mag == cap as u128 || (mag + 1) * den > num, "floor of the premium unless clamped");
+        kani::cover!(rate > 0 && mag == cap as u128, "positive, clamped");
+        kani::cover!(rate < 0 && mag == cap as u128, "negative, clamped");
+        kani::cover!(rate > 0 && mag < cap as u128, "positive, unclamped");
+        kani::cover!(rate < 0 && mag < cap as u128, "negative, unclamped");
+        kani::cover!(rate == 0, "production width: mark != index but the premium floors to 0");
+    }
+}
+
+/// weak-1020 D4 twin (pre-planned): full u128 fee, the production default split constants (2000/1600/4800/1600).
+#[cfg(kani)]
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_fee_split_no_leg_exceeds_fee_default_split_u128() {
+    let fee: u128 = kani::any();
+    fee_split_spec(fee, 1_600, 4_800, 1_600);
+}
+
+#[cfg(kani)]
+fn fee_split_spec(fee: u128, c: u16, l: u16, i: u16) {
+    let p_bps = percolator_prog::constants::PROTOCOL_FEE_BPS;
+    let r = percolator_prog::policy_v16::split_trade_fee(fee, p_bps, c, l, i);
+    let fits = fee <= u128::MAX / 10_000;
+    if fits {
+        assert!(r.is_ok(), "no overflow refusal while fee * 10_000 fits");
+    }
+    match r {
+        Ok(p) => {
+            assert!(p.protocol <= fee && p.creator <= fee && p.lp <= fee && p.insurance <= fee, "no leg exceeds the fee");
+            let sum = p
+                .protocol
+                .checked_add(p.creator)
+                .and_then(|x| x.checked_add(p.lp))
+                .and_then(|x| x.checked_add(p.insurance));
+            assert_eq!(sum, Some(fee), "the four legs sum to the fee exactly");
+            if fits {
+                for (leg, b) in [(p.protocol, p_bps), (p.creator, c), (p.lp, l)] {
+                    let prod = fee * b as u128;
+                    assert!(leg * 10_000 <= prod && prod < leg * 10_000 + 10_000, "bps leg = floor(fee * bps / 1e4)");
+                }
+                let ins_share = fee * i as u128;
+                assert!(p.insurance * 10_000 >= ins_share, "insurance never below its own exact share");
+                assert!(p.insurance * 10_000 < ins_share + 30_000, "insurance takes at most 3 atoms of dust");
+                kani::cover!(fee > 0 && p.insurance * 10_000 > ins_share, "dust routed to insurance");
+                kani::cover!(fee == u128::MAX / 10_000, "boundary: largest fee with fee * 1e4 in range");
+            }
+            kani::cover!(fee == 0, "zero fee");
+        }
+        Err(_) => {
+            assert!(!fits);
+            kani::cover!(true, "overflow refusal reached (fee * bps beyond u128)");
+        }
+    }
 }

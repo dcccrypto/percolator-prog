@@ -1,0 +1,22 @@
+[package]
+name = "weak1020-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# v22kani WEAK agent (2026-10-20). Standalone: proves the EXACT production files ../../src/vault_lp_v18.rs,
+# ../../src/growth_v19.rs and ../../src/bond_v20.rs (path-included, same pattern as kani/growth), so the
+# `mul_div_floor` contract can be `proof_for_contract`-ed and `stub_verified` in ONE crate.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+percolator = { path = "../../../percolator", features = ["fork-facade"] }
+
+[features]
+devnet = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
