@@ -9,7 +9,7 @@
 //!     floor, `<= span`, monotone in num, monotone and 1-Lipschitz in span.
 //! E3: `curve_interp` at full width (boundaries + 50M xorshift samples, both branches) against
 //!     an independent u128 reference.
-use contlev_proofs::growth_v19::{curve_interp, log2_frac_q16, log2_q16, LOG2_FRAC_BITS};
+use contlev_proofs::growth_v19::{curve_interp, log2_frac_q16, log2_q16, n_cap_q, LOG2_FRAC_BITS, MAX_LAMBDA_BPS};
 use std::time::Instant;
 
 fn main() {
@@ -104,5 +104,41 @@ fn main() {
         checked += 1;
     }
     println!("E3 PASS: {checked} full-width checks against u128 ({:.1}s)", t2.elapsed().as_secs_f64());
+    // E4 (ledger §11): n_cap_q exact against a u128 reference and MONOTONE in (C_m, λ): an
+    // exhaustive small grid, then 20M random draws at the program's ranges (C_m <= 2^64,
+    // λ <= MAX_LAMBDA_BPS, 1 <= price <= 1e12, scale = POS_SCALE), each with a larger C_m and λ.
+    let t3 = Instant::now();
+    let refq = |c: u128, l: u32, p: u64, s: u128| -> u128 { c * l as u128 * s / (10_000u128 * p as u128) };
+    let mut n4 = 0u64;
+    for p in 1u64..=40 {
+        for s in [1u128, 7, 1_000_000] {
+            for c in 0u128..200 {
+                let mut prev = 0u128;
+                for l in 0u32..300 {
+                    let r = n_cap_q(c, l, p, s).unwrap();
+                    assert_eq!(r, refq(c, l, p, s));
+                    assert!(r >= prev, "monotone in λ");
+                    if c > 0 {
+                        assert!(n_cap_q(c - 1, l, p, s).unwrap() <= r, "monotone in C_m");
+                    }
+                    prev = r;
+                    n4 += 1;
+                }
+            }
+        }
+    }
+    for _ in 0..20_000_000u64 {
+        let c = (next() >> (next() % 64)) as u128;
+        let l = (next() % (MAX_LAMBDA_BPS as u64 + 1)) as u32;
+        let p = 1 + next() % 1_000_000_000_000;
+        let s = 1_000_000u128;
+        let r = n_cap_q(c, l, p, s).unwrap();
+        assert_eq!(r, refq(c, l, p, s));
+        let c2 = c + (next() >> (next() % 64)) as u128;
+        let l2 = l + (next() % (MAX_LAMBDA_BPS as u64 + 1 - l as u64)) as u32;
+        assert!(n_cap_q(c2, l2, p, s).unwrap() >= r, "monotone");
+        n4 += 1;
+    }
+    println!("E4 PASS: {n4} n_cap_q checks (exact vs u128, monotone in C_m and λ) ({:.1}s)", t3.elapsed().as_secs_f64());
     println!("ALL PASS");
 }

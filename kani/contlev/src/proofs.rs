@@ -616,3 +616,299 @@ fn kani_contlev_n_cap_q_monotone_lemma() {
     assert!(n_cap_q(c1 as u128, l1 as u32, 0, ps as u128).is_none(), "zero price: None");
     kani::cover!(a < b && a > 0, "strictly increasing, positive");
 }
+
+// ════ §11 decomposition (2026-10-20): replaces the 4 NO-VERDICT harnesses above
+// (interp_facts, curve_monotone_and_min, n_cap_step_identity, n_cap_q_monotone_lemma; kept for
+// the record). One nonlinear call per harness, an equal-term identity, a verified contract, or
+// composition only. Ledger §11 (rev 2, after the decomposition review). ════
+
+/// Thresholds at FULL u64 width (any monotone config incl. the defaults $25k/$100k/$500k at 6 or
+/// 9 decimals, and a saturated T3): `4 <= T1 < T2 < T3`, T3 may be `u64::MAX`.
+fn any_thresholds_wide() -> [u64; 3] {
+    let a: u64 = kani::any();
+    let b: u64 = kani::any();
+    let c: u64 = kani::any();
+    kani::assume(4 <= a && a < b && b < c);
+    [a, b, c]
+}
+
+/// D1. `curve_interp` IS `floor(s·n/d)` (remainder form), `<= s`, 0 at n = 0, s at n = d.
+/// u8 operands (the width-independent facts; D2 is the full-width code identity).
+/// Mutant: ceil (`(s·n + d - 1) / d`): the remainder form FAILS.
+#[kani::proof]
+fn kani_contlev_interp_exact_u8() {
+    let s: u8 = kani::any();
+    let n: u8 = kani::any();
+    let d: u8 = kani::any();
+    kani::assume(d >= 1 && n <= d);
+    let (s, n, d) = (s as u64, n as u64, d as u64);
+    let a = curve_interp(s, n as u32, d as u32);
+    let p = s * n;
+    assert!(a * d <= p && p - a * d < d, "exact floor (remainder form)");
+    assert!(a <= s, "<= span");
+    if n == 0 {
+        assert_eq!(a, 0);
+    }
+    if n == d {
+        assert_eq!(a, s);
+    }
+    kani::cover!(a > 0 && a < s, "strictly inside (0, span)");
+    kani::cover!(a * d != p, "a floored quotient");
+    kani::cover!(n == d && s > 0, "num = den");
+}
+
+/// D2. Full native-branch width (span, num, den u32): the code computes exactly the u64 floor
+/// quotient `s·n / d` of the UNWRAPPED product (equal-term identity; Rust's u64 `/` is floor),
+/// and `s·n` never wraps (u32·u32 <= (2^32-1)^2 < 2^64, a constant check plus monotonicity of
+/// the product). The u128 branch (span > u32::MAX) is never produced by a program table (ledger
+/// §11) and is checked natively (E3). Mutant: ceil: FAILS the identity.
+#[kani::proof]
+fn kani_contlev_interp_exact_u32() {
+    let s: u32 = kani::any();
+    let n: u32 = kani::any();
+    let d: u32 = kani::any();
+    kani::assume(d >= 1 && n <= d);
+    assert!((u32::MAX as u64).checked_mul(u32::MAX as u64).is_some(), "u32·u32 fits u64");
+    let a = curve_interp(s as u64, n, d);
+    assert_eq!(a, (s as u64).wrapping_mul(n as u64) / (d as u64), "the floor quotient of the product");
+    kani::cover!(a > 0 && (a as u128) < s as u128 && n < d && s > u16::MAX as u32, "wide operands, strictly inside");
+}
+
+/// M1. The leading curve and its segment are MONOTONE in the depth, for any monotone thresholds
+/// at full u64 width (incl. a saturated T3) and any monotone table (log2 / interp models).
+/// Mutant: `hi - interp` (a decreasing interpolation): FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::log2_q16, log2_model)]
+#[kani::stub(crate::growth_v19::curve_interp, interp_model)]
+#[kani::unwind(8)]
+fn kani_contlev_curve_monotone() {
+    let th = any_thresholds_wide();
+    let tab = any_table();
+    let t = u64t(tab);
+    let d: u64 = kani::any();
+    let e: u64 = kani::any();
+    kani::assume(d <= e);
+    let (pd, pe) = (curve_pos(d, th), curve_pos(e, th));
+    assert!(pd.seg <= pe.seg && pe.seg <= 4, "segment monotone, never the failure position");
+    let (vd, ve) = (curve_value(pd, t), curve_value(pe, t));
+    assert!(vd <= ve, "leverage curve monotone in depth");
+    kani::cover!(d < e && vd < ve && pd.seg == pe.seg && pd.seg == 2, "strictly increasing inside one segment");
+    kani::cover!(pd.seg < pe.seg && vd < ve, "strictly increasing across an anchor");
+    kani::cover!(th[2] == u64::MAX && e > th[1] && pe.seg == 3, "saturated T3");
+    kani::cover!(th[0] >= 25_000_000_000, "T1 at or above the $25k default (6 decimals)");
+    kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
+}
+
+// memoising recording stubs of the curve functions (M2 checks composition only)
+const CV_CAP: usize = 16;
+static mut CP_N: usize = 0;
+static mut CP_IN: [(u64, [u64; 3]); CV_CAP] = [(0, [0; 3]); CV_CAP];
+static mut CP_OUT: [(u8, u32, u32); CV_CAP] = [(0, 0, 0); CV_CAP];
+static mut CL_N: usize = 0;
+static mut CL_IN: [((u8, u32, u32), u64, [u64; 3]); CV_CAP] = [((0, 0, 0), 0, [0; 3]); CV_CAP];
+static mut CL_OUT: [(u8, u32, u32); CV_CAP] = [(0, 0, 0); CV_CAP];
+static mut VV_N: usize = 0;
+static mut VV_IN: [((u8, u32, u32), [u64; 4]); CV_CAP] = [((0, 0, 0), [0; 4]); CV_CAP];
+static mut VV_OUT: [u64; CV_CAP] = [0; CV_CAP];
+
+fn pos_tuple(p: CurvePos) -> (u8, u32, u32) {
+    (p.seg, p.num, p.den)
+}
+
+fn curve_pos_memo(d: u64, th: [u64; 3]) -> CurvePos {
+    let out: (u8, u32, u32) = kani::any();
+    unsafe {
+        let n = CP_N;
+        assert!(n < CV_CAP);
+        let mut j = 0;
+        while j < n {
+            if CP_IN[j] == (d, th) {
+                kani::assume(CP_OUT[j] == out);
+            }
+            j += 1;
+        }
+        CP_IN[n] = (d, th);
+        CP_OUT[n] = out;
+        CP_N = n + 1;
+    }
+    CurvePos { seg: out.0, num: out.1, den: out.2 }
+}
+
+fn curve_pos_lag_memo(lead: CurvePos, d: u64, th: [u64; 3]) -> CurvePos {
+    let out: (u8, u32, u32) = kani::any();
+    unsafe {
+        let n = CL_N;
+        assert!(n < CV_CAP);
+        let mut j = 0;
+        while j < n {
+            if CL_IN[j] == (pos_tuple(lead), d, th) {
+                kani::assume(CL_OUT[j] == out);
+            }
+            j += 1;
+        }
+        CL_IN[n] = (pos_tuple(lead), d, th);
+        CL_OUT[n] = out;
+        CL_N = n + 1;
+    }
+    CurvePos { seg: out.0, num: out.1, den: out.2 }
+}
+
+/// `curve_value` model: memoised, and `<= max(t)` (proved: H4 "inside [t0, t3]" on monotone
+/// tables; `curve_value` never exceeds its largest entry), so the dials' casts are exact.
+fn curve_value_memo(p: CurvePos, t: [u64; 4]) -> u64 {
+    let r: u64 = kani::any();
+    let mx = core::cmp::max(core::cmp::max(t[0], t[1]), core::cmp::max(t[2], t[3]));
+    kani::assume(r <= mx);
+    unsafe {
+        let n = VV_N;
+        assert!(n < CV_CAP);
+        let mut j = 0;
+        while j < n {
+            if VV_IN[j] == (pos_tuple(p), t) {
+                kani::assume(VV_OUT[j] == r);
+            }
+            j += 1;
+        }
+        VV_IN[n] = (pos_tuple(p), t);
+        VV_OUT[n] = r;
+        VV_N = n + 1;
+    }
+    r
+}
+
+/// M2. `smooth_dials_and_venue_l(v, b)` is EXACTLY (min of the two leverage curves, min of the
+/// two lagging κ curves, min of the two lagging λ curves, the venue leverage curve), for ANY
+/// (v, b) and thresholds: composition only (the curve functions are memoised models). With M1
+/// and H7 (monotone) the min is the curve at min(v, b), and the dials are symmetric.
+/// Mutants: `max` for `min` in `m2`: FAILS; κ from the leading position: FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::curve_pos, curve_pos_memo)]
+#[kani::stub(crate::growth_v19::curve_pos_lag, curve_pos_lag_memo)]
+#[kani::stub(crate::growth_v19::curve_value, curve_value_memo)]
+#[kani::unwind(17)]
+fn kani_contlev_dials_are_min_of_curves() {
+    let th: [u64; 3] = kani::any();
+    let tab: [u16; 4] = kani::any();
+    let t = u64t(tab);
+    let v: u64 = kani::any();
+    let b: u64 = kani::any();
+    let (dials, vl) = smooth_dials_and_venue_l(v, b, th, tab);
+    let (pv, pb) = (curve_pos(v, th), curve_pos(b, th));
+    let (qv, qb) = (curve_pos_lag(pv, v, th), curve_pos_lag(pb, b, th));
+    let (lv, lb) = (curve_value(pv, t), curve_value(pb, t));
+    let (kv, kb) = (curve_value(qv, KAPPA_TABLE_BPS), curve_value(qb, KAPPA_TABLE_BPS));
+    let (mv, mb) = (curve_value(qv, LAMBDA_DEPTH_TABLE_BPS), curve_value(qb, LAMBDA_DEPTH_TABLE_BPS));
+    assert_eq!(dials.l_signal_x100 as u64, core::cmp::min(lv, lb), "L = min of the leverage curves");
+    assert_eq!(dials.kappa_bps as u64, core::cmp::min(kv, kb), "κ = min of the lagging curves");
+    assert_eq!(dials.lambda_depth_bps as u64, core::cmp::min(mv, mb), "λ = min of the lagging curves");
+    assert_eq!(vl as u64, lv, "venue value = the venue curve");
+    kani::cover!(lv < lb && kv > kb, "venue binds L, book binds κ");
+    kani::cover!(lb < lv && (vl as u64) > lb, "book binds L, venue bound above");
+    kani::cover!(v == b, "equal depths");
+    kani::cover!(unsafe { VV_N } >= 13, "all curve values went through the model (stubs applied)");
+}
+
+// recording stub of `n_cap_g8_q_dials` (any function): S1 checks the wiring only
+static mut ND_SEEN: bool = false;
+static mut ND_ARGS: (bool, u128, u32, u32, u32, Option<u64>, u64, u128) = (false, 0, 0, 0, 0, None, 0, 0);
+static mut ND_R: Option<u128> = None;
+
+#[allow(clippy::too_many_arguments)]
+fn n_cap_g8_q_dials_record(
+    clamp: bool,
+    c_m: u128,
+    stored: u32,
+    lam: u32,
+    kap: u32,
+    cap: Option<u64>,
+    price: u64,
+    ps: u128,
+) -> Option<u128> {
+    let r: Option<u128> = kani::any();
+    unsafe {
+        assert!(!ND_SEEN, "called once");
+        ND_SEEN = true;
+        ND_ARGS = (clamp, c_m, stored, lam, kap, cap, price, ps);
+        ND_R = r;
+    }
+    r
+}
+
+/// S1. `n_cap_g8_q(tier)` calls `n_cap_g8_q_dials` once, with exactly (clamp, C_m, stored λ,
+/// `lambda_depth_bps(tier)`, `kappa_depth_bps(tier)`, cap depth, price, scale), and returns its
+/// result (full width; the dials function is any function here).
+/// Mutant: κ and λ swapped in `n_cap_g8_q`: FAILS (at tier 0: 10,000 vs 5,000).
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_g8_q_dials, n_cap_g8_q_dials_record)]
+fn kani_contlev_n_cap_step_identity_stubbed() {
+    let clamp: bool = kani::any();
+    let c_m: u128 = kani::any();
+    let stored: u32 = kani::any();
+    let tier: u8 = kani::any();
+    let cap: Option<u64> = kani::any();
+    let price: u64 = kani::any();
+    let ps: u128 = kani::any();
+    let r = n_cap_g8_q(clamp, c_m, stored, tier, cap, price, ps);
+    unsafe {
+        assert!(ND_SEEN, "the dials reader was called");
+        assert_eq!(ND_ARGS, (clamp, c_m, stored, lambda_depth_bps(tier), kappa_depth_bps(tier), cap, price, ps), "step dials passed");
+        assert_eq!(r, ND_R, "its result returned");
+    }
+    kani::cover!(tier == 0 && clamp, "tier 0");
+    kani::cover!(tier == 2 && clamp, "tier 2");
+    kani::cover!(tier == 3 && clamp && r.is_some(), "tier 3, Some");
+}
+
+/// Q0. The primitive's contract (`mul_div_floor_spec`: exact floor in remainder form, None iff
+/// d == 0 or a·b overflows; `mul_div_floor_facts`), u8 operands; the lift to u128 is the paper
+/// step of `kani/growth` (two-line wrapper over core u128 `checked_mul` and `/`). Same harness as
+/// `kani/growth` `kani_growth_c_mul_div_floor` (PASSED 226 s on 10-14). Needed in this crate
+/// for `stub_verified` in Q1.
+#[kani::proof_for_contract(crate::vault_lp_v18::mul_div_floor)]
+fn kani_contlev_mul_div_floor_contract() {
+    let a = kani::any::<u8>() as u128;
+    let b = kani::any::<u8>() as u128;
+    let d = kani::any::<u8>() as u128;
+    let r = crate::vault_lp_v18::mul_div_floor(a, b, d);
+    kani::cover!(d == 0, "d == 0 -> None");
+    kani::cover!(r.is_some_and(|q| q > 0 && q * d != a * b), "inexact floor");
+    kani::cover!(r == Some(0) && a * b > 0, "rounds to 0");
+}
+
+/// Q1. `n_cap_q` = `spec::n_cap_q` (None on a zero price or an overflow; else the exact floor
+/// `floor(c·λ·s / (1e4·p))` in remainder form) at FULL u128 width, with the primitive replaced
+/// by its verified contract (Q0): a pure substitution, z3. Plus: Some on the program's domain
+/// (C_m < 2^64 via `conservative_equity <= vault <= MAX_VAULT_TVL` 1e16; λ <= MAX_LAMBDA_BPS;
+/// s = POS_SCALE). Mutant: result + 1: FAILS.
+#[kani::proof]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+fn kani_contlev_n_cap_q_exact() {
+    let c: u128 = kani::any();
+    let l: u32 = kani::any();
+    let p: u64 = kani::any();
+    let s: u128 = kani::any();
+    let r = n_cap_q(c, l, p, s);
+    assert!(crate::growth_v19::spec::n_cap_q(c, l, p, s, r), "n_cap_q meets its exact spec");
+    if p == 0 {
+        assert!(r.is_none());
+    }
+    kani::cover!(r.is_some_and(|x| x > 0) && c > u64::MAX as u128, "positive capacity beyond 2^64");
+    kani::cover!(r.is_none() && p > 0, "overflow: None (fail closed)");
+}
+
+/// Q2. `n_cap_q` is Some (never fails closed by overflow) on the program's domain: C_m < 2^64
+/// (`conservative_equity <= vault <= MAX_VAULT_TVL` = 1e16), λ <= MAX_LAMBDA_BPS, scale =
+/// POS_SCALE, any price >= 1 (1e4·price never overflows u128). Real primitive (only the
+/// overflow checks matter; the quotient is sliced away). The depth-cap call passes a C up to
+/// ~2·u64::MAX: still < 2^99 there, by the same bound (paper).
+/// Mutant: none (a domain property); E4 also checks Some at random over the domain.
+#[kani::proof]
+fn kani_contlev_n_cap_q_some_on_domain() {
+    let c: u64 = kani::any();
+    let l: u32 = kani::any();
+    let p: u64 = kani::any();
+    kani::assume(l <= MAX_LAMBDA_BPS && p >= 1);
+    let r = n_cap_q(c as u128, l, p, 1_000_000);
+    assert!(r.is_some(), "Some on the program's domain");
+    kani::cover!(c == u64::MAX && l == MAX_LAMBDA_BPS && p == 1, "the domain's corner");
+}
