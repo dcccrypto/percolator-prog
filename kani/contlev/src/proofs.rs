@@ -1225,3 +1225,106 @@ fn kani_contlev_n_cap_q_some_domain_corner() {
     assert!(r.is_some(), "Some at the domain's corner");
     kani::cover!(p == 1 && r.is_some_and(|x| x > u64::MAX as u128), "corner, price 1: capacity beyond 2^64");
 }
+
+// ════ §11.5 (2026-10-20): G-1 as a COMPOSITION proof (G1 / G1b hit NO-VERDICT at 3600 s on z3:
+// the model assumed the full exact-floor spec, i.e. 128-bit products of free values). ════
+
+// `n_cap_q` as ANY function, constrained only by two consequences of its carried exact spec
+// (ledger v22-kani-overnight-2026-10-14 row 13: S1 `kani_growth_s1_n_cap_q_structure` PASS
+// full width + `kani_growth_c_mul_div_floor` PASS; n_cap_q, mul_div_floor + contract,
+// spec::n_cap_q are byte-identical 72f1eefa -> 4a598926): price 0 => None; C = 0, price > 0 =>
+// Some(0) (floor(0 · S / D) = 0, the product 0 never overflows).
+static mut NA_N: usize = 0;
+static mut NA_C: [u128; 2] = [0; 2];
+static mut NA_L: [u32; 2] = [0; 2];
+static mut NA_P: [u64; 2] = [0; 2];
+static mut NA_S: [u128; 2] = [0; 2];
+static mut NA_R: [Option<u128>; 2] = [None; 2];
+
+fn n_cap_q_any_record(c_m: u128, lambda_bps: u32, price_e6: u64, pos_scale: u128) -> Option<u128> {
+    let r: Option<u128> = kani::any();
+    if price_e6 == 0 {
+        kani::assume(r.is_none());
+    } else if c_m == 0 {
+        kani::assume(r == Some(0));
+    }
+    unsafe {
+        let n = NA_N;
+        assert!(n < 2, "at most two n_cap_q calls (capital term, depth term)");
+        NA_C[n] = c_m;
+        NA_L[n] = lambda_bps;
+        NA_P[n] = price_e6;
+        NA_S[n] = pos_scale;
+        NA_R[n] = r;
+        NA_N = n + 1;
+    }
+    r
+}
+
+/// G1c (G-1, composition). `n_cap_g8_q_dials` on a clamp-enforced market, any κ (so the lagging
+/// κ the program passes: `growth_n_cap_g8` reads `ctx.dials.kappa_bps`), λ, C_m, price, scale,
+/// full width, with `n_cap_q` any function (above):
+///  * the capital call is `n_cap_q(C_m, min(stored λ, λ_depth), P, S)`;
+///  * depth None: N_cap = that capital result exactly;
+///  * depth Some(d): if the capital result is None, N_cap is None; else the depth call is
+///    `n_cap_q(floor(d·κ / 1e4), 1x, P, S)` and N_cap = min(capital, depth result or 0), so
+///    N_cap <= the depth term;
+///  * depth Some(0), price > 0, capital Some: N_cap = Some(0);  price 0: None.
+/// With the carried exact spec of `n_cap_q` (depth term · 1e4·P <= floor(d·κ/1e4) · 1e4 · S) and
+/// L1 (floor(y/1e4)·1e4 <= y) this gives N_cap · 1e4 · P <= d · κ · S.
+/// Mutant: κ dropped in `depth_cap_q_kappa` (`d / BPS`): "depth call argument" FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_q, n_cap_q_any_record)]
+fn kani_contlev_n_cap_depth_bound_composition() {
+    let c_m: u128 = kani::any();
+    let stored: u32 = kani::any();
+    let lam_d: u32 = kani::any();
+    let kap: u32 = kani::any();
+    let depth: Option<u64> = kani::any();
+    let price: u64 = kani::any();
+    let ps: u128 = kani::any();
+    let n = n_cap_g8_q_dials(true, c_m, stored, lam_d, kap, depth, price, ps);
+    let lam_eff = if stored < lam_d { stored } else { lam_d };
+    unsafe {
+        assert!(NA_N >= 1 && NA_C[0] == c_m && NA_L[0] == lam_eff && NA_P[0] == price && NA_S[0] == ps, "capital call: n_cap_q(C_m, λ_eff, P, S)");
+        let cap = NA_R[0];
+        if price == 0 {
+            assert!(n.is_none(), "price 0: None");
+        }
+        match depth {
+            None => assert_eq!(n, cap, "no depth: exactly the capital rule"),
+            Some(d) => match cap {
+                None => assert!(n.is_none(), "capital None: None"),
+                Some(c) => {
+                    assert!(NA_N == 2, "the depth call is made");
+                    assert_eq!(NA_C[1], (d as u128) * (kap as u128) / crate::growth_v19::BPS, "depth call argument: floor(d·κ / 1e4)");
+                    assert!(NA_L[1] == DEFAULT_LAMBDA_BPS && NA_P[1] == price && NA_S[1] == ps, "depth call: 1x, same price and scale");
+                    let dt = NA_R[1].unwrap_or(0);
+                    assert_eq!(n, Some(if c < dt { c } else { dt }), "N_cap = min(capital, depth term)");
+                    assert!(n.is_some_and(|x| x <= dt), "N_cap <= the depth term");
+                    if d == 0 && price > 0 {
+                        assert_eq!(n, Some(0), "depth 0: N_cap 0");
+                    }
+                }
+            },
+        }
+        kani::cover!(depth.is_some_and(|d| d > 0) && n.is_some_and(|x| x > 0 && NA_R[1] == Some(x) && cap.is_some_and(|c| c > x)), "the depth cap binds");
+        kani::cover!(depth.is_some_and(|d| d > 0) && n.is_some_and(|x| x > 0 && cap == Some(x) && NA_R[1].is_some_and(|q| q > x)), "the capital term binds");
+        kani::cover!(depth.is_some_and(|d| d > 0) && cap.is_some() && NA_R[1].is_none() && n == Some(0), "depth term overflow: 0 (fail closed)");
+        kani::cover!(depth == Some(0) && price > 0 && cap.is_some_and(|c| c > 0) && n == Some(0), "depth 0: closed");
+        kani::cover!(depth.is_none() && n.is_some_and(|x| x > 0), "no depth: capital rule");
+        kani::cover!(NA_N == 2 && NA_C[1] > 0, "a positive depth argument");
+    }
+}
+
+/// L1. The arithmetic link `floor(y / 1e4) · 1e4 <= y` (and `> y - 1e4`) for the depth term's
+/// argument, at u64 width (the production y = d·κ < 2^96 is a u128; the fact is Rust's floor
+/// division, width-independent; native E4 checks the composite at the program's ranges).
+/// Mutant: ceil: FAILS.
+#[kani::proof]
+fn kani_contlev_floor_div_bps_lemma() {
+    let y: u64 = kani::any();
+    let q = y / 10_000;
+    assert!(q * 10_000 <= y && y - q * 10_000 < 10_000, "floor(y/1e4)·1e4 in (y - 1e4, y]");
+    kani::cover!(q * 10_000 != y && q > 0, "a floored quotient");
+}
