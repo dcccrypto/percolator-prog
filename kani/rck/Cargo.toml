@@ -1,0 +1,20 @@
+[package]
+name = "rck-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone proofs crate for the v22kani RCK lane (RC coverage gaps G-2 / G-3, 2026-10-20).
+# Compiles the EXACT production files ../../src/growth_v19.rs and ../../src/vault_lp_v18.rs (no
+# copy), like kani/contlev, and reuses contlev's engine-shim for `percolator::band_rent`.
+# Not a member of the program's build. Report: ~/wt-v22kani-1020/reports/RCK.md.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+percolator = { path = "../contlev/engine-shim" }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
