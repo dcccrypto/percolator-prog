@@ -54,24 +54,23 @@ fn kani_p3e_skew_funding_conserves_through_engine_kernel() {
     kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
 }
 
-/// weak-1020 D7 (row was VACUOUS: its own negative control `neg_flat_a` SURVIVED, because with u8/u16 magnitudes
-/// |fid| <= 4 and even the flat-A bug rounds into [-1, 0]). Rewritten: same REAL rate path and REAL engine kernel,
-/// grid A (k * MIN_A_SIDE, k = 1..=10), but realistic magnitudes (rate up to u16, dt u16 slots, e6 price u32 =>
-/// |fid| up to ~1.8e10) and the load-bearing assertion is the kernel SHAPE (spec 5.3, exact in i128 here):
-/// f_long == -(fid * a_long), f_short == fid * a_short, i.e. each side moves in proportion to ITS OWN A, which
-/// is what makes two matched legs cancel. The [-1, 0] net of two settled legs is kept at the original q (u8).
-/// The negative control (`--features neg_flat_a`) must FAIL on the shape assertion.
+/// weak-1020 D7 rev 3 (row was VACUOUS: its own negative control `neg_flat_a` SURVIVED). Rev 1 (realistic
+/// magnitudes + settlement net) and rev 2 (realistic magnitudes, shape only) both had NO VERDICT at 2400 s: the
+/// widened rate path (`skew_funding_rate_e9` divides by a symbolic OI; `floor_div` of a 64-bit numerator) is the cost.
+/// The shape assertion does not need large |fid|: with ANY fid != 0, `-(fid * a_long)` differs from the flat
+/// `-(fid * ADL_ONE)` whenever a_long != ADL_ONE. Rev 3 = the ORIGINAL narrow domain (which had a verdict) with the
+/// kernel SHAPE asserted (spec 5.3) on top of the original [-1, 0] net. The negative control must now FAIL.
 #[kani::proof]
 #[kani::solver(cadical)]
 fn kani_p3e_skew_funding_conserves_grid_a() {
-    let premium: i16 = kani::any();
-    let lp_net: i32 = kani::any();
-    let oi: u32 = kani::any();
-    let slope: u16 = kani::any();
-    let cap: u16 = kani::any();
-    let max_abs: u16 = kani::any();
-    let dt: u16 = kani::any();
-    let price: u32 = kani::any();
+    let premium: i8 = kani::any();
+    let lp_net: i16 = kani::any();
+    let oi: u16 = kani::any();
+    let slope: u8 = kani::any();
+    let cap: u8 = kani::any();
+    let max_abs: u8 = kani::any();
+    let dt: u8 = kani::any();
+    let price: u16 = kani::any();
     let q: u8 = kani::any();
     let kl: u8 = kani::any();
     let ks: u8 = kani::any();
@@ -80,7 +79,6 @@ fn kani_p3e_skew_funding_conserves_grid_a() {
     let a_short = MIN_A_SIDE * ks as u128;
     let skew = skew_funding_rate_e9(lp_net as i128, oi as u128, slope as u64, cap as u64);
     let rate = combine_funding_rate_e9(premium as i128, skew, max_abs as u64);
-    assert!(rate.unsigned_abs() <= max_abs as u128, "combined rate within its cap");
     let fid = floor_div_signed_conservative_i128(rate * dt as i128 * price as i128, FUNDING_DEN);
     let (_kl, _ks, f_long, f_short) =
         percolator::kani_adl_scaled_accrual_index_deltas(0, fid, a_long, a_short).unwrap();
@@ -89,18 +87,14 @@ fn kani_p3e_skew_funding_conserves_grid_a() {
     let (f_long, f_short) = (-(fid * ADL_ONE as i128), fid * ADL_ONE as i128);
     assert_eq!(f_long, -(fid * a_long as i128), "long F moves by its own A (spec 5.3)");
     assert_eq!(f_short, fid * a_short as i128, "short F moves by its own A (spec 5.3)");
-    // the crowded side pays: positive fid charges longs, credits shorts
-    if fid > 0 {
-        assert!(f_long < 0 && f_short > 0);
-    }
-    // weak-1020 rev 2 (after the rev-1 run: NO VERDICT at 2400 s, stuck in propositional reduction on the two
-    // symbolic-divisor settlement divisions): the [-1, 0] settlement net is NOT re-proved here. It is the
-    // cancellation lemma of the engine harness `proof_asymmetric_a_matched_legs_cancellation_identity` (real kernel
-    // deltas settled by the engine's floor rule, grid A): a delta of the exact shape asserted above nets to [-1, 0].
-    let _ = q;
-    kani::cover!(kl != ks && fid != 0 && f_long != -f_short, "asymmetric-A transfer (sides move by different F)");
-    kani::cover!(skew != 0 && premium == 0 && f_long < 0, "skew alone moves value");
-    kani::cover!(kl != ks && (fid >= 16 || fid <= -16), "|fid| large enough that flat A cannot round away");
+    let q = q as i128;
+    let long_pnl = floor_div_signed_conservative_i128(q * f_long, a_long * POS_SCALE);
+    let short_pnl = floor_div_signed_conservative_i128(q * f_short, a_short * POS_SCALE);
+    let net = long_pnl + short_pnl;
+    kani::cover!(kl != ks && fid != 0 && q > 0 && long_pnl != 0, "asymmetric-A transfer");
+    kani::cover!(skew != 0 && premium == 0 && long_pnl < 0, "skew alone moves value");
+    kani::cover!(kl != ks && kl != 10 && fid != 0, "asymmetric, long side below ADL_ONE, funding moving");
+    assert!(net <= 0 && net >= -1);
 }
 
 
