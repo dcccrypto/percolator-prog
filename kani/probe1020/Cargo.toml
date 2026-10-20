@@ -1,0 +1,14 @@
+[package]
+name = "probe1020"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "v22kani 2026-10-20 (agent WRAP): solver-capability probes on pure u128 arithmetic. NOT verdict harnesses; they calibrate which encodings each solver decides at full width before the real harnesses are written."
+
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

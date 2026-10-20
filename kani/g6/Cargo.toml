@@ -1,0 +1,23 @@
+[package]
+name = "g6-lemmas"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "v22kani 2026-10-20 (agent WRAP): G6 bond / rescue / insurance-unit no-dilution as a chain of full-width Kani lemmas (proof_for_contract + stub_verified) on the EXACT production files."
+
+# Standalone (not a workspace member) so proof_for_contract / stub_verified can target the
+# path-included production functions.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+# growth_v19.rs calls percolator::band_rent.
+percolator = { path = "../../../percolator", features = ["fork-facade"] }
+
+[features]
+devnet = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
