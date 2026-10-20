@@ -715,6 +715,18 @@ fn pos_tuple(p: CurvePos) -> (u8, u32, u32) {
     (p.seg, p.num, p.den)
 }
 
+// Field-by-field key equality (array / tuple `==` lowers to a `memcmp` loop whose unwinding
+// assertion failed under `unwind(17)` in the 07:11 run: a harness defect, not a counterexample).
+fn eq3(a: [u64; 3], b: [u64; 3]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2]
+}
+fn eq4(a: [u64; 4], b: [u64; 4]) -> bool {
+    a[0] == b[0] && a[1] == b[1] && a[2] == b[2] && a[3] == b[3]
+}
+fn eqp(a: (u8, u32, u32), b: (u8, u32, u32)) -> bool {
+    a.0 == b.0 && a.1 == b.1 && a.2 == b.2
+}
+
 fn curve_pos_memo(d: u64, th: [u64; 3]) -> CurvePos {
     let out: (u8, u32, u32) = kani::any();
     unsafe {
@@ -722,8 +734,8 @@ fn curve_pos_memo(d: u64, th: [u64; 3]) -> CurvePos {
         assert!(n < CV_CAP);
         let mut j = 0;
         while j < n {
-            if CP_IN[j] == (d, th) {
-                kani::assume(CP_OUT[j] == out);
+            if CP_IN[j].0 == d && eq3(CP_IN[j].1, th) {
+                kani::assume(eqp(CP_OUT[j], out));
             }
             j += 1;
         }
@@ -741,8 +753,8 @@ fn curve_pos_lag_memo(lead: CurvePos, d: u64, th: [u64; 3]) -> CurvePos {
         assert!(n < CV_CAP);
         let mut j = 0;
         while j < n {
-            if CL_IN[j] == (pos_tuple(lead), d, th) {
-                kani::assume(CL_OUT[j] == out);
+            if eqp(CL_IN[j].0, pos_tuple(lead)) && CL_IN[j].1 == d && eq3(CL_IN[j].2, th) {
+                kani::assume(eqp(CL_OUT[j], out));
             }
             j += 1;
         }
@@ -764,7 +776,7 @@ fn curve_value_memo(p: CurvePos, t: [u64; 4]) -> u64 {
         assert!(n < CV_CAP);
         let mut j = 0;
         while j < n {
-            if VV_IN[j] == (pos_tuple(p), t) {
+            if eqp(VV_IN[j].0, pos_tuple(p)) && eq4(VV_IN[j].1, t) {
                 kani::assume(VV_OUT[j] == r);
             }
             j += 1;
