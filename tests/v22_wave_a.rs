@@ -264,9 +264,11 @@ fn wave_a_wire_round_trips_and_canonical_forms() {
     let mut zero = growth_init(LOT_PRICE_FLOOR_E6, Some(6)).encode();
     *zero.last_mut().unwrap() = 0;
     assert!(ProgInstruction::decode(&zero).is_err(), "non-canonical lot 0");
-    // 76: legacy 17 B; v2.2 26 B; keeper_ok 2 and the all-zero trailer refused.
+    // 76: legacy 17 B (RETIRED at decode, AUD-S1-18); v2.2 26 B; keeper_ok 2 and the all-zero
+    // trailer refused.
     let legacy76 = ProgInstruction::RequestRedeemLpShares { shares: 7 }.encode();
     assert_eq!(legacy76.len(), 17);
+    assert!(ProgInstruction::decode(&legacy76).is_err(), "AUD-S1-18: the floorless legacy 76 is retired");
     let v76 = ProgInstruction::RequestRedeemLpSharesV22 { shares: 7, min_payout_atoms: 9, keeper_ok: 1 };
     assert_eq!(v76.encode().len(), 26);
     assert_eq!(ProgInstruction::decode(&v76.encode()).unwrap(), v76);
@@ -515,7 +517,8 @@ fn sec_s5_wire_malleability() {
         assert!(ProgInstruction::decode(&ok77[..cut]).is_err(), "partial 77 trailer len {cut}");
     }
     assert!(ProgInstruction::decode(&ProgInstruction::ExecuteRedemption { domain: 0 }.encode()).is_ok());
-    assert!(ProgInstruction::decode(&ProgInstruction::RequestRedeemLpShares { shares: 1 }.encode()).is_ok());
+    // AUD-S1-18: the floorless legacy 76 is retired (the legacy 77 form stays).
+    assert!(ProgInstruction::decode(&ProgInstruction::RequestRedeemLpShares { shares: 1 }.encode()).is_err());
     let mut z = ok76.clone();
     z[17..25].copy_from_slice(&0u64.to_le_bytes());
     for k in [0u8, 1] {

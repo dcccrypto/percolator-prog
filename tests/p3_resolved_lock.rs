@@ -513,7 +513,7 @@ impl World {
         let owner = self.owners[u].insecure_clone();
         let red = state::derive_lp_redemption(&self.env.program_id, &reg, &owner.pubkey()).0;
         self.send(
-            ProgInstruction::RequestRedeemLpShares { shares },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(reg, false),
