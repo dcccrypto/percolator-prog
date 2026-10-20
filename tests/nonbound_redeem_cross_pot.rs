@@ -1222,3 +1222,66 @@ fn s10_mirror_equals_ledger_principal_through_rebalance_consumption_and_cross_po
     let after = s10_mirror_equals_ledger(&env, &v, "redemption");
     assert!(after.0 + after.1 < before.0 + before.1, "vacuity: the redemption drew pot principal");
 }
+
+/// Tag 77 on a non-bound vault with the own / sibling pot ledger's writable flag chosen by the
+/// caller (everything else as `execute`).
+fn execute_with_ledger_flags(env: &mut Env, v: &Vault, domain: u16, own_w: bool, sib_w: bool) -> Result<(), String> {
+    let payer = env.payer.insecure_clone();
+    let (escrow, _) = derive_lp_escrow(&env.program_id, &env.market);
+    let (redemption, _) = derive_lp_redemption(&env.program_id, &v.registry, &v.lp.pubkey());
+    let va = vault_authority(env);
+    let meta = |k: Pubkey, w: bool| if w { AccountMeta::new(k, false) } else { AccountMeta::new_readonly(k, false) };
+    send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::ExecuteRedemption { domain },
+        vec![
+            AccountMeta::new(payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(v.registry, false),
+            AccountMeta::new(redemption, false),
+            AccountMeta::new(v.mint, false),
+            AccountMeta::new(escrow, false),
+            AccountMeta::new(env.vault_token, false),
+            AccountMeta::new_readonly(va, false),
+            meta(v.ledger, own_w),
+            AccountMeta::new(v.dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            meta(v.sibling_ledger, sib_w),
+            AccountMeta::new(v.lp.pubkey(), true),
+        ],
+        &[&v.lp.insecure_clone()],
+    )
+}
+
+/// AUD-S1-22 (v2.2 audit 2026-10-17): a non-bound exit nets the two pots' ledger principal
+/// (Wave A A3) and that netting silently skipped a READ-ONLY ledger, so the caller chose,
+/// through the account meta, whether the exit was priced on the netted or the per-pot E3.
+/// Tag 77 now refuses a non-bound exit unless BOTH pot ledgers are writable
+/// (ExpectedWritable = Custom(7)), whichever pot pays; with both writable it pays as before.
+/// Red on the 4d69ee52 .so (the read-only exits succeed there).
+#[test]
+fn s1_22_nonbound_exit_refuses_a_read_only_pot_ledger() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 1_000_000_000, DOMAIN);
+    deposit(&mut env, &v, 1_000_000_000, SIBLING_DOMAIN);
+    let shares = token_amount(&env.svm, v.lp_ata) as u128 / 4;
+    request(&mut env, &v, shares);
+    let shares_before = registry_shares(&env, &v);
+    let dest_before = token_amount(&env.svm, v.dest);
+
+    let e = execute_with_ledger_flags(&mut env, &v, DOMAIN, true, false)
+        .expect_err("S1-22: a read-only sibling ledger must be refused on a non-bound exit");
+    assert!(e.contains("Custom(7)"), "ExpectedWritable, got {e}");
+    let e = execute_with_ledger_flags(&mut env, &v, SIBLING_DOMAIN, false, true)
+        .expect_err("S1-22: a read-only own ledger must be refused when the sibling pot pays");
+    assert!(e.contains("Custom(7)"), "ExpectedWritable, got {e}");
+    assert_eq!(registry_shares(&env, &v), shares_before, "nothing redeemed by the refused exits");
+    assert_eq!(token_amount(&env.svm, v.dest), dest_before, "nothing paid by the refused exits");
+
+    execute_with_ledger_flags(&mut env, &v, DOMAIN, true, true).expect("both ledgers writable: the exit pays");
+    assert_eq!(registry_shares(&env, &v), shares_before - shares, "the writable exit redeemed the request");
+    assert!(token_amount(&env.svm, v.dest) > dest_before, "vacuity: the writable exit paid");
+}

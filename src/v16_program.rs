@@ -32237,6 +32237,15 @@ pub mod processor {
         } else {
             None
         };
+        // AUD-S1-22: a NON-bound exit nets the two pots' ledger principal (A3,
+        // `nonbound_exit_cross_pot_netting`) and, when Resolved, absorbs both pots first; both
+        // silently skip a read-only ledger. Require both ledgers writable here so the caller
+        // (an unsigned keeper exit included) cannot opt out of the netting through the meta.
+        // Bound exits are unchanged (`vault_lp_draw_then_book` handles its own ledgers).
+        if bound_tail.is_none() {
+            expect_writable(ledger_ai)?;
+            expect_writable(sibling_ledger_ai)?;
+        }
 
         // ── Cooldown gate. ──
         let now_slot = Clock::get().map(|c| c.slot).unwrap_or(0);
