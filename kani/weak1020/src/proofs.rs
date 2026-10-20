@@ -41,9 +41,19 @@ fn kani_weak_c_mul_div_floor_u64() {
 #[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_weak_wc5_deposit_floor_full_u128() {
-    let amount: u128 = kani::any();
-    let b: u128 = kani::any();
-    let value: u128 = kani::any();
+    wc5_body(kani::any(), kani::any(), kani::any());
+}
+
+/// weak-1020 rev 2 (after `kani_weak_wc6_redemption_floor_full_u128` had NO VERDICT at 2400 s, cadical): the same
+/// body at u64 operands (every product fits u128, so the overflow branch is unreachable here), z3.
+#[kani::proof]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+#[kani::solver(z3)]
+fn kani_weak_wc5_deposit_floor_u64() {
+    wc5_body(kani::any::<u64>() as u128, kani::any::<u64>() as u128, kani::any::<u64>() as u128);
+}
+
+fn wc5_body(amount: u128, b: u128, value: u128) {
     kani::assume(amount > 0); // the original's assume (a deposit moves at least one atom)
     let m = bond_shares_for_deposit(amount, b, value);
     if b == 0 {
@@ -56,14 +66,14 @@ fn kani_weak_wc5_deposit_floor_full_u128() {
         match amount.checked_mul(b) {
             None => {
                 assert!(m.is_none(), "an overflowing amount * B fails closed");
-                kani::cover!(true, "overflow branch (unreachable at u8)");
             }
             Some(p) => {
                 let m = m.unwrap();
                 let mv = m.checked_mul(value);
                 assert!(mv.is_some_and(|mv| mv <= p), "rounds down: m * value <= amount * B");
                 assert!(mv.is_some_and(|mv| p - mv < value), "exact floor: amount * B < m * value + value");
-                kani::cover!(p % value == 0 && m > 0 && p > u64::MAX as u128, "exact, above u64");
+                kani::cover!(p % value == 0 && m > 0, "exact");
+                kani::cover!(p > u64::MAX as u128, "product above u64");
                 kani::cover!(p % value != 0, "floored");
             }
         }
@@ -80,10 +90,23 @@ fn kani_weak_wc5_deposit_floor_full_u128() {
 #[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
 #[kani::solver(cadical)]
 fn kani_weak_wc6_redemption_floor_full_u128() {
-    let b: u128 = kani::any();
-    let sh: u128 = kani::any();
-    let cb: u128 = kani::any();
-    let value: u128 = kani::any();
+    wc6_body(kani::any(), kani::any(), kani::any(), kani::any());
+}
+
+/// weak-1020 rev 2: the same body at u64 operands, z3 (see `kani_weak_wc5_deposit_floor_u64`).
+#[kani::proof]
+#[kani::stub_verified(crate::vault_lp_v18::mul_div_floor)]
+#[kani::solver(z3)]
+fn kani_weak_wc6_redemption_floor_u64() {
+    wc6_body(
+        kani::any::<u64>() as u128,
+        kani::any::<u64>() as u128,
+        kani::any::<u64>() as u128,
+        kani::any::<u64>() as u128,
+    );
+}
+
+fn wc6_body(b: u128, sh: u128, cb: u128, value: u128) {
     kani::assume(b > 0 && value <= cb); // the original's assume
     let pay = bond_atoms_for_redemption(sh, b, value);
     let cb2 = bond_claim_after_redemption(cb, sh, b);
@@ -109,8 +132,7 @@ fn kani_weak_wc6_redemption_floor_full_u128() {
         let p = p.unwrap();
         let sb = slice.checked_mul(b);
         assert!(sb.is_some_and(|sb| sb <= p && p - sb < b), "slice = floor(sh * C_b / B)");
-        kani::cover!(sh < b && c2 > 0 && slice > 0 && cb > u64::MAX as u128, "partial redemption above u64");
+        kani::cover!(sh < b && c2 > 0 && slice > 0, "partial redemption");
         kani::cover!(sh == b && cb > 0 && c2 == 0, "full redemption clears C_b");
     }
-    kani::cover!(sh <= b && cb2.is_none(), "claim product overflows (fails closed)");
 }

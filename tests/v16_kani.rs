@@ -1523,22 +1523,39 @@ fn kani_v16_ewma_mark_decode_preserves_wire_fields() {
 fn kani_v16_decode_rejects_trailing_bytes() {
     // weak-1020 D1: every tag the decoder accepts from ONE byte (zero payload) refuses one extra byte, and the
     // bare tag is accepted (so the refusal is due to the extra byte alone). Tag list read from the decoder.
+    // (rev 3. Rev 1 indexed the tag list with a symbolic index: the whole decoder went symbolic. Rev 2 iterated an
+    // array: the tag still reached decode through the array iterator's buffer, CBMC lost its constness, and the
+    // drop glue of `Result<Instruction>` (recursive through `InitMarketV19 { market: Box<Instruction> }`) unwound
+    // without bound. Rev 3: one call per LITERAL tag, and refused results are `mem::forget`-ed, never dropped.)
     let extra: u8 = kani::any();
-    let k: u8 = kani::any();
-    let tags = [1u8, 46, 54, 80, 81, 87, 116, 121];
-    kani::assume((k as usize) < tags.len());
-    let tag = tags[k as usize];
-    assert!(Instruction::decode(&[tag]).is_ok(), "the bare zero-payload tag decodes");
+    zero_payload_tag_refuses_extra(1, extra);
+    zero_payload_tag_refuses_extra(46, extra);
+    zero_payload_tag_refuses_extra(54, extra);
+    zero_payload_tag_refuses_extra(80, extra);
+    zero_payload_tag_refuses_extra(81, extra);
+    zero_payload_tag_refuses_extra(87, extra);
+    zero_payload_tag_refuses_extra(116, extra);
+    zero_payload_tag_refuses_extra(121, extra);
+    kani::cover!(extra == 0, "boundary: a zero trailing byte is still refused");
+}
+
+#[inline(always)]
+fn zero_payload_tag_refuses_extra(tag: u8, extra: u8) {
+    let ok = Instruction::decode(&[tag]);
+    assert!(ok.is_ok(), "the bare zero-payload tag decodes");
+    core::mem::forget(ok);
     let r = Instruction::decode(&[tag, extra]);
     assert!(r.is_err(), "zero-payload tag + 1 byte is refused");
-    kani::cover!(tag == 1 && r.is_err(), "InitPortfolio + byte refused");
-    kani::cover!(tag == 46 && r.is_err(), "ClaimResolvedPayoutTopup + byte refused");
-    kani::cover!(tag == 54 && r.is_err(), "SyncInsuranceLedger + byte refused");
-    kani::cover!(tag == 80 && r.is_err(), "CloseLpVault + byte refused");
-    kani::cover!(tag == 81 && r.is_err(), "CancelRedemption + byte refused");
-    kani::cover!(tag == 87 && r.is_err(), "WithdrawInsuranceReserveToStake + byte refused");
-    kani::cover!(tag == 116 && r.is_err(), "InitInsuranceUnits + byte refused");
-    kani::cover!(tag == 121 && r.is_err(), "CommitG9FeedAllowlist + byte refused");
+    kani::cover!(r.is_err(), "zero-payload tag + byte reached Err");
+    core::mem::forget(r);
+}
+
+#[inline(always)]
+fn bare_payload_tag_refused(tag: u8) {
+    let bare = Instruction::decode(&[tag]);
+    assert!(bare.is_err(), "a payload-bearing tag with no payload is refused");
+    kani::cover!(bare.is_err(), "bare payload-bearing tag reached Err");
+    core::mem::forget(bare);
 }
 
 fn assert_rejects_trailing_byte(ix: Instruction, extra: u8) {
@@ -1962,14 +1979,36 @@ fn kani_v16_zero_length_decode_rejects() {
     let r = Instruction::decode(&data);
     assert!(r.is_err());
     kani::cover!(r.is_err(), "empty input reached Err");
+    core::mem::forget(r);
     // weak-1020 D1: and every payload-bearing tag refuses its bare tag byte (a 1-byte prefix of its payload).
-    let k: u8 = kani::any();
-    let tags = [3u8, 4, 9, 24, 28, 35, 36, 37, 38, 39, 42, 43, 44, 45, 48, 49, 50, 51, 55, 56, 57, 58, 59, 62, 63, 64, 79];
-    kani::assume((k as usize) < tags.len());
-    let bare = Instruction::decode(&[tags[k as usize]]);
-    assert!(bare.is_err(), "a payload-bearing tag with no payload is refused");
-    kani::cover!(tags[k as usize] == 3 && bare.is_err(), "Deposit tag alone refused");
-    kani::cover!(tags[k as usize] == 79 && bare.is_err(), "SetLpVaultPaused tag alone refused");
+    // (rev 3: one call per literal tag; see kani_v16_decode_rejects_trailing_bytes.)
+    bare_payload_tag_refused(3);
+    bare_payload_tag_refused(4);
+    bare_payload_tag_refused(9);
+    bare_payload_tag_refused(24);
+    bare_payload_tag_refused(28);
+    bare_payload_tag_refused(35);
+    bare_payload_tag_refused(36);
+    bare_payload_tag_refused(37);
+    bare_payload_tag_refused(38);
+    bare_payload_tag_refused(39);
+    bare_payload_tag_refused(42);
+    bare_payload_tag_refused(43);
+    bare_payload_tag_refused(44);
+    bare_payload_tag_refused(45);
+    bare_payload_tag_refused(48);
+    bare_payload_tag_refused(49);
+    bare_payload_tag_refused(50);
+    bare_payload_tag_refused(51);
+    bare_payload_tag_refused(55);
+    bare_payload_tag_refused(56);
+    bare_payload_tag_refused(57);
+    bare_payload_tag_refused(58);
+    bare_payload_tag_refused(59);
+    bare_payload_tag_refused(62);
+    bare_payload_tag_refused(63);
+    bare_payload_tag_refused(64);
+    bare_payload_tag_refused(79);
 }
 
 #[kani::proof]
@@ -3428,6 +3467,8 @@ fn wire_exact(spec: &[u8], encoded: &[u8], extra: u8) -> Instruction {
     let long_r = Instruction::decode(&long);
     assert!(long_r.is_err(), "one trailing byte is refused");
     kani::cover!(short.is_err() && long_r.is_err(), "both malformed lengths reached Err");
+    core::mem::forget(short);
+    core::mem::forget(long_r);
     let ok = Instruction::decode(spec);
     assert!(ok.is_ok(), "the exact spec layout decodes");
     ok.unwrap()
@@ -3442,6 +3483,7 @@ fn assert_rejects_trailing_byte_sym(ix: Instruction, extra: u8) {
     let r = Instruction::decode(&long);
     assert!(r.is_err(), "payload + 1 byte refused");
     kani::cover!(r.is_err(), "trailing-byte refusal reached");
+    core::mem::forget(r);
 }
 
 /// weak-1020 D3 twin (pre-planned): u32 inputs (index up to 4.29e9 > 1e9, so the zero-rounding case exists here too).
