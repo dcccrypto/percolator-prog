@@ -1,0 +1,13 @@
+[package]
+name = "dexnative"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone NATIVE (not Kani) checks of the production DEX depth math, extracted verbatim by
+# extract.sh (--check proves byte-identity). v22kani GROW lane 2026-10-20.
+[workspace]
+
+[profile.release]
+overflow-checks = true
+debug-assertions = true

@@ -3,10 +3,11 @@
 //! (`kani_dex_isqrt_exact_u64`, `kani_dex_depth_floor_exact`, `kani_dex_valuation_floor`,
 //! `kani_dex_pin_check_all_or_nothing`). Every harness calls the PRODUCTION function.
 //! Report: ~/wt-v22kani-1020/reports/GROW.md. Run (one build, several harnesses):
-//!   cargo kani --tests --features devnet --harness <name> [--harness <name> ...]
+//!   (in kani/dexwrap) cargo kani --harness <name> [--harness <name> ...]
+//! Moved out of tests/ (2026-10-20 06:15Z): `cargo kani --tests` compiles every test target and
+//! the base's tests/v16_kani.rs does not compile (E0061, pre-existing, not GROW's). Here the wrapper
+//! is a plain path dependency (lib only, feature devnet).
 #![cfg(kani)]
-
-extern crate kani;
 
 use percolator_prog::depth_src_v22::*;
 

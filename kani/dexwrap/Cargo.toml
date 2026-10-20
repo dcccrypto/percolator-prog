@@ -1,0 +1,15 @@
+[package]
+name = "grow-dexwrap-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# v22kani GROW lane: Kani harnesses on the PRODUCTION depth_src_v22 functions of the wrapper lib
+# (path dependency, devnet flavour). Standalone so that only the lib (not every test target) builds.
+[workspace]
+
+[dependencies]
+percolator-prog = { path = "../..", features = ["devnet"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
