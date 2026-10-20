@@ -30,5 +30,9 @@ mod proofs;
 #[cfg(all(kani, not(feature = "nc")))]
 mod proofs_overnight;
 
+// v22kani GROW lane (2026-10-20): narrow-type order lemmas and the T7 split.
+#[cfg(all(kani, not(feature = "nc")))]
+mod proofs_grow;
+
 #[cfg(all(kani, feature = "nc"))]
 mod proofs_nc;
