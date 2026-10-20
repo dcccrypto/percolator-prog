@@ -551,3 +551,48 @@ fn g6_w_wd2_rescue_par_per_share_full() {
         kani::cover!(fits && dc > 0 && c > u64::MAX as u128, "COVER: claim grows, beyond u64");
     }
 }
+
+// ═══════════════ lever 1 (coordinator 14:3x): the chain restated in checked_mul form ONLY ═══════════════
+// No wrapping term anywhere: every product the lemma, its proof and its users mention is `checked_mul`,
+// so lemma terms and production terms are the same circuit kind. Each lemma is proved DIRECTLY (no stubs).
+
+/// Integer distributivity, checked form only, proved directly.
+#[kani::requires(x.checked_add(y).is_some())]
+#[kani::ensures(|_: &()| (x + y).checked_mul(z).is_none_or(|l| x.checked_mul(z).is_some_and(|xz| y.checked_mul(z).is_some_and(|yz| xz.checked_add(yz) == Some(l)))))]
+pub fn lem_dist_cc(x: u128, y: u128, z: u128) {}
+
+#[kani::proof_for_contract(lem_dist_cc)]
+fn g6c_dist_direct() {
+    let (x, y, z): (u128, u128, u128) = (kani::any(), kani::any(), kani::any());
+    lem_dist_cc(x, y, z);
+    kani::cover!(x > 0 && y > 0 && x.wrapping_add(y).checked_mul(z).is_some_and(|l| l > u64::MAX as u128), "COVER: both summands, beyond u64");
+}
+
+/// Monotonicity, checked form, proved directly (same statement as `lem_mono`; separate entry so the
+/// z3 run is its own row).
+#[kani::proof_for_contract(lem_mono)]
+fn g6c_mono_direct() {
+    let (x, y, z): (u128, u128, u128) = (kani::any(), kani::any(), kani::any());
+    lem_mono(x, y, z);
+    kani::cover!(x < y && z > 1 && y.checked_mul(z).is_some_and(|v| v > u64::MAX as u128), "COVER: strict, beyond u64");
+}
+
+/// D1 split (a): the production `mul_div_floor` meets the SPEC half of its contract (exact floor in
+/// remainder form, checked products), every u128 input. Plain proof, asserts the production spec fn.
+#[kani::proof]
+fn g6c_d1a_floor_spec_full() {
+    let (a, b, d): (u128, u128, u128) = (kani::any(), kani::any(), kani::any());
+    let r = mul_div_floor(a, b, d);
+    assert!(crate::vault_lp_v18::mul_div_floor_spec(a, b, d, r));
+    kani::cover!(r.is_some_and(|q| q > u64::MAX as u128) && d > 1, "COVER: quotient beyond u64");
+    kani::cover!(a.checked_mul(b).is_none() && d > 0, "COVER: overflow -> None");
+}
+
+/// D1 split (b): the RANGE half of the contract (`b <= d => q <= a`), every u128 input.
+#[kani::proof]
+fn g6c_d1b_floor_facts_full() {
+    let (a, b, d): (u128, u128, u128) = (kani::any(), kani::any(), kani::any());
+    let r = mul_div_floor(a, b, d);
+    assert!(crate::vault_lp_v18::mul_div_floor_facts(a, b, d, r));
+    kani::cover!(b <= d && r.is_some_and(|q| q > 0 && q < a) && a > u64::MAX as u128, "COVER: b <= d, strict, beyond u64");
+}
