@@ -3477,7 +3477,10 @@ fn wire_exact(spec: &[u8], encoded: &[u8], extra: u8) -> Instruction {
 /// weak-1020 D1: trailing byte refused for a payload with SYMBOLIC fields (not constants); the exact payload decodes.
 fn assert_rejects_trailing_byte_sym(ix: Instruction, extra: u8) {
     let data = ix.encode();
-    assert!(Instruction::decode(&data).is_ok(), "exact-length payload decodes");
+    core::mem::forget(ix);
+    let ok = Instruction::decode(&data);
+    assert!(ok.is_ok(), "exact-length payload decodes");
+    core::mem::forget(ok);
     let mut long = data.clone();
     long.push(extra);
     let r = Instruction::decode(&long);
@@ -3566,4 +3569,990 @@ fn fee_split_spec(fee: u128, c: u16, l: u16, i: u16) {
             kani::cover!(true, "overflow refusal reached (fee * bps beyond u128)");
         }
     }
+}
+
+// ===== weak-1020 rev 4: per-instruction splits of the rows that had no verdict / were not reached =====
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 35) of `kani_v16_ewma_mark_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag35_ewma_mark() {
+    let asset_index: u16 = kani::any();
+    let now_slot: u64 = kani::any();
+    let initial_mark_e6: u64 = kani::any();
+    let mark_ewma_halflife_slots: u64 = kani::any();
+    let mark_min_fee: u64 = kani::any();
+    let push_mark_e6: u64 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs.
+    let market_id: u64 = kani::any();
+    // TB-2a: trailing observation_sequence replay-protection counter on all four (+8 each).
+    let configure_ewma_seq: u64 = kani::any();
+    let push_ewma_seq: u64 = kani::any();
+    let configure_auth_seq: u64 = kani::any();
+    let push_auth_seq: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut configure = [0u8; 51];
+    configure[0] = 35;
+    configure[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    configure[3..11].copy_from_slice(&market_id.to_le_bytes());
+    configure[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    configure[19..27].copy_from_slice(&initial_mark_e6.to_le_bytes());
+    configure[27..35].copy_from_slice(&mark_ewma_halflife_slots.to_le_bytes());
+    configure[35..43].copy_from_slice(&mark_min_fee.to_le_bytes());
+    configure[43..51].copy_from_slice(&configure_ewma_seq.to_le_bytes());
+    let enc = Instruction::ConfigureEwmaMark {
+        market_id,
+        asset_index,
+        now_slot,
+        initial_mark_e6,
+        mark_ewma_halflife_slots,
+        mark_min_fee,
+        observation_sequence: configure_ewma_seq,
+    }
+    .encode();
+    match wire_exact(&configure, &enc, extra) {
+        Instruction::ConfigureEwmaMark {
+            market_id: got_market_id,
+            asset_index: got_asset_index,
+            now_slot: got_now,
+            initial_mark_e6: got_mark,
+            mark_ewma_halflife_slots: got_halflife,
+            mark_min_fee: got_min_fee,
+            observation_sequence: got_seq,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_asset_index, asset_index);
+            assert_eq!(got_now, now_slot);
+            assert_eq!(got_mark, initial_mark_e6);
+            assert_eq!(got_halflife, mark_ewma_halflife_slots);
+            assert_eq!(got_min_fee, mark_min_fee);
+            assert_eq!(got_seq, configure_ewma_seq);
+            kani::cover!(true, "tag 35 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 36) of `kani_v16_ewma_mark_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag36_ewma_mark() {
+    let asset_index: u16 = kani::any();
+    let now_slot: u64 = kani::any();
+    let initial_mark_e6: u64 = kani::any();
+    let mark_ewma_halflife_slots: u64 = kani::any();
+    let mark_min_fee: u64 = kani::any();
+    let push_mark_e6: u64 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs.
+    let market_id: u64 = kani::any();
+    // TB-2a: trailing observation_sequence replay-protection counter on all four (+8 each).
+    let configure_ewma_seq: u64 = kani::any();
+    let push_ewma_seq: u64 = kani::any();
+    let configure_auth_seq: u64 = kani::any();
+    let push_auth_seq: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut push = [0u8; 35];
+    push[0] = 36;
+    push[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    push[3..11].copy_from_slice(&market_id.to_le_bytes());
+    push[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    push[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
+    push[27..35].copy_from_slice(&push_ewma_seq.to_le_bytes());
+    let enc = Instruction::PushEwmaMark {
+        market_id,
+        asset_index,
+        now_slot,
+        mark_e6: push_mark_e6,
+        observation_sequence: push_ewma_seq,
+    }
+    .encode();
+    match wire_exact(&push, &enc, extra) {
+        Instruction::PushEwmaMark {
+            market_id: got_market_id,
+            asset_index: got_asset_index,
+            now_slot: got_now,
+            mark_e6: got_mark,
+            observation_sequence: got_seq,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_asset_index, asset_index);
+            assert_eq!(got_now, now_slot);
+            assert_eq!(got_mark, push_mark_e6);
+            assert_eq!(got_seq, push_ewma_seq);
+            kani::cover!(true, "tag 36 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 62) of `kani_v16_ewma_mark_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag62_ewma_mark() {
+    let asset_index: u16 = kani::any();
+    let now_slot: u64 = kani::any();
+    let initial_mark_e6: u64 = kani::any();
+    let mark_ewma_halflife_slots: u64 = kani::any();
+    let mark_min_fee: u64 = kani::any();
+    let push_mark_e6: u64 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs.
+    let market_id: u64 = kani::any();
+    // TB-2a: trailing observation_sequence replay-protection counter on all four (+8 each).
+    let configure_ewma_seq: u64 = kani::any();
+    let push_ewma_seq: u64 = kani::any();
+    let configure_auth_seq: u64 = kani::any();
+    let push_auth_seq: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut configure_auth = [0u8; 35];
+    configure_auth[0] = 62;
+    configure_auth[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    configure_auth[3..11].copy_from_slice(&market_id.to_le_bytes());
+    configure_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    configure_auth[19..27].copy_from_slice(&initial_mark_e6.to_le_bytes());
+    configure_auth[27..35].copy_from_slice(&configure_auth_seq.to_le_bytes());
+    let enc = Instruction::ConfigureAuthMark {
+        market_id,
+        asset_index,
+        now_slot,
+        initial_mark_e6,
+        observation_sequence: configure_auth_seq,
+    }
+    .encode();
+    match wire_exact(&configure_auth, &enc, extra) {
+        Instruction::ConfigureAuthMark {
+            market_id: got_market_id,
+            asset_index: got_asset_index,
+            now_slot: got_now,
+            initial_mark_e6: got_mark,
+            observation_sequence: got_seq,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_asset_index, asset_index);
+            assert_eq!(got_now, now_slot);
+            assert_eq!(got_mark, initial_mark_e6);
+            assert_eq!(got_seq, configure_auth_seq);
+            kani::cover!(true, "tag 62 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 63) of `kani_v16_ewma_mark_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag63_ewma_mark() {
+    let asset_index: u16 = kani::any();
+    let now_slot: u64 = kani::any();
+    let initial_mark_e6: u64 = kani::any();
+    let mark_ewma_halflife_slots: u64 = kani::any();
+    let mark_min_fee: u64 = kani::any();
+    let push_mark_e6: u64 = kani::any();
+    // Wave-2 TB-4: market_id: u64 trailing asset_index on all four of these ixs.
+    let market_id: u64 = kani::any();
+    // TB-2a: trailing observation_sequence replay-protection counter on all four (+8 each).
+    let configure_ewma_seq: u64 = kani::any();
+    let push_ewma_seq: u64 = kani::any();
+    let configure_auth_seq: u64 = kani::any();
+    let push_auth_seq: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    // tag 63, the 35-byte form (the 44-byte G8 depth form is a separate layout; one extra byte is neither).
+    let mut push_auth = [0u8; 35];
+    push_auth[0] = 63;
+    push_auth[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    push_auth[3..11].copy_from_slice(&market_id.to_le_bytes());
+    push_auth[11..19].copy_from_slice(&now_slot.to_le_bytes());
+    push_auth[19..27].copy_from_slice(&push_mark_e6.to_le_bytes());
+    push_auth[27..35].copy_from_slice(&push_auth_seq.to_le_bytes());
+    let enc = Instruction::PushAuthMark {
+        market_id,
+        asset_index,
+        now_slot,
+        mark_e6: push_mark_e6,
+        observation_sequence: push_auth_seq,
+    }
+    .encode();
+    match wire_exact(&push_auth, &enc, extra) {
+        Instruction::PushAuthMark {
+            market_id: got_market_id,
+            asset_index: got_asset_index,
+            now_slot: got_now,
+            mark_e6: got_mark,
+            observation_sequence: got_seq,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_asset_index, asset_index);
+            assert_eq!(got_now, now_slot);
+            assert_eq!(got_mark, push_mark_e6);
+            assert_eq!(got_seq, push_auth_seq);
+            kani::cover!(true, "tag 63 (35 B form) decoded");
+        }
+        _ => unreachable!(),
+    }
+    kani::cover!(initial_mark_e6 != mark_min_fee && now_slot != market_id, "u64 fields distinguishable");
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 38) of `kani_v16_permissionless_resolve_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag38_permissionless_resolve() {
+    let stale_slots: u64 = kani::any();
+    let force_close_delay_slots: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    // Wave-2 TB-4: asset_generation_frontier: u64 is a LEADING field (before stale_slots).
+    let asset_generation_frontier: u64 = kani::any();
+    // W3A-2: trailing policy_sequence replay-protection counter (25 -> 33).
+    let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut configure = [0u8; 33];
+    configure[0] = 38;
+    configure[1..9].copy_from_slice(&asset_generation_frontier.to_le_bytes());
+    configure[9..17].copy_from_slice(&stale_slots.to_le_bytes());
+    configure[17..25].copy_from_slice(&force_close_delay_slots.to_le_bytes());
+    configure[25..33].copy_from_slice(&policy_sequence.to_le_bytes());
+    let enc = Instruction::ConfigurePermissionlessResolve {
+        asset_generation_frontier,
+        stale_slots,
+        force_close_delay_slots,
+        policy_sequence,
+    }
+    .encode();
+    match wire_exact(&configure, &enc, extra) {
+        Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: got_frontier,
+            stale_slots: got_stale,
+            force_close_delay_slots: got_delay,
+            policy_sequence: got_seq,
+        } => {
+            assert_eq!(got_frontier, asset_generation_frontier);
+            assert_eq!(got_stale, stale_slots);
+            assert_eq!(got_delay, force_close_delay_slots);
+            assert_eq!(got_seq, policy_sequence);
+            kani::cover!(true, "tag 38 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 39) of `kani_v16_permissionless_resolve_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag39_permissionless_resolve() {
+    let stale_slots: u64 = kani::any();
+    let force_close_delay_slots: u64 = kani::any();
+    let now_slot: u64 = kani::any();
+    // Wave-2 TB-4: asset_generation_frontier: u64 is a LEADING field (before stale_slots).
+    let asset_generation_frontier: u64 = kani::any();
+    // W3A-2: trailing policy_sequence replay-protection counter (25 -> 33).
+    let policy_sequence: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut resolve = [0u8; 9];
+    resolve[0] = 39;
+    resolve[1..9].copy_from_slice(&now_slot.to_le_bytes());
+    let enc = Instruction::ResolveStalePermissionless { now_slot }.encode();
+    match wire_exact(&resolve, &enc, extra) {
+        Instruction::ResolveStalePermissionless { now_slot: got } => {
+            assert_eq!(got, now_slot);
+            kani::cover!(true, "tag 39 decoded");
+        }
+        _ => unreachable!(),
+    }
+    kani::cover!(stale_slots != force_close_delay_slots, "the two u64 fields distinguishable");
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 43) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag43_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut forfeit = [0u8; 35];
+    forfeit[0] = 43;
+    forfeit[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+    forfeit[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+    forfeit[17..19].copy_from_slice(&asset_index.to_le_bytes());
+    forfeit[19..35].copy_from_slice(&b_loss_atom_budget.to_le_bytes());
+    let enc = Instruction::ForfeitRecoveryLeg { portfolio_id, position_epoch, asset_index, b_loss_atom_budget }.encode();
+    match wire_exact(&forfeit, &enc, extra) {
+        Instruction::ForfeitRecoveryLeg { portfolio_id: a, position_epoch: b, asset_index: c, b_loss_atom_budget: d } => {
+            assert_eq!((a, b, c, d), (portfolio_id, position_epoch, asset_index, b_loss_atom_budget));
+            kani::cover!(true, "tag 43 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 44) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag44_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut rebalance = [0u8; 35];
+    rebalance[0] = 44;
+    rebalance[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+    rebalance[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+    rebalance[17..19].copy_from_slice(&asset_index.to_le_bytes());
+    rebalance[19..35].copy_from_slice(&reduce_q.to_le_bytes());
+    let enc = Instruction::RebalanceReduce { portfolio_id, position_epoch, asset_index, reduce_q }.encode();
+    match wire_exact(&rebalance, &enc, extra) {
+        Instruction::RebalanceReduce { portfolio_id: a, position_epoch: b, asset_index: c, reduce_q: d } => {
+            assert_eq!((a, b, c, d), (portfolio_id, position_epoch, asset_index, reduce_q));
+            kani::cover!(true, "tag 44 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 45) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag45_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut finalize = [0u8; 4];
+    finalize[0] = 45;
+    finalize[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    finalize[3] = side;
+    let enc = Instruction::FinalizeResetSide { asset_index, side }.encode();
+    match wire_exact(&finalize, &enc, extra) {
+        Instruction::FinalizeResetSide { asset_index: a, side: s } => {
+            assert_eq!((a, s), (asset_index, side));
+            kani::cover!(true, "tag 45 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 64) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag64_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut force_close = [0u8; 27];
+    force_close[0] = 64;
+    force_close[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    force_close[3..11].copy_from_slice(&now_slot.to_le_bytes());
+    force_close[11..27].copy_from_slice(&close_q.to_le_bytes());
+    let enc = Instruction::ForceCloseAbandonedAsset { asset_index, now_slot, close_q }.encode();
+    match wire_exact(&force_close, &enc, extra) {
+        Instruction::ForceCloseAbandonedAsset { asset_index: a, now_slot: n, close_q: q } => {
+            assert_eq!((a, n, q), (asset_index, now_slot, close_q));
+            kani::cover!(true, "tag 64 decoded");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 46) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag46_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let claim = [46u8];
+    let enc = Instruction::ClaimResolvedPayoutTopup.encode();
+    match wire_exact(&claim, &enc, extra) {
+        Instruction::ClaimResolvedPayoutTopup => kani::cover!(true, "tag 46 decoded"),
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 48) of `kani_v16_recovery_close_progress_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag48_recovery_close_progress() {
+    // weak-1020 D1. Spec layouts:
+    //   43 ForfeitRecoveryLeg: portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, budget u128 @19 (35 B)
+    //   44 RebalanceReduce:    portfolio_id u64 @1, position_epoch u64 @9, asset_index u16 @17, reduce_q u128 @19 (35 B)
+    //   45 FinalizeResetSide:  asset_index u16 @1, side u8 @3 (4 B)
+    //   64 ForceCloseAbandonedAsset: asset_index u16 @1, now_slot u64 @3, close_q u128 @11 (27 B)
+    //   46 ClaimResolvedPayoutTopup: tag only (1 B)
+    //   48 SyncMaintenanceFee: now_slot u64 @1 (9 B)
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+    let b_loss_atom_budget: u128 = kani::any();
+    let reduce_q: u128 = kani::any();
+    let close_q: u128 = kani::any();
+    let now_slot: u64 = kani::any();
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    let mut sync_fee = [0u8; 9];
+    sync_fee[0] = 48;
+    sync_fee[1..9].copy_from_slice(&now_slot.to_le_bytes());
+    let enc = Instruction::SyncMaintenanceFee { now_slot }.encode();
+    match wire_exact(&sync_fee, &enc, extra) {
+        Instruction::SyncMaintenanceFee { now_slot: got } => {
+            assert_eq!(got, now_slot);
+            kani::cover!(true, "tag 48 decoded");
+        }
+        _ => unreachable!(),
+    }
+    kani::cover!(close_q == u128::MAX && side == u8::MAX, "boundary: close_q MAX, side 255");
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 56) of `kani_v16_domain_insurance_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag56_domain_insurance() {
+    // v17: domain fields are u16 (not u8).
+    let domain: u16 = kani::any();
+    let amount: u128 = kani::any();
+    // INTEGRATION: locked wire order for tag 56 (runbook §4): domain,
+    // market_id, intent_id, authority_epoch, amount.
+    let market_id: u64 = kani::any();
+    let intent_id: u64 = kani::any();
+    let authority_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    // TopUpInsuranceDomain: tag(1) + domain(u16=2) + market_id(u64=8) +
+    // intent_id(u64=8) + authority_epoch(u64=8) + amount(u128=16) = 43 bytes.
+    let mut top_up = [0u8; 43];
+    top_up[0] = 56;
+    top_up[1..3].copy_from_slice(&domain.to_le_bytes());
+    top_up[3..11].copy_from_slice(&market_id.to_le_bytes());
+    top_up[11..19].copy_from_slice(&intent_id.to_le_bytes());
+    top_up[19..27].copy_from_slice(&authority_epoch.to_le_bytes());
+    top_up[27..43].copy_from_slice(&amount.to_le_bytes());
+    let enc = Instruction::TopUpInsuranceDomain { market_id, intent_id, domain, amount, authority_epoch }.encode();
+    match wire_exact(&top_up, &enc, extra) {
+        Instruction::TopUpInsuranceDomain {
+            market_id: got_market_id,
+            intent_id: got_intent_id,
+            domain: got_domain,
+            amount: got_amount,
+            authority_epoch: got_epoch,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_intent_id, intent_id);
+            assert_eq!(got_epoch, authority_epoch);
+            assert_eq!(got_domain, domain);
+            assert_eq!(got_amount, amount);
+            kani::cover!(true, "tag 56 decoded as TopUpInsuranceDomain");
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// weak-1020 D1 split (rev 4): one instruction (tag 57) of `kani_v16_domain_insurance_decode_preserves_wire_fields`; the row = the conjunction of its splits.
+#[kani::proof]
+fn kani_weak_d1_tag57_domain_insurance() {
+    // v17: domain fields are u16 (not u8).
+    let domain: u16 = kani::any();
+    let amount: u128 = kani::any();
+    // INTEGRATION: locked wire order for tag 56 (runbook §4): domain,
+    // market_id, intent_id, authority_epoch, amount.
+    let market_id: u64 = kani::any();
+    let intent_id: u64 = kani::any();
+    let authority_epoch: u64 = kani::any();
+    let extra: u8 = kani::any();
+
+    // v17: tag 57 is now WithdrawInsuranceAsset { asset_index: u16, amount: u128,
+    // authority_epoch: u64 }. W3A-1: tag(1) + asset_index(u16=2) + market_id(u64=8) +
+    // amount(u128=16) + authority_epoch(u64=8) = 35 bytes.
+    let mut withdraw = [0u8; 35];
+    let asset_index: u16 = kani::any();
+    let withdraw_authority_epoch: u64 = kani::any();
+    withdraw[0] = 57;
+    withdraw[1..3].copy_from_slice(&asset_index.to_le_bytes());
+    withdraw[3..11].copy_from_slice(&market_id.to_le_bytes());
+    withdraw[11..27].copy_from_slice(&amount.to_le_bytes());
+    withdraw[27..35].copy_from_slice(&withdraw_authority_epoch.to_le_bytes());
+    let enc = Instruction::WithdrawInsuranceAsset {
+        market_id,
+        asset_index,
+        amount,
+        authority_epoch: withdraw_authority_epoch,
+    }
+    .encode();
+    match wire_exact(&withdraw, &enc, extra) {
+        Instruction::WithdrawInsuranceAsset {
+            market_id: got_market_id,
+            asset_index: got_asset_index,
+            amount: got_amount,
+            authority_epoch: got_authority_epoch,
+        } => {
+            assert_eq!(got_market_id, market_id);
+            assert_eq!(got_asset_index, asset_index);
+            assert_eq!(got_amount, amount);
+            assert_eq!(got_authority_epoch, withdraw_authority_epoch);
+            kani::cover!(true, "tag 57 decoded as WithdrawInsuranceAsset");
+        }
+        _ => unreachable!(),
+    }
+    kani::cover!(domain == u16::MAX && amount == u128::MAX, "boundary: domain MAX, amount MAX");
+}
+
+/// weak-1020 D1 split (rev 4): tag 3 of `kani_v16_deposit_withdraw_decode_preserves_wire_fields` with a LITERAL tag (the array loop hid the tag constness).
+#[kani::proof]
+fn kani_weak_d1_tag3_deposit_withdraw() {
+    // weak-1020 D1: spec layout (tag 3/4: portfolio_id u64 @1, expected_sequence u64 @9, amount u128 @17; 33 B),
+    // built WITHOUT encode(); encode() must reproduce it; exact length both ways.
+    let portfolio_id: u64 = kani::any();
+    let expected_sequence: u64 = kani::any();
+    let amount: u128 = kani::any();
+    let extra: u8 = kani::any();
+    {
+        let tag = 3u8;
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&expected_sequence.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 3 {
+            Instruction::Deposit { portfolio_id, expected_sequence, amount }.encode()
+        } else {
+            Instruction::Withdraw { portfolio_id, expected_sequence, amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::Deposit { portfolio_id: a, expected_sequence: b, amount: c } if tag == 3 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 3 decoded as Deposit");
+            }
+            Instruction::Withdraw { portfolio_id: a, expected_sequence: b, amount: c } if tag == 4 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 4 decoded as Withdraw");
+            }
+            _ => unreachable!(),
+        }
+    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0, "boundary: amount == 0");
+    kani::cover!(portfolio_id == u64::MAX && expected_sequence == 0, "boundary: id MAX, sequence 0");
+}
+
+/// weak-1020 D1 split (rev 4): tag 4 of `kani_v16_deposit_withdraw_decode_preserves_wire_fields` with a LITERAL tag (the array loop hid the tag constness).
+#[kani::proof]
+fn kani_weak_d1_tag4_deposit_withdraw() {
+    // weak-1020 D1: spec layout (tag 3/4: portfolio_id u64 @1, expected_sequence u64 @9, amount u128 @17; 33 B),
+    // built WITHOUT encode(); encode() must reproduce it; exact length both ways.
+    let portfolio_id: u64 = kani::any();
+    let expected_sequence: u64 = kani::any();
+    let amount: u128 = kani::any();
+    let extra: u8 = kani::any();
+    {
+        let tag = 4u8;
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&expected_sequence.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 3 {
+            Instruction::Deposit { portfolio_id, expected_sequence, amount }.encode()
+        } else {
+            Instruction::Withdraw { portfolio_id, expected_sequence, amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::Deposit { portfolio_id: a, expected_sequence: b, amount: c } if tag == 3 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 3 decoded as Deposit");
+            }
+            Instruction::Withdraw { portfolio_id: a, expected_sequence: b, amount: c } if tag == 4 => {
+                assert_eq!((a, b, c), (portfolio_id, expected_sequence, amount));
+                kani::cover!(true, "tag 4 decoded as Withdraw");
+            }
+            _ => unreachable!(),
+        }
+    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0, "boundary: amount == 0");
+    kani::cover!(portfolio_id == u64::MAX && expected_sequence == 0, "boundary: id MAX, sequence 0");
+}
+
+/// weak-1020 D1 split (rev 4): tag 28 of `kani_v16_convert_and_cure_decode_preserves_wire_fields` with a LITERAL tag (the array loop hid the tag constness).
+#[kani::proof]
+fn kani_weak_d1_tag28_convert_and_cure() {
+    // weak-1020 D1: tag 28 / 42: portfolio_id u64 @1, position_epoch u64 @9, amount u128 @17; 33 B.
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let amount: u128 = kani::any();
+    let extra: u8 = kani::any();
+    {
+        let tag = 28u8;
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 28 {
+            Instruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount }.encode()
+        } else {
+            Instruction::CureAndCancelClose { portfolio_id, position_epoch, optional_deposit: amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::ConvertReleasedPnl { portfolio_id: a, position_epoch: b, amount: c } if tag == 28 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 28 decoded as ConvertReleasedPnl");
+            }
+            Instruction::CureAndCancelClose { portfolio_id: a, position_epoch: b, optional_deposit: c } if tag == 42 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 42 decoded as CureAndCancelClose");
+            }
+            _ => unreachable!(),
+        }
+    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0 && position_epoch == u64::MAX, "boundary: zero amount, epoch MAX");
+}
+
+/// weak-1020 D1 split (rev 4): tag 42 of `kani_v16_convert_and_cure_decode_preserves_wire_fields` with a LITERAL tag (the array loop hid the tag constness).
+#[kani::proof]
+fn kani_weak_d1_tag42_convert_and_cure() {
+    // weak-1020 D1: tag 28 / 42: portfolio_id u64 @1, position_epoch u64 @9, amount u128 @17; 33 B.
+    let portfolio_id: u64 = kani::any();
+    let position_epoch: u64 = kani::any();
+    let amount: u128 = kani::any();
+    let extra: u8 = kani::any();
+    {
+        let tag = 42u8;
+        let mut spec = [0u8; 33];
+        spec[0] = tag;
+        spec[1..9].copy_from_slice(&portfolio_id.to_le_bytes());
+        spec[9..17].copy_from_slice(&position_epoch.to_le_bytes());
+        spec[17..33].copy_from_slice(&amount.to_le_bytes());
+        let enc = if tag == 28 {
+            Instruction::ConvertReleasedPnl { portfolio_id, position_epoch, amount }.encode()
+        } else {
+            Instruction::CureAndCancelClose { portfolio_id, position_epoch, optional_deposit: amount }.encode()
+        };
+        match wire_exact(&spec, &enc, extra) {
+            Instruction::ConvertReleasedPnl { portfolio_id: a, position_epoch: b, amount: c } if tag == 28 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 28 decoded as ConvertReleasedPnl");
+            }
+            Instruction::CureAndCancelClose { portfolio_id: a, position_epoch: b, optional_deposit: c } if tag == 42 => {
+                assert_eq!((a, b, c), (portfolio_id, position_epoch, amount));
+                kani::cover!(true, "tag 42 decoded as CureAndCancelClose");
+            }
+            _ => unreachable!(),
+        }
+    }
+    kani::cover!(amount == u128::MAX, "boundary: amount == u128::MAX");
+    kani::cover!(amount == 0 && position_epoch == u64::MAX, "boundary: zero amount, epoch MAX");
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `InitPortfolio` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_InitPortfolio() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::InitPortfolio, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `Deposit` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_Deposit() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::Deposit { portfolio_id: id, expected_sequence: seq, amount }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `Withdraw` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_Withdraw() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::Withdraw { portfolio_id: id, expected_sequence: seq, amount }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `TopUpInsurance` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_TopUpInsurance() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::TopUpInsurance { market_id: id, intent_id: seq, amount, authority_epoch: epoch },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `TopUpBackingBucket` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_TopUpBackingBucket() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::TopUpBackingBucket {
+            market_id: id,
+            intent_id: seq,
+            domain,
+            amount,
+            expiry_slot: epoch,
+            authority_epoch: epoch,
+        },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `WithdrawBackingBucket` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_WithdrawBackingBucket() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::WithdrawBackingBucket { market_id: id, domain, amount, authority_epoch: epoch },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `WithdrawInsurance` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_WithdrawInsurance() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::WithdrawInsurance { amount }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `WithdrawInsuranceAsset` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_WithdrawInsuranceAsset() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::WithdrawInsuranceAsset { market_id: id, asset_index: domain, amount, authority_epoch: epoch },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `SwapSecondaryForPrimary` (split of `kani_v16_custody_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_SwapSecondaryForPrimary() {
+    let extra: u8 = kani::any();
+    let (id, seq, epoch): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let domain: u16 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::SwapSecondaryForPrimary { amount, authority_epoch: epoch }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `ConvertReleasedPnl` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_ConvertReleasedPnl() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::ConvertReleasedPnl { portfolio_id: id, position_epoch: epoch, amount },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `CloseResolved` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_CloseResolved() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::CloseResolved { fee_rate_per_slot: amount }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `CureAndCancelClose` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_CureAndCancelClose() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::CureAndCancelClose { portfolio_id: id, position_epoch: epoch, optional_deposit: amount },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `ForfeitRecoveryLeg` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_ForfeitRecoveryLeg() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::ForfeitRecoveryLeg { portfolio_id: id, position_epoch: epoch, asset_index, b_loss_atom_budget: amount },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `RebalanceReduce` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_RebalanceReduce() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::RebalanceReduce { portfolio_id: id, position_epoch: epoch, asset_index, reduce_q: amount },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `FinalizeResetSide` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_FinalizeResetSide() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::FinalizeResetSide { asset_index, side }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `ForceCloseAbandonedAsset` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_ForceCloseAbandonedAsset() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::ForceCloseAbandonedAsset { asset_index, now_slot: slot, close_q: amount },
+        extra,
+    );
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `ClaimResolvedPayoutTopup` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_ClaimResolvedPayoutTopup() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::ClaimResolvedPayoutTopup, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `RefineResolvedUnreceiptedBound` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_RefineResolvedUnreceiptedBound() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(Instruction::RefineResolvedUnreceiptedBound { decrease_num: amount }, extra);
+}
+
+/// weak-1020 D1 split (rev 4): trailing byte for `ClosePortfolio` (split of `kani_v16_resolved_recovery_payloads_reject_trailing_byte`).
+#[kani::proof]
+fn kani_weak_d1_trail_ClosePortfolio() {
+    let extra: u8 = kani::any();
+    let (id, epoch, slot): (u64, u64, u64) = (kani::any(), kani::any(), kani::any());
+    let amount: u128 = kani::any();
+    let asset_index: u16 = kani::any();
+    let side: u8 = kani::any();
+
+    assert_rejects_trailing_byte_sym(
+        Instruction::ClosePortfolio { portfolio_id: id, expected_sequence: slot, position_epoch: epoch },
+        extra,
+    );
 }
