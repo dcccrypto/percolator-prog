@@ -1206,3 +1206,22 @@ fn kani_contlev_kappa_lambda_lag_never_looser_wide() {
     kani::cover!(th[2] == u64::MAX && q.seg == 1 && v > t[0] && v < t[1], "saturated T3: the [T1, T2) lag segment interpolates");
     kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
 }
+
+/// Q2c (replaces the NO-VERDICT Q2). Some on the program's domain, via the domain CORNER: with
+/// S1 (`kani_growth_s1_n_cap_q_structure`, PASS, full width: n_cap_q = None iff P = 0 or c·λ
+/// overflows, else `mul_div_floor(c·λ, S, 1e4·P)`) and the primitive contract (None iff the
+/// product overflows), n_cap_q is Some iff P > 0, c·λ and c·λ·S do not overflow u128. Products of
+/// non-negative integers are monotone, so if the corner (C_m = u64::MAX, λ = MAX_LAMBDA_BPS,
+/// S = POS_SCALE) does not overflow, no point of the domain does. This harness checks the corner
+/// on the REAL code (concrete inputs, any price >= 1).
+/// Mutant: a domain too large (C_m = u128::MAX): None.
+#[kani::proof]
+fn kani_contlev_n_cap_q_some_domain_corner() {
+    let p: u64 = kani::any();
+    kani::assume(p >= 1);
+    let c = u64::MAX as u128;
+    assert!(c.checked_mul(MAX_LAMBDA_BPS as u128).and_then(|x| x.checked_mul(1_000_000)).is_some(), "the corner product fits u128");
+    let r = n_cap_q(c, MAX_LAMBDA_BPS, p, 1_000_000);
+    assert!(r.is_some(), "Some at the domain's corner");
+    kani::cover!(p == 1 && r.is_some_and(|x| x > u64::MAX as u128), "corner, price 1: capacity beyond 2^64");
+}
