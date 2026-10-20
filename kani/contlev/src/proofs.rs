@@ -924,3 +924,285 @@ fn kani_contlev_n_cap_q_some_on_domain() {
     assert!(r.is_some(), "Some on the program's domain");
     kani::cover!(c == u64::MAX && l == MAX_LAMBDA_BPS && p == 1, "the domain's corner");
 }
+
+// ════ §11.3 addendum (2026-10-20): G-1 (the ABSOLUTE depth bound of N_cap) and full-u64
+// threshold variants of H4 / H6 / H7 (the passed versions drew T1 < 2^32 atoms, which excludes
+// the default config). Ledger §11.3. ════
+
+// recording model of `n_cap_q` that assumes exactly its proved spec (`spec::n_cap_q`: Q1, via
+// the proved `mul_div_floor` contract Q0) and records each call, so G1 can name the depth-cap
+// call's own result.
+static mut NE_N: usize = 0;
+static mut NE_C: [u128; 2] = [0; 2];
+static mut NE_L: [u32; 2] = [0; 2];
+static mut NE_R: [Option<u128>; 2] = [None; 2];
+
+fn n_cap_q_spec_record(c_m: u128, lambda_bps: u32, price_e6: u64, pos_scale: u128) -> Option<u128> {
+    let r: Option<u128> = kani::any();
+    kani::assume(crate::growth_v19::spec::n_cap_q(c_m, lambda_bps, price_e6, pos_scale, r));
+    unsafe {
+        let n = NE_N;
+        assert!(n < 2, "at most two n_cap_q calls (capital term, depth term)");
+        NE_C[n] = c_m;
+        NE_L[n] = lambda_bps;
+        NE_R[n] = r;
+        NE_N = n + 1;
+    }
+    r
+}
+
+/// G1 (coverage gap G-1). The absolute depth bound of `n_cap_g8_q_dials` on a clamp-enforced
+/// market, for ANY κ (so for the lagging κ_eff the program passes: `growth_n_cap_g8` reads
+/// `ctx.dials.kappa_bps`, v16_program.rs ~43389-43394, = H7 / M2's lagging curve), any λ, C_m,
+/// price, scale (full width). With fresh depth `Some(d)`, as three linear / same-term links:
+///   (a1) N_cap <= D (the depth term actually computed; 0 when its n_cap_q overflows);
+///   (a2) D · (1e4 · P) <= c_D · 1e4 · s, c_D = floor(d · κ / 1e4) (`n_cap_q`'s spec at λ 1x);
+///   (a3) c_D · 1e4 <= d · κ (floor(y/1e4)·1e4 <= y: maths, not re-proved);
+/// so N_cap · 1e4 · P <= d · κ · s (multiplication by non-negative constants is monotone).
+/// (c) depth None: N_cap = the capital rule `n_cap_q(C_m, min(stored λ, λ_depth))` exactly.
+/// (d) price 0: None.
+/// Mutant: the κ factor dropped (`d / BPS` for `d·κ / BPS`): "c_D = floor(d·κ / 1e4)" FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::n_cap_q, n_cap_q_spec_record)]
+fn kani_contlev_n_cap_absolute_depth_bound() {
+    let c_m: u128 = kani::any();
+    let stored: u32 = kani::any();
+    let lam_d: u32 = kani::any();
+    let kap: u32 = kani::any();
+    let depth: Option<u64> = kani::any();
+    let price: u64 = kani::any();
+    let ps: u128 = kani::any();
+    let n = n_cap_g8_q_dials(true, c_m, stored, lam_d, kap, depth, price, ps);
+    let lam_eff = if stored < lam_d { stored } else { lam_d };
+    unsafe {
+        assert!(NE_N >= 1 && NE_C[0] == c_m && NE_L[0] == lam_eff, "capital term: n_cap_q(C_m, λ_eff)");
+        if price == 0 {
+            assert!(n.is_none(), "(d) price 0: None");
+        }
+        match depth {
+            None => {
+                assert_eq!(n, NE_R[0], "(c) no depth: exactly the capital rule at λ_eff");
+            }
+            Some(d) => {
+                if let Some(x) = n {
+                    assert!(NE_N == 2 && NE_L[1] == DEFAULT_LAMBDA_BPS, "depth term: n_cap_q(c_D, 1x)");
+                    let c_d = NE_C[1];
+                    let dk = (d as u128) * (kap as u128);
+                    assert_eq!(c_d, dk / 10_000, "c_D = floor(d·κ / 1e4)");
+                    let dd = NE_R[1].unwrap_or(0);
+                    assert!(x <= dd, "(a1) N_cap <= the depth term");
+                    if let Some(q) = NE_R[1] {
+                        // (a2): the depth term's own spec, over the same terms (spec::n_cap_q)
+                        let den = crate::growth_v19::BPS.checked_mul(price as u128).unwrap();
+                        let num = c_d.checked_mul(10_000).and_then(|v| v.checked_mul(ps));
+                        assert!(num.is_some_and(|nm| q.checked_mul(den).is_some_and(|qd| qd <= nm)), "(a2) D·1e4·P <= c_D·1e4·s");
+                    }
+                    // (a3) c_D·1e4 <= d·κ is floor(y / 1e4)·1e4 <= y (Rust u128 `/` is floor): maths.
+                }
+            }
+        }
+        kani::cover!(depth.is_some_and(|d| d > 0) && n.is_some_and(|x| x > 0 && NE_R[1] == Some(x) && NE_R[0].is_some_and(|c| c > x)), "the depth cap binds");
+        kani::cover!(depth.is_some_and(|d| d > 0) && n.is_some_and(|x| x > 0 && NE_R[0] == Some(x) && NE_R[1].is_some_and(|q| q > x)), "the capital term binds");
+        kani::cover!(depth.is_none() && n.is_some_and(|x| x > 0), "no depth: capital rule");
+        kani::cover!(price == 0, "price 0");
+    }
+}
+
+/// G1b. Depth `Some(0)` with a non-zero price: N_cap = Some(0) whenever the capital term is
+/// Some, else None (an overflowing capital term fails closed). REAL `n_cap_q` / `mul_div_floor`
+/// (no model): the depth term is `n_cap_q(0, 1x, P, s)` = Some(0), so the comparison is over
+/// the same terms (review §11.3: the model version needed q·den = 0 ⇒ q = 0).
+/// Mutant: κ dropped does not change a zero depth; the meaningful G-1 mutant is G1's.
+#[kani::proof]
+fn kani_contlev_n_cap_zero_depth_is_zero() {
+    let c_m: u128 = kani::any();
+    let stored: u32 = kani::any();
+    let lam_d: u32 = kani::any();
+    let kap: u32 = kani::any();
+    let price: u64 = kani::any();
+    let ps: u128 = kani::any();
+    kani::assume(price > 0);
+    let n = n_cap_g8_q_dials(true, c_m, stored, lam_d, kap, Some(0), price, ps);
+    let lam_eff = if stored < lam_d { stored } else { lam_d };
+    let cap = n_cap_q(c_m, lam_eff, price, ps);
+    if cap.is_some() {
+        assert_eq!(n, Some(0), "(b) depth 0: N_cap 0");
+    } else {
+        assert!(n.is_none(), "an overflowing capital term fails closed");
+    }
+    kani::cover!(n == Some(0) && cap.is_some_and(|c| c > 0), "capital > 0, depth 0: closed");
+    kani::cover!(n.is_none(), "capital overflow: None");
+}
+
+/// H4w. H4 at FULL u64 thresholds (incl. the defaults and a saturated T3): anchors, brackets,
+/// segment containment, ends. Mutant: the step function for the interpolation: FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::log2_q16, log2_model)]
+#[kani::stub(crate::growth_v19::curve_interp, interp_model)]
+#[kani::unwind(8)]
+fn kani_contlev_curve_anchors_and_bounds_wide() {
+    let th = any_thresholds_wide();
+    let tab = any_table();
+    let t = u64t(tab);
+    let anc = curve_anchors(th);
+    let i: usize = kani::any();
+    kani::assume(i < 4);
+    if anc[i] > 0 && anc[i] != u64::MAX && (i == 0 || anc[i] > anc[i - 1]) {
+        assert_eq!(curve_u64(anc[i], th, t), t[i], "equal to the table at each anchor");
+    }
+    let d: u64 = kani::any();
+    let p = curve_pos(d, th);
+    let v = curve_value(p, t);
+    assert!(p.seg <= 4, "never the failure position");
+    assert!(v >= t[0] && v <= t[3], "inside [t0, t3]");
+    if p.seg >= 1 && p.seg <= 3 {
+        let k = p.seg as usize;
+        assert!(d >= anc[k - 1] && (d < anc[k] || anc[k] == u64::MAX), "the segment contains the depth");
+        assert!(p.num <= p.den);
+        assert!(v >= t[k - 1] && v <= t[k], "inside the segment's bracket");
+        if p.num == 0 {
+            assert_eq!(v, t[k - 1], "num = 0 reads the lower anchor value");
+        }
+        if p.den > 0 && p.num == p.den {
+            assert_eq!(v, t[k], "num = den reads the upper anchor value (continuity from the left)");
+        }
+    }
+    if d < anc[0] {
+        assert_eq!(v, t[0], "below anchor 0: t0");
+    }
+    if d >= th[2] && th[2] != u64::MAX {
+        assert_eq!(v, t[3], "from T3: t3");
+    }
+    if th[2] == u64::MAX {
+        assert!(v <= t[2], "saturated T3: never t3 (unless t2 = t3)");
+    }
+    let dflt = th[0] == 25_000_000_000 && th[1] == 100_000_000_000 && th[2] == 500_000_000_000;
+    kani::cover!(dflt && p.seg == 2 && v > t[1] && v < t[2], "default config, strictly between T1 and T2");
+    kani::cover!(dflt && p.seg == 4, "default config, past T3");
+    kani::cover!(th[2] == u64::MAX && p.seg == 3 && v > t[2 - 1], "saturated T3, inside [T2, MAX)");
+    kani::cover!(p.seg == 3 && p.den > 0 && p.num == p.den && t[2] < t[3], "top of a segment");
+    kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
+}
+
+/// H6w. H6 at FULL u64 thresholds (incl. the defaults and a saturated T3); an extra cover shows
+/// the wide range (T1 >= 2^32) is exercised.
+/// H6 (security review M-2: the stress cap stays STEPPED). Under a draw / real ADL / the h-lock
+/// the program's target is `target_ceiling_x100(grad, s, launch, L_tier, signal, stress_cap_x100(s,
+/// combined tier))` with `signal` the leverage curve at min(venue, book). The stepped cap is
+/// NEVER ABOVE the unstressed curve (the curve is `>= L_table(tier)` of the combined tier), so
+/// the stressed target is never above the unstressed one; it is exactly base caf062bd's
+/// `max(launch, min(signal, L_table(tier - s)))` capped at L_tier; and the ceiling in force
+/// (`min(stored, target)`) takes it at once.
+/// The program wiring (the gate's ctx at the combined tier, the push writer at the venue tier)
+/// lives in v16_program.rs, outside this crate: the LiteSVM test
+/// `contlev_m2_draw_at_200k_300k_400k_stores_the_stepped_5x` pins it (and fails on 3198539a).
+/// Mutants: `stress_cap_x100` reading `tier - s + 1`: "= base's stepped formula" (and "never
+/// above" at tier 0); the h-lock early return dropped in `target_ceiling_x100`: the h-lock call
+/// with no cap (`u16::MAX`) must still read launch; the curve `>= L_table(tier)` broken (e.g.
+/// the leverage curve lagging like κ): the first assert.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::log2_q16, log2_model)]
+#[kani::stub(crate::growth_v19::curve_interp, interp_model)]
+#[kani::unwind(13)]
+fn kani_contlev_stress_cap_stepped_under_curve_wide() {
+    let th = any_thresholds_wide();
+    let tab = any_table();
+    let d: u64 = kani::any();
+    let e: u64 = kani::any();
+    let st: u8 = kani::any();
+    kani::assume(st <= STRESS_HLOCK);
+    let tier = combined_tier(depth_tier_for(d, th), depth_tier_for(e, th));
+    let (dials, _) = smooth_dials_and_venue_l(d, e, th, tab);
+    let sig = dials.l_signal_x100;
+    let cap = stress_cap_x100(st, tier, tab);
+    let grad = graduation_on(true, 64, tier);
+    let (launch, lt) = (tab[0], tab[3]);
+    let t = target_ceiling_x100(grad, st, launch, lt, sig, cap);
+    let t0 = target_ceiling_x100(grad, STRESS_NONE, launch, lt, sig, stress_cap_x100(STRESS_NONE, tier, tab));
+    assert!(sig as u64 >= tab[tier as usize] as u64, "the curve at the smaller depth >= L_table(combined tier)");
+    if st >= STRESS_DRAW {
+        assert!(cap <= sig, "the stepped stress cap is never above the unstressed curve");
+    }
+    assert!(t <= t0, "stressed target <= unstressed target");
+    if st == STRESS_HLOCK || !grad {
+        assert_eq!(t, launch, "h-lock / no graduation: launch");
+    } else {
+        let stepped = tab[tier.saturating_sub(st) as usize];
+        let want = if st == STRESS_NONE { sig } else { core::cmp::min(sig, stepped) };
+        assert_eq!(t, core::cmp::min(core::cmp::max(launch, want), lt), "= base caf062bd's stepped formula");
+        if st == STRESS_DRAW || st == STRESS_ADL {
+            assert_eq!(t, core::cmp::min(core::cmp::max(launch, stepped), lt), "under stress the target does not depend on the curve");
+        }
+    }
+    assert_eq!(target_ceiling_x100(grad, STRESS_HLOCK, launch, lt, sig, u16::MAX), launch, "h-lock: launch whatever the cap");
+    let stored: u16 = kani::any();
+    let f = ceiling_in_force_x100(true, stored, t, launch, lt);
+    assert!(f <= t, "applied at once (in force <= target)");
+    kani::cover!(th[0] >= 1u64 << 32 && st == STRESS_DRAW && grad && tier == 2 && t == tab[1] && tab[1] < sig, "wide thresholds (T1 >= 2^32): draw at tier 2 reads the stepped L1");
+    kani::cover!(st == STRESS_DRAW && grad && tier == 2 && t < sig && t > launch, "draw at tier 2 binds above launch");
+    kani::cover!(st == STRESS_DRAW && grad && tier == 2 && sig > tab[2] && t == tab[1], "draw between T2 and T3: the stepped L1, not the curve");
+    kani::cover!(st == STRESS_ADL && grad && tier == 3 && t == tab[1] && tab[1] > launch, "ADL past T3: L1");
+    kani::cover!(st == STRESS_HLOCK && grad && t < t0, "h-lock cuts");
+    kani::cover!(st == STRESS_NONE && grad && t == sig && sig > tab[tier as usize], "unstressed: the curve, above the step");
+    kani::cover!(stored > t && f == t && st >= STRESS_DRAW, "cut at once from a higher stored ceiling");
+    kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
+}
+
+/// H7w. H7 at FULL u64 thresholds (incl. the defaults, a saturated T3 and a 4·T3 that
+/// saturates): the lagging κ / λ curve is never above the step, >= t0, t0 below and at T1, t1 at
+/// T2, t2 at T3 (T3 < MAX), t3 from 4·T3 (when 4·T3 does not saturate), the next value at the
+/// top of a segment, monotone; on the real κ / λ tables too.
+/// Mutant: κ / λ from the leading position (3198539a): "never above the step" FAILS.
+#[kani::proof]
+#[kani::stub(crate::growth_v19::log2_q16, log2_model)]
+#[kani::stub(crate::growth_v19::curve_interp, interp_model)]
+#[kani::unwind(13)]
+fn kani_contlev_kappa_lambda_lag_never_looser_wide() {
+    let th = any_thresholds_wide();
+    let tab = any_table();
+    let t = u64t(tab);
+    let d: u64 = kani::any();
+    let e: u64 = kani::any();
+    kani::assume(d <= e);
+    let tier = depth_tier_for(d, th) as usize;
+    let p = curve_pos(d, th);
+    let q = curve_pos_lag(p, d, th);
+    let v = curve_value(q, t);
+    assert!(q.seg <= 4, "never the failure position");
+    assert!(v <= t[tier], "never above the step");
+    assert!(v >= t[0]);
+    assert!(curve_value(q, KAPPA_TABLE_BPS) <= kappa_depth_bps(tier as u8) as u64, "κ <= κ_step");
+    assert!(curve_value(q, LAMBDA_DEPTH_TABLE_BPS) <= lambda_depth_bps(tier as u8) as u64, "λ <= λ_step");
+    if d <= th[0] {
+        assert_eq!(v, t[0], "up to and at T1: t0");
+    }
+    if d == th[1] {
+        assert_eq!(v, t[1], "at T2: t1");
+    }
+    if d == th[2] && th[2] != u64::MAX {
+        assert_eq!(v, t[2], "at T3: t2");
+    }
+    let top_ok = th[2] <= u64::MAX / KAPPA_LAG_TOP_MUL;
+    if !top_ok {
+        assert!(v <= t[2], "saturated T3 / 4·T3: never past t2");
+    }
+    if top_ok && d >= th[2] * KAPPA_LAG_TOP_MUL {
+        assert_eq!(v, t[3], "from 4·T3: t3");
+    }
+    if q.seg >= 1 && q.seg <= 3 && q.den > 0 && q.num == q.den {
+        assert_eq!(v, t[q.seg as usize], "top of a segment: the next value (continuity)");
+    }
+    let ve = curve_value(curve_pos_lag(curve_pos(e, th), e, th), t);
+    assert!(v <= ve, "monotone");
+    let dflt = th[0] == 25_000_000_000 && th[1] == 100_000_000_000 && th[2] == 500_000_000_000;
+    kani::cover!(dflt && q.seg == 1 && v > t[0] && v < t[1], "default config, strictly inside [T1, T2)");
+    kani::cover!(dflt && q.seg == 3 && v > t[2] && v < t[3], "default config, strictly inside [T3, 4·T3)");
+    kani::cover!(dflt && d >= th[2] * 4 && t[2] < t[3], "default config, past 4·T3");
+    kani::cover!(!top_ok && p.seg == 4 && q.seg == 3 && q.den == 0, "4·T3 saturates: flat top segment");
+    if th[2] == u64::MAX && d >= th[1] {
+        assert_eq!(v, t[1], "saturated T3: the lag is flat at t1 from T2 (fail closed)");
+    }
+    kani::cover!(th[2] == u64::MAX && d >= th[1] && q.seg == 2 && q.den == 0 && v == t[1] && t[1] < t[2], "saturated T3: lag flat at t1 from T2");
+    kani::cover!(th[2] == u64::MAX && q.seg == 1 && v > t[0] && v < t[1], "saturated T3: the [T1, T2) lag segment interpolates");
+    kani::cover!(unsafe { LG_N } > 0 && unsafe { IP_N } > 0, "both models ran (stubs applied)");
+}
