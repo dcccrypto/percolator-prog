@@ -967,6 +967,7 @@ fn bind_single(e: &mut Env, max_lev_bps: u32) -> Bound {
 /// deployed v18.2 bytes have no tag 94 at all (negative control: the P3 path does not
 /// exist on-chain today).
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_bind_survey() {
     for name in ["ansem", "collect", "murphy", "textit"] {
         let fx = load_fixture(name);
@@ -1019,6 +1020,7 @@ fn p3_fork_bind_survey() {
 /// accepts `LP_VAULT_BACKING_EXPIRY_SLOT` on a Fresh bucket. ANSEM and Murphy accept the
 /// deposit on both byte sets.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_earn_seed_blocked_by_foreign_fresh_bucket() {
     for (name, blocked) in [("ansem", false), ("collect", true), ("murphy", false), ("textit", true)] {
         let fx = load_fixture(name);
@@ -1214,6 +1216,7 @@ fn creator_of(e: &Env) -> Pubkey {
 /// LP's loss exceeds the junior. The "win paid by the junior, seniors untouched" invariant
 /// must then NOT hold as a whole, i.e. the assertion can fail.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_ansem_creator_win_is_paid_by_the_junior() {
     let fx = load_fixture("ansem");
     let mut e = env(&fx, Bytes::Candidate);
@@ -1392,6 +1395,7 @@ fn replay_drain(name: &str, live_lp: &str, live_taker: &str) {
 }
 
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_collect_drain_refused_with_80_not_49() {
     replay_drain(
         "collect",
@@ -1401,6 +1405,7 @@ fn p3_fork_collect_drain_refused_with_80_not_49() {
 }
 
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_murphy_drain_refused_with_80_not_49() {
     replay_drain(
         "murphy",
@@ -1424,6 +1429,7 @@ fn p3_fork_murphy_drain_refused_with_80_not_49() {
 /// Negative control: on the deployed bytes, the same short open against the LIVE LP fails
 /// with 49.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p3_fork_textit_both_sides_open_and_close() {
     let fx = load_fixture("textit");
     let mut d = env(&fx, Bytes::Deployed);

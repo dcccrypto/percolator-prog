@@ -415,6 +415,7 @@ fn show(label: &str, o: &Outcome) {
 /// Diagnostic dump of every fixture under both byte sets (asserts only that the
 /// fixture parses and the Clock is pinned). Run with `--nocapture` to see state.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_survey() {
     for name in ["collect", "murphy", "textit", "ansem"] {
         let fx = load_fixture(name);
@@ -576,6 +577,7 @@ fn replay_zero_capital_lp(name: &str, taker: &str, self_taker: Option<(&str, u32
 /// LP E5nysm… (owner 9sM73A… = asset_admin); taker GGMfwK… (owner AXa339…);
 /// self-owned taker JE7SHW… (owner 9sM73A…).
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_collect_zero_capital_lp() {
     replay_zero_capital_lp(
         "collect",
@@ -589,6 +591,7 @@ fn p1_fork_collect_zero_capital_lp() {
 /// LP EXgiHL… (owner AXa339… = asset_admin); taker 9noH7P… (owner 9sM73A…);
 /// self-owned taker CQwnpC… (owner AXa339…).
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_murphy_zero_capital_lp() {
     replay_zero_capital_lp(
         "murphy",
@@ -606,6 +609,7 @@ fn p1_fork_murphy_zero_capital_lp() {
 /// short side is still ResetPending. So the live TEXTIT replay is the same
 /// zero-capital shape as COLLECT/Murphy, and is pinned as such.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_textit_live_state() {
     replay_zero_capital_lp(
         "textit",
@@ -622,6 +626,7 @@ fn p1_fork_textit_live_state() {
 /// only on Custom(21). Candidate: both are SameOwnerTrade Custom(67) with the
 /// matcher never invoked.
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_ansem_self_owned_taker() {
     let fx = load_fixture("ansem");
     let lp_key = pk("2SewEcvfyyEx3HE8NL8jjH6YJdtzGvZKvWbS2QqxhtZP");
@@ -756,6 +761,7 @@ fn rewrite_portfolio_owner(e: &mut Env, k: &Pubkey, new_owner: &Pubkey) {
 }
 
 #[test]
+#[ignore = "v18.2 live-state replay (retired GnwdeQr markets, hard-coded pubkeys, v18.2 wrapper .so); the v2.2 wrapper reads the fixtures as Custom(1) InvalidVersion. Not re-pointable; v2.2 behaviour is covered by p1_lp_limits / p1_band_owner / p3_vault_lp"]
 fn p1_fork_synthetic_floored_lp_reduce_still_works() {
     let fx = load_fixture("ansem");
     let mut e = env(&fx, Bytes::Candidate);
