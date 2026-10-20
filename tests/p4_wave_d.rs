@@ -2288,12 +2288,13 @@ fn xprog_insurance_loss_spreads_pro_rata_over_stakers_and_classes() {
     }
 }
 
-/// XP-3: the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS pools only; a FEE_ONLY pool
-/// (no deployment, no risk) is refused.
+/// XP-3 (AUD-FC-B1 option C): the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS and
+/// FEE_ONLY pools; a legacy (risk_mode 0) pool is refused. The FEE_ONLY case is exercised by
+/// `b1_option_c_fee_only_pool_is_paid_the_staker_leg_by_tag_87` (tests/p1_close_fees.rs).
 #[test]
-fn xprog_fee_leg_refuses_fee_only_pool() {
+fn xprog_fee_leg_refuses_legacy_pool() {
     let mut w = P3::new();
-    let p = craft_pool(&mut w, 2, 1);
+    let p = craft_pool(&mut w, 0, 1);
     let admin = w.env.admin.insecure_clone();
     let (m, pid) = (w.env.market, w.env.program_id);
     stake_send(&mut w, vec![19], vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(p.pda, false), AccountMeta::new_readonly(p.vault_auth, false), AccountMeta::new(m, false), AccountMeta::new_readonly(pid, false)], &[&admin]).expect("bind");
@@ -2301,7 +2302,7 @@ fn xprog_fee_leg_refuses_fee_only_pool() {
     let (wv, wva) = (w.env.vault, w.env.vault_authority);
     let r = w.send_raw(vec![87], vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new_readonly(p.pda, false), AccountMeta::new(p.vault, false), AccountMeta::new(wv, false), AccountMeta::new_readonly(wva, false), AccountMeta::new_readonly(spl_token::ID, false)], &[]);
     let want = percolator_prog::error::PercolatorError::StakePoolModeMismatch as u32;
-    assert!(r.as_ref().err().map_or(false, |e| code(e) == Some(want)), "fee-only pool must be refused the fee leg: {r:?}");
+    assert!(r.as_ref().err().map_or(false, |e| code(e) == Some(want)), "legacy pool must be refused the fee leg: {r:?}");
 }
 
 /// Tag 101 with the units ledger appended (after [11] system program).

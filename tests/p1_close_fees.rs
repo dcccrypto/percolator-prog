@@ -1273,6 +1273,40 @@ fn ws1_first_loss_or_forged_pool_is_not_rebooked() {
     assert!(env.market_closed());
 }
 
+/// AUD-FC-B1 option C (PRODUCT DECISION, not deployed): a v5 FEE_ONLY pool (risk_mode 2) is
+/// owed the 16% staker leg. Tag 87 pays it into the pool vault (stake `AccrueFees` then books it
+/// to the stakers), CloseSlab given the pool does NOT re-book it onto the protocol leg, and the
+/// close then proceeds. NEGATIVE CONTROL: a legacy pool (risk_mode 0) is still refused 59 and
+/// its leg is still re-booked to the protocol (the ws1 test above).
+#[test]
+fn b1_option_c_fee_only_pool_is_paid_the_staker_leg_by_tag_87() {
+    let mut e = Env::build(true, false);
+    e.set_pool_risk_mode(2); // stake RISK_MODE_FEE_ONLY
+    let (mut env, fees) = terminal_empty_market_with_fees_in(e);
+    let stake0 = env.token_amount(env.stake_vault);
+    let d = env.withdraw_protocol_fee().expect("tag 84");
+    let protocol_claimed = env.token_amount(d) as u128;
+    let creator_owed = env.legs().creator_owed();
+    let d = env.withdraw_creator_fee(creator_owed).expect("tag 90");
+    let creator_claimed = env.token_amount(d) as u128;
+    // With the pool: the LP leg folds onto the staker leg (P1), but the staker leg is NOT orphaned.
+    env.close_slab_with_pool().expect("P1 step: LP leg onto the staker leg");
+    let legs1 = env.legs();
+    let owed = legs1.ins_accrued - legs1.ins_withdrawn;
+    assert!(owed > 0, "the FEE_ONLY staker leg is owed");
+    assert_custom(env.close_slab_with_pool(), 71, "FEE_ONLY (option C): the leg waits for tag 87, not re-booked");
+    assert_eq!(env.legs(), legs1, "nothing re-booked to the protocol");
+    env.withdraw_to_stake().expect("option C: tag 87 pays a FEE_ONLY pool");
+    let paid = env.token_amount(env.stake_vault) - stake0;
+    assert_eq!(paid as u128, owed, "the whole staker leg landed in the pool vault");
+    let legs2 = env.legs();
+    assert_eq!(legs2.ins_withdrawn, legs2.ins_accrued);
+    assert_eq!(fees, protocol_claimed + creator_claimed + paid as u128, "conservation to the atom");
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab once the staker leg is paid");
+    assert!(env.market_closed());
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. S2 audit 2026-10-17 (fee routing): the dead-share-floor gate must not pre-empt the
 //    orphaned-leg re-book. Every v2.2 market has an Earn (LP) vault, so its asset-0 long bucket

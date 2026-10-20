@@ -1355,9 +1355,15 @@ pub mod constants {
     pub const STAKE_POOL_OFF_DISCRIMINATOR: usize = 320;
     /// v5 `StakePool::risk_mode`: the 16% insurance fee leg (tag 87) is paid to FIRST_LOSS
     /// pools only (their stake is deployed into this market's insurance and absorbs its losses
-    /// through `InsuranceUnitsV20`); a FEE_ONLY pool carries no risk and is owed nothing.
+    /// through `InsuranceUnitsV20`); a FEE_ONLY pool carries no risk and was owed nothing (changed
+    /// by AUD-FC-B1 option C below).
     pub const STAKE_POOL_OFF_RISK_MODE: usize = 408;
     pub const STAKE_POOL_RISK_MODE_FIRST_LOSS: u8 = 1;
+    /// v5 `StakePool::risk_mode` FEE_ONLY (stake `RISK_MODE_FEE_ONLY`). AUD-FC-B1 option C
+    /// (DECISION, not deployed): a FEE_ONLY pool is also owed the 16% staker fee leg, so its
+    /// stakers earn the fees through stake `AccrueFees` instead of the leg being re-booked to
+    /// the protocol at CloseSlab.
+    pub const STAKE_POOL_RISK_MODE_FEE_ONLY: u8 = 2;
     pub const STAKE_POOL_OFF_VERSION: usize = 328;
 
     // ── Sweep NET-NEW: KIND-byte futures guard ──────────────────────────────
@@ -23879,8 +23885,8 @@ pub mod processor {
         // this market's losses via `FlushToInsurance`; this fee leg is their
         // compensation for exactly that exposure. Paying it to a pool that
         // carries no such exposure would be an unearned transfer.
-        // (8b) v5: FIRST_LOSS only (Phase 4 item 6: "the 16% staker fee leg is paid only to
-        // first-loss pools").
+        // (8b) v5: FIRST_LOSS or FEE_ONLY (AUD-FC-B1 option C; Phase 4 item 6 had "paid only to
+        // first-loss pools"). A legacy risk_mode 0 pool is still refused.
         if !pool.owed_staker_leg() {
             return Err(PercolatorError::StakePoolModeMismatch.into());
         }
@@ -23905,10 +23911,12 @@ pub mod processor {
 
     impl BoundStakePool {
         /// Steps (8) + (8b): is this pool owed the staker fee leg (tag 87 pays it)?
-        /// Insurance-LP mode AND v5 FIRST_LOSS; any other pool is owed nothing.
+        /// Insurance-LP mode AND v5 FIRST_LOSS or FEE_ONLY (AUD-FC-B1 option C); a legacy
+        /// (risk_mode 0) pool is owed nothing.
         fn owed_staker_leg(&self) -> bool {
             self.pool_mode == crate::constants::STAKE_POOL_MODE_INSURANCE_LP
-                && self.risk_mode == crate::constants::STAKE_POOL_RISK_MODE_FIRST_LOSS
+                && (self.risk_mode == crate::constants::STAKE_POOL_RISK_MODE_FIRST_LOSS
+                    || self.risk_mode == crate::constants::STAKE_POOL_RISK_MODE_FEE_ONLY)
         }
     }
 
