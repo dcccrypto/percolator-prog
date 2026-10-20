@@ -1210,7 +1210,7 @@ impl Replay {
         let red = state::derive_lp_redemption(&pid, &self.registry, &who.pubkey()).0;
         self.env.svm.expire_blockhash();
         self.env.send(
-            ProgInstruction::RequestRedeemLpShares { shares },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             vec![
                 AccountMeta::new(who.pubkey(), true),
                 AccountMeta::new(self.registry, false),
@@ -2443,7 +2443,7 @@ impl Replay {
         let red = self.redemption_pda(&who.pubkey());
         self.env.svm.expire_blockhash();
         let ix = match ext {
-            None => ProgInstruction::RequestRedeemLpShares { shares },
+            None => ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             Some((min_payout_atoms, keeper_ok)) => ProgInstruction::RequestRedeemLpSharesV22 {
                 shares,
                 min_payout_atoms,
@@ -3201,9 +3201,9 @@ fn sec_s5_wire_malleability() {
     for cut in 4..12 {
         assert!(ProgInstruction::decode(&ok77[..cut]).is_err(), "partial 77 trailer len {cut}");
     }
-    // legacy forms still decode
+    // the legacy 77 form still decodes; the floorless legacy 76 is retired (AUD-S1-18)
     assert!(ProgInstruction::decode(&ProgInstruction::ExecuteRedemption { domain: 0 }.encode()).is_ok());
-    assert!(ProgInstruction::decode(&ProgInstruction::RequestRedeemLpShares { shares: 1 }.encode()).is_ok());
+    assert!(ProgInstruction::decode(&ProgInstruction::RequestRedeemLpShares { shares: 1 }.encode()).is_err());
     // all-zero trailers refused (non-canonical)
     let mut z = ok76.clone();
     z[17..25].copy_from_slice(&0u64.to_le_bytes());
