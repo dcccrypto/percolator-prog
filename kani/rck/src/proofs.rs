@@ -168,3 +168,20 @@ fn kani_rck_g3_composed_depth_reader() {
     kani::cover!(!ever && fresh.is_none() && c1.is_none(), "never had depth: None");
     kani::cover!(ever && n1 < lgs && lg > 0 && s1 == Some(lg.min(twv)), "future last-good stamp: no decay");
 }
+
+/// RCK-4 (G-2, the ceiling third of `kani_g8_off_band_identity`, which is NV under cadical 900 s
+/// and z3 2400 s because of its u128 n_cap parts, proved by RCK-1/2 instead): off the clamp the
+/// ceiling in force is exactly `min(L_launch, L_tier)`, whatever the stored ceiling and target.
+/// Mutant: off-band `min(stored, launch)` (reads the stored ceiling off the clamp) -> FAIL.
+#[kani::proof]
+fn kani_rck_g2_ceiling_off_band_is_launch() {
+    let stored: u16 = kani::any();
+    let tgt: u16 = kani::any();
+    let la: u16 = kani::any();
+    let lt: u16 = kani::any();
+    let f = ceiling_in_force_x100(false, stored, tgt, la, lt);
+    assert_eq!(f, la.min(lt), "off-band: launch, never the stored / target ceiling");
+    kani::cover!(stored > la.min(lt) && tgt > la.min(lt), "a graduated stored ceiling and target ignored");
+    kani::cover!(stored < la.min(lt), "a stored ceiling below launch ignored too");
+    kani::cover!(la > lt && f == lt, "L_tier binds");
+}
