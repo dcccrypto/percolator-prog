@@ -763,7 +763,8 @@ impl Env {
         let mut accounts = vec![
             AccountMeta::new(signer.pubkey(), true),
             AccountMeta::new_readonly(self.program_data, false),
-            AccountMeta::new_readonly(self.market, false),
+            // F-3: tag 123 writes the pin bit into the market's growth record.
+            AccountMeta::new(self.market, false),
             AccountMeta::new(pda, false),
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         ];
@@ -826,8 +827,8 @@ impl Env {
 /// CHILLHOUSE (PumpSwap, SPL Token): tag 123 creates the PDA with the verified pin; a mode-2
 /// push stores the program-computed depth 2,027,034,782 (base 171,449,177,380,421 atoms at the
 /// 12,000,000 per-lot mark, lot_exp 4: value 205,739,012,856) with source 2, stamped now; a later
-/// mode-2 push rotates it; afterwards the 35 B form zeroes the depth exactly as before and mode 1
-/// still stores an attested depth (source 1).
+/// mode-2 push rotates it; afterwards the 35 B form zeroes the depth exactly as before. F-3: the
+/// pin sets `DEPTH_DEX_PINNED` and a keeper-attested (mode 1) push is refused while it is set.
 #[test]
 fn c_set_depth_source_and_mode2_push_chillhouse() {
     let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
@@ -847,14 +848,14 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     let dex = env.dex_accounts(chill());
     let cu_dex = env.push(2, 0, &dex).expect("mode 2 push");
     let g = env.growth();
-    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 0, growth_v19::DEPTH_SOURCE_DEX));
+    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 0, growth_v19::DEPTH_SOURCE_DEX | growth_v19::DEPTH_DEX_PINNED));
     assert_eq!(g.depth_slot, env.slot);
     // second sample in a later slot: rotates
     env.warp(1);
     env.push(2, 0, &dex).expect("mode 2 push 2");
     let g = env.growth();
     // merged with the tiers branch: byte 44 = source 2 | DEPTH_PREV_REAL | DEPTH_EVER
-    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 2_027_034_782, 2 | growth_v19::DEPTH_PREV_REAL | growth_v19::DEPTH_EVER));
+    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (2_027_034_782, 2_027_034_782, 2 | growth_v19::DEPTH_PREV_REAL | growth_v19::DEPTH_EVER | growth_v19::DEPTH_DEX_PINNED));
     assert_eq!(growth_v19::effective_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, env.slot), 2_027_034_782);
     assert_eq!(growth_v19::fresh_depth_e6(g.depth_e6, g.depth_prev_e6, g.depth_slot, g.depth_source, env.slot), Some(2_027_034_782));
     // R2-M1 + round 3 D-I1: the market's first fresh reading is min(r, T1 / 16)
@@ -863,16 +864,16 @@ fn c_set_depth_source_and_mode2_push_chillhouse() {
     env.warp(1);
     let cu_35 = env.push(255, 0, &[]).expect("35 B push");
     let g = env.growth();
-    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 2_027_034_782, growth_v19::DEPTH_PREV_REAL | growth_v19::DEPTH_EVER));
+    assert_eq!((g.depth_e6, g.depth_prev_e6, g.depth_source), (0, 2_027_034_782, growth_v19::DEPTH_PREV_REAL | growth_v19::DEPTH_EVER | growth_v19::DEPTH_DEX_PINNED));
     // CU: mode 2 costs the four account reads, the pin check, the isqrt and one log line on
     // top of the 35 B push (incl. the transaction's compute-budget instruction).
     eprintln!("CU mode2={cu_dex} 35B={cu_35} delta={}", cu_dex.saturating_sub(cu_35));
     assert!(cu_dex < cu_35 + 40_000, "mode 2 overhead bounded: {cu_dex} vs {cu_35}");
-    // mode 1 still attested
+    // F-3: mode 1 (keeper-attested) is refused on the pinned market; nothing is written
     env.warp(1);
-    env.push(1, 30_000_000_000, &[]).expect("mode 1 push");
-    let g = env.growth();
-    assert_eq!((g.depth_e6, g.depth_source), (30_000_000_000, 1 | growth_v19::DEPTH_EVER));
+    let before = env.snapshot();
+    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 on a DEX-pinned market");
+    assert_eq!(env.snapshot(), before, "a refused attested push writes nothing");
     // Coordinator ruling (merge): a REAL on-chain zero depth (mode 2, the pool's asset vault
     // emptied: STATE POKE of the token amount) is a fresh reading of 0 at once: DEPTH_EVER, every
     // reader 0 through the time-weighted window (the κ cap is 0 on a clamp-enforced market),
@@ -1269,4 +1270,142 @@ fn c_mode2_flash_liquidity_is_rate_limited() {
     env.push(2, 0, &dex).expect("honest 1");
     // down at once to the window minimum: the honest reading in whole tokens (floor)
     assert_eq!(env.growth().depth_last_good_e6, real / 1_000_000 * 1_000_000, "min(real, inflated) = real: down at once");
+}
+
+// ── v2.2 DEATH F-3 (= SEC-RC L-2) and SEC-RC L-1 ─────────────────────────────────────────────
+
+/// F-3: a keeper-attested (mode 1) depth push is refused (129) while the market is pinned to its
+/// DEX pool, with nothing written (sequence not consumed). Before the pin and after the UA clears
+/// it, mode 1 lands as before. The 35 B form, mode 0 and mode 2 stay allowed while pinned, and
+/// none of them drops the pin bit. On 75fca911 the mode-1 push lands and replaces the pool's
+/// reading (source 2 -> 1), which is the finding.
+#[test]
+fn f3_attested_depth_refused_while_dex_pinned() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    let dex = env.dex_accounts(chill());
+    // CONTROL: no pin yet, mode 1 lands (source 1)
+    env.warp(1);
+    env.push(1, 30_000_000_000, &[]).expect("mode 1 before any pin");
+    assert_eq!(growth_v19::depth_source_of(env.growth().depth_source), growth_v19::DEPTH_SOURCE_ATTESTED);
+    assert!(!growth_v19::depth_dex_pinned(env.growth().depth_source));
+    // the pin sets the bit at once (before any mode-2 reading)
+    env.set_source(chill()).expect("pin");
+    assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "tag 123 op 1 sets DEPTH_DEX_PINNED");
+    env.warp(1);
+    let before = env.snapshot();
+    assert_err(&env.push(1, 1_000_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 right after the pin");
+    assert_eq!(env.snapshot(), before, "nothing written, sequence not consumed");
+    env.push(2, 0, &dex).expect("mode 2 while pinned");
+    let g = env.growth();
+    assert_eq!(growth_v19::depth_source_of(g.depth_source), growth_v19::DEPTH_SOURCE_DEX);
+    assert!(growth_v19::depth_dex_pinned(g.depth_source));
+    env.warp(1);
+    let before = env.snapshot();
+    assert_err(&env.push(1, 1_000_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after a DEX reading (the ncc-liedex lie)");
+    assert_eq!(env.snapshot(), before);
+    assert_eq!(growth_v19::depth_source_of(env.growth().depth_source), growth_v19::DEPTH_SOURCE_DEX, "the pool reading stands");
+    env.push(255, 0, &[]).expect("35 B while pinned (absent: the conservative direction)");
+    assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "35 B keeps the bit");
+    env.warp(1);
+    env.push(0, 0, &[]).expect("mode 0 while pinned");
+    assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "mode 0 keeps the bit");
+    env.warp(1);
+    env.push(2, 0, &dex).expect("mode 2 again");
+    // the UA clears the pin: the bit goes, mode 1 lands again
+    env.clear_source().expect("UA clear");
+    assert!(!growth_v19::depth_dex_pinned(env.growth().depth_source), "tag 123 op 0 clears the bit");
+    env.warp(1);
+    env.push(1, 30_000_000_000, &[]).expect("mode 1 after the clear");
+    assert_eq!(growth_v19::depth_source_of(env.growth().depth_source), growth_v19::DEPTH_SOURCE_ATTESTED);
+    // re-pin: refused again
+    env.set_source(chill()).expect("re-pin");
+    env.warp(1);
+    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after a re-pin");
+    // tag 123 with the market read-only is refused (it must write the bit); nothing changes
+    let (ua, pda) = (env.ua.insecure_clone(), env.pda());
+    let before = (env.svm.get_account(&env.market).unwrap().data, env.record());
+    let accounts = vec![
+        AccountMeta::new(ua.pubkey(), true),
+        AccountMeta::new_readonly(env.program_data, false),
+        AccountMeta::new_readonly(env.market, false),
+        AccountMeta::new(pda, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+    ];
+    assert!(env.send(ProgInstruction::SetDepthSource { op: 0, asset_index: 0, market_id: 1 }, accounts, &[&ua]).is_err(), "read-only market at tag 123");
+    assert_eq!((env.svm.get_account(&env.market).unwrap().data, env.record()), before);
+}
+
+/// F-3: a pin made before the bit existed (state poke: the bit cleared under an active pin) is
+/// covered from its first mode-2 reading on: that reading proves an active pin and sets the bit.
+#[test]
+fn f3_mode2_reading_sets_the_pin_bit_for_an_older_pin() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.set_source(chill()).expect("pin");
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let mut g = state::read_asset_growth(&data, 0, ENGINE_IMR).unwrap().unwrap();
+    g.depth_source &= !growth_v19::DEPTH_DEX_PINNED;
+    state::write_asset_growth(&mut data, 0, &g, ENGINE_IMR).unwrap();
+    let mut a = env.svm.get_account(&env.market).unwrap();
+    a.data = data;
+    env.svm.set_account(env.market, a).unwrap();
+    assert!(!growth_v19::depth_dex_pinned(env.growth().depth_source), "setup: an older pin without the bit");
+    env.warp(1);
+    let dex = env.dex_accounts(chill());
+    env.push(2, 0, &dex).expect("mode 2");
+    assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "a DEX reading sets the bit");
+    env.warp(1);
+    assert_err(&env.push(1, 30_000_000_000, &[]), &code(PercolatorError::DepthSourceInvalid), "mode 1 after the first DEX reading");
+}
+
+/// F-3: the pure decision, every (pinned, mode) pair; and the validator accepts the bit.
+#[test]
+fn f3_depth_push_mode_allowed_table() {
+    for byte in 0u8..=255 {
+        if !growth_v19::depth_source_byte_ok(byte) {
+            continue;
+        }
+        let pinned = byte & growth_v19::DEPTH_DEX_PINNED != 0;
+        for mode in [None, Some(0u8), Some(1), Some(2)] {
+            let want = !(pinned && mode == Some(growth_v19::DEPTH_MODE_ATTESTED));
+            assert_eq!(growth_v19::depth_push_mode_allowed(byte, mode), want, "byte {byte:#04x} mode {mode:?}");
+        }
+    }
+    assert!(growth_v19::depth_source_byte_ok(growth_v19::DEPTH_DEX_PINNED | growth_v19::DEPTH_EVER | growth_v19::DEPTH_PREV_REAL | 2));
+    assert!(!growth_v19::depth_source_byte_ok(0x08) && !growth_v19::depth_source_byte_ok(0x10) && !growth_v19::depth_source_byte_ok(0x20));
+    assert_eq!(growth_v19::depth_source_of(growth_v19::DEPTH_DEX_PINNED | 2), 2, "the bit is not a source");
+}
+
+/// SEC-RC L-1: the RC validator refuses a growth record with flags 0 and a non-empty depth
+/// window (the shape the controller rollback refuses), and a window write migrates the record to
+/// the round-3 layout first, so no legitimate write can produce that shape. On 75fca911 the
+/// validator accepts it.
+#[test]
+fn l1_flags0_with_a_window_is_refused_and_window_writes_migrate() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    for _ in 0..3 {
+        env.warp(1);
+        env.push(1, 30_000_000_000, &[]).expect("depth pushes open the window");
+    }
+    let g = env.growth();
+    assert!(g.depth_tw().bucket_p1 != 0, "setup: a window exists");
+    assert_ne!(g.flags & growth_v19::GROWTH_FLAG_R3_LAYOUT, 0, "setup: the push migrated the record");
+    state::validate_asset_growth(&g, ENGINE_IMR).expect("CONTROL: the real record validates");
+    let mut bad = g;
+    bad.flags = 0;
+    assert!(state::validate_asset_growth(&bad, ENGINE_IMR).is_err(), "flags 0 with a window must be refused");
+    let mut no_window = bad;
+    no_window.set_depth_tw(growth_v19::DepthWindow { cur_tokens: 0, prev_tokens: 0, bucket_p1: 0 });
+    no_window.vol_var_x100_le = [0; 4];
+    no_window.rent_stamp64_le = [0; 4];
+    state::validate_asset_growth(&no_window, ENGINE_IMR).expect("CONTROL: flags 0 without a window is the pre-round-3 shape");
+    // a window write on a flags-0 record migrates it (bit 0 set, bytes 0..8 zeroed)
+    let mut pre = no_window;
+    pre.vol_var_x100_le = [7; 4];
+    pre.set_depth_tw(g.depth_tw());
+    assert_ne!(pre.flags & growth_v19::GROWTH_FLAG_R3_LAYOUT, 0, "set_depth_tw migrates first");
+    assert_eq!(pre.vol_var_x100_le, [0; 4], "the retired c_launch bytes are zeroed by the migration");
+    state::validate_asset_growth(&pre, ENGINE_IMR).expect("the migrated record validates");
+    assert!(growth_v19::depth_tw_layout_ok(growth_v19::GROWTH_FLAG_R3_LAYOUT, g.depth_tw()));
+    assert!(!growth_v19::depth_tw_layout_ok(0, g.depth_tw()));
+    assert!(growth_v19::depth_tw_layout_ok(0, growth_v19::DepthWindow { cur_tokens: 0, prev_tokens: 0, bucket_p1: 0 }));
 }

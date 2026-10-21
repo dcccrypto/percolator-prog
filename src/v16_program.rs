@@ -7731,8 +7731,10 @@ pub mod state {
         pub rent_kink_bps: u16, // 42..44
         /// v2.2 growth overnight §1.3 (G8) + R2.1: bits 0-1 = the source of the stored
         /// `depth_e6` (0 none, 1 keeper-attested, 2 on-chain DEX pool); bit 7 = `DEPTH_EVER`
-        /// (sticky: a fresh effective depth was seen once; cleared only by the I-1 reset). Bits
-        /// 2-6 must be 0.
+        /// (sticky: a fresh effective depth was seen once; cleared only by the I-1 reset); bit 2
+        /// `DEPTH_PREV_REAL`; bit 6 `DEPTH_DEX_PINNED` (F-3: tag 123 pin in force, mode-1 pushes
+        /// refused; preserved by every depth / graduation write, cleared only by tag 123 op 0).
+        /// Bits 3-5 must be 0.
         pub depth_source: u8, // 44
         /// R2.1: the highest venue tier keeper-attested depth may earn (0 = protocol default 1,
         /// max 3). Upgrade authority only (tag 93 tier trailer). Configuration: survives I-1.
@@ -7879,7 +7881,23 @@ pub mod state {
             }
         }
 
+        /// F-3: set or clear the DEX pin bit (`DEPTH_DEX_PINNED`). Setting it migrates the record
+        /// to the round-3 layout first (flags bit 0), like every other controller-era write.
+        pub fn set_dex_pinned(&mut self, pinned: bool) {
+            if pinned {
+                self.migrate_r3_layout();
+                self.depth_source |= crate::growth_v19::DEPTH_DEX_PINNED;
+            } else {
+                self.depth_source &= !crate::growth_v19::DEPTH_DEX_PINNED;
+            }
+        }
+
         pub fn set_depth_tw(&mut self, w: crate::growth_v19::DepthWindow) {
+            // SEC-RC L-1: a window lives in the round-3 layout only (bytes 30..38 / 118..120);
+            // migrate first so a window write can never produce flags 0 with a window.
+            if w.bucket_p1 != 0 {
+                self.migrate_r3_layout();
+            }
             self.depth_tw_cur_le = w.cur_tokens.to_le_bytes();
             self.depth_tw_prev_le = w.prev_tokens.to_le_bytes();
             self.depth_tw_bucket_le = w.bucket_p1.to_le_bytes();
@@ -7913,7 +7931,9 @@ pub mod state {
             self.depth_e6 = d.depth_e6;
             self.depth_slot = d.depth_slot;
             self.depth_prev_e6 = d.depth_prev_e6;
-            self.depth_source = d.depth_source;
+            // F-3: the DEX pin bit is not depth state; only tag 123 moves it.
+            self.depth_source = d.depth_source & !crate::growth_v19::DEPTH_DEX_PINNED
+                | (self.depth_source & crate::growth_v19::DEPTH_DEX_PINNED);
             self.depth_last_good_e6 = d.last_good_e6;
             self.depth_last_good_slot = d.last_good_slot;
             self.depth_rise_slot64_le = d.rise_slot64.to_le_bytes();
@@ -7948,7 +7968,10 @@ pub mod state {
             self.depth_e6 = f.depth_e6;
             self.depth_slot = f.depth_slot;
             self.depth_prev_e6 = f.depth_prev_e6;
-            self.depth_source = f.depth_source;
+            // F-3: the DEX pin bit survives the I-1 reset (fail closed: a restarted asset keeps
+            // refusing attested depth until the upgrade authority clears or re-pins, tag 123).
+            self.depth_source = f.depth_source & !crate::growth_v19::DEPTH_DEX_PINNED
+                | (self.depth_source & crate::growth_v19::DEPTH_DEX_PINNED);
             self.depth_last_good_e6 = f.depth_last_good_e6;
             self.depth_last_good_slot = f.depth_last_good_slot;
             self.depth_rise_slot64_le = f.depth_rise_slot64.to_le_bytes();
@@ -8004,6 +8027,7 @@ pub mod state {
             || g.rent_kink_bps as u128 > crate::growth_v19::BPS
             || g.util_fee_max_bps > crate::growth_v19::GROWTH_UTIL_FEE_HARD_MAX_BPS
             || !crate::growth_v19::depth_tw_window_ok(g.depth_tw())
+            || !crate::growth_v19::depth_tw_layout_ok(g.flags, g.depth_tw())
             || g.l_launch_x100 < crate::growth_v19::LEVERAGE_X100_ONE
             || g.l_launch_x100 > g.l_tier_x100
             || g.l_tier_x100 > tier_max
@@ -28714,6 +28738,18 @@ pub mod processor {
         else {
             return Ok(());
         };
+        // v2.2 DEATH F-3 (SEC-RC L-2): a keeper-attested depth never lands on a DEX-pinned asset
+        // (fail closed: the whole push, mark included, is refused; the keeper sends mode 2, or
+        // the 35 B form when the pool is unreadable).
+        if !growth_v19::depth_push_mode_allowed(g.depth_source, depth.map(|(m, _)| m)) {
+            solana_program::log::sol_log("g8_depth_refused_attested_on_dex_pin");
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        // A mode-2 reading proves an active pin (checked by `dex_depth_reading`): record it, so a
+        // pin made before the bit existed is covered from its first DEX reading on.
+        if matches!(depth, Some((growth_v19::DEPTH_SOURCE_DEX, _))) {
+            g.set_dex_pinned(true);
+        }
         let (source, depth_e6) = match depth {
             Some((growth_v19::DEPTH_MODE_ATTESTED, d)) => (growth_v19::DEPTH_SOURCE_ATTESTED, d),
             // Mode 2: `d` here is the depth the PROGRAM computed from the pinned pool
@@ -30430,7 +30466,6 @@ pub mod processor {
                 == portfolio_ai.key.to_bytes(),
             None => false,
         };
-        let mut band_on = false;
         let mut legs_reducible = true;
         let mut slot = 0usize;
         while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
@@ -30445,7 +30480,6 @@ pub mod processor {
                 continue;
             };
             let asset = &m.engine.asset;
-            band_on |= asset.band_epoch.get() != 0;
             let eff_nonzero = matches!(leg_slot_effective_signed_q(&group, leg), Some((_, q)) if q != 0);
             legs_reducible &= eff_nonzero
                 && asset.oi_eff_long_q.get() != 0
@@ -30466,7 +30500,6 @@ pub mod processor {
             certified_equity: cert.certified_equity,
             certified_maintenance_req: cert.certified_maintenance_req,
             certified_liq_deficit: cert.certified_liq_deficit,
-            band_on,
             vault_lp,
             legs_reducible,
             active_legs,
@@ -38783,6 +38816,29 @@ pub mod processor {
         Ok(cfg.collateral_mint)
     }
 
+    /// v2.2 DEATH F-3 (SEC-RC L-2): mirror the pin into the market asset's growth record
+    /// (`DEPTH_DEX_PINNED`, byte 44 bit 6) so PushAuthMark refuses keeper-attested depth while
+    /// the pin is in force. No growth record (growth off, or an asset index past the configured
+    /// slots): nothing is stored there, so nothing can be overridden; a no-op.
+    #[inline(never)]
+    fn depth_source_mark_market(
+        market_ai: &AccountInfo<'_>,
+        asset_index: u16,
+        pinned: bool,
+    ) -> ProgramResult {
+        let mut data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, group) = state::market_view_mut(&mut data)?;
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let Some(market) = group.markets.get_mut(asset_index as usize) else {
+            return Ok(());
+        };
+        let Some(mut g) = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? else {
+            return Ok(());
+        };
+        g.set_dex_pinned(pinned);
+        state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)
+    }
+
     /// Tag 123 op 1: builds the pin from `[5] pool · [6] base vault · [7] quote vault ·
     /// [8] base mint · [9] quote mint` and refuses (`DepthSourceInvalid`) unless: the pool's
     /// owner is on the allow-list and the pool parses as that AMM; both vaults are initialized
@@ -38887,6 +38943,10 @@ pub mod processor {
     /// with no record, or a record of another market: `DepthSourceInvalid`. Non-UA:
     /// `Unauthorized`. For op 0 the wire's asset / generation are not checked (a stale pin of a
     /// reused slot can always be cleared).
+    ///
+    /// v2.2 DEATH F-3: the market account is WRITABLE (both ops). op 1 sets `DEPTH_DEX_PINNED` in
+    /// the pinned asset's growth record, op 0 clears it on the pin's own asset; while it is set
+    /// PushAuthMark refuses a keeper-attested (mode 1) depth with `DepthSourceInvalid`.
     #[inline(never)]
     fn handle_set_depth_source<'a>(
         program_id: &Pubkey,
@@ -38910,6 +38970,7 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         expect_owner(market_ai, program_id)?;
+        expect_writable(market_ai)?;
         expect_writable(src_ai)?;
         let (pda, bump) = state::derive_depth_source(program_id, market_ai.key);
         if *src_ai.key != pda {
@@ -38930,6 +38991,8 @@ pub mod processor {
                 &state::DepthSourceV22::cleared(market_bytes, old.bump),
                 false,
             )?;
+            drop(data);
+            depth_source_mark_market(market_ai, old.asset_index, false)?;
             solana_program::log::sol_log("g8_depth_source_cleared");
             return Ok(());
         }
@@ -38943,6 +39006,8 @@ pub mod processor {
             &collateral_mint,
         )?;
         let fresh = src_ai.data_is_empty();
+        // F-3: a replaced pin of ANOTHER asset index leaves that asset's pin bit to clear.
+        let mut replaced_asset: Option<u16> = None;
         if fresh {
             expect_writable(upgrade_authority)?;
             let bump_bytes = [bump];
@@ -38967,8 +39032,15 @@ pub mod processor {
             if old.market != market_bytes || old.bump != bump {
                 return Err(PercolatorError::DepthSourceInvalid.into());
             }
+            if old.asset_index != asset_index {
+                replaced_asset = Some(old.asset_index);
+            }
         }
         state::write_depth_source(&mut src_ai.try_borrow_mut_data()?, &rec, fresh)?;
+        if let Some(prev) = replaced_asset {
+            depth_source_mark_market(market_ai, prev, false)?;
+        }
+        depth_source_mark_market(market_ai, asset_index, true)?;
         solana_program::log::sol_log(&alloc::format!(
             "g8_depth_source_set asset={} kind={} flags={} base_decimals={}",
             asset_index, rec.amm_kind, rec.flags, rec.base_decimals

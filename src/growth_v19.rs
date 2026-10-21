@@ -1095,6 +1095,27 @@ pub const DEPTH_SOURCE_MASK: u8 = 0x03;
 /// Sticky: never cleared except by the I-1 reset (asset restart / slot reuse / re-activation).
 /// Once set, an absent or stale reading no longer removes the κ cap (`cap_depth_e6`).
 pub const DEPTH_EVER: u8 = 0x80;
+/// Byte 44 bit 6 (v2.2 DEATH F-3 / SEC-RC L-2): the market asset's depth is PINNED to an
+/// on-chain DEX pool (tag 123 `SetDepthSource` op 1 sets it, op 0 clears it; every PushAuthMark
+/// mode-2 reading also sets it, which covers a pin made before this bit existed). While it is set
+/// a keeper-attested (mode 1) depth is REFUSED (`DepthSourceInvalid`), fail closed: an attested
+/// reading can never override or replace the pinned pool's reading. The 35 B form and mode 0
+/// (no depth: absent, the conservative direction) stay allowed. Sticky across the I-1 reset;
+/// only tag 123 op 0 clears it. Not a source: `depth_source_of` masks it out.
+pub const DEPTH_DEX_PINNED: u8 = 0x40;
+
+/// Whether the asset's depth is pinned to the on-chain DEX source (`DEPTH_DEX_PINNED`).
+pub fn depth_dex_pinned(depth_source_byte: u8) -> bool {
+    depth_source_byte & DEPTH_DEX_PINNED != 0
+}
+
+/// F-3: may a PushAuthMark carrying depth `mode` (`None` = the 35 B form) land on an asset whose
+/// depth byte is `depth_source_byte`? Everything is allowed except a keeper-attested depth on a
+/// DEX-pinned asset.
+pub fn depth_push_mode_allowed(depth_source_byte: u8, mode: Option<u8>) -> bool {
+    !(depth_dex_pinned(depth_source_byte) && mode == Some(DEPTH_MODE_ATTESTED))
+}
+
 /// Byte 44 bit 2 (coordinator ruling 2026-10-14, "most conservative wins"): the PREVIOUS sample
 /// (`depth_prev_e6`) was a REAL reading (source 1 or 2, a 0 included), not an absent one (35 B
 /// push, mode 0, never). With the source bits (which say the same of the CURRENT sample) it lets
@@ -1155,7 +1176,7 @@ pub fn depth_ever(depth_source_byte: u8) -> bool {
 /// Validator: only bits 0-1 (a known source, 0..=2), bit 2 (`DEPTH_PREV_REAL`) and bit 7
 /// (`DEPTH_EVER`) may be set.
 pub fn depth_source_byte_ok(depth_source_byte: u8) -> bool {
-    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_EVER) == 0
+    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_DEX_PINNED | DEPTH_EVER) == 0
         && depth_source_of(depth_source_byte) <= DEPTH_SOURCE_DEX
 }
 
@@ -1338,6 +1359,13 @@ pub fn depth_tw_window_ok(w: DepthWindow) -> bool {
     } else {
         w.cur_tokens != DEPTH_TW_ABSENT && (w.bucket_p1 as u64) <= DEPTH_TW_BUCKET_RING
     }
+}
+
+/// SEC-RC L-1: a depth window (bucket code != 0) exists only in the round-3 layout (flags bit 0).
+/// A record with flags 0 and a window is refused, fail closed: the controller rollback reads a
+/// flags-0 record as pre-controller and refuses a window there, so both sides agree on the shape.
+pub fn depth_tw_layout_ok(flags: u8, w: DepthWindow) -> bool {
+    w.bucket_p1 == 0 || flags & GROWTH_FLAG_R3_LAYOUT != 0
 }
 
 /// Whether the window spans a full adjacent bucket pair (a RISE of the rate-limited depth needs
