@@ -11,8 +11,16 @@
 //! certificate the previous refresh wrote is stale again before any later transaction could act
 //! on it. Only a second crank in the SAME transaction (same slot, no accrual between) found the
 //! certificate current. The deployed keeper sends one crank per account, so off-band positions ran
-//! to bankruptcy. Band markets were unaffected: a pinned accrual moves no price, so their
-//! certificates stay current across transactions and the next crank liquidates.
+//! to bankruptcy.
+//!
+//! Band markets (v2.2 DEATH F-1, 2026-10-20): the follow-on applies to them too. The original
+//! premise ("a pinned accrual moves no price, so band certificates stay current across
+//! transactions") does not hold while the market is pinned and the target keeps moving: every
+//! changed raw target bumps `oracle_epoch`, and the funding / rent a band market must carry keep
+//! moving `funding_epoch`, so a one-crank sweep only re-certified a liquidation-pending leg. The
+//! leg then blocked the band re-anchor (I-B3), the pin clock ran out and the market resolved at
+//! the frozen band-edge price (`BandPinExpired`). The follow-on is byte-for-byte the legacy second
+//! crank of the same slot, which already liquidated band legs at the pinned price (BSL-bounded).
 //!
 //! This module is the pure decision kernel. Free of `AccountInfo`, syscalls and engine types so
 //! every function is a Kani target. The processor gathers the inputs AFTER the first step and,
@@ -101,8 +109,6 @@ pub struct F1Inputs {
     pub certified_equity: i128,
     pub certified_maintenance_req: u128,
     pub certified_liq_deficit: u128,
-    /// Some active leg is on a band market (band_epoch != 0): the band's own pass liquidates.
-    pub band_on: bool,
     /// The account is a bound vault LP: its own P3 path (senior draw first) stays unchanged.
     pub vault_lp: bool,
     /// Every active leg has a nonzero effective size, both sides of its asset hold effective OI,
@@ -148,7 +154,6 @@ pub fn follow_on_eligible(i: &F1Inputs) -> bool {
         && !i.expired_close
         && !i.recovery_eligible
         && !i.resolved_winner
-        && !i.band_on
         && !i.vault_lp
         && i.legs_reducible
         && shape_within_budget(i.active_legs, i.occupied_source_domains)
@@ -216,7 +221,7 @@ mod f1_kani_proofs {
         let want = follow_on_eligible(&i) && i.engine_liquidatable && i.certified_liq_deficit != 0 && below;
         assert_eq!(follow_on_liquidation(&i), want);
         if follow_on_liquidation(&i) {
-            assert!(i.live && i.first_step_certified_refresh && !i.band_on && !i.vault_lp);
+            assert!(i.live && i.first_step_certified_refresh && !i.vault_lp);
             assert!(!i.b_stale && !i.pending_close && !i.expired_close && !i.recovery_eligible && !i.resolved_winner);
             assert!(i.legs_reducible && i.steps_taken == 0);
             assert!(i.active_legs <= F1_MAX_FOLLOW_ON_LEGS && (i.occupied_source_domains as u16) <= 2 * i.active_legs as u16, "follow-on outside the measured compute envelope");
@@ -225,7 +230,6 @@ mod f1_kani_proofs {
         kani::cover!(below && i.engine_liquidatable && i.certified_liq_deficit != 0 && !follow_on_eligible(&i),
             "below but ineligible: not attempted");
         kani::cover!(below && follow_on_eligible(&i) && !i.engine_liquidatable, "engine disagrees: not attempted");
-        kani::cover!(i.band_on && below && i.engine_liquidatable, "band market: never");
         kani::cover!(!i.legs_reducible && below && i.engine_liquidatable && i.certified_liq_deficit != 0, "a leg not reducible: never");
         kani::cover!(i.active_legs == 4 && below && i.engine_liquidatable && !follow_on_liquidation(&i), "4 legs: legacy two-crank");
         kani::cover!(i.active_legs == 3 && i.occupied_source_domains == 6 && want, "3 legs, 6 domains: follows on");
