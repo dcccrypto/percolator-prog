@@ -3427,3 +3427,31 @@ fn gh561_no_bond_is_admitted_while_a_backstop_is_outstanding() {
         .expect("108 once the backstop is repaid");
     env.assert_conserved("gh561 deposit");
 }
+
+/// GH#561 review correction (REGRESSION, Resolved): the backstop halt on tag 110 is LIVE-only,
+/// exactly as tag 102's. In Resolved every vault-LP payout repays the backstop first at tag 101
+/// and whatever is never repaid stays a realised insurance loss that "blocks nothing in Resolved"
+/// (tag 101). A residual receivable left after the LP's terminal payout (STATE POKE: 1 token, the
+/// shape of a payout that fell short) must not lock the bond holders out of the pots.
+/// NEGATIVE CONTROL: with the halt counting the backstop in both modes (the #562 head as
+/// submitted) this exit is refused `VaultLpPausedForSeniorDraw` (89).
+#[test]
+fn gh561_resolved_bond_exit_is_not_halted_by_an_unrepaid_backstop() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    let admin = env.admin.insecure_clone();
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    poke_backstop_consistent(&mut env, U);
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    let paid_b = env
+        .bond_execute(&h, lp.portfolio, 2_000 * U)
+        .expect("110 Resolved is not halted by a residual backstop");
+    assert_eq!(paid_b, 2_000 * U, "bonds whole from the pots");
+    let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+    assert_eq!(st.backstop_outstanding_atoms, U, "vacuity: the receivable was outstanding during the exit");
+}

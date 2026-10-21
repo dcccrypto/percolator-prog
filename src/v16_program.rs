@@ -42025,9 +42025,15 @@ pub mod processor {
         // `backstop_outstanding_atoms` states it is senior to both). Tags 97 / 98 / 102
         // already add it to this argument; bonds must too, or a redemption can exit
         // while lent insurance is still outstanding and unrepayable.
+        //
+        // LIVE only, exactly as tag 102 (`backstop_halt = if resolved { 0 } ..`): in Resolved
+        // every vault-LP payout repays the backstop FIRST at tag 101, and whatever is never
+        // repaid stays a realised insurance loss that blocks nothing (tag 101 comment). Counting
+        // it here in Resolved would lock every bond holder out of the pots for good the moment
+        // the LP's terminal payout falls one atom short of the receivable.
+        let backstop_halt = if live { st.backstop_outstanding_atoms as u128 } else { 0 };
         if vault_lp_v18::vault_lp_draw_halts(
-            st.senior_draw_outstanding_atoms
-                .saturating_add(st.backstop_outstanding_atoms as u128),
+            st.senior_draw_outstanding_atoms.saturating_add(backstop_halt),
             vault_lp_v18::DRAW_OP_BOND_WITHDRAW,
         ) {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
