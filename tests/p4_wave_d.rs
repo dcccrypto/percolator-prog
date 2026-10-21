@@ -3741,3 +3741,45 @@ fn gh566_an_uncapped_draw_still_consumes_the_proposal() {
     let r = backstop_111(&mut w, 0, 0, true);
     assert!(has(&r, INS_REFUSED), "no second draw on a consumed proposal: {r:?}");
 }
+
+/// GH#566 review: splitting the recapitalisation into caller-capped draws lends EXACTLY what one
+/// uncapped draw lends, never more. The protocol caps (cumulative licence, R-9 senior-drawn room,
+/// W-2(c) epoch cap) are re-evaluated on every draw against the running `outstanding` and epoch
+/// total, so leaving the proposal open after a short draw cannot be used to exceed them; and only
+/// the draw the caller's cap did not bind consumes the proposal.
+#[test]
+fn gh566_split_draws_lend_no_more_than_one_uncapped_draw() {
+    use percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS;
+    // Reference: the same world, one uncapped draw.
+    let lent_once = {
+        let (mut w, _s, (_tk, tp)) = g9_world();
+        seed_units(&mut w, 20_000_000);
+        backstop_111(&mut w, 2, 0, true).expect("propose");
+        g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
+        backstop_111(&mut w, 0, 0, true).expect("uncapped draw");
+        backstop_st(&w)
+    };
+    assert!(lent_once > 1_000, "vacuity: the reference draw lends real money, got {lent_once}");
+
+    let (mut w, _s, (_tk, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+    backstop_111(&mut w, 2, 0, true).expect("propose");
+    let pending = units(&w).unwrap().g9_pending_slot;
+    let ins_before = w.env.market_state().1.insurance;
+    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
+    backstop_111(&mut w, 0, 1, true).expect("1-atom draw");
+    backstop_111(&mut w, 0, (lent_once / 2) as u128, true).expect("half draw");
+    assert_eq!(backstop_st(&w), 1 + lent_once / 2);
+    assert_eq!(units(&w).unwrap().g9_pending_slot, pending, "caller-capped draws leave the proposal open");
+    // A cap ABOVE what the protocol allows does not bind, so this draw consumes the proposal.
+    backstop_111(&mut w, 0, u64::MAX as u128, true).expect("the rest");
+    assert_eq!(backstop_st(&w), lent_once, "split draws lend exactly one uncapped draw's amount");
+    assert_eq!(
+        w.env.market_state().1.insurance,
+        ins_before - lent_once as u128,
+        "insurance fell by exactly what was lent"
+    );
+    assert_eq!(units(&w).unwrap().g9_pending_slot, 0, "consumed once the caller's cap stopped binding");
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED), "no further draw on the consumed proposal: {r:?}");
+}

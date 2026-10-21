@@ -3358,6 +3358,12 @@ fn r3_item7_fee_crank_is_a_ratchet_site() {
 // helper rather than by an explicit guard. If anyone changes how LP value is computed, the
 // second-order route stops firing and these tests are what catches the resulting hole.
 //
+// UPDATE (landing on feat/v22-rc2-2026-10-21): that has ALREADY happened on the RC2 line. Against
+// the RC2 base canonical .so (50a336d4, sha cc720a0e) both tests below FAIL: tag 110 pays 400
+// tokens at par with a 50-token backstop outstanding, and tag 108 admits a deposit. The line numbers
+// above are from aca02ba6. So on RC2 these are true REGRESSION tests for the netting and halts
+// added here, not only property tests.
+//
 // The backstop is set directly rather than driven through tag 111, the way `poke_senior_claim`
 // sets up a senior claim: reaching `backstop_due` needs an exhausted-pot senior draw this suite's
 // world does not build. The G9 flow itself is covered in `p4_wave_d.rs`.
