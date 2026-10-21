@@ -3674,3 +3674,70 @@ fn pin_tag94_vault_lp_only_under_the_pinned_matcher() {
         assert!(has(&r2, refused), "tag 94 under matcher {other} must be refused ({refused}): {r2:?}");
     }
 }
+
+// ── GH#566: the caller's `max_amount` must not spend the proposal ───────────────────────────────
+
+/// REGRESSION. A draw short-changed by the CALLER's `max_amount` leaves the proposal executable,
+/// so the recapitalisation it exists for can still happen in the same window.
+///
+/// FAILS ON PRISTINE `aca02ba6`: there the 1-atom draw sets `g9_pending_slot = 0`, the follow-up
+/// draw is refused `p4_backstop_not_executable`, and the real draw needs a fresh PROPOSE plus
+/// another `G9_DELAY_SLOTS` — repeatable by anyone, at one transaction per window, since tag 111 is
+/// permissionless.
+#[test]
+fn gh566_a_caller_capped_draw_does_not_consume_the_proposal() {
+    use percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS;
+    let (mut w, _s, (_tk, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+
+    backstop_111(&mut w, 2, 0, true).expect("propose");
+    let pending = units(&w).unwrap().g9_pending_slot;
+    assert!(pending > 0, "proposal recorded");
+    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
+
+    // A 1-atom draw moves one atom and MUST leave the proposal alone.
+    backstop_111(&mut w, 0, 1, true).expect("1-atom draw accepted");
+    assert_eq!(backstop_st(&w), 1, "one atom lent");
+    assert_eq!(
+        units(&w).unwrap().g9_pending_slot,
+        pending,
+        "a caller-capped draw must NOT consume the proposal"
+    );
+
+    // ...so the real recapitalisation still lands, in the same window, with no new proposal.
+    backstop_111(&mut w, 0, 0, true).expect("the full draw still lands");
+    let total = backstop_st(&w);
+    assert!(total > 1_000, "the recapitalisation actually happened, total lent {total}");
+    assert_eq!(
+        units(&w).unwrap().g9_pending_slot,
+        0,
+        "the FULL draw does consume the proposal"
+    );
+}
+
+/// CONTROL: an uncapped draw still consumes the proposal, and still lends the full amount. This is
+/// the behaviour the fix must not change, and it passes before and after.
+#[test]
+fn gh566_an_uncapped_draw_still_consumes_the_proposal() {
+    use percolator_prog::p4_rescue_ins::G9_DELAY_SLOTS;
+    let (mut w, _s, (_tk, tp)) = g9_world();
+    seed_units(&mut w, 20_000_000);
+
+    backstop_111(&mut w, 2, 0, true).expect("propose");
+    let ins_before = w.env.market_state().1.insurance;
+    g9_wait(&mut w, &[tp], G9_DELAY_SLOTS);
+
+    backstop_111(&mut w, 0, 0, true).expect("uncapped draw");
+    let lent = backstop_st(&w);
+    assert!(lent > 1_000, "an uncapped draw lends real money, got {lent}");
+    assert_eq!(
+        w.env.market_state().1.insurance,
+        ins_before - lent as u128,
+        "insurance fell by exactly what was lent"
+    );
+    assert_eq!(units(&w).unwrap().g9_pending_slot, 0, "consumed by a full draw");
+
+    // And a second draw on the consumed proposal is refused, as before.
+    let r = backstop_111(&mut w, 0, 0, true);
+    assert!(has(&r, INS_REFUSED), "no second draw on a consumed proposal: {r:?}");
+}

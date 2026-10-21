@@ -39423,13 +39423,31 @@ pub mod processor {
                         u.g9_epoch_drawn_atoms,
                         crate::p4_rescue_ins::G9_EPOCH_CAP_BPS,
                     ));
+                    // GH#566: everything above is a PROTOCOL cap — the cumulative licence, the
+                    // senior-drawn room, the per-epoch cap. A draw clamped by one of those has been
+                    // honoured as far as the protocol permits, so it consumes the proposal, exactly
+                    // as before (pinned by `w2_g9_two_step_window_and_epoch_cap`).
+                    //
+                    // `max_amount` is different: it is caller-supplied instruction data, and tag 111
+                    // is permissionless. Consuming the proposal for a short-changed draw let anyone
+                    // spend an executable proposal on one atom and send the recapitalisation back to
+                    // a fresh PROPOSE plus another G9_DELAY_SLOTS — deniable indefinitely at one
+                    // transaction per window, while the one atom left outstanding keeps
+                    // `vault_lp_halt_mirror` armed (and mode-1 RESTORE cannot repay it while the LP
+                    // is in deficit, because `backstop_restore_equity_room` is 0 there).
+                    //
+                    // So the caller's cap now only limits how much moves; it does not spend the
+                    // proposal. A full draw still does.
+                    let uncapped_amt = amt;
                     if max_amount != 0 {
                         amt = amt.min(max_amount);
                     }
                     if amt == 0 {
                         return Err(PercolatorError::InsuranceBackstopRefused.into());
                     }
-                    u.g9_pending_slot = 0;
+                    if amt == uncapped_amt {
+                        u.g9_pending_slot = 0;
+                    }
                     u.g9_epoch_drawn_atoms = u
                         .g9_epoch_drawn_atoms
                         .checked_add(amt)
