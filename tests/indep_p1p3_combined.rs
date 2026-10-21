@@ -6,7 +6,7 @@
 //! security review BLOCKERS (P3-H1 resolved exit, P3-H2 creator free option).
 //!
 //! Tags 94..101 are encoded as raw bytes per §0.3 so this file compiles against the BASE host
-//! lib (6377376a). Wrapper .so under test: INDEP_WRAPPER_SO (default ~/wt-indep/p3-so/current.so).
+//! lib (6377376a). Wrapper .so under test: INDEP_WRAPPER_SO (default: this tree's target/deploy/percolator_prog.so).
 //! Negative control: any pre-P3 .so (v18.2 / P1) must fail these tests at tag 94.
 //!
 //! Properties asserted (design §2.2):
