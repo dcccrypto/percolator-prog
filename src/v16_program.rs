@@ -30330,7 +30330,6 @@ pub mod processor {
                 == portfolio_ai.key.to_bytes(),
             None => false,
         };
-        let mut band_on = false;
         let mut legs_reducible = true;
         let mut slot = 0usize;
         while slot < percolator::V16_MAX_PORTFOLIO_ASSETS_N {
@@ -30345,7 +30344,6 @@ pub mod processor {
                 continue;
             };
             let asset = &m.engine.asset;
-            band_on |= asset.band_epoch.get() != 0;
             let eff_nonzero = matches!(leg_slot_effective_signed_q(&group, leg), Some((_, q)) if q != 0);
             legs_reducible &= eff_nonzero
                 && asset.oi_eff_long_q.get() != 0
@@ -30366,7 +30364,6 @@ pub mod processor {
             certified_equity: cert.certified_equity,
             certified_maintenance_req: cert.certified_maintenance_req,
             certified_liq_deficit: cert.certified_liq_deficit,
-            band_on,
             vault_lp,
             legs_reducible,
             active_legs,

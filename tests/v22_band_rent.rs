@@ -4746,3 +4746,151 @@ fn controller_rollback_differential_from_controller_bpf() {
     let g = env.growth_bytes();
     assert_ne!(g[39] & 1, 0, "the controller migrated the legacy-shaped record on its first push");
 }
+
+// ── v2.2 DEATH F-1 (2026-10-20): a dump past the band edge must not strand liquidation-pending
+// legs and resolve the market at the frozen band-edge price ───────────────────────────────────
+
+/// Outcome of a dump walk on a band market under the deployed one-crank sweep.
+#[derive(Debug, Default)]
+struct DeathF1Walk {
+    /// Rounds in which some long was reduced (liquidated).
+    liq_rounds: usize,
+    /// Of those, rounds whose target sat beyond the band edge before the sweep (the pinned stretch).
+    liq_rounds_beyond_edge: usize,
+    /// Rounds that started with the target beyond the band edge.
+    rounds_beyond_edge: usize,
+    /// Highest number of liquidation-pending legs seen.
+    max_pending: u64,
+    /// Band epoch before / after.
+    epoch0: u64,
+    epoch1: u64,
+    /// Effective price before / after, and the dump target.
+    eff0: u64,
+    eff1: u64,
+    target: u64,
+    /// Longest continuous pin (slots) observed.
+    max_pin_age: u64,
+    /// The market left Live (BandPinExpired recovery or resolution).
+    left_live: bool,
+    rounds: usize,
+    bankrupt: bool,
+    hlock: bool,
+}
+
+/// Two ~8x longs on a band market; the target falls 30% over 60 slots (far past the 100 bps band
+/// edge: the effective price pins at the edge while the lag penalty makes the longs
+/// liquidatable), then stays there, moving by one tick per push like a live feed. Each slot: one target push and ONE deployed-shape sweep
+/// `[observation crank, refresh xN]` (`f1_sweep`), as the live keeper's plain sweep and any
+/// third-party single-crank liquidator send.
+fn death_f1_dump_walk(so: Option<PathBuf>, rounds: usize) -> DeathF1Walk {
+    let mut env = f1_env(so, band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let mut longs = Vec::new();
+    for d in [12u128, 13] {
+        let t = env.trader(d * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 100 * Q).expect("open long");
+        longs.push(t.1);
+    }
+    env.warp(0);
+    env.crank_current(lp.account);
+    let a0 = env.engine_asset();
+    let mut w = DeathF1Walk { epoch0: a0.band_epoch, eff0: a0.effective_price, target: a0.effective_price * 70 / 100, ..Default::default() };
+    for r in 0..rounds {
+        w.rounds = r + 1;
+        env.warp(1);
+        let fall = (r as u64 + 1).min(60);
+        // a live feed: after the fall the target keeps moving by one tick (every changed target
+        // bumps `oracle_epoch`, as the keeper's pushes do in the sims)
+        let tgt = w.eff0 - (w.eff0 - w.target) * fall / 60 + (r as u64 % 2);
+        env.push(tgt);
+        let before: Vec<i128> = longs.iter().map(|t| env.pos(*t)).collect();
+        let pre = env.engine_asset();
+        let (lo, _) = percolator::band_rent::band_bounds(pre.band_anchor_price, BAND_BPS as u64).unwrap();
+        let beyond = pre.raw_oracle_target_price < lo;
+        w.rounds_beyond_edge += usize::from(beyond);
+        match f1_sweep(&mut env, lp.account, &longs) {
+            Ok(_) => {}
+            Err(e) => {
+                // a recovery declared by the crank itself shows up as a mode change
+                let mut data = env.svm.get_account(&env.market).unwrap().data;
+                let (_, g) = state::market_view_mut(&mut data).unwrap();
+                if g.header.mode != 0 {
+                    w.left_live = true;
+                    break;
+                }
+                panic!("round {r}: sweep failed on a Live market: {e}");
+            }
+        }
+        if longs.iter().zip(before.iter()).any(|(t, b)| env.pos(*t).unsigned_abs() < b.unsigned_abs()) {
+            w.liq_rounds += 1;
+            w.liq_rounds_beyond_edge += usize::from(beyond);
+        }
+        let a = env.engine_asset();
+        if std::env::var_os("DEATH_TRACE").is_some() && (r < 120 || r % 50 == 0) {
+            let pos: Vec<i128> = longs.iter().map(|t| env.pos(*t)).collect();
+            let certs: Vec<(i128, u128, u128)> = longs.iter().map(|t| f1_cert(&env, *t)).collect();
+            println!("DTRACE r{r} slot {} tgt {} eff {} anchor {} ep {} pend {}/{} unc {}/{} pin {} pos {pos:?} certs {certs:?}", env.slot, a.raw_oracle_target_price, a.effective_price, a.band_anchor_price, a.band_epoch, a.band_liq_pending_long, a.band_liq_pending_short, a.band_uncertified_long, a.band_uncertified_short, a.band_pin_since_slot);
+        }
+        w.max_pending = w.max_pending.max(a.band_liq_pending_long + a.band_liq_pending_short);
+        if a.band_pin_since_slot != 0 {
+            w.max_pin_age = w.max_pin_age.max(env.slot.saturating_sub(a.band_pin_since_slot));
+        }
+        for t in &longs {
+            let (eq, _, _) = f1_cert(&env, *t);
+            w.bankrupt |= eq < 0 && env.pos(*t) != 0;
+        }
+        w.hlock |= f1_hlock(&env);
+        let mut data = env.svm.get_account(&env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut data).unwrap();
+        if g.header.mode != 0 {
+            w.left_live = true;
+            break;
+        }
+    }
+    let a1 = env.engine_asset();
+    w.epoch1 = a1.band_epoch;
+    w.eff1 = a1.effective_price;
+    env.assert_conservation();
+    w
+}
+
+/// F-1 fixed: under the deployed one-crank sweep, the liquidation-pending legs a dump past the
+/// band edge creates are liquidated (at the pinned band price, BSL-bounded: no bankruptcy, no
+/// h-lock), the anchor advances epoch by epoch and the effective price walks down to the target
+/// (the staircase); the pin never runs long and the market stays Live.
+/// On 75fca911 (band veto in the F1 follow-on) no long is ever liquidated, the pending legs block
+/// the anchor, the effective price stays frozen at the first band edge and the pin clock runs
+/// toward `BandPinExpired` (9,000 slots): the sim's death.
+#[test]
+fn death_f1_band_dump_one_crank_sweep_liquidates_and_catches_up() {
+    let w = death_f1_dump_walk(None, 1_200);
+    println!("DEATHF1 {w:?}");
+    let (lo0, _) = percolator::band_rent::band_bounds(w.eff0, BAND_BPS as u64).unwrap();
+    assert!(w.rounds_beyond_edge >= 10, "vacuity: the dump must push the target past the band edge");
+    assert!(w.liq_rounds_beyond_edge >= 1, "a one-crank sweep must liquidate while the target is beyond the band edge");
+    assert!(!w.left_live, "the market must not leave Live");
+    assert!(w.epoch1 > w.epoch0 + 5, "the anchor must advance (staircase): {} -> {}", w.epoch0, w.epoch1);
+    assert!(w.eff1 < lo0, "the effective price must leave the first band (no freeze): {} vs lo {}", w.eff1, lo0);
+    assert!(w.eff1 <= w.target * 101 / 100, "the effective price catches up to the target: {} vs {}", w.eff1, w.target);
+    assert!(w.max_pin_age < BAND_PMAX as u64 / 2, "the pin never approaches BandPinExpired: {}", w.max_pin_age);
+    assert!(!w.bankrupt && !w.hlock, "BSL: no bankruptcy, no h-lock");
+}
+
+/// NEGATIVE CONTROL for F-1: the same dump on the RC bytes (`F1_BASE_SO` = 75fca911's .so, the
+/// band veto in the F1 follow-on): the pending legs are never liquidated by the one-crank sweep,
+/// the anchor never advances past them and the effective price stays frozen at the first band's
+/// edge while the pin clock runs.
+#[test]
+#[ignore = "negative control: needs F1_BASE_SO=<RC 75fca911 wrapper .so>"]
+fn death_f1_negative_control_rc_bytes_freeze() {
+    let w = death_f1_dump_walk(Some(f1_base_so()), 1_200);
+    println!("DEATHF1 base {w:?}");
+    let (lo0, _) = percolator::band_rent::band_bounds(w.eff0, BAND_BPS as u64).unwrap();
+    assert!(w.max_pending >= 1 && w.rounds_beyond_edge >= 10, "vacuity: pending legs while the target is beyond the edge");
+    assert_eq!(w.liq_rounds, 0, "the RC bytes never liquidate with one crank per round");
+    let _ = lo0;
+    assert!(w.eff1 > w.eff0 * 98 / 100, "frozen within two bands of the start while the target is 30% lower: {}", w.eff1);
+    assert!(w.epoch1 < w.epoch0 + 20, "the anchor stops advancing: {} -> {}", w.epoch0, w.epoch1);
+    assert!(w.max_pin_age > 1_000, "the pin clock runs");
+}
