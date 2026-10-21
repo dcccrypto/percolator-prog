@@ -1,0 +1,16 @@
+[package]
+name = "rck-rc2-wrap-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# v22kani RCK lane, round 2 (2026-10-21): DEX-pin preservation at RC2 target 4db44b69 (#564) on the
+# PRODUCTION AssetGrowthV19 setters + growth_v19 writers. The wrapper lib is a plain path dependency
+# (lib only, devnet), like GROW's kani/dexwrap. Report: ~/wt-v22kani-1020/reports/RCK.md §5.
+[workspace]
+
+[dependencies]
+percolator-prog = { path = "../..", features = ["devnet"] }
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }
