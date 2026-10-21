@@ -4666,8 +4666,33 @@ fn controller_rollback_differential_pinned_from_controller_bpf() {
     let b44 = env.growth_bytes()[44];
     env.poke_growth_raw(44, &[b44 | 0x40]);
     env.warp(2);
-    let r = env.push_depth(PRICE, 1, 600 * USD as u64);
-    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(129)")), "RC2 refuses mode 1 on a pinned asset: {r:?}");
+    // The controller's pinned behaviour for a keeper-attested (mode 1) push, branched on what the
+    // controller BPF actually does (both are pinned-shape proofs; anything else fails):
+    // - RC2 (#564, cc720a0e): the whole push is refused with 129 and nothing is written;
+    // - RC2.1 (#565, 8cad1f86, SEC-RC2 L-RC2-1): Ok, the mark lands, the attested depth is ignored
+    //   (byte 44 and the depth state 56..96 byte-identical, the pin bit kept).
+    let pre = env.growth_bytes();
+    // the wrapper's stored oracle target (what a landed push writes; the engine copy moves on accrual)
+    let target = |env: &Env| state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap().oracle_target_price_e6;
+    let pre_target = target(&env);
+    let mark = pre_target + pre_target / 100;
+    let r = env.push_depth(mark, 1, 777 * USD as u64);
+    let post = env.growth_bytes();
+    match &r {
+        Err(e) => {
+            assert!(e.contains("Custom(129)"), "a refusal must be RC2's 129: {e}");
+            assert_eq!(post, pre, "RC2: nothing written");
+            assert_eq!(target(&env), pre_target, "RC2: the mark did not land");
+            println!("controller pinned mode-1 behaviour: RC2 (refused, 129)");
+        }
+        Ok(_) => {
+            assert_eq!(post[44], pre[44], "RC2.1: byte 44 unchanged (pin bit kept)");
+            assert_eq!(post[44] & 0x40, 0x40, "RC2.1: still pinned");
+            assert_eq!(&post[56..96], &pre[56..96], "RC2.1: the attested depth is ignored (depth state untouched)");
+            assert_eq!(target(&env), mark, "RC2.1: the mark landed");
+            println!("controller pinned mode-1 behaviour: RC2.1 (mark lands, depth ignored)");
+        }
+    }
     env.push(PRICE);
     env.crank(lp.account).expect("RC2 crank on the pinned asset");
     env.crank_current(lp.account);
