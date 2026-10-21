@@ -3461,3 +3461,30 @@ fn gh561_resolved_bond_exit_is_not_halted_by_an_unrepaid_backstop() {
     let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
     assert_eq!(st.backstop_outstanding_atoms, U, "vacuity: the receivable was outstanding during the exit");
 }
+
+/// GH#561 review (Resolved PRICING pin): the Resolved bond payout is NOT netted by a residual
+/// backstop. In Resolved, tag 101 repays the backstop first and anything left is a realised
+/// insurance loss; `bond_withdraw_resolved_core` prices on `resolved_bond_value(physical, C, C_b)`
+/// with no backstop term (the #562 netting sits only in `bond_withdraw_live_core`). The residual
+/// here (3,500) exceeds the junior cushion (physical 15,000 - C 10,000 - C_b 2,000 = 3,000), so a
+/// netted price would be min(C_b, 15,000 - 3,500 - 10,000) = 1,500, not par.
+/// NEGATIVE CONTROL (mutant build: `physical` netted by the backstop in the Resolved core): pays
+/// 1,500 and this test fails.
+#[test]
+fn gh561_resolved_bond_payout_is_not_netted_by_a_residual_backstop() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 0);
+    let admin = env.admin.insecure_clone();
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    poke_backstop_consistent(&mut env, 3_500 * U);
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    let paid_b = env.bond_execute(&h, lp.portfolio, 0).expect("110 Resolved");
+    assert_eq!(paid_b, 2_000 * U, "Resolved bonds priced on the un-netted tranche value (par)");
+    let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+    assert_eq!(st.backstop_outstanding_atoms, 3_500 * U, "vacuity: the residual exceeded the junior cushion during the exit");
+}
