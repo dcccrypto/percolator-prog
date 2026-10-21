@@ -185,3 +185,158 @@ fn kani_rck_g2_ceiling_off_band_is_launch() {
     kani::cover!(stored < la.min(lt), "a stored ceiling below launch ignored too");
     kani::cover!(la > lt && f == lt, "L_tier binds");
 }
+
+// ════════════════════════════ Round 2 (2026-10-21) ════════════════════════════════════════
+// Design: ~/wt-v22kani-1020/reports/RCK.md §5. `kani_r3_gap8_alpha_cap` (src) is NV under
+// cadical 900 s and z3 2400 s; split into its dial half (no arithmetic) and its allocation half,
+// whose arithmetic leaves `bps_floor` / `bps_ceil` are proved by lemmas and then replaced by
+// MODELS admitting exactly the lemmas' relation (sound: the real fn is one of the admitted fns).
+
+use crate::vault_lp_v18 as vl;
+
+const B: u64 = 10_000;
+
+/// L-F: the real `bps_floor` on `x < 2^32` is the exact floor: `z·1e4 ≤ x·b < z·1e4 + 1e4`;
+/// `b > 1e4` is `None`.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_floor() {
+    let x: u32 = kani::any();
+    let b: u16 = kani::any();
+    let r = vl::bps_floor(x as u128, b);
+    if b as u64 > B {
+        assert!(r.is_none());
+    } else {
+        let z = r.unwrap();
+        assert!(z <= x as u128, "z <= x (b <= 1e4)");
+        let (z, xb) = (z as u64, x as u64 * b as u64);
+        assert!(z * B <= xb && xb < z * B + B, "exact floor");
+    }
+    kani::cover!(b as u64 == B && r == Some(x as u128), "b = 1e4: z == x");
+    kani::cover!(b == 5_000 && x % 2 == 1 && r.is_some(), "half of an odd x");
+    kani::cover!(b as u64 > B && r.is_none(), "b > 1e4: None");
+}
+
+/// L-C: the real `bps_ceil` on `x < 2^32` is the exact ceiling: `x·b ≤ z·1e4 < x·b + 1e4`.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_ceil() {
+    let x: u32 = kani::any();
+    let b: u16 = kani::any();
+    let r = vl::bps_ceil(x as u128, b);
+    if b as u64 > B {
+        assert!(r.is_none());
+    } else {
+        let z = r.unwrap();
+        assert!(z <= x as u128, "z <= x (b <= 1e4)");
+        let (z, xb) = (z as u64, x as u64 * b as u64);
+        assert!(xb <= z * B && z * B < xb + B, "exact ceiling");
+        kani::cover!(b == 3_000 && z * B > xb, "rounds up");
+        kani::cover!(b == 3_000 && x > 0 && z * B == xb, "exact");
+    }
+    kani::cover!(b as u64 > B && r.is_none(), "b > 1e4: None");
+}
+
+fn bps_floor_model(x: u128, bps: u16) -> Option<u128> {
+    if bps as u64 > B {
+        return None;
+    }
+    assert!(x < 1u128 << 32, "model domain = the lemma's (caller obligation)");
+    let z: u64 = kani::any();
+    let xb = x as u64 * bps as u64;
+    kani::assume(z <= x as u64 && z * B <= xb && xb < z * B + B);
+    Some(z as u128)
+}
+
+fn bps_ceil_model(x: u128, bps: u16) -> Option<u128> {
+    if bps as u64 > B {
+        return None;
+    }
+    assert!(x < 1u128 << 32, "model domain = the lemma's (caller obligation)");
+    let z: u64 = kani::any();
+    let xb = x as u64 * bps as u64;
+    kani::assume(z <= x as u64 && xb <= z * B && z * B < xb + B);
+    Some(z as u128)
+}
+
+/// RCK-5a: the dial half of gap8 (verbatim asserts): the alpha ceiling is 50% unless F3 is proven
+/// AND the market is clamp-enforced; the alpha in force is `min(stored, 50%)` until F3 is proven.
+/// Mutant M-B1: ignore `f3_proven` in `alloc_alpha_max_bps_for` -> FAIL.
+#[kani::proof]
+fn kani_rck_gap8_alpha_dials() {
+    let proven: bool = kani::any();
+    let band: bool = kani::any();
+    let stored: u16 = kani::any();
+    let m = alloc_alpha_max_bps_for(proven, band);
+    if proven && band {
+        assert_eq!(m, ALLOC_ALPHA_MAX_BAND_BPS);
+    } else {
+        assert_eq!(m, 5_000);
+    }
+    let a = alloc_alpha_in_force_bps_for(proven, stored);
+    assert!(a <= stored);
+    if !proven {
+        assert!(a <= 5_000);
+        assert_eq!(a, if stored < 5_000 { stored } else { 5_000 });
+    } else {
+        assert_eq!(a, stored);
+    }
+    kani::cover!(!proven && band && m == 5_000, "band market capped at 50% while unproven");
+    kani::cover!(proven && band && m == ALLOC_ALPHA_MAX_BAND_BPS, "band max once proven");
+    kani::cover!(!band && m == 5_000, "off-band 50%");
+    kani::cover!(!proven && stored > 5_000 && a == 5_000, "a 70% record allocates at 50%");
+    kani::cover!(!proven && stored < 5_000 && a == stored, "a lower dial is kept");
+    kani::cover!(proven && stored > 5_000 && a == stored, "after the flip: the stored dial");
+}
+
+/// RCK-5b: the allocation half of gap8: while F3 is unproven, the allocation limit at the in-force
+/// alpha never takes the allocated counter above floor(50% · C_eff) (division-free:
+/// `l > 0 ⇒ 2·(alloc + l) ≤ c`). `bps_floor` / `bps_ceil` = the lemma models.
+/// Mutant M-B1b: `alloc_alpha_in_force_bps_for` ignores the unproven cap -> FAIL.
+#[kani::proof]
+#[kani::stub(crate::vault_lp_v18::bps_floor, bps_floor_model)]
+#[kani::stub(crate::vault_lp_v18::bps_ceil, bps_ceil_model)]
+fn kani_rck_gap8_alloc_under_half() {
+    let stored: u16 = kani::any();
+    kani::assume(stored <= ALLOC_ALPHA_MAX_BAND_BPS);
+    let a = alloc_alpha_in_force_bps_for(false, stored);
+    let c: u32 = kani::any();
+    let alloc: u32 = kani::any();
+    let draw: u32 = kani::any();
+    let r = vl::vault_lp_alloc_limit(c as u128, alloc as u128, draw as u128, a, vl::ALLOC_BUFFER_MIN_BPS);
+    let l = r.unwrap();
+    if l > 0 {
+        assert!(2 * (alloc as u128 + l) <= c as u128, "alloc + limit <= floor(50% C_eff)");
+    }
+    // division-free covers (no extra divider in the model run)
+    kani::cover!(l > 0 && 2 * (alloc as u128 + l) + 1 >= c as u128, "tight at 50%");
+    kani::cover!(stored > 5_000 && l > 0, "a 70% record allocates (at 50%)");
+    kani::cover!(l > 0 && (draw as u128) * 10 < (c as u128) * 6 && alloc == 0, "thin drawable: liquid-room regime");
+    kani::cover!(l > 0 && draw as u128 >= c as u128, "deep drawable: alpha-room regime");
+}
+
+/// RCK-6 (G-3, one-step induction): with no fresh sample in a step (window and last_good
+/// unchanged), the sticky cap of a DEPTH_EVER record never rises from `now` to `now + 1` and stays
+/// `<= min(last_good, window)`. Since this holds for every `now`, `cap(now + n) <= cap(now)` for
+/// every `n` by induction (RCK-3 asserts the any-gap form directly).
+/// Mutant M-C1: the sticky path ignores the window -> FAIL `c1 <= tw`.
+#[kani::proof]
+fn kani_rck_g3_sticky_cap_one_step() {
+    let src: u8 = kani::any();
+    let byte = src | DEPTH_EVER;
+    let lg: u64 = kani::any();
+    let lgs: u64 = kani::any();
+    let now: u64 = kani::any();
+    kani::assume(now < u64::MAX);
+    let tw: Option<u64> = kani::any();
+    let twv = tw.unwrap_or(u64::MAX);
+    let c0 = cap_depth_e6(byte, None, lg, lgs, now, tw);
+    let c1 = cap_depth_e6(byte, None, lg, lgs, now + 1, tw);
+    assert!(c0.is_some() && c1.is_some(), "never uncapped once DEPTH_EVER");
+    let (c0, c1) = (c0.unwrap(), c1.unwrap());
+    assert!(c1 <= c0, "one step never raises the sticky cap");
+    assert!(c1 <= lg && c1 <= twv, "invariant: cap <= min(last_good, window)");
+    kani::cover!(c1 < c0 && c1 > 0, "a halving step");
+    kani::cover!(c1 == c0 && c0 > 0 && now >= lgs, "in-epoch step");
+    kani::cover!(c0 > 0 && c1 == 0 && tw.is_none(), "the k = 64 step to 0");
+    kani::cover!(tw.is_some_and(|t| t < sticky_depth_e6(lg, lgs, now + 1)) && c1 == twv, "window binds");
+    kani::cover!(now + 1 < lgs && lg > 0 && c1 == lg.min(twv), "future last-good stamp: no decay");
+}
