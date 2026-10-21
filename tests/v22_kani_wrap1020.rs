@@ -135,6 +135,66 @@ fn kani_w1020_s1_23_position_vector_detects_exactly_reshapes() {
     kani::cover!(k == V16_MAX_PORTFOLIO_ASSETS_N - 1, "COVER: last leg slot");
 }
 
+/// H23c (v22live 2026-10-20): H23b split by leg slot. H23b runs CBMC out of memory (7,501 VCCs, twice:
+/// 09:27 and 14:48 BST), because a SYMBOLIC slot k turns every `copy_from_slice` into the two 10.6 kB
+/// images into a symbolic-offset write. Here the slot is a CONCRETE const K, and the 16 harnesses
+/// `kani_w1020_s1_23c_position_vector_k{0..15}` together prove exactly H23b's property for every slot
+/// (H23b's k ranges over 0..V16_MAX_PORTFOLIO_ASSETS_N = 16). ONE image is used: it is read as state A,
+/// then rewritten in place to state B (leg K's tuple/active, plus capital and the leg's a_basis noise),
+/// and read again. Every other leg is empty in both states, as in H23b. Same assertions and covers.
+/// Mutant M23b: the vector drops `basis_pos_q` (must FAIL the "vector equal iff" assertion).
+fn h23c_position_vector_detects_exactly_reshapes<const K: usize>() {
+    let (aa, am, as_, ab): (u32, u64, u8, i128) = (kani::any(), kani::any(), kani::any(), kani::any());
+    let (ba, bm, bs, bb): (u32, u64, u8, i128) = (kani::any(), kani::any(), kani::any(), kani::any());
+    let b_active: bool = kani::any();
+    // Byte image: every field of PortfolioAccountV16Account is an align-1 `[u8; N]` pod, so the
+    // production `bytemuck::try_from_bytes` view never refuses a `Vec<u8>` for alignment. (A u128
+    // backing viewed through `cast_slice_mut` made CBMC model every byte write as a byte_update of
+    // a 16-byte word: that is what ran propositional reduction out of memory.)
+    let mut st = vec![0u8; PORTFOLIO_ACCOUNT_LEN];
+    let d: &mut [u8] = &mut st[..];
+    init_header(d);
+    write_leg(d, K, 1, aa, am, as_, ab);
+    let va = state::portfolio_position_vector(d);
+    // state B, in place
+    write_leg(d, K, b_active as u8, ba, bm, bs, bb);
+    let cap: u128 = kani::any();
+    let coff = HEADER_LEN + offset_of!(PortfolioAccountV16Account, capital);
+    d[coff..coff + 16].copy_from_slice(&cap.to_le_bytes());
+    let abasis: u128 = kani::any();
+    let aoff = leg_off(K) + offset_of!(PortfolioLegV16Account, a_basis);
+    d[aoff..aoff + 16].copy_from_slice(bytemuck::bytes_of(&V16PodU128::new(abasis)));
+    let vb = state::portfolio_position_vector(d);
+    assert!(va.is_some() && vb.is_some(), "a well-formed portfolio is readable");
+    let (va, vb) = (va.unwrap(), vb.unwrap());
+    assert_eq!(va.len(), 1);
+    let same_tuple = aa == ba && am == bm && as_ == bs && ab == bb;
+    assert_eq!(va == vb, b_active && same_tuple, "vector equal iff the position is unchanged");
+    kani::cover!(va == vb && cap != 0, "COVER: capital changed, no bump");
+    kani::cover!(b_active && aa == ba && am == bm && as_ == bs && ab != bb, "COVER: only basis changed -> bump");
+    kani::cover!(b_active && aa == ba && am == bm && ab == bb && as_ != bs, "COVER: only side changed -> bump");
+    kani::cover!(!b_active && same_tuple, "COVER: leg closed -> bump");
+}
+
+macro_rules! h23c_harness {
+    ($($name:ident = $k:literal),* $(,)?) => { $(
+        #[kani::proof]
+        #[kani::unwind(18)]
+        fn $name() { h23c_position_vector_detects_exactly_reshapes::<$k>(); }
+    )* };
+}
+const _H23C_COVERS_EVERY_SLOT: () = assert!(V16_MAX_PORTFOLIO_ASSETS_N == 16);
+h23c_harness!(
+    kani_w1020_s1_23c_position_vector_k0 = 0, kani_w1020_s1_23c_position_vector_k1 = 1,
+    kani_w1020_s1_23c_position_vector_k2 = 2, kani_w1020_s1_23c_position_vector_k3 = 3,
+    kani_w1020_s1_23c_position_vector_k4 = 4, kani_w1020_s1_23c_position_vector_k5 = 5,
+    kani_w1020_s1_23c_position_vector_k6 = 6, kani_w1020_s1_23c_position_vector_k7 = 7,
+    kani_w1020_s1_23c_position_vector_k8 = 8, kani_w1020_s1_23c_position_vector_k9 = 9,
+    kani_w1020_s1_23c_position_vector_k10 = 10, kani_w1020_s1_23c_position_vector_k11 = 11,
+    kani_w1020_s1_23c_position_vector_k12 = 12, kani_w1020_s1_23c_position_vector_k13 = 13,
+    kani_w1020_s1_23c_position_vector_k14 = 14, kani_w1020_s1_23c_position_vector_k15 = 15,
+);
+
 // ── AUD-S1-24: a Live insurance debit consumes its authority epoch ───────────────────────────
 
 /// H24. The lane write the tag-57 Live debit now performs (`advance_authority_epoch_view` ->
@@ -220,4 +280,70 @@ fn kani_w1020_s1_16_rearm_is_exact_cushion_threshold() {
         kani::cover!(!rearm && lhs == rhs, "COVER: exactly at target stays vested");
         kani::cover!(rearm && before * 10_000 >= rhs, "COVER: the withdrawal itself crossed the target");
     }
+}
+
+// v22live bisection probes for the H23c CBMC out-of-memory (diagnostic only; not part of the property).
+#[kani::proof]
+#[kani::unwind(18)]
+fn h23probe_p1_single_read_symbolic_leg() {
+    let (aa, am, as_, ab): (u32, u64, u8, i128) = (kani::any(), kani::any(), kani::any(), kani::any());
+    let mut st = vec![0u8; PORTFOLIO_ACCOUNT_LEN];
+    let d: &mut [u8] = &mut st[..];
+    init_header(d);
+    write_leg(d, 0, 1, aa, am, as_, ab);
+    let va = state::portfolio_position_vector(d);
+    assert!(va.is_some());
+    let va = va.unwrap();
+    assert_eq!(va.len(), 1);
+    assert!(va[0] == (aa, am, as_, ab));
+    kani::cover!(ab < 0, "COVER: short basis");
+}
+
+#[kani::proof]
+#[kani::unwind(18)]
+fn h23probe_p2_single_read_concrete_leg() {
+    let mut st = vec![0u8; PORTFOLIO_ACCOUNT_LEN];
+    let d: &mut [u8] = &mut st[..];
+    init_header(d);
+    write_leg(d, 0, 1, 3, 7, 1, -5);
+    let va = state::portfolio_position_vector(d);
+    assert!(va.is_some());
+    assert_eq!(va.unwrap().len(), 1);
+}
+
+/// Field-level leg write: only the five position bytes ranges are written (no whole-struct `bytes_of`).
+fn write_leg_fields(d: &mut [u8], k: usize, active: u8, asset: u32, mid: u64, side: u8, basis: i128) {
+    let o = leg_off(k);
+    d[o + offset_of!(PortfolioLegV16Account, active)] = active;
+    let a = o + offset_of!(PortfolioLegV16Account, asset_index);
+    d[a..a + 4].copy_from_slice(&asset.to_le_bytes());
+    let m = o + offset_of!(PortfolioLegV16Account, market_id);
+    d[m..m + 8].copy_from_slice(&mid.to_le_bytes());
+    d[o + offset_of!(PortfolioLegV16Account, side)] = side;
+    let b = o + offset_of!(PortfolioLegV16Account, basis_pos_q);
+    d[b..b + 16].copy_from_slice(&basis.to_le_bytes());
+}
+
+#[kani::proof]
+#[kani::unwind(18)]
+fn h23probe_p3_single_read_symbolic_asset_only() {
+    let aa: u32 = kani::any();
+    let mut st = vec![0u8; PORTFOLIO_ACCOUNT_LEN];
+    let d: &mut [u8] = &mut st[..];
+    init_header(d);
+    write_leg(d, 0, 1, aa, 7, 1, -5);
+    let va = state::portfolio_position_vector(d).unwrap();
+    assert!(va.len() == 1 && va[0] == (aa, 7, 1, -5));
+}
+
+#[kani::proof]
+#[kani::unwind(18)]
+fn h23probe_p4_single_read_symbolic_field_writes() {
+    let (aa, am, as_, ab): (u32, u64, u8, i128) = (kani::any(), kani::any(), kani::any(), kani::any());
+    let mut st = vec![0u8; PORTFOLIO_ACCOUNT_LEN];
+    let d: &mut [u8] = &mut st[..];
+    init_header(d);
+    write_leg_fields(d, 0, 1, aa, am, as_, ab);
+    let va = state::portfolio_position_vector(d).unwrap();
+    assert!(va.len() == 1 && va[0] == (aa, am, as_, ab));
 }
