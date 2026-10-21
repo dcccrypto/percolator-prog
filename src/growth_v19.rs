@@ -1048,10 +1048,19 @@ pub fn depth_ever(depth_source_byte: u8) -> bool {
     depth_source_byte & DEPTH_EVER != 0
 }
 
-/// Validator: only bits 0-1 (a known source, 0..=2), bit 2 (`DEPTH_PREV_REAL`) and bit 7
-/// (`DEPTH_EVER`) may be set.
+/// Byte 44 bit 6 (CONTROLLER ROLLBACK, coupling to v2.2 DEATH F-3): the RC2 controller marks a
+/// tag-123 DEX-pinned asset with this bit and refuses keeper-attested (mode 1) depth while it is
+/// set. This build has no pin concept: the bit is only TOLERATED so RC2-written records decode.
+/// Every reader here masks byte 44 (`depth_source_of`, `depth_ever`, `DEPTH_PREV_REAL`), so the bit
+/// changes no value; this build's depth writer (`set_depth_state`) does not carry it, so it decays
+/// on the first depth write after a rollback, and RC2 re-arms it on its next mode-2 reading.
+pub const DEPTH_DEX_PINNED: u8 = 0x40;
+
+/// Validator: only bits 0-1 (a known source, 0..=2), bit 2 (`DEPTH_PREV_REAL`), bit 6
+/// (`DEPTH_DEX_PINNED`, tolerated: see above) and bit 7 (`DEPTH_EVER`) may be set. Bits 3-5 stay
+/// refused.
 pub fn depth_source_byte_ok(depth_source_byte: u8) -> bool {
-    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_EVER) == 0
+    depth_source_byte & !(DEPTH_SOURCE_MASK | DEPTH_PREV_REAL | DEPTH_DEX_PINNED | DEPTH_EVER) == 0
         && depth_source_of(depth_source_byte) <= DEPTH_SOURCE_DEX
 }
 
@@ -2726,6 +2735,14 @@ mod tests {
         // validator: bit 2 allowed, bits 3-6 not
         assert!(depth_source_byte_ok(DEPTH_EVER | DEPTH_PREV_REAL | DEPTH_SOURCE_DEX));
         assert!(!depth_source_byte_ok(0x08));
+        // CONTROLLER ROLLBACK: the RC2 DEX-pin bit decodes (0xC6 is what RC2 stores on a pinned
+        // DEX market), bits 3-5 stay refused.
+        assert!(depth_source_byte_ok(DEPTH_EVER | DEPTH_DEX_PINNED | DEPTH_PREV_REAL | DEPTH_SOURCE_DEX));
+        assert!(depth_source_byte_ok(DEPTH_DEX_PINNED));
+        for b in [0x08u8, 0x10, 0x20, 0x48, 0x60] {
+            assert!(!depth_source_byte_ok(b), "{b:#04x}");
+        }
+        assert!(!depth_source_byte_ok(DEPTH_DEX_PINNED | 0x03), "an unknown source stays refused");
     }
 
     #[test]

@@ -4577,6 +4577,133 @@ fn controller_rollback_still_refuses_records_the_controller_cannot_write() {
     assert!(!env.growth_decodes(), "the remaining validator clauses still bind");
 }
 
+impl Env {
+    /// A trader opens, the market moves on (push + crank), the trader closes to flat and
+    /// withdraws: the exit path a rollback must keep open on every record it accepts.
+    fn rollback_trader_exit(&mut self, lp: &Lp, tag: &str) {
+        // A fresh slot, mark and LP crank first: a trade right after another one meets LossStale
+        // (Custom 121) in this harness on every build (see the differential below).
+        self.warp(2);
+        self.push(PRICE);
+        self.crank(lp.account).unwrap_or_else(|e| panic!("{tag}: LP crank refused: {e}"));
+        self.crank_current(lp.account);
+        let (k, p) = self.trader(1_000 * USD);
+        self.trade_cpi(&k, p, lp, 10 * Q).unwrap_or_else(|e| panic!("{tag}: open refused: {e}"));
+        self.warp(2);
+        self.push(PRICE);
+        self.crank(p).unwrap_or_else(|e| panic!("{tag}: trader crank refused: {e}"));
+        self.crank_current(p);
+        self.crank_current(lp.account);
+        self.trade_cpi(&k, p, lp, -10 * Q).unwrap_or_else(|e| panic!("{tag}: close refused: {e}"));
+        self.withdraw(&k, p, 100 * USD).unwrap_or_else(|e| panic!("{tag}: withdraw refused: {e}"));
+        self.assert_conservation();
+    }
+}
+
+/// RC2 coupling (v2.2 DEATH F-3): the RC2 controller stores byte 44 bit 6 (`DEPTH_DEX_PINNED`) on
+/// a tag-123 DEX-pinned asset; a pinned DEX market reads 0xC6 (DEX | PREV_REAL | PINNED | EVER).
+/// The rollback decodes such a record (with flags 0x03, and also the flags-0 shape, which RC2
+/// never writes but which must not brick a market either), runs every core instruction and the
+/// trader exit, keeps DEPTH_EVER, and its own depth write drops the bit (no pin concept here).
+#[test]
+fn controller_rollback_accepts_an_rc2_dex_pinned_record_and_exits_work() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    env.poke_controller_record(0x03);
+    env.poke_growth_raw(44, &[0xC6]);
+    assert!(env.growth_decodes(), "the RC2 pinned shape (flags 3, byte 44 = 0xC6) decodes");
+    env.rollback_exercise(&lp, "flags 3 + DEX pin");
+    env.rollback_trader_exit(&lp, "flags 3 + DEX pin");
+    let b = env.growth_bytes();
+    assert_controller_bytes_dropped(&b, "flags 3 + DEX pin");
+    assert_eq!(b[44] & 0x80, 0x80, "DEPTH_EVER survives");
+    assert_eq!(b[44] & 0x40, 0, "the rollback's depth write does not carry the pin bit");
+    // flags 0 + pin bit: not an RC2 shape, but tolerated (never brick a market on the bit).
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    let b44 = env.growth_bytes()[44];
+    env.poke_growth_raw(44, &[b44 | 0x40]);
+    assert!(env.growth_decodes(), "flags 0 + pin bit decodes");
+    env.rollback_exercise(&lp, "flags 0 + DEX pin");
+    env.rollback_trader_exit(&lp, "flags 0 + DEX pin");
+    // bits 3-5 of byte 44 stay refused
+    for bad in [0x08u8, 0x10, 0x20] {
+        let mut env = Env::new(band_cfg());
+        env.auth_mark();
+        let _lp = env.lp(1_000 * USD);
+        env.poke_growth_raw(44, &[bad | 0x40]);
+        assert!(!env.growth_decodes(), "byte 44 {:#04x} must be refused", bad | 0x40);
+    }
+}
+
+/// PINNED DIFFERENTIAL (ignored; `CONTROLLER_SO` = the RC2 controller BPF): the controller writes
+/// the record (flags 0x03, window); the asset is then marked DEX-pinned (STATE POKE of byte 44
+/// bit 6, the bit RC2's tag 123 op 1 / mode-2 reading sets; a pool fixture is not mounted in this
+/// env) and the REAL RC2 BPF is shown to treat it as pinned (a mode-1 push is refused with 129) and
+/// to write the record back with the bit (a 35 B push lands, the bit survives: an RC2-written
+/// pinned record). The program is swapped for this rollback: every core instruction and the
+/// trader exit land. Swapped back to RC2: pushes, crank and tag 106 land again.
+#[test]
+#[ignore]
+fn controller_rollback_differential_pinned_from_controller_bpf() {
+    let controller = PathBuf::from(std::env::var_os("CONTROLLER_SO").expect("CONTROLLER_SO"));
+    let rollback = std::fs::read(program_path()).expect("rollback .so");
+    let mut env = f1_env(Some(controller.clone()), band_cfg());
+    let ctrl = std::fs::read(&controller).unwrap();
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    env.depth_twice(600 * USD as u64);
+    for _ in 0..3 {
+        env.warp(2);
+        env.push(PRICE);
+        env.warp(2);
+        env.push_depth(PRICE, 1, 600 * USD as u64).expect("controller 44 B push");
+    }
+    let b44 = env.growth_bytes()[44];
+    env.poke_growth_raw(44, &[b44 | 0x40]);
+    env.warp(2);
+    let r = env.push_depth(PRICE, 1, 600 * USD as u64);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(129)")), "RC2 refuses mode 1 on a pinned asset: {r:?}");
+    env.push(PRICE);
+    env.crank(lp.account).expect("RC2 crank on the pinned asset");
+    env.crank_current(lp.account);
+    let g = env.growth_bytes();
+    println!("RC2 pinned record: flags={:#04x} byte44={:#04x} 30..38={:?} 118..120={:?}", g[39], g[44], &g[30..38], &g[118..120]);
+    assert_ne!(g[39] & 1, 0, "RC2 (controller) layout");
+    assert_eq!(g[44] & 0x40, 0x40, "RC2 wrote the record back with the pin bit");
+    // Swap to the rollback.
+    env.svm.add_program(env.program_id, &rollback);
+    // The trader exit first (open, crank, close, withdraw), then the remaining core instructions:
+    // in this BPF env a second fresh open after another trade meets LossStale (Custom 121) on
+    // every build, pinned or not (checked with the pin poke removed), so the exercise's own trade
+    // is not repeated here.
+    env.rollback_trader_exit(&lp, "RC2 pinned -> rollback");
+    env.warp(1);
+    env.push(PRICE);
+    env.warp(1);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("rollback 44 B mode-1 push on the formerly pinned asset");
+    env.crank(lp.account).expect("rollback crank");
+    env.crank_current(lp.account);
+    env.settle_rent(lp.account, lp.account).expect("rollback tag 106");
+    env.assert_conservation();
+    assert_eq!(env.growth_bytes()[44] & 0x40, 0, "the rollback's depth write does not carry the pin bit");
+    assert_controller_bytes_dropped(&env.growth_bytes(), "after the rollback's writes");
+    // Re-upgrade to RC2.
+    env.svm.add_program(env.program_id, &ctrl);
+    env.warp(2);
+    env.push(PRICE);
+    env.warp(2);
+    env.push_depth(PRICE, 1, 600 * USD as u64).expect("RC2 44 B push after the round trip (pin bit decayed)");
+    env.crank(lp.account).expect("RC2 crank after the round trip");
+    env.crank_current(lp.account);
+    env.settle_rent(lp.account, lp.account).expect("RC2 tag 106 after the round trip");
+    assert_ne!(env.growth_bytes()[39] & 1, 0, "RC2 re-migrated the record");
+}
+
 /// DIFFERENTIAL (ignored; `CONTROLLER_SO` = the controller wrapper at the IDs this test env
 /// mounts, `GROWTH_WRAPPER_SO` or target/deploy = this rollback build): the market is created and
 /// driven by the real controller BPF (35 B and 44 B pushes, which write flags / window / variance,
