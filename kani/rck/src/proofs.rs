@@ -340,3 +340,124 @@ fn kani_rck_g3_sticky_cap_one_step() {
     kani::cover!(tw.is_some_and(|t| t < sticky_depth_e6(lg, lgs, now + 1)) && c1 == twv, "window binds");
     kani::cover!(now + 1 < lgs && lg > 0 && c1 == lg.min(twv), "future last-good stamp: no decay");
 }
+
+// ─── Round 3 (coordinator, 2026-10-21): LF / LC in remainder form, K1-L1 style ──────────────────
+// The production bodies (vault_lp_v18.rs:51 and :60-61) are
+//   bps_floor = (x / B)·b + ((x % B)·b) / B
+//   bps_ceil  = (x / B)·b + ((x % B)·b) / B + [((x % B)·b) % B != 0]
+// Width lift (stated, = Rust's definition of `/` and `%` on unsigned ints, width-independent):
+//   x = B·q + r with q = x / B, r = x % B < B;  r·b = B·s + u with s = (r·b) / B, u = (r·b) % B < B.
+// For x < 2^32 and b <= B every value below is < 2^64, so u64 here equals the production u128.
+// The lemmas below assume ONLY those two identities (remainder form, no division) and prove the
+// exact floor / ceiling relation; the native test `tests/native_bps.rs` checks the real functions
+// against the same relation exhaustively over every (r, b) residue pair.
+const Q_MAX: u64 = (u32::MAX as u64) / B; // x < 2^32  =>  q <= Q_MAX
+
+fn rem_form() -> (u64, u64, u64, u64, u64) {
+    let q: u64 = kani::any();
+    let r: u64 = kani::any();
+    let b: u64 = kani::any();
+    let s: u64 = kani::any();
+    let u: u64 = kani::any();
+    kani::assume(q <= Q_MAX && r < B && b <= B && u < B);
+    kani::assume(r * b == s * B + u); // r·b < 1e8: no overflow
+    (q, r, b, s, u)
+}
+
+/// LF-r: floor. z = q·b + s satisfies z·B <= x·b < z·B + B, and z <= x.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_floor_remform() {
+    let (q, r, b, s, u) = rem_form();
+    let x = q * B + r;
+    let z = q * b + s;
+    let xb = x * b;
+    assert!(z * B <= xb && xb < z * B + B, "exact floor (remainder form)");
+    assert!(z <= x, "z <= x");
+    kani::cover!(u == 0 && b > 0 && r > 0, "exact product");
+    kani::cover!(u > 0, "rounded down");
+    kani::cover!(b == B && z == x, "b = 1e4: z == x");
+    kani::cover!(q == Q_MAX, "top of the u32 range");
+}
+
+/// LC-r: ceiling. z = q·b + s + [u != 0] satisfies x·b <= z·B < x·b + B, and z <= x.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_ceil_remform() {
+    let (q, r, b, s, u) = rem_form();
+    let x = q * B + r;
+    let z = q * b + s + (u != 0) as u64;
+    let xb = x * b;
+    assert!(xb <= z * B && z * B < xb + B, "exact ceiling (remainder form)");
+    assert!(z <= x, "z <= x");
+    kani::cover!(u == 0 && b > 0 && r > 0, "exact product: no round-up");
+    kani::cover!(u > 0, "rounds up");
+    kani::cover!(b == B && z == x, "b = 1e4: z == x");
+    kani::cover!(q == Q_MAX, "top of the u32 range");
+}
+
+// Round 3b lever (decided before running): z3 decides WRAPPING distributivity (WRAP lane, R1, 1 s at
+// u128), and remainder-form exact u64 timed out under cadical (900 s). So: the same relations in
+// wrapping form under z3, plus a no-overflow lemma (cadical) on the same bounded domain, under which
+// wrapping == exact.
+fn rem_form_w() -> (u64, u64, u64, u64, u64) {
+    let q: u64 = kani::any();
+    let r: u64 = kani::any();
+    let b: u64 = kani::any();
+    let s: u64 = kani::any();
+    let u: u64 = kani::any();
+    kani::assume(q <= Q_MAX && r < B && b <= B && u < B && s < B);
+    kani::assume(r.wrapping_mul(b) == s.wrapping_mul(B).wrapping_add(u));
+    (q, r, b, s, u)
+}
+
+/// LF-w (z3): x·b == z·B + u in wrapping arithmetic, z = q·b + s.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_floor_wrap() {
+    let (q, r, b, s, u) = rem_form_w();
+    let x = q.wrapping_mul(B).wrapping_add(r);
+    let z = q.wrapping_mul(b).wrapping_add(s);
+    assert!(x.wrapping_mul(b) == z.wrapping_mul(B).wrapping_add(u), "x·b = z·B + u");
+    kani::cover!(u > 0 && q > 0, "rounded, q > 0");
+    kani::cover!(u == 0 && b > 0, "exact");
+}
+
+/// NO (cadical): on the domain, every product / sum used is below 2^64 (so wrapping == exact), and
+/// the inner product r·b is below 1e8 so s < 1e4.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_no_overflow() {
+    let q: u64 = kani::any();
+    let r: u64 = kani::any();
+    let b: u64 = kani::any();
+    kani::assume(q <= Q_MAX && r < B && b <= B);
+    let x = q.checked_mul(B).and_then(|v| v.checked_add(r));
+    assert!(x.is_some());
+    let x = x.unwrap();
+    assert!(x <= u32::MAX as u64 + B);
+    assert!(x.checked_mul(b).is_some_and(|v| v < (1u64 << 47)), "x·b < 2^47");
+    assert!(q.checked_mul(b).is_some_and(|v| v <= Q_MAX * B), "q·b small");
+    assert!(r.checked_mul(b).is_some_and(|v| v < B * B), "r·b < 1e8");
+    kani::cover!(q == Q_MAX && b == B, "extreme");
+}
+
+/// LC-w (z3): ceiling. zc = q·b + s + [u != 0]; zc·B == x·b + (B − u)·[u != 0] in wrapping form.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_ceil_wrap() {
+    let (q, r, b, s, u) = rem_form_w();
+    let x = q.wrapping_mul(B).wrapping_add(r);
+    let zc = q.wrapping_mul(b).wrapping_add(s).wrapping_add((u != 0) as u64);
+    let pad = if u != 0 { B - u } else { 0 };
+    assert!(zc.wrapping_mul(B) == x.wrapping_mul(b).wrapping_add(pad), "zc·B = x·b + pad");
+    kani::cover!(u > 0 && q > 0, "rounds up");
+    kani::cover!(u == 0 && b > 0, "exact");
+}
+
+/// NO-2 (cadical): z·B and zc·B (z = q·b + s, s < B) stay below 2^64 on the domain.
+#[kani::proof]
+fn kani_rck_gap8_lemma_bps_no_overflow_z() {
+    let q: u64 = kani::any();
+    let b: u64 = kani::any();
+    let s: u64 = kani::any();
+    kani::assume(q <= Q_MAX && b <= B && s < B);
+    let z = q.checked_mul(b).and_then(|v| v.checked_add(s + 1));
+    assert!(z.is_some_and(|z| z.checked_mul(B).is_some_and(|v| v < (1u64 << 47))), "(q·b + s + 1)·B < 2^47");
+    kani::cover!(q == Q_MAX && b == B && s == B - 1, "extreme");
+}
