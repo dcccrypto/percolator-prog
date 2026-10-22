@@ -195,6 +195,31 @@ pub fn live_bound_principal_portion(atoms_out: u128, available_principal: u128) 
     }
 }
 
+/// P3U (2026-10-20): one BOUND pot's available principal for tag 77's OI-reservation guard: the
+/// B24 owned reading `min(principal, held)` with `held = floor((fresh_unliened + valid_liened) /
+/// scale)`, i.e. the per-pot term of [`bound_vault_nav`] that prices the payout. The ledger's
+/// impairment counters are deliberately NOT used (B24: they book every consumed lien, including
+/// the vault LP's settled loss routed into the pot). Whenever the redemption's gates hold
+/// (`principal_portion <= principal` and `principal_portion * scale <= fresh_unliened`), the
+/// result is `>= principal_portion` (Kani `kani_p3u_bound_pot_available_covers_gated_payout`, `kani/contlev`), so
+/// the guard's post-principal subtraction cannot underflow. Saturating; `0` for `scale == 0`.
+pub fn bound_pot_available_principal(
+    principal: u128,
+    fresh_unliened_num: u128,
+    valid_liened_num: u128,
+    scale: u128,
+) -> u128 {
+    if scale == 0 {
+        return 0;
+    }
+    let held = fresh_unliened_num.saturating_add(valid_liened_num) / scale;
+    if principal < held {
+        principal
+    } else {
+        held
+    }
+}
+
 /// The junior floor while any senior claim exists: `ceil(C * floor_bps / 10_000)`.
 pub fn junior_floor_atoms(senior_claim: u128, junior_floor_bps: u16) -> Option<u128> {
     bps_ceil(senior_claim, junior_floor_bps)
