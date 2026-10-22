@@ -152,7 +152,7 @@ impl P3 {
         let admin = self.env.admin.insecure_clone();
         let (m, r, mint) = (self.env.market, self.registry, self.lp_mint);
         self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: OI_BPS.with(|c| c.get()), domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -596,6 +596,9 @@ fn code(e: &str) -> Option<u32> {
     custom_code(e)
 }
 
+// P3U: the LP vault's `oi_reservation_threshold_bps` at tag 74 (0 = the harness default; the
+// relaunch seeds use 8,000).
+thread_local! { static OI_BPS: std::cell::Cell<u16> = std::cell::Cell::new(0); }
 thread_local! { static TL_IM: std::cell::Cell<u64> = std::cell::Cell::new(10_000); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
@@ -2262,4 +2265,66 @@ fn p3_d1_opposite_pot_untouched_winner_paid_in_full() {
     eprintln!("D1o: W paid {paid} (null control {null}); drawn {drawn_c}/{drawn_n}");
     assert!(null > 2_000_000, "vacuity: W had a profit");
     assert!(paid + 2 >= null, "D-1 opposite pot: untouched winner W paid {paid} < null {null}");
+}
+
+/// P3U (2026-10-20, sim P2.10 `sdredeem-250k`): after a loss reached a pot (B24 shape: a
+/// junior-covered win converted out of the vault LP's settled loss in the pot), the pot's ledger
+/// has booked impairment that the B24 pricing deliberately ignores. With the relaunch
+/// OI-reservation threshold (8,000 bps) the FULL exit of the last senior on that pot was refused
+/// with 25 (EngineCounterUnderflow): tag 77's OI guard read `principal - booked impairment` as
+/// the pot's available principal and computed `available - principal_portion`. The exit must
+/// pay its pro-rata value (as it does with the guard off, `p3_b24_live_...`), every senior in
+/// full, conserved.
+#[test]
+fn p3u_full_senior_exit_after_booked_pot_loss_with_oi_reservation_pays() {
+    OI_BPS.with(|c| c.set(8_000));
+    let (mut w, seniors, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 2);
+    OI_BPS.with(|c| c.set(0));
+    let lp = w.lp;
+    let _ = w.crank(lp);
+    let c = w.c();
+    let s_total = w.registry_shares();
+    let mut paid_total = 0u128;
+    for (i, (k, ata)) in seniors.iter().enumerate() {
+        let shares = w.tok(ata) as u128;
+        w.request_redeem(k, *ata, shares).unwrap();
+        let (d, r) = if i == 0 { w.execute_redeem(k, true) } else { w.execute_redeem_domain(k, 1) };
+        eprintln!("P3U senior {i}: 77 -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+        r.expect("P3U: a full senior exit must not fail with an internal 25");
+        paid_total += w.tok(&d) as u128;
+    }
+    let fair = c * (s_total - DEAD) / s_total;
+    assert!(paid_total + 2 >= fair, "P3U: seniors paid {paid_total} < fair {fair}");
+    // Non-vacuity: the pot the last senior left through carries booked impairment ABOVE its
+    // remaining principal, i.e. the old reading `principal_before - net_loss` was below the
+    // principal this exit took (the exact 25 condition).
+    let (p1, loss1, rec1, _, _) = w.domains()[1];
+    eprintln!("P3U pot 1 after exits: principal {p1} loss {loss1} recovery {rec1}");
+    assert!(loss1.saturating_sub(rec1) > p1, "vacuity: pot 1's booked impairment must exceed its remaining principal");
+    conserved(&w, "p3u");
+}
+
+/// P3U control: the same world with the guard ON, a PARTIAL (25%) exit on the impaired pot was
+/// already paid before the fix (its principal stays under the impairment-net reading); after
+/// the fix the rest of the position exits too.
+#[test]
+fn p3u_partial_then_rest_exit_on_impaired_pot_with_oi_reservation() {
+    OI_BPS.with(|c| c.set(8_000));
+    let (mut w, seniors, _t) = q1_world(9_000_000, 1_000_000, 1_000_000, 2);
+    OI_BPS.with(|c| c.set(0));
+    let lp = w.lp;
+    let _ = w.crank(lp);
+    let (k1, a1) = (seniors[1].0.insecure_clone(), seniors[1].1);
+    let sh = w.tok(&a1) as u128;
+    w.request_redeem(&k1, a1, sh / 4).unwrap();
+    let (d, r) = w.execute_redeem_domain(&k1, 1);
+    eprintln!("P3U partial 25%: 77 -> {:?} paid {}", r.as_ref().map_err(|e| code(e)), w.tok(&d));
+    r.expect("25% exit");
+    let rest = w.tok(&a1) as u128;
+    w.request_redeem(&k1, a1, rest).unwrap();
+    let (d2, r2) = w.execute_redeem_domain(&k1, 1);
+    eprintln!("P3U rest: 77 -> {:?} paid {}", r2.as_ref().map_err(|e| code(e)), w.tok(&d2));
+    r2.expect("P3U: the rest of the position exits (no internal 25)");
+    assert_eq!(w.tok(&a1), 0);
+    conserved(&w, "p3u partial");
 }

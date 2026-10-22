@@ -4787,6 +4787,401 @@ fn p2b_h2_redemption_above_buffer_waits_for_recall() {
     env.assert_conserved("h2 above buffer");
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// SEC-P3U: authored by Sentinel (percolator-security), SEC-RC.md §P3U, 2026-10-21; imported
+// from ~/wt-v22-secrc/rc2/tests/p3_vault_lp.rs (local PoCs) by Anvil for P3U-E1. Since P3U option
+// D the fee policy cannot reach a bound pot through instructions; the worlds bind fee-free and
+// force the policy (`sec_bind_with_backing_fee`), i.e. they are defence-in-depth worlds now.
+// Bound-vault variant of the #419 earnings bug, on REAL fee
+// earnings (a backing trade-fee policy on both pots + real TradeCpi opens/closes; no state poke).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+impl Env {
+    fn sec_set_backing_fee(&mut self, domain: u16, fee_bps: u16, ins: u16) -> Result<(), String> {
+        let a = (domain / 2) as usize;
+        let cur = state::read_asset_control_sequences(&self.svm.get_account(&self.market).unwrap().data, a).unwrap();
+        let seq = if domain % 2 == 0 { cur.backing_fee_long } else { cur.backing_fee_short } + 1;
+        let market_id = state::read_market_trade_preflight(&self.svm.get_account(&self.market).unwrap().data, a).unwrap().3;
+        let admin = self.admin.insecure_clone();
+        self.send(
+            ProgInstruction::UpdateBackingFeePolicy { market_id, domain, fee_bps, insurance_share_bps: ins, policy_sequence: seq },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(self.market, false)],
+            &[&admin],
+        )
+    }
+    /// P3U option D (Anvil, 2026-10-22): tag 51 now refuses a non-zero backing fee on a bound
+    /// pot and tag 94 refuses to bind a pot that has one, so a real-fee bound world can no longer
+    /// be built through instructions. Defence-in-depth worlds bind fee-free and then FORCE the
+    /// policy into the market account with the exact writes tag 51 makes (wrapper config +
+    /// asset-0 oracle profile + policy count). Everything after that is real flow.
+    fn sec_bind_with_backing_fee(&mut self, fee_bps: u16) -> Lp {
+        let lp = self.bind(1_000);
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        let (mut cfg, _, _, _) = state::read_market_config_mode_and_capacity(&acct.data).unwrap();
+        let mut prof = state::read_asset_oracle_profile(&acct.data, 0).unwrap();
+        let added = (cfg.backing_trade_fee_bps_long == 0) as u16 + (cfg.backing_trade_fee_bps_short == 0) as u16;
+        cfg.backing_trade_fee_bps_long = fee_bps;
+        cfg.backing_trade_fee_bps_short = fee_bps;
+        cfg.backing_trade_fee_policy_count += added;
+        prof.backing_trade_fee_bps_long = fee_bps;
+        prof.backing_trade_fee_bps_short = fee_bps;
+        state::write_wrapper_config(&mut acct.data, &cfg).unwrap();
+        state::write_asset_oracle_profile(&mut acct.data, 0, &prof).unwrap();
+        self.svm.set_account(self.market, acct).unwrap();
+        lp
+    }
+    fn sec_pots(&self) -> [(u128, u128, u128); 2] {
+        let g = self.market_state().1;
+        let b = |i: usize| (g.source_backing_buckets[i].utilization_fee_earnings, g.source_backing_buckets[i].fresh_unliened_backing_num / percolator::BOUND_SCALE, g.source_backing_buckets[i].valid_liened_backing_num / percolator::BOUND_SCALE);
+        [b(0), b(1)]
+    }
+}
+
+fn sec_p3u_world(fee_bps: u16, rounds: usize, alloc: u128, redeem_bps: u128) -> (Result<u64, String>, [(u128, u128, u128); 2], [(u128, u128, u128); 2]) {
+    let mut env = Env::new(Params::default());
+    let lp = env.sec_bind_with_backing_fee(fee_bps); // P3U-D: forced (was tag 51 before bind)
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..4).map(|_| env.new_trader(5_000_000)).collect();
+    for r in 0..rounds {
+        for (i, t) in ts.iter().enumerate() {
+            let s = if i % 2 == 0 { 1 } else { -1 } * (3 + (r % 3) as i128) * POS;
+            env.svm.expire_blockhash();
+            if let Err(e) = env.trade(t, &lp, s) { println!("open r{r} t{i}: {}", &e[..e.len().min(90)]); }
+        }
+        let ports: Vec<Pubkey> = std::iter::once(lp.portfolio).chain(ts.iter().map(|t| t.portfolio)).collect();
+        env.hold(1, &ports);
+        for t in ts.iter() {
+            let p = env.position(t.portfolio);
+            if p != 0 {
+                env.svm.expire_blockhash();
+                if let Err(e) = env.trade(t, &lp, -p) { println!("close r{r}: {}", &e[..e.len().min(90)]); }
+            }
+        }
+        env.hold(1, &ports);
+    }
+    let pots_after_trades = env.sec_pots();
+    println!("pots after trades (ufe, fresh, valid): {pots_after_trades:?}");
+    let h = env.crank_fees(true);
+    println!("tag 78: {:?}", h.as_ref().map(|_| ()));
+    if alloc > 0 {
+        let a = env.allocate(lp.portfolio, alloc);
+        println!("allocate {alloc}: {:?}", a.as_ref().map(|_| ()).map_err(|e| e[..e.len().min(120)].to_string()));
+    }
+    let shares = env.lp_shares(&d) * redeem_bps / 10_000;
+    env.earn_request(&d, shares);
+    let _ = env.crank_fees(true);
+    let pots_before = env.sec_pots();
+    let r = env.earn_execute(&d, Some(lp.portfolio));
+    println!("C={} S={} redeem {} shares: {:?}", env.vlp().senior_claim_atoms, env.registry_state().total_lp_shares_outstanding, shares,
+        r.as_ref().map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }));
+    println!("pots before redeem: {pots_before:?} after: {:?}", env.sec_pots());
+    env.assert_conserved("sec p3u");
+    (r, pots_after_trades, pots_before)
+}
+
+#[test]
+fn sec_p3u_bound_earnings_real_fees_explore() {
+    for (fee, alloc, bps) in [(30u16, 0u128, 10_000u128), (30, 0, 5_000), (100, 1_000_000, 10_000), (100, 3_000_000, 10_000), (100, 200, 10_000)] {
+        println!("==== fee {fee} alloc {alloc} redeem {bps}");
+        let _ = sec_p3u_world(fee, 3, alloc, bps);
+    }
+}
+
+#[test]
+fn sec_p3u_bound_earnings_winner_liens_explore() {
+    let mut env = Env::new(Params::default());
+    let lp = env.sec_bind_with_backing_fee(100); // P3U-D: forced (was tag 51 before bind)
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let d1 = env.new_depositor();
+    let r = env.earn_deposit_domain(&d1, 5_000_000, 1, Some(lp.portfolio));
+    println!("earn into pot 1: {:?}", r.as_ref().map(|_| ()));
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..4).map(|_| env.new_trader(5_000_000)).collect();
+    let ports: Vec<Pubkey> = std::iter::once(lp.portfolio).chain(ts.iter().map(|t| t.portfolio)).collect();
+    for (i, t) in ts.iter().enumerate() {
+        let s = if i % 2 == 0 { -4 * POS } else { 4 * POS };
+        env.svm.expire_blockhash();
+        env.trade(t, &lp, s).expect("open");
+    }
+    println!("after opens: {:?}", env.sec_pots());
+    env.move_price(900_000, &ports);
+    println!("after -10%: {:?}", env.sec_pots());
+    env.hold(50, &ports);
+    println!("after hold 50: {:?}", env.sec_pots());
+    for t in ts.iter() {
+        let p = env.position(t.portfolio);
+        env.svm.expire_blockhash();
+        let r = env.trade(t, &lp, if p < 0 { -POS } else { -POS });
+        println!("add/reduce {}: {:?} pots {:?}", p / POS, r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots());
+    }
+    for t in ts.iter() {
+        let p = env.position(t.portfolio);
+        env.svm.expire_blockhash();
+        let _ = env.trade(t, &lp, -p);
+    }
+    env.hold(2, &ports);
+    println!("after closes: {:?}", env.sec_pots());
+    env.assert_conserved("explore");
+}
+
+#[test]
+fn sec_p3u_bound_earnings_im_lien_explore() {
+    let mut env = Env::new(Params::default());
+    let lp = env.sec_bind_with_backing_fee(100); // P3U-D: forced (was tag 51 before bind)
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let d1 = env.new_depositor();
+    env.earn_deposit_domain(&d1, 5_000_000, 1, Some(lp.portfolio)).expect("earn pot1");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..2).map(|_| env.new_trader(600_000)).collect();
+    let ports: Vec<Pubkey> = std::iter::once(lp.portfolio).chain(ts.iter().map(|t| t.portfolio)).collect();
+    env.trade(&ts[0], &lp, -4 * POS).expect("short");
+    env.move_price(900_000, &ports);
+    env.hold(3, &ports);
+    let g = env.market_state().1;
+    println!("after -20%: pots {:?} sc {:?}", env.sec_pots(), g.source_credit.iter().take(2).map(|c| (c.positive_claim_bound_num / percolator::BOUND_SCALE, c.fresh_reserved_backing_num / percolator::BOUND_SCALE, c.valid_liened_backing_num / percolator::BOUND_SCALE)).collect::<Vec<_>>());
+    let p = env.portfolio(ts[0].portfolio);
+    println!("winner cap {} pnl {}", p.capital, p.pnl);
+    for add in [2i128, 4, 6, 8] {
+        env.svm.expire_blockhash();
+        let r = env.trade(&ts[0], &lp, -add * POS);
+        let p = env.portfolio(ts[0].portfolio);
+        let liens: Vec<_> = p.source_lien_counterparty_backing_num.iter().map(|x| x / percolator::BOUND_SCALE).collect();
+        println!("winner add {add}: {:?} pos {} cap {} pnl {} liens {:?} pots {:?}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.position(ts[0].portfolio) / POS, p.capital, p.pnl, liens, env.sec_pots());
+        env.hold(1, &ports);
+    }
+    env.assert_conserved("explore im");
+}
+
+/// Real-flow world: backing fee 100 bps on both pots, Earn 10M in pot 0 and 5M in pot 1, junior
+/// 10M; a short winner (cap 0.6) adds to its position against its PnL, which liens pot 0's
+/// backing and pays a REAL backing fee into pot 0's earnings (3,000 atoms). Then `alloc` senior
+/// capital goes to the vault LP (tag 103), and depositor d (10M shares) redeems in full through
+/// the bound path. Returns (result, ep estimate inputs).
+fn sec_p3u_fee_world(alloc: u128) -> (Result<u64, String>, u128, [(u128, u128, u128); 2]) {
+    let mut env = Env::new(Params::default());
+    let lp = env.sec_bind_with_backing_fee(100); // P3U-D: forced (was tag 51 before bind)
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let d1 = env.new_depositor();
+    env.earn_deposit_domain(&d1, 5_000_000, 1, Some(lp.portfolio)).expect("earn pot1");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let w = env.new_trader(600_000);
+    let ports = vec![lp.portfolio, w.portfolio];
+    env.trade(&w, &lp, -4 * POS).expect("short");
+    env.move_price(900_000, &ports);
+    env.hold(3, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -2 * POS).expect("add 2");
+    env.hold(1, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -4 * POS).expect("add 4 (liens pot 0 -> backing fee)");
+    env.hold(1, &ports);
+    // flatten the winner (its lien releases), back to a quiet book
+    env.svm.expire_blockhash();
+    let p = env.position(w.portfolio);
+    let _ = env.trade(&w, &lp, -p);
+    env.hold(2, &ports);
+    let _ = env.crank_fees(true);
+    if alloc > 0 {
+        env.allocate(lp.portfolio, alloc).expect("allocate");
+    }
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    let _ = env.crank_fees(true);
+    let pots = env.sec_pots();
+    let s = env.registry_state().total_lp_shares_outstanding;
+    let c = env.vlp().senior_claim_atoms;
+    let r = env.earn_execute(&d, Some(lp.portfolio));
+    println!("alloc {alloc}: C {c} S {s} shares {shares} fair {} pots-before {pots:?} -> {:?} pots-after {:?}",
+        shares * c / s, r.as_ref().map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots());
+    env.assert_conserved("sec p3u fee world");
+    (r, shares * c / s, pots)
+}
+
+#[test]
+fn sec_p3u_bound_earnings_gross_vs_portion() {
+    for alloc in [0u128, 5_000_000, 5_001_000, 5_001_500, 5_002_000, 5_002_500, 5_003_500, 5_010_000] {
+        let _ = sec_p3u_fee_world(alloc);
+    }
+}
+
+/// Strand check: same real-fee world, no allocation; BOTH seniors exit in full, then the junior
+/// pulls everything it can (97 max) and 102 releases surplus. Where do pot 0's 3,000 earnings go?
+#[test]
+fn sec_p3u_bound_earnings_strand_check() {
+    let mut env = Env::new(Params::default());
+    let lp = env.sec_bind_with_backing_fee(100); // P3U-D: forced (was tag 51 before bind)
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let d1 = env.new_depositor();
+    env.earn_deposit_domain(&d1, 5_000_000, 1, Some(lp.portfolio)).expect("earn pot1");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let w = env.new_trader(600_000);
+    let ports = vec![lp.portfolio, w.portfolio];
+    env.trade(&w, &lp, -4 * POS).expect("short");
+    env.move_price(900_000, &ports);
+    env.hold(3, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -2 * POS).expect("add 2");
+    env.hold(1, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -4 * POS).expect("add 4");
+    env.hold(1, &ports);
+    env.svm.expire_blockhash();
+    let p = env.position(w.portfolio);
+    let _ = env.trade(&w, &lp, -p);
+    env.hold(2, &ports);
+    let _ = env.crank_fees(true);
+    println!("start: pots {:?} C {} S {}", env.sec_pots(), env.vlp().senior_claim_atoms, env.registry_state().total_lp_shares_outstanding);
+    for (name, dep) in [("d", &d), ("d1", &d1)] {
+        let sh = env.lp_shares(dep);
+        env.earn_request(dep, sh);
+        let _ = env.crank_fees(true);
+        let r = env.earn_execute(dep, Some(lp.portfolio));
+        println!("{name} full exit {sh}: {:?} pots {:?}", r.as_ref().map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots());
+    }
+    println!("after seniors: C {} S {} pots {:?}", env.vlp().senior_claim_atoms, env.registry_state().total_lp_shares_outstanding, env.sec_pots());
+    for amt in [3_000u128, 1_500, 1_000, 400_000, 100_000] {
+        env.svm.expire_blockhash();
+        let r = env.release_surplus(&admin, lp.portfolio, amt, DOMAIN);
+        println!("102 release {amt}: {:?} pots {:?}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots());
+    }
+    // Resolved terminal path: close the winner, settle the vault LP, terminal harvest, sweep.
+    env.resolve();
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    let (rw, _) = env.stranger_close_resolved(w.portfolio, w.kp.pubkey());
+    println!("winner close: {:?}", rw.as_ref().map(|_| ()));
+    for topup in [0u8, 1] { let r = env.settle_resolved(&Keypair::new(), lp.portfolio, topup, jd); println!("101 topup {topup}: {:?}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() })); }
+    let registry = env.registry;
+    let r1 = env.permissionless_close_portfolio(lp.portfolio, registry);
+    let wk = w.kp.pubkey();
+    let r2 = env.permissionless_close_portfolio(w.portfolio, wk);
+    println!("cleanup lp {:?} winner {:?} materialized {}", r1.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), r2.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.materialized_count());
+    let r = env.crank_fees(true);
+    println!("78 terminal: {:?} pots {:?}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots());
+    let g = env.market_state().1;
+    let physical = (g.source_backing_buckets[0].fresh_unliened_backing_num + g.source_backing_buckets[1].fresh_unliened_backing_num) / percolator::BOUND_SCALE;
+    let sweep = physical.saturating_sub(env.vlp().senior_claim_atoms);
+    let r = env.release_surplus_resolved(&admin, lp.portfolio, sweep, jd);
+    println!("junior terminal sweep {sweep}: {:?} pots {:?} jd {}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() }), env.sec_pots(), env.tok(jd));
+    for amt in [3_000u128, 1_500] { let r = env.release_surplus_resolved(&admin, lp.portfolio, amt, jd); println!("102R extra {amt}: {:?}", r.as_ref().map(|_| ()).map_err(|e| { let i = e.find("Custom").unwrap_or(0); e[i..(i + 12).min(e.len())].to_string() })); }
+    let g = env.market_state().1;
+    println!("end: vault {} insurance {} c_tot {} backing_provider_earnings_total {}", g.vault, g.insurance, g.c_tot, g.backing_provider_earnings_total);
+    // Anvil (P3U, import): the original ended in `assert_conserved`, which fails only because the
+    // extra 102-Resolved releases and the winner's payout are not added to `paid_out` (a test
+    // accounting artefact, SEC-RC §P3U). Kept as a CHARACTERISATION of P3U-I3 instead: the
+    // engine vault equals the SPL vault, and the pot's utilization earnings (3,000) have no exit
+    // on a bound vault (P3U.md §13: a product decision for Khubair), which also makes the
+    // junior's full terminal sweep 14 (draining the pot's last fresh backing marks it Empty
+    // while it still carries earnings; engine `validate_backing_bucket_static`).
+    assert_eq!(g.vault, env.tok(env.vault_token) as u128, "engine vault == SPL vault");
+    assert_eq!(g.backing_provider_earnings_total, 3_000, "P3U-I3: bound pot earnings still stranded");
+    assert_eq!(env.sec_pots()[0].0, 3_000, "P3U-I3: pot 0 utilization earnings untouched");
+}
+
+/// P3U-E1 regression (on Sentinel's real-fee world above): tag 77's earnings gate checks the
+/// GROSS chunk the exit consumes. Every size the pot can fund pays exactly fair (byte-identical
+/// to before); the band `earnings_portion <= pot earnings < gross_consumed` (alloc 5,003,500:
+/// ep 2,500, gross 5,000, pot 3,000) is the named 88 (recall first), never the internal 25.
+#[test]
+fn p3u_e1_bound_earnings_gate_checks_gross_not_the_lp_slice() {
+    for alloc in [0u128, 5_001_500, 5_002_500] {
+        let (r, fair, _) = sec_p3u_fee_world(alloc);
+        assert_eq!(r.expect("paid row") as u128, fair, "alloc {alloc}: paid exactly fair");
+    }
+    for alloc in [5_003_500u128, 5_010_000] {
+        let (r, _, pots) = sec_p3u_fee_world(alloc);
+        assert_eq!(pots[0].0, 3_000, "vacuity: real backing-fee earnings in pot 0");
+        err_has(&r, PercolatorError::VaultLpRedeemNeedsRecall);
+    }
+}
+
+/// P3U option D (coordinator 2026-10-22): a pot bound to a vault LP never carries a backing
+/// trade-fee policy. Tag 51 refuses a NON-zero fee on either pot of a bound asset
+/// (VaultLpAlreadyBound) and still accepts 0; on an UNBOUND market the same call lands (control).
+#[test]
+fn p3u_d_tag51_refuses_nonzero_backing_fee_on_a_bound_pot() {
+    let mut ctrl = Env::new(Params::default());
+    ctrl.sec_set_backing_fee(0, 100, 0).expect("control: unbound market takes a backing fee policy");
+    let mut env = Env::new(Params::default());
+    let _lp = env.bind(1_000);
+    for d in [0u16, 1] {
+        err_has(&env.sec_set_backing_fee(d, 100, 0), PercolatorError::VaultLpAlreadyBound);
+        err_has(&env.sec_set_backing_fee(d, 1, 0), PercolatorError::VaultLpAlreadyBound);
+        env.sec_set_backing_fee(d, 0, 0).expect("a zero policy is always accepted");
+    }
+    let (cfg, _) = env.market_state();
+    assert_eq!((cfg.backing_trade_fee_bps_long, cfg.backing_trade_fee_bps_short), (0, 0));
+}
+
+/// P3U option D: tag 94 binds only fee-free pots. A backing fee policy on either pot refuses the
+/// bind (VaultLpBindRequiresFlatAsset, "bind at creation, before any fee policy or trade");
+/// clearing it to 0 lets the same bind land.
+#[test]
+fn p3u_d_bind_refused_while_a_pot_has_a_backing_fee_policy() {
+    for d in [0u16, 1] {
+        let mut env = Env::new(Params::default());
+        env.sec_set_backing_fee(d, 100, 0).expect("policy on the unbound pot");
+        let admin = env.admin.insecure_clone();
+        let m = env.matcher;
+        err_has(&env.init_vault_lp_full(&admin, 1_000, m, &[]).map(|_| ()), PercolatorError::VaultLpBindRequiresFlatAsset);
+        env.sec_set_backing_fee(d, 0, 0).expect("clear the policy");
+        let _lp = env.bind(1_000);
+    }
+}
+
+/// P3U option D, earnings accrual: the real-fee flow that booked 3,000 atoms of utilization
+/// earnings into pot 0 (Sentinel's world: a short winner adding against its PnL liens pot 0's
+/// backing, every TradeCpi signing a 10,000 bps backing-fee cap) books NOTHING on a bound vault:
+/// tag 51 is refused after the bind, and the market's time-based utilization rate is 0 by
+/// construction (no wrapper setter). Both pots and the header earnings counter stay at 0.
+#[test]
+fn p3u_d_bound_pots_cannot_earn_utilization_fees() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let r0 = env.sec_set_backing_fee(0, 100, 0);
+    let r1 = env.sec_set_backing_fee(1, 100, 0);
+    println!("P3U-D tag 51 after bind: {:?} {:?}", r0.as_ref().map(|_| ()), r1.as_ref().map(|_| ()));
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    let d1 = env.new_depositor();
+    env.earn_deposit_domain(&d1, 5_000_000, 1, Some(lp.portfolio)).expect("earn pot1");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let w = env.new_trader(600_000);
+    let ports = vec![lp.portfolio, w.portfolio];
+    env.trade(&w, &lp, -4 * POS).expect("short");
+    env.move_price(900_000, &ports);
+    env.hold(3, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -2 * POS).expect("add 2");
+    env.hold(1, &ports);
+    env.svm.expire_blockhash();
+    env.trade(&w, &lp, -4 * POS).expect("add 4 (liens pot 0)");
+    let liened = env.sec_pots()[0].2;
+    env.hold(40, &ports);
+    let pots = env.sec_pots();
+    let (_, g) = env.market_state();
+    println!("P3U-D pots {pots:?} liened-at-add {liened} bpet {}", g.backing_provider_earnings_total);
+    assert!(liened > 0 || pots[0].2 > 0, "vacuity: the winner's add liened pot 0's backing");
+    assert_eq!((pots[0].0, pots[1].0), (0, 0), "a bound pot books no utilization earnings");
+    assert_eq!(g.backing_provider_earnings_total, 0);
+    env.svm.expire_blockhash();
+    let p = env.position(w.portfolio);
+    let _ = env.trade(&w, &lp, -p);
+    env.hold(2, &ports);
+    assert_eq!(env.sec_pots()[0].0, 0);
+    env.assert_conserved("p3u-d accrual");
+}
+
 /// L-4: while the halt is active (junior exhausted), a THIN-side taker's own close is never
 /// refused even though it grows |LP| on a NON-growth bound asset (M-1 measure on every asset).
 #[test]

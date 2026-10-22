@@ -1636,7 +1636,9 @@ pub mod error {
         CloseSlabFeesOutstanding, // Custom(71)
         // ── P3 vault-owned LP (2026-09-29). APPENDED; P1's 66..=71 go BEFORE these on
         // rebase, so the SDK must map by name from the final enum, not by these comments. ──
-        /// InitVaultLp on a vault (or asset) that already has a bound vault LP.
+        /// InitVaultLp on a vault (or asset) that already has a bound vault LP. P3U option D
+        /// (2026-10-22): also UpdateBackingFeePolicy (51) setting a NON-zero backing fee on a pot
+        /// of a bound asset (a bound pot's utilization earnings would have no exit).
         VaultLpAlreadyBound,
         /// A vault-LP instruction on a vault with no bound vault LP.
         VaultLpNotBound,
@@ -1698,6 +1700,8 @@ VaultLpMultiAssetMarket,
         /// leaves the vault LP's winners short and can block terminal-flat forever. Bind a vault
         /// at market creation (relaunch seeds and the wizard do), before any trade. Custom(90),
         /// appended at the END (no existing code shifts). SDK: add to the client error map.
+        /// P3U option D (2026-10-22): also returned when either pot of the asset carries a
+        /// backing trade-fee policy or booked utilization earnings (bind fee-free pots only).
         VaultLpBindRequiresFlatAsset,
         /// Vault impaired, deposits paused. NON-BOUND Earn deposit (75) refused because EITHER
         /// pot's booked net impairment exceeds its principal (pricing floors that pot at zero,
@@ -27798,6 +27802,13 @@ pub mod processor {
             {
                 return Err(PercolatorError::EngineLockActive.into());
             }
+            // P3U option D (coordinator decision 2026-10-22, SEC-RC §P3U I3/E1): a pot bound to
+            // a vault LP never carries a backing trade-fee policy. Its utilization earnings
+            // would have no exit on the bound path (stranded; they also block the pot's last
+            // atom and CloseSlab). Lowering to 0 stays allowed. Fail closed: VaultLpAlreadyBound.
+            if fee_bps != 0 && market_bound_vault_asset(&group)? == Some(asset_index) {
+                return Err(PercolatorError::VaultLpAlreadyBound.into());
+            }
             // sync/w3b-backing-fee-consent (ADOPT upstream be8516b8): a rate change on a
             // FUNDED bucket is bound to depositor consent -- see
             // `policy_v16::backing_fee_policy_change_allowed`. No-op changes and changes on
@@ -32103,7 +32114,8 @@ pub mod processor {
     fn execute_redemption_oi_reservation_check(
         ledger: &state::BackingDomainLedgerAccountV16,
         // E3: the pot's AVAILABLE principal the payout was priced on (non-bound: the physical
-        // attribution; bound: the ledger reading, unchanged), so the guard and the payout agree.
+        // attribution; bound: the B24 owned reading `min(principal, held)`, P3U), so the guard
+        // and the payout agree.
         available_pre: u128,
         principal_portion: u128,
         gross_consumed: u128,
@@ -32805,8 +32817,13 @@ pub mod processor {
                 }
                 return Err(PercolatorError::EngineLockActive.into());
             }
-            // Earnings availability gate: earnings pool must cover the LP's earnings slice.
-            if earnings_portion > bucket.utilization_fee_earnings {
+            // Earnings availability gate: the pot must hold the GROSS chunk this exit consumes
+            // (`gross_consumed >= earnings_portion`; the decrements below take `gross_consumed`
+            // from the bucket, `backing_provider_earnings_total` and the ledger watermark).
+            // P3U-E1 (SEC-RC §P3U, 2026-10-21): gating on the LP slice let an exit with
+            // `earnings_portion <= pot earnings < gross_consumed` reach the checked decrement ->
+            // 25. Checked after the sibling earnings top-up (non-bound), as before.
+            if gross_consumed > bucket.utilization_fee_earnings {
                 if bound_live {
                     return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
                 }
@@ -32841,10 +32858,22 @@ pub mod processor {
             let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
             if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
                 // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
+                // P3U (2026-10-20): a BOUND pot's available principal is the B24 reading the
+                // payout was priced on (`min(ledger principal, held backing)`, the per-pot term
+                // of `bound_vault_nav`), NOT `principal - booked impairment`. The ledger's
+                // impairment counters book every consumed lien (incl. the vault LP's settled loss
+                // routed into the pot), so after a loss that reading fell below a payout the
+                // gates above admit and the guard's `available_pre - principal_portion`
+                // underflowed: a full senior exit got 25 for as long as the counters stood.
                 execute_redemption_oi_reservation_check(
                     &ledger,
                     if bound_tail.is_some() {
-                        backing_ledger_available_principal_atoms(&ledger)
+                        vault_lp_v18::bound_pot_available_principal(
+                            ledger.total_principal_atoms,
+                            bucket.fresh_unliened_backing_num,
+                            bucket.valid_liened_backing_num,
+                            BOUND_SCALE,
+                        )
                     } else {
                         ledger_cap
                     },
@@ -35878,6 +35907,31 @@ pub mod processor {
     /// attributes (measured: 900,000 atoms unowned after every party exited). Terminal
     /// valuation therefore uses the pots, not the ledgers.
     /// F14-Q2: the asset a vault LP is bound to on this market, if any (one vault per market).
+    /// P3U option D: tag 94 binds an asset only when both of its pots are fee-free: no backing
+    /// trade-fee policy on either side (`backing_trade_fee_bps_{long,short} == 0`) and no
+    /// utilization earnings already booked in either bucket. Out of line (tag 94 frame).
+    #[inline(never)]
+    fn bind_pots_fee_free(
+        market_data: &mut [u8],
+        cfg: &WrapperConfigV16,
+        asset_index: usize,
+    ) -> Result<bool, ProgramError> {
+        {
+            let profile = read_oracle_profile_for_asset(market_data, cfg, asset_index)?;
+            if profile.backing_trade_fee_bps_long != 0 || profile.backing_trade_fee_bps_short != 0 {
+                return Ok(false);
+            }
+        }
+        let (_, group) = state::market_view_mut(market_data)?;
+        for d in [asset_index * 2, asset_index * 2 + 1] {
+            let (_, bucket) = backing_domain_parts_view(&group, d)?;
+            if bucket.utilization_fee_earnings != 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn market_bound_vault_asset(group: &state::MarketViewMutV16<'_>) -> Result<Option<usize>, ProgramError> {
         let n = (group.header.config.max_market_slots.get() as usize).min(group.markets.len());
         for i in 0..n {
@@ -36544,6 +36598,13 @@ pub mod processor {
             if asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0 {
                 return Err(PercolatorError::VaultLpBindRequiresFlatAsset.into());
             }
+        }
+        // P3U option D (2026-10-22): bind only fee-free pots. A bound pot's utilization earnings
+        // have no exit, so neither pot may carry a backing trade-fee policy or earnings at bind
+        // (tag 51 refuses a non-zero policy afterwards). Same refusal as the flat-asset rule:
+        // bind at market creation, before any fee policy or trade.
+        if !bind_pots_fee_free(&mut market_ai.try_borrow_mut_data()?, &cfg, asset_index)? {
+            return Err(PercolatorError::VaultLpBindRequiresFlatAsset.into());
         }
 
         let (vault_lp_pda, vault_lp_bump) = state::derive_vault_lp_state(program_id, market_ai.key);
