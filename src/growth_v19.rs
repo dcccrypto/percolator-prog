@@ -2307,6 +2307,50 @@ pub fn kappa_depth_bps(tier: u8) -> u32 {
     }
 }
 
+/// Interim κ cap (S-3 spot push, `v22-leverage-sims-2026-10-25.md`): `κ_eff = min(κ_tier,
+/// η · 101.5 · f)` with `η = 1/2` (half the attacker's no-leak break-even) and `f` the oracle spot
+/// pool's fee as a fraction. In bps of the depth: `floor(fee_bps · 1015 / 20)`
+/// (`KAPPA_CAP_NUM / KAPPA_CAP_DEN`): 5 bps -> 253, 25 -> 1268, 30 -> 1522, 100 -> 5075.
+pub const KAPPA_CAP_NUM: u32 = 1_015;
+pub const KAPPA_CAP_DEN: u32 = 20;
+/// The pool fee (bps) assumed when the fee is not known. FAIL SAFE: the smallest fee of the S-3
+/// grid (0.05%), so the cap is the TIGHTEST plausible one (253 bps = 0.0253x of depth). Neither
+/// PumpSwap (fees live in its GlobalConfig, not the `Pool`) nor Raydium CPMM (fee lives in the
+/// `AmmConfig` the pool points at, not the `PoolState`) carries the fee in the pinned pool account,
+/// and the pin record has no fee field, so today every market reads this value until the fee is
+/// plumbed (`growth_g8_ctx_view`: `pool_fee_bps`). It can only tighten (see `kappa_eff_bps`).
+pub const KAPPA_CAP_FALLBACK_FEE_BPS: u16 = 5;
+// The S-3 reference values (fee 5 / 25 / 30 / 100 bps).
+const _: () = assert!(
+    (5u32 * KAPPA_CAP_NUM / KAPPA_CAP_DEN) == 253
+        && (25u32 * KAPPA_CAP_NUM / KAPPA_CAP_DEN) == 1_268
+        && (30u32 * KAPPA_CAP_NUM / KAPPA_CAP_DEN) == 1_522
+        && (100u32 * KAPPA_CAP_NUM / KAPPA_CAP_DEN) == 5_075
+);
+
+/// The κ cap (bps of the depth) of a pool with fee `fee_bps`: `floor(fee_bps · 1015 / 20)`
+/// (rounds DOWN: tighter). `u16 · 1015 < 2^26`, never overflows. A fee of 0 gives 0 (closed).
+#[cfg_attr(kani, kani::ensures(|r: &u32| spec::kappa_cap_bps(fee_bps, *r)))]
+pub fn kappa_cap_bps(fee_bps: u16) -> u32 {
+    (fee_bps as u32) * KAPPA_CAP_NUM / KAPPA_CAP_DEN
+}
+
+/// `κ_eff = min(κ_tier, kappa_cap_bps(fee))`; an unknown fee (`None`) reads
+/// `KAPPA_CAP_FALLBACK_FEE_BPS`. Tighten-only: never above `kappa_tier_bps` (so never above
+/// HEAD's κ and never above the tier table), whatever the fee.
+#[cfg_attr(kani, kani::ensures(|r: &u32| spec::kappa_eff_bps(kappa_tier_bps, fee_bps, *r)))]
+pub fn kappa_eff_bps(kappa_tier_bps: u32, fee_bps: Option<u16>) -> u32 {
+    let cap = kappa_cap_bps(match fee_bps {
+        Some(f) => f,
+        None => KAPPA_CAP_FALLBACK_FEE_BPS,
+    });
+    if kappa_tier_bps < cap {
+        kappa_tier_bps
+    } else {
+        cap
+    }
+}
+
 /// `λ_eff = min(stored λ, λ_depth(tier))`.
 pub fn lambda_eff_bps(stored_lambda_bps: u32, tier: u8) -> u32 {
     let d = lambda_depth_bps(tier);
@@ -2691,6 +2735,12 @@ pub fn rent_stamp64_of(slot: u64) -> u32 {
 /// Round 3 item 7 (design GAP-13c): the bind-time guard -- on a clamp-enforced market with a
 /// measured depth, one minimum band leg must fit in the tier-0 depth capacity:
 /// `band_min_leg_notional <= floor(κ0 * cap_depth)`. `None` (never measured) passes.
+///
+/// Interim κ cap: this guard deliberately keeps the UNCAPPED tier-0 κ. Using `kappa_eff_bps` here
+/// would TIGHTEN it (a smaller RHS refuses more binds, at a 5 bps fallback fee 0.0253x instead of
+/// 0.5x), a new bind-time liveness refusal and not an N_cap bound. The N_cap readers already apply
+/// the cap (an N_cap below one band leg stays closed to opens there). Switching it is a human
+/// call.
 pub fn band_min_leg_fits_depth(band_min_leg_notional: u64, cap_depth_e6: Option<u64>) -> bool {
     match cap_depth_e6 {
         None => true,
@@ -2792,6 +2842,21 @@ pub mod spec {
             return p == 0;
         }
         (q - 1).checked_mul(d).is_some_and(|x| x < p && p - x <= d)
+    }
+
+    /// `r == floor(fee · 1015 / 20)`.
+    pub fn kappa_cap_bps(fee: u16, r: u32) -> bool {
+        mul_div_floor(fee as u128, super::KAPPA_CAP_NUM as u128, super::KAPPA_CAP_DEN as u128, Some(r as u128))
+    }
+
+    /// `r == min(κ_tier, cap(fee or the fallback fee))`; in particular `r <= κ_tier` (tighten-only).
+    pub fn kappa_eff_bps(tier: u32, fee: Option<u16>, r: u32) -> bool {
+        let f = match fee {
+            Some(f) => f,
+            None => super::KAPPA_CAP_FALLBACK_FEE_BPS,
+        };
+        let cap = (f as u32) * super::KAPPA_CAP_NUM / super::KAPPA_CAP_DEN;
+        r <= tier && r == if tier < cap { tier } else { cap }
     }
 
     /// Floor (rounds DOWN): the contract of `vault_lp_v18::mul_div_floor`.
@@ -2969,6 +3034,93 @@ pub mod spec {
 
 #[cfg(test)]
 mod tests {
+    // ── interim κ cap: κ_eff = min(κ_tier, floor(fee_bps · 1015 / 20)) ──────────────────────────
+
+    #[test]
+    fn kappa_cap_values_at_fee_bps() {
+        assert_eq!(kappa_cap_bps(5), 253);
+        assert_eq!(kappa_cap_bps(25), 1_268);
+        assert_eq!(kappa_cap_bps(30), 1_522);
+        assert_eq!(kappa_cap_bps(100), 5_075);
+        assert_eq!(kappa_cap_bps(0), 0);
+        // no overflow at the u16 extreme: 65535 * 1015 / 20
+        assert_eq!(kappa_cap_bps(u16::MAX), 3_325_901);
+    }
+
+    #[test]
+    fn kappa_eff_is_min_with_each_tier() {
+        // fee 25 bps (cap 1268): below every tier value -> the cap binds at all four tiers
+        for t in 0..4u8 {
+            assert_eq!(kappa_eff_bps(kappa_depth_bps(t), Some(25)), 1_268);
+        }
+        // fee 100 bps (cap 5075): below tier 0 (5000)? no, 5075 > 5000 -> tier 0 binds, others the cap
+        assert_eq!(kappa_eff_bps(kappa_depth_bps(0), Some(100)), 5_000);
+        for t in 1..4u8 {
+            assert_eq!(kappa_eff_bps(kappa_depth_bps(t), Some(100)), 5_075);
+        }
+        // a large fee never lifts κ above the tier table
+        for t in 0..4u8 {
+            assert_eq!(kappa_eff_bps(kappa_depth_bps(t), Some(1_000)), kappa_depth_bps(t));
+            assert_eq!(kappa_eff_bps(kappa_depth_bps(t), Some(u16::MAX)), kappa_depth_bps(t));
+        }
+        // the same on the smoothed (curve) dial: any value between the table anchors
+        assert_eq!(kappa_eff_bps(6_695, Some(30)), 1_522);
+        assert_eq!(kappa_eff_bps(1_000, Some(30)), 1_000);
+    }
+
+    #[test]
+    fn kappa_eff_tighten_only_all_tiers_and_fees() {
+        for t in 0..4u8 {
+            let k = kappa_depth_bps(t);
+            for fee in (0..=u16::MAX).step_by(7).chain([1, 5, 25, 30, 100, 197, 198, 199, 200, u16::MAX]) {
+                let e = kappa_eff_bps(k, Some(fee));
+                assert!(e <= k, "tier {t} fee {fee}: {e} > {k}");
+                assert!(e <= kappa_cap_bps(fee));
+                assert_eq!(e, core::cmp::min(k, kappa_cap_bps(fee)));
+            }
+            assert!(kappa_eff_bps(k, None) <= k);
+        }
+        // monotone in the fee (a lower fee never gives a looser κ)
+        for fee in 0..2_000u16 {
+            assert!(kappa_cap_bps(fee) <= kappa_cap_bps(fee + 1));
+        }
+    }
+
+    #[test]
+    fn kappa_eff_fee_unknown_fails_safe() {
+        // unknown fee reads the smallest S-3 grid fee (5 bps -> 253): the tightest plausible cap,
+        // and never above the fee-known value at any real pool fee >= 5 bps.
+        assert_eq!(KAPPA_CAP_FALLBACK_FEE_BPS, 5);
+        for t in 0..4u8 {
+            assert_eq!(kappa_eff_bps(kappa_depth_bps(t), None), 253);
+            for fee in [5u16, 25, 30, 100] {
+                assert!(kappa_eff_bps(kappa_depth_bps(t), None) <= kappa_eff_bps(kappa_depth_bps(t), Some(fee)));
+            }
+        }
+    }
+
+    #[test]
+    fn kappa_cap_tightens_n_cap_never_loosens() {
+        let ps = 1_000_000u128;
+        let (price, depth) = (1_000_000u64, Some(10_000_000_000u64));
+        for t in 0..4u8 {
+            let base = n_cap_g8_q(true, 1_000_000_000_000u128, 30_000, t, depth, price, ps).unwrap();
+            for fee in [None, Some(5u16), Some(25), Some(30), Some(100)] {
+                let k = kappa_eff_bps(kappa_depth_bps(t), fee);
+                let n = n_cap_g8_q_dials(true, 1_000_000_000_000u128, 30_000, lambda_depth_bps(t), k, depth, price, ps).unwrap();
+                assert!(n <= base, "tier {t} fee {fee:?}");
+            }
+            // fee 25 bps: depth cap = 0.1268 * depth / price (floor), the κ term binds here
+            let n25 = n_cap_g8_q_dials(true, 1_000_000_000_000u128, 30_000, lambda_depth_bps(t), kappa_eff_bps(kappa_depth_bps(t), Some(25)), depth, price, ps).unwrap();
+            assert_eq!(n25, depth_cap_q_kappa(1_268, depth, price, ps));
+            // the clip's caps (ext-v3) take the same dial
+            let k = kappa_eff_bps(kappa_depth_bps(t), Some(25));
+            let (cap_capped, _) = growth_matcher_caps_g8_dials(false, true, 1_000_000_000_000u128, 30_000, lambda_depth_bps(t), k, depth, price, ps, u128::MAX);
+            let (cap_base, _) = growth_matcher_caps_g8(false, true, 1_000_000_000_000u128, 30_000, t, depth, price, ps, u128::MAX);
+            assert!(cap_capped <= cap_base);
+        }
+    }
+
     use super::*;
 
     const PS: u128 = 1_000_000;

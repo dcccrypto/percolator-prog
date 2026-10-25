@@ -43808,6 +43808,12 @@ pub mod processor {
         };
         let (mut dials, venue_l_x100) =
             growth_v19::smooth_dials_and_venue_l(venue_depth, book_depth, thresholds, l_table);
+        // Interim κ cap (S-3): κ_eff = min(κ, 0.5 · 101.5 · pool fee), tighten-only. Every N_cap
+        // reader (gate, clip, ext-v3 caps, rent snapshot) takes κ from `dials`, so this is the one
+        // place. The pool fee is not in the pinned pool account (PumpSwap: GlobalConfig; Raydium
+        // CPMM: the AmmConfig account) nor in the pin record: `None` fails safe to the 5 bps cap.
+        let pool_fee_bps: Option<u16> = None;
+        dials.kappa_bps = growth_v19::kappa_eff_bps(dials.kappa_bps, pool_fee_bps);
         // Round 3 item 6 (GAP-6): L_vol = floor(1e4 / max(IMR, z * sigma_H + liq fee)) over
         // H = two band epochs (the Band Safety Law horizon); no data -> launch (fails closed).
         let vol = if g.vol_has_data() {
