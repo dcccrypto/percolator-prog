@@ -43833,6 +43833,16 @@ pub mod processor {
         };
         dials.l_signal_x100 = growth_v19::l_signal_with_vol(dials.l_signal_x100, vol, l_table[0]);
         let venue_l_x100 = growth_v19::l_signal_with_vol(venue_l_x100, vol, l_table[0]);
+        // v2.2 lev build (D-c step 1, D-h): until W1 ships, λ_eff <= 1.0 and
+        // λ_eff <= 0.95 / (2·σ_72h). σ from the stored variance; no data -> the seed variance
+        // (fails closed). Every λ reader takes `min(stored λ, dials.lambda_depth_bps)` (gate,
+        // TradeCpi clip, ext v3, rent snapshot, P3-H2 exposure cap, junior / bond locks), so capping
+        // the dial caps λ_eff everywhere. Tighten-only (`lev_guard_v22::lambda_fallback_bps`).
+        let lev_var = if g.vol_has_data() { g.vol_var_x100() } else { growth_v19::VOL_VAR_SEED_X100 };
+        dials.lambda_depth_bps = crate::lev_guard_v22::lambda_fallback_bps(
+            dials.lambda_depth_bps,
+            growth_v19::sigma_h_bps(lev_var, crate::lev_guard_v22::LAMBDA_VOL_HORIZON_SLOTS),
+        );
         let cap_depth_e6 = growth_v19::cap_depth_e6(
             g.depth_source,
             fresh,

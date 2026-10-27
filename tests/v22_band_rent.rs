@@ -1460,7 +1460,22 @@ fn sec_pinned_close_flip_and_open_variants() {
     let newbie = env.trader(1_000 * USD);
     let r = env.trade_cpi(&newbie.0, newbie.1, &lp, 10 * Q);
     eprintln!("SEC pinned fresh long open: {r:?}");
+    // v2.2 lev build: the +30 % pushes above are a real volatility burst, so λ_vol =
+    // 0.95/(2·σ_72h) now leaves the LP no headroom and the open is clipped to a ZERO fill before
+    // it reaches the lag gate. Either way nothing may land at the stale price.
+    assert!(r.is_err() || env.pos(newbie.1) == 0, "open at the pinned stale price must not land");
+    assert_eq!(env.pos(newbie.1), 0);
+    // The original control, with capacity restored (calm variance written back): the open now
+    // reaches the engine and the lag gate refuses it.
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    let rg = state::asset_growth_range(&acct.data, 0).unwrap();
+    acct.data[rg.start..rg.start + 4]
+        .copy_from_slice(&percolator_prog::growth_v19::VOL_VAR_SEED_X100.to_le_bytes());
+    env.svm.set_account(env.market, acct).unwrap();
+    let r = env.trade_cpi(&newbie.0, newbie.1, &lp, 10 * Q);
+    eprintln!("SEC pinned fresh long open (calm variance): {r:?}");
     assert!(r.is_err(), "open at the pinned stale price must be refused");
+    assert_eq!(env.pos(newbie.1), 0);
     let _ = (pin, &long);
 }
 
@@ -2159,6 +2174,15 @@ impl Env {
         self.svm.set_account(self.market, acct).unwrap();
         self.warp(1);
         self.push(price);
+        // v2.2 lev build: the poke is a fixture ("the flat asset has always been at `price`"),
+        // not a market move, so the volatility estimator must not read the teleport as a ~99 %
+        // one-push move (that would collapse λ_vol = 0.95/(2·σ_72h) and with it the capacity
+        // these band tests are not about). Reset the stored variance to the calm seed.
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&acct.data, 0).unwrap();
+        acct.data[r.start..r.start + 4]
+            .copy_from_slice(&percolator_prog::growth_v19::VOL_VAR_SEED_X100.to_le_bytes());
+        self.svm.set_account(self.market, acct).unwrap();
     }
 }
 
@@ -5214,4 +5238,129 @@ fn death_f1_negative_control_rc_bytes_freeze() {
     assert!(w.eff1 > w.eff0 * 98 / 100, "frozen within two bands of the start while the target is 30% lower: {}", w.eff1);
     assert!(w.epoch1 < w.epoch0 + 20, "the anchor stops advancing: {} -> {}", w.epoch0, w.epoch1);
     assert!(w.max_pin_age > 1_000, "the pin clock runs");
+}
+
+// ── v2.2 lev build (D-c step 1, D-h): λ_eff <= 1.0 before W1, λ_vol = 0.95/(2·σ_72h) ──────────
+
+fn lev_lp_equity(env: &Env, p: Pubkey) -> u128 {
+    let s = env.portfolio_state(p);
+    percolator_prog::vault_lp_v18::conservative_equity(s.capital, s.pnl, s.fee_credits).unwrap()
+}
+
+fn lev_set_var(env: &mut Env, var_x100: u32) {
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    let r = state::asset_growth_range(&acct.data, 0).unwrap();
+    acct.data[r.start..r.start + 4].copy_from_slice(&var_x100.to_le_bytes());
+    env.svm.set_account(env.market, acct).unwrap();
+}
+
+/// A calm market whose stored λ (3x) and depth dial would both allow > 1x (HEAD λ_eff): a
+/// $200k LP (book depth past T2) and a STATE-POKED fresh $20M on-chain (mode 2) depth reading, so
+/// the κ·depth term ($506k at the interim κ cap) does not bind and the λ term does. (Attested
+/// depth is capped at the T3 anchor, $500k, where κ·depth = $12.6k always binds first: on this
+/// base the λ <= 1.0 cap is only reachable through deep DEX depth.)
+fn lev_deep_env() -> (Env, Lp) {
+    use percolator_prog::growth_v19 as gv;
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    env.set_growth_dials(30_000, 5_000, 0).expect("UA: stored λ 3x");
+    let lp = env.lp(200_000 * USD);
+    env.warp(1);
+    env.push(PRICE);
+    let d: u64 = 20_000_000 * USD_E6;
+    let now = env.engine_asset().slot_last;
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    let mut g = state::read_asset_growth(&acct.data, 0, ENGINE_IMR).unwrap().unwrap();
+    g.depth_source = gv::DEPTH_SOURCE_DEX | gv::DEPTH_EVER | gv::DEPTH_PREV_REAL | gv::DEPTH_DEX_PINNED;
+    g.depth_e6 = d;
+    g.depth_prev_e6 = d;
+    g.depth_slot = now;
+    g.depth_last_good_e6 = d;
+    g.depth_last_good_slot = now;
+    let tokens = (d / USD_E6) as u32;
+    g.set_depth_tw(gv::DepthWindow { cur_tokens: tokens, prev_tokens: tokens, bucket_p1: ((now / gv::DEPTH_TW_BUCKET_SLOTS) % 65_535 + 1) as u16 });
+    state::write_asset_growth(&mut acct.data, 0, &g, ENGINE_IMR).unwrap();
+    env.svm.set_account(env.market, acct).unwrap();
+    (env, lp)
+}
+
+/// D-h: before W1, λ_eff is at most 1.0 even where the stored λ (3x) and the depth dial (> 1x)
+/// both allow more. The TradeCpi clip hands the LP exactly its headroom, so a large open leaves
+/// the LP at most at N_cap(λ = 1.0). NON-VACUITY: HEAD's λ_eff (min(stored, λ_depth)) is > 1x here
+/// and the request is larger than HEAD's N_cap, so without the cap the fill would be larger.
+#[test]
+fn lev_lambda_capped_at_1x_before_w1() {
+    use percolator_prog::{growth_v19 as gv, lev_guard_v22 as lg};
+    let (mut env, lp) = lev_deep_env();
+    let g = env.growth();
+    assert_eq!(g.lambda_bps, 30_000, "stored λ 3x");
+    let c_m0 = lev_lp_equity(&env, lp.account);
+    let head_lambda_depth = gv::smooth_dials(
+        g.depth_last_good_e6,
+        gv::book_depth_e6(c_m0, g.lambda_bps),
+        g.tier_thresholds_e6(),
+        g.tier_table_x100(),
+    )
+    .lambda_depth_bps;
+    assert!(head_lambda_depth > 10_000, "non-vacuous: the depth dial alone allows {head_lambda_depth} bps");
+    assert!(!lg::W1_LIVE);
+    let c_m = lev_lp_equity(&env, lp.account);
+    let n1 = gv::n_cap_q(c_m, 10_000, PRICE, POS_SCALE).unwrap();
+    let n_head = gv::n_cap_q(c_m, core::cmp::min(30_000, head_lambda_depth), PRICE, POS_SCALE).unwrap();
+    assert!(n_head > n1 * 12 / 10, "HEAD would allow more: {n_head} vs {n1}");
+    let var = env.growth().vol_var_x100();
+    let s72 = gv::sigma_h_bps(var, lg::LAMBDA_VOL_HORIZON_SLOTS);
+    assert!(lg::lambda_vol_bps(s72) > 10_000, "calm: λ_vol {} does not bind", lg::lambda_vol_bps(s72));
+    let taker = env.trader(1_000_000 * USD);
+    let want = (n_head as i128 / Q + 10) * Q;
+    let r = env.trade_cpi(&taker.0, taker.1, &lp, want);
+    eprintln!("lev λ 1x open {want}: {r:?}");
+    let lp_abs = env.pos(lp.account).unsigned_abs();
+    assert!(lp_abs > n1 / 2, "a real fill: {lp_abs}");
+    assert!(lp_abs <= n1, "LP net {lp_abs} above N_cap(λ 1.0) {n1}");
+    assert!(lp_abs < n_head, "the cap bound below HEAD's {n_head}");
+    // a further open on the same side cannot push the LP past the 1x cap
+    let _ = env.trade_cpi(&taker.0, taker.1, &lp, 10 * Q);
+    assert!(env.pos(lp.account).unsigned_abs() <= n1);
+    env.assert_conservation();
+}
+
+/// D-c step 1: λ_vol = 0.95/(2·σ_72h). A variance whose σ_72h is 95 % gives λ_vol = 0.5, so the
+/// same deep market's capacity halves; a calm variance restores it. Exits stay open.
+#[test]
+fn lev_lambda_vol_halves_capacity_and_exits_stay_open() {
+    use percolator_prog::{growth_v19 as gv, lev_guard_v22 as lg};
+    let (mut env, lp) = lev_deep_env();
+    // σ_72h = 9,500 bps: var_x100 = 9500² · 100 / 648,000
+    let hot = (9_500u64 * 9_500 * 100 / lg::LAMBDA_VOL_HORIZON_SLOTS) as u32;
+    let s72 = gv::sigma_h_bps(hot, lg::LAMBDA_VOL_HORIZON_SLOTS);
+    let lam = lg::lambda_vol_bps(s72);
+    assert!((4_990..=5_010).contains(&lam), "λ_vol ≈ 0.5: {lam} (σ {s72})");
+    lev_set_var(&mut env, hot);
+    let c_m = lev_lp_equity(&env, lp.account);
+    let n_hot = gv::n_cap_q(c_m, lam, PRICE, POS_SCALE).unwrap();
+    let n1 = gv::n_cap_q(c_m, 10_000, PRICE, POS_SCALE).unwrap();
+    let taker = env.trader(1_000_000 * USD);
+    let r = env.trade_cpi(&taker.0, taker.1, &lp, (n1 as i128 / Q) * Q);
+    eprintln!("lev λ_vol open: {r:?}");
+    let a = env.pos(lp.account).unsigned_abs();
+    assert!(a > 0 && a <= n_hot, "LP net {a} within N_cap(λ_vol) {n_hot}");
+    assert!(a < n1, "hot variance bound below the 1x cap {n1}");
+    // an exit (reduce) still lands while capacity is small
+    let half = (env.pos(taker.1) / 2 / Q) * Q;
+    eprintln!("lev λ_vol taker {} lp {} half {half}", env.pos(taker.1), env.pos(lp.account));
+    env.warp(1);
+    env.push(PRICE);
+    env.crank(taker.1).expect("crank taker");
+    env.crank(lp.account).expect("crank lp");
+    let r = env.trade_cpi(&taker.0, taker.1, &lp, -half);
+    assert!(r.is_ok(), "reduce lands: {r:?}");
+    // calm again: the capacity is back to the 1x cap
+    lev_set_var(&mut env, gv::VOL_VAR_SEED_X100 / 100);
+    let _ = env.trade_cpi(&taker.0, taker.1, &lp, (n1 as i128 / Q) * Q);
+    let b = env.pos(lp.account).unsigned_abs();
+    // the LP earned fees on the round trips: N_cap at the CURRENT equity
+    let n1_now = gv::n_cap_q(lev_lp_equity(&env, lp.account), 10_000, PRICE, POS_SCALE).unwrap();
+    assert!(b > a && b <= n1_now, "calm: refills past the hot cap {a} up to the 1x cap {b} (cap {n1_now})");
+    env.assert_conservation();
 }
