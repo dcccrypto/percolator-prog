@@ -3191,7 +3191,11 @@ mod tests {
         assert_eq!(l_signal_with_vol(2_000, None, 500), 500, "no data: launch");
         assert_eq!(l_signal_with_vol(2_000, Some(1_748), 500), 1_748);
         assert!(growth_flags_ok(0) && growth_flags_ok(1) && growth_flags_ok(3));
-        assert!(!growth_flags_ok(2) && !growth_flags_ok(4));
+        assert!(!growth_flags_ok(2));
+        // v2.2 lev build: bit 2 (0x04) is now GROWTH_FLAG_LEV_GUARD (claimed in v22-allocations.md);
+        // valid alone and with the round-3 bits; every higher bit is still refused.
+        assert!(growth_flags_ok(GROWTH_FLAG_LEV_GUARD) && growth_flags_ok(GROWTH_FLAG_LEV_GUARD | 3));
+        assert!(!growth_flags_ok(GROWTH_FLAG_LEV_GUARD | 2) && !growth_flags_ok(8) && !growth_flags_ok(0x80));
     }
 
     /// Continuous leverage (2026-10-19): the log-interpolated depth curve.
