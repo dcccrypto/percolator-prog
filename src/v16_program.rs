@@ -73,6 +73,11 @@ pub mod depth_src_v22;
 /// `~/percolator-ops/ledger/v22-f1-refresh-liquidation-2026-10-14.md`.
 pub mod f1_refresh_liq_v22;
 
+/// v2.2 leverage build (2026-10-27): pure rules for the LP stop (W1), the holder risk overlay,
+/// the move-freeze price band, the new-token rules, the pre-W1 λ fallback and the minimum creator
+/// stake. See `~/percolator-ops/ledger/v22-levbuild-2026-10-27.md`.
+pub mod lev_guard_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
