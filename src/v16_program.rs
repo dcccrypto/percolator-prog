@@ -25819,6 +25819,33 @@ pub mod processor {
         event_tag: u8,
         event_reason: u8,
     ) -> ProgramResult {
+        band_forced_reduce_against_vault_lp(
+            program_id,
+            market_ai,
+            victim_ai,
+            lp_ai,
+            asset_index,
+            u128::MAX,
+            event_tag,
+            event_reason,
+        )
+    }
+
+    /// The same forced bilateral close at `P_last`, of at most `reduce_abs_q` of the victim's leg
+    /// (`u128::MAX` = the whole leg: tags 118 / 119, unchanged). v2.2 lev build: W1 (tag 124 op 5)
+    /// reduces opposing accounts to the round's keep-fraction through it.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn band_forced_reduce_against_vault_lp<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        victim_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        asset_index: u16,
+        reduce_abs_q: u128,
+        event_tag: u8,
+        event_reason: u8,
+    ) -> ProgramResult {
         if victim_ai.key == lp_ai.key {
             return Err(PercolatorError::InvalidInstruction.into());
         }
@@ -25866,7 +25893,16 @@ pub mod processor {
         };
         let vault_lp_pre =
             vault_lp_capture_pre_fill(market_ai, victim_ai, lp_ai, &[asset_index], max_market_slots)?;
-        let closed_q = position.checked_neg().ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let closed_q = if reduce_abs_q >= position.unsigned_abs() {
+            position.checked_neg().ok_or(PercolatorError::EngineArithmeticOverflow)?
+        } else {
+            // reduce_abs_q < |position| <= i128::MAX: lossless
+            let r = reduce_abs_q as i128;
+            if position > 0 { -r } else { r }
+        };
+        if closed_q == 0 {
+            return Err(PercolatorError::EngineInvalidLeg.into());
+        }
         handle_trade_nocpi_zero_copy(
             program_id,
             &victim_owner,
@@ -44952,14 +44988,185 @@ pub mod processor {
         lev_guard_store(guard_ai, &gd)
     }
 
-    /// Op 5, the LP stop (W1, plan v2 D-b / D-c / D-i). Built in the follow-up PR.
+    /// The vault LP's ADL-effective position on `a`, the W1 target `λ_eff·C_m_now` (Q), the band
+    /// minimum leg in Q at `P_last` and the users' OI opposite the LP; refuses (21) while the
+    /// asset lags, as tag 118.
+    #[inline(never)]
+    fn lev_w1_market_state<'a>(
+        market_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        a: usize,
+        c_m: u128,
+    ) -> Result<(i128, u128, u128, u128), ProgramError> {
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 || permissionless_resolve_matured_now_view(&cfg, &group) {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if asset_price_lagged_view(&group, a)? {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let vault = read_asset_vault_lp_from_view(&group, a)?;
+        if vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || vault.vault_lp_portfolio != lp_ai.key.to_bytes() {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let Some(g) = asset_growth_view(&group, a)? else {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        };
+        let lam = growth_capacity_lambda_view(&group, a, &g, c_m)?;
+        let price = group.markets[a].engine.asset.effective_price.get();
+        let target = crate::lev_guard_v22::w1_target_q(c_m, lam, price, percolator::POS_SCALE);
+        let min_leg = group.header.config.band_min_leg_notional.get() as u128;
+        let min_leg_q = if price == 0 {
+            u128::MAX
+        } else {
+            (min_leg.saturating_mul(percolator::POS_SCALE)).div_ceil(price as u128)
+        };
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        let (_, lp_net) = raw_and_effective_signed_position_for_asset_view(&group, &lp, a)?;
+        // the users opposite the LP: the side the LP's net faces
+        let (oi_long, oi_short) = side_oi_snapshot_view(&group, a)?;
+        let users_opp = if lp_net < 0 {
+            growth_v19::users_side_oi_q(oi_long, lp_net, true)
+        } else {
+            growth_v19::users_side_oi_q(oi_short, lp_net, false)
+        };
+        Ok((lp_net, target, min_leg_q, users_opp))
+    }
+
+    /// An account's ADL-effective position on `a`.
+    fn lev_position_of<'a>(market_ai: &AccountInfo<'a>, p_ai: &AccountInfo<'a>, a: usize) -> Result<i128, ProgramError> {
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        ensure_portfolio_storage_for_market_slots(p_ai, max_market_slots)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let mut d = p_ai.try_borrow_mut_data()?;
+        let p = state::portfolio_view_mut_for_market_slots(&mut d, max_market_slots)?;
+        expect_portfolio_view_account_key(&p, p_ai.key)?;
+        Ok(raw_and_effective_signed_position_for_asset_view(&group, &p, a)?.1)
+    }
+
+    /// Op 5, the LP stop W1 (plan v2 D-b / D-c / D-i; wrapper only, D-a). Permissionless.
+    ///
+    /// Samples the LP's NAV per share. With no round open it opens one iff the stop holds
+    /// (NAV/share <= 50 % of the trailing peak or of the reference) and the LP's net exceeds the
+    /// target `λ_eff·C_m_now`: the round's keep-fraction `k = target / |LP net|` is fixed then.
+    /// Each listed portfolio OPPOSITE the LP (a user whose position faces the LP's net) is cut
+    /// ONCE per round to `floor(k·|pos|)`, `k = (U - E) / U` from the aggregate opposing book `U`
+    /// and the LP's excess `E` (`w1_keep_bps_users`), so the LP reaches the target only after every
+    /// opposing account is cut (the whole leg when the rest is below the band minimum
+    /// leg) by a forced bilateral reduce against the vault LP at `P_last`, no fee (tags 118 /
+    /// 119's primitive). The per-account result depends only on that account's position and `k`,
+    /// so the order and grouping of the calls do not matter (rule 27). The round closes, and the
+    /// NAV reference resets, once the LP's net is within the target. Refused (21) while the asset
+    /// lags. Not an error to list a same-side, flat or already-cut account: it is skipped.
     #[inline(never)]
     fn lev_guard_lp_stop<'a>(
-        _program_id: &Pubkey,
-        _accounts: &'a [AccountInfo<'a>],
-        _now: u64,
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        now: u64,
     ) -> ProgramResult {
-        Err(PercolatorError::LpStopNotTriggered.into())
+        use crate::lev_guard_v22 as lg;
+        let market_ai = account(accounts, 1)?;
+        let guard_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        let vault_lp_ai = account(accounts, 4)?;
+        expect_writable(market_ai)?;
+        expect_writable(guard_ai)?;
+        expect_writable(lp_ai)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+        let a = gd.asset_index as usize;
+        let (eq, fin, fout) = lev_lp_flows(program_id, market_ai, lp_ai, vault_lp_ai, accounts.get(5))?;
+        let nav = lg::nav_sample(&gd.nav(), eq, fin, fout, now);
+        gd.set_nav(&nav);
+        let (lp_net, target, min_leg_q, users_opp) = lev_w1_market_state(market_ai, lp_ai, a, eq)?;
+        if gd.round_active == 0 {
+            if !lg::lp_stop_triggered(&nav) {
+                return Err(PercolatorError::LpStopNotTriggered.into());
+            }
+            let keep = lg::w1_keep_bps_users(users_opp, lp_net.unsigned_abs(), target);
+            if keep >= 10_000 {
+                // The stop holds but the LP is already within λ_eff·C_m: acknowledge it (the
+                // reference resets), nothing to cut.
+                gd.set_nav(&lg::nav_stop_reset(&nav));
+                solana_program::log::sol_log("lev_w1_stop_within_target");
+                return lev_guard_store(guard_ai, &gd);
+            }
+            gd.round_active = 1;
+            gd.round_id = gd.round_id.wrapping_add(1);
+            gd.round_keep_bps = keep;
+            gd.round_lp_long = u8::from(lp_net > 0);
+            gd.round_target_q = target.to_le_bytes();
+            gd.touched_n = 0;
+            solana_program::log::sol_log(&alloc::format!(
+                "lev_w1_round_open id={} keep_bps={} lp_net={} target={} navps={}",
+                gd.round_id, keep, lp_net, target, nav.navps
+            ));
+        }
+        let keep = gd.round_keep_bps;
+        let lp_long = gd.round_lp_long == 1;
+        let mut cut_any = false;
+        for victim_ai in accounts.iter().skip(6) {
+            if victim_ai.key == lp_ai.key || victim_ai.owner != program_id {
+                return Err(PercolatorError::LevGuardInvalid.into());
+            }
+            let k = victim_ai.key.to_bytes();
+            {
+                let gdata = guard_ai.try_borrow_data()?;
+                let o = constants::HEADER_LEN + lg::LEV_GUARD_REC_LEN;
+                let region = gdata.get(o..o + lg::LEV_GUARD_TOUCHED_LEN).ok_or(PercolatorError::LevGuardInvalid)?;
+                if lg::touched_has_in(region, gd.touched_n, &k) {
+                    continue;
+                }
+            }
+            let pos = lev_position_of(market_ai, victim_ai, a)?;
+            // Opposite the LP: the LP long faces users short, and vice versa.
+            let opposing = if lp_long { pos < 0 } else { pos > 0 };
+            if !opposing {
+                continue;
+            }
+            let keep_q = lg::w1_keep_q(pos.unsigned_abs(), keep, min_leg_q);
+            let cut = pos.unsigned_abs() - keep_q;
+            if cut > 0 {
+                expect_writable(victim_ai)?;
+                band_forced_reduce_against_vault_lp(
+                    program_id,
+                    market_ai,
+                    victim_ai,
+                    lp_ai,
+                    gd.asset_index,
+                    cut,
+                    fill_events_v22::TAG_LEV_GUARD_LP_STOP,
+                    fill_events_v22::REASON_LP_STOP,
+                )?;
+                cut_any = true;
+            }
+            {
+                let mut gdata = guard_ai.try_borrow_mut_data()?;
+                let region = state::lev_guard_touched_mut(&mut gdata)?;
+                if !lg::touch_in(region, gd.touched_n, &k) {
+                    return Err(PercolatorError::LevGuardInvalid.into());
+                }
+            }
+            gd.touched_n += 1;
+        }
+        // Close the round once the LP is within the round's target.
+        let (lp_after, _, _, _) = lev_w1_market_state(market_ai, lp_ai, a, eq)?;
+        if lp_after.unsigned_abs() <= gd.round_target() {
+            gd.round_active = 0;
+            gd.set_nav(&lg::nav_stop_reset(&gd.nav()));
+            solana_program::log::sol_log(&alloc::format!("lev_w1_round_done id={} lp_net={}", gd.round_id, lp_after));
+        } else if !cut_any && accounts.len() <= 6 {
+            // An open round, nothing listed to cut: a no-op call is a caller error.
+            return Err(PercolatorError::LpStopNotTriggered.into());
+        }
+        lev_guard_store(guard_ai, &gd)
     }
 
     /// growth-v19 post-fill gate (plan §2.1), every route: called from BOTH shared executors

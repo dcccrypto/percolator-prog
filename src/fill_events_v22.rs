@@ -37,6 +37,8 @@ pub const TAG_SETTLE_HOLDING_RENT: u8 = 106;
 pub const TAG_INSURANCE_BACKSTOP: u8 = 111;
 pub const TAG_SWEEP_BAND_DUST: u8 = 118;
 pub const TAG_EVICT_AND_TRADE: u8 = 119;
+/// v2.2 lev build: tag 124 op 5, the LP stop (W1) forced reduce.
+pub const TAG_LEV_GUARD_LP_STOP: u8 = 124;
 /// prog#547 (fix-all 2026-10-18): position closes the owner did not sign for.
 pub const TAG_RESOLVE_MARKET: u8 = 19;
 pub const TAG_CLOSE_RESOLVED: u8 = 30;
@@ -65,6 +67,8 @@ pub const REASON_FORCE_CLOSE_ABANDONED: u8 = 6;
 /// Tag 30 CloseResolved: a position settled at the resolved price when the portfolio is closed
 /// after resolution (permissionless after the force-close delay). ADL-effective units.
 pub const REASON_RESOLVED_CLOSE: u8 = 7;
+/// v2.2 lev build: the W1 LP stop cut an opposing account to the round's keep-fraction at P_last.
+pub const REASON_LP_STOP: u8 = 8;
 
 /// MOVE subkinds.
 pub const MOVE_EARN_EXIT: u8 = 1;
