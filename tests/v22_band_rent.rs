@@ -5491,6 +5491,7 @@ mod lev_guard_t {
     }
 
     pub fn tg(env: &mut Env, taker: &(Keypair, Pubkey), lp: &Lp, size_q: i128) -> Result<u64, String> {
+        env.svm.expire_blockhash(); // a byte-identical retry must really run again
         let g = guard_key(env);
         trade_with(env, &taker.0, taker.1, lp, size_q, Some(g))
     }
@@ -5799,13 +5800,14 @@ fn lev_guard_price_band_breaker_trips_and_expires() {
     let t = env.trader(1_000 * USD);
     let size = 1_000 * (base + with_mo) / 2 / 100; // between 0.75·L and L
     let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(size));
-    assert!(lgt::has(&r, lgt::REFUSED), "m_oracle window: {size} refused: {r:?}");
-    // the windows pass (state poke of the deadlines): the same open lands
+    assert!(lgt::has(&r, lgt::REFUSED), "freeze + m_oracle window: {size} refused: {r:?}");
+    // the 1 h freeze passes (state poke of its deadline) but m_oracle (24 h) still binds alone
     let now = env.slot;
-    lgt::poke_guard(&mut env, |g| {
-        g.pb_freeze_until = now;
-        g.pb_oracle_until = now;
-    });
+    lgt::poke_guard(&mut env, |g| g.pb_freeze_until = now);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(size));
+    assert!(lgt::has(&r, lgt::REFUSED), "m_oracle alone: {size} refused: {r:?}");
+    // both windows pass: the same open lands
+    lgt::poke_guard(&mut env, |g| g.pb_oracle_until = now);
     lgt::tg(&mut env, &t, &lp, lgt::usd_q(size)).expect("after the windows");
     env.assert_conservation();
 }
