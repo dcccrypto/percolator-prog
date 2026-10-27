@@ -6091,3 +6091,67 @@ fn i570_exposed_unlagged_lp_deposits_without_a_crank() {
     assert_eq!(env.lp_shares(&d2), 1_000 * U as u128, "minted at par");
     env.assert_conserved("i570 unlagged liveness");
 }
+
+// ── v2.2 lev build, decision 7: the $500 minimum creator stake (500·10^decimals atoms) ──────
+// The test mint has 0 decimals, so the minimum is 500 atoms here (`min_creator_stake_atoms(0)`);
+// the decimals scaling is unit-tested in `lev_guard_v22::tests::min_stake_decimals`.
+
+const LEV_MIN_STAKE: u64 = 500;
+const LEV_STAKE_ERR: &str = "Custom(131)";
+
+#[test]
+fn lev_min_creator_stake_deposit_and_withdraw_boundaries() {
+    assert_eq!(percolator_prog::lev_guard_v22::min_creator_stake_atoms(0), Some(LEV_MIN_STAKE as u128));
+    let mut env = Env::new(growth_params());
+    assert!(growth_rec(&env).is_some(), "growth market");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    // below the minimum: refused, nothing booked
+    let r = env.junior_deposit_as(&admin, lp.portfolio, LEV_MIN_STAKE - 1);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "499: {r:?}");
+    assert_eq!(env.vlp().junior_deposited_atoms, 0);
+    // exactly the minimum: lands
+    env.junior_deposit_as(&admin, lp.portfolio, LEV_MIN_STAKE).expect("500 lands");
+    // a top-up of 1 atom once at the minimum: lands
+    env.junior_deposit_as(&admin, lp.portfolio, 100).expect("top-up");
+    assert_eq!(env.vlp().junior_deposited_atoms, 600);
+    // a withdrawal that would leave 499 (in (0, min)): refused
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, 101);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 499: {r:?}");
+    // leave exactly the minimum: lands
+    env.junior_withdraw_as(&admin, lp.portfolio, 100).expect("leave 500");
+    // full exit (net 0): the rule allows it (other locks decide)
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, LEV_MIN_STAKE);
+    assert!(!r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "full exit is not a stake refusal: {r:?}");
+}
+
+#[test]
+fn lev_min_creator_stake_blocks_allocation_until_reached() {
+    let mut env = Env::new(growth_params());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, None).expect("senior");
+    let lp = env.bind(2_000);
+    // no creator stake: senior capital may not be allocated to the vault LP
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "no stake: {r:?}");
+    assert_eq!(env.allocated(), 0);
+    // sybil-style dust from the junior owner is refused too (the deposit itself fails)
+    let admin = env.admin.insecure_clone();
+    assert!(env.junior_deposit_as(&admin, lp.portfolio, 1).is_err());
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "still no stake: {r:?}");
+    // the minimum reached: the stake rule no longer refuses
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("stake");
+    let r = env.allocate(lp.portfolio, u128::MAX);
+    assert!(!r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "stake met: {r:?}");
+}
+
+/// Scope: a market with growth OFF (a pre-v2.2 vault-LP market) is not subject to the rule.
+#[test]
+fn lev_min_creator_stake_not_applied_off_growth() {
+    let mut env = Env::new(Params::default());
+    assert!(growth_rec(&env).is_none());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 1).expect("growth off: 1 atom lands");
+}

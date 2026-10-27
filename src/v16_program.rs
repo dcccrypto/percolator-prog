@@ -1933,10 +1933,17 @@ VaultLpMultiAssetMarket,
         /// 0..=3. A 0 field means the protocol default and is checked as that default.
         /// Custom(130). SDK agent: add `GrowthTierConfigInvalid = 130`.
         GrowthTierConfigInvalid = 130,
+        // ── v2.2 leverage build (2026-10-27; ledger v22-allocations.md, claimed before use) ──
+        /// Decision 7: on a growth asset the junior (creator) stake's net contribution
+        /// (deposited − withdrawn) must be 0 or at least `500·10^decimals` collateral atoms; a
+        /// deposit may not leave it below, a withdrawal may not leave it in (0, min), and no
+        /// senior allocation (tag 103) runs below it. Custom(131).
+        CreatorStakeBelowMinimum = 131,
     }
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::GrowthTierConfigInvalid as u32 == 130);
+    const _: () = assert!(PercolatorError::CreatorStakeBelowMinimum as u32 == 131);
     const _: () = assert!(PercolatorError::PositionCapReached as u32 == 126);
     const _: () = assert!(PercolatorError::CounterpartyPositionCapReached as u32 == 127);
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
@@ -37161,6 +37168,16 @@ pub mod processor {
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
             expect_portfolio_view_account_key(&lp, lp_ai.key)?;
             group.deposit_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
+            // v2.2 lev build (decision 7): the junior stake after this deposit must reach the
+            // $500 minimum (decimals-aware) on a growth asset.
+            lev_require_creator_stake(
+                &group,
+                st.asset_index as usize,
+                crate::lev_guard_v22::junior_net(
+                    st.junior_deposited_atoms.saturating_add(amount),
+                    st.junior_withdrawn_atoms,
+                ),
+            )?;
             // Round 3 item 6: the launch capital `c_launch` is no longer recorded here (R2.1
             // stopped reading it; its bytes 0..8 carry the volatility EWMA and the rent stamp).
         }
@@ -37362,6 +37379,15 @@ pub mod processor {
                     }
                 }
             }
+            // v2.2 lev build (decision 7): a withdrawal may not leave the junior stake in (0, min).
+            lev_require_creator_stake(
+                &group,
+                st.asset_index as usize,
+                crate::lev_guard_v22::junior_net(
+                    st.junior_deposited_atoms,
+                    st.junior_withdrawn_atoms.saturating_add(amount),
+                ),
+            )?;
             group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             // Phase 2b A4 lock (defence in depth: the engine withdraw above is flat-only).
             p2b_a4_capacity_check(&group, &lp, st.asset_index as usize, c_m_before)?;
@@ -40229,6 +40255,18 @@ pub mod processor {
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::VaultLpAllocateRefused.into());
+        }
+        // v2.2 lev build (decision 7): no senior capital is allocated to the vault LP of a growth
+        // asset until the creator's stake reaches the $500 minimum.
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut market_data)?;
+            let net = crate::lev_guard_v22::junior_net(st.junior_deposited_atoms, st.junior_withdrawn_atoms);
+            if let Some(min) = lev_min_creator_stake_view(&group, st.asset_index as usize)? {
+                if net < min {
+                    return Err(PercolatorError::CreatorStakeBelowMinimum.into());
+                }
+            }
         }
         let mut x = load_or_create_vault_lp_ext(
             program_id,
@@ -43875,6 +43913,43 @@ pub mod processor {
             dials,
             venue_l_x100,
         })
+    }
+
+    /// v2.2 lev build (decision 7): the minimum creator (junior) stake of the bound asset in
+    /// collateral atoms, `500 · 10^decimals` (decimals from the growth record, R2-L2: 0 = 6).
+    /// `None` when growth is off on the asset (a pre-v2.2 vault-LP market: rule not applied).
+    fn lev_min_creator_stake_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<Option<u128>, ProgramError> {
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        match state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? {
+            Some(g) => Ok(Some(
+                crate::lev_guard_v22::min_creator_stake_atoms(growth_v19::collateral_decimals_of(
+                    g.collateral_decimals_p1,
+                ))
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+            )),
+            None => Ok(None),
+        }
+    }
+
+    /// v2.2 lev build (decision 7): refuse a junior net contribution in (0, min) on a growth asset.
+    fn lev_require_creator_stake(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        junior_net_after: u128,
+    ) -> ProgramResult {
+        if let Some(min) = lev_min_creator_stake_view(group, asset_index)? {
+            if !crate::lev_guard_v22::junior_stake_ok(junior_net_after, min) {
+                return Err(PercolatorError::CreatorStakeBelowMinimum.into());
+            }
+        }
+        Ok(())
     }
 
     /// Security review W-L1 (v2.2 growth overnight): the LP-capacity lambda every OTHER stored-λ
