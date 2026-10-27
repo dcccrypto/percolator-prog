@@ -2105,9 +2105,14 @@ pub const GROWTH_FLAG_R3_LAYOUT: u8 = 0x01;
 /// `flags` bit 1: the variance has at least one sample (requires bit 0).
 pub const GROWTH_FLAG_VOL_DATA: u8 = 0x02;
 
-/// Validator for the `flags` byte: only bits 0-1, and bit 1 only with bit 0.
+/// `flags` bit 2 (v2.2 lev build, 2026-10-27): the market's leverage guard (`LevGuardV22`, tag
+/// 124) is bound to this asset, so a risk-increasing fill must carry it. Set once by tag 124 op 0,
+/// never cleared; every writer of `flags` preserves it (`migrate_r3_layout`, `set_graduation`).
+pub const GROWTH_FLAG_LEV_GUARD: u8 = 0x04;
+
+/// Validator for the `flags` byte: only bits 0-2, and bit 1 only with bit 0.
 pub fn growth_flags_ok(flags: u8) -> bool {
-    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA) == 0
+    flags & !(GROWTH_FLAG_R3_LAYOUT | GROWTH_FLAG_VOL_DATA | GROWTH_FLAG_LEV_GUARD) == 0
         && (flags & GROWTH_FLAG_VOL_DATA == 0 || flags & GROWTH_FLAG_R3_LAYOUT != 0)
 }
 

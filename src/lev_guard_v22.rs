@@ -635,6 +635,230 @@ pub fn cpmm_dump_bps(r: u64, q: u64) -> u16 {
     (BPS - kept_bps) as u16
 }
 
+// ── the guard record: `["lev_guard", market]`, header kind 17, body at `HEADER_LEN` ───────────
+
+pub const LEV_GUARD_SEED: &[u8] = b"lev_guard";
+pub const LEV_GUARD_VERSION: u8 = 1;
+/// `flags` bit 0 / 1: the pinned base mint was last proven to have a live mint / freeze authority.
+pub const GUARD_FLAG_MINT_AUTH: u8 = 1 << 0;
+pub const GUARD_FLAG_FREEZE_AUTH: u8 = 1 << 1;
+pub const GUARD_FLAGS_KNOWN: u8 = GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH;
+
+/// Tag 124 ops.
+pub const OP_INIT: u8 = 0;
+pub const OP_SET_RISK_KEY: u8 = 1;
+pub const OP_REPORT: u8 = 2;
+pub const OP_TIGHTEN: u8 = 3;
+pub const OP_POKE: u8 = 4;
+pub const OP_LP_STOP: u8 = 5;
+pub const OP_SET_T0: u8 = 6;
+
+fn u128_of(b: &[u8; 16]) -> u128 {
+    u128::from_le_bytes(*b)
+}
+
+/// One record per market. u128 fields are LE byte arrays (Pod, no implicit padding).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct LevGuardV22 {
+    pub market: [u8; 32],   // 0..32
+    /// The holder risk key (D-d, decision 20). Zero = none (reports refused). Upgrade authority.
+    pub risk_key: [u8; 32], // 32..64
+    /// T0: the earliest slot the program vouches for as the token's start (the guard's creation,
+    /// or an upgrade-authority backdate). Every age rule reads it.
+    pub t0_slot: u64,       // 64..72
+    pub asset_index: u16,   // 72..74
+    pub version: u8,        // 74
+    pub bump: u8,           // 75
+    pub flags: u8,          // 76
+    pub round_active: u8,   // 77  W1: 1 while a stop round is open
+    pub round_lp_long: u8,  // 78  W1: the LP side when the round opened (1 long, 0 short)
+    pub _pad0: u8,          // 79
+    // ── risk report (key-written) ──
+    pub rep_j_dump_bps: u16, // 80
+    pub rep_m_ind_bps: u16,  // 82
+    pub rep_l_cap_x100: u16, // 84
+    pub rep_n_mult_bps: u16, // 86
+    pub rep_slot: u64,       // 88..96
+    // ── permissionless holder proof ──
+    pub holder_dump_bps: u16, // 96
+    pub round_keep_bps: u16,  // 98  W1 keep-fraction of the open round
+    pub touched_n: u16,       // 100 W1 accounts reduced in this round
+    pub _pad1: [u8; 2],       // 102..104
+    pub holder_dump_slot: u64, // 104..112
+    // ── price band ──
+    pub pb_last_px: u64,      // 112
+    pub pb_last_slot: u64,    // 120
+    pub pb_ref_px: u64,       // 128
+    pub pb_ref_slot: u64,     // 136
+    pub pb_freeze_until: u64, // 144
+    pub pb_oracle_until: u64, // 152
+    pub frozen_l_x100: u16,   // 160
+    pub _pad2: [u8; 6],       // 162..168
+    pub frozen_n_q: [u8; 16], // 168..184
+    // ── NAV per share (LP stop) ──
+    pub navps: [u8; 16],       // 184
+    pub nav_last_equity: [u8; 16], // 200
+    pub nav_last_in: [u8; 16],  // 216
+    pub nav_last_out: [u8; 16], // 232
+    pub nav_peak_cur: [u8; 16], // 248
+    pub nav_peak_prev: [u8; 16], // 264
+    pub nav_ref: [u8; 16],      // 280
+    pub nav_bucket_start: u64,  // 296
+    pub nav_last_slot: u64,     // 304
+    // ── W1 round ──
+    pub round_id: u64,          // 312
+    pub round_target_q: [u8; 16], // 320..336
+}
+/// The record proper (336 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
+/// in the account body as `W1_TOUCHED_CAP` LE u64 tags, read and written in place
+/// (`touched_has_in`, `touch_in`), never copied onto the stack.
+pub const LEV_GUARD_REC_LEN: usize = 336;
+pub const LEV_GUARD_TOUCHED_LEN: usize = 8 * W1_TOUCHED_CAP;
+pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
+const _: () = assert!(core::mem::size_of::<LevGuardV22>() == LEV_GUARD_REC_LEN);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, rep_j_dump_bps) == 80);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, holder_dump_slot) == 104);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, pb_last_px) == 112);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, frozen_n_q) == 168);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, navps) == 184);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_id) == 312);
+
+impl LevGuardV22 {
+    pub fn report(&self) -> RiskReport {
+        RiskReport {
+            j_dump_bps: self.rep_j_dump_bps,
+            m_ind_bps: self.rep_m_ind_bps,
+            l_cap_x100: self.rep_l_cap_x100,
+            n_mult_bps: self.rep_n_mult_bps,
+            slot: self.rep_slot,
+        }
+    }
+    pub fn perm(&self) -> PermFacts {
+        PermFacts {
+            mint_auth_live: self.flags & GUARD_FLAG_MINT_AUTH != 0,
+            freeze_auth_live: self.flags & GUARD_FLAG_FREEZE_AUTH != 0,
+            holder_dump_bps: self.holder_dump_bps,
+            holder_dump_slot: self.holder_dump_slot,
+        }
+    }
+    pub fn price_band(&self) -> PriceBand {
+        PriceBand {
+            last_px_e6: self.pb_last_px,
+            last_slot: self.pb_last_slot,
+            ref_px_e6: self.pb_ref_px,
+            ref_slot: self.pb_ref_slot,
+            freeze_until: self.pb_freeze_until,
+            oracle_until: self.pb_oracle_until,
+        }
+    }
+    pub fn set_price_band(&mut self, b: &PriceBand) {
+        self.pb_last_px = b.last_px_e6;
+        self.pb_last_slot = b.last_slot;
+        self.pb_ref_px = b.ref_px_e6;
+        self.pb_ref_slot = b.ref_slot;
+        self.pb_freeze_until = b.freeze_until;
+        self.pb_oracle_until = b.oracle_until;
+    }
+    pub fn frozen_n(&self) -> u128 {
+        u128_of(&self.frozen_n_q)
+    }
+    pub fn nav(&self) -> NavState {
+        NavState {
+            navps: u128_of(&self.navps),
+            last_equity: u128_of(&self.nav_last_equity),
+            last_in: u128_of(&self.nav_last_in),
+            last_out: u128_of(&self.nav_last_out),
+            peak_cur: u128_of(&self.nav_peak_cur),
+            peak_prev: u128_of(&self.nav_peak_prev),
+            bucket_start: self.nav_bucket_start,
+            ref_navps: u128_of(&self.nav_ref),
+            last_slot: self.nav_last_slot,
+        }
+    }
+    pub fn set_nav(&mut self, n: &NavState) {
+        self.navps = n.navps.to_le_bytes();
+        self.nav_last_equity = n.last_equity.to_le_bytes();
+        self.nav_last_in = n.last_in.to_le_bytes();
+        self.nav_last_out = n.last_out.to_le_bytes();
+        self.nav_peak_cur = n.peak_cur.to_le_bytes();
+        self.nav_peak_prev = n.peak_prev.to_le_bytes();
+        self.nav_ref = n.ref_navps.to_le_bytes();
+        self.nav_bucket_start = n.bucket_start;
+        self.nav_last_slot = n.last_slot;
+    }
+    pub fn round_target(&self) -> u128 {
+        u128_of(&self.round_target_q)
+    }
+}
+
+/// Whether `key` is among the first `n` tags of the touched region (`LEV_GUARD_TOUCHED_LEN` B).
+pub fn touched_has_in(region: &[u8], n: u16, key: &[u8; 32]) -> bool {
+    let t = key_tag(key);
+    (0..(n as usize).min(W1_TOUCHED_CAP)).any(|i| {
+        region
+            .get(i * 8..i * 8 + 8)
+            .is_some_and(|b| u64::from_le_bytes([b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7]]) == t)
+    })
+}
+
+/// Append `key`'s tag at index `n` of the region. `false` when full (fail closed: the caller
+/// refuses rather than reduce an account it could not record).
+pub fn touch_in(region: &mut [u8], n: u16, key: &[u8; 32]) -> bool {
+    let i = n as usize;
+    if i >= W1_TOUCHED_CAP {
+        return false;
+    }
+    match region.get_mut(i * 8..i * 8 + 8) {
+        Some(b) => {
+            b.copy_from_slice(&key_tag(key).to_le_bytes());
+            true
+        }
+        None => false,
+    }
+}
+
+/// Structural validation of a stored record (every reader runs it).
+pub fn validate_guard(g: &LevGuardV22) -> bool {
+    g.version == LEV_GUARD_VERSION
+        && g.flags & !GUARD_FLAGS_KNOWN == 0
+        && g.round_active <= 1
+        && g.round_lp_long <= 1
+        && (g.touched_n as usize) <= W1_TOUCHED_CAP
+        && g.round_keep_bps <= 10_000
+        && report_ok(&g.report())
+        && g._pad0 == 0
+        && g._pad1 == [0; 2]
+        && g._pad2 == [0; 6]
+}
+
+/// A fresh record for `market`.
+pub fn new_guard(market: [u8; 32], asset_index: u16, t0_slot: u64, bump: u8) -> LevGuardV22 {
+    let mut g: LevGuardV22 = bytemuck::Zeroable::zeroed();
+    g.market = market;
+    g.asset_index = asset_index;
+    g.t0_slot = t0_slot;
+    g.version = LEV_GUARD_VERSION;
+    g.bump = bump;
+    g
+}
+
+/// Read the SPL / Token-2022 `COption<Pubkey>` mint and freeze authorities of a mint account
+/// (offsets 0 and 46; tag 1 = Some). `None` if the account is too short or a tag is not 0/1.
+pub fn mint_authorities(data: &[u8]) -> Option<(bool, bool)> {
+    if data.len() < 82 {
+        return None;
+    }
+    let tag = |o: usize| -> Option<bool> {
+        match u32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]) {
+            0 => Some(false),
+            1 => Some(true),
+            _ => None,
+        }
+    };
+    Some((tag(0)?, tag(46)?))
+}
+
 // ── arithmetic ───────────────────────────────────────────────────────────────────────────────
 
 /// `floor(a · b / d)` saturating at u128::MAX; `d == 0` reads 0 (callers never pass it).
@@ -1136,6 +1360,61 @@ mod tests {
             assert!(d >= prev);
             prev = d;
         }
+    }
+
+    #[test]
+    fn guard_record_roundtrip_and_validation() {
+        let mut g = new_guard([7u8; 32], 0, 1234, 254);
+        assert!(validate_guard(&g));
+        assert_eq!(core::mem::size_of::<LevGuardV22>(), LEV_GUARD_REC_LEN);
+        let n = nav_sample(&nav_epoch_start(1_000, 5, 6, 10), 900, 5, 6, 20);
+        g.set_nav(&n);
+        assert_eq!(g.nav(), n);
+        let pb = PriceBand { last_px_e6: 1, last_slot: 2, ref_px_e6: 3, ref_slot: 4, freeze_until: 5, oracle_until: 6 };
+        g.set_price_band(&pb);
+        assert_eq!(g.price_band(), pb);
+        // touched set (in place): once per key, fails closed when full
+        let mut region = [0u8; LEV_GUARD_TOUCHED_LEN];
+        let k1 = [1u8; 32];
+        assert!(!touched_has_in(&region, 0, &k1));
+        assert!(touch_in(&mut region, 0, &k1));
+        assert!(touched_has_in(&region, 1, &k1));
+        assert!(!touched_has_in(&region, 0, &k1), "n bounds the search");
+        for i in 1..W1_TOUCHED_CAP {
+            let mut k = [0u8; 32];
+            k[..8].copy_from_slice(&(i as u64 + 1_000).to_le_bytes());
+            assert!(touch_in(&mut region, i as u16, &k));
+        }
+        assert!(!touch_in(&mut region, W1_TOUCHED_CAP as u16, &[9u8; 32]), "full set refuses");
+        assert!(touched_has_in(&region, W1_TOUCHED_CAP as u16, &k1));
+        g.touched_n = W1_TOUCHED_CAP as u16;
+        assert!(validate_guard(&g));
+        // structural refusals
+        let mut b = g;
+        b.flags = 4;
+        assert!(!validate_guard(&b));
+        let mut b = g;
+        b.rep_n_mult_bps = 10_001;
+        assert!(!validate_guard(&b));
+        let mut b = g;
+        b.version = 2;
+        assert!(!validate_guard(&b));
+        let mut b = g;
+        b._pad2 = [1, 0, 0, 0, 0, 0];
+        assert!(!validate_guard(&b));
+    }
+
+    #[test]
+    fn mint_authority_parse() {
+        let mut d = [0u8; 82];
+        assert_eq!(mint_authorities(&d), Some((false, false)));
+        d[0] = 1;
+        assert_eq!(mint_authorities(&d), Some((true, false)));
+        d[46] = 1;
+        assert_eq!(mint_authorities(&d), Some((true, true)));
+        d[0] = 2;
+        assert_eq!(mint_authorities(&d), None);
+        assert_eq!(mint_authorities(&[0u8; 81]), None);
     }
 
     #[test]

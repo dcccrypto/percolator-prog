@@ -279,6 +279,11 @@ struct Lp {
     delegate: Pubkey,
 }
 
+thread_local! {
+    /// v2.2 lev build: the slot `Env::try_new` starts at (1 = the historical default, no warp).
+    static LEV_START_SLOT: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
+}
+
 struct Env {
     svm: LiteSVM,
     program_id: Pubkey,
@@ -300,6 +305,12 @@ struct Env {
 impl Env {
     fn try_new(cfg: Cfg) -> Result<Self, String> {
         let mut svm = LiteSVM::new();
+        // v2.2 lev build: an opt-in start slot (age tests need a clock far past T0); the default
+        // (1) leaves every other test exactly as before (no warp).
+        let start_slot = LEV_START_SLOT.with(|c| c.get());
+        if start_slot != 1 {
+            svm.warp_to_slot(start_slot);
+        }
         let program_id = percolator_prog::id();
         svm.add_program(program_id, &std::fs::read(program_path()).expect("read wrapper BPF"));
         svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).unwrap());
@@ -341,7 +352,7 @@ impl Env {
             portfolio_account_len: state::portfolio_account_len_for_market_slots(cfg.slots)
                 .unwrap(),
             next_key: 0x40,
-            slot: 1,
+            slot: start_slot,
             engine_imr: MKT.with(|m| m.get().0),
             upgrade_authority: seeded_keypair(3),
             program_data: Pubkey::find_program_address(
@@ -5362,5 +5373,559 @@ fn lev_lambda_vol_halves_capacity_and_exits_stay_open() {
     // the LP earned fees on the round trips: N_cap at the CURRENT equity
     let n1_now = gv::n_cap_q(lev_lp_equity(&env, lp.account), 10_000, PRICE, POS_SCALE).unwrap();
     assert!(b > a && b <= n1_now, "calm: refills past the hot cap {a} up to the 1x cap {b} (cap {n1_now})");
+    env.assert_conservation();
+}
+
+// ── v2.2 lev build: the leverage guard (tag 124) on TradeCpi ────────────────────────────────
+
+mod lev_guard_t {
+    use super::*;
+    use percolator_prog::{growth_v19 as gv, lev_guard_v22 as lg};
+
+    pub const REQ: &str = "Custom(132)";
+    pub const REFUSED: &str = "Custom(133)";
+    pub const INVALID: &str = "Custom(134)";
+    pub const UNAUTH: &str = "Custom(8)";
+
+    pub fn guard_key(env: &Env) -> Pubkey {
+        state::derive_lev_guard(&env.program_id, &env.market).0
+    }
+
+    pub fn lev_ix(op: u8, t0: u64, key: [u8; 32], report: [u16; 4]) -> ProgInstruction {
+        ProgInstruction::LevGuard { op, t0, key, report }
+    }
+
+    /// Op 0 by the upgrade authority (t0 = 0: now; else a backdate) or by `signer`.
+    pub fn init(env: &mut Env, signer: Option<&Keypair>, t0: u64) -> Result<u64, String> {
+        let s = match signer {
+            Some(k) => k.insecure_clone(),
+            None => env.upgrade_authority.insecure_clone(),
+        };
+        let (pd, m, g) = (env.program_data, env.market, guard_key(env));
+        let _ = env.svm.airdrop(&s.pubkey(), 10_000_000_000);
+        env.send(
+            lev_ix(lg::OP_INIT, t0, [0; 32], [0; 4]),
+            vec![
+                AccountMeta::new(s.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(g, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&s],
+        )
+    }
+
+    pub fn ua_op(env: &mut Env, op: u8, t0: u64, key: [u8; 32]) -> Result<u64, String> {
+        let ua = env.upgrade_authority.insecure_clone();
+        let (pd, m, g) = (env.program_data, env.market, guard_key(env));
+        env.send(
+            lev_ix(op, t0, key, [0; 4]),
+            vec![
+                AccountMeta::new(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new_readonly(m, false),
+                AccountMeta::new(g, false),
+            ],
+            &[&ua],
+        )
+    }
+
+    pub fn report(env: &mut Env, key: &Keypair, r: [u16; 4]) -> Result<u64, String> {
+        let (m, g) = (env.market, guard_key(env));
+        env.send(
+            lev_ix(lg::OP_REPORT, 0, [0; 32], r),
+            vec![AccountMeta::new_readonly(key.pubkey(), true), AccountMeta::new_readonly(m, false), AccountMeta::new(g, false)],
+            &[key],
+        )
+    }
+
+    pub fn guard(env: &Env) -> lg::LevGuardV22 {
+        state::read_lev_guard(&env.svm.get_account(&guard_key(env)).unwrap().data).unwrap()
+    }
+
+    pub fn poke_guard(env: &mut Env, f: impl FnOnce(&mut lg::LevGuardV22)) {
+        let k = guard_key(env);
+        let mut a = env.svm.get_account(&k).unwrap();
+        let mut g = state::read_lev_guard(&a.data).unwrap();
+        f(&mut g);
+        state::write_lev_guard(&mut a.data, &g, false).unwrap();
+        env.svm.set_account(k, a).unwrap();
+    }
+
+    /// TradeCpi with `extra` appended as the LAST account (the guard, or a forgery).
+    pub fn trade_with(env: &mut Env, taker: &Keypair, taker_account: Pubkey, lp: &Lp, size_q: i128, extra: Option<Pubkey>) -> Result<u64, String> {
+        let (a_id, _, a_epoch) = env.identity(taker_account);
+        let (b_id, b_seq, b_epoch) = env.identity(lp.account);
+        let market_id = env.market_id();
+        let (m, mp) = (env.market, env.matcher_program);
+        let mut metas = vec![
+            AccountMeta::new(taker.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(taker_account, false),
+            AccountMeta::new(lp.account, false),
+            AccountMeta::new_readonly(mp, false),
+            AccountMeta::new(lp.ctx, false),
+            AccountMeta::new_readonly(lp.delegate, false),
+        ];
+        if let Some(x) = extra {
+            metas.push(AccountMeta::new(x, false));
+        }
+        env.send(
+            ProgInstruction::TradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_epoch,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_epoch,
+                market_id,
+                account_b_matcher_sequence: b_seq,
+                asset_index: 0,
+                size_q,
+                fee_bps: 10_000,
+                limit_price: 0,
+                backing_fee_cap_bps: 10_000,
+            },
+            metas,
+            &[taker],
+        )
+    }
+
+    pub fn tg(env: &mut Env, taker: &(Keypair, Pubkey), lp: &Lp, size_q: i128) -> Result<u64, String> {
+        let g = guard_key(env);
+        trade_with(env, &taker.0, taker.1, lp, size_q, Some(g))
+    }
+
+    pub fn has(r: &Result<u64, String>, code: &str) -> bool {
+        r.as_ref().err().is_some_and(|e| e.contains(code))
+    }
+
+    /// The L_trader the gate computes for `band` at the market's stored variance (x100).
+    pub fn l_trader_now(env: &Env, j: u16) -> u16 {
+        let g = env.growth();
+        let s = if g.vol_has_data() { Some(gv::sigma_h_bps(g.vol_var_x100(), lg::SLOTS_PER_HOUR)) } else { None };
+        lg::l_trader_x100(MMR, s, j)
+    }
+
+    /// A band market with a $10k LP, a guard backdated to age `age_slots`.
+    pub fn world(age_slots: u64) -> (Env, Lp) {
+        LEV_START_SLOT.with(|c| c.set(40 * lg::SLOTS_PER_DAY));
+        let mut env = env_with_launch(band_cfg(), 500);
+        LEV_START_SLOT.with(|c| c.set(1));
+        env.auth_mark();
+        let lp = env.lp(10_000 * USD);
+        env.warp(1);
+        env.push(PRICE);
+        let now = env.slot;
+        init(&mut env, None, now - age_slots).expect("UA init (backdated)");
+        (env, lp)
+    }
+
+    /// $ notional -> engine Q at PRICE ($1 = Q).
+    pub fn usd_q(d: i128) -> i128 {
+        d * Q
+    }
+}
+use lev_guard_t as lgt;
+
+#[test]
+fn lev_guard_init_authorization_and_t0_rules() {
+    use percolator_prog::lev_guard_v22 as lg;
+    LEV_START_SLOT.with(|c| c.set(1_000_000));
+    let mut env = env_with_launch(band_cfg(), 500);
+    LEV_START_SLOT.with(|c| c.set(1));
+    env.auth_mark();
+    env.warp(1); // the Clock now equals env.slot
+    // no bound vault LP yet: refused
+    let r = lgt::init(&mut env, None, 0);
+    assert!(lgt::has(&r, lgt::INVALID), "no bound asset: {r:?}");
+    let _lp = env.lp(10_000 * USD);
+    // a stranger cannot create it
+    let stranger = Keypair::new();
+    let r = lgt::init(&mut env, Some(&stranger), 0);
+    assert!(lgt::has(&r, lgt::UNAUTH), "stranger: {r:?}");
+    // the creator (marketauth) may NOT backdate its own token's age
+    let admin = env.admin.insecure_clone();
+    let r = lgt::init(&mut env, Some(&admin), 1);
+    assert!(lgt::has(&r, lgt::INVALID), "creator backdate: {r:?}");
+    // the creator may create it at now
+    lgt::init(&mut env, Some(&admin), 0).expect("marketauth init at now");
+    let g = lgt::guard(&env);
+    assert_eq!(g.t0_slot, env.slot);
+    assert_eq!(g.asset_index, 0);
+    assert!(env.growth().flags & percolator_prog::growth_v19::GROWTH_FLAG_LEV_GUARD != 0, "bit 2 set");
+    // a second init fails (exists)
+    assert!(lgt::init(&mut env, None, 0).is_err());
+    // UA backdate via op 6; a future T0 is refused; a stranger cannot
+    let now = env.slot;
+    assert!(lgt::has(&lgt::ua_op(&mut env, lg::OP_SET_T0, now + 1, [0; 32]), lgt::INVALID));
+    lgt::ua_op(&mut env, lg::OP_SET_T0, now - 100, [0; 32]).expect("UA backdate");
+    assert_eq!(lgt::guard(&env).t0_slot, now - 100);
+}
+
+#[test]
+fn lev_guard_required_and_forged_guard_bypass_attempts() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let t = env.trader(1_000 * USD);
+    // open without the guard: refused
+    let r = env.trade_cpi(&t.0, t.1, &lp, lgt::usd_q(100));
+    assert!(lgt::has(&r, lgt::REQ), "no guard: {r:?}");
+    assert_eq!(env.pos(t.1), 0);
+    // a forged "guard" (program-owned, kind 17, another market) is not this market's guard
+    let fake = Pubkey::new_unique();
+    let mut acct = env.svm.get_account(&lgt::guard_key(&env)).unwrap();
+    {
+        let mut g = state::read_lev_guard(&acct.data).unwrap();
+        g.market = [0xAB; 32];
+        g.t0_slot = 0;
+        state::write_lev_guard(&mut acct.data, &g, false).unwrap();
+    }
+    env.svm.set_account(fake, acct).unwrap();
+    let r = lgt::trade_with(&mut env, &t.0, t.1, &lp, lgt::usd_q(100), Some(fake));
+    assert!(lgt::has(&r, lgt::REQ), "forged guard: {r:?}");
+    // another program-owned account last (the LP portfolio) is not stripped: the matcher tail
+    // refuses it as before
+    let r = lgt::trade_with(&mut env, &t.0, t.1, &lp, lgt::usd_q(100), Some(lp.account));
+    assert!(r.is_err(), "program-owned tail account: {r:?}");
+    // with the guard: lands
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(100)).expect("guarded open");
+    assert_eq!(env.pos(t.1), lgt::usd_q(100));
+    // a REDUCE without the guard is never checked
+    env.warp(1);
+    env.push(PRICE);
+    env.trade_cpi(&t.0, t.1, &lp, -lgt::usd_q(50)).expect("reduce without the guard");
+    env.assert_conservation();
+}
+
+#[test]
+fn lev_guard_no_opens_under_6h_boundary_and_exits_open() {
+    use percolator_prog::lev_guard_v22 as lg;
+    // age 6 h - 1 slot: refused; closes stay open
+    let (mut env, lp) = lgt::world(lg::AGE_NO_OPEN_SLOTS - 1);
+    let t = env.trader(1_000 * USD);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(100));
+    assert!(lgt::has(&r, lgt::REFUSED), "age < 6 h: {r:?}");
+    assert!(r.as_ref().unwrap_err().contains("lev_guard_refused age_under_6h"));
+    // shorts too
+    let r = lgt::tg(&mut env, &t, &lp, -lgt::usd_q(100));
+    assert!(lgt::has(&r, lgt::REFUSED), "short under 6 h: {r:?}");
+    // exactly 6 h: lands
+    let (mut env, lp) = lgt::world(lg::AGE_NO_OPEN_SLOTS);
+    let t = env.trader(1_000 * USD);
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(100)).expect("age 6 h opens");
+    // move T0 forward (UA) so the token reads < 6 h again: a close still lands, an add does not
+    let now = env.slot;
+    lgt::ua_op(&mut env, lg::OP_SET_T0, now, [0; 32]).expect("T0 = now");
+    env.warp(1);
+    env.push(PRICE);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(10));
+    assert!(lgt::has(&r, lgt::REFUSED), "add under 6 h: {r:?}");
+    lgt::tg(&mut env, &t, &lp, -lgt::usd_q(100)).expect("close under 6 h");
+    assert_eq!(env.pos(t.1), 0);
+    env.assert_conservation();
+}
+
+/// D-k / G1: the dump default lowers L_trader by age: 35 % at 6–24 h, 20 % at 1–7 d, 0 after
+/// (unreported). An open just under the computed L_eff lands; just over is refused. CONTROL: the
+/// same over-L open lands on an unguarded market (the existing ceiling allows it).
+#[test]
+fn lev_guard_young_token_dump_term_lowers_leverage() {
+    use percolator_prog::lev_guard_v22 as lg;
+    for (age, j) in [
+        (lg::AGE_NO_OPEN_SLOTS, lg::J_DUMP_DEFAULT_DAY_BPS),
+        (lg::AGE_DAY_SLOTS - 1, lg::J_DUMP_DEFAULT_DAY_BPS),
+        (lg::AGE_DAY_SLOTS, lg::J_DUMP_DEFAULT_WEEK_BPS),
+        (lg::AGE_WEEK_SLOTS - 1, lg::J_DUMP_DEFAULT_WEEK_BPS),
+    ] {
+        let (mut env, lp) = lgt::world(age);
+        let l_tr = lgt::l_trader_now(&env, j);
+        let l = core::cmp::max(lg::l_floor_x100(env.growth().l_tier_x100), l_tr) as i128;
+        assert!(l < 500, "below the 5x launch ceiling: {l}");
+        let t = env.trader(1_000 * USD);
+        let over = 1_000 * l / 100 * 105 / 100;
+        let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(over));
+        assert!(lgt::has(&r, lgt::REFUSED), "age {age}: {over} over L {l}: {r:?}");
+        let under = 1_000 * l / 100 * 85 / 100;
+        lgt::tg(&mut env, &t, &lp, lgt::usd_q(under)).unwrap_or_else(|e| panic!("age {age}: {under} under L {l}: {e}"));
+    }
+    // control: no guard, same over-L size at 6 h lands under the 5x launch ceiling
+    let mut env = env_with_launch(band_cfg(), 500);
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let t = env.trader(1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, lgt::usd_q(2_900)).expect("unguarded: 2.9x lands");
+}
+
+/// D-l + G4: under 7 d the users' short book is capped at longs·min(1, MMR/1) + 0.1·C_m (m = 100 %).
+/// SYBIL: splitting the short across accounts gains nothing (the cap is on the aggregate). After
+/// 30 d (m_tail 50 %, β 0.5) the same book fits.
+#[test]
+fn lev_guard_short_side_dump_cap_young_and_sybil() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp) = lgt::world(lg::AGE_DAY_SLOTS);
+    let c_m = 10_000 * USD;
+    let cap_usd = (lg::short_users_cap_notional(0, c_m, MMR, lg::AgeBand::Week, 0) / USD) as i128;
+    assert_eq!(cap_usd, 1_000, "0.1 · $10k");
+    // five sybils at $240 each: four land ($960), the fifth would make $1,200 > $1,000
+    let mut landed = 0i128;
+    for i in 0..5 {
+        let s = env.trader(1_000 * USD);
+        let r = lgt::tg(&mut env, &s, &lp, -lgt::usd_q(240));
+        if i < 4 {
+            r.unwrap_or_else(|e| panic!("sybil {i}: {e}"));
+            landed += 240;
+        } else {
+            assert!(lgt::has(&r, lgt::REFUSED), "sybil 5 over the aggregate cap: {r:?}");
+            assert!(r.unwrap_err().contains("short_dump_cap"));
+        }
+    }
+    assert_eq!(landed, 960);
+    // a whale asking for the whole cap in one account is refused the same way
+    let w = env.trader(5_000 * USD);
+    let r = lgt::tg(&mut env, &w, &lp, -lgt::usd_q(100));
+    assert!(lgt::has(&r, lgt::REFUSED), "whale over cap: {r:?}");
+    // longs raise the room by longs·min(1, MMR/m) = 5 % of the long notional
+    let l = env.trader(5_000 * USD);
+    lgt::tg(&mut env, &l, &lp, lgt::usd_q(2_000)).expect("long $2k");
+    lgt::tg(&mut env, &w, &lp, -lgt::usd_q(90)).expect("room from the long offset (5 % of $2k = $100)");
+    // mature token: β 0.5, m_tail 50 % -> cap = C_m ($10k): a $1,200 short book fits
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let s = env.trader(1_000 * USD);
+    lgt::tg(&mut env, &s, &lp, -lgt::usd_q(1_200)).expect("mature: $1.2k short fits");
+    env.assert_conservation();
+}
+
+/// D-d: the risk key's report tightens (never loosens), is held 24 h, then falls back to the
+/// on-chain default; the L and N floors bound it; only the key may write; out-of-range refused.
+#[test]
+fn lev_guard_risk_report_tightens_floors_and_staleness() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let key = Keypair::new();
+    // no key set: refused
+    let r = lgt::report(&mut env, &key, [0, 0, 300, 10_000]);
+    assert!(lgt::has(&r, lgt::UNAUTH), "no key: {r:?}");
+    lgt::ua_op(&mut env, lg::OP_SET_RISK_KEY, 0, key.pubkey().to_bytes()).expect("UA sets the key");
+    // a stranger cannot report
+    let s = Keypair::new();
+    assert!(lgt::has(&lgt::report(&mut env, &s, [0, 0, 300, 10_000]), lgt::UNAUTH));
+    // out of range
+    assert!(lgt::has(&lgt::report(&mut env, &key, [0, 0, 300, 10_001]), lgt::INVALID));
+    // L cap 1 (below the floor): the floor 2x holds
+    lgt::report(&mut env, &key, [0, 0, 1, 10_000]).expect("report L cap 1");
+    let t = env.trader(1_000 * USD);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(2_100));
+    assert!(lgt::has(&r, lgt::REFUSED), "2.1x over the 2x floor: {r:?}");
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(1_900)).expect("1.9x under the floor lands");
+    // N mult 0: the LP may grow only to N_floor ($200) -> already past it, any further growth refused
+    lgt::report(&mut env, &key, [0, 0, 0, 0]).expect("report N mult 0");
+    let t2 = env.trader(1_000 * USD);
+    let r = lgt::tg(&mut env, &t2, &lp, lgt::usd_q(50));
+    assert!(lgt::has(&r, lgt::REFUSED), "N floor: {r:?}");
+    assert!(r.unwrap_err().contains("lev_guard_refused size"));
+    // a fill that SHRINKS the LP's net (t2 short against the long crowd) is not a size breach
+    lgt::tg(&mut env, &t2, &lp, -lgt::usd_q(50)).expect("short reduces the LP net");
+    // stale (> 24 h): the report no longer applies (older token: moderate floor J 10 %)
+    let now = env.slot;
+    lgt::poke_guard(&mut env, |g| g.rep_slot = now - lg::REPORT_HELD_SLOTS - 1);
+    let t3 = env.trader(1_000 * USD);
+    lgt::tg(&mut env, &t3, &lp, lgt::usd_q(100)).expect("stale report: default applies, opens land");
+    // held (<= 24 h): it applies again
+    lgt::poke_guard(&mut env, |g| g.rep_slot = now - lg::REPORT_HELD_SLOTS);
+    let r = lgt::tg(&mut env, &t3, &lp, lgt::usd_q(100));
+    assert!(lgt::has(&r, lgt::REFUSED), "held report applies: {r:?}");
+    env.assert_conservation();
+}
+
+/// Decision 25 / G8: a pushed target > 10 % from the last sample trips the on-chain breaker
+/// (recorded by the permissionless poke, op 4): 1 h freeze + m_oracle 0.75 for 24 h. An open
+/// that fits L but not 0.75·L is then refused; once both windows pass it lands.
+#[test]
+fn lev_guard_price_band_breaker_trips_and_expires() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let poke = |env: &mut Env, lp: &Lp| -> Result<u64, String> {
+        let (m, g, p) = (env.market, lgt::guard_key(env), env.payer.pubkey());
+        env.send(
+            ProgInstruction::LevGuard { op: lg::OP_POKE, t0: 0, key: [0; 32], report: [0; 4] },
+            vec![
+                AccountMeta::new(p, true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(g, false),
+                AccountMeta::new(lp.account, false),
+            ],
+            &[],
+        )
+    };
+    poke(&mut env, &lp).expect("first sample");
+    let g0 = lgt::guard(&env);
+    assert_eq!((g0.pb_last_px, g0.pb_ref_px, g0.pb_freeze_until), (PRICE, PRICE, 0));
+    // +10 % exactly: no trip
+    env.warp(1);
+    env.push(PRICE * 110 / 100);
+    poke(&mut env, &lp).expect("+10 %");
+    assert_eq!(lgt::guard(&env).pb_freeze_until, 0, "10 % is not over the breaker");
+    // back, then +11 % in one push: breaker
+    env.warp(1);
+    env.push(PRICE);
+    poke(&mut env, &lp).expect("back");
+    env.warp(1);
+    env.push(PRICE * 111 / 100);
+    let r = poke(&mut env, &lp).expect("+11 %");
+    let _ = r;
+    let g1 = lgt::guard(&env);
+    let now = env.slot;
+    assert_eq!(g1.pb_freeze_until, now + lg::FREEZE_SLOTS, "1 h freeze");
+    assert_eq!(g1.pb_oracle_until, now + lg::M_ORACLE_SLOTS, "24 h m_oracle");
+    // settle the market back at PRICE with calm variance so only the guard's m_oracle binds
+    for _ in 0..40 {
+        env.warp(1);
+        env.push(PRICE);
+        let _ = env.crank(lp.account);
+        if env.engine_asset().effective_price == PRICE {
+            break;
+        }
+    }
+    assert_eq!(env.engine_asset().effective_price, PRICE, "settled");
+    // σ_1h ≈ 488 bps: L_trader ≈ 6x, so the 5x ceiling binds without m_oracle and 0.75·6x = 4.5x
+    // binds with it (the window is not vacuous)
+    lev_set_var(&mut env, 2_646);
+    let l_tr = lgt::l_trader_now(&env, 0);
+    assert!((590..=610).contains(&l_tr), "L_trader ≈ 6x: {l_tr}");
+    let existing = 500u16; // the 5x launch ceiling (no graduation without depth)
+    let base = lg::l_overlay_x100(existing, l_tr, u16::MAX, false, None, env.growth().l_tier_x100) as i128;
+    let with_mo = lg::l_overlay_x100(existing, l_tr, u16::MAX, true, None, env.growth().l_tier_x100) as i128;
+    assert!(with_mo < base && with_mo == (l_tr as i128) * 3 / 4, "m_oracle 0.75·L_trader binds below the ceiling: {base} -> {with_mo}");
+    let t = env.trader(1_000 * USD);
+    let size = 1_000 * (base + with_mo) / 2 / 100; // between 0.75·L and L
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(size));
+    assert!(lgt::has(&r, lgt::REFUSED), "m_oracle window: {size} refused: {r:?}");
+    // the windows pass (state poke of the deadlines): the same open lands
+    let now = env.slot;
+    lgt::poke_guard(&mut env, |g| {
+        g.pb_freeze_until = now;
+        g.pb_oracle_until = now;
+    });
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(size)).expect("after the windows");
+    env.assert_conservation();
+}
+
+/// D-d permissionless tighten path (op 3): anyone proves on-chain facts against the PINNED pool.
+/// * forged accounts (not the pin's mint / vault, the vault as the "holder", a non-PDA source)
+///   are refused (134);
+/// * a live mint authority pins leverage to L_floor (2x) and size to N_floor ($200); revoking
+///   it (a later proof) restores both;
+/// * a top holder with q = R (the pool's base reserve) proves a 75 % CPMM dump: J_dump 75 %.
+#[test]
+fn lev_guard_permissionless_proofs_against_the_pin() {
+    use percolator_prog::{depth_src_v22 as ds, lev_guard_v22 as lg};
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let (mint, vault, quote_mint, quote_vault, pool, holder) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let set_mint = |env: &mut Env, mint_auth: bool, freeze_auth: bool| {
+        let mut d = vec![0u8; 82];
+        if mint_auth {
+            d[0] = 1;
+            d[4..36].copy_from_slice(&[7u8; 32]);
+        }
+        d[44] = 6;
+        d[45] = 1;
+        if freeze_auth {
+            d[46] = 1;
+            d[50..82].copy_from_slice(&[8u8; 32]);
+        }
+        env.svm.set_account(mint, solana_sdk::account::Account { lamports: 1_000_000_000, data: d, owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    };
+    let tok = |env: &mut Env, key: Pubkey, m: Pubkey, amount: u64| {
+        let mut d = vec![0u8; 165];
+        d[0..32].copy_from_slice(m.as_ref());
+        d[32..64].copy_from_slice(&[9u8; 32]);
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d[108] = 1;
+        env.svm.set_account(key, solana_sdk::account::Account { lamports: 1_000_000_000, data: d, owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    };
+    set_mint(&mut env, false, false);
+    tok(&mut env, vault, mint, 1_000_000);
+    tok(&mut env, holder, mint, 1_000_000);
+    // the pin record (state-poked: tag 123 needs real pool bytes; the guard only reads the record)
+    let (src, bump) = state::derive_depth_source(&env.program_id, &env.market);
+    let rec = ds::DepthSourceV22 {
+        market: env.market.to_bytes(),
+        amm_program: ds::PUMPSWAP_AMM_PROGRAM_ID.to_bytes(),
+        pool: pool.to_bytes(),
+        base_vault: vault.to_bytes(),
+        quote_vault: quote_vault.to_bytes(),
+        base_mint: mint.to_bytes(),
+        quote_mint: quote_mint.to_bytes(),
+        market_id: 1,
+        set_slot: 1,
+        asset_index: 0,
+        base_decimals: 6,
+        quote_decimals: 6,
+        flags: ds::DEPTH_SRC_FLAG_ACTIVE,
+        version: ds::DEPTH_SOURCE_VERSION,
+        bump,
+        amm_kind: ds::AMM_PUMPSWAP,
+        _reserved: [0; 8],
+    };
+    let mut d = vec![0u8; state::depth_source_account_len()];
+    state::write_depth_source(&mut d, &rec, true).unwrap();
+    env.svm.set_account(src, solana_sdk::account::Account { lamports: 1_000_000_000, data: d, owner: env.program_id, executable: false, rent_epoch: 0 }).unwrap();
+    let prove = |env: &mut Env, src: Pubkey, m: Pubkey, v: Pubkey, h: Option<Pubkey>| -> Result<u64, String> {
+        let (mk, g, p) = (env.market, lgt::guard_key(env), env.payer.pubkey());
+        let mut metas = vec![
+            AccountMeta::new(p, true),
+            AccountMeta::new_readonly(mk, false),
+            AccountMeta::new(g, false),
+            AccountMeta::new_readonly(src, false),
+            AccountMeta::new_readonly(m, false),
+            AccountMeta::new_readonly(v, false),
+        ];
+        if let Some(h) = h {
+            metas.push(AccountMeta::new_readonly(h, false));
+        }
+        env.send(ProgInstruction::LevGuard { op: lg::OP_TIGHTEN, t0: 0, key: [0; 32], report: [0; 4] }, metas, &[])
+    };
+    // forgeries
+    assert!(lgt::has(&prove(&mut env, src, quote_mint, vault, None), lgt::INVALID), "wrong mint");
+    assert!(lgt::has(&prove(&mut env, src, mint, quote_vault, None), lgt::INVALID), "wrong vault");
+    assert!(lgt::has(&prove(&mut env, src, mint, vault, Some(vault)), lgt::INVALID), "vault as holder");
+    assert!(lgt::has(&prove(&mut env, lp.account, mint, vault, None), lgt::INVALID), "not the source PDA");
+    // clean mint: nothing set
+    prove(&mut env, src, mint, vault, None).expect("clean proof");
+    assert_eq!(lgt::guard(&env).flags, 0);
+    // live mint authority: floors bind
+    set_mint(&mut env, true, false);
+    prove(&mut env, src, mint, vault, None).expect("mint authority proof");
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_MINT_AUTH);
+    let t = env.trader(100 * USD);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(250));
+    assert!(lgt::has(&r, lgt::REFUSED), "2.5x over the 2x floor: {r:?}");
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(190)).expect("1.9x, LP net $190 <= N_floor $200");
+    let t2 = env.trader(100 * USD);
+    let r = lgt::tg(&mut env, &t2, &lp, lgt::usd_q(30));
+    assert!(lgt::has(&r, lgt::REFUSED) && r.unwrap_err().contains("size"), "LP net $220 > N_floor");
+    // freeze authority alone does the same
+    set_mint(&mut env, false, true);
+    prove(&mut env, src, mint, vault, None).expect("freeze authority proof");
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_FREEZE_AUTH);
+    // revoked: the next proof clears the flags and the same open lands
+    set_mint(&mut env, false, false);
+    prove(&mut env, src, mint, vault, None).expect("revoked proof");
+    assert_eq!(lgt::guard(&env).flags, 0);
+    lgt::tg(&mut env, &t2, &lp, lgt::usd_q(30)).expect("authority revoked: lands");
+    // a holder with q = R proves a 75 % dump
+    prove(&mut env, src, mint, vault, Some(holder)).expect("holder proof");
+    let g = lgt::guard(&env);
+    assert_eq!(g.holder_dump_bps, 7_500);
+    assert_eq!(g.holder_dump_slot, env.slot);
+    // a smaller holder cannot overwrite a live larger proof
+    tok(&mut env, holder, mint, 1);
+    prove(&mut env, src, mint, vault, Some(holder)).expect("small holder proof");
+    assert_eq!(lgt::guard(&env).holder_dump_bps, 7_500);
+    // J 75 %: L_trader ~1.2x -> the 2x floor
+    let t3 = env.trader(100 * USD);
+    let r = lgt::tg(&mut env, &t3, &lp, lgt::usd_q(250));
+    assert!(lgt::has(&r, lgt::REFUSED), "holder dump: {r:?}");
     env.assert_conservation();
 }

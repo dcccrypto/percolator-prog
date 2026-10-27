@@ -654,6 +654,15 @@ pub mod constants {
     /// (`SetDepthSource`, upgrade authority); read by PushAuthMark depth mode 2.
     pub const KIND_DEPTH_SOURCE: u8 = 16;
     pub const TAG_SET_DEPTH_SOURCE: u8 = 123;
+    /// v2.2 lev build (2026-10-27): the leverage guard, ops `lev_guard_v22::OP_*` (init, risk
+    /// key, report, permissionless tighten, poke, LP-stop W1 round, T0 backdate). PDA
+    /// `["lev_guard", market]`, header kind 17.
+    pub const TAG_LEV_GUARD: u8 = 124;
+    pub const KIND_LEV_GUARD: u8 = 17;
+    /// Mainnet builds refuse a risk-increasing fill on ANY clamp-enforced growth asset without a
+    /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
+    /// existing devnet markets keep trading until the guard is created for them.
+    pub const LEV_GUARD_REQUIRED_ON_EVERY_GROWTH_ASSET: bool = cfg!(not(feature = "devnet"));
     /// Tag 123 `op`: 0 = clear the pin (mode 2 refused afterwards), 1 = set / replace it.
     pub const DEPTH_SOURCE_OP_CLEAR: u8 = 0;
     pub const DEPTH_SOURCE_OP_SET: u8 = 1;
@@ -698,7 +707,7 @@ pub mod constants {
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
-        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, 205, 206, 207,
+        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, 206, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -1939,11 +1948,29 @@ VaultLpMultiAssetMarket,
         /// deposit may not leave it below, a withdrawal may not leave it in (0, min), and no
         /// senior allocation (tag 103) runs below it. Custom(131).
         CreatorStakeBelowMinimum = 131,
+        /// A risk-increasing fill on a guarded growth asset did not carry the market's
+        /// `LevGuardV22` as its LAST account (or BatchTradeCpi was used to open on it).
+        /// Custom(132).
+        LevGuardRequired = 132,
+        /// The leverage guard refused a risk-increasing fill: token younger than 6 h (D-j), the
+        /// overlay leverage or size (holder report, permissionless facts, price-band freeze /
+        /// m_oracle), or the short-side dump cap (D-l). Custom(133).
+        LevGuardRefused = 133,
+        /// Tag 124 refused: bad op or data, wrong signer / key, a proof account that is not the
+        /// pinned one, a record that does not validate. Custom(134).
+        LevGuardInvalid = 134,
+        /// Tag 124 op 5 (W1) while the LP stop does not hold or nothing is left to reduce.
+        /// Custom(135).
+        LpStopNotTriggered = 135,
     }
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::GrowthTierConfigInvalid as u32 == 130);
     const _: () = assert!(PercolatorError::CreatorStakeBelowMinimum as u32 == 131);
+    const _: () = assert!(PercolatorError::LevGuardRequired as u32 == 132);
+    const _: () = assert!(PercolatorError::LevGuardRefused as u32 == 133);
+    const _: () = assert!(PercolatorError::LevGuardInvalid as u32 == 134);
+    const _: () = assert!(PercolatorError::LpStopNotTriggered as u32 == 135);
     const _: () = assert!(PercolatorError::PositionCapReached as u32 == 126);
     const _: () = assert!(PercolatorError::CounterpartyPositionCapReached as u32 == 127);
     const _: () = assert!(PercolatorError::RedemptionBelowMinPayout as u32 == 117);
@@ -3909,6 +3936,11 @@ pub mod state {
     }
 
     #[inline]
+    /// v2.2 lev build: `true` iff `data` carries a valid header of `kind` (no error value).
+    pub fn check_header_kind(data: &[u8], kind: u8) -> bool {
+        check_header(data, kind).is_ok()
+    }
+
     pub fn check_portfolio_kind(data: &[u8]) -> Result<(), ProgramError> {
         check_header(data, KIND_PORTFOLIO)
     }
@@ -7583,6 +7615,64 @@ pub mod state {
         Ok(())
     }
 
+    /// v2.2 lev build: the guard account (`["lev_guard", market]`, kind 17).
+    pub const fn lev_guard_account_len() -> usize {
+        HEADER_LEN + crate::lev_guard_v22::LEV_GUARD_BODY_LEN
+    }
+
+    pub fn derive_lev_guard(
+        program_id: &solana_program::pubkey::Pubkey,
+        market: &solana_program::pubkey::Pubkey,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::lev_guard_v22::LEV_GUARD_SEED, market.as_ref()],
+            program_id,
+        )
+    }
+
+    pub fn read_lev_guard(data: &[u8]) -> Result<crate::lev_guard_v22::LevGuardV22, ProgramError> {
+        if data.len() != lev_guard_account_len() {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        check_header(data, crate::constants::KIND_LEV_GUARD)
+            .map_err(|_| ProgramError::from(PercolatorError::LevGuardInvalid))?;
+        let g: crate::lev_guard_v22::LevGuardV22 = bytemuck::pod_read_unaligned(
+            &data[HEADER_LEN..HEADER_LEN + crate::lev_guard_v22::LEV_GUARD_REC_LEN],
+        );
+        if !crate::lev_guard_v22::validate_guard(&g) {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        Ok(g)
+    }
+
+    pub fn write_lev_guard(
+        data: &mut [u8],
+        g: &crate::lev_guard_v22::LevGuardV22,
+        fresh: bool,
+    ) -> Result<(), ProgramError> {
+        if data.len() != lev_guard_account_len() || !crate::lev_guard_v22::validate_guard(g) {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        if fresh {
+            if is_initialized(data) {
+                return Err(PercolatorError::LevGuardInvalid.into());
+            }
+            write_header(data, crate::constants::KIND_LEV_GUARD)?;
+        } else if check_header(data, crate::constants::KIND_LEV_GUARD).is_err() {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        data[HEADER_LEN..HEADER_LEN + crate::lev_guard_v22::LEV_GUARD_REC_LEN]
+            .copy_from_slice(bytemuck::bytes_of(g));
+        Ok(())
+    }
+
+    /// The W1 touched region of a guard account (after the record).
+    pub fn lev_guard_touched_mut(data: &mut [u8]) -> Result<&mut [u8], ProgramError> {
+        let o = HEADER_LEN + crate::lev_guard_v22::LEV_GUARD_REC_LEN;
+        data.get_mut(o..o + crate::lev_guard_v22::LEV_GUARD_TOUCHED_LEN)
+            .ok_or_else(|| PercolatorError::LevGuardInvalid.into())
+    }
+
     pub fn read_g9_feed_allowlist(data: &[u8]) -> Result<G9FeedAllowlistV22, ProgramError> {
         if data.len() < g9_feed_allowlist_account_len() {
             return Err(PercolatorError::InvalidAccountLen.into());
@@ -7876,7 +7966,9 @@ pub mod state {
             if self.flags & crate::growth_v19::GROWTH_FLAG_R3_LAYOUT == 0 {
                 self.vol_var_x100_le = [0; 4];
                 self.rent_stamp64_le = [0; 4];
-                self.flags = crate::growth_v19::GROWTH_FLAG_R3_LAYOUT;
+                // v2.2 lev build: the guard bit survives the migration.
+                self.flags = crate::growth_v19::GROWTH_FLAG_R3_LAYOUT
+                    | (self.flags & crate::growth_v19::GROWTH_FLAG_LEV_GUARD);
             }
         }
 
@@ -7978,7 +8070,10 @@ pub mod state {
             // I-1: bytes 0..8 are round-3 data from here on (zeroed: no volatility data).
             self.vol_var_x100_le = f.vol_var_x100.to_le_bytes();
             self.rent_stamp64_le = f.rent_stamp64.to_le_bytes();
-            self.flags = crate::growth_v19::GROWTH_FLAG_R3_LAYOUT;
+            // v2.2 lev build: the guard bit survives the I-1 reset (a restarted asset keeps its
+            // guard; it is never cleared).
+            self.flags = crate::growth_v19::GROWTH_FLAG_R3_LAYOUT
+                | (self.flags & crate::growth_v19::GROWTH_FLAG_LEV_GUARD);
             self.ceil_x100 = f.ceil_x100;
             self.ceil_slot = f.ceil_slot;
             self.depth_e6 = f.depth_e6;
@@ -9532,6 +9627,10 @@ pub mod ix {
         /// `[4]` system program; op 1 also `[5]` pool · `[6]` base vault · `[7]` quote vault ·
         /// `[8]` base mint · `[9]` quote mint ("base" = the market's asset).
         SetDepthSource { op: u8, asset_index: u16, market_id: u64 },
+        /// v2.2 lev build, tag 124 (`lev_guard_v22::OP_*`). Wire: `[124, op]` then op 0 / 6:
+        /// `t0 u64` (0 = now); op 1: `key [32]`; op 2: `j_dump u16, m_ind u16, l_cap u16,
+        /// n_mult u16`; ops 3 / 4 / 5: nothing.
+        LevGuard { op: u8, t0: u64, key: [u8; 32], report: [u16; 4] },
     }
 
     impl Instruction {
@@ -10384,6 +10483,23 @@ pub mod ix {
                         *b = read_u8(&mut rest)?;
                     }
                     Self::InitLpShareMetadata { ticker_len, ticker }
+                }
+                crate::constants::TAG_LEV_GUARD => {
+                    use crate::lev_guard_v22 as lg;
+                    let op = read_u8(&mut rest)?;
+                    let (mut t0, mut key, mut report) = (0u64, [0u8; 32], [0u16; 4]);
+                    match op {
+                        lg::OP_INIT | lg::OP_SET_T0 => t0 = read_u64(&mut rest)?,
+                        lg::OP_SET_RISK_KEY => key = read_bytes32(&mut rest)?,
+                        lg::OP_REPORT => {
+                            for r in report.iter_mut() {
+                                *r = read_u16(&mut rest)?;
+                            }
+                        }
+                        lg::OP_TIGHTEN | lg::OP_POKE | lg::OP_LP_STOP => {}
+                        _ => return Err(ProgramError::InvalidInstructionData),
+                    }
+                    Self::LevGuard { op, t0, key, report }
                 }
                 crate::constants::TAG_SET_DEPTH_SOURCE => {
                     let op = read_u8(&mut rest)?;
@@ -11584,6 +11700,21 @@ pub mod ix {
                     out.push(op);
                     push_u16(&mut out, asset_index);
                     push_u64(&mut out, market_id);
+                }
+                Self::LevGuard { op, t0, key, report } => {
+                    use crate::lev_guard_v22 as lg;
+                    out.push(crate::constants::TAG_LEV_GUARD);
+                    out.push(op);
+                    match op {
+                        lg::OP_INIT | lg::OP_SET_T0 => push_u64(&mut out, t0),
+                        lg::OP_SET_RISK_KEY => out.extend_from_slice(&key),
+                        lg::OP_REPORT => {
+                            for r in report {
+                                push_u16(&mut out, r);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
             out
@@ -13575,6 +13706,7 @@ pub mod lag_policy {
             Instruction::CommitG9FeedAllowlist => entry("CommitG9FeedAllowlist", LagPolicy::MarkFree, "upgrade-authority config (timelock commit)"),
             Instruction::InitLpShareMetadata { .. } => entry("InitLpShareMetadata", LagPolicy::MarkFree, "tag 122: writes the share mint's Metaplex name; reads no price, moves no value"),
             Instruction::SetDepthSource { .. } => entry("SetDepthSource", LagPolicy::MarkFree, "tag 123: upgrade-authority pin of the DEX depth source; reads no price, moves no value"),
+            Instruction::LevGuard { .. } => entry("LevGuard", LagPolicy::Gated, "tag 124: guard config / reports / samples move no value; op 5 (W1) is a forced bilateral reduce at P_last, refused while the asset lags (as tag 118)"),
         }
     }
 }
@@ -16336,6 +16468,9 @@ pub mod processor {
                 asset_index,
                 market_id,
             } => handle_set_depth_source(program_id, accounts, op, asset_index, market_id),
+            Instruction::LevGuard { op, t0, key, report } => {
+                handle_lev_guard(program_id, accounts, op, t0, key, report)
+            }
             Instruction::ProposeG9FeedAllowlist { entries } => {
                 handle_propose_g9_feed_allowlist(program_id, accounts, &entries)
             }
@@ -19079,7 +19214,7 @@ pub mod processor {
     // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
     // binding params.
     #[allow(clippy::too_many_arguments)]
-    fn handle_trade_cpi<'a>(
+    fn handle_trade_cpi_inner<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         account_a_portfolio_id: u64,
@@ -20232,7 +20367,7 @@ pub mod processor {
     // TB-1b: grew past the clippy threshold with the 4 new portfolio-identity
     // binding params.
     #[allow(clippy::too_many_arguments)]
-    fn handle_batch_trade_cpi<'a>(
+    fn handle_batch_trade_cpi_inner<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         account_a_portfolio_id: u64,
@@ -44094,6 +44229,737 @@ pub mod processor {
             percolator::POS_SCALE,
             percolator::MAX_POSITION_ABS_Q,
         ))
+    }
+
+
+    // ── v2.2 lev build (2026-10-27): the leverage guard (tag 124) and its TradeCpi gate ───────
+    //
+    // Everything below is TIGHTEN-ONLY on top of the existing growth gate (`lev_guard_v22`):
+    // the original TradeCpi / BatchTradeCpi bodies are unchanged (`*_inner`); the outer handlers
+    // strip the guard (passed as the LAST account: the matcher tail refuses program-owned
+    // accounts, so no valid transaction ended in one before), capture the pre-fill positions,
+    // run the body, then apply the guard to a risk-increasing taker only. Exits are never checked.
+
+    /// TradeCpi (tag 10, and the inner trade of tag 119): the guard wrapper.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn handle_trade_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
+        account_b_matcher_sequence: u64,
+        asset_index: u16,
+        expected_market_id: u64,
+        size_q: i128,
+        fee_bps: u64,
+        limit_price: u64,
+        backing_fee_cap_bps: u16,
+    ) -> ProgramResult {
+        let (accounts, guard_ai) = lev_guard_split(accounts, program_id);
+        let pre = lev_trade_pre(program_id, accounts, asset_index)?;
+        handle_trade_cpi_inner(
+            program_id,
+            accounts,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+            account_b_matcher_sequence,
+            asset_index,
+            expected_market_id,
+            size_q,
+            fee_bps,
+            limit_price,
+            backing_fee_cap_bps,
+        )?;
+        match pre {
+            Some(p) => lev_trade_post(program_id, accounts, asset_index, p, guard_ai),
+            None => Ok(()),
+        }
+    }
+
+    /// BatchTradeCpi: on a guarded asset a batch may only REDUCE the taker (opens go through
+    /// TradeCpi, which carries the guard). Fail closed.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn handle_batch_trade_cpi<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        account_a_portfolio_id: u64,
+        account_a_position_epoch: u64,
+        account_b_portfolio_id: u64,
+        account_b_position_epoch: u64,
+        max_slippage_atoms: u128,
+        max_fee_atoms: u128,
+        account_b_matcher_sequence: u64,
+        legs: &[ix::BatchTradeCpiLeg],
+    ) -> ProgramResult {
+        let mut pre: Vec<(u16, i128)> = Vec::new();
+        for leg in legs {
+            if pre.iter().any(|(a, _)| *a == leg.asset_index) {
+                continue;
+            }
+            if let Some((t, _)) = lev_trade_pre(program_id, accounts, leg.asset_index)? {
+                pre.push((leg.asset_index, t));
+            }
+        }
+        handle_batch_trade_cpi_inner(
+            program_id,
+            accounts,
+            account_a_portfolio_id,
+            account_a_position_epoch,
+            account_b_portfolio_id,
+            account_b_position_epoch,
+            max_slippage_atoms,
+            max_fee_atoms,
+            account_b_matcher_sequence,
+            legs,
+        )?;
+        if pre.is_empty() {
+            return Ok(());
+        }
+        let market_ai = account(accounts, 1)?;
+        let taker_ai = account(accounts, 2)?;
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let mut taker_data = taker_ai.try_borrow_mut_data()?;
+        let taker = state::portfolio_view_mut_for_market_slots(&mut taker_data, max_market_slots)?;
+        for (a, before) in pre {
+            let (_, after) = raw_and_effective_signed_position_for_asset_view(&group, &taker, a as usize)?;
+            if growth_v19::taker_risk_increasing(before, after) {
+                return Err(PercolatorError::LevGuardRequired.into());
+            }
+        }
+        Ok(())
+    }
+
+    /// The guard, if it is the LAST account (owner = this program, kind 17). The account list
+    /// without it is what the trade body sees.
+    fn lev_guard_split<'a>(
+        accounts: &'a [AccountInfo<'a>],
+        program_id: &Pubkey,
+    ) -> (&'a [AccountInfo<'a>], Option<&'a AccountInfo<'a>>) {
+        if let Some((last, rest)) = accounts.split_last() {
+            if last.owner == program_id {
+                let is_guard = match last.try_borrow_data() {
+                    Ok(d) => {
+                        d.len() == state::lev_guard_account_len()
+                            && state::check_header_kind(&d, constants::KIND_LEV_GUARD)
+                    }
+                    Err(_) => false,
+                };
+                if is_guard {
+                    return (rest, Some(last));
+                }
+            }
+        }
+        (accounts, None)
+    }
+
+    /// Whether the guard applies to `asset_index` (growth on and the guard bit set; on mainnet
+    /// builds also every clamp-enforced growth asset), and if so the taker's and the LP's
+    /// ADL-effective positions before the fill. TradeCpi accounts: `[2]` taker, `[3]` LP.
+    #[inline(never)]
+    fn lev_trade_pre<'a>(
+        _program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+    ) -> Result<Option<(i128, i128)>, ProgramError> {
+        let market_ai = account(accounts, 1)?;
+        let taker_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let a = asset_index as usize;
+        if a >= group.markets.len() {
+            return Ok(None);
+        }
+        let Some(g) = asset_growth_view(&group, a)? else {
+            return Ok(None);
+        };
+        let guarded = g.flags & growth_v19::GROWTH_FLAG_LEV_GUARD != 0;
+        let clamp = growth_v19::clamp_enforced_for(group.header.config.band_bps.get(), g.r_gap_bps);
+        if !guarded && !(constants::LEV_GUARD_REQUIRED_ON_EVERY_GROWTH_ASSET && clamp) {
+            return Ok(None);
+        }
+        if taker_ai.key == lp_ai.key {
+            return Ok(None);
+        }
+        ensure_portfolio_storage_for_market_slots(taker_ai, max_market_slots)?;
+        ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        let mut taker_data = taker_ai.try_borrow_mut_data()?;
+        let taker = state::portfolio_view_mut_for_market_slots(&mut taker_data, max_market_slots)?;
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        let (_, t) = raw_and_effective_signed_position_for_asset_view(&group, &taker, a)?;
+        let (_, l) = raw_and_effective_signed_position_for_asset_view(&group, &lp, a)?;
+        Ok(Some((t, l)))
+    }
+
+    /// Read the guard of `market` from `ai`: program-owned, kind 17, validated, this market.
+    fn lev_guard_read(
+        program_id: &Pubkey,
+        ai: &AccountInfo<'_>,
+        market: &Pubkey,
+    ) -> Result<crate::lev_guard_v22::LevGuardV22, ProgramError> {
+        if ai.owner != program_id {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        let g = state::read_lev_guard(&ai.try_borrow_data()?)?;
+        if g.market != market.to_bytes() {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        Ok(g)
+    }
+
+    fn lev_guard_store(ai: &AccountInfo<'_>, g: &crate::lev_guard_v22::LevGuardV22) -> ProgramResult {
+        expect_writable(ai)?;
+        state::write_lev_guard(&mut ai.try_borrow_mut_data()?, g, false)
+    }
+
+    /// The last AUTHENTICATED pushed mark of asset `a` (the asset oracle profile's target: what
+    /// the keeper breaker watches; the engine's target only refreshes at the next accrual and the
+    /// effective price only walks toward it inside the band), else the engine's target / P_last.
+    fn lev_target_price(
+        cfg: &WrapperConfigV16,
+        group: &state::MarketViewMutV16<'_>,
+        a: usize,
+    ) -> u64 {
+        if let Ok(p) = read_oracle_profile_from_view(group, cfg, a) {
+            if p.oracle_target_price_e6 != 0 {
+                return p.oracle_target_price_e6;
+            }
+        }
+        match group.markets.get(a) {
+            Some(m) => {
+                let t = m.engine.asset.raw_oracle_target_price.get();
+                if t != 0 { t } else { m.engine.asset.effective_price.get() }
+            }
+            None => 0,
+        }
+    }
+
+    /// The numbers every guard decision reads, from the market, the asset's growth record and
+    /// the bound LP's conservative equity `c_m`: (ceiling in force x100, N_cap Q, price, σ_1h).
+    fn lev_market_numbers(
+        group: &state::MarketViewMutV16<'_>,
+        a: usize,
+        g: &state::AssetGrowthV19,
+        c_m: u128,
+    ) -> Result<(u16, u128, u64, Option<u64>), ProgramError> {
+        let ctx = growth_g8_ctx_view(group, a, g, Some(c_m))?;
+        let price = group
+            .markets
+            .get(a)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .effective_price
+            .get();
+        let l = growth_ceiling_x100(g, &ctx);
+        let n = growth_n_cap_g8(g, &ctx, c_m, price).unwrap_or(0);
+        let sigma_1h = if g.vol_has_data() {
+            Some(growth_v19::sigma_h_bps(g.vol_var_x100(), crate::lev_guard_v22::SLOTS_PER_HOUR))
+        } else {
+            None
+        };
+        Ok((l, n, price, sigma_1h))
+    }
+
+    /// Fold one price observation into the guard; on a trip outside an existing freeze,
+    /// snapshot the ceiling and N_cap the freeze holds (decision 25 / G8).
+    fn lev_observe(
+        gd: &mut crate::lev_guard_v22::LevGuardV22,
+        price: u64,
+        now: u64,
+        sigma_1h: Option<u64>,
+        l_now: u16,
+        n_now: u128,
+    ) {
+        use crate::lev_guard_v22 as lg;
+        let before = gd.price_band();
+        let (pb, trip) = lg::observe_price(&before, price, now, sigma_1h);
+        if trip != lg::Trip::None && !lg::frozen(&before, now) {
+            gd.frozen_l_x100 = l_now;
+            gd.frozen_n_q = n_now.to_le_bytes();
+            solana_program::log::sol_log(&alloc::format!(
+                "lev_guard_trip kind={} px={} last={} ref={}",
+                if trip == lg::Trip::Breaker { "breaker" } else { "freeze" },
+                price,
+                before.last_px_e6,
+                before.ref_px_e6
+            ));
+        }
+        gd.set_price_band(&pb);
+    }
+
+    /// After a TradeCpi fill on a guarded asset: refuse a risk-increasing taker that breaks any
+    /// guard rule. Reads the guard (required), samples the price band into it, writes it back.
+    #[inline(never)]
+    fn lev_trade_post<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        pre: (i128, i128),
+        guard_ai: Option<&'a AccountInfo<'a>>,
+    ) -> ProgramResult {
+        use crate::lev_guard_v22 as lg;
+        let market_ai = account(accounts, 1)?;
+        let taker_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        let (taker_before, lp_before) = pre;
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let now = Clock::get()?.slot;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, group) = state::market_view_mut(&mut market_data)?;
+        let a = asset_index as usize;
+        let Some(g) = asset_growth_view(&group, a)? else {
+            return Ok(());
+        };
+        let mut taker_data = taker_ai.try_borrow_mut_data()?;
+        let taker = state::portfolio_view_mut_for_market_slots(&mut taker_data, max_market_slots)?;
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        let (_, taker_after) = raw_and_effective_signed_position_for_asset_view(&group, &taker, a)?;
+        if !growth_v19::taker_risk_increasing(taker_before, taker_after) {
+            return Ok(());
+        }
+        let (_, lp_after) = raw_and_effective_signed_position_for_asset_view(&group, &lp, a)?;
+        let Some(guard_ai) = guard_ai else {
+            return Err(PercolatorError::LevGuardRequired.into());
+        };
+        let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)
+            .map_err(|_| ProgramError::from(PercolatorError::LevGuardRequired))?;
+        if gd.asset_index != asset_index {
+            return Err(PercolatorError::LevGuardRequired.into());
+        }
+        let refuse = |why: &str| -> ProgramResult {
+            solana_program::log::sol_log(&alloc::format!("lev_guard_refused {why}"));
+            Err(PercolatorError::LevGuardRefused.into())
+        };
+        // D-j: no opens before 6 h.
+        let band = lg::age_band(gd.t0_slot, now);
+        if band == lg::AgeBand::NoOpen {
+            return refuse("age_under_6h");
+        }
+        let overflow = || ProgramError::from(PercolatorError::EngineArithmeticOverflow);
+        let c_m = vault_lp_v18::conservative_equity(
+            lp.header.capital.get(),
+            lp.header.pnl.get(),
+            lp.header.fee_credits.get(),
+        )
+        .ok_or_else(overflow)?;
+        let (l_now, n_now, price, sigma_1h) = lev_market_numbers(&group, a, &g, c_m)?;
+        lev_observe(&mut gd, lev_target_price(&cfg, &group, a), now, sigma_1h, l_now, n_now);
+        let pb = gd.price_band();
+        let frozen = lg::frozen(&pb, now);
+        let ov = lg::merge_overlay(band, &gd.report(), &gd.perm(), now);
+        let mmr = group.header.config.maintenance_margin_bps.get();
+        let engine_imr = group.header.config.initial_margin_bps.get();
+        // Leverage: L_trader with the dump term, the report cap, m_oracle, the freeze; floored
+        // at L_floor and never above the existing ceiling.
+        let l_tr = lg::l_trader_x100(mmr, sigma_1h, ov.j_dump_bps);
+        let l_eff = lg::l_overlay_x100(
+            l_now,
+            l_tr,
+            ov.l_cap_x100,
+            lg::m_oracle_on(&pb, now),
+            if frozen { Some(gd.frozen_l_x100) } else { None },
+            g.l_tier_x100,
+        );
+        let imr = growth_v19::ceiling_imr_bps(engine_imr, l_eff).ok_or_else(overflow)?;
+        let notional = vault_lp_v18::notional_atoms(taker_after.unsigned_abs(), price, percolator::POS_SCALE)
+            .ok_or_else(overflow)?;
+        let taker_eq = vault_lp_v18::conservative_equity(
+            taker.header.capital.get(),
+            taker.header.pnl.get(),
+            taker.header.fee_credits.get(),
+        )
+        .ok_or_else(overflow)?;
+        if !vault_lp_v18::leverage_gate_ok(taker_eq, notional, imr) {
+            return refuse("leverage");
+        }
+        // Size: the report multiplier with the N_floor, the freeze. Only a fill that GROWS the
+        // LP's net is checked against it.
+        let unit = growth_v19::whole_token_atoms(growth_v19::collateral_decimals_of(g.collateral_decimals_p1)) as u128;
+        let floor_q = growth_v19::n_cap_q(
+            (lg::N_FLOOR_USD as u128).saturating_mul(unit),
+            10_000,
+            price,
+            percolator::POS_SCALE,
+        )
+        .unwrap_or(0);
+        let n_eff = lg::n_overlay_q(n_now, band, ov.n_mult_bps, floor_q, if frozen { Some(gd.frozen_n()) } else { None });
+        if lp_after.unsigned_abs() > lp_before.unsigned_abs() && lp_after.unsigned_abs() > n_eff {
+            return refuse("size");
+        }
+        // Short side (D-l, sims dec. 15): users' short notional <= longs·min(1, MMR/m) + β·C_m/m.
+        if taker_after < 0 {
+            let (oi_long, oi_short) = side_oi_snapshot_view(&group, a)?;
+            let users_long = growth_v19::users_side_oi_q(oi_long, lp_after, true);
+            let users_short = growth_v19::users_side_oi_q(oi_short, lp_after, false);
+            let to_n = |q: u128| vault_lp_v18::notional_atoms(q, price, percolator::POS_SCALE).unwrap_or(u128::MAX);
+            let cap = lg::short_users_cap_notional(to_n(users_long), c_m, mmr, band, ov.m_ind_bps);
+            if to_n(users_short) > cap {
+                return refuse("short_dump_cap");
+            }
+        }
+        drop(lp_data);
+        drop(taker_data);
+        drop(market_data);
+        lev_guard_store(guard_ai, &gd)
+    }
+
+    /// The upgrade authority (ProgramData-proven).
+    fn lev_is_upgrade_authority(
+        program_id: &Pubkey,
+        signer: &AccountInfo<'_>,
+        program_data_ai: &AccountInfo<'_>,
+    ) -> Result<bool, ProgramError> {
+        let (pd, _) = derive_program_data_address(program_id);
+        if program_data_ai.key != &pd || !signer.is_signer {
+            return Ok(false);
+        }
+        Ok(read_program_data_upgrade_authority(program_data_ai)? == Some(*signer.key))
+    }
+
+    /// Tag 124. Ops (`lev_guard_v22::OP_*`), accounts:
+    /// * 0 INIT `t0` (0 = now; only the UA may backdate): `[0] marketauth or UA (s, w, payer)
+    ///   · [1] program_data · [2] market (w) · [3] guard (w, PDA) · [4] system_program`. Binds
+    ///   the guard to the market's bound vault-LP asset and sets its growth bit 2.
+    /// * 1 SET_RISK_KEY `key` / 6 SET_T0 `t0`: `[0] UA (s) · [1] program_data · [2] market ·
+    ///   [3] guard (w)`.
+    /// * 2 REPORT `j, m, l, n`: `[0] risk key (s) · [1] market · [2] guard (w)`.
+    /// * 3 TIGHTEN (permissionless): `[0] any · [1] market · [2] guard (w) · [3] depth source
+    ///   PDA · [4] pinned base mint · [5] pinned base vault · [6] holder token account (opt.)`.
+    /// * 4 POKE (permissionless): `[0] any · [1] market (w) · [2] guard (w) · [3] bound vault LP (w) ·
+    ///   [4] vault_lp_state (opt.: NAV sampled only with it) · [5] vault_lp_ext (opt.)`.
+    /// * 5 LP_STOP (permissionless W1): `[0] any · [1] market (w) · [2] guard (w) · [3] bound
+    ///   vault LP (w) · [4] vault_lp_state · [5] vault_lp_ext · [6..] opposing portfolios (w)`.
+    #[inline(never)]
+    fn handle_lev_guard<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        op: u8,
+        t0: u64,
+        key: [u8; 32],
+        report: [u16; 4],
+    ) -> ProgramResult {
+        use crate::lev_guard_v22 as lg;
+        let now = Clock::get()?.slot;
+        match op {
+            lg::OP_INIT => lev_guard_init(program_id, accounts, t0, now),
+            lg::OP_SET_RISK_KEY | lg::OP_SET_T0 => {
+                let ua = account(accounts, 0)?;
+                let program_data_ai = account(accounts, 1)?;
+                let market_ai = account(accounts, 2)?;
+                let guard_ai = account(accounts, 3)?;
+                if !lev_is_upgrade_authority(program_id, ua, program_data_ai)? {
+                    return Err(PercolatorError::Unauthorized.into());
+                }
+                expect_owner(market_ai, program_id)?;
+                let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+                if op == lg::OP_SET_RISK_KEY {
+                    gd.risk_key = key;
+                } else {
+                    if t0 == 0 || t0 > now {
+                        return Err(PercolatorError::LevGuardInvalid.into());
+                    }
+                    gd.t0_slot = t0;
+                }
+                lev_guard_store(guard_ai, &gd)
+            }
+            lg::OP_REPORT => {
+                let signer = account(accounts, 0)?;
+                let market_ai = account(accounts, 1)?;
+                let guard_ai = account(accounts, 2)?;
+                expect_signer(signer)?;
+                expect_owner(market_ai, program_id)?;
+                let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+                if gd.risk_key == [0u8; 32] || gd.risk_key != signer.key.to_bytes() {
+                    return Err(PercolatorError::Unauthorized.into());
+                }
+                let r = lg::RiskReport {
+                    j_dump_bps: report[0],
+                    m_ind_bps: report[1],
+                    l_cap_x100: report[2],
+                    n_mult_bps: report[3],
+                    slot: now,
+                };
+                if !lg::report_ok(&r) {
+                    return Err(PercolatorError::LevGuardInvalid.into());
+                }
+                gd.rep_j_dump_bps = r.j_dump_bps;
+                gd.rep_m_ind_bps = r.m_ind_bps;
+                gd.rep_l_cap_x100 = r.l_cap_x100;
+                gd.rep_n_mult_bps = r.n_mult_bps;
+                gd.rep_slot = now;
+                lev_guard_store(guard_ai, &gd)
+            }
+            lg::OP_TIGHTEN => lev_guard_tighten(program_id, accounts, now),
+            lg::OP_POKE => lev_guard_poke(program_id, accounts, now),
+            lg::OP_LP_STOP => lev_guard_lp_stop(program_id, accounts, now),
+            _ => Err(PercolatorError::LevGuardInvalid.into()),
+        }
+    }
+
+    #[inline(never)]
+    fn lev_guard_init<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        t0: u64,
+        now: u64,
+    ) -> ProgramResult {
+        use crate::lev_guard_v22 as lg;
+        let authority = account(accounts, 0)?;
+        let program_data_ai = account(accounts, 1)?;
+        let market_ai = account(accounts, 2)?;
+        let guard_ai = account(accounts, 3)?;
+        let system_program_ai = account(accounts, 4)?;
+        expect_signer(authority)?;
+        expect_writable(authority)?;
+        expect_writable(market_ai)?;
+        expect_writable(guard_ai)?;
+        expect_owner(market_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (pda, bump) = state::derive_lev_guard(program_id, market_ai.key);
+        if *guard_ai.key != pda || !guard_ai.data_is_empty() {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        }
+        let is_ua = lev_is_upgrade_authority(program_id, authority, program_data_ai)?;
+        // T0: now, or (upgrade authority only) an earlier slot. A creator can never backdate
+        // its own token's age (that would loosen every age rule).
+        let t0 = if t0 == 0 {
+            now
+        } else if is_ua && t0 <= now {
+            t0
+        } else {
+            return Err(PercolatorError::LevGuardInvalid.into());
+        };
+        let asset_index = {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut data)?;
+            if !is_ua && cfg.marketauth != authority.key.to_bytes() {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            let Some(i) = market_bound_vault_asset(&group)? else {
+                return Err(PercolatorError::LevGuardInvalid.into());
+            };
+            let engine_imr = group.header.config.initial_margin_bps.get();
+            let market = group
+                .markets
+                .get_mut(i)
+                .ok_or(PercolatorError::InvalidInstruction)?;
+            let Some(mut g) = state::asset_growth_from_wrapper_bytes(&market.wrapper[..], engine_imr)? else {
+                return Err(PercolatorError::LevGuardInvalid.into());
+            };
+            g.flags |= growth_v19::GROWTH_FLAG_LEV_GUARD;
+            state::asset_growth_to_wrapper_bytes(&mut market.wrapper[..], &g, engine_imr)?;
+            i
+        };
+        let bump_bytes = [bump];
+        let seeds: &[&[u8]] = &[lg::LEV_GUARD_SEED, market_ai.key.as_ref(), bump_bytes.as_ref()];
+        create_pda_account(
+            authority,
+            guard_ai,
+            system_program_ai,
+            state::lev_guard_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let rec = lg::new_guard(market_ai.key.to_bytes(), asset_index as u16, t0, bump);
+        state::write_lev_guard(&mut guard_ai.try_borrow_mut_data()?, &rec, true)?;
+        solana_program::log::sol_log(&alloc::format!("lev_guard_init asset={} t0={}", asset_index, t0));
+        Ok(())
+    }
+
+    /// Op 3 (D-d permissionless tighten path): authority flags from the pinned base mint, and a
+    /// top-holder proof against the pinned pool's base vault. Both are on-chain facts; the
+    /// authority flags follow the mint either way (a revoked authority clears them).
+    #[inline(never)]
+    fn lev_guard_tighten<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        now: u64,
+    ) -> ProgramResult {
+        use crate::depth_src_v22 as ds;
+        use crate::lev_guard_v22 as lg;
+        let market_ai = account(accounts, 1)?;
+        let guard_ai = account(accounts, 2)?;
+        let src_ai = account(accounts, 3)?;
+        let mint_ai = account(accounts, 4)?;
+        let vault_ai = account(accounts, 5)?;
+        let bad = || ProgramError::from(PercolatorError::LevGuardInvalid);
+        expect_owner(market_ai, program_id)?;
+        let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+        if src_ai.owner != program_id {
+            return Err(bad());
+        }
+        let (src_pda, _) = state::derive_depth_source(program_id, market_ai.key);
+        if *src_ai.key != src_pda {
+            return Err(bad());
+        }
+        let pin = state::read_depth_source(&src_ai.try_borrow_data()?)?;
+        if pin.market != market_ai.key.to_bytes() || !pin.is_active() || pin.asset_index != gd.asset_index {
+            return Err(bad());
+        }
+        if mint_ai.key.to_bytes() != pin.base_mint || vault_ai.key.to_bytes() != pin.base_vault {
+            return Err(bad());
+        }
+        let mint_owner = mint_ai.owner.to_bytes();
+        if !ds::is_token_program(&mint_owner) {
+            return Err(bad());
+        }
+        let (mint_live, freeze_live) = lg::mint_authorities(&mint_ai.try_borrow_data()?).ok_or_else(bad)?;
+        let mut flags = gd.flags & !(lg::GUARD_FLAG_MINT_AUTH | lg::GUARD_FLAG_FREEZE_AUTH);
+        if mint_live {
+            flags |= lg::GUARD_FLAG_MINT_AUTH;
+        }
+        if freeze_live {
+            flags |= lg::GUARD_FLAG_FREEZE_AUTH;
+        }
+        gd.flags = flags;
+        let vault = ds::parse_token_account(&vault_ai.owner.to_bytes(), &vault_ai.try_borrow_data()?).ok_or_else(bad)?;
+        if vault.mint != pin.base_mint {
+            return Err(bad());
+        }
+        if let Some(holder_ai) = accounts.get(6) {
+            if holder_ai.key == vault_ai.key {
+                return Err(bad());
+            }
+            let h = ds::parse_token_account(&holder_ai.owner.to_bytes(), &holder_ai.try_borrow_data()?).ok_or_else(bad)?;
+            if h.mint != pin.base_mint {
+                return Err(bad());
+            }
+            let dump = lg::cpmm_dump_bps(vault.amount, h.amount);
+            let stored_live = gd.holder_dump_slot != 0
+                && now >= gd.holder_dump_slot
+                && now - gd.holder_dump_slot <= lg::HOLDER_PROOF_SLOTS;
+            if !stored_live || dump >= gd.holder_dump_bps {
+                gd.holder_dump_bps = dump;
+                gd.holder_dump_slot = now;
+            }
+        }
+        solana_program::log::sol_log(&alloc::format!(
+            "lev_guard_tighten mint_auth={} freeze_auth={} holder_dump_bps={}",
+            mint_live, freeze_live, gd.holder_dump_bps
+        ));
+        lev_guard_store(guard_ai, &gd)
+    }
+
+    /// The vault LP's (conservative equity, cumulative flows in, cumulative flows out) for the
+    /// NAV/share index: in = junior deposits + senior allocations + senior draws; out = junior
+    /// withdrawals + recalls (`VaultLpStateV18` / `VaultLpExtV19` monotonic counters).
+    fn lev_lp_flows<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        vault_lp_ai: &AccountInfo<'a>,
+        ext_ai: Option<&AccountInfo<'a>>,
+    ) -> Result<(u128, u128, u128), ProgramError> {
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
+        if lp_ai.key.to_bytes() != st.lp_portfolio {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let allocated_total = match ext_ai {
+            Some(x) if !x.data_is_empty() => load_vault_lp_ext(program_id, x, market_ai.key)?.allocated_total_atoms,
+            _ => 0,
+        };
+        let flow_in = st
+            .junior_deposited_atoms
+            .saturating_add(allocated_total)
+            .saturating_add(st.senior_drawn_atoms);
+        let flow_out = st.junior_withdrawn_atoms.saturating_add(st.recalled_atoms);
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        let eq = vault_lp_v18::conservative_equity(lp.header.capital.get(), lp.header.pnl.get(), lp.header.fee_credits.get())
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((eq, flow_in, flow_out))
+    }
+
+    /// Op 4: sample the price band and the LP's NAV per share (permissionless; the keeper runs
+    /// it after each push). Moves no value.
+    #[inline(never)]
+    fn lev_guard_poke<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        now: u64,
+    ) -> ProgramResult {
+        let market_ai = account(accounts, 1)?;
+        let guard_ai = account(accounts, 2)?;
+        let lp_ai = account(accounts, 3)?;
+        expect_owner(market_ai, program_id)?;
+        expect_owner(lp_ai, program_id)?;
+        // The market / portfolio views are mutable borrows: both must be writable.
+        expect_writable(market_ai)?;
+        expect_writable(lp_ai)?;
+        let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+        // NAV needs the vault's flow counters ([4] vault_lp_state, [5] ext); without them only the
+        // price band is sampled.
+        let flows = match accounts.get(4) {
+            Some(v) => Some(lev_lp_flows(program_id, market_ai, lp_ai, v, accounts.get(5))?),
+            None => None,
+        };
+        let eq = match flows {
+            Some((e, _, _)) => e,
+            None => {
+                let (_, _, max_market_slots, _) =
+                    state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+                let mut lp_data = lp_ai.try_borrow_mut_data()?;
+                let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+                expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+                vault_lp_v18::conservative_equity(lp.header.capital.get(), lp.header.pnl.get(), lp.header.fee_credits.get())
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            }
+        };
+        {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            let a = gd.asset_index as usize;
+            let vault = read_asset_vault_lp_from_view(&group, a)?;
+            if vault.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 || vault.vault_lp_portfolio != lp_ai.key.to_bytes() {
+                return Err(PercolatorError::VaultLpNotBound.into());
+            }
+            if let Some(g) = asset_growth_view(&group, a)? {
+                let (l_now, n_now, _price, sigma_1h) = lev_market_numbers(&group, a, &g, eq)?;
+                lev_observe(&mut gd, lev_target_price(&cfg, &group, a), now, sigma_1h, l_now, n_now);
+            }
+        }
+        if let Some((eq, fin, fout)) = flows {
+            let n = crate::lev_guard_v22::nav_sample(&gd.nav(), eq, fin, fout, now);
+            gd.set_nav(&n);
+            solana_program::log::sol_log(&alloc::format!(
+                "lev_guard_poke navps={} peak={} ref={} stop={}",
+                n.navps,
+                n.peak(),
+                n.ref_navps,
+                crate::lev_guard_v22::lp_stop_triggered(&n)
+            ));
+        }
+        lev_guard_store(guard_ai, &gd)
+    }
+
+    /// Op 5, the LP stop (W1, plan v2 D-b / D-c / D-i). Built in the follow-up PR.
+    #[inline(never)]
+    fn lev_guard_lp_stop<'a>(
+        _program_id: &Pubkey,
+        _accounts: &'a [AccountInfo<'a>],
+        _now: u64,
+    ) -> ProgramResult {
+        Err(PercolatorError::LpStopNotTriggered.into())
     }
 
     /// growth-v19 post-fill gate (plan §2.1), every route: called from BOTH shared executors

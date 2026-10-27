@@ -2542,3 +2542,37 @@ fn growth_p5_wrapper_leg_im_equals_engine_cert_per_leg_im() {
     }
     assert_eq!(checked, sizes.len());
 }
+
+/// v2.2 lev build: on a guarded asset BatchTradeCpi may only REDUCE the taker (opens must go
+/// through TradeCpi, which carries the guard): a batch open is refused with LevGuardRequired
+/// (132); a batch reduce lands. CONTROL: before the guard exists the same batch open lands.
+#[test]
+fn lev_guard_batch_trade_cpi_is_reduce_only_on_a_guarded_asset() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let mut env = Env::new(MarketCfg::growth(1_000));
+    let lp = env.lp(1_000 * USD);
+    let (a, ap) = env.trader(200 * USD);
+    assert_ok(&env.batch_trade_cpi(&a, ap, &lp, units(100)), "control: batch open before the guard");
+    // the upgrade authority binds the guard (T0 backdated is not needed for this rule)
+    let ua = env.upgrade_authority.insecure_clone();
+    let (pd, m) = (env.program_data, env.market);
+    let g = state::derive_lev_guard(&env.program_id, &m).0;
+    assert_ok(
+        &env.send(
+            ProgInstruction::LevGuard { op: lg::OP_INIT, t0: 0, key: [0; 32], report: [0; 4] },
+            vec![
+                AccountMeta::new(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(g, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&ua],
+        ),
+        "UA binds the guard",
+    );
+    assert_err(&env.batch_trade_cpi(&a, ap, &lp, units(50)), "Custom(132)", "batch open on a guarded asset");
+    assert_eq!(env.pos(ap), units(100));
+    assert_ok(&env.batch_trade_cpi(&a, ap, &lp, -units(50)), "batch reduce on a guarded asset");
+    assert_eq!(env.pos(ap), units(50));
+}

@@ -188,6 +188,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::InitLpShareMetadata { .. } => "InitLpShareMetadata",
         // v2.2 growth round 2 (R2.1 item 4), tag 123.
         Instruction::SetDepthSource { .. } => "SetDepthSource",
+        Instruction::LevGuard { .. } => "LevGuard",
     }
 }
 
