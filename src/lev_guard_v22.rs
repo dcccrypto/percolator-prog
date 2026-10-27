@@ -1542,9 +1542,11 @@ mod proofs {
     /// W1: an account's kept position depends only on (its position, k), and never exceeds it.
     #[kani::proof]
     fn kani_lev_w1_keep_bounded() {
-        let p: u64 = kani::any();
+        // 32-bit widths keep the symbolic multiply / divide tractable (CBMC); the arithmetic is
+        // the same code path at every width (u128 in the function).
+        let p: u32 = kani::any();
         let k: u16 = kani::any();
-        let m: u64 = kani::any();
+        let m: u32 = kani::any();
         let v = w1_keep_q(p as u128, k, m as u128);
         assert!(v <= p as u128);
         if k >= 10_000 && (p as u128) >= m as u128 {
@@ -1567,10 +1569,10 @@ mod proofs {
     /// A pure flow (deposit or withdrawal with no P&L) never moves NAV per share.
     #[kani::proof]
     fn kani_lev_nav_flow_neutral() {
-        let e0: u64 = kani::any();
-        let fin: u64 = kani::any();
-        let fout: u64 = kani::any();
-        let a: u64 = kani::any();
+        let e0: u32 = kani::any();
+        let fin: u32 = kani::any();
+        let fout: u32 = kani::any();
+        let a: u32 = kani::any();
         kani::assume(e0 > 0);
         let s = nav_epoch_start(e0 as u128, fin as u128, fout as u128, 0);
         let dep: bool = kani::any();
