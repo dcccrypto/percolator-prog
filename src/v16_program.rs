@@ -44509,6 +44509,27 @@ pub mod processor {
         Ok((l, n, price, sigma_1h))
     }
 
+    /// Decision 28 (night P2): fold the market's current variance into the guard's burst memory and
+    /// return σ_1h for the LEVERAGE term: from `max(var_now, decayed_peak / 4)` (k = 0.5). `None` with
+    /// no volatility data (unchanged). The price-band σ test keeps the raw σ (a higher σ there would make
+    /// the abnormal-move freeze LESS sensitive, a loosening).
+    fn lev_burst_sigma(
+        gd: &mut crate::lev_guard_v22::LevGuardV22,
+        g: &state::AssetGrowthV19,
+        now: u64,
+    ) -> Option<u64> {
+        use crate::lev_guard_v22 as lg;
+        if !g.vol_has_data() {
+            return None;
+        }
+        let var_now = g.vol_var_x100();
+        let (p, t) = lg::burst_update(gd.burst_var_peak_x100, gd.burst_peak_slot, var_now, now);
+        gd.burst_var_peak_x100 = p;
+        gd.burst_peak_slot = t;
+        let var_eff = lg::burst_var_eff(p, t, var_now, now);
+        Some(growth_v19::sigma_h_bps(var_eff, lg::SLOTS_PER_HOUR))
+    }
+
     /// Fold one price observation into the guard; on a trip outside an existing freeze,
     /// snapshot the ceiling and N_cap the freeze holds (decision 25 / G8).
     fn lev_observe(
@@ -44609,8 +44630,9 @@ pub mod processor {
         let mmr = group.header.config.maintenance_margin_bps.get();
         let engine_imr = group.header.config.initial_margin_bps.get();
         // Leverage: L_trader with the dump term, the report cap, m_oracle, the freeze; floored
-        // at L_floor and never above the existing ceiling.
-        let l_tr = lg::l_trader_x100(mmr, sigma_1h, ov.j_dump_bps);
+        // at L_floor and never above the existing ceiling. σ carries the burst memory (decision 28).
+        let sigma_lev = lev_burst_sigma(&mut gd, &g, now);
+        let l_tr = lg::l_trader_x100(mmr, sigma_lev, ov.j_dump_bps);
         let l_eff = lg::l_overlay_x100(
             l_now,
             l_tr,
@@ -44991,6 +45013,9 @@ pub mod processor {
             if let Some(g) = asset_growth_view(&group, a)? {
                 let (l_now, n_now, _price, sigma_1h) = lev_market_numbers(&group, a, &g, eq)?;
                 lev_observe(&mut gd, lev_target_price(&cfg, &group, a), now, sigma_1h, l_now, n_now);
+                // Decision 28: the keeper's poke after each push keeps the burst memory current even
+                // when nobody opens.
+                let _ = lev_burst_sigma(&mut gd, &g, now);
             }
         }
         if let Some((eq, fin, fout)) = flows {

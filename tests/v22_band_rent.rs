@@ -5794,6 +5794,13 @@ fn lev_guard_price_band_breaker_trips_and_expires() {
     let l_tr = lgt::l_trader_now(&env, 0);
     assert!((590..=610).contains(&l_tr), "L_trader ≈ 6x: {l_tr}");
     let existing = 500u16; // the 5x launch ceiling (no graduation without depth)
+    // Decision 28 (night P2): the ±10 % pushes above are a real burst that the burst memory now
+    // keeps for a week. This test isolates the price band (freeze / m_oracle), so the memory is
+    // cleared here; `lev_guard_burst_memory_holds_leverage_down_after_a_burst` covers it.
+    lgt::poke_guard(&mut env, |g| {
+        g.burst_var_peak_x100 = 0;
+        g.burst_peak_slot = 0;
+    });
     let base = lg::l_overlay_x100(existing, l_tr, u16::MAX, false, None, env.growth().l_tier_x100) as i128;
     let with_mo = lg::l_overlay_x100(existing, l_tr, u16::MAX, true, None, env.growth().l_tier_x100) as i128;
     assert!(with_mo < base && with_mo == (l_tr as i128) * 3 / 4, "m_oracle 0.75·L_trader binds below the ceiling: {base} -> {with_mo}");
@@ -5970,5 +5977,56 @@ fn lev_guard_live_w1_round_blocks_lp_growing_opens_f3_f4() {
     env.push(PRICE);
     assert!(!lg::w1_round_live(1, open, env.slot));
     lgt::tg(&mut env, &long, &lp, lgt::usd_q(20)).expect("stale round no longer blocks");
+    env.assert_conservation();
+}
+
+/// Decision 28 (night 2026-10-28 P2): burst memory. A recent volatility burst (peak variance worth
+/// σ_1h ≈ 10 %) keeps the leverage term at k = 0.5 of that σ even after the market calms: an open above
+/// the burst-limited leverage is refused; the same open lands once the memory has decayed (weeks), and
+/// reduces are never checked. Tighten-only: with no burst the gate is unchanged.
+#[test]
+fn lev_guard_burst_memory_holds_leverage_down_after_a_burst() {
+    use percolator_prog::{growth_v19 as gv, lev_guard_v22 as lg};
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    for i in 0..8u64 {
+        env.warp(20);
+        env.push(if i % 2 == 0 { PRICE + PRICE / 1000 } else { PRICE });
+    }
+    let g = env.growth();
+    assert!(g.vol_has_data(), "volatility data after a few pushes");
+    let var_now = g.vol_var_x100();
+    // σ_1h 10 % ⇔ var_x100 = σ²·100 / 9000; the memory floor is peak / 4
+    let var_burst: u32 = 1_000 * 1_000 * 100 / 9_000;
+    assert!(var_burst > var_now.saturating_mul(4), "the burst dominates today's variance ({var_now})");
+    let now = env.slot;
+    lgt::poke_guard(&mut env, |gd| {
+        gd.burst_var_peak_x100 = var_burst * 4;
+        gd.burst_peak_slot = now;
+    });
+    let l_b = lg::l_trader_x100(MMR, Some(gv::sigma_h_bps(var_burst, lg::SLOTS_PER_HOUR)), 0);
+    let l_b = core::cmp::max(lg::l_floor_x100(env.growth().l_tier_x100), l_b) as i128;
+    assert!(l_b < lgt::l_trader_now(&env, 0) as i128 && l_b < 500, "burst-limited leverage {l_b}");
+    let t = env.trader(1_000 * USD);
+    let over = 1_000 * l_b / 100 * 110 / 100;
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(over));
+    assert!(lgt::has(&r, lgt::REFUSED) && r.as_ref().unwrap_err().contains("leverage"), "{over} over burst L {l_b}: {r:?}");
+    let under = 1_000 * l_b / 100 * 85 / 100;
+    lgt::tg(&mut env, &t, &lp, lgt::usd_q(under)).expect("under the burst-limited leverage");
+    // reduces are never checked
+    env.trade_cpi(&t.0, t.1, &lp, -lgt::usd_q(under / 2)).expect("reduce");
+    // weeks later the memory has decayed: the same open lands. The peak is re-stamped at slot 1
+    // (the world starts ~40 d in, i.e. > 5 half-lives earlier).
+    let gd = lgt::guard(&env);
+    assert_eq!(gd.burst_var_peak_x100, var_burst * 4, "the gate kept the peak");
+    lgt::poke_guard(&mut env, |gd| gd.burst_peak_slot = 1);
+    env.warp(1);
+    env.push(PRICE);
+    let decayed = lg::burst_var_eff(var_burst * 4, 1, env.growth().vol_var_x100(), env.slot);
+    let l_d = lg::l_trader_x100(MMR, Some(gv::sigma_h_bps(decayed, lg::SLOTS_PER_HOUR)), 0) as i128;
+    let floor = lg::burst_decay(var_burst * 4, env.slot - 1) / lg::BURST_VAR_FLOOR_DIV;
+    assert!(floor < var_burst / 8, "the memory floor decayed: {floor}");
+    assert!(l_d * 100 > over * 100 / 1_000 * 105, "decayed var {decayed}, L {l_d}");
+    let t2 = env.trader(1_000 * USD);
+    lgt::tg(&mut env, &t2, &lp, lgt::usd_q(over)).expect("memory decayed: the burst no longer binds");
     env.assert_conservation();
 }

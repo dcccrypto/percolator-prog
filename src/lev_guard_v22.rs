@@ -329,6 +329,46 @@ pub fn short_users_cap_notional(long_users_notional: u128, c_m: u128, mmr_bps: u
     offset.saturating_add(dump)
 }
 
+// ── burst memory (decision 28, sims MC-2b; night 2026-10-28 P2) ───────────────────────────────
+
+/// `σ_eff ≥ k·σ_peak` with k = 0.5, i.e. on the variance `var_eff ≥ var_peak / 4`.
+pub const BURST_VAR_FLOOR_DIV: u32 = 4;
+/// The peak's half-life: 7 days (plan §13; the H8 fix of the sim).
+pub const BURST_HALF_LIFE_SLOTS: u64 = 7 * SLOTS_PER_DAY;
+
+/// The stored peak decayed over `elapsed` slots: halved per whole half-life, then LINEAR inside the
+/// current half-life (`p·(1 − f/2)`, f ∈ [0, 1)), which is never below the exact `p·2^(−f)`: it decays no
+/// faster than the sim's exponential (tighter, never looser).
+pub fn burst_decay(peak: u32, elapsed: u64) -> u32 {
+    let halvings = elapsed / BURST_HALF_LIFE_SLOTS;
+    if halvings >= 32 {
+        return 0;
+    }
+    let p = (peak >> halvings) as u64;
+    let rem = elapsed % BURST_HALF_LIFE_SLOTS;
+    // p - p·rem/(2·HL), rounded so the result stays >= the exact value (subtract the floor).
+    let cut = p.saturating_mul(rem) / (2 * BURST_HALF_LIFE_SLOTS);
+    (p - cut) as u32
+}
+
+/// Fold the current variance into the memory. A new high (>= the decayed peak) restarts the clock;
+/// otherwise the stored peak and slot are kept (decay is read from the original high, so repeated
+/// samples never compound the linear segments). A slot behind the peak's (clock fault) reads elapsed 0.
+pub fn burst_update(peak: u32, peak_slot: u64, var_now: u32, now: u64) -> (u32, u64) {
+    let eff = burst_decay(peak, now.saturating_sub(peak_slot));
+    if var_now >= eff {
+        (var_now, now)
+    } else {
+        (peak, peak_slot)
+    }
+}
+
+/// The variance the leverage term uses: `max(var_now, decayed_peak / 4)`. Tighten-only (>= var_now).
+pub fn burst_var_eff(peak: u32, peak_slot: u64, var_now: u32, now: u64) -> u32 {
+    let floor = burst_decay(peak, now.saturating_sub(peak_slot)) / BURST_VAR_FLOOR_DIV;
+    if floor > var_now { floor } else { var_now }
+}
+
 // ── price band: the on-chain mirror of the keeper breaker (decision 25, G8) ──────────────────
 
 /// Keeper breaker thresholds: 10 % between consecutive samples, 30 % against the 1-h reference.
@@ -768,11 +808,16 @@ pub struct LevGuardV22 {
     /// Night audit 2026-10-28 (F4): the slot the open round started. A round older than
     /// `W1_ROUND_SLOTS` is stale: it no longer blocks opens and the next W1 call replaces it.
     pub round_open_slot: u64,     // 336..344
+    /// Decision 28 (night 2026-10-28, P2) burst memory: the running peak of the market's
+    /// volatility variance (`vol_var_x100`) and the slot it was set; read decayed (7-day half-life).
+    pub burst_var_peak_x100: u32, // 344..348
+    pub _pad3: [u8; 4],           // 348..352
+    pub burst_peak_slot: u64,     // 352..360
 }
-/// The record proper (344 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
+/// The record proper (360 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
 /// in the account body as `W1_TOUCHED_CAP` LE u64 tags, read and written in place
 /// (`touched_has_in`, `touch_in`), never copied onto the stack.
-pub const LEV_GUARD_REC_LEN: usize = 344;
+pub const LEV_GUARD_REC_LEN: usize = 360;
 pub const LEV_GUARD_TOUCHED_LEN: usize = 8 * W1_TOUCHED_CAP;
 pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
 const _: () = assert!(core::mem::size_of::<LevGuardV22>() == LEV_GUARD_REC_LEN);
@@ -783,6 +828,8 @@ const _: () = assert!(core::mem::offset_of!(LevGuardV22, frozen_n_q) == 168);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, navps) == 184);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_id) == 312);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_open_slot) == 336);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, burst_var_peak_x100) == 344);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, burst_peak_slot) == 352);
 
 impl LevGuardV22 {
     pub fn report(&self) -> RiskReport {
@@ -890,6 +937,7 @@ pub fn validate_guard(g: &LevGuardV22) -> bool {
         && g._pad0 == 0
         && g._pad1 == [0; 2]
         && g._pad2 == [0; 6]
+        && g._pad3 == [0; 4]
 }
 
 /// A fresh record for `market`.
@@ -1355,6 +1403,40 @@ mod tests {
         assert!(w1_round_live(1, 100, 50));
     }
 
+    /// Night P2: burst memory decay bounds (never faster than 2^(−t/HL)), clock restart on a new high,
+    /// no compounding, and the k = 0.5 floor.
+    #[test]
+    fn burst_memory_decay_update_and_floor() {
+        let hl = BURST_HALF_LIFE_SLOTS;
+        assert_eq!(burst_decay(1_000_000, 0), 1_000_000);
+        assert_eq!(burst_decay(1_000_000, hl), 500_000);
+        assert_eq!(burst_decay(1_000_000, 2 * hl), 250_000);
+        assert_eq!(burst_decay(1_000_000, 64 * hl), 0);
+        assert_eq!(burst_decay(u32::MAX, 0), u32::MAX);
+        // never below the exact exponential, never above the undecayed peak, monotone in time
+        let mut prev = u32::MAX;
+        for i in 0..=200u64 {
+            let t = i * hl / 40;
+            let d = burst_decay(1_000_000, t);
+            let exact = 1_000_000f64 * 2f64.powf(-(t as f64) / hl as f64);
+            assert!(d as f64 + 1.0 >= exact, "t {t}: {d} < exact {exact}");
+            assert!(d <= 1_000_000 && d <= prev, "t {t}");
+            prev = d;
+        }
+        // update: a new high restarts; a lower sample keeps the original peak and slot
+        assert_eq!(burst_update(100, 5, 200, 10), (200, 10));
+        assert_eq!(burst_update(1_000, 5, 200, 10), (1_000, 5));
+        let (p, t) = burst_update(1_000, 0, 10, hl);
+        assert_eq!((p, t), (1_000, 0), "no compounding: decay keeps reading from the original high");
+        // floor: var_eff >= peak/4, never below var_now
+        assert_eq!(burst_var_eff(4_000, 0, 10, 0), 1_000);
+        assert_eq!(burst_var_eff(4_000, 0, 2_000, 0), 2_000);
+        assert_eq!(burst_var_eff(4_000, 0, 10, hl), 500);
+        assert_eq!(burst_var_eff(0, 0, 7, 0), 7);
+        // a clock behind the peak slot reads no decay (tighter)
+        assert_eq!(burst_var_eff(4_000, 100, 0, 50), 1_000);
+    }
+
     #[test]
     fn nav_deposit_withdraw_cycles_never_trip_proptest_style() {
         // many deterministic pseudo-random flow cycles with zero P&L: the index stays 1.0
@@ -1674,6 +1756,21 @@ mod proofs {
         };
         assert!(n.navps == NAV_ONE || n.last_equity == 0 || e0 as u128 + a as u128 == 0);
         assert!(!lp_stop_triggered(&n) || (!dep && a == e0));
+    }
+
+    /// Night P2: burst memory only ever raises the variance the leverage term reads (tighten-only),
+    /// and the decayed peak never exceeds the stored one.
+    #[kani::proof]
+    fn kani_lev_burst_tighten_only() {
+        let peak: u32 = kani::any();
+        let var_now: u32 = kani::any();
+        let peak_slot: u64 = kani::any();
+        let now: u64 = kani::any();
+        let e = burst_var_eff(peak, peak_slot, var_now, now);
+        assert!(e >= var_now);
+        assert!(burst_decay(peak, now.saturating_sub(peak_slot)) <= peak);
+        let (p2, _) = burst_update(peak, peak_slot, var_now, now);
+        assert!(p2 >= var_now || p2 == peak);
     }
 
     /// D-b, from ANY stored NAV state (not only an epoch start): a pure deposit or withdrawal
