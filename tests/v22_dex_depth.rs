@@ -768,13 +768,33 @@ impl Env {
             AccountMeta::new(pda, false),
             AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
         ];
+        // Decision 16 (night 2026-10-28): the pool-claim PDAs. op 1: `[10]` the new pool's claim, `[11]`
+        // the old pool's when the pin moves; op 0: `[5]` the pinned pool's claim.
+        let old_pool = self.record().map(|r| r.pool).filter(|p| *p != [0u8; 32]);
         if let Some(k) = k {
             for a in [k.pool, k.base_vault, k.quote_vault, k.base_mint, k.quote_mint] {
                 accounts.push(AccountMeta::new_readonly(a, false));
             }
+            accounts.push(AccountMeta::new(self.claim_pda(&k.pool.to_bytes()), false));
+            if let Some(op_) = old_pool.filter(|p| *p != k.pool.to_bytes()) {
+                accounts.push(AccountMeta::new(self.claim_pda(&op_), false));
+            }
+        } else if let Some(op_) = old_pool {
+            accounts.push(AccountMeta::new(self.claim_pda(&op_), false));
         }
         let signer = signer.insecure_clone();
         self.send(ProgInstruction::SetDepthSource { op, asset_index: 0, market_id }, accounts, &[&signer])
+    }
+
+    fn claim_pda(&self, pool: &[u8; 32]) -> Pubkey {
+        state::derive_pool_claim(&self.program_id, pool).0
+    }
+
+    fn claim(&self, pool: &[u8; 32]) -> Option<ds::PoolClaimV22> {
+        self.svm
+            .get_account(&self.claim_pda(pool))
+            .filter(|a| !a.data.is_empty() && a.lamports > 0)
+            .map(|a| state::read_pool_claim(&a.data).expect("valid claim"))
     }
 
     fn set_source(&mut self, k: PoolKeys) -> Result<u64, String> {
@@ -1479,4 +1499,79 @@ fn l_rc2_1_unpinned_mode1_unchanged() {
     assert!(!growth_v19::depth_dex_pinned(g.depth_source));
     assert_eq!(state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap().oracle_target_price_e6, mark);
     assert_eq!(env.oracle_seq(), seq + 1);
+}
+
+/// Decision 16 (night 2026-10-28): one growth market per spot pool. Tag 123 claims the pinned pool for the
+/// market (`["pool_claim", pool]`, kind 18); a pool claimed by ANOTHER market cannot be pinned (nothing is
+/// written); the same market may re-pin; clearing the pin releases the claim (rent back to the UA), after
+/// which the pool is free again. Wrong claim PDA and a foreign-owned claim account are refused.
+#[test]
+fn pool_claim_one_market_per_pool() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    let pool = chill().pool.to_bytes();
+    // pin: the claim is created for this market
+    env.set_source(chill()).expect("pin creates the claim");
+    let c = env.claim(&pool).expect("claim exists");
+    assert_eq!(c.market, env.market.to_bytes());
+    assert_eq!(c.pool, pool);
+    // the same market re-pins: fine, still one claim
+    env.warp(1);
+    env.set_source(chill()).expect("same-market re-pin");
+    assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes());
+    // clear: released (account emptied, lamports returned)
+    let ua_before = env.svm.get_account(&env.ua.pubkey()).unwrap().lamports;
+    env.warp(1);
+    env.clear_source().expect("clear releases the claim");
+    assert!(env.claim(&pool).is_none(), "claim released");
+    assert!(env.svm.get_account(&env.ua.pubkey()).unwrap().lamports > ua_before - 10_000, "rent refunded (minus fees)");
+    // ANOTHER market holds the claim (injected: a program-owned kind-18 record naming a different market):
+    // the pin is refused and nothing is written
+    let other = Pubkey::new_unique();
+    let (cpda, bump) = state::derive_pool_claim(&env.program_id, &pool);
+    let mut data = vec![0u8; state::pool_claim_account_len()];
+    let rec = ds::PoolClaimV22 {
+        pool,
+        market: other.to_bytes(),
+        asset_index: 0,
+        version: ds::POOL_CLAIM_VERSION,
+        bump,
+        _reserved: [0; 12],
+    };
+    state::write_pool_claim(&mut data, &rec, true).unwrap();
+    let acct = solana_sdk::account::Account { lamports: 10_000_000, data, owner: env.program_id, executable: false, rent_epoch: 0 };
+    env.svm.set_account(cpda, acct.clone()).unwrap();
+    let before = env.record();
+    env.warp(1);
+    let r = env.set_source(chill());
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(129)")), "claimed elsewhere: {r:?}");
+    assert_eq!(env.record(), before, "pin not written");
+    assert_eq!(env.claim(&pool).unwrap().market, other.to_bytes(), "the other market keeps its claim");
+    // the same record owned by another program is not a claim: refused
+    let mut foreign = acct.clone();
+    foreign.owner = Pubkey::new_unique();
+    env.svm.set_account(cpda, foreign).unwrap();
+    env.warp(1);
+    assert!(env.set_source(chill()).is_err(), "foreign-owned claim account");
+    // a wrong claim PDA in [10]: refused
+    env.svm.set_account(cpda, solana_sdk::account::Account { lamports: 0, data: vec![], owner: solana_sdk::system_program::id(), executable: false, rent_epoch: 0 }).unwrap();
+    let (ua, pda) = (env.ua.insecure_clone(), env.pda());
+    let k = chill();
+    let mut accounts = vec![
+        AccountMeta::new(ua.pubkey(), true),
+        AccountMeta::new_readonly(env.program_data, false),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(pda, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+    ];
+    for a in [k.pool, k.base_vault, k.quote_vault, k.base_mint, k.quote_mint] {
+        accounts.push(AccountMeta::new_readonly(a, false));
+    }
+    accounts.push(AccountMeta::new(Pubkey::new_unique(), false));
+    env.warp(1);
+    let r = env.send(ProgInstruction::SetDepthSource { op: 1, asset_index: 0, market_id: 1 }, accounts, &[&ua]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(129)")), "wrong claim PDA: {r:?}");
+    // free again: the pin lands and claims it
+    env.warp(1);
+    env.set_source(chill()).expect("unclaimed pool pins");
+    assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes());
 }

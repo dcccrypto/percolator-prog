@@ -659,6 +659,8 @@ pub mod constants {
     /// `["lev_guard", market]`, header kind 17.
     pub const TAG_LEV_GUARD: u8 = 124;
     pub const KIND_LEV_GUARD: u8 = 17;
+    /// Night 2026-10-28 (decision 16): `["pool_claim", pool]`, one growth market per spot pool.
+    pub const KIND_POOL_CLAIM: u8 = 18;
     /// Mainnet builds refuse a risk-increasing fill on ANY clamp-enforced growth asset without a
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
@@ -7612,6 +7614,54 @@ pub mod state {
             return Err(PercolatorError::DepthSourceInvalid.into());
         }
         data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(x));
+        Ok(())
+    }
+
+    /// Decision 16 (night 2026-10-28): the pool claim (`["pool_claim", pool]`, kind 18).
+    pub const fn pool_claim_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<crate::depth_src_v22::PoolClaimV22>()
+    }
+
+    pub fn derive_pool_claim(
+        program_id: &solana_program::pubkey::Pubkey,
+        pool: &[u8; 32],
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[crate::depth_src_v22::POOL_CLAIM_SEED, pool.as_ref()],
+            program_id,
+        )
+    }
+
+    pub fn read_pool_claim(data: &[u8]) -> Result<crate::depth_src_v22::PoolClaimV22, ProgramError> {
+        if data.len() != pool_claim_account_len()
+            || check_header(data, crate::constants::KIND_POOL_CLAIM).is_err()
+        {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let c: crate::depth_src_v22::PoolClaimV22 = bytemuck::pod_read_unaligned(&data[HEADER_LEN..]);
+        if !crate::depth_src_v22::validate_pool_claim(&c) {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        Ok(c)
+    }
+
+    pub fn write_pool_claim(
+        data: &mut [u8],
+        c: &crate::depth_src_v22::PoolClaimV22,
+        fresh: bool,
+    ) -> Result<(), ProgramError> {
+        if data.len() != pool_claim_account_len() || !crate::depth_src_v22::validate_pool_claim(c) {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        if fresh {
+            if is_initialized(data) {
+                return Err(PercolatorError::DepthSourceInvalid.into());
+            }
+            write_header(data, crate::constants::KIND_POOL_CLAIM)?;
+        } else if check_header(data, crate::constants::KIND_POOL_CLAIM).is_err() {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(c));
         Ok(())
     }
 
@@ -39237,6 +39287,107 @@ pub mod processor {
         Ok(rec)
     }
 
+    /// Decision 16 (night 2026-10-28): refuse to pin `pool` when ANOTHER market holds its claim. The claim
+    /// account must be the pool's PDA; empty = unclaimed.
+    fn pool_claim_check(
+        program_id: &Pubkey,
+        claim_ai: &AccountInfo<'_>,
+        pool: &[u8; 32],
+        market: &[u8; 32],
+    ) -> ProgramResult {
+        let (pda, _) = state::derive_pool_claim(program_id, pool);
+        if *claim_ai.key != pda {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        if claim_ai.data_is_empty() {
+            return Ok(());
+        }
+        if claim_ai.owner != program_id {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let c = state::read_pool_claim(&claim_ai.try_borrow_data()?)?;
+        if c.pool != *pool || !crate::depth_src_v22::pool_claim_held_by(&c, market) {
+            solana_program::log::sol_log("g8_pool_claimed_elsewhere");
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        Ok(())
+    }
+
+    /// Create (payer = the upgrade authority) or refresh this market's claim on `pool`.
+    fn pool_claim_take<'a>(
+        program_id: &Pubkey,
+        claim_ai: &AccountInfo<'a>,
+        payer: &AccountInfo<'a>,
+        system_program_ai: &AccountInfo<'a>,
+        pool: &[u8; 32],
+        market: &[u8; 32],
+        asset_index: u16,
+    ) -> ProgramResult {
+        expect_writable(claim_ai)?;
+        let (pda, bump) = state::derive_pool_claim(program_id, pool);
+        if *claim_ai.key != pda {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let fresh = claim_ai.data_is_empty();
+        if fresh {
+            expect_writable(payer)?;
+            let bump_bytes = [bump];
+            let seeds: &[&[u8]] = &[crate::depth_src_v22::POOL_CLAIM_SEED, pool.as_ref(), bump_bytes.as_ref()];
+            create_pda_account(payer, claim_ai, system_program_ai, state::pool_claim_account_len(), program_id, seeds)?;
+        }
+        let c = crate::depth_src_v22::PoolClaimV22 {
+            pool: *pool,
+            market: *market,
+            asset_index,
+            version: crate::depth_src_v22::POOL_CLAIM_VERSION,
+            bump,
+            _reserved: [0u8; 12],
+        };
+        state::write_pool_claim(&mut claim_ai.try_borrow_mut_data()?, &c, fresh)
+    }
+
+    /// Release this market's claim on `pool` (rent to `dest`). An empty claim (a pin made before claims
+    /// existed) is a no-op; a claim held by ANOTHER market is left untouched.
+    fn pool_claim_release<'a>(
+        program_id: &Pubkey,
+        claim_ai: &AccountInfo<'a>,
+        dest: &AccountInfo<'a>,
+        pool: &[u8; 32],
+        market: &[u8; 32],
+    ) -> ProgramResult {
+        let (pda, _) = state::derive_pool_claim(program_id, pool);
+        if *claim_ai.key != pda {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        if claim_ai.data_is_empty() {
+            return Ok(());
+        }
+        if claim_ai.owner != program_id {
+            return Err(PercolatorError::DepthSourceInvalid.into());
+        }
+        let c = state::read_pool_claim(&claim_ai.try_borrow_data()?)?;
+        if !crate::depth_src_v22::pool_claim_held_by(&c, market) {
+            return Ok(());
+        }
+        expect_writable(claim_ai)?;
+        expect_writable(dest)?;
+        let lamports = claim_ai.lamports();
+        **dest.try_borrow_mut_lamports()? = dest
+            .lamports()
+            .checked_add(lamports)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        **claim_ai.try_borrow_mut_lamports()? = 0;
+        // A full close (not only zero lamports): data emptied and the account handed back to the
+        // system program, so a later pin of this pool (same or another market) in the same slot /
+        // before the runtime purges it sees an EMPTY claim, never a zeroed record it would refuse.
+        claim_ai.try_borrow_mut_data()?.fill(0);
+        claim_ai.realloc(0, false)?;
+        claim_ai.assign(&system_program::ID);
+        solana_program::log::sol_log("g8_pool_claim_released");
+        Ok(())
+    }
+
+
     /// SetDepthSource (tag 123, R2.1 item 4). UPGRADE AUTHORITY only (ProgramData-proven, the
     /// same check as tags 93 / 117). op 1 creates (UA pays) or replaces the market's
     /// `DepthSourceV22` pin (`depth_source_build_pin` lists every check); op 0 CLEARS an
@@ -39249,6 +39400,11 @@ pub mod processor {
     /// v2.2 DEATH F-3: the market account is WRITABLE (both ops). op 1 sets `DEPTH_DEX_PINNED` in
     /// the pinned asset's growth record, op 0 clears it on the pin's own asset; while it is set
     /// PushAuthMark ignores a keeper-attested (mode 1) depth (its mark still lands, L-RC2-1).
+    ///
+    /// Decision 16 (night 2026-10-28), one growth market per spot pool: op 1 also takes `[10]` the
+    /// pinned pool's claim PDA `["pool_claim", pool]` (w; created for this market, refused if another
+    /// market holds it) and, when the pin moves to a different pool, `[11]` the old pool's claim (w;
+    /// released). op 0 takes `[5]` the pinned pool's claim (w; released, rent to the UA).
     #[inline(never)]
     fn handle_set_depth_source<'a>(
         program_id: &Pubkey,
@@ -39294,6 +39450,10 @@ pub mod processor {
                 false,
             )?;
             drop(data);
+            // Decision 16: the pool this market held is released (`[5]` = its claim PDA).
+            if old.pool != [0u8; 32] {
+                pool_claim_release(program_id, account(accounts, 5)?, upgrade_authority, &old.pool, &market_bytes)?;
+            }
             depth_source_mark_market(market_ai, old.asset_index, false)?;
             solana_program::log::sol_log("g8_depth_source_cleared");
             return Ok(());
@@ -39308,8 +39468,12 @@ pub mod processor {
             &collateral_mint,
         )?;
         let fresh = src_ai.data_is_empty();
+        // Decision 16: the pool must not be claimed by another market (`[10]` = its claim PDA).
+        let claim_ai = account(accounts, 10)?;
+        pool_claim_check(program_id, claim_ai, &rec.pool, &market_bytes)?;
         // F-3: a replaced pin of ANOTHER asset index leaves that asset's pin bit to clear.
         let mut replaced_asset: Option<u16> = None;
+        let mut released_pool: Option<[u8; 32]> = None;
         if fresh {
             expect_writable(upgrade_authority)?;
             let bump_bytes = [bump];
@@ -39337,8 +39501,16 @@ pub mod processor {
             if old.asset_index != asset_index {
                 replaced_asset = Some(old.asset_index);
             }
+            if old.pool != [0u8; 32] && old.pool != rec.pool {
+                released_pool = Some(old.pool);
+            }
         }
         state::write_depth_source(&mut src_ai.try_borrow_mut_data()?, &rec, fresh)?;
+        pool_claim_take(program_id, claim_ai, upgrade_authority, system_program_ai, &rec.pool, &market_bytes, asset_index)?;
+        if let Some(old_pool) = released_pool {
+            // The pin moved to another pool: `[11]` = the old pool's claim, released.
+            pool_claim_release(program_id, account(accounts, 11)?, upgrade_authority, &old_pool, &market_bytes)?;
+        }
         if let Some(prev) = replaced_asset {
             depth_source_mark_market(market_ai, prev, false)?;
         }

@@ -853,3 +853,53 @@ mod tests {
         assert_eq!(reserve_value_e6(ValuePath::QuoteIsCollateral, 5, 9, 0, 99, 99), Some(9));
     }
 }
+
+// ── decision 16 (night 2026-10-28): one growth market per spot pool ─────────────────────────
+
+/// `["pool_claim", pool]`, header kind 18 (`constants::KIND_POOL_CLAIM`), body at `HEADER_LEN`. The pool a
+/// market's depth-source pin reads is CLAIMED by that market: tag 123 refuses to pin a pool another market
+/// holds (plan v2 decision 16 / G6 / G11: two markets sizing capacity off one pool's depth double-count it,
+/// and one pool push moves both). Created at the pin, released when the pin clears or moves to another pool.
+pub const POOL_CLAIM_SEED: &[u8] = b"pool_claim";
+pub const POOL_CLAIM_VERSION: u8 = 1;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct PoolClaimV22 {
+    pub pool: [u8; 32],      // 0..32
+    pub market: [u8; 32],    // 32..64  the claiming market (slab) key
+    pub asset_index: u16,    // 64..66
+    pub version: u8,         // 66
+    pub bump: u8,            // 67
+    pub _reserved: [u8; 12], // 68..80
+}
+const _: () = assert!(core::mem::size_of::<PoolClaimV22>() == 80);
+const _: () = assert!(core::mem::offset_of!(PoolClaimV22, market) == 32);
+const _: () = assert!(core::mem::offset_of!(PoolClaimV22, asset_index) == 64);
+
+pub fn validate_pool_claim(c: &PoolClaimV22) -> bool {
+    c.version == POOL_CLAIM_VERSION && c.pool != [0u8; 32] && c.market != [0u8; 32] && c._reserved == [0u8; 12]
+}
+
+/// What tag 123 may do with the claim account of the pool it is about to pin: `None` = the account is empty
+/// (create it), `Some(true)` = this market already holds it, `Some(false)` = ANOTHER market holds it (refuse).
+pub fn pool_claim_held_by(c: &PoolClaimV22, market: &[u8; 32]) -> bool {
+    c.market == *market
+}
+
+#[cfg(test)]
+mod pool_claim_tests {
+    use super::*;
+    #[test]
+    fn pool_claim_layout_and_validation() {
+        let mut c: PoolClaimV22 = bytemuck::Zeroable::zeroed();
+        assert!(!validate_pool_claim(&c));
+        c.pool = [1; 32];
+        c.market = [2; 32];
+        c.version = POOL_CLAIM_VERSION;
+        assert!(validate_pool_claim(&c));
+        assert!(pool_claim_held_by(&c, &[2; 32]) && !pool_claim_held_by(&c, &[3; 32]));
+        c._reserved[0] = 1;
+        assert!(!validate_pool_claim(&c));
+    }
+}
