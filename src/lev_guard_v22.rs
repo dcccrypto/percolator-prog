@@ -495,12 +495,12 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
     let dout = flow_out - st.last_out;
     // End reading: econ = equity - din + dout, clamped at 0 (a loss beyond everything reads as 0).
     let econ = equity.saturating_add(dout).saturating_sub(din);
-    let mut navps = mul_div_floor_sat(st.navps, econ, st.last_equity);
+    let mut navps = nav_scale(st.navps, econ, st.last_equity);
     if din != 0 || dout != 0 {
         // Start reading (F1): the flows joined the base before the P&L. The higher reading wins.
         let base = st.last_equity.saturating_add(din).saturating_sub(dout);
         if base != 0 {
-            let start = mul_div_floor_sat(st.navps, equity, base);
+            let start = nav_scale(st.navps, equity, base);
             if start > navps {
                 navps = start;
             }
@@ -527,6 +527,18 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
         n.peak_cur = navps;
     }
     n
+}
+
+/// `navps · num / den` (floored), exactly `navps` when `num == den` (a pure flow, or no P&L): no
+/// division on that path, so `mul_div_floor_sat`'s saturation for astronomically large inputs can
+/// never move the index on a flow, and the flow-neutrality proof (`kani_lev_nav_flow_neutral`)
+/// needs no 128-bit division (task 4, night 2026-10-28).
+pub fn nav_scale(navps: u128, num: u128, den: u128) -> u128 {
+    if num == den {
+        navps
+    } else {
+        mul_div_floor_sat(navps, num, den)
+    }
 }
 
 /// D-b + D-i: the stop fires at NAV/share <= 50 % of the trailing peak OR <= 50 % of the
@@ -1662,5 +1674,41 @@ mod proofs {
         };
         assert!(n.navps == NAV_ONE || n.last_equity == 0 || e0 as u128 + a as u128 == 0);
         assert!(!lp_stop_triggered(&n) || (!dep && a == e0));
+    }
+
+    /// D-b, from ANY stored NAV state (not only an epoch start): a pure deposit or withdrawal
+    /// (no P&L) leaves NAV per share exactly unchanged, and a stop that did not hold before the
+    /// flow does not hold after it (whatever bucket roll the sample's slot causes). Night
+    /// 2026-10-28: provable without 128-bit division thanks to `nav_scale`'s `num == den` path.
+    #[kani::proof]
+    fn kani_lev_nav_pure_flow_any_state() {
+        let navps: u64 = kani::any();
+        let last: u64 = kani::any();
+        let lin: u64 = kani::any();
+        let lout: u64 = kani::any();
+        let st = NavState {
+            navps: navps as u128,
+            last_equity: last as u128,
+            last_in: lin as u128,
+            last_out: lout as u128,
+            peak_cur: kani::any::<u64>() as u128,
+            peak_prev: kani::any::<u64>() as u128,
+            bucket_start: kani::any(),
+            ref_navps: kani::any::<u64>() as u128,
+            last_slot: kani::any(),
+        };
+        kani::assume(navps > 0 && last > 0);
+        let now: u64 = kani::any();
+        kani::assume(now >= st.bucket_start);
+        let a: u64 = kani::any();
+        let dep: bool = kani::any();
+        let n = if dep {
+            nav_sample(&st, last as u128 + a as u128, lin as u128 + a as u128, lout as u128, now)
+        } else {
+            kani::assume(a <= last);
+            nav_sample(&st, (last - a) as u128, lin as u128, lout as u128 + a as u128, now)
+        };
+        assert!(n.navps == st.navps);
+        assert!(lp_stop_triggered(&st) || !lp_stop_triggered(&n));
     }
 }
