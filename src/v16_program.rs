@@ -45113,6 +45113,7 @@ pub mod processor {
             gd.round_keep_bps = 0;
             gd.touched_n = 0;
         }
+        let mut opened_now = false;
         if gd.round_active == 0 {
             if !lg::lp_stop_triggered(&nav) {
                 return Err(PercolatorError::LpStopNotTriggered.into());
@@ -45132,6 +45133,7 @@ pub mod processor {
             gd.round_target_q = target.to_le_bytes();
             gd.round_open_slot = now;
             gd.touched_n = 0;
+            opened_now = true;
             solana_program::log::sol_log(&alloc::format!(
                 "lev_w1_round_open id={} keep_bps={} lp_net={} target={} navps={}",
                 gd.round_id, keep, lp_net, target, nav.navps
@@ -45190,8 +45192,10 @@ pub mod processor {
             gd.round_active = 0;
             gd.set_nav(&lg::nav_stop_reset(&gd.nav()));
             solana_program::log::sol_log(&alloc::format!("lev_w1_round_done id={} lp_net={}", gd.round_id, lp_after));
-        } else if !cut_any && accounts.len() <= 6 {
-            // An open round, nothing listed to cut: a no-op call is a caller error.
+        } else if !cut_any && accounts.len() <= 6 && !opened_now {
+            // An ALREADY-open round, nothing listed to cut: a no-op call is a caller error. A call that
+            // OPENS the round is progress on its own (night review K-1: erroring here reverted the
+            // open, so a keeper that opens first and cuts in later calls could never start a round).
             return Err(PercolatorError::LpStopNotTriggered.into());
         }
         lev_guard_store(guard_ai, &gd)

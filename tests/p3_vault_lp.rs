@@ -6399,3 +6399,21 @@ fn lev_w1_nav_sample_requires_the_ext_pda_f2() {
     lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("W1 after a real loss");
     assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
 }
+
+/// Night review K-1: a W1 call that OPENS the round without listing any account lands (the round is
+/// recorded: k, side, target, open slot), and later calls cut the accounts; a no-victim call on an
+/// ALREADY-open round is still refused (135). On a0c1337d the opening call reverted with 135.
+#[test]
+fn lev_w1_round_opens_without_victims_k1() {
+    let (mut env, lp, users) = lev_w1::world();
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    lev_w1::w1(&mut env, &lp, &[]).expect("opening call with no victims lands");
+    let g = lev_w1::guard(&env);
+    assert_eq!(g.round_active, 1, "round recorded");
+    assert!(g.round_keep_bps > 0 && g.round_keep_bps < 10_000);
+    let r = lev_w1::w1(&mut env, &lp, &[]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "no-op on an open round: {r:?}");
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio, users[1].portfolio, users[2].portfolio]).expect("cut");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+    assert_eq!(lev_w1::guard(&env).round_active, 0, "round closed once every opposing account is cut");
+}
