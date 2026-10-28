@@ -5931,3 +5931,44 @@ fn lev_guard_permissionless_proofs_against_the_pin() {
     assert!(lgt::has(&r, lgt::REFUSED), "holder dump: {r:?}");
     env.assert_conservation();
 }
+
+/// Night audit 2026-10-28 F3 / F4: while a W1 round is LIVE (open < 1 h), no fill may grow the
+/// LP's net (a cut user, or a fresh one, would re-open against the LP and the round could never
+/// bring the LP to target); reducing fills, and fills that shrink the LP's net, still land. Once
+/// the round is stale (> W1_ROUND_SLOTS) it no longer blocks opens (liveness: a round that cannot
+/// finish, e.g. > 512 opposing accounts, cannot wedge the market).
+#[test]
+fn lev_guard_live_w1_round_blocks_lp_growing_opens_f3_f4() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    let long = env.trader(1_000 * USD);
+    let short = env.trader(1_000 * USD);
+    lgt::tg(&mut env, &long, &lp, lgt::usd_q(100)).expect("open long before any round");
+    let lp_before = env.pos(lp.account);
+    assert!(lp_before < 0, "LP short against the long: {lp_before}");
+    // a live round (as op 5 leaves it open between keeper calls)
+    let now = env.slot;
+    lgt::poke_guard(&mut env, |g| {
+        g.round_active = 1;
+        g.round_open_slot = now;
+        g.round_keep_bps = 5_000;
+        g.round_lp_long = 0;
+    });
+    env.warp(1);
+    env.push(PRICE);
+    // another long would grow the LP's short: refused
+    let r = lgt::tg(&mut env, &long, &lp, lgt::usd_q(50));
+    assert!(lgt::has(&r, lgt::REFUSED), "LP-growing open during a live round: {r:?}");
+    assert_eq!(env.pos(lp.account), lp_before);
+    // a short shrinks the LP's net: lands (risk-increasing for the taker, not for the LP)
+    lgt::tg(&mut env, &short, &lp, -lgt::usd_q(30)).expect("LP-reducing open during a round");
+    // a reduce of the long: lands without the guard
+    env.trade_cpi(&long.0, long.1, &lp, -lgt::usd_q(10)).expect("reduce during a round");
+    // the round goes stale after W1_ROUND_SLOTS: opens that grow the LP's net land again
+    let open = lgt::guard(&env).round_open_slot;
+    env.warp(lg::W1_ROUND_SLOTS + 1 - (env.slot - open));
+    env.push(PRICE);
+    assert!(!lg::w1_round_live(1, open, env.slot));
+    lgt::tg(&mut env, &long, &lp, lgt::usd_q(20)).expect("stale round no longer blocks");
+    env.assert_conservation();
+}

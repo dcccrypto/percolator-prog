@@ -6328,3 +6328,74 @@ fn lev_w1_deposit_withdraw_cycle_does_not_trip() {
     assert_eq!(env.position(users[0].portfolio), tok(GPRICE, 4_000));
 }
 
+
+/// Night audit 2026-10-28 F1: a creator top-up (or an Earn allocation) followed, in the SAME
+/// sample interval, by a loss that is small against the post-flow equity must not trip the stop.
+/// On a0c1337d the whole loss was charged to the PRE-deposit equity: 10k + 20k deposited, then
+/// 20 % of 30k lost, read as NAV/share 0.4 and W1 force-cut every healthy opposing user.
+#[test]
+fn lev_w1_deposit_then_small_loss_does_not_trip_f1() {
+    let (mut env, lp, users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000 * U).expect("top-up");
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 5); // -20 % of the post-deposit capital
+    let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio, users[1].portfolio]);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "no stop: {r:?}");
+    assert_eq!(env.position(users[0].portfolio), tok(GPRICE, 4_000), "healthy user untouched");
+    // the same 20 % with no flow in the interval reads as 20 %: still no stop; a real 60 % loss
+    // (no flow) still trips
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    let nav = lev_w1::guard(&env).nav();
+    assert!(nav.navps > percolator_prog::lev_guard_v22::NAV_ONE / 2, "navps {}", nav.navps);
+    lev_w1::lose_capital(&mut env, lp.portfolio, 3, 10);
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("a real loss still fires W1");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+}
+
+/// Night audit 2026-10-28 F2: the NAV sample REQUIRES the vault-LP ext at its PDA. On a0c1337d a
+/// permissionless poke could drop it: `flow_in` went backwards, the epoch restarted at 1.0 and
+/// the peak / reference were wiped (a loss masked), or pass a wrong account.
+#[test]
+fn lev_w1_nav_sample_requires_the_ext_pda_f2() {
+    // world() with Earn capital allocated into the vault LP (allocated_total != 0)
+    let mut env = Env::new(growth_params());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, None).expect("senior (pre-bind)");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+    env.allocate(lp.portfolio, 5_000 * U as u128).expect("allocate");
+    assert!(env.allocated() > 0);
+    let mut users = Vec::new();
+    for (cap, tokens) in [(5_000 * U, 4_000), (5_000 * U, 2_500)] {
+        let t = env.new_trader(cap);
+        env.trade_signing_fee(&t, &lp, tok(GPRICE, tokens), GROWTH_FEE).expect("user long");
+        users.push(t);
+    }
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("poke with ext");
+    let before_raw = env.svm.get_account(&lev_w1::guard_key(&env)).unwrap().data;
+    // a real 60 % loss: the stop holds
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    // poke WITHOUT the ext: refused, nothing reset
+    env.svm.expire_blockhash();
+    let mut metas = vec![
+        AccountMeta::new_readonly(env.admin.pubkey(), false),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(lev_w1::guard_key(&env), false),
+        AccountMeta::new(lp.portfolio, false),
+        AccountMeta::new_readonly(env.vault_lp, false),
+    ];
+    let ix = ProgInstruction::LevGuard { op: percolator_prog::lev_guard_v22::OP_POKE, t0: 0, key: [0; 32], report: [0; 4] };
+    let r = env.send(ix.clone(), metas.clone(), &[]);
+    assert!(r.is_err(), "poke without the ext: {r:?}");
+    // a wrong account in the ext slot: refused
+    metas.push(AccountMeta::new_readonly(Pubkey::new_unique(), false));
+    env.svm.expire_blockhash();
+    let r = env.send(ix, metas, &[]);
+    assert!(r.is_err(), "poke with a non-PDA ext: {r:?}");
+    assert_eq!(env.svm.get_account(&lev_w1::guard_key(&env)).unwrap().data, before_raw, "no epoch reset");
+    // the honest sample sees the loss and W1 fires
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("W1 after a real loss");
+    assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+}
