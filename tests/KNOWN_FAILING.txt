@@ -141,3 +141,5 @@ timing_a_exit_one_slot_before_deficit_push_cooldown0_vs_long
 # p3_p2_negotiated_fee_* tests fail in CI only because CI does not provide the V1 / P2 matcher and deployed-growth-wrapper
 # .so files (V1_MATCHER_SO, P2_MATCHER_SO, GROWTH_BASE_SO); they pass locally with those set (ledger v22-night-2026-10-28.md).
 # Follow-up: build / fetch those artifacts in the job instead of hiding the tests here.
+# day1 2026-10-28: DONE. ci.yml builds them from pinned source (scripts/ci-build-test-artifacts.sh, pins in
+# ci/deployed-refs.env) and sets the env vars; still nothing about them is listed here.

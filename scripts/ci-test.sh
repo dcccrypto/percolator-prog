@@ -141,6 +141,16 @@ if [ -d "../percolator-match-p2" ]; then
 fi
 echo "::endgroup::"
 
+# day1 2026-10-28: the test-only reference programs (scripts/ci-build-test-artifacts.sh). In CI they are
+# REQUIRED: a missing one would turn ~25 tests red for an environment reason again, so refuse up front.
+if [ "${CI_TEST_ARTIFACTS_REQUIRED:-0}" = "1" ]; then
+  for v in GROWTH_BASE_SO V1_MATCHER_SO INDEP_V1_MATCHER_SO INDEP_P2_MATCHER_SO P2_MATCHER_SO; do
+    f="${!v:-}"
+    [ -n "$f" ] && [ -s "$f" ] || { echo "FATAL: $v is unset or not a file (${f:-<unset>})"; exit 1; }
+    echo "  $v=$f ($(wc -c < "$f" | tr -d ' ') B)"
+  done
+fi
+
 echo "::group::build wrapper BPF"
 # --features devnet is NOT optional, and leaving it off is what made main red from
 # 15eb8b0c (2026-08-31) onward.

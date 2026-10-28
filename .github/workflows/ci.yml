@@ -119,7 +119,7 @@ jobs:
   test:
     name: build + test
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 90  # day1 2026-10-28: + building the test-only reference programs (~10 min)
     strategy:
       fail-fast: false
       # ONE NFT PIN, as of 2026-08-29.
@@ -146,7 +146,8 @@ jobs:
       # moved to cf56ba5. parity-check.sh fails the build if a SHA reappears inline here.
       - name: load canonical deployed refs
         id: refs
-        run: grep -E '^[A-Z_]+=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
+        # [A-Z0-9_]: the day1 test-artifact pins (MATCHER_V1_*, MATCHER_P2_*) have digits in their names.
+        run: grep -E '^[A-Z][A-Z0-9_]*=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
 
       # The wrapper compiles the engine through `path = "../percolator"`, and mounts
       # the matcher / nft / stake .so for its cross-program suites. All four must sit
@@ -241,14 +242,37 @@ jobs:
       # Stake likewise, and for an extra reason: main carries the 408-byte StakePool
       # layout that is deliberately NOT deployed (25 live pools are 392 bytes).
       # P1: tests/p1_fee_channel.rs drives the P2 matcher (feat/p2-matcher-v2, NOT deployed).
-      - name: checkout P2 matcher (tests only, not deployed)
+      - name: checkout P2 matcher (tests only, not deployed; pinned, was the moving branch feat/p2-matcher-v2)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator-match, path: percolator-match-p2, ref: feat/p2-matcher-v2, token: '${{ secrets.GITHUB_TOKEN }}' }
+        with: { repository: dcccrypto/percolator-match, path: percolator-match-p2, ref: '${{ steps.refs.outputs.MATCHER_P2_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      # day1 2026-10-28: the test-only REFERENCE programs ~25 tests need (v1 matcher, v2.1 wrapper on its own
+      # engine). Built from these pins by scripts/ci-build-test-artifacts.sh below; nothing is downloaded and
+      # none of those tests is allowlisted.
+      - name: checkout v1 matcher (tests only; the v18.2 deployed matcher)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-match, path: percolator-match-v1, ref: '${{ steps.refs.outputs.MATCHER_V1_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: checkout growth base wrapper (tests only; the deployed v2.1 wrapper)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator-prog, path: growth-base/percolator-prog, ref: '${{ steps.refs.outputs.GROWTH_BASE_WRAPPER }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - name: checkout growth base engine (its path dependency)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: growth-base/percolator, ref: '${{ steps.refs.outputs.GROWTH_BASE_ENGINE }}', token: '${{ secrets.GITHUB_TOKEN }}' }
       - name: checkout stake (pinned to the deployed commit)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
       - uses: dtolnay/rust-toolchain@stable
+      # The reference programs are built with the DEPLOY toolchain so the two matchers reproduce their
+      # recorded sha256 (the script fails otherwise). The 4.2.2 install below then becomes the active
+      # release for the suite itself, exactly as before.
+      - name: install the deploy solana toolchain for the reference programs (3.1.14 = 3.1.15 bytes / v1.52)
+        env:
+          SOLANA_CLI_VERSION: "3.1.14"
+        run: sh -c "$(curl -sSfL https://release.anza.xyz/v${SOLANA_CLI_VERSION}/install)"
+      - name: build the test-only reference programs (v1 matcher, P2 matcher, growth base wrapper)
+        run: |
+          export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+          percolator-prog/scripts/ci-build-test-artifacts.sh "$GITHUB_WORKSPACE" /tmp/ci-test-so
       - name: install solana toolchain (cargo build-sbf)
         env:
           SOLANA_CLI_VERSION: "4.2.2"
@@ -277,4 +301,13 @@ jobs:
           NFT_PIN: ci_sibling
           P1_FORK_DEPLOYED_SO: /tmp/wrapper-v18.2.so
           P1_FORK_MATCHER_SO: /tmp/matcher-12bd671.so
+          # day1 2026-10-28: the reference programs built above. P2_MATCHER_SO (p1_fee_channel, p3_vault_lp) is
+          # the DEPLOYED matcher line (2b08537, built by ci-test.sh at ../percolator-match): it speaks the ext-v2
+          # inventory wire the wrapper sends; 4a0f696 refuses it (InvalidInstructionData, measured locally).
+          GROWTH_BASE_SO: /tmp/ci-test-so/growth-base.so
+          V1_MATCHER_SO: /tmp/ci-test-so/v1-matcher.so
+          INDEP_V1_MATCHER_SO: /tmp/ci-test-so/v1-matcher.so
+          INDEP_P2_MATCHER_SO: /tmp/ci-test-so/p2-matcher.so
+          P2_MATCHER_SO: ${{ github.workspace }}/percolator-match/target/deploy/percolator_match.so
+          CI_TEST_ARTIFACTS_REQUIRED: "1"
         run: ./scripts/ci-test.sh
