@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Kani contracts must not change the program (security review Q2.3, 2026-10-05). Builds the
-# wrapper .so twice with the DEPLOY toolchain (cargo-build-sbf 3.1.15 / platform-tools v1.52):
+# wrapper .so twice with the DEPLOY toolchain (cargo-build-sbf 3.1.15 or the byte-identical 3.1.14 / platform-tools v1.52):
 # once from this tree, once from a copy with every `#[cfg_attr(kani, ...)]` attribute line
 # stripped from src/, and fails unless the two .so files are byte-identical.
 # Local: ./scripts/kani-contracts-bytecheck.sh        CI: job `kani-contracts-bytecheck`.

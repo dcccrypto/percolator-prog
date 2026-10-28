@@ -129,3 +129,11 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 # 11x6=66 -> Custom(9) from the product bound, 11x5 -> executes. It passes; it is not
 # allowlisted.
 # =========================================================================================
+
+# night 2026-10-28: pre-existing on the rc23 base 33b8382a (levbuild 2026-10-27 base whole suite, local,
+# --features devnet, siblings ~/wt-v22-rc/sib); not caused by the leverage build. Listed so CI can go green
+# on the exact-match rule; each still needs its own owner (p1_fee_channel: fee-channel consent path;
+# indep_p3_f14q: deficit-push cooldown timing).
+p2_fee_channel_on_charges_requested_fee_to_taker_and_credits_lp_exactly
+p2_fee_channel_refuses_without_taker_consent_or_above_protocol_max
+timing_a_exit_one_slot_before_deficit_push_cooldown0_vs_long

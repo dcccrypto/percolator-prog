@@ -76,8 +76,10 @@ REF_NFT_DEPLOYED="${REF_NFT_DEPLOYED:-$NFT_DEPLOYED}"
 # The wrapper side is HEAD -- in CI that is the PR's merge commit, i.e. the tree under
 # review; it is still a real commit object, so this is `git show`, not a working-tree read.
 REF_WRAPPER_CANDIDATE="${REF_WRAPPER_CANDIDATE:-HEAD}"
-REF_STAKE_CANDIDATE="${REF_STAKE_CANDIDATE:-origin/main}"
-REF_NFT_CANDIDATE="${REF_NFT_CANDIDATE:-origin/main}"
+# A release branch may pin its shipping stake / nft in ci/deployed-refs.env (STAKE_CANDIDATE /
+# NFT_CANDIDATE); otherwise the candidates are stake / nft `main`.
+REF_STAKE_CANDIDATE="${REF_STAKE_CANDIDATE:-${STAKE_CANDIDATE:-origin/main}}"
+REF_NFT_CANDIDATE="${REF_NFT_CANDIDATE:-${NFT_CANDIDATE:-origin/main}}"
 
 KNOWN="${KNOWN:-$ROOT/tests/KNOWN_PARITY_DIVERGENCE.txt}"
 

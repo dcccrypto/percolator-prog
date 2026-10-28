@@ -174,7 +174,10 @@ cargo build-sbf --features devnet || exit 1
 echo "::endgroup::"
 
 echo "::group::cargo test --no-fail-fast"
-cargo test --no-fail-fast 2>&1 | tee /tmp/ci_test.log | tail -40
+# night 2026-10-28: the flag the comment above calls NOT optional was missing here, so every test
+# binary that names a devnet-only constant (CANONICAL_VAULT_LP_MATCHER_PROGRAM: p3_senior_draw,
+# p3_resolved_lock, indep_p3_*, ...) failed to COMPILE and the job parsed 0 passing tests.
+cargo test --features devnet --no-fail-fast 2>&1 | tee /tmp/ci_test.log | tail -40
 echo "::endgroup::"
 
 # Bare test names, as before, for the allowlist diff.
