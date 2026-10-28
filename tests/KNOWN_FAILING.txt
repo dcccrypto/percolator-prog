@@ -57,8 +57,6 @@
 #    2  v16_nft_e2e                                  [UNDIAGNOSED - tracked]
 #
 # Reducing this list is tracked work, not a licence to ignore failures.
-e2e::e2e_cross_portfolio_substitution_rejects
-e2e::e2e_direct_hook_invocation_rejects
 v16_wrapper_close_portfolio_rejects_non_empty_and_closes_empty
 v16_wrapper_close_slab_requires_admin_resolved_empty_market
 v16_wrapper_domain_withdrawals_reject_admin_before_shutdown_and_accept_secondary_mint
@@ -137,3 +135,9 @@ v16_wrapper_withdraw_insurance_requires_operator_and_healthy_market
 p2_fee_channel_on_charges_requested_fee_to_taker_and_credits_lp_exactly
 p2_fee_channel_refuses_without_taker_consent_or_above_protocol_max
 timing_a_exit_one_slot_before_deficit_push_cooldown0_vs_long
+# night 2026-10-28: e2e::e2e_cross_portfolio_substitution_rejects and e2e::e2e_direct_hook_invocation_rejects REMOVED:
+# they pass in CI now that the job compiles with --features devnet (first green build+test parse since the toolchain 404).
+# NOT allowlisted on purpose: ~25 gate_p1_batch_* / gate_p2_* / p1p2_* / p1_* / growth_off_is_byte_for_byte_legacy /
+# p3_p2_negotiated_fee_* tests fail in CI only because CI does not provide the V1 / P2 matcher and deployed-growth-wrapper
+# .so files (V1_MATCHER_SO, P2_MATCHER_SO, GROWTH_BASE_SO); they pass locally with those set (ledger v22-night-2026-10-28.md).
+# Follow-up: build / fetch those artifacts in the job instead of hiding the tests here.
