@@ -44586,6 +44586,14 @@ pub mod processor {
         if band == lg::AgeBand::NoOpen {
             return refuse("age_under_6h");
         }
+        // Night audit 2026-10-28 (F3): while a W1 round is live, no fill may grow the LP's net.
+        // Otherwise a user cut by the round (touched: never cut again in it) or a new account
+        // re-opens against the LP right away and the round can never bring the LP to target.
+        if lg::w1_round_live(gd.round_active, gd.round_open_slot, now)
+            && lp_after.unsigned_abs() > lp_before.unsigned_abs()
+        {
+            return refuse("lp_stop_round");
+        }
         let overflow = || ProgramError::from(PercolatorError::EngineArithmeticOverflow);
         let c_m = vault_lp_v18::conservative_equity(
             lp.header.capital.get(),
@@ -44907,9 +44915,20 @@ pub mod processor {
         if lp_ai.key.to_bytes() != st.lp_portfolio {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
-        let allocated_total = match ext_ai {
-            Some(x) if !x.data_is_empty() => load_vault_lp_ext(program_id, x, market_ai.key)?.allocated_total_atoms,
-            _ => 0,
+        // Night audit 2026-10-28 (F2): the ext is REQUIRED at its PDA. Optional, a caller could
+        // drop it (allocated_total read 0, `flow_in` went backwards, the epoch restarted at 1.0 and
+        // the peak / reference were wiped: a permissionless reset that masks any loss) or drop it
+        // once and pass it the next time (the whole allocated total read as one inflow, a false
+        // trip). Empty only when the ext does not exist yet (nothing allocated).
+        let ext_ai = ext_ai.ok_or(PercolatorError::VaultLpNotBound)?;
+        let (ext_pda, _) = state::derive_vault_lp_ext(program_id, market_ai.key);
+        if *ext_ai.key != ext_pda {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        let allocated_total = if ext_ai.data_is_empty() {
+            0
+        } else {
+            load_vault_lp_ext(program_id, ext_ai, market_ai.key)?.allocated_total_atoms
         };
         let flow_in = st
             .junior_deposited_atoms
@@ -45086,6 +45105,14 @@ pub mod processor {
         let nav = lg::nav_sample(&gd.nav(), eq, fin, fout, now);
         gd.set_nav(&nav);
         let (lp_net, target, min_leg_q, users_opp) = lev_w1_market_state(market_ai, lp_ai, a, eq)?;
+        if gd.round_active == 1 && !lg::w1_round_live(gd.round_active, gd.round_open_slot, now) {
+            // F4: a stale round (older than W1_ROUND_SLOTS) is replaced: if the stop still holds a
+            // fresh round opens below with k from the book as it is now.
+            solana_program::log::sol_log(&alloc::format!("lev_w1_round_stale id={}", gd.round_id));
+            gd.round_active = 0;
+            gd.round_keep_bps = 0;
+            gd.touched_n = 0;
+        }
         if gd.round_active == 0 {
             if !lg::lp_stop_triggered(&nav) {
                 return Err(PercolatorError::LpStopNotTriggered.into());
@@ -45103,6 +45130,7 @@ pub mod processor {
             gd.round_keep_bps = keep;
             gd.round_lp_long = u8::from(lp_net > 0);
             gd.round_target_q = target.to_le_bytes();
+            gd.round_open_slot = now;
             gd.touched_n = 0;
             solana_program::log::sol_log(&alloc::format!(
                 "lev_w1_round_open id={} keep_bps={} lp_net={} target={} navps={}",

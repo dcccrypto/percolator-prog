@@ -472,9 +472,17 @@ pub fn nav_epoch_start(equity: u128, flow_in: u128, flow_out: u128, now: u64) ->
 
 /// One sample. `equity` is the vault LP's conservative equity now; `flow_in` / `flow_out` the
 /// MONOTONIC cumulative atoms moved into / out of the LP by deposits, allocations, draws (in)
-/// and withdrawals, recalls (out). The economic value at the sample is `equity - (Δin - Δout)`
-/// (every flow in the interval is treated as arriving at its end, so a deposit can never mask
-/// a loss and a withdrawal can never fake one), and `navps' = navps · econ / last_equity`.
+/// and withdrawals, recalls (out). Pure flows never move the index.
+///
+/// The program cannot see WHEN in the interval a flow landed, so a P&L in the same interval has
+/// two readings: flows at the END (`econ = equity − Δin + Δout`, `navps' = navps·econ/last`) or at
+/// the START (`navps' = navps·equity/(last + Δin − Δout)`). The index takes the HIGHER one
+/// (night audit 2026-10-28, F1): D-b requires that flows can never trip the stop, and the
+/// end-only reading let a routine inflow (an Earn allocation, a creator top-up) followed by a
+/// small loss read as a loss of the PRE-flow equity (a 6 % loss after a 9× allocation read as
+/// 60 %), firing W1 against healthy users. For a pure outflow the end reading is already the
+/// higher one, so withdrawals behave as before. Residual: a loss in the same interval as an
+/// inflow is measured against the larger base (bounded masking; exact needs a sample at the flow).
 ///
 /// Epoch restart (fresh 1.0): no previous equity (first capital), or the index reached 0 (the
 /// LP was wiped; D-i "epoch start"), or a counter went backwards (data fault: fail to a clean
@@ -485,9 +493,19 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
     }
     let din = flow_in - st.last_in;
     let dout = flow_out - st.last_out;
-    // econ = equity - din + dout, clamped at 0 (a loss beyond everything reads as 0).
+    // End reading: econ = equity - din + dout, clamped at 0 (a loss beyond everything reads as 0).
     let econ = equity.saturating_add(dout).saturating_sub(din);
-    let navps = mul_div_floor_sat(st.navps, econ, st.last_equity);
+    let mut navps = mul_div_floor_sat(st.navps, econ, st.last_equity);
+    if din != 0 || dout != 0 {
+        // Start reading (F1): the flows joined the base before the P&L. The higher reading wins.
+        let base = st.last_equity.saturating_add(din).saturating_sub(dout);
+        if base != 0 {
+            let start = mul_div_floor_sat(st.navps, equity, base);
+            if start > navps {
+                navps = start;
+            }
+        }
+    }
     let mut n = *st;
     n.navps = navps;
     n.last_equity = equity;
@@ -578,6 +596,15 @@ pub fn w1_target_q(c_m: u128, lambda_eff_bps: u32, price_e6: u64, pos_scale: u12
 pub const W1_TOUCHED_CAP: usize = 512;
 pub fn key_tag(key: &[u8; 32]) -> u64 {
     u64::from_le_bytes([key[0], key[1], key[2], key[3], key[4], key[5], key[6], key[7]])
+}
+/// Night audit 2026-10-28 (F4): a W1 round lives at most one hour. While live it blocks every
+/// fill that grows the LP's net (F3); once stale the next W1 call closes it and, if the stop
+/// still holds, opens a fresh round with `k` from the book as it is then (so more than
+/// `W1_TOUCHED_CAP` opposing accounts, or an account the keeper never reached, cannot wedge the
+/// market: liveness).
+pub const W1_ROUND_SLOTS: u64 = SLOTS_PER_HOUR;
+pub fn w1_round_live(round_active: u8, round_open_slot: u64, now: u64) -> bool {
+    round_active == 1 && now.saturating_sub(round_open_slot) <= W1_ROUND_SLOTS
 }
 pub fn touched_contains(set: &[u64], n: usize, tag: u64) -> bool {
     set.iter().take(n).any(|t| *t == tag)
@@ -726,11 +753,14 @@ pub struct LevGuardV22 {
     // ── W1 round ──
     pub round_id: u64,          // 312
     pub round_target_q: [u8; 16], // 320..336
+    /// Night audit 2026-10-28 (F4): the slot the open round started. A round older than
+    /// `W1_ROUND_SLOTS` is stale: it no longer blocks opens and the next W1 call replaces it.
+    pub round_open_slot: u64,     // 336..344
 }
-/// The record proper (336 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
+/// The record proper (344 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
 /// in the account body as `W1_TOUCHED_CAP` LE u64 tags, read and written in place
 /// (`touched_has_in`, `touch_in`), never copied onto the stack.
-pub const LEV_GUARD_REC_LEN: usize = 336;
+pub const LEV_GUARD_REC_LEN: usize = 344;
 pub const LEV_GUARD_TOUCHED_LEN: usize = 8 * W1_TOUCHED_CAP;
 pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
 const _: () = assert!(core::mem::size_of::<LevGuardV22>() == LEV_GUARD_REC_LEN);
@@ -740,6 +770,7 @@ const _: () = assert!(core::mem::offset_of!(LevGuardV22, pb_last_px) == 112);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, frozen_n_q) == 168);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, navps) == 184);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_id) == 312);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_open_slot) == 336);
 
 impl LevGuardV22 {
     pub fn report(&self) -> RiskReport {
@@ -1193,11 +1224,19 @@ mod tests {
         s = nav_sample(&s, 1_000, 10_000, 9_000, 20);
         assert_eq!(s.navps, NAV_ONE);
         assert!(!lp_stop_triggered(&s));
-        // deposit + loss in one interval: the deposit cannot mask the loss
+        // deposit + loss in one interval (F1): the deposit cannot TRIP the stop. The loss is read
+        // against the post-deposit base (600 of 6,000), not as 60 % of the pre-deposit 1,000.
         let s0 = nav_epoch_start(1_000, 0, 0, 0);
         let s1 = nav_sample(&s0, 1_000 - 600 + 5_000, 5_000, 0, 10); // lost 600, deposited 5,000
+        assert_eq!(s1.navps, NAV_ONE * 5_400 / 6_000);
+        assert!(!lp_stop_triggered(&s1));
+        // the same loss with no flow in the interval still trips
+        let s1 = nav_sample(&s0, 1_000 - 600, 0, 0, 10);
         assert_eq!(s1.navps, NAV_ONE * 400 / 1_000);
         assert!(lp_stop_triggered(&s1));
+        // a loss bigger than the whole post-deposit base still reads as a stop
+        let s1 = nav_sample(&s0, 2_500, 5_000, 0, 10); // 6,000 -> 2,500
+        assert!(lp_stop_triggered(&s1), "navps {}", s1.navps);
         // withdraw then loss: the withdrawal cannot fake a loss
         let s1 = nav_sample(&s0, 1_000 - 900, 0, 900, 10); // withdrew 900, no P&L
         assert_eq!(s1.navps, NAV_ONE);
@@ -1263,6 +1302,45 @@ mod tests {
         let b2 = nav_sample(&NavState { last_in: 10, ..b }, 1_000, 5, 0, 6);
         assert_eq!(b2.navps, NAV_ONE);
         assert!(!lp_stop_triggered(&NavState::default()));
+    }
+
+    /// Night audit F1 regression: an inflow followed (in the same sample interval) by a loss that
+    /// is under 50 % of the POST-inflow base never trips the stop, for any inflow multiple. On the
+    /// end-only reading a 9x allocation then a 6 % loss read as NAV/share 0.4 (stop).
+    #[test]
+    fn nav_inflow_then_small_loss_never_trips_f1() {
+        let s0 = nav_epoch_start(1_000, 0, 0, 0);
+        // the concrete case: 1,000 + 9,000 allocated, then 6 % of 10,000 lost
+        let s1 = nav_sample(&s0, 10_000 - 600, 9_000, 0, 10);
+        assert_eq!(s1.navps, NAV_ONE * 9_400 / 10_000);
+        assert!(!lp_stop_triggered(&s1));
+        for mult in [1u128, 2, 5, 9, 50, 1_000] {
+            let f = 1_000 * mult;
+            for loss_pct in [1u128, 10, 25, 40, 49] {
+                let x = (1_000 + f) * loss_pct / 100;
+                let s1 = nav_sample(&s0, 1_000 + f - x, f, 0, 10);
+                assert!(!lp_stop_triggered(&s1), "inflow {f} loss {x}: navps {}", s1.navps);
+            }
+            // >= 50 % of the post-inflow base: still a stop
+            let x = (1_000 + f) * 51 / 100;
+            let s1 = nav_sample(&s0, 1_000 + f - x, f, 0, 10);
+            assert!(lp_stop_triggered(&s1), "inflow {f} loss {x}: navps {}", s1.navps);
+        }
+        // an outflow interval is unchanged (end reading): a loss after a withdrawal reads against
+        // the pre-withdrawal base, as before the fix
+        let s1 = nav_sample(&s0, 1_000 - 100 - 450, 0, 100, 10);
+        assert_eq!(s1.navps, NAV_ONE * 550 / 1_000);
+    }
+
+    /// Night audit F4: a round is live for one hour after it opens, then stale.
+    #[test]
+    fn w1_round_liveness_window_f4() {
+        assert!(!w1_round_live(0, 100, 100));
+        assert!(w1_round_live(1, 100, 100));
+        assert!(w1_round_live(1, 100, 100 + W1_ROUND_SLOTS));
+        assert!(!w1_round_live(1, 100, 101 + W1_ROUND_SLOTS));
+        // a clock behind the open slot reads live (fail closed: keeps blocking LP-growing opens)
+        assert!(w1_round_live(1, 100, 50));
     }
 
     #[test]
