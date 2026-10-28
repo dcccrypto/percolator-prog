@@ -78,6 +78,10 @@ pub mod f1_refresh_liq_v22;
 /// stake. See `~/percolator-ops/ledger/v22-levbuild-2026-10-27.md`.
 pub mod lev_guard_v22;
 
+/// v2.2 decision 1 (night 2026-10-28, plan P3): the volatility-derived engine profile, PURE and
+/// NOT WIRED (an owner decision; it loosens low-σ majors). `lev_profile_v22::profile_for_sigma_bps`.
+pub mod lev_profile_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
