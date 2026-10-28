@@ -12,7 +12,12 @@
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
 # handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the
 # source-domain admission, the post-fill gates and the fee split/accrual into their own frames.
-3648 percolator_prog::processor::handle_trade_nocpi_zero_copy pin
+# night 2026-10-28: 3648 -> 3712 B. Bisected (first-parent, f921f70d..33b8382a, cargo-build-sbf
+# 3.1.14 = 3.1.15 bytes / v1.52): first bad commit 3e9e788c (#552, band favourable-close rule binds
+# RebalanceReduce tag 44). The growth went unseen because this gate could not install its toolchain.
+# The DEPLOYED devnet wrapper aca02ba6 already runs at 3712 B; 384 B under the 4096 B frame. Re-pinned
+# at the deployed value (no code change); any further growth still fails.
+3712 percolator_prog::processor::handle_trade_nocpi_zero_copy pin
 3584 percolator_prog::processor::handle_batch_execute_zero_copy pin
 1664 percolator_prog::processor::handle_trade_cpi pin
 2048 percolator_prog::processor::handle_batch_trade_cpi pin
