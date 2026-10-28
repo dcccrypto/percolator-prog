@@ -78,8 +78,8 @@ pub mod f1_refresh_liq_v22;
 /// stake. See `~/percolator-ops/ledger/v22-levbuild-2026-10-27.md`.
 pub mod lev_guard_v22;
 
-/// v2.2 decision 1 (night 2026-10-28, plan P3): the volatility-derived engine profile, PURE and
-/// NOT WIRED (an owner decision; it loosens low-σ majors). `lev_profile_v22::profile_for_sigma_bps`.
+/// v2.2 decision 1 (night 2026-10-28, plan P3): the volatility-derived engine profile. Day1: wired into
+/// the guarded-open gate as a TIGHTEN-ONLY floor, OFF by default (`lev_profile_v22::VOL_PROFILE_LIVE`).
 pub mod lev_profile_v22;
 
 pub mod constants {
@@ -44805,10 +44805,10 @@ pub mod processor {
         let ov = lg::merge_overlay(band, &gd.report(), &gd.perm(), now);
         let mmr = group.header.config.maintenance_margin_bps.get();
         let engine_imr = group.header.config.initial_margin_bps.get();
-        // Leverage: L_trader with the dump term, the report cap, m_oracle, the freeze; floored
-        // at L_floor and never above the existing ceiling. σ carries the burst memory (decision 28).
+        // Leverage: L_trader (dump term, report cap, m_oracle, freeze), floored at L_floor, never above the ceiling; σ = burst memory (dec. 28). Day1 (dec. 1): + the vol profile as a TIGHTEN-ONLY floor, OFF (`lev_profile_v22::open_gate_floor`); the short cap below keeps the raw MMR.
         let sigma_lev = lev_burst_sigma(&mut gd, &g, now);
-        let l_tr = lg::l_trader_x100(mmr, sigma_lev, ov.j_dump_bps);
+        let (mmr_lev, imr_floor) = crate::lev_profile_v22::open_gate_floor(mmr, || g.vol_has_data().then(|| lg::burst_var_eff(gd.burst_var_peak_x100, gd.burst_peak_slot, g.vol_var_x100(), now)));
+        let l_tr = lg::l_trader_x100(mmr_lev, sigma_lev, ov.j_dump_bps);
         let l_eff = lg::l_overlay_x100(
             l_now,
             l_tr,
@@ -44817,7 +44817,7 @@ pub mod processor {
             if frozen { Some(gd.frozen_l_x100) } else { None },
             g.l_tier_x100,
         );
-        let imr = growth_v19::ceiling_imr_bps(engine_imr, l_eff).ok_or_else(overflow)?;
+        let imr = growth_v19::ceiling_imr_bps(engine_imr, l_eff).ok_or_else(overflow)?.max(imr_floor);
         let notional = vault_lp_v18::notional_atoms(taker_after.unsigned_abs(), price, percolator::POS_SCALE)
             .ok_or_else(overflow)?;
         let taker_eq = vault_lp_v18::conservative_equity(

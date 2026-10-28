@@ -111,6 +111,10 @@ jobs:
       - name: byte-diff the .so with and without the Kani contracts
         working-directory: percolator-prog
         run: ./scripts/kani-contracts-bytecheck.sh
+      # Day1 2026-10-28 (decision 1): the vol profile is wired TIGHTEN-ONLY and OFF; OFF must be the unwired .so.
+      - name: byte-diff the .so with the vol profile wired-but-OFF vs unwired
+        working-directory: percolator-prog
+        run: ./scripts/vol-profile-off-bytecheck.sh
 
   test:
     name: build + test

@@ -6030,3 +6030,52 @@ fn lev_guard_burst_memory_holds_leverage_down_after_a_burst() {
     lgt::tg(&mut env, &t2, &lp, lgt::usd_q(over)).expect("memory decayed: the burst no longer binds");
     env.assert_conservation();
 }
+
+/// Day1 2026-10-28 (decision 1, P3): the volatility profile is a TIGHTEN-ONLY floor on the guarded-open
+/// gate, OFF by default (`lev_profile_v22::VOL_PROFILE_LIVE`). At σ_day ≈ 80 %/day the profile's MMR (860)
+/// is above the market's (500), so it WOULD bind: an open sized between L(ON) and L(OFF).
+/// OFF (the shipped build): it lands, exactly as the unwired gate (and the .so is byte-identical to the
+/// unwired one, scripts/vol-profile-off-bytecheck.sh). ON (a build with the switch flipped): it is refused
+/// "leverage", and an open under L(ON) still lands. The test reads the switch from the same source tree
+/// the .so is built from, so it asserts the right half in either build.
+#[test]
+fn lev_guard_vol_profile_floor_off_is_unchanged_on_only_tightens() {
+    use percolator_prog::{growth_v19 as gv, lev_guard_v22 as lg, lev_profile_v22 as vp};
+    let (mut env, lp) = lgt::world(lg::AGE_MONTH_SLOTS);
+    for i in 0..8u64 {
+        env.warp(20);
+        env.push(if i % 2 == 0 { PRICE + PRICE / 1000 } else { PRICE });
+    }
+    assert!(env.growth().vol_has_data(), "volatility data after a few pushes");
+    // var 29_630 -> σ_day = ceil(sqrt(29_630 * 2_160)) = 8_001 bps -> band 256, profile MMR 860 / IMR 946
+    let v: u32 = 29_630;
+    assert!(v > env.growth().vol_var_x100(), "the burst floor dominates today's variance");
+    let now = env.slot;
+    lgt::poke_guard(&mut env, |gd| {
+        gd.burst_var_peak_x100 = v * lg::BURST_VAR_FLOOR_DIV;
+        gd.burst_peak_slot = now;
+    });
+    assert_eq!(vp::profile_mmr_imr_for_var(Some(v)), Some((860, 946)));
+    let s1h = Some(gv::sigma_h_bps(v, lg::SLOTS_PER_HOUR));
+    let fl = lg::l_floor_x100(env.growth().l_tier_x100);
+    let l_off = core::cmp::max(fl, lg::l_trader_x100(MMR, s1h, 0)) as i128;
+    let l_on = core::cmp::max(fl, lg::l_trader_x100(860, s1h, 0)) as i128;
+    assert!(l_on * 105 < l_off * 100 && l_off < 500, "the profile would bind here: L(ON) {l_on} vs L(OFF) {l_off}");
+    // the wiring's numbers: OFF is the unwired (MMR, no IMR floor); ON lifts both
+    let want = if vp::VOL_PROFILE_LIVE { (860, 946) } else { (MMR, 0) };
+    assert_eq!(vp::open_gate_floor(MMR, || Some(v)), want);
+    let mid = (l_on + l_off) / 2;
+    let t = env.trader(1_000 * USD);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(1_000 * mid / 100));
+    if vp::VOL_PROFILE_LIVE {
+        assert!(lgt::has(&r, lgt::REFUSED) && r.as_ref().unwrap_err().contains("leverage"), "ON: {mid} over L(ON) {l_on}: {r:?}");
+        let t2 = env.trader(1_000 * USD);
+        lgt::tg(&mut env, &t2, &lp, lgt::usd_q(1_000 * l_on / 100 * 85 / 100)).expect("ON: under L(ON) lands");
+    } else {
+        r.unwrap_or_else(|e| panic!("OFF: {mid} (L(ON) {l_on} < it < L(OFF) {l_off}) must land as on the unwired gate: {e}"));
+        // and OFF still refuses just over L(OFF): the gate itself is unchanged, not removed
+        let t2 = env.trader(1_000 * USD);
+        let r2 = lgt::tg(&mut env, &t2, &lp, lgt::usd_q(1_000 * l_off / 100 * 110 / 100));
+        assert!(lgt::has(&r2, lgt::REFUSED), "OFF: over L(OFF) {l_off} refused: {r2:?}");
+    }
+}
