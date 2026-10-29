@@ -457,7 +457,14 @@ pub fn rescue_bound_readings(
 // ── Item 5: rescue tranche ─────────────────────────────────────────────────────────────────────
 
 /// Below `RESCUE_NAV_FLOOR_BPS` of par the vault is dead: resolve or wind down, never rescue.
-pub const RESCUE_NAV_FLOOR_BPS: u16 = 500;
+///
+/// D23 / #595: 50% (was 5%). A bound rescue grows the senior claim by `dc = floor(m * C / S)` with
+/// `m = floor(x * S / v)`, i.e. `dc <= x * C / v`. With `v >= C / 2` that is at most `2x`: the
+/// claim can never grow by more than twice the money actually paid in (at the old 5% floor and
+/// `x = 10 v` it was up to 20x: C -> 11 C on 0.5 C of real money, with bonds, the junior floor
+/// and the tag-98 recall limit all measured against a claim nobody paid in). Below 50% of par
+/// the vault winds down instead of being rescued.
+pub const RESCUE_NAV_FLOOR_BPS: u16 = 5_000;
 /// Smallest rescue (100 units of a 6-decimal collateral).
 pub const RESCUE_MIN_ATOMS: u128 = 100_000_000;
 /// Largest rescue relative to the certified impaired value: `x <= 10 * v`.

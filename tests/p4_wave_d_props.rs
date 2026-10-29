@@ -44,7 +44,7 @@ proptest! {
         v_frac in 500u128..10_000,
         x_mult in 1u128..1_000,
     ) {
-        let v = c * v_frac / 10_000; // 5% <= v/C < 100%
+        let v = c * v_frac / 10_000; // 5% <= v/C < 100%; only v/C >= 50% (D23 floor) is admitted below
         let x = (v / 100).max(p4::RESCUE_MIN_ATOMS) * x_mult / 10;
         prop_assume!(v > 0 && v < c);
         if p4::rescue_admitted(x, v, c, s).is_err() {
@@ -57,6 +57,27 @@ proptest! {
         prop_assert!(p4::rescue_par_per_share_not_raised(c, s, m, dc), "par per share");
         prop_assert!(m >= floor(x, s, c), "never above par");
         prop_assert!(v >= c * p4::RESCUE_NAV_FLOOR_BPS as u128 / 10_000, "floor");
+    }
+
+    /// D23 / #595: the gearing bound. On every ADMITTED rescue the senior claim grows by at most
+    /// 2x the atoms paid in (`dc <= 2x`, plus the floor-rounding atom): `dc = floor(m * C / S)` with
+    /// `m = floor(x * S / v)` so `dc <= x * C / v`, and the floor keeps `v >= C / 2`.
+    #[test]
+    fn rescue_claim_grows_at_most_twice_the_money_in(
+        c in 1_000_000u128..1u128 << 60,
+        s in 1u128..1u128 << 60,
+        v_frac in 1u128..10_000,
+        x_mult in 1u128..1_000,
+    ) {
+        let v = c * v_frac / 10_000;
+        prop_assume!(v > 0 && v < c);
+        let x = (v / 100).max(p4::RESCUE_MIN_ATOMS) * x_mult / 10;
+        if p4::rescue_admitted(x, v, c, s).is_err() {
+            return Ok(());
+        }
+        let m = p4::rescue_shares(x, s, v).unwrap();
+        let dc = p4::rescue_claim_delta(m, c, s).unwrap();
+        prop_assert!(dc <= 2 * x, "claim grew {dc} on {x} paid in (v {v}, C {c})");
     }
 
     /// Rescue, then a random later loss or recovery of the vault value: the rescuer and the
