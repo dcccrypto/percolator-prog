@@ -732,6 +732,20 @@ fn fork_clone_state(f: &Fork) -> Fork {
 }
 
 /// Review I-1: the dust bound is one whole unit of the market's collateral mint.
+/// D24 / #554: the pure threshold predicate. Strict, on the WORSE side, at exactly 99% of ADL_ONE.
+#[test]
+fn d24_wind_down_threshold_predicate_is_strict_on_the_worse_side() {
+    let t = ADL_ONE / 100 * 99;
+    assert_eq!(state::ADL_WIND_DOWN_A_THRESHOLD_BPS, 9_900);
+    assert!(!state::adl_wind_down_a_below_threshold(ADL_ONE, ADL_ONE), "a healthy market is never below");
+    assert!(!state::adl_wind_down_a_below_threshold(ADL_ONE, ADL_ONE - 1), "one step below ADL_ONE is shallow");
+    assert!(!state::adl_wind_down_a_below_threshold(t, ADL_ONE), "exactly 99% is not below (strict)");
+    assert!(!state::adl_wind_down_a_below_threshold(ADL_ONE, t), "either side");
+    assert!(state::adl_wind_down_a_below_threshold(t - 1, ADL_ONE), "one below 99% on the long side");
+    assert!(state::adl_wind_down_a_below_threshold(ADL_ONE, t - 1), "one below 99% on the short side");
+    assert!(state::adl_wind_down_a_below_threshold(percolator::MIN_A_SIDE, ADL_ONE), "the engine floor is far below");
+}
+
 #[test]
 fn p2b_dust_bound_scales_with_collateral_decimals() {
     assert_eq!(state::adl_wind_down_dust_notional_atoms(6), 1_000_000);
