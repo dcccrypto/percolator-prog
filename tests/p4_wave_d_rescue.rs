@@ -904,7 +904,8 @@ fn rescue_refused_when_not_impaired() {
     assert_eq!(shares_of(&env, r.lp_ata), 0);
 }
 
-/// RS-3 (I-RS4): below the 5% NAV floor the vault is dead: 115, never a rescue.
+/// RS-3 (I-RS4): far below the NAV floor (here 2.5% of par; the floor is 50% since D23 / #595) the
+/// vault is dead: 115, never a rescue.
 #[test]
 fn rescue_refused_below_nav_floor() {
     // Exit NAV = 2P - consumed; 5% of par = 0.1 P. consumed = 1.95 P leaves 0.05 P.
@@ -917,6 +918,39 @@ fn rescue_refused_below_nav_floor() {
     let r = new_actor(&mut env, &v);
     let res = try_rescue(&mut env, &r, 200_000_000, 1);
     assert!(res.as_ref().err().map_or(false, |e| has_code(e, RESCUE_NAV_FLOOR)), "{res:?}");
+}
+
+/// D23 / #595: the rescue floor is 50% of par (was 5%). A rescue grows the senior claim by
+/// `x * C / v`, so with `v >= C / 2` it can never grow it by more than 2x the money paid in (at
+/// 5% it was up to 20x). At 40% of par the vault must wind down instead: 115, nothing moves.
+#[test]
+fn d23_rescue_refused_at_40_percent_of_par() {
+    // Exit NAV = 2P - consumed; par = 2P. consumed = 1.2 P leaves 0.8 P = 40% of par.
+    let consumed = 1_200_000_000u128;
+    let (mut env, v) = otc_env(DOMAIN, P);
+    consume_pot_backing(&mut env, SIBLING_DOMAIN, consumed - P);
+    let (l0, l1) = (v.ledger, v.sibling_ledger);
+    book_synced_impairment(&mut env, l0, P);
+    book_synced_impairment(&mut env, l1, consumed - P);
+    assert_eq!(exit_nav(&env, &v), 2 * P - consumed, "vacuity: the exit reading is 40% of par");
+    let r = new_actor(&mut env, &v);
+    let vault0 = token_amount(&env.svm, env.vault_token);
+    let res = try_rescue(&mut env, &r, 200_000_000, 1);
+    assert!(res.as_ref().err().map_or(false, |e| has_code(e, RESCUE_NAV_FLOOR)), "40% of par must be refused with 115: {res:?}");
+    assert_eq!(token_amount(&env.svm, env.vault_token), vault0, "nothing moved");
+    assert_eq!(shares_of(&env, r.lp_ata), 0);
+}
+
+/// D23 / #595: just above the new floor a rescue is still admitted, and the claim it creates is at
+/// most 2x the money paid in: at 60% of par (v = 1.2 P of par 2 P) a rescue is allowed.
+#[test]
+fn d23_rescue_allowed_at_60_percent_of_par() {
+    let consumed = 800_000_000u128; // 2P - 0.8P = 1.2P = 60% of par
+    let (mut env, v) = impaired(consumed);
+    assert_eq!(exit_nav(&env, &v), 2 * P - consumed, "vacuity: the exit reading is 60% of par");
+    let r = new_actor(&mut env, &v);
+    try_rescue(&mut env, &r, 200_000_000, 1).expect("60% of par is above the floor: rescue admitted");
+    assert!(shares_of(&env, r.lp_ata) > 0, "shares minted");
 }
 
 /// RS-4: amount bounds [100e6, 10 v] and the rescuer's slippage floor (min_shares).
