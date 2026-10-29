@@ -1908,10 +1908,28 @@ pub fn log2_q16(x: u64) -> Option<u32> {
 
 /// The 16 fractional binary digits of `log2(m / 2^31)` for a Q.31 mantissa `m in [2^31, 2^32)`
 /// (`log2_q16`'s fraction; a named function so Kani can replace it by its proven properties).
-/// Result `< 2^16`, monotone non-decreasing in `m`, 0 at `m = 2^31`. Requires `m < 2^32`
-/// (`log2_q16` passes the normalised mantissa): every product below is then `< 2^64`.
+/// Result `< 2^16`, monotone non-decreasing in `m`, 0 at `m = 2^31`.
+///
+/// GH#596: TOTAL. The loop's invariant is `m in [2^31, 2^32)`; outside it `m * m` would exceed
+/// `u64` and `wrapping_mul` (chosen for CU over `checked_mul`) would wrap SILENTLY, since the
+/// `debug_assert!` below is compiled out of the deployed program. The two lines that open the
+/// body clamp `m` into the domain, so a caller that does not normalise gets the domain's
+/// nearer endpoint rather than a wrapped answer. The clamp is IDENTITY on the domain, so every
+/// value `log2_q16` passes is
+/// bit-identical to before (the SDK's bit-exact port and the curve parity fixture are
+/// unaffected). Cost is two ALU ops, once, outside the loop.
 #[inline(always)]
-pub fn log2_frac_q16(mut m: u64) -> u32 {
+pub fn log2_frac_q16(m: u64) -> u32 {
+    // Identity for every `m` in [2^31, 2^32); SATURATES anything else to the nearer endpoint.
+    // A clamp, not a mask: it keeps the function MONOTONE NON-DECREASING over all of u64
+    // (masking would send 2^32 below 2^32 - 1), which is the property `log2_q16` relies on.
+    let mut m = if m < 1u64 << 31 {
+        1u64 << 31
+    } else if m >= 1u64 << 32 {
+        (1u64 << 32) - 1
+    } else {
+        m
+    };
     let mut frac: u32 = 0;
     let mut i = 0;
     while i < LOG2_FRAC_BITS {
@@ -3127,6 +3145,103 @@ mod tests {
     }
 
     use super::*;
+
+    // ── GH#596: `log2_frac_q16` is TOTAL, and unchanged on its domain ───────────────────────
+    //
+    // The loop needs `m in [2^31, 2^32)` or `m.wrapping_mul(m)` wraps SILENTLY: the
+    // `debug_assert!` that documented the precondition is compiled out of the deployed
+    // program. The fix clamps into the domain. These pin both halves -- the clamp is identity
+    // on the domain (so the SDK's bit-exact port and the curve parity fixture are untouched),
+    // and off the domain the answer is a domain endpoint rather than a wrapped value.
+
+    /// The PRE-FIX body, verbatim. Any divergence on the domain would mean the fix changed a
+    /// value `log2_q16` can actually pass.
+    fn log2_frac_q16_prefix_reference(mut m: u64) -> u32 {
+        let mut frac: u32 = 0;
+        let mut i = 0;
+        while i < LOG2_FRAC_BITS {
+            m = m.wrapping_mul(m) >> 31;
+            frac <<= 1;
+            if m >= 1u64 << 32 {
+                frac |= 1;
+                m >>= 1;
+            }
+            i += 1;
+        }
+        frac
+    }
+
+    #[test]
+    fn gh596_log2_frac_q16_is_bit_identical_on_its_domain() {
+        // no_std: no Vec. Check each family in place.
+        let check = |m: u64| {
+            assert!((1u64 << 31..1u64 << 32).contains(&m), "fixture off the domain: {m}");
+            assert_eq!(
+                log2_frac_q16(m),
+                log2_frac_q16_prefix_reference(m),
+                "the clamp must be identity on the domain (m = {m})",
+            );
+        };
+        // Endpoints and powers of two.
+        for m in [1u64 << 31, (1u64 << 32) - 1, (1u64 << 31) + 1, 3u64 << 30] {
+            check(m);
+        }
+        // An even spread across the domain.
+        for k in 0..64u64 {
+            check((1u64 << 31) + k * (((1u64 << 31) - 1) / 63));
+        }
+        // A deterministic pseudo-random spread.
+        let mut seed = 0x9E3779B97F4A7C15u64;
+        for _ in 0..8192 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            check((1u64 << 31) | (seed >> 33)); // always in [2^31, 2^32)
+        }
+    }
+
+    #[test]
+    fn gh596_log2_frac_q16_is_total_off_its_domain() {
+        // Below the domain: reads as the low endpoint 2^31, whose fraction is 0.
+        for m in [0u64, 1, 42, (1u64 << 31) - 1] {
+            assert_eq!(log2_frac_q16(m), 0, "below the domain must read as 2^31 (m = {m})");
+        }
+        // At or above 2^32, and on arbitrary 64-bit values: always a valid Q.16 fraction.
+        let mut seed = 0x243F6A8885A308D3u64;
+        for _ in 0..8192 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            assert!(log2_frac_q16(seed) < 1u32 << 16, "result left Q.16 (m = {seed})");
+        }
+        // At or above 2^32: saturates to the high endpoint, so the value is the maximum the
+        // function can return -- and monotonicity holds across the whole of u64.
+        let top = log2_frac_q16((1u64 << 32) - 1);
+        for m in [1u64 << 32, (1u64 << 32) + 7, u64::MAX, 1u64 << 63] {
+            assert_eq!(log2_frac_q16(m), top, "above the domain must saturate (m = {m})");
+        }
+        // Monotone non-decreasing over arbitrary u64, the property log2_q16 relies on.
+        let mut prev = 0u32;
+        for k in 0..=64u32 {
+            let m = if k == 64 { u64::MAX } else { 1u64 << k };
+            let got = log2_frac_q16(m);
+            assert!(got >= prev || m < 1u64 << 31, "monotonicity broke at m = {m}");
+            if m >= 1u64 << 31 {
+                prev = got;
+            }
+        }
+    }
+
+    #[test]
+    fn gh596_log2_q16_is_unchanged() {
+        // `log2_q16` normalises before calling, so every input must be bit-identical.
+        assert_eq!(log2_q16(0), None);
+        for x in [1u64, 2, 3, 1024, 1u64 << 40, u64::MAX] {
+            let k = 63 - x.leading_zeros();
+            let m = if k >= 31 { x >> (k - 31) } else { x << (31 - k) };
+            assert_eq!(
+                log2_q16(x),
+                Some((k << LOG2_FRAC_BITS) | log2_frac_q16_prefix_reference(m)),
+            );
+        }
+        assert_eq!(log2_q16(1u64 << 40), Some(40 << 16), "exact at a power of two");
+    }
 
     const PS: u128 = 1_000_000;
 
