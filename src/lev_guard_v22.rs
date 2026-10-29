@@ -524,6 +524,25 @@ pub fn nav_epoch_start(equity: u128, flow_in: u128, flow_out: u128, now: u64) ->
 /// higher one, so withdrawals behave as before. Residual: a loss in the same interval as an
 /// inflow is measured against the larger base (bounded masking; exact needs a sample at the flow).
 ///
+/// GH#627 root cause: "the higher reading wins" also picks the SMALLER base for a gain, and a
+/// base is not bounded below by anything real -- earn `P`, withdraw all but one atom, sample, and
+/// the gain read as `P / 1 atom` (×1e6 per $1, `u128::MAX` in five cycles; a deposit-earn-withdraw
+/// round trip does the same from a dust `last`). The P&L itself is exact,
+/// `P = equity + Δout − Δin − last`; only which capital earned it is unknown, and that capital
+/// was at most `last + Δin` (every inflow there from the start, every outflow leaving at the
+/// end). So the reading is CAPPED at the gross reading `navps·(equity + Δout)/(last + Δin)`:
+///   - a pure flow (`P = 0`) gives `num == den`, the index does not move (D-b unchanged);
+///   - a loss (`P < 0`) reads F1 exactly: the gross reading is the mildest one, so the cap never
+///     binds, and F1 stays NET-based, so a deposit-withdraw round trip cannot dilute a loss;
+///   - a gain (`P > 0`) can never lift the index more than `P` earned on the most capital that
+///     could have earned it, which is at most what the same `P` does with no flow at all
+///     (`(last + P)/last`). No ordering or splitting of flows can amplify a gain, and a near-zero
+///     base can no longer turn a small profit into a huge index gain (and so hide a real stop
+///     behind the D-i reference).
+/// No constant is involved: the bound is the interval's own data. Plain intervals (no flow) are
+/// unchanged; only a gain in the same interval as a flow reads lower than under F1 alone -- and
+/// the keeper / app poke before a flow (D16) makes those intervals exact anyway.
+///
 /// Epoch restart (fresh 1.0): no previous equity (first capital), or the index reached 0 (the
 /// LP was wiped; D-i "epoch start"), or a counter went backwards (data fault: fail to a clean
 /// epoch rather than invent a loss).
@@ -544,6 +563,12 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
             if start > navps {
                 navps = start;
             }
+        }
+        // GH#627: never above the gross reading (see above). The sums are atom counts and cannot
+        // reach 2^128; saturating only keeps the function total.
+        let gross = nav_scale(st.navps, equity.saturating_add(dout), st.last_equity.saturating_add(din));
+        if navps > gross {
+            navps = gross;
         }
     }
     let mut n = *st;
@@ -2033,33 +2058,22 @@ mod tests {
         assert!(!junior_value_allows_allocation(usd(1_800), usd(1_000), usd(400), min));
     }
 
-    /// GH#627: the 50 % test must not read a saturated index as a drawdown. Drives the index to
-    /// `u128::MAX` through the F1 start-reading path the way an LP can -- earn, withdraw to a
-    /// 1-atom base, sample -- then pins that the stop stays OFF and that the honest trigger still
-    /// works at the same extreme.
+    /// GH#627 (#629): the 50 % test must not read a saturated index as a drawdown. The issue's
+    /// path to `u128::MAX` (earn, withdraw to a 1-atom base, sample) is closed at the root by the
+    /// gross-reading cap (`gh627_earn_then_withdraw_to_dust_reads_the_gain_on_the_capital_that_
+    /// earned_it`), so the saturated state is built directly: the predicate must stay correct at
+    /// the extreme on its own, and the honest trigger must still work there.
     #[test]
     fn saturated_navps_is_not_a_drawdown_and_the_reset_still_clears() {
-        const D: u128 = 1_000_000; // 6-decimal collateral: $1 = 1e6 atoms
-        let mut slot = 1_000u64;
-        let mut st = nav_epoch_start(1_000 * D, 0, 0, slot);
-        let (mut fin, mut fout) = (0u128, 0u128);
-        assert_eq!(st.navps, NAV_ONE);
-        let mut cycles = 0;
-        while st.navps != u128::MAX {
-            cycles += 1;
-            assert!(cycles <= 8, "expected saturation within a handful of cycles, not {cycles}");
-            // a pure deposit: the index must not move (flow neutrality)
-            slot += 10;
-            fin += 1_000 * D;
-            let before = st.navps;
-            st = nav_sample(&st, st.last_equity + 1_000 * D, fin, fout, slot);
-            assert_eq!(st.navps, before, "a pure deposit moved the index");
-            // earn $1, then withdraw all but one atom, inside ONE interval: base = 1
-            slot += 10;
-            let out = st.last_equity - 1;
-            fout += out;
-            st = nav_sample(&st, st.last_equity - out + D, fin, fout, slot);
-        }
+        let slot = 1_000u64;
+        let (fin, fout) = (0u128, 0u128);
+        let st = NavState {
+            navps: u128::MAX,
+            peak_cur: u128::MAX,
+            peak_prev: u128::MAX,
+            ref_navps: u128::MAX,
+            ..nav_epoch_start(1_000_000_000, fin, fout, slot)
+        };
         assert_eq!(st.navps, u128::MAX);
         assert_eq!(st.peak(), u128::MAX, "the peak follows the index up");
 
@@ -2083,6 +2097,186 @@ mod tests {
         assert!(lp_stop_triggered(&on_ref), "ref arm: 50 is half of 100");
         let off_ref = NavState { navps: 51, peak_cur: 60, peak_prev: 60, ref_navps: 100, ..st };
         assert!(!lp_stop_triggered(&off_ref));
+    }
+
+    // ── GH#627 root cause: no ordering of flows may amplify a gain ─────────────────────────────
+
+    /// The rc23 reading before the #627 root-cause fix (F1 alone: the higher of the end and the
+    /// start reading), kept as the reference the new rule is compared against.
+    fn f1_reading(st: &NavState, equity: u128, flow_in: u128, flow_out: u128) -> u128 {
+        let din = flow_in - st.last_in;
+        let dout = flow_out - st.last_out;
+        let econ = equity.saturating_add(dout).saturating_sub(din);
+        let mut navps = nav_scale(st.navps, econ, st.last_equity);
+        if din != 0 || dout != 0 {
+            let base = st.last_equity.saturating_add(din).saturating_sub(dout);
+            if base != 0 {
+                let start = nav_scale(st.navps, equity, base);
+                if start > navps {
+                    navps = start;
+                }
+            }
+        }
+        navps
+    }
+
+    /// The interval's P&L is exact, `P = equity + Δout − Δin − last`; only WHICH capital earned it
+    /// is ambiguous. The issue's attack (earn `P`, withdraw all but one atom, sample) used to read
+    /// the gain against a 1-atom base: ×(1+P) per cycle, `u128::MAX` in five. Now the gain is read
+    /// against the most capital that could have earned it, so each cycle moves the index by
+    /// exactly `(E + P) / E` -- what the same P&L does with no flow at all -- and it never
+    /// saturates. Both variants from the issue: $1 earned (pre-D1) and $500 left standing (D1).
+    #[test]
+    fn gh627_earn_then_withdraw_to_dust_reads_the_gain_on_the_capital_that_earned_it() {
+        const D: u128 = 1_000_000; // 6-decimal collateral: $1 = 1e6 atoms
+        for p in [D, 500 * D] {
+            let mut slot = 1_000u64;
+            let e = 1_000 * D;
+            let mut st = nav_epoch_start(e, 0, 0, slot);
+            let (mut fin, mut fout) = (0u128, 0u128);
+            let mut expect = NAV_ONE;
+            for cycle in 1..=50 {
+                // put the capital back (a pure flow: the index must not move)
+                slot += 10;
+                let top_up = e - st.last_equity;
+                fin += top_up;
+                let before = st.navps;
+                st = nav_sample(&st, st.last_equity + top_up, fin, fout, slot);
+                assert_eq!(st.navps, before, "cycle {cycle}: a pure deposit moved the index");
+                // earn P, withdraw all but one atom of the pre-gain capital, ONE interval
+                slot += 10;
+                let out = st.last_equity - 1;
+                fout += out;
+                st = nav_sample(&st, st.last_equity - out + p, fin, fout, slot);
+                expect = mul_div_floor_sat(expect, e + p, e);
+                assert_eq!(st.navps, expect, "cycle {cycle}: the gain is P on E, not P on 1 atom");
+            }
+            assert!(st.navps < u128::MAX / 1_000_000, "50 cycles cannot approach saturation");
+            // and the same P&L with no flow at all moves the index by the same factor
+            let quiet = nav_sample(&nav_epoch_start(e, 0, 0, 0), e + p, 0, 0, 10);
+            assert_eq!(quiet.navps, mul_div_floor_sat(NAV_ONE, e + p, e));
+        }
+    }
+
+    /// The round-trip variant a net-only base cannot see: deposit `X`, earn on it, withdraw it all,
+    /// inside one interval, from a dust `last`. Net flow is `-P`, so `max(last, net base)` would
+    /// still be 1 atom; the gross base `last + Δin` is the capital that was really there.
+    #[test]
+    fn gh627_round_trip_from_dust_does_not_amplify() {
+        const D: u128 = 1_000_000;
+        let st = nav_epoch_start(1, 0, 0, 0); // a 1-atom LP
+        let x = 10_000 * D;
+        let p = 100 * D;
+        // in X, +P on X, out X + P: equity back at 1 atom
+        let n = nav_sample(&st, 1, x, x + p, 10);
+        assert_eq!(n.navps, mul_div_floor_sat(NAV_ONE, 1 + x + p, 1 + x), "+1 % on X, not ×1e8");
+        assert!(f1_reading(&st, 1, x, x + p) > NAV_ONE * 1_000_000, "the F1 reading it replaces");
+    }
+
+    /// Deterministic fuzz over random states and intervals (xorshift, ~200k cases). Invariants:
+    ///  I1 flow neutrality: no P&L ⇒ the index does not move, whatever the flows;
+    ///  I2 no amplification: a gain never lifts the index above the gross reading
+    ///     `(equity + Δout) / (last + Δin)`, hence never above the no-flow reading `(last + P) / last`;
+    ///  I3 losses unchanged: for `P <= 0` the reading is exactly F1's (deposits still cannot trip);
+    ///  I4 no flows ⇒ identical to the rc23 reading (nothing changes in the plain case);
+    ///  I5 monotone in equity: more equity never reads lower (no perverse incentive);
+    ///  I6 a gain never reads below the start: P >= 0 ⇒ navps' >= navps.
+    #[test]
+    fn nav_sample_flow_invariants_fuzz() {
+        let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut gains_changed = 0u64;
+        for i in 0..200_000u64 {
+            // magnitudes from dust to 1e15 atoms ($1e9 at 6 decimals); index from 1 to 1e24
+            let mag = |r: u64, bits: u64| -> u128 { (r % (1u64 << (r % bits).max(1))) as u128 };
+            let last = 1 + mag(next(), 50);
+            let navps = 1 + mag(next(), 62) * (1 + (next() % 1_000_000) as u128);
+            let (lin, lout) = (mag(next(), 60), mag(next(), 60));
+            let st = NavState {
+                navps,
+                last_equity: last,
+                last_in: lin,
+                last_out: lout,
+                peak_cur: navps,
+                peak_prev: navps,
+                bucket_start: 0,
+                ref_navps: navps,
+                last_slot: 0,
+            };
+            let kind = next() % 4;
+            let din = if kind == 1 || kind == 3 { mag(next(), 50) } else { 0 };
+            let dout = if kind == 2 || kind == 3 { mag(next(), 50) % (last + din + 1) } else { 0 };
+            // P in [-(last + din - dout), +2·(last + din)]
+            let cap = last + din - dout;
+            let pnl: i128 = if next() % 2 == 0 {
+                -((next() as u128 % (cap + 1)) as i128)
+            } else {
+                (next() as u128 % (2 * (last + din) + 1)) as i128
+            };
+            let equity = (cap as i128 + pnl) as u128;
+            let n = nav_sample(&st, equity, lin + din, lout + dout, 10);
+            let f1 = f1_reading(&st, equity, lin + din, lout + dout);
+            if pnl == 0 {
+                assert_eq!(n.navps, navps, "I1 case {i}");
+            }
+            let gross = nav_scale(navps, equity + dout, last + din);
+            if pnl > 0 {
+                assert!(n.navps <= gross, "I2 gross case {i}");
+                let no_flow = nav_scale(navps, last + pnl as u128, last);
+                assert!(n.navps <= no_flow, "I2 no-flow case {i}");
+                assert!(n.navps >= navps, "I6 case {i}");
+                if n.navps != f1 {
+                    gains_changed += 1;
+                }
+            } else {
+                assert_eq!(n.navps, f1, "I3 case {i}");
+            }
+            if din == 0 && dout == 0 {
+                assert_eq!(n.navps, f1, "I4 case {i}");
+            }
+            let n_more = nav_sample(&st, equity + 1, lin + din, lout + dout, 10);
+            assert!(n_more.navps >= n.navps, "I5 case {i}");
+        }
+        assert!(gains_changed > 10_000, "the fuzz must exercise the changed branch: {gains_changed}");
+    }
+
+    /// Saturation is unreachable through flows: 10,000 adversarial intervals (any flows, gains up
+    /// to +100 % of the capital that could have earned them) from a 1-atom LP keep the index at or
+    /// below the product of the per-interval gross factors, and that product -- the honest
+    /// compounding of the capital present -- is what it would take to saturate (~89 doublings).
+    #[test]
+    fn nav_index_growth_is_bounded_by_real_returns() {
+        let mut x: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        let mut st = nav_epoch_start(1, 0, 0, 0);
+        let (mut fin, mut fout) = (0u128, 0u128);
+        let mut bound_num_log2 = 0f64;
+        for k in 1..=10_000u64 {
+            let last = st.last_equity.max(1);
+            let din = (next() % 1_000_000_000) as u128;
+            let dout = (next() as u128) % (last + din);
+            // a gain of at most 1 % of the gross capital, the adversary's best ordering applied
+            let gross = last + din;
+            let p = (next() as u128) % (gross / 100 + 1);
+            fin += din;
+            fout += dout;
+            let eq = gross - dout + p;
+            st = nav_sample(&st, eq, fin, fout, k * 10);
+            bound_num_log2 += ((gross + p) as f64 / gross as f64).log2();
+            assert!(st.navps != u128::MAX, "interval {k}: saturated");
+        }
+        let got = (st.navps as f64 / NAV_ONE as f64).log2();
+        assert!(got <= bound_num_log2 + 1e-6, "index {got} above the honest compounding {bound_num_log2}");
     }
 
     /// GH#627 follow-up: the division form is the doubling form wherever `2 · navps` does not
