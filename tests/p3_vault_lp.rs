@@ -6671,3 +6671,158 @@ fn gh627_dust_base_cycle_cannot_hide_a_real_lp_stop() {
     assert!(after.navps <= lg::NAV_ONE / 2, "the honest index crossed half of the reference");
     assert_eq!(after.ref_navps, after.navps, "the stop held: acknowledged, reference reset");
 }
+
+// ── navcheck 2026-10-29: independent review of #630, end to end on the real handlers ───────────
+
+/// THE BUG: an insolvent vault LP reads conservative equity 0, so a sample stores NAV/share 0 --
+/// the deepest stop there is. `nav_sample` restarted the epoch whenever the STORED index (or the
+/// stored equity) was 0, and op 5 samples before deciding: once op 4 had sampled the wipe -- the
+/// keeper's routine poke, which D19 orders BEFORE W1 -- every op 5 restarted at 1.0 and refused
+/// (Custom 135), and the next poke stored the restart and erased the stop for good. Control: the
+/// same wipe with op 5 first fires, so the outcome depended only on who sampled first.
+#[test]
+fn navcheck_a_wiped_lp_fires_w1_even_after_the_poke_sampled_it() {
+    use percolator_prog::lev_guard_v22 as lg;
+    for poke_first in [false, true] {
+        let (mut env, lp, users) = lev_w1::world();
+        lev_w1::lose_capital(&mut env, lp.portfolio, 0, 1);
+        if poke_first {
+            lev_w1::poke(&mut env, &lp).expect("the routine poke samples the wipe");
+            let g = lev_w1::guard(&env).nav();
+            assert_eq!(g.navps, 0, "the wipe reads NAV/share 0");
+            assert!(lg::lp_stop_triggered(&g), "the stored state says: stop");
+            lev_w1::poke(&mut env, &lp).expect("a second routine poke");
+            assert!(lg::lp_stop_triggered(&lev_w1::guard(&env).nav()), "a second poke must not erase the stop");
+        }
+        let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio, users[1].portfolio, users[2].portfolio]);
+        assert!(r.is_ok(), "poke_first {poke_first}: W1 must fire on a wiped LP: {r:?}");
+        assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000), "poke_first {poke_first}: a real cut");
+    }
+}
+
+/// Earn-backed W1 world: 10k senior (pre-bind), 10k creator stake, nothing allocated yet, two users
+/// long (the LP short), guard bound and the NAV epoch started.
+fn navcheck_earn_world() -> (Env, Lp, Vec<Trader>) {
+    let mut env = Env::new(growth_params());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, None).expect("senior (pre-bind)");
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+    let mut users = Vec::new();
+    for (cap, tokens) in [(5_000 * U, 4_000), (5_000 * U, 2_500)] {
+        let t = env.new_trader(cap);
+        env.trade_signing_fee(&t, &lp, tok(GPRICE, tokens), GROWTH_FEE).expect("user long");
+        users.push(t);
+    }
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("NAV epoch start");
+    (env, lp, users)
+}
+
+/// Pre-existing F1 residual (night audit 2026-10-28; #630 does not touch losses), end to end:
+/// tag 103 is PERMISSIONLESS, so after a real loss of more than half of the vault LP (the price
+/// runs against its short) anyone can allocate senior capital into it -- it is still solvent and
+/// the junior still covers the 5 % floor -- and sample in the same breath. The loss is then read
+/// on the larger base, op 5 refuses, and the seniors' 5k sits in an LP whose stop was silenced.
+/// Control: with the routine poke first (the honest ordering) the same loss fires W1.
+/// Pinned as the CURRENT behaviour; only sampling at the flow (v2.3) removes it.
+#[test]
+fn navcheck_residual_f1_permissionless_allocation_masks_a_real_loss() {
+    use percolator_prog::lev_guard_v22 as lg;
+    for poke_first in [true, false] {
+        let (mut env, lp, users) = navcheck_earn_world();
+        let e0 = lev_w1::guard(&env).nav().last_equity;
+        // the price runs +85 % against the LP's 6.5k short: a real, unrealised loss of ~55 %
+        let mut p = GPRICE;
+        let crank: Vec<Pubkey> = [lp.portfolio].into_iter().chain(users.iter().map(|u| u.portfolio)).collect();
+        while p < GPRICE * 185 / 100 {
+            p = (p * 107 / 100).min(GPRICE * 185 / 100);
+            env.move_price(p, &crank);
+        }
+        let (_, eq, _) = env.p2b_v(lp.portfolio);
+        eprintln!("navcheck F1 residual: e0 {e0} equity after the move {eq}");
+        assert!(eq * 2 < e0 && eq * 4 > e0, "a real loss between 50 % and 75 %: {e0} -> {eq}");
+        if poke_first {
+            lev_w1::poke(&mut env, &lp).expect("the honest poke sees the loss first");
+        }
+        env.svm.expire_blockhash();
+        env.allocate(lp.portfolio, u128::MAX).expect("103 by a stranger into a losing, solvent LP");
+        let a = env.allocated();
+        assert_eq!(a, 5_000 * U as u128, "alpha 50 % of the 10k senior claim");
+        lev_w1::poke(&mut env, &lp).expect("sample");
+        let nav = lev_w1::guard(&env).nav();
+        eprintln!("navcheck F1 residual: poke_first {poke_first} navps {}", nav.navps);
+        let r = lev_w1::w1(&mut env, &lp, &[users[0].portfolio]);
+        if poke_first {
+            assert!(lg::lp_stop_triggered(&nav), "the loss was booked before the inflow");
+            r.expect("honest ordering: the real loss fires W1");
+            assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
+        } else {
+            assert_eq!(nav.navps, lg::mul_div_floor_sat(lg::NAV_ONE, eq + a, e0 + a), "read on (L + X)");
+            assert!(!lg::lp_stop_triggered(&nav), "masked: {}", nav.navps);
+            assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "masked: {r:?}");
+        }
+    }
+}
+
+/// #630 residual (new with the gross cap), end to end: a real gain of a FLAT vault LP (a trade it
+/// won, closed) is diluted toward zero by permissionless 103 / 98 round trips landed before the
+/// sample. Under F1 alone the same interval read the gain exactly; with the routine poke first it
+/// is exact under #630 too. Pinned as the CURRENT behaviour; only sampling at the flow removes it.
+#[test]
+fn navcheck_residual_630_permissionless_round_trips_dilute_a_real_gain() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let run = |cycles: u32| -> (u128, u128, u128) {
+        let mut env = Env::new(growth_params());
+        let d = env.new_depositor();
+        env.earn_deposit(&d, 10_000 * U, None).expect("senior (pre-bind)");
+        let lp = env.bind(2_000);
+        let admin = env.admin.insecure_clone();
+        env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+        let t = env.new_trader(5_000 * U);
+        let q = tok(GPRICE, 4_000);
+        env.trade_signing_fee(&t, &lp, q, GROWTH_FEE).expect("long vs the vault LP");
+        lev_w1::init(&mut env);
+        lev_w1::poke(&mut env, &lp).expect("NAV epoch start");
+        let e0 = lev_w1::guard(&env).nav().last_equity;
+        let mut p = GPRICE;
+        while p > GPRICE * 8 / 10 {
+            p = (p * 93 / 100).max(GPRICE * 8 / 10);
+            env.move_price(p, &[lp.portfolio, t.portfolio]);
+        }
+        env.svm.expire_blockhash();
+        env.trade_signing_fee(&t, &lp, -q, GROWTH_FEE).expect("close: the LP is flat, it won");
+        for _ in 0..3 {
+            env.slot += 1;
+            env.svm.warp_to_slot(env.slot);
+            let _ = env.crank(lp.portfolio);
+            let _ = env.crank(t.portfolio);
+        }
+        assert_eq!(env.position(lp.portfolio), 0);
+        for c in 0..cycles {
+            env.svm.expire_blockhash();
+            env.allocate(lp.portfolio, u128::MAX).unwrap_or_else(|e| panic!("cycle {c}: 103 {e}"));
+            let a = env.allocated();
+            env.svm.expire_blockhash();
+            env.recall_ext(lp.portfolio, a, DOMAIN).unwrap_or_else(|e| panic!("cycle {c}: 98 {e}"));
+            assert_eq!(env.allocated(), 0, "cycle {c}: a balanced round trip");
+        }
+        lev_w1::poke(&mut env, &lp).expect("sample");
+        let nav = lev_w1::guard(&env).nav();
+        (e0, nav.last_equity, nav.navps)
+    };
+    let (e0, e1, honest) = run(0);
+    assert!(e1 > e0, "a real gain: {e0} -> {e1}");
+    assert_eq!(honest, lg::NAV_ONE * e1 / e0, "no flow: the gain read exactly");
+    let (_, e1g, griefed) = run(10);
+    assert_eq!(e1g, e1, "the round trips moved no value");
+    eprintln!(
+        "navcheck #630 residual: gain {:.4} % read as {:.4} % after 10 round trips",
+        (honest - lg::NAV_ONE) as f64 / 1e10,
+        (griefed - lg::NAV_ONE) as f64 / 1e10
+    );
+    assert!(griefed > lg::NAV_ONE, "still a gain (I6)");
+    assert!((griefed - lg::NAV_ONE) * 5 < honest - lg::NAV_ONE, "diluted to under a fifth of the real gain");
+}
+
