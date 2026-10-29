@@ -2503,3 +2503,172 @@ mod proofs {
         assert!(lp_stop_triggered(&st) || !lp_stop_triggered(&n));
     }
 }
+
+/// Independent review (2026-10-29) of #612 defect 3 / D11: a deterministic model of one W1 round
+/// across several op-5 calls, mirroring `lev_guard_lp_stop` (frozen `round_keep_bps` and
+/// `round_target_q`, LIVE `remaining_q = |LP| - target(live price)`, the D11 close rule with the
+/// live `min_leg_q`) and the engine's error-113 check (`require_band_trade_shape`: a left leg needs
+/// `floor(q*P/POS_SCALE) >= band_min_leg_notional`; a call that trips it reverts as a whole).
+#[cfg(test)]
+mod review_612_round_sim {
+    use super::*;
+    use std::vec;
+    use std::vec::Vec;
+
+    const S: u128 = 1_000_000; // POS_SCALE, price e6
+    const M: u128 = 10_000_000; // band_min_leg_notional (10 USDC)
+
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Pol { Live, Frozen, MaxFrozenLive }
+
+    fn min_q(p: u128) -> u128 { (M * S).div_ceil(p) }
+    fn target_q(t_notional: u128, p: u128) -> u128 { t_notional * S / p }
+
+    #[derive(Debug, Default)]
+    struct Out { e0: u128, cut: u128, wiped: usize, trimmed: usize, reverts: usize, stuck: usize, lp_end: u128, round_target: u128, closed: bool }
+
+    /// `calls[j]` = (price for call j, the victim indices listed in call j). Users are all opposite
+    /// the LP; the LP is their only counterparty (LP = sum of users). On a reverted multi-victim
+    /// call the keeper retries those victims one per call at the same price; a single-victim call
+    /// that still reverts leaves that victim stuck.
+    fn run(users0: &[u128], t_notional: u128, calls: &[(u128, Vec<usize>)], pol: Pol) -> Out {
+        let mut users = users0.to_vec();
+        let mut lp: u128 = users.iter().sum();
+        let p0 = calls[0].0;
+        let rt = target_q(t_notional, p0);
+        let k = w1_keep_bps_users(lp, lp, rt);
+        let min0 = min_q(p0);
+        let mut o = Out { e0: lp - rt, round_target: rt, ..Default::default() };
+        let mut touched = vec![false; users.len()];
+        let mut queue: Vec<(u128, Vec<usize>)> = calls.to_vec();
+        let mut qi = 0;
+        while qi < queue.len() {
+            let (p, list) = queue[qi].clone();
+            qi += 1;
+            let live = min_q(p);
+            let used = match pol { Pol::Live => live, Pol::Frozen => min0, Pol::MaxFrozenLive => live.max(min0) };
+            let mut remaining = lp.saturating_sub(target_q(t_notional, p));
+            let (snap_u, snap_lp, snap_t) = (users.clone(), lp, touched.clone());
+            let (mut w, mut t, mut c) = (0usize, 0usize, 0u128);
+            let mut reverted = false;
+            for &i in &list {
+                if touched[i] || users[i] == 0 { continue; }
+                let pos = users[i];
+                let cut = w1_cut_q(pos, k, used, remaining);
+                if cut > 0 {
+                    let left = pos - cut;
+                    if left > 0 && left * p / S < M { reverted = true; break; } // error 113
+                    users[i] = left;
+                    lp -= cut;
+                    c += cut;
+                    if left == 0 { w += 1 } else { t += 1 }
+                    remaining = remaining.saturating_sub(cut);
+                }
+                touched[i] = true;
+            }
+            if reverted {
+                users = snap_u; lp = snap_lp; touched = snap_t;
+                o.reverts += 1;
+                if list.len() > 1 {
+                    for &i in &list { queue.insert(qi, (p, vec![i])); }
+                } else {
+                    o.stuck += 1;
+                }
+                continue;
+            }
+            o.cut += c; o.wiped += w; o.trimmed += t;
+            if lp <= rt || w1_leftover_below_leg(lp, rt, live) { o.closed = true; break; }
+        }
+        o.lp_end = lp;
+        o
+    }
+
+    /// Claim under review: "the total cut is bounded (at most one leg plus the flooring slack)",
+    /// and the code comment "at most one wiped leg plus the flooring slack". Constant price, one
+    /// call, all 21 legs listed: only the ORDER differs.
+    #[test]
+    fn review_overshoot_depends_on_order_and_exceeds_one_leg() {
+        let p = 1_000_000u128;
+        let mut users = vec![19 * S; 20]; // 20 legs of 19 tokens: keep at k=50% is 9.5 < 10, so all-or-nothing
+        users.push(380 * S); // one big leg, pro-rata
+        let t = 380 * S; // target notional: excess = 380 tokens, k = 50%
+        let small_first: Vec<usize> = (0..21).collect();
+        let big_first: Vec<usize> = core::iter::once(20).chain(0..20).collect();
+        let a = run(&users, t, &[(p, small_first)], Pol::Live);
+        let b = run(&users, t, &[(p, big_first)], Pol::Live);
+        std::println!("small-first {a:?}\nbig-first   {b:?}");
+        let slack = 21 + users.iter().sum::<u128>() / 10_000; // one unit per leg + one bp of U
+        assert_eq!(b.cut, b.e0, "big first: exactly the excess");
+        assert_eq!(b.wiped, 10);
+        assert_eq!(a.wiped, 20, "small first: twice as many accounts wiped");
+        assert_eq!(a.cut, a.e0 + 190 * S, "small first: 1.5x the excess");
+        assert!(a.cut > a.e0 + 19 * S + slack, "overshoot is 10 wiped legs, not one");
+    }
+
+    /// The LP is pushed past its target and FLIPS when the target is small next to the excess
+    /// (the usual shape after a 50% NAV drawdown shrinks C_m).
+    #[test]
+    fn review_adversarial_order_pushes_lp_far_below_target() {
+        let p = 1_000_000u128;
+        let mut users = vec![19 * S; 40];
+        users.push(760 * S);
+        let t = 100 * S;
+        let all: Vec<usize> = (0..41).collect();
+        let o = run(&users, t, &[(p, all)], Pol::Live);
+        std::println!("{o:?}");
+        // excess 1420, k = floor((1520-1420)/1520) = 657 bps: the big leg keeps 6.57%
+        // total = 760 (wipes) + 710 (pro-rata, unbudgeted) = 1470 vs excess 1420: LP ends at half its target
+        assert!(o.lp_end * 2 <= o.round_target + 1, "LP {} vs target {}", o.lp_end, o.round_target);
+    }
+
+    /// Claim (a)/(b) on freezing: with the price falling between calls, a frozen `min_leg_q`
+    /// trims legs to a remainder that is below the LIVE minimum, the engine refuses (113), and the
+    /// call reverts. Live and max(frozen, live) never revert.
+    #[test]
+    fn review_frozen_min_leg_reverts_on_a_falling_price_live_and_max_do_not() {
+        let users = vec![21 * S; 30]; // keep at 50% = 10.5 tokens: above the minimum at p0 only
+        let t = 315 * S; // excess 315 tokens, k = 50%
+        let calls: Vec<(u128, Vec<usize>)> = (0..6)
+            .map(|j| (1_000_000 - 20_000 * j as u128, (j * 5..j * 5 + 5).collect()))
+            .collect();
+        for pol in [Pol::Live, Pol::Frozen, Pol::MaxFrozenLive] {
+            let o = run(&users, t, &calls, pol);
+            std::println!("{pol:?} {o:?}");
+            match pol {
+                Pol::Frozen => assert!(o.reverts > 0 && o.stuck > 0, "frozen: 113 reverts"),
+                _ => assert_eq!(o.reverts, 0),
+            }
+        }
+    }
+
+    /// Price RISING between calls: live and frozen/max differ only in which legs are trimmed vs
+    /// all-or-nothing. Report the cut against the excess for every policy and a sweep of paths.
+    #[test]
+    fn review_sweep_policies_over_price_paths() {
+        let mut st = 0x2545_F491_4F6C_DD1Du64;
+        let mut next = move || { st ^= st << 13; st ^= st >> 7; st ^= st << 17; st };
+        let mut worst = [(0i128, 0usize); 3];
+        for _ in 0..3_000 {
+            let n = 8 + (next() % 40) as usize;
+            let users: Vec<u128> = (0..n).map(|_| (10 + next() % 60) as u128 * S / 1 + (next() % S as u64) as u128).collect();
+            let u: u128 = users.iter().sum();
+            let t = u * (1 + (next() % 9) as u128) / 10;
+            let mut p = 1_000_000u128;
+            let mut idx: Vec<usize> = (0..n).collect();
+            for i in (1..n).rev() { idx.swap(i, (next() % (i as u64 + 1)) as usize); }
+            let calls: Vec<(u128, Vec<usize>)> = idx
+                .chunks(5)
+                .map(|c| { let r = (p, c.to_vec()); p = p * (950 + (next() % 101) as u128) / 1000; r })
+                .collect();
+            for (j, pol) in [Pol::Live, Pol::Frozen, Pol::MaxFrozenLive].into_iter().enumerate() {
+                let o = run(&users, t, &calls, pol);
+                let over = o.cut as i128 - o.e0 as i128;
+                if over > worst[j].0 { worst[j].0 = over; }
+                worst[j].1 += o.reverts;
+            }
+        }
+        std::println!("worst overshoot (Q) / total reverts: live {:?} frozen {:?} max {:?}", worst[0], worst[1], worst[2]);
+        assert_eq!(worst[0].1, 0, "live never trips 113");
+        assert_eq!(worst[2].1, 0, "max(frozen, live) never trips 113");
+    }
+}
