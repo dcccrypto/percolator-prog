@@ -26286,7 +26286,7 @@ mod p3_vault_lp_skew {
         env.send(
             ProgInstruction::CreateLpVault {
                 fee_share_bps: 5_000,
-                redemption_cooldown_slots: 0,
+                redemption_cooldown_slots: percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS, // #569 / D22: bound vault needs >= 150
                 oi_reservation_threshold_bps: 0,
                 domain: 0,
             },

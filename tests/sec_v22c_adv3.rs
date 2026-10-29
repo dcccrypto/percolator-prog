@@ -138,6 +138,11 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
     .0
 }
 
+// #569 / D22: a vault BOUND as the vault LP must carry a redemption cooldown of at least
+// MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS (150). Harness change only: vaults are created with it
+// and `earn_execute` lets the clock pass the cooldown (it used to run in the request's slot at 0).
+const BOUND_COOLDOWN: u64 = percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS;
+
 #[derive(Clone, Copy)]
 struct Params {
     mm_bps: u64,
@@ -356,7 +361,7 @@ impl Env {
         env.send(
             ProgInstruction::CreateLpVault {
                 fee_share_bps: 5_000,
-                redemption_cooldown_slots: 0,
+                redemption_cooldown_slots: BOUND_COOLDOWN,
                 oi_reservation_threshold_bps: 0,
                 domain: DOMAIN,
             },
@@ -1060,6 +1065,9 @@ impl Env {
     }
 
     fn earn_execute(&mut self, d: &Depositor, tail: Option<Pubkey>) -> Result<u64, String> {
+        // #569 / D22: a bound vault's cooldown is >= 150 slots; let the request mature first.
+        self.slot += BOUND_COOLDOWN;
+        self.svm.warp_to_slot(self.slot);
         let before = self.tok(d.dest);
         let mut accts = vec![
             AccountMeta::new(self.payer.pubkey(), true),
@@ -2923,7 +2931,7 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
         ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
         solana_sdk::system_instruction::create_account(&admin.pubkey(), &lp, plen_rent, plen as u64, &env.pid),
         solana_sdk::system_instruction::create_account(&admin.pubkey(), &ctx, ctx_rent, MATCHER_CONTEXT_LEN as u64, &env.matcher),
-        ix(env.pid, ProgInstruction::CreateLpVault { fee_share_bps: 5_000, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: DOMAIN }, vec![
+        ix(env.pid, ProgInstruction::CreateLpVault { fee_share_bps: 5_000, redemption_cooldown_slots: BOUND_COOLDOWN, oi_reservation_threshold_bps: 0, domain: DOMAIN }, vec![
             AccountMeta::new(admin.pubkey(), true),
             AccountMeta::new(env.market, false),
             AccountMeta::new(env.registry, false),
