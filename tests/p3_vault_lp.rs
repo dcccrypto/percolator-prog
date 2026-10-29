@@ -6256,6 +6256,75 @@ fn lev_min_creator_stake_not_applied_off_growth() {
     env.junior_deposit_as(&admin, lp.portfolio, 1).expect("growth off: 1 atom lands");
 }
 
+/// D1: the $500 creator minimum is tested on VALUE. The stake is deposited at $600 (here 600
+/// atoms: the test mint has 0 decimals, minimum 500), the market takes ~$120 of it, and the
+/// creator exits at value. Net deposits would call the remainder "$120 net" and refuse it forever.
+#[test]
+fn d1_creator_exit_to_zero_at_value_after_a_loss() {
+    let mut env = Env::new(growth_params());
+    // The G4 LP floor ($1) would halt a 600-atom vault LP; the upgrade authority presets a 1-atom
+    // floor before the bind (tag 93 fields that are left at zero are defaulted, so keep the rest).
+    {
+        let admin = env.admin.insecure_clone();
+        env.set_program_data_authority(&admin.pubkey());
+        let (pd, _) = Pubkey::find_program_address(&[env.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::ID);
+        let market = env.market;
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::SetAssetRiskLimits {
+                asset_index: 0,
+                exec_band_bps: 0,
+                lp_exposure_k_bps: 0,
+                lp_floor_atoms: 1,
+                side_oi_cap_q: 0,
+                matcher_ext_mode: 1,
+                max_requested_fee_bps: 100,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&admin],
+        )
+        .expect("preset a 1-atom LP floor");
+    }
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 600).expect("stake 600");
+    let t = env.new_trader(1_000_000_000);
+    let q = tok(env.price, 1) * 59 / 100_000; // ~590 atoms of notional against 600 of capital
+    env.trade_signing_fee(&t, &lp, q, GROWTH_FEE).expect("long vs the vault LP");
+    assert_eq!(env.position(lp.portfolio), -q, "the LP is short");
+    // price +40%: the LP loses ~150 atoms of its 600
+    let mut p = GPRICE;
+    while p < GPRICE * 14 / 10 {
+        p = (p * 107 / 100).min(GPRICE * 14 / 10);
+        env.move_price(p, &[lp.portfolio, t.portfolio]);
+    }
+    env.svm.expire_blockhash();
+    env.trade_signing_fee(&t, &lp, -q, GROWTH_FEE).expect("close: the LP is flat again");
+    for _ in 0..3 {
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        let _ = env.crank(lp.portfolio);
+        let _ = env.crank(t.portfolio);
+    }
+    assert_eq!(env.position(lp.portfolio), 0);
+    let lpp = env.portfolio(lp.portfolio);
+    let value = (lpp.capital as i128 + lpp.pnl) as u64;
+    eprintln!("d1: stake value {value} of 600 deposited");
+    assert!(value < LEV_MIN_STAKE && value > 300, "a real loss below the minimum: {value}");
+    // a partial exit that leaves value in (0, min): refused
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, value - 300);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 300: {r:?}");
+    let r = env.junior_withdraw_as(&admin, lp.portfolio, value - 1);
+    assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 1: {r:?}");
+    // the full exit at value: allowed (the junior floor is 0: no Earn money in)
+    env.junior_withdraw_as(&admin, lp.portfolio, value).expect("exit to zero at value");
+    assert_eq!(env.portfolio(lp.portfolio).capital, 0);
+}
+
 // ── v2.2 lev build: the LP stop W1 (tag 124 op 5) on a real tag-94 vault LP ─────────────────
 
 mod lev_w1 {
