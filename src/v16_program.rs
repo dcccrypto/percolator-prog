@@ -1883,7 +1883,7 @@ VaultLpMultiAssetMarket,
         /// loss-current, the amount is outside `[RESCUE_MIN_ATOMS, 10 * v]`, the vault is paused,
         /// or the requested tranche does not exist. Custom(114).
         RescueRefused = 114,
-        /// Item 5: the certified value is below `RESCUE_NAV_FLOOR_BPS` (5%) of par: the vault is
+        /// Item 5: the certified value is below `RESCUE_NAV_FLOOR_BPS` (50% since D23 / #595, was 5%) of par: the vault is
         /// dead and must resolve or wind down. Custom(115). App: "This market can no longer be
         /// recapitalised; it will be wound down".
         RescueNavFloor = 115,
