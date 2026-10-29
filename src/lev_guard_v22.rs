@@ -587,8 +587,12 @@ pub fn lp_stop_triggered(st: &NavState) -> bool {
     if !st.initialised() {
         return false;
     }
-    let twice = st.navps.saturating_mul(2);
-    twice <= st.peak() || twice <= st.ref_navps
+    // GH#627: compare by division, never by doubling. `navps.saturating_mul(2)` pinned to
+    // `u128::MAX` once the index saturated, and `peak() >= navps` was `u128::MAX` too, so the test
+    // read `MAX <= MAX` -- the stop latched on with NO drawdown, and `nav_stop_reset` could not
+    // clear it because it restarts the reference and both peaks AT the current index.
+    // Exactly equivalent for every value: for integers `navps * 2 <= p` iff `navps <= p / 2`.
+    st.navps <= st.peak() / 2 || st.navps <= st.ref_navps / 2
 }
 
 /// After a completed stop round: the reference and both peaks restart at the current NAV/share
@@ -2027,6 +2031,58 @@ mod tests {
         assert!(!junior_value_allows_allocation(usd(1_000), usd(1_000), 0, min));
         // the bond's claim comes out before the junior
         assert!(!junior_value_allows_allocation(usd(1_800), usd(1_000), usd(400), min));
+    }
+
+    /// GH#627: the 50 % test must not read a saturated index as a drawdown. Drives the index to
+    /// `u128::MAX` through the F1 start-reading path the way an LP can -- earn, withdraw to a
+    /// 1-atom base, sample -- then pins that the stop stays OFF and that the honest trigger still
+    /// works at the same extreme.
+    #[test]
+    fn saturated_navps_is_not_a_drawdown_and_the_reset_still_clears() {
+        const D: u128 = 1_000_000; // 6-decimal collateral: $1 = 1e6 atoms
+        let mut slot = 1_000u64;
+        let mut st = nav_epoch_start(1_000 * D, 0, 0, slot);
+        let (mut fin, mut fout) = (0u128, 0u128);
+        assert_eq!(st.navps, NAV_ONE);
+        let mut cycles = 0;
+        while st.navps != u128::MAX {
+            cycles += 1;
+            assert!(cycles <= 8, "expected saturation within a handful of cycles, not {cycles}");
+            // a pure deposit: the index must not move (flow neutrality)
+            slot += 10;
+            fin += 1_000 * D;
+            let before = st.navps;
+            st = nav_sample(&st, st.last_equity + 1_000 * D, fin, fout, slot);
+            assert_eq!(st.navps, before, "a pure deposit moved the index");
+            // earn $1, then withdraw all but one atom, inside ONE interval: base = 1
+            slot += 10;
+            let out = st.last_equity - 1;
+            fout += out;
+            st = nav_sample(&st, st.last_equity - out + D, fin, fout, slot);
+        }
+        assert_eq!(st.navps, u128::MAX);
+        assert_eq!(st.peak(), u128::MAX, "the peak follows the index up");
+
+        // the defect: doubling saturates, so the old test read MAX <= MAX as a 50 % fall
+        assert_eq!(st.navps.saturating_mul(2), u128::MAX, "the doubling that used to latch it on");
+        // the fix: a saturated index at its own peak is no drawdown at all
+        assert!(!lp_stop_triggered(&st), "a saturated index is not a 50 % fall");
+        // and the reset is no longer a no-op that cannot clear a latched stop
+        assert!(!lp_stop_triggered(&nav_stop_reset(&st)));
+        let quiet = nav_sample(&st, st.last_equity, fin, fout, slot + 10);
+        assert_eq!(quiet.navps, u128::MAX, "a quiet interval leaves the index where it is");
+        assert!(!lp_stop_triggered(&quiet));
+
+        // the honest trigger still fires at the same extreme: half of a MAX peak is a real fall
+        let halved = NavState { navps: u128::MAX / 2, ..st };
+        assert!(lp_stop_triggered(&halved), "a genuine 50 % fall from a saturated peak must fire");
+        let just_above = NavState { navps: u128::MAX / 2 + 1, ..st };
+        assert!(!lp_stop_triggered(&just_above), "one atom above half must not fire");
+        // the reference arm, independently of the peak
+        let on_ref = NavState { navps: 50, peak_cur: 60, peak_prev: 60, ref_navps: 100, ..st };
+        assert!(lp_stop_triggered(&on_ref), "ref arm: 50 is half of 100");
+        let off_ref = NavState { navps: 51, peak_cur: 60, peak_prev: 60, ref_navps: 100, ..st };
+        assert!(!lp_stop_triggered(&off_ref));
     }
 
     #[test]
