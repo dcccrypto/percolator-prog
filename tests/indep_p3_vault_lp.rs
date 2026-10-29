@@ -37,6 +37,22 @@ fn p3_so() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_prog.so"))
 }
 
+// #569 / D22: a vault BOUND as the vault LP must carry a redemption cooldown of at least
+// MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS (150). Harness change only: the vault is created
+// with that cooldown and an ExecuteRedemption first lets the clock pass request + cooldown
+// (it used to run in the request's slot at cooldown 0). No assertion is changed.
+const BOUND_COOLDOWN: u64 = percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS;
+thread_local! { static LAST_REQ_SLOT: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+fn bound_cooldown_note(svm: &litesvm::LiteSVM) {
+    LAST_REQ_SLOT.with(|c| c.set(svm.get_sysvar::<solana_sdk::clock::Clock>().slot));
+}
+fn bound_cooldown_wait(svm: &mut litesvm::LiteSVM) {
+    let need = LAST_REQ_SLOT.with(|c| c.get()) + BOUND_COOLDOWN;
+    if svm.get_sysvar::<solana_sdk::clock::Clock>().slot < need {
+        svm.warp_to_slot(need);
+    }
+}
+
 struct P3 {
     env: V16CuEnv,
     matcher: Pubkey,
@@ -148,7 +164,7 @@ impl P3 {
         let admin = self.env.admin.insecure_clone();
         let (m, r, mint) = (self.env.market, self.registry, self.lp_mint);
         self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: BOUND_COOLDOWN, oi_reservation_threshold_bps: 0, domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -200,7 +216,9 @@ impl P3 {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ];
-        self.send(ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 }, metas, &[who])
+        let r = self.send(ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 }, metas, &[who]);
+        if r.is_ok() { bound_cooldown_note(&self.env.svm); }
+        r
     }
 
     fn execute_redeem(&mut self, who: &Keypair, bound: bool) -> (Pubkey, Result<u64, String>) {
@@ -226,6 +244,7 @@ impl P3 {
             metas.push(AccountMeta::new(self.state_pda, false));
             metas.push(AccountMeta::new(self.lp, false));
         }
+        bound_cooldown_wait(&mut self.env.svm);
         let r = self.send(ProgInstruction::ExecuteRedemption { domain: 0 }, metas, &[]);
         (dest, r)
     }

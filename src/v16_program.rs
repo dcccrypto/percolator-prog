@@ -1084,6 +1084,12 @@ pub mod constants {
     /// (`setup_vault(0)` throughout tests/v16_fork_lp_vault_redeem.rs). The bug in
     /// #440 is unbounded ABOVE; that is what is bounded.
     pub const MAX_LP_REDEMPTION_COOLDOWN_SLOTS: u64 = 78_840_000;
+    /// #569: minimum `redemption_cooldown_slots` for a vault that is BOUND as the vault LP
+    /// (tag 94 InitVaultLp). With cooldown 0 a senior can 76 + 77 in one slot ahead of an
+    /// already-published adverse push, is priced at par, and the stayers bear the whole
+    /// loss. Decided policy (2026-09-30): not 0, not 20, at least 150 slots; both clients
+    /// already use 150. Enforced at the bind only: unbound vaults keep 0 legal (#440).
+    pub const MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS: u64 = 150;
     /// Upper bound for `insurance_withdraw_cooldown_slots` (#427). Same magnitude and
     /// same reason as `MAX_LP_REDEMPTION_COOLDOWN_SLOTS`: ~1 year at 2.5 slots/s.
     ///
@@ -36830,6 +36836,12 @@ pub mod processor {
         }
         if state::registry_vault_lp_bound(&registry)? {
             return Err(PercolatorError::VaultLpAlreadyBound.into());
+        }
+        // #569: a bound vault must carry a real redemption cooldown (same-slot 76+77 front-run).
+        if registry.redemption_cooldown_slots
+            < crate::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
         }
         let (own_ledger_pda, _) =
             state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
