@@ -17,7 +17,7 @@
 //! `P1_WRAPPER_SO=<path>` overrides the wrapper .so (used to replay the COLLECT/Murphy shape
 //! against the deployed base build `deploy/v18.2-wrapper@6377376a`).
 use litesvm::LiteSVM;
-use percolator::{SideV16, POS_SCALE};
+use percolator::{SideV16, ADL_ONE, POS_SCALE};
 use percolator_prog::{
     ix::{BatchTradeCpiLeg, Instruction as ProgInstruction},
     state,
@@ -71,6 +71,9 @@ fn program_path() -> PathBuf {
 }
 
 fn matcher_program_path() -> PathBuf {
+    if let Some(p) = std::env::var_os("INDEP_MATCHER_SO") {
+        return PathBuf::from(p);
+    }
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.pop();
     path.push("percolator-match/target/deploy/percolator_match.so");
@@ -1455,4 +1458,141 @@ fn attribution_rule_is_frame_based() {
     ];
     let evs = wrapper_events(&forged, &env.program_id);
     assert_eq!(evs.len(), 1, "only the line inside the wrapper's own frame counts: {evs:?}");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D24 / #554: tag 104 (AdlWindDown) only below a real threshold of A.
+// ─────────────────────────────────────────────────────────────────────────────
+
+impl Env {
+    /// Tag 105 SetAdlWindDownMaxSlots (tighten-only), signed by the mocked upgrade authority.
+    fn set_adl_max_slots(&mut self, max_episode_slots: u32) {
+        let ua = self.upgrade_authority.insecure_clone();
+        let (pd, market) = (self.program_data, self.market);
+        self.send(
+            ProgInstruction::SetAdlWindDownMaxSlots { asset_index: 0, max_episode_slots },
+            vec![
+                AccountMeta::new_readonly(ua.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(market, false),
+            ],
+            &[&ua],
+        )
+        .expect("tag 105 tighten the episode bound");
+    }
+
+    fn clock_slot(&self) -> u64 {
+        self.svm.get_sysvar::<solana_sdk::clock::Clock>().slot
+    }
+
+    fn warp_by(&mut self, slots: u64) {
+        let s = self.clock_slot() + slots;
+        self.svm.warp_to_slot(s);
+    }
+
+    fn adl_limits(&self) -> state::AssetRiskLimitsV17 {
+        state::read_asset_risk_limits(&self.svm.get_account(&self.market).unwrap().data, 0).unwrap()
+    }
+
+    /// One tag-104 call on `portfolio` (permissionless: the payer signs only the transaction).
+    fn adl_wind_down_once(&mut self, portfolio: Pubkey) -> Result<u64, String> {
+        let (id, _, epoch) = self.identity(portfolio);
+        let now_slot = self.clock_slot();
+        self.send(
+            ProgInstruction::AdlWindDown { now_slot, asset_index: 0, portfolio_id: id, position_epoch: epoch },
+            vec![
+                AccountMeta::new_readonly(Pubkey::new_unique(), false),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new_readonly(self.mint, false),
+            ],
+            &[],
+        )
+    }
+
+    /// Repeat tag 104 until it stops making price-catch-up-only progress (an accrual segment is
+    /// capped at `max_accrual_dt_slots`, exactly as the crank is).
+    fn adl_wind_down(&mut self, portfolio: Pubkey) -> Result<u64, String> {
+        let mut last = Ok(0);
+        for _ in 0..64 {
+            let before = self.pos(portfolio);
+            let slot_last = self.group().assets[0].slot_last;
+            last = self.adl_wind_down_once(portfolio);
+            if last.is_err() || self.pos(portfolio) != before || self.group().assets[0].slot_last == slot_last {
+                break;
+            }
+        }
+        last
+    }
+}
+
+/// A 1,000-unit book (taker long, LP short), `reduce_q` of the taker's leg removed through the
+/// designated exit (tag 44), then the ADL episode bound (tightened to 5 slots so the test does
+/// not crank 9,000 slots of accrual) elapses. Returns (env, lp account, taker account).
+fn d24_episode_after_reduce(reduce_q: u128) -> (Env, Pubkey, Pubkey) {
+    let mut env = Env::new();
+    let taker = Keypair::new();
+    let taker_account = env.portfolio(&taker, 1_000_000);
+    let lp = env.lp(1_000_000);
+    env.trade_cpi(&taker, taker_account, &lp, 1_000 * Q).expect("open 1,000 units");
+    env.set_adl_max_slots(5);
+    env.reduce(&taker, taker_account, reduce_q).expect("tag 44 exit");
+    // Arm the episode (first observation), let the bound elapse, then call again.
+    let _ = env.adl_wind_down(lp.account);
+    env.warp_by(6);
+    (env, lp.account, taker_account)
+}
+
+/// #554 attack: ONE unit (0.1% of the open interest) through tag 44 scales the opposite side's A just below ADL_ONE
+/// (reduce-only for everyone). Before D24 the episode bound alone then made the LP's healthy leg
+/// force-closable by anyone through tag 104. D24: a side's A must be below 99% of ADL_ONE for
+/// tag 104 to wind a healthy leg down, so a one-unit trigger buys nothing: the leg stays open and
+/// no episode is even armed.
+#[test]
+fn d24_one_unit_tag44_does_not_make_healthy_legs_force_closable() {
+    let (mut env, lp_account, _taker_account) = d24_episode_after_reduce(Q as u128);
+    let a = env.group().assets[0].clone();
+    assert!(a.a_short < ADL_ONE || a.a_long < ADL_ONE, "vacuity: the one-unit exit DID put the asset in ADL reduce-only (A {}/{})", a.a_long, a.a_short);
+    let degradation_bps = (ADL_ONE - a.a_long.min(a.a_short)) * 10_000 / ADL_ONE;
+    assert!(degradation_bps < 100, "vacuity: the degradation is shallow ({degradation_bps} bps)");
+    let leg_before = env.pos(lp_account);
+    assert_ne!(leg_before, 0, "vacuity: the LP leg is open");
+    let _ = env.adl_wind_down(lp_account);
+    assert_eq!(env.pos(lp_account), leg_before, "D24: a shallow A must not make a healthy leg force-closable");
+    assert_eq!(env.adl_limits().adl_episode_since_slot, 0, "D24: a shallow A does not even arm the episode clock");
+}
+
+/// The positive control: a genuinely deep ADL episode (the exit removes 20% of the open interest,
+/// A far below 99%) still lets tag 104 wind the leg down once the episode bound has elapsed.
+#[test]
+fn d24_deep_adl_episode_still_winds_down_after_the_bound() {
+    let (mut env, lp_account, _taker_account) = d24_episode_after_reduce(200 * Q as u128);
+    let a = env.group().assets[0].clone();
+    assert!(a.a_long.min(a.a_short) < ADL_ONE / 100 * 99, "vacuity: A is below 99% ({}/{})", a.a_long, a.a_short);
+    let leg_before = env.pos(lp_account);
+    assert_ne!(leg_before, 0, "vacuity: the LP leg is open");
+    env.adl_wind_down(lp_account).expect("deep episode: tag 104 runs");
+    assert_eq!(env.pos(lp_account), 0, "a deep ADL episode past its bound still force-closes the leg");
+    assert_ne!(env.adl_limits().adl_episode_since_slot, 0, "the episode was armed");
+}
+
+/// The threshold is exactly 99% of ADL_ONE (9,900 bps), strict: an exit that leaves A at exactly
+/// 99% is still refused, one raw unit more is admitted. Removing 10 of 1,000 units scales A to
+/// floor(ADL_ONE * 990 / 1000) = 0.99 * ADL_ONE exactly.
+#[test]
+fn d24_threshold_is_exactly_99_percent_of_adl_one() {
+    let threshold = ADL_ONE / 10_000 * percolator_prog::state::ADL_WIND_DOWN_A_THRESHOLD_BPS as u128;
+    assert_eq!(threshold, ADL_ONE / 100 * 99);
+    let (mut env, lp_account, _) = d24_episode_after_reduce(10 * Q as u128);
+    let a = env.group().assets[0].clone();
+    assert_eq!(a.a_long.min(a.a_short), threshold, "vacuity: A sits exactly at the threshold");
+    let leg = env.pos(lp_account);
+    let _ = env.adl_wind_down(lp_account);
+    assert_eq!(env.pos(lp_account), leg, "A == 99% is not below the threshold: refused");
+
+    let (mut env, lp_account, _) = d24_episode_after_reduce(10 * Q as u128 + 1);
+    let a = env.group().assets[0].clone();
+    assert!(a.a_long.min(a.a_short) < threshold, "vacuity: A is one step below the threshold");
+    env.adl_wind_down(lp_account).expect("below the threshold: tag 104 runs");
+    assert_eq!(env.pos(lp_account), 0, "A just below 99%: force-close admitted after the bound");
 }
