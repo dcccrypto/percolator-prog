@@ -10183,7 +10183,12 @@ pub mod ix {
                 76 => {
                     let shares = read_u128(&mut rest)?;
                     if rest.is_empty() {
-                        Self::RequestRedeemLpShares { shares }
+                        // AUD-S1-18: the legacy 17-byte form (no payout floor) is RETIRED. On a
+                        // bound vault (and in Resolved) tag 77 is permissionless, so a request
+                        // without a stored floor could be executed by anyone at any moment with
+                        // no payout bound. Every v2.2 request must carry the 9-byte trailer.
+                        // Requests already stored in the legacy 112-byte layout still execute.
+                        return Err(ProgramError::InvalidInstructionData);
                     } else {
                         let min_payout_atoms = read_u64(&mut rest)?;
                         let keeper_ok = read_u8(&mut rest)?;

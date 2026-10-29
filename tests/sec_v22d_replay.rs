@@ -1210,7 +1210,7 @@ impl Replay {
         let red = state::derive_lp_redemption(&pid, &self.registry, &who.pubkey()).0;
         self.env.svm.expire_blockhash();
         self.env.send(
-            ProgInstruction::RequestRedeemLpShares { shares },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             vec![
                 AccountMeta::new(who.pubkey(), true),
                 AccountMeta::new(self.registry, false),

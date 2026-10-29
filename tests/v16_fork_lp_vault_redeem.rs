@@ -504,7 +504,7 @@ fn request(env: &mut Env, d: &Depositor, lp_amount: u128) -> Result<(), String> 
         pid,
         &payer,
         vec![(
-            ProgInstruction::RequestRedeemLpShares { shares: lp_amount },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares: lp_amount, min_payout_atoms: 1, keeper_ok: 0 },
             accts,
         )],
         &[&kp],
@@ -3086,7 +3086,7 @@ fn request_redeem_succeeds_with_prefunded_escrow_and_redemption() {
         pid,
         &payer,
         vec![(
-            ProgInstruction::RequestRedeemLpShares { shares: MINTED },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares: MINTED, min_payout_atoms: 1, keeper_ok: 0 },
             accounts,
         )],
         &[&depositor.kp],

@@ -1086,7 +1086,7 @@ impl Env {
     fn earn_request(&mut self, d: &Depositor, shares: u128) {
         let kp = d.kp.insecure_clone();
         self.send(
-            ProgInstruction::RequestRedeemLpShares { shares },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             vec![
                 AccountMeta::new(d.kp.pubkey(), true),
                 AccountMeta::new(self.registry, false),

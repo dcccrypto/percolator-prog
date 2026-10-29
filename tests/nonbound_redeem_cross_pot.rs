@@ -560,7 +560,7 @@ fn request(env: &mut Env, v: &Vault, shares: u128) {
         &mut env.svm,
         env.program_id,
         &payer,
-        ProgInstruction::RequestRedeemLpShares { shares },
+        ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
         vec![
             AccountMeta::new(lp.pubkey(), true),
             AccountMeta::new(v.registry, false),
@@ -1284,4 +1284,48 @@ fn s1_22_nonbound_exit_refuses_a_read_only_pot_ledger() {
     execute_with_ledger_flags(&mut env, &v, DOMAIN, true, true).expect("both ledgers writable: the exit pays");
     assert_eq!(registry_shares(&env, &v), shares_before - shares, "the writable exit redeemed the request");
     assert!(token_amount(&env.svm, v.dest) > dest_before, "vacuity: the writable exit paid");
+}
+
+/// AUD-S1-18 (v2.2 audit 2026-10-17): the legacy 17-byte tag 76 (no payout floor) is retired.
+/// On a bound vault and in Resolved, tag 77 is permissionless, so a floorless request could be
+/// executed by anyone at any moment with no payout bound. The on-chain decoder now refuses it
+/// (InvalidInstructionData) and nothing is escrowed; the floored 26-byte form still works.
+/// Red on the 4d69ee52 .so (the legacy request is accepted there).
+#[test]
+fn s1_18_legacy_floorless_request_is_refused_on_chain() {
+    let mut env = setup();
+    let v = vault(&mut env);
+    deposit(&mut env, &v, 1_000_000_000, DOMAIN);
+    let lp = v.lp.insecure_clone();
+    let payer = env.payer.insecure_clone();
+    let (escrow, _) = derive_lp_escrow(&env.program_id, &env.market);
+    let (redemption, _) = derive_lp_redemption(&env.program_id, &v.registry, &lp.pubkey());
+    let metas = vec![
+        AccountMeta::new(lp.pubkey(), true),
+        AccountMeta::new(v.registry, false),
+        AccountMeta::new(v.mint, false),
+        AccountMeta::new(v.lp_ata, false),
+        AccountMeta::new(escrow, false),
+        AccountMeta::new(redemption, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+    ];
+    let shares = token_amount(&env.svm, v.lp_ata) as u128 / 4;
+    let lp_before = token_amount(&env.svm, v.lp_ata);
+    assert_eq!(ProgInstruction::RequestRedeemLpShares { shares }.encode().len(), 17, "the legacy wire");
+    let e = send(&mut env.svm, env.program_id, &payer, ProgInstruction::RequestRedeemLpShares { shares }, metas.clone(), &[&lp])
+        .expect_err("AUD-S1-18: the floorless legacy tag 76 must be refused");
+    assert!(e.contains("InvalidInstructionData"), "decode refusal, got {e}");
+    assert!(env.svm.get_account(&redemption).map_or(true, |a| a.data.is_empty()), "no request account created");
+    assert_eq!(token_amount(&env.svm, v.lp_ata), lp_before, "no shares escrowed");
+    send(
+        &mut env.svm,
+        env.program_id,
+        &payer,
+        ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
+        metas,
+        &[&lp],
+    )
+    .expect("the floored form is accepted");
+    assert_eq!(env.svm.get_account(&redemption).unwrap().data.len(), state::lp_redemption_v22_account_len());
 }

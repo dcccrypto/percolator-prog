@@ -1163,7 +1163,7 @@ impl CrosscutEnv {
                 AccountMeta::new_readonly(system_program::ID, false),
             ],
             // v17: RequestRedeemLpShares field renamed lp_amount → shares.
-            data: ProgInstruction::RequestRedeemLpShares { shares: lp_amount }.encode(),
+            data: ProgInstruction::RequestRedeemLpSharesV22 { shares: lp_amount, min_payout_atoms: 1, keeper_ok: 0 }.encode(),
         };
         send_ixs(&mut self.svm, &self.payer, vec![wix], &[depositor]).expect("lp request redeem");
     }
