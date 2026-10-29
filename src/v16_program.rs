@@ -45341,7 +45341,23 @@ pub mod processor {
             ));
         }
         let keep = gd.round_keep_bps;
-        let lp_long = gd.round_lp_long == 1;
+        // #612: the LP's side is re-derived from live state on every call. It used to be read from
+        // `round_lp_long`, written once at round open and never refreshed, so a round that had
+        // flipped the LP went on selecting the side it started with -- and a forced reduce does not
+        // check the LP's side, it just closes the victim's leg and puts the LP on the other end.
+        let lp_long = lp_net > 0;
+        gd.round_lp_long = u8::from(lp_long);
+        // #612: how much of the round's excess is still outstanding, measured from live state so it
+        // is self-correcting across the many calls a round spans. The aggregate rule
+        // (`w1_keep_bps_users`) is pro-rata and exact; the per-leg minimum in `w1_keep_q` overrides
+        // it by closing sub-minimum remainders IN FULL, and nothing used to count that back against
+        // the excess, so a book of near-minimum legs lost the whole opposing side.
+        //
+        // The budget binds on those whole-leg wipes only. Pro-rata cuts stay exact and unclamped,
+        // because clamping them would make an account's outcome depend on its place in the caller's
+        // list. The residual overshoot is therefore at most one wiped leg plus the flooring slack,
+        // instead of unbounded.
+        let mut remaining_q = lp_net.unsigned_abs().saturating_sub(target);
         let mut cut_any = false;
         for victim_ai in accounts.iter().skip(6) {
             if victim_ai.key == lp_ai.key || victim_ai.owner != program_id {
@@ -45362,8 +45378,7 @@ pub mod processor {
             if !opposing {
                 continue;
             }
-            let keep_q = lg::w1_keep_q(pos.unsigned_abs(), keep, min_leg_q);
-            let cut = pos.unsigned_abs() - keep_q;
+            let cut = lg::w1_cut_q(pos.unsigned_abs(), keep, min_leg_q, remaining_q);
             if cut > 0 {
                 expect_writable(victim_ai)?;
                 band_forced_reduce_against_vault_lp(
@@ -45377,6 +45392,9 @@ pub mod processor {
                     fill_events_v22::REASON_LP_STOP,
                 )?;
                 cut_any = true;
+                // Saturating: a pro-rata cut is not budget-gated, so the running total can pass the
+                // excess by the flooring slack. Once it has, whole-leg wipes stop being admitted.
+                remaining_q = remaining_q.saturating_sub(cut);
             }
             {
                 let mut gdata = guard_ai.try_borrow_mut_data()?;

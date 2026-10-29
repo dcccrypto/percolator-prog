@@ -636,6 +636,36 @@ pub fn w1_keep_q(pos_abs_q: u128, keep_bps: u16, min_leg_q: u128) -> u128 {
     if keep < min_leg_q { 0 } else { keep }
 }
 
+/// What to cut from ONE opposing leg: the pro-rata reduction, but never more than the round's
+/// outstanding excess, and never leaving a leg below `min_leg_q`.
+///
+/// `w1_keep_q` returning 0 means the pro-rata remainder cannot stand as a band leg (it is below the
+/// market minimum, or `keep_bps` is 0), so that leg is all-or-nothing. It is only taken in full when
+/// the round still needs that much: a leg that cannot be cut without overshooting is left alone
+/// rather than destroyed. Without that budget the per-leg minimum silently overrides the aggregate
+/// rule and the round removes up to `1/(1-k)` times the excess (#612).
+///
+/// Invariants, for every input: `cut <= pos_abs_q`; the remainder `pos_abs_q - cut` is either 0 or
+/// at least `min_leg_q`; and a WHOLE-leg cut never exceeds `remaining_q`.
+pub fn w1_cut_q(pos_abs_q: u128, keep_bps: u16, min_leg_q: u128, remaining_q: u128) -> u128 {
+    if pos_abs_q == 0 {
+        return 0;
+    }
+    let keep = w1_keep_q(pos_abs_q, keep_bps, min_leg_q);
+    if keep == 0 {
+        // All or nothing: a partial cut would leave a standing leg below the market minimum. Take
+        // the whole leg only while the round still needs that much. This is the budget that was
+        // missing, and the only place it binds.
+        return if pos_abs_q <= remaining_q { pos_abs_q } else { 0 };
+    }
+    // The pro-rata cut is deliberately NOT clamped. Flooring already makes the pro-rata total
+    // exceed the excess by up to one lot per leg, and clamping it would make an account's own
+    // outcome depend on where it sat in the caller's list -- the order and grouping independence a
+    // round is specified to have, pinned by
+    // `lev_w1_lp_stop_round_cuts_opposing_users_once_and_order_independent`.
+    pos_abs_q - keep
+}
+
 /// The LP-side target `λ_eff · C_m_now` in Q (`growth_v19::n_cap_q`).
 pub fn w1_target_q(c_m: u128, lambda_eff_bps: u32, price_e6: u64, pos_scale: u128) -> u128 {
     crate::growth_v19::n_cap_q(c_m, lambda_eff_bps, price_e6, pos_scale).unwrap_or(0)
@@ -1574,6 +1604,128 @@ mod tests {
                 }
             }
             assert!(lp_now <= target, "after all cuts the LP is within target: {lp_now} vs {target}");
+        }
+    }
+
+    /// #612: the aggregate rule is pro-rata and exact, but `w1_keep_q` closes a sub-minimum
+    /// remainder IN FULL. With a real `min_leg_q` that overrides the aggregate and the round
+    /// removes the whole opposing side; `w1_cut_q` carries the outstanding excess as a budget, so
+    /// it cannot. Note what the test above does differently: it passes `min_leg_q = 0`, the one
+    /// value that disables the branch this is about.
+    #[test]
+    fn w1_cut_q_cannot_overshoot_the_rounds_excess() {
+        // 256 opposing legs at the market minimum. InitMarket floors `band_min_leg_notional` at 10
+        // whole collateral tokens, and a trade may not leave a leg below it (error 113), so this is
+        // an ordinary book, not a contrived one. Price 1.00, 6 decimals.
+        const MIN_LEG: u128 = 10_000_000;
+        let pos = [MIN_LEG; 256];
+        let users: u128 = pos.iter().sum();
+        let target: u128 = 500 * 1_000_000;
+        let lp = target + MIN_LEG; // the excess to remove is ONE minimum leg
+        let excess = lp - target;
+        let k = w1_keep_bps_users(users, lp, target);
+        assert_eq!(k, 9_960, "the rule intends to keep 99.6%: one leg's worth removed in total");
+
+        // the old per-leg call: 99.6% of the minimum is below the minimum, so every leg is wiped
+        assert_eq!(w1_keep_q(MIN_LEG, k, MIN_LEG), 0);
+        let old_total: u128 = pos.iter().map(|p| p - w1_keep_q(*p, k, MIN_LEG)).sum();
+        assert_eq!(old_total, users, "the entire opposing side goes");
+        assert_eq!(old_total / excess, 256, "256x the excess the round asked for");
+
+        // with the budget: exactly the excess, and it stops after the first leg
+        let mut remaining = excess;
+        let (mut total, mut cuts) = (0u128, 0usize);
+        for p in pos.iter() {
+            let cut = w1_cut_q(*p, k, MIN_LEG, remaining);
+            if cut == 0 {
+                continue;
+            }
+            total += cut;
+            remaining -= cut;
+            cuts += 1;
+        }
+        assert_eq!(total, excess, "exactly the excess, never more");
+        assert_eq!(cuts, 1, "one minimum leg closed, not 256");
+        assert_eq!(lp - total, target, "the LP lands on target and never crosses it");
+    }
+
+    /// #612: in a mixed book the budget changes only which sub-minimum legs are wiped. The
+    /// pro-rata legs keep exactly their keep-fraction whatever order they are listed in, which is
+    /// what the integration test
+    /// `lev_w1_lp_stop_round_cuts_opposing_users_once_and_order_independent` pins end to end.
+    #[test]
+    fn w1_cut_q_leaves_pro_rata_legs_order_independent() {
+        const MIN_LEG: u128 = 10_000_000;
+        let k: u16 = 5_000;
+        let big = [400 * MIN_LEG, 250 * MIN_LEG, 150 * MIN_LEG];
+        let run = |order: &[usize; 3], budget: u128| -> [u128; 3] {
+            let mut remaining = budget;
+            let mut kept = [0u128; 3];
+            for &i in order {
+                let cut = w1_cut_q(big[i], k, MIN_LEG, remaining);
+                remaining = remaining.saturating_sub(cut);
+                kept[i] = big[i] - cut;
+            }
+            kept
+        };
+        // whatever the order, and whatever is left of the budget, each leg keeps its fraction
+        let mut want = [0u128; 3];
+        for (w, p) in want.iter_mut().zip(big) {
+            *w = p * u128::from(k) / 10_000;
+        }
+        assert_eq!(run(&[0, 1, 2], u128::MAX), want);
+        assert_eq!(run(&[2, 1, 0], u128::MAX), want);
+        assert_eq!(run(&[1, 2, 0], 1), want, "an exhausted budget does not spare a pro-rata leg");
+    }
+
+    /// #612: a leg that cannot be cut without overshooting is left alone, not destroyed.
+    #[test]
+    fn w1_cut_q_skips_a_leg_it_cannot_cut_within_budget() {
+        const MIN_LEG: u128 = 10_000_000;
+        // the pro-rata remainder would be sub-minimum, so the leg is all-or-nothing -- and taking
+        // the whole leg is more than the round still needs
+        assert_eq!(w1_cut_q(MIN_LEG, 9_960, MIN_LEG, MIN_LEG - 1), 0);
+        // the round needs exactly this much: take it
+        assert_eq!(w1_cut_q(MIN_LEG, 9_960, MIN_LEG, MIN_LEG), MIN_LEG);
+        // a leg with room for a valid remainder is cut pro-rata, and the budget does NOT touch it:
+        // its own outcome must not depend on where the caller listed it. The flooring slack is why
+        // the pro-rata total can pass the excess at all, and it is at most one lot per leg.
+        assert_eq!(w1_cut_q(100 * MIN_LEG, 5_000, MIN_LEG, u128::MAX), 50 * MIN_LEG);
+        assert_eq!(w1_cut_q(100 * MIN_LEG, 5_000, MIN_LEG, 7), 50 * MIN_LEG);
+        assert_eq!(w1_cut_q(100 * MIN_LEG, 5_000, MIN_LEG, 0), 50 * MIN_LEG);
+        // keep of 100% cuts nothing
+        assert_eq!(w1_cut_q(100 * MIN_LEG, 10_000, MIN_LEG, u128::MAX), 0);
+    }
+
+    /// #612: for every shape, a cut stays inside the leg, never leaves a standing leg below the
+    /// market minimum, and -- where it takes a WHOLE leg -- stays inside the round's budget. A
+    /// pro-rata cut is intentionally not budget-gated (see `w1_cut_q`), so there is no blanket
+    /// `cut <= remaining` to assert.
+    #[test]
+    fn w1_cut_q_invariants_hold_for_every_shape() {
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = move || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for _ in 0..200_000 {
+            let min_leg = u128::from(next() % 50_000);
+            let pos = u128::from(next() % 1_000_000);
+            let k = (next() % 12_000) as u16;
+            let rem = u128::from(next() % 1_000_000);
+            let cut = w1_cut_q(pos, k, min_leg, rem);
+            assert!(cut <= pos, "cut {cut} over leg {pos}");
+            // `keep == 0` is exactly the all-or-nothing case, and the only one the budget gates
+            if cut == pos && pos > 0 {
+                assert!(cut <= rem, "whole leg {cut} taken over budget {rem}");
+            }
+            let left = pos - cut;
+            assert!(
+                left == 0 || left >= min_leg || pos < min_leg,
+                "left a standing leg below the minimum: pos {pos} k {k} min {min_leg} cut {cut} left {left}"
+            );
         }
     }
 
