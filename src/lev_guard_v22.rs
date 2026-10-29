@@ -546,9 +546,30 @@ pub fn nav_epoch_start(equity: u128, flow_in: u128, flow_out: u128, now: u64) ->
 /// Epoch restart (fresh 1.0): no previous equity (first capital), or the index reached 0 (the
 /// LP was wiped; D-i "epoch start"), or a counter went backwards (data fault: fail to a clean
 /// epoch rather than invent a loss).
+///
+/// A restart never erases a PENDING stop (navcheck 2026-10-29). An insolvent LP reads
+/// conservative equity 0, so its sample stores NAV/share 0 -- the deepest stop there is -- and
+/// the restart used to fire on the very next sample: op 5 samples before it decides, so once op 4
+/// (the keeper's routine poke, which runs before W1) had stored the wipe, every op 5 read a fresh
+/// 1.0 and refused, and the next poke stored the restart for good. The same held for a triggered
+/// index left on zero equity by an outflow. While the stored state is triggered, the reading is
+/// held (counters and equity advance, the index and peaks do not) until op 5 acknowledges it
+/// (`nav_stop_reset`); a wiped index then reads uninitialised and the next sample restarts. An
+/// untriggered empty pool restarts exactly as before.
 pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, now: u64) -> NavState {
-    if !st.initialised() || st.last_equity == 0 || st.navps == 0 || flow_in < st.last_in || flow_out < st.last_out {
+    if !st.initialised() || flow_in < st.last_in || flow_out < st.last_out {
         return nav_epoch_start(equity, flow_in, flow_out, now);
+    }
+    if st.last_equity == 0 || st.navps == 0 {
+        if !lp_stop_triggered(st) {
+            return nav_epoch_start(equity, flow_in, flow_out, now);
+        }
+        let mut n = *st;
+        n.last_equity = equity;
+        n.last_in = flow_in;
+        n.last_out = flow_out;
+        n.last_slot = now;
+        return n;
     }
     let din = flow_in - st.last_in;
     let dout = flow_out - st.last_out;
@@ -1519,8 +1540,15 @@ mod tests {
         let w = nav_sample(&s, 0, 0, 0, 5);
         assert_eq!(w.navps, 0);
         assert!(lp_stop_triggered(&w));
-        // the next sample starts a clean epoch (no perpetual stop on a dead index)
-        let n = nav_sample(&w, 3_000, 3_000, 0, 6);
+        // navcheck 2026-10-29: the next sample (a poke, or op 5's own sample, even after a
+        // refill) HOLDS the wipe until op 5 acknowledges it -- a restart here used to erase the
+        // stop before W1 could act. Not perpetual: the acknowledgement (`nav_stop_reset`, on a
+        // round close or "within target") makes the dead index uninitialised, and the sample
+        // after it starts a clean epoch.
+        let held = nav_sample(&w, 3_000, 3_000, 0, 6);
+        assert_eq!((held.navps, held.last_equity, held.last_in), (0, 3_000, 3_000));
+        assert!(lp_stop_triggered(&held));
+        let n = nav_sample(&nav_stop_reset(&held), 3_000, 3_000, 0, 7);
         assert_eq!(n.navps, NAV_ONE);
         assert!(!lp_stop_triggered(&n));
         // a counter going backwards fails to a clean epoch, never to a fake loss
@@ -2501,5 +2529,34 @@ mod proofs {
         };
         assert!(n.navps == st.navps);
         assert!(lp_stop_triggered(&st) || !lp_stop_triggered(&n));
+    }
+
+    /// navcheck 2026-10-29: from ANY stored state on the restart path (index 0 or equity 0), a
+    /// sample never erases a pending stop, whatever the equity and flows; and an untriggered one
+    /// still restarts at 1.0. (No division on either path.)
+    #[kani::proof]
+    fn kani_lev_nav_restart_never_erases_a_pending_stop() {
+        let st = NavState {
+            navps: kani::any::<u64>() as u128,
+            last_equity: kani::any::<u64>() as u128,
+            last_in: kani::any::<u64>() as u128,
+            last_out: kani::any::<u64>() as u128,
+            peak_cur: kani::any::<u64>() as u128,
+            peak_prev: kani::any::<u64>() as u128,
+            bucket_start: kani::any(),
+            ref_navps: kani::any::<u64>() as u128,
+            last_slot: kani::any(),
+        };
+        kani::assume(st.navps == 0 || st.last_equity == 0);
+        let equity = kani::any::<u64>() as u128;
+        let din = kani::any::<u64>() as u128;
+        let dout = kani::any::<u64>() as u128;
+        let n = nav_sample(&st, equity, st.last_in + din, st.last_out + dout, kani::any());
+        if lp_stop_triggered(&st) {
+            assert!(lp_stop_triggered(&n));
+            assert!(n.navps == st.navps && n.ref_navps == st.ref_navps);
+        } else {
+            assert!(n.navps == NAV_ONE && !lp_stop_triggered(&n));
+        }
     }
 }
