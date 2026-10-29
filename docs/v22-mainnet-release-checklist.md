@@ -26,8 +26,8 @@ is its negative control; run it once on the devnet `.so` to see it fail).
 The marker is an accident guard, not tamper evidence: a hostile builder could embed both
 strings. Item 2 is the tamper check.
 
-The pinned set (stake, wrapper, vault-LP matcher, fee authority) lives in `src/mainnet_ids.rs` as
-`RELEASE-STEP` placeholders: `--features mainnet-ids` does NOT COMPILE until all four are set. The build
+The pinned set (stake, wrapper, vault-LP matcher, fee authority, NFT program — GH#576) lives in `src/mainnet_ids.rs` as
+`RELEASE-STEP` placeholders: `--features mainnet-ids` does NOT COMPILE until all five are set. The build
 carries a marker: `check-mainnet-pin.sh` REJECTS a `mainnet-ids-test-placeholders` build
 (`PCLR-PIN:TEST...`) and an unpinned build (`PCLR-PIN:NONE`: no feature, or devnet) and accepts only
 `PCLR-PIN:MAINNET-OK`. Also change the stake / NFT allowlists to the mainnet wrapper id in the same release.

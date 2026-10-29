@@ -1293,18 +1293,24 @@ pub mod constants {
     // until a mainnet NFT id is added (alongside the other `mainnet_ids` RELEASE-STEPs).
     // Host builds (`cargo test`, never deployed) use the devnet id so the native suite
     // exercises the same pinned path the devnet binary runs.
-    #[cfg(any(feature = "devnet", not(target_os = "solana")))]
+    // GH#576: the `mainnet-ids` arm pins `mainnet_ids::MAINNET_NFT_PROGRAM_ID`, which is in the
+    // build-time `PINNED_SET` assertion, so a release build cannot compile until it is set
+    // (before, the release build compiled with no NFT arm and every NFT path dead on chain).
+    #[cfg(all(not(feature = "mainnet-ids"), any(feature = "devnet", not(target_os = "solana"))))]
     pub const NFT_PROGRAM_ID: solana_program::pubkey::Pubkey =
         solana_program::pubkey!("27LWmR72Ru1NCkbN2xgxB7BgYcTUrU7qeEJoV3D8sZh1");
+    #[cfg(feature = "mainnet-ids")]
+    pub const NFT_PROGRAM_ID: solana_program::pubkey::Pubkey =
+        crate::mainnet_ids::MAINNET_NFT_PROGRAM_ID;
 
     /// `true` iff `nft_program_id` is this build's pinned NFT program (GH#548). Always
     /// `false` in a build with no pin.
     pub fn is_pinned_nft_program(nft_program_id: &[u8; 32]) -> bool {
-        #[cfg(any(feature = "devnet", not(target_os = "solana")))]
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids", not(target_os = "solana")))]
         {
             *nft_program_id == NFT_PROGRAM_ID.to_bytes()
         }
-        #[cfg(not(any(feature = "devnet", not(target_os = "solana"))))]
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids", not(target_os = "solana"))))]
         {
             let _ = nft_program_id;
             false
