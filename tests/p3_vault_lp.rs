@@ -6586,3 +6586,88 @@ fn lev_w1_round_opens_without_victims_k1() {
     assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
     assert_eq!(lev_w1::guard(&env).round_active, 0, "round closed once every opposing account is cut");
 }
+
+/// GH#627 root cause, end to end on the real handlers (reported by 0x-SquidSol): the issue's
+/// "earn, withdraw to a dust base, sample" cycle used to multiply NAV/share by ~P/1 atom, so a
+/// later slow bleed of the LP -- three 25 % losses, each in its own 24-48 h peak window, so only
+/// the D-i reference arm can see them -- never reached half of the reference: a REAL stop hidden.
+/// With the gross-reading cap the cycle reads as the gain it was (P on the capital that earned
+/// it), the index tracks the LP, and op 5 fires exactly when the honest index crosses 50 %.
+///
+/// Real paths: the gain is a trade the LP wins (price -20 %, the trader closes), the withdrawal
+/// is tag 97 on the flat LP (D1: P + 1 of value left standing), the re-deposit tag 96, every
+/// sample op 4, the stop op 5. Only the bleed is a state poke (`lose_capital`, as every W1 test).
+#[test]
+fn gh627_dust_base_cycle_cannot_hide_a_real_lp_stop() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000 * U).expect("creator stake");
+    // the attacker's own trader opens BEFORE the guard (no 6-h rule yet); the LP is short
+    let t = env.new_trader(5_000 * U);
+    let q = tok(GPRICE, 4_000);
+    env.trade_signing_fee(&t, &lp, q, GROWTH_FEE).expect("long vs the vault LP");
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("NAV epoch start");
+    let e0 = lev_w1::guard(&env).nav().last_equity;
+
+    // 1. earn: price -20 %, the trader closes (an exit: allowed under the guard), the LP is flat
+    let mut p = GPRICE;
+    while p > GPRICE * 8 / 10 {
+        p = (p * 93 / 100).max(GPRICE * 8 / 10);
+        env.move_price(p, &[lp.portfolio, t.portfolio]);
+    }
+    env.svm.expire_blockhash();
+    env.trade_signing_fee(&t, &lp, -q, GROWTH_FEE).expect("close: the LP is flat again");
+    for _ in 0..3 {
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        let _ = env.crank(lp.portfolio);
+        let _ = env.crank(t.portfolio);
+    }
+    assert_eq!(env.position(lp.portfolio), 0);
+    // 2. withdraw all but one atom of the last SAMPLED equity, in the same interval (tag 97)
+    let out = (e0 - 1) as u64;
+    env.junior_withdraw_as(&admin, lp.portfolio, out).expect("tag 97 on a flat LP, P + 1 left");
+    lev_w1::poke(&mut env, &lp).expect("sample");
+    let nav = lev_w1::guard(&env).nav();
+    let gained = nav.last_equity - 1; // P: the value left standing is P + 1
+    eprintln!("gh627 e2e: e0 {e0}, P {gained}, navps after the cycle {}", nav.navps);
+    assert!(gained >= LEV_MIN_STAKE as u128, "a real gain, and D1's minimum left standing: {gained}");
+    // the gain reads as P on the capital that earned it (rounding: one unit of the index)
+    let honest = lg::NAV_ONE * (e0 + gained) / e0;
+    assert!(nav.navps <= honest && nav.navps + 1 >= honest, "navps {} vs honest {honest}", nav.navps);
+    assert!(nav.navps < 2 * lg::NAV_ONE, "not P / 1 atom: {}", nav.navps);
+    // 3. put the capital back (tag 96: a pure flow, the index does not move)
+    env.junior_deposit_as(&admin, lp.portfolio, out).expect("re-deposit");
+    lev_w1::poke(&mut env, &lp).expect("sample");
+    assert_eq!(lev_w1::guard(&env).nav().navps, nav.navps, "a deposit moved the index");
+
+    // 4. a slow bleed: 25 % per step, each step in a fresh 24-48 h peak window, so the peak arm
+    //    never sees 50 % and only the D-i reference arm can. (The LP stays flat: this harness
+    //    accrues one slot per crank, so multi-day warps are only feasible without open interest;
+    //    the cut itself is covered by `lev_w1_lp_stop_round_cuts_opposing_users_*`.)
+    for step in 1..=3 {
+        lev_w1::lose_capital(&mut env, lp.portfolio, 3, 4);
+        if step < 3 {
+            // honest index (1 + P/E)·0.75, then ·0.5625: above half of the reference, so op 5 must
+            // refuse (no false trip either)
+            let r = lev_w1::w1(&mut env, &lp, &[]);
+            assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "step {step}: {r:?}");
+            env.slot += 2 * lg::SLOTS_PER_DAY + 1;
+            env.svm.warp_to_slot(env.slot);
+            env.move_price(p, &[lp.portfolio, t.portfolio]); // same price, fresh mark (no band move)
+            lev_w1::poke(&mut env, &lp).expect("sample: the peak window rolls");
+            let g = lev_w1::guard(&env).nav();
+            assert!(!lg::lp_stop_triggered(&g), "step {step}: no stop yet");
+        }
+    }
+    // 5. the real stop: (1 + P/E)·0.42 < 0.5 of the reference -- op 5 must fire. Under the F1
+    //    reading alone the cycle above had lifted the index ~8e6× and this op returned 135.
+    lev_w1::w1(&mut env, &lp, &[]).expect("a real 58 % bleed fires W1 (it was masked before)");
+    let after = lev_w1::guard(&env).nav();
+    eprintln!("gh627 e2e: stop fired at navps {} (ref was {})", after.navps, lg::NAV_ONE);
+    assert!(after.navps <= lg::NAV_ONE / 2, "the honest index crossed half of the reference");
+    assert_eq!(after.ref_navps, after.navps, "the stop held: acknowledged, reference reset");
+}
