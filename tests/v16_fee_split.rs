@@ -554,6 +554,7 @@ struct FeeEnv {
     payer: Keypair,
     admin: Keypair,
     market: Pubkey,
+    market_kp: Keypair,
     mint: Pubkey,
     vault: Pubkey,
     pool_pda: Pubkey,
@@ -590,7 +591,8 @@ impl FeeEnv {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
@@ -634,6 +636,7 @@ impl FeeEnv {
             payer,
             admin,
             market,
+            market_kp,
             mint,
             vault,
             pool_pda: Pubkey::default(),
@@ -720,7 +723,7 @@ impl FeeEnv {
             program_id: PERCOLATOR_MAINNET,
             accounts: vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.market, true),
                 AccountMeta::new_readonly(self.mint, false),
             ],
             data: ProgInstruction::InitMarket {
@@ -750,7 +753,8 @@ impl FeeEnv {
             .encode(),
         };
         let payer = self.payer.insecure_clone();
-        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin]).expect("InitMarket");
+        let market_kp = self.market_kp.insecure_clone();
+        send_ixs(&mut self.svm, &payer, vec![ix], &[&admin, &market_kp]).expect("InitMarket");
     }
 
     fn top_up_insurance(&mut self, source: Pubkey, amount: u64) {
@@ -945,7 +949,8 @@ impl FeeEnv {
 
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let portfolio = Pubkey::new_unique();
+        let portfolio_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let portfolio = portfolio_kp.pubkey();
         let len = state::portfolio_account_len_for_market_slots(FS_MAX_ASSETS as usize).unwrap();
         self.svm
             .set_account(
@@ -965,11 +970,11 @@ impl FeeEnv {
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
             data: ProgInstruction::InitPortfolio.encode(),
         };
-        send_ixs(&mut self.svm, &payer, vec![ix], &[owner]).expect("InitPortfolio");
+        send_ixs(&mut self.svm, &payer, vec![ix], &[owner, &portfolio_kp]).expect("InitPortfolio");
         portfolio
     }
 

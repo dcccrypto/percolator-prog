@@ -274,7 +274,8 @@ impl Env {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id);
@@ -360,10 +361,10 @@ impl Env {
             },
             vec![
                 AccountMeta::new(env.admin.pubkey(), true),
-                AccountMeta::new(env.market, false),
+                AccountMeta::new(env.market, true),
                 AccountMeta::new_readonly(env.mint, false),
             ],
-            &[&env.admin.insecure_clone()],
+            &[&env.admin.insecure_clone(), &market_kp],
         )
         .expect("init market");
 
@@ -447,7 +448,8 @@ impl Env {
 
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let portfolio = Pubkey::new_unique();
+        let portfolio_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let portfolio = portfolio_kp.pubkey();
         self.svm
             .set_account(
                 portfolio,
@@ -465,9 +467,9 @@ impl Env {
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[owner],
+            &[owner, &portfolio_kp],
         )
         .expect("init portfolio");
         portfolio

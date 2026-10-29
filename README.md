@@ -137,6 +137,7 @@ This section describes intent and operational ordering, not argument-by-argument
 
 ### Market lifecycle
 - **InitMarket**
+  - requires the market (slab) account to SIGN (account index 1; all encodings: tags 0, V19, LotV22, V22). Create + init in ONE transaction: the new account's keypair already signs its `createAccount`, so a separately created slab can no longer be front-run by a third party (D26 / S1-30)
   - initializes slab header/config + calls `RiskEngine::init_in_place(risk_params, clock.slot, init_price)`
   - binds vault token account + oracle keys into config
   - initializes the matcher nonce to zero
@@ -472,7 +473,7 @@ Create:
 ### Step 1: InitMarket
 Call `InitMarket` with:
 - admin signer
-- slab (writable)
+- slab (writable, **signer**: create + init in one tx)
 - mint + vault
 - oracle pubkeys
 - staleness/conf filter params

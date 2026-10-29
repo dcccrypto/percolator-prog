@@ -418,12 +418,17 @@ impl Env {
 
     /// A NEW account created by a real system `create_account` (payer + new key both sign).
     fn create_owned(&mut self, owner: &Pubkey, len: usize) -> Pubkey {
+        self.create_owned_kp(owner, len).pubkey()
+    }
+
+    /// D26: same, but keeps the new account's keypair (InitPortfolio requires its signature).
+    fn create_owned_kp(&mut self, owner: &Pubkey, len: usize) -> Keypair {
         let kp = Keypair::new();
         let lamports = self.svm.minimum_balance_for_rent_exemption(len);
         let ix = system_instruction::create_account(&self.payer.pubkey(), &kp.pubkey(), lamports, len as u64, owner);
         let o = self.send(vec![ix], &[], &[&kp]);
         expect_ok(&o, "system create_account");
-        kp.pubkey()
+        kp
     }
 
     fn market(&self) -> (state::WrapperConfigV16, state::MarketGroupV16) {
@@ -757,12 +762,13 @@ impl Env {
     /// NEW portfolio owned by `owner` (fake-signed: `owner` is either a fresh test key or a
     /// live wallet that could sign), funded with TEST-SUPPLIED capital.
     fn new_trader(&mut self, owner: Pubkey, capital: u64) -> Pubkey {
-        let p = self.create_owned(&WRAPPER_ID, self.plen);
+        let pkp = self.create_owned_kp(&WRAPPER_ID, self.plen);
+        let p = pkp.pubkey();
         let ix = self.wrapper_ix(
             ProgInstruction::InitPortfolio,
-            vec![AccountMeta::new(owner, true), AccountMeta::new(self.slab, false), AccountMeta::new(p, false)],
+            vec![AccountMeta::new(owner, true), AccountMeta::new(self.slab, false), AccountMeta::new(p, true)],
         );
-        let o = self.send(vec![ix], &[owner], &[]);
+        let o = self.send(vec![ix], &[owner], &[&pkp]);
         expect_ok(&o, &format!("{} InitPortfolio", self.label));
         if capital > 0 {
             let src = self.new_token(self.mint, owner, capital);

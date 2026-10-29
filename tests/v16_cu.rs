@@ -361,6 +361,8 @@ struct V16CuEnv {
     payer: Keypair,
     admin: Keypair,
     market: Pubkey,
+    // D26: the market account's keypair (InitMarket requires its signature).
+    market_kp: Keypair,
     mint: Pubkey,
     vault: Pubkey,
     vault_authority: Pubkey,
@@ -515,7 +517,8 @@ impl V16CuEnv {
         let payer = Keypair::new();
         let admin = Keypair::new();
         let market_kp = Keypair::new();
-        let market = if params.system_created_market { market_kp.pubkey() } else { Pubkey::new_unique() };
+        // D26: InitMarket requires the market account's signature, so the market is always a keypair.
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         let vault_authority =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id).0;
@@ -608,10 +611,10 @@ impl V16CuEnv {
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         );
         if let Err(error) = init_result {
             let market_after = svm.get_account(&market).map(|a| a.data).unwrap_or_default();
@@ -623,6 +626,7 @@ impl V16CuEnv {
             payer,
             admin,
             market,
+            market_kp,
             mint,
             vault,
             vault_authority,
@@ -638,7 +642,9 @@ impl V16CuEnv {
     }
 
     fn create_portfolio_with_cu(&mut self, owner: &Keypair) -> (Pubkey, u64) {
-        let portfolio = Pubkey::new_unique();
+        // D26: InitPortfolio requires the portfolio account's signature, so it is a keypair.
+        let portfolio_kp = Keypair::new();
+        let portfolio = portfolio_kp.pubkey();
         self.ensure_signer_account(owner.pubkey());
         self.svm
             .set_account(
@@ -658,9 +664,9 @@ impl V16CuEnv {
                 vec![
                     AccountMeta::new(owner.pubkey(), true),
                     AccountMeta::new(self.market, false),
-                    AccountMeta::new(portfolio, false),
+                    AccountMeta::new(portfolio, true),
                 ],
-                &[owner],
+                &[owner, &portfolio_kp],
             )
             .expect("init portfolio");
         (portfolio, cu)
@@ -683,7 +689,7 @@ impl V16CuEnv {
             accounts: vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(account.pubkey(), false),
+                AccountMeta::new(account.pubkey(), true),
             ],
             data: ProgInstruction::InitPortfolio.encode(),
         };
@@ -4616,10 +4622,10 @@ fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
         },
         vec![
             AccountMeta::new(env.admin.pubkey(), true),
-            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.market, true),
             AccountMeta::new_readonly(env.mint, false),
         ],
-        &[&env.admin],
+        &[&env.admin, &env.market_kp],
     );
     let err = reinit.expect_err("InitMarket must refuse to reinitialize a closed market's pubkey");
     assert!(
@@ -15630,10 +15636,10 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
         },
         vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market.pubkey(), false),
+            AccountMeta::new(market.pubkey(), true),
             AccountMeta::new_readonly(mint, false),
         ],
-        &[&admin],
+        &[&admin, &market],
     )
     .expect("init market");
 
@@ -19269,7 +19275,8 @@ fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String
     );
     let payer = Keypair::new();
     let admin = Keypair::new();
-    let market = Pubkey::new_unique();
+    let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+    let market = market_kp.pubkey();
     let mint = Pubkey::new_unique();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
@@ -19303,7 +19310,7 @@ fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String
         program_id,
         accounts: vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(market, false),
+            AccountMeta::new(market, true),
             AccountMeta::new_readonly(mint, false),
         ],
         data: ProgInstruction::InitMarket {
@@ -19335,7 +19342,7 @@ fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String
     let tx = Transaction::new_signed_with_payer(
         &[heap_ix(), cu_ix(), ix],
         Some(&payer.pubkey()),
-        &[&payer, &admin],
+        &[&payer, &admin, &market_kp],
         svm.latest_blockhash(),
     );
     svm.send_transaction(tx)
@@ -26931,14 +26938,15 @@ fn v22_init_portfolio_refuses_a_wrong_length_and_never_reallocs() {
     for bad in [required - 1, required + 1, 10_240] {
         let owner = Keypair::new();
         env.ensure_signer_account(owner.pubkey());
-        let key = Pubkey::new_unique();
+        let key_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let key = key_kp.pubkey();
         env.svm
             .set_account(key, Account { lamports: 1_000_000_000, data: vec![0u8; bad], owner: env.program_id, executable: false, rent_epoch: 0 })
             .unwrap();
         let r = env.send(
             ProgInstruction::InitPortfolio,
-            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(key, false)],
-            &[&owner],
+            vec![AccountMeta::new(owner.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(key, true)],
+            &[&owner, &key_kp],
         );
         let e = r.expect_err("wrong length refused");
         assert!(e.contains(&format!("Custom({code})")), "injected len {bad}: {e}");
@@ -28555,4 +28563,112 @@ fn v22_f1_static_bound_keeps_the_worst_shapes_inside_the_budget() {
     assert!(settle4 > 0, "4 legs: the first crank must be refresh-only (outside the static bound)");
     assert!(liq4 > 0, "4 legs: the second crank must still liquidate");
     assert!(settle4 + X1_STRANDED_BACKING_CU <= X1_CRANK_CU_LIMIT && liq4 + X1_FILL_EVENT_CU <= X1_CRANK_CU_LIMIT);
+}
+
+// D26 (S1-13 / S1-30), on the real SBF binary: InitMarket needs the market account's signature
+// (account 1) and InitPortfolio the portfolio account's (account 2). A separately created account
+// that did not sign the transaction is refused with ExpectedSigner (Custom(6)) and left untouched.
+#[test]
+fn d26_init_market_and_init_portfolio_refuse_an_account_that_did_not_sign() {
+    // InitMarket: market meta present but NOT a signer (the pre-D26 shape).
+    let mut svm = LiteSVM::new();
+    let program_id = percolator_prog::id();
+    svm.add_program(program_id, &std::fs::read(program_path()).expect("read BPF"));
+    svm.add_program(spl_token::ID, &std::fs::read(spl_token_program_path()).expect("read token BPF"));
+    let payer = Keypair::new();
+    let admin = Keypair::new();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
+    let mint = Pubkey::new_unique();
+    svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+    svm.set_account(
+        mint,
+        Account { lamports: 1_000_000_000, data: make_mint_data(), owner: spl_token::ID, executable: false, rent_epoch: 0 },
+    )
+    .unwrap();
+    let market_len = state::market_account_len_for_capacity(1).unwrap();
+    svm.set_account(
+        market,
+        Account { lamports: 1_000_000_000, data: vec![0u8; market_len], owner: program_id, executable: false, rent_epoch: 0 },
+    )
+    .unwrap();
+    let params = V16CuMarketParams::default();
+    let init_ix = || ProgInstruction::InitMarket {
+        max_portfolio_assets: params.max_portfolio_assets,
+        h_min: params.h_min,
+        h_max: params.h_max,
+        initial_price: params.initial_price,
+        min_nonzero_mm_req: params.min_nonzero_mm_req,
+        min_nonzero_im_req: params.min_nonzero_im_req,
+        maintenance_margin_bps: params.maintenance_margin_bps,
+        initial_margin_bps: params.initial_margin_bps,
+        max_trading_fee_bps: params.max_trading_fee_bps,
+        trade_fee_base_bps: params.trade_fee_base_bps,
+        liquidation_fee_bps: params.liquidation_fee_bps,
+        liquidation_fee_cap: params.liquidation_fee_cap,
+        min_liquidation_abs: params.min_liquidation_abs,
+        max_price_move_bps_per_slot: params.max_price_move_bps_per_slot,
+        max_accrual_dt_slots: params.max_accrual_dt_slots,
+        max_abs_funding_e9_per_slot: params.max_abs_funding_e9_per_slot,
+        min_funding_lifetime_slots: params.min_funding_lifetime_slots,
+        max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
+        max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
+        max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
+        public_b_chunk_atoms: params.public_b_chunk_atoms,
+        maintenance_fee_per_slot: params.maintenance_fee_per_slot,
+    };
+    let before = svm.get_account(&market).unwrap().data;
+    let refused = send_tx(
+        &mut svm,
+        program_id,
+        &payer,
+        init_ix(),
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new_readonly(mint, false),
+        ],
+        &[&admin],
+    );
+    let e = refused.expect_err("an unsigned market account must be refused");
+    assert!(e.contains("Custom(6)"), "expected ExpectedSigner (Custom(6)), got {e}");
+    assert_eq!(svm.get_account(&market).unwrap().data, before, "refused InitMarket leaves the slab untouched");
+
+    // InitPortfolio on the standard env (whose InitMarket is the signed positive control).
+    let mut env = V16CuEnv::new();
+    let owner = Keypair::new();
+    env.ensure_signer_account(owner.pubkey());
+    let portfolio_kp = Keypair::new();
+    let portfolio = portfolio_kp.pubkey();
+    env.svm
+        .set_account(
+            portfolio,
+            Account { lamports: 1_000_000_000, data: vec![0u8; env.portfolio_account_len], owner: env.program_id, executable: false, rent_epoch: 0 },
+        )
+        .unwrap();
+    let before_p = env.svm.get_account(&portfolio).unwrap().data;
+    let refused = env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[&owner],
+    );
+    let e = refused.expect_err("an unsigned portfolio account must be refused");
+    assert!(e.contains("Custom(6)"), "expected ExpectedSigner (Custom(6)), got {e}");
+    assert_eq!(env.svm.get_account(&portfolio).unwrap().data, before_p, "refused InitPortfolio leaves the account untouched");
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::InitPortfolio,
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, true),
+        ],
+        &[&owner, &portfolio_kp],
+    )
+    .expect("a signed portfolio account initialises");
 }

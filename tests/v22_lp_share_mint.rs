@@ -58,7 +58,8 @@ thread_local! {
     /// Decimals of the collateral mint the fixture creates.
     static COLLATERAL_DECIMALS: Cell<u8> = const { Cell::new(6) };
     /// Fixed market address (compute comparisons: PDA bump searches cost the same on both runs).
-    static FIXED_MARKET: Cell<Option<Pubkey>> = const { Cell::new(None) };
+    // D26: the market account must sign InitMarket, so the fixed market is a seeded KEYPAIR (seed byte).
+    static FIXED_MARKET: Cell<Option<u8>> = const { Cell::new(None) };
 }
 
 fn program_path() -> PathBuf {
@@ -255,7 +256,11 @@ fn setup_market() -> Env {
 
     let payer = Keypair::new();
     let admin = Keypair::new();
-    let market = FIXED_MARKET.with(|c| c.get()).unwrap_or_else(Pubkey::new_unique);
+    let market_kp = match FIXED_MARKET.with(|c| c.get()) {
+        Some(seed) => solana_sdk::signer::keypair::keypair_from_seed(&[seed; 32]).unwrap(),
+        None => Keypair::new(),
+    };
+    let market = market_kp.pubkey();
     let collateral_mint = Pubkey::new_unique();
     svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
     svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
@@ -293,11 +298,11 @@ fn setup_market() -> Env {
             init_market_ix(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
             ],
         )],
-        &[&admin],
+        &[&admin, &market_kp],
     )
     .expect("init market");
 
@@ -1759,7 +1764,7 @@ fn burned_or_rotated_marketauth_cannot_name_real_metaplex() {
 
 #[test]
 fn print_tag_74_compute_units() {
-    FIXED_MARKET.with(|c| c.set(Some(Pubkey::new_from_array([7u8; 32]))));
+    FIXED_MARKET.with(|c| c.set(Some(7u8)));
     let mut env = setup_market();
     let mint = env.collateral_mint;
     let cu = create_vault_with(&mut env, vec![AccountMeta::new_readonly(mint, false)]).expect("create");

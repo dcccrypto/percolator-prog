@@ -512,7 +512,8 @@ mod e2e {
         use percolator_prog::state::market_account_len_for_capacity;
 
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let collateral_mint = Pubkey::new_unique();
 
         svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
@@ -592,10 +593,10 @@ mod e2e {
             init_market_ix.encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("InitMarket");
 
@@ -1577,7 +1578,8 @@ mod e2e {
         // Set up a market WITHOUT calling SetNftProgramId.
         use percolator_prog::state::market_account_len_for_capacity;
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let collateral_mint = Pubkey::new_unique();
         svm.airdrop(&admin.pubkey(), 100_000_000_000).unwrap();
         {
@@ -1648,10 +1650,10 @@ mod e2e {
             .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(collateral_mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("InitMarket (no registry)");
 
