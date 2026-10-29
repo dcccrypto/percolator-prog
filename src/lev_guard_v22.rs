@@ -666,6 +666,17 @@ pub fn w1_cut_q(pos_abs_q: u128, keep_bps: u16, min_leg_q: u128, remaining_q: u1
     pos_abs_q - keep
 }
 
+/// D11 (#612 defect 4): is the LP's leftover excess over the round's target smaller than one
+/// minimum leg? Every live leg is at or above `min_leg_q` (a fill that would leave less is refused,
+/// error 113), and `w1_cut_q` takes a whole leg only while `pos <= remaining`. So once the excess
+/// is below `min_leg_q` no whole-leg cut can ever be admitted again and the round cannot converge;
+/// it would only be replaced every `W1_ROUND_SLOTS` and re-open, with F3 blocking crowd-side opens
+/// meanwhile. The LP is then as close to target as the market's own granularity allows, and the
+/// round (or an opening that would start one) is treated as within target.
+pub fn w1_leftover_below_leg(lp_abs_q: u128, target_q: u128, min_leg_q: u128) -> bool {
+    lp_abs_q.saturating_sub(target_q) < min_leg_q
+}
+
 /// The LP-side target `λ_eff · C_m_now` in Q (`growth_v19::n_cap_q`).
 pub fn w1_target_q(c_m: u128, lambda_eff_bps: u32, price_e6: u64, pos_scale: u128) -> u128 {
     crate::growth_v19::n_cap_q(c_m, lambda_eff_bps, price_e6, pos_scale).unwrap_or(0)
@@ -800,7 +811,13 @@ pub const LEV_GUARD_VERSION: u8 = 1;
 /// `flags` bit 0 / 1: the pinned base mint was last proven to have a live mint / freeze authority.
 pub const GUARD_FLAG_MINT_AUTH: u8 = 1 << 0;
 pub const GUARD_FLAG_FREEZE_AUTH: u8 = 1 << 1;
-pub const GUARD_FLAGS_KNOWN: u8 = GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH;
+/// D12 / GH#614 bit 2 (`0x04`): op 3 has read the pinned base mint's authorities at least once.
+/// Bits 0/1 alone cannot tell "proven clean" from "never looked". A record written before this bit
+/// existed reads 0 = never proven, which is the tight answer. The record layout is unchanged: this
+/// is a previously spare flag bit (`validate_guard` used to refuse it).
+pub const GUARD_FLAG_PERM_PROVEN: u8 = 1 << 2;
+pub const GUARD_FLAGS_KNOWN: u8 =
+    GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH | GUARD_FLAG_PERM_PROVEN;
 
 /// Tag 124 ops.
 pub const OP_INIT: u8 = 0;
@@ -907,6 +924,23 @@ impl LevGuardV22 {
             n_mult_bps: self.rep_n_mult_bps,
             slot: self.rep_slot,
         }
+    }
+    /// D12: have the mint/freeze authorities ever been read by op 3?
+    pub fn perm_proven(&self) -> bool {
+        self.flags & GUARD_FLAG_PERM_PROVEN != 0
+    }
+    /// D12 (fail TIGHT): the permissionless facts the open gate feeds to `merge_overlay`. Where
+    /// `proof_required` (mainnet builds) and the authorities were never proven, both read as LIVE,
+    /// so the existing authority-live clamp (L_floor 2x, N_floor $200) applies instead of the
+    /// no-clamp path a never-checked mint used to take. Once op 3 has proven the mint, the stored
+    /// bits speak (clean = full limits, live = clamp).
+    pub fn perm_for_gate(&self, proof_required: bool) -> PermFacts {
+        let mut p = self.perm();
+        if proof_required && !self.perm_proven() {
+            p.mint_auth_live = true;
+            p.freeze_auth_live = true;
+        }
+        p
     }
     pub fn perm(&self) -> PermFacts {
         PermFacts {
@@ -1712,6 +1746,61 @@ mod tests {
         assert_eq!(w1_cut_q(100 * MIN_LEG, 10_000, MIN_LEG, u128::MAX), 0);
     }
 
+    /// D11 (#612 defect 4): the round that never converges. 256 legs at the minimum, the LP one
+    /// minimum leg PLUS a sliver over target... then a first whole-leg cut brings it to a sliver
+    /// (< one leg) over target, and no whole leg is admitted afterwards.
+    #[test]
+    fn w1_round_with_leftover_below_one_leg_never_converges_without_the_close_rule() {
+        const MIN_LEG: u128 = 10_000_000;
+        let target: u128 = 500 * 1_000_000;
+        let lp0 = target + MIN_LEG + MIN_LEG / 2; // excess 1.5 legs
+        let pos = [MIN_LEG; 256];
+        let users: u128 = pos.iter().sum();
+        let k = w1_keep_bps_users(users, lp0, target);
+        let mut lp = lp0;
+        let mut remaining = lp0 - target;
+        for p in pos.iter() {
+            let cut = w1_cut_q(*p, k, MIN_LEG, remaining);
+            lp -= cut;
+            remaining = remaining.saturating_sub(cut);
+        }
+        // every leg was visited: one whole leg went, then the 0.5-leg leftover admits none
+        assert_eq!(lp, target + MIN_LEG / 2, "the round is stuck half a leg above target");
+        assert!(lp > target, "plain `lp <= target` never closes it");
+        // the rule: the leftover is below one leg, so the round closes
+        assert!(w1_leftover_below_leg(lp, target, MIN_LEG), "D11: close it");
+        // and an opening in that state is acknowledged rather than started
+        assert!(w1_leftover_below_leg(target + MIN_LEG - 1, target, MIN_LEG));
+    }
+
+    /// D11: a real drawdown keeps the stop armed. The rule never reads or writes the NAV state, and
+    /// it only fires within one leg of target; anything a leg or more over keeps the round open.
+    #[test]
+    fn w1_leftover_rule_keeps_a_real_excess_open_and_the_stop_armed() {
+        const MIN_LEG: u128 = 10_000_000;
+        let target: u128 = 500 * 1_000_000;
+        assert!(!w1_leftover_below_leg(target + MIN_LEG, target, MIN_LEG), "exactly one leg: still needs a cut");
+        assert!(!w1_leftover_below_leg(target + 50 * MIN_LEG, target, MIN_LEG));
+        assert!(w1_leftover_below_leg(target + MIN_LEG - 1, target, MIN_LEG));
+        assert!(w1_leftover_below_leg(target, target, MIN_LEG), "at target");
+        assert!(w1_leftover_below_leg(target - 1, target, MIN_LEG), "under target");
+        // a price of 0 gives min_leg_q = MAX: the lag gate refuses first, but the rule must not panic
+        assert!(w1_leftover_below_leg(u128::MAX - 1, 0, u128::MAX));
+        // a halved NAV/share with the LP far over target: the stop is triggered and stays so, since
+        // the rule does not touch the NAV reference (only an acknowledged close does)
+        let nav = NavState {
+            navps: 400,
+            peak_cur: 1_000,
+            peak_prev: 1_000,
+            ref_navps: 1_000,
+            last_equity: 1,
+            ..Default::default()
+        };
+        assert!(lp_stop_triggered(&nav));
+        assert!(!w1_leftover_below_leg(target + 40 * MIN_LEG, target, MIN_LEG));
+        assert!(lp_stop_triggered(&nav), "the round stays open and the reference is untouched");
+    }
+
     /// #612: for every shape, a cut stays inside the leg, never leaves a standing leg below the
     /// market minimum, and -- where it takes a WHOLE leg -- stays inside the round's budget. A
     /// pro-rata cut is intentionally not budget-gated (see `w1_cut_q`), so there is no blanket
@@ -1834,7 +1923,7 @@ mod tests {
         assert!(validate_guard(&g));
         // structural refusals
         let mut b = g;
-        b.flags = 4;
+        b.flags = 8; // bit 2 is GUARD_FLAG_PERM_PROVEN now (D12); bit 3 is still spare
         assert!(!validate_guard(&b));
         let mut b = g;
         b.rep_n_mult_bps = 10_001;
@@ -1845,6 +1934,47 @@ mod tests {
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
         assert!(!validate_guard(&b));
+    }
+
+    /// D12: unproven -> the authority-live overlay (L 2x, N $200); proven clean -> full limits;
+    /// proven live -> the same clamp. Devnet (`proof_required = false`) is unchanged.
+    #[test]
+    fn unproven_guard_gets_the_authority_live_overlay_when_proof_is_required() {
+        let now = 10 * SLOTS_PER_DAY;
+        let rep = RiskReport::default();
+        let fresh = new_guard([3u8; 32], 0, 1, 255);
+        assert!(!fresh.perm_proven());
+        let ov = |g: &LevGuardV22, req: bool| merge_overlay(AgeBand::Mature, &rep, &g.perm_for_gate(req), now);
+        // unproven, required: clamped exactly like a proven-live authority
+        let live = merge_overlay(
+            AgeBand::Mature,
+            &rep,
+            &PermFacts { mint_auth_live: true, ..Default::default() },
+            now,
+        );
+        assert_eq!((live.l_cap_x100, live.n_mult_bps), (1, 0));
+        assert_eq!(ov(&fresh, true), live, "unproven: tight (L 2x floor, N $200 floor)");
+        // unproven, not required (devnet): as before, no clamp
+        assert_eq!(ov(&fresh, false).l_cap_x100, u16::MAX);
+        assert_eq!(ov(&fresh, false).n_mult_bps, 10_000);
+        // proven clean: full limits either way
+        let mut clean = fresh;
+        clean.flags = GUARD_FLAG_PERM_PROVEN;
+        assert!(validate_guard(&clean));
+        assert_eq!(ov(&clean, true).l_cap_x100, u16::MAX);
+        assert_eq!(ov(&clean, true).n_mult_bps, 10_000);
+        // proven with a live mint authority / freeze authority: the clamp
+        for bit in [GUARD_FLAG_MINT_AUTH, GUARD_FLAG_FREEZE_AUTH] {
+            let mut g = fresh;
+            g.flags = GUARD_FLAG_PERM_PROVEN | bit;
+            assert!(validate_guard(&g));
+            assert_eq!((ov(&g, true).l_cap_x100, ov(&g, true).n_mult_bps), (1, 0));
+        }
+        // the holder-dump proof is untouched by the substitution
+        let mut h = fresh;
+        h.holder_dump_bps = 1_234;
+        h.holder_dump_slot = now;
+        assert_eq!(h.perm_for_gate(true).holder_dump_bps, 1_234);
     }
 
     /// D1: the creator minimum is tested on VALUE. $500 in, $100 lost, $400 left: a full $400

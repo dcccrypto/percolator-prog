@@ -157,6 +157,10 @@ struct Params {
     /// Initial per-lot mark (e6). v2.2 Wave A: a growth market must open at >= 10^7 (the lot
     /// precision floor), so `growth_params` prices a LOT of 10 tokens at $10 (`GPRICE`).
     price: u64,
+    /// `redemption_cooldown_slots` of the created vault. #569 / D22: a vault that is BOUND as the
+    /// vault LP (tag 94) must carry >= `MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS`, so the
+    /// default is that minimum and `earn_execute` warps past it.
+    cooldown: u64,
 }
 
 impl Default for Params {
@@ -171,6 +175,7 @@ impl Default for Params {
             funding: 0,
             growth: None,
             price: PRICE,
+            cooldown: percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS,
         }
     }
 }
@@ -197,6 +202,8 @@ struct Env {
     paid_out: u128,
     /// The market's initial per-lot mark (`Params::price`).
     price: u64,
+    /// The created vault's `redemption_cooldown_slots`.
+    cooldown: u64,
 }
 
 #[allow(dead_code)]
@@ -235,7 +242,8 @@ impl Env {
         svm.add_program(matcher, &std::fs::read(&matcher_so).unwrap());
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
@@ -301,6 +309,7 @@ impl Env {
             paid_in: 0,
             paid_out: 0,
             price: p.price,
+            cooldown: p.cooldown,
         };
         env.svm.warp_to_slot(1);
         let admin = env.admin.insecure_clone();
@@ -340,10 +349,10 @@ impl Env {
             init,
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("init market");
         let seq = env.oracle_seq() + 1;
@@ -365,7 +374,7 @@ impl Env {
         env.send(
             ProgInstruction::CreateLpVault {
                 fee_share_bps: 5_000,
-                redemption_cooldown_slots: 0,
+                redemption_cooldown_slots: p.cooldown,
                 oi_reservation_threshold_bps: 0,
                 domain: DOMAIN,
             },
@@ -500,7 +509,14 @@ impl Env {
     }
 
     fn new_program_account(&mut self, len: usize) -> Pubkey {
-        let key = Pubkey::new_unique();
+        self.new_program_account_kp(len).pubkey()
+    }
+
+    /// D26: a program-owned account that HOLDS its keypair, for instructions that require the new
+    /// account's signature (InitPortfolio).
+    fn new_program_account_kp(&mut self, len: usize) -> Keypair {
+        let kp = Keypair::new();
+        let key = kp.pubkey();
         self.svm
             .set_account(
                 key,
@@ -513,7 +529,7 @@ impl Env {
                 },
             )
             .unwrap();
-        key
+        kp
     }
 
     // ── P3 instructions ─────────────────────────────────────────────────────────────────
@@ -948,6 +964,16 @@ impl Env {
     }
 
     fn earn_execute(&mut self, d: &Depositor, tail: Option<Pubkey>) -> Result<u64, String> {
+        // #569 / D22: a bound vault's cooldown is >= 150 slots, so the request matures only
+        // after a clock warp (setup change only; every assertion is unchanged).
+        self.slot += self.cooldown;
+        self.svm.warp_to_slot(self.slot);
+        self.earn_execute_nowarp(d, tail)
+    }
+
+    /// ExecuteRedemption with NO clock warp: the caller already let the cooldown elapse (e.g. the
+    /// request was filed before the scenario's price push, or the wait was cranked with `hold`).
+    fn earn_execute_nowarp(&mut self, d: &Depositor, tail: Option<Pubkey>) -> Result<u64, String> {
         let before = self.tok(d.dest);
         let mut accts = vec![
             AccountMeta::new(self.payer.pubkey(), true),
@@ -998,15 +1024,16 @@ impl Env {
     fn new_trader(&mut self, capital: u64) -> Trader {
         let kp = Keypair::new();
         self.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
-        let portfolio = self.new_program_account(self.plen);
+        let portfolio_kp = self.new_program_account_kp(self.plen);
+        let portfolio = portfolio_kp.pubkey();
         self.send(
             ProgInstruction::InitPortfolio,
             vec![
                 AccountMeta::new(kp.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[&kp.insecure_clone()],
+            &[&kp.insecure_clone(), &portfolio_kp],
         )
         .expect("init portfolio");
         let t = Trader { kp, portfolio };
@@ -1183,6 +1210,38 @@ fn p3_init_vault_lp_binds_a_registry_owned_lp_and_seeds_senior_claim_at_nav() {
     // Re-bind refused.
     let admin = env.admin.insecure_clone();
     err_has(&env.init_vault_lp_as(&admin, 1_000), PercolatorError::VaultLpAlreadyBound);
+}
+
+/// #569 / D22: a vault BOUND as the vault LP must carry a real redemption cooldown. Cooldown 0
+/// let a senior 76+77 in one slot ahead of an already-published adverse push and be paid par
+/// while the stayers bore the whole loss. The bind (tag 94) refuses anything below
+/// `MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS` (150) and accepts exactly the minimum.
+#[test]
+fn d22_569_bind_refuses_cooldown_below_150_and_accepts_150() {
+    let min = percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS;
+    assert_eq!(min, 150, "decided policy 2026-09-30: not 0, not 20, at least 150");
+    for bad in [0u64, 1, 20, min - 1] {
+        let mut env = Env::new(Params { cooldown: bad, ..Params::default() });
+        let admin = env.admin.insecure_clone();
+        let r = env.init_vault_lp_as(&admin, 1_000);
+        assert!(r.is_err(), "cooldown {bad}: the bind must be refused, got {r:?}");
+        assert!(
+            r.as_ref().unwrap_err().contains(&code(PercolatorError::InvalidInstruction)),
+            "cooldown {bad}: wrong refusal {r:?}"
+        );
+        assert_eq!(env.registry_state()._reserved[0], 0, "cooldown {bad}: registry must stay unbound");
+    }
+    for ok in [min, min + 1, 600] {
+        let mut env = Env::new(Params { cooldown: ok, ..Params::default() });
+        let admin = env.admin.insecure_clone();
+        env.init_vault_lp_as(&admin, 1_000).unwrap_or_else(|e| panic!("cooldown {ok}: bind must succeed: {e}"));
+        assert_eq!(env.registry_state()._reserved[0], 1, "cooldown {ok}: registry bound flag");
+    }
+    // An UNBOUND vault keeps cooldown 0 legal (#440: only the upper bound applies at create).
+    let mut env = Env::new(Params { cooldown: 0, ..Params::default() });
+    assert_eq!(env.registry_state()._reserved[0], 0);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 1_000_000, None).expect("unbound cooldown-0 vault still takes deposits");
 }
 
 /// v2.2 (10,603 B portfolios): InitVaultLp REFUSES a pre-created lp portfolio whose length is not
@@ -4624,12 +4683,15 @@ fn p2b_r2_round_trip_on_an_allocated_vault_cannot_extract() {
     // 4. E redeems (recalling the allocation first if the pot is short; LP is flat).
     let es = env.lp_shares(&e);
     env.earn_request(&e, es);
-    let e_paid = match env.earn_execute(&e, Some(lp.portfolio)) {
+    // #569 / D22: let the (>= 150 slot) cooldown elapse slot by slot with the market cranked
+    // (accrual is per slot), at the held mark; the exit then executes with no further warp.
+    env.hold(env.cooldown, &all(&a1, &a2, &lp));
+    let e_paid = match env.earn_execute_nowarp(&e, Some(lp.portfolio)) {
         Ok(p) => p,
         Err(_) => {
             let a = env.allocated();
             env.recall_ext(lp.portfolio, a, DOMAIN).expect("recall");
-            env.earn_execute(&e, Some(lp.portfolio)).expect("E 77 after recall")
+            env.earn_execute_nowarp(&e, Some(lp.portfolio)).expect("E 77 after recall")
         }
     };
     // 5. A1 converts the second gain; the incumbent redeems.
@@ -5998,10 +6060,38 @@ fn i570_push_once(env: &mut Env, target: u64, crank: &[Pubkey]) {
     assert_ne!(g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, "the mark lags");
 }
 
+fn i570_push_once_keep(env: &mut Env, target: u64, crank: &[Pubkey]) {
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let admin = env.admin.insecure_clone();
+    let seq = env.oracle_seq() + 1;
+    let (m, slot) = (env.market, env.slot);
+    env.send(
+        ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: slot, mark_e6: target, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("push (wait)");
+    for p in crank {
+        env.crank(*p).expect("crank (wait)");
+    }
+}
+
 /// Seniors 10,000, junior `junior`, `allocate` of senior capital moved to the vault LP, the LP
 /// short 6,000 units at $1 on a 1%/slot-cap market; ONE push to `target` and one crank each.
+///
+/// #569 / D22: the bound vault's cooldown is >= 150 slots, so the exit cannot execute in the
+/// request's slot, and the market accrues every slot (a 150-slot jump leaves the LP certificate
+/// stale: 85). The two exit tests build the world on a 20 bps/slot cap (instead of 100) so the lag
+/// outlives the cooldown, and `i570_wait_cooldown` lets the cooldown elapse slot by slot with
+/// the SAME target re-published and every portfolio cranked, as a keeper would. The exit then
+/// executes while the mark still lags, as the pre-#569 same-slot flow did.
 fn i570_lag_world(junior: u64, allocate: bool, target: u64) -> (Env, Lp, Depositor, Trader) {
-    let (mut env, lp, d1) = p2b_world(Params { move_bps: 100, ..Params::default() }, 10_000, junior);
+    i570_lag_world_cap(junior, allocate, target, 100)
+}
+
+fn i570_lag_world_cap(junior: u64, allocate: bool, target: u64, move_bps: u64) -> (Env, Lp, Depositor, Trader) {
+    let (mut env, lp, d1) = p2b_world(Params { move_bps, ..Params::default() }, 10_000, junior);
     if allocate {
         env.allocate(lp.portfolio, u128::MAX).expect("103 allocate");
         assert_eq!(env.allocated(), 5_000 * U as u128);
@@ -6014,14 +6104,23 @@ fn i570_lag_world(junior: u64, allocate: bool, target: u64) -> (Env, Lp, Deposit
     (env, lp, d1, t)
 }
 
+/// Let the vault's cooldown elapse with the lag intact: every slot re-publishes `target` and
+/// cranks the listed portfolios (the keeper loop), so no certificate goes stale.
+fn i570_wait_cooldown(env: &mut Env, target: u64, crank: &[Pubkey]) {
+    for _ in 0..env.cooldown {
+        i570_push_once_keep(env, target, crank);
+    }
+}
+
 /// Adverse lag past the junior cushion ($1.50: pending loss 3,000 > junior 2,000; nav < C): the
 /// exit pays below par, so the entry is refused (74) during the lag, and still after catch-up
 /// (no new information arrives: the target was already published).
 #[test]
 fn i570_entry_refused_while_exit_prices_below_par_under_adverse_lag() {
-    let (mut env, lp, d1, t) = i570_lag_world(2_000, true, 1_500_000);
+    let (mut env, lp, d1, t) = i570_lag_world_cap(2_000, true, 1_500_000, 20);
     env.earn_request(&d1, 1_000 * U as u128);
-    let paid = env.earn_execute(&d1, Some(lp.portfolio)).expect("77 during lag");
+    i570_wait_cooldown(&mut env, 1_500_000, &[t.portfolio, lp.portfolio]);
+    let paid = env.earn_execute_nowarp(&d1, Some(lp.portfolio)).expect("77 during lag");
     assert!(paid < 1_000 * U, "exit is priced below par at the pending price: {paid}");
     // Liveness accounting: with inventory and a certificate the exit just made stale, 75 was
     // ALREADY 85 (`vault_lp_live_pricing_claim`); the worse-price read adds no requirement.
@@ -6042,11 +6141,12 @@ fn i570_entry_refused_while_exit_prices_below_par_under_adverse_lag() {
 /// deficit the pots will fund, so the exit pays below par and the entry is refused (74).
 #[test]
 fn i570_entry_refused_when_pots_cover_c_but_worse_price_deficit_does_not() {
-    let (mut env, lp, d1, _t) = i570_lag_world(8_000, false, 2_500_000);
+    let (mut env, lp, d1, t) = i570_lag_world_cap(8_000, false, 2_500_000, 20);
     let (nav, _, c) = env.p2b_v(lp.portfolio);
     assert!(nav >= c, "nav {nav} >= C {c}: the pots alone cover the senior");
     env.earn_request(&d1, 1_000 * U as u128);
-    let paid = env.earn_execute(&d1, Some(lp.portfolio)).expect("77 during lag");
+    i570_wait_cooldown(&mut env, 2_500_000, &[t.portfolio, lp.portfolio]);
+    let paid = env.earn_execute_nowarp(&d1, Some(lp.portfolio)).expect("77 during lag");
     assert!(paid < 1_000 * U, "exit is priced below par at the pending price: {paid}");
     let _ = env.crank(lp.portfolio);
     let d2 = env.new_depositor();

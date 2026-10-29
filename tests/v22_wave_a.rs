@@ -300,17 +300,31 @@ fn wave_a_wire_round_trips_and_canonical_forms() {
 /// A fresh market account in a harness env, initialised with `ix`. Leaves `env.market`
 /// pointing at it on success so the harness helpers (ConfigureAuthMark etc.) target it.
 fn init_on_fresh(env: &mut V16CuEnv, ix: ProgInstruction) -> Result<u64, String> {
-    let m = env.program_account(state::market_account_len_for_capacity(1).unwrap());
+    // D26: InitMarket requires the market account's signature, so the fresh market is a keypair.
+    let m_kp = solana_sdk::signer::keypair::Keypair::new();
+    let m = solana_sdk::signer::Signer::pubkey(&m_kp);
+    env.svm
+        .set_account(
+            m,
+            solana_sdk::account::Account {
+                lamports: 1_000_000_000,
+                data: vec![0u8; state::market_account_len_for_capacity(1).unwrap()],
+                owner: env.program_id,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
     let admin = env.admin.insecure_clone();
     let mint = env.mint;
     let r = env.send(
         ix,
         vec![
             AccountMeta::new(admin.pubkey(), true),
-            AccountMeta::new(m, false),
+            AccountMeta::new(m, true),
             AccountMeta::new_readonly(mint, false),
         ],
-        &[&admin],
+        &[&admin, &m_kp],
     );
     if r.is_ok() {
         env.market = m;

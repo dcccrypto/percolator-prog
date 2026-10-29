@@ -318,7 +318,9 @@ impl Env {
         svm.add_program(matcher_program, &std::fs::read(matcher_program_path()).unwrap());
         let payer = seeded_keypair(1);
         let admin = seeded_keypair(2);
-        let market = Pubkey::new_from_array([0x11; 32]);
+        // D26: InitMarket requires the market account's signature, so the market is a seeded keypair.
+        let market_kp = seeded_keypair(0x11);
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_from_array([0x12; 32]);
         let vault_authority =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id).0;
@@ -388,10 +390,10 @@ impl Env {
             init_market_ix(&cfg),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )?;
         Ok(env)
     }
@@ -494,7 +496,9 @@ impl Env {
     }
 
     fn portfolio(&mut self, owner: &Keypair, deposit: u128) -> Pubkey {
-        let portfolio = self.key();
+        // D26: InitPortfolio requires the portfolio account's signature (seeded keypair).
+        let portfolio_kp = self.signer();
+        let portfolio = portfolio_kp.pubkey();
         if self.svm.get_balance(&owner.pubkey()).unwrap_or(0) == 0 {
             self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
         }
@@ -516,9 +520,9 @@ impl Env {
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(m, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[owner],
+            &[owner, &portfolio_kp],
         )
         .expect("init portfolio");
         if deposit > 0 {
@@ -5902,11 +5906,11 @@ fn lev_guard_permissionless_proofs_against_the_pin() {
     assert!(lgt::has(&prove(&mut env, lp.account, mint, vault, None), lgt::INVALID), "not the source PDA");
     // clean mint: nothing set
     prove(&mut env, src, mint, vault, None).expect("clean proof");
-    assert_eq!(lgt::guard(&env).flags, 0);
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_PERM_PROVEN, "D12: a clean proof records the PROVEN bit only");
     // live mint authority: floors bind
     set_mint(&mut env, true, false);
     prove(&mut env, src, mint, vault, None).expect("mint authority proof");
-    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_MINT_AUTH);
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_PERM_PROVEN | lg::GUARD_FLAG_MINT_AUTH);
     let t = env.trader(100 * USD);
     let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(250));
     assert!(lgt::has(&r, lgt::REFUSED), "2.5x over the 2x floor: {r:?}");
@@ -5917,11 +5921,11 @@ fn lev_guard_permissionless_proofs_against_the_pin() {
     // freeze authority alone does the same
     set_mint(&mut env, false, true);
     prove(&mut env, src, mint, vault, None).expect("freeze authority proof");
-    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_FREEZE_AUTH);
-    // revoked: the next proof clears the flags and the same open lands
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_PERM_PROVEN | lg::GUARD_FLAG_FREEZE_AUTH);
+    // revoked: the next proof clears the authority flags (PROVEN stays) and the same open lands
     set_mint(&mut env, false, false);
     prove(&mut env, src, mint, vault, None).expect("revoked proof");
-    assert_eq!(lgt::guard(&env).flags, 0);
+    assert_eq!(lgt::guard(&env).flags, lg::GUARD_FLAG_PERM_PROVEN);
     lgt::tg(&mut env, &t2, &lp, lgt::usd_q(30)).expect("authority revoked: lands");
     // a holder with q = R proves a 75 % dump
     prove(&mut env, src, mint, vault, Some(holder)).expect("holder proof");

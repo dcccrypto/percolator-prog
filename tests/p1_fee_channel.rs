@@ -338,7 +338,8 @@ impl Env {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         let vault_authority =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &program_id).0;
@@ -407,10 +408,10 @@ impl Env {
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("init market");
 
@@ -467,7 +468,8 @@ impl Env {
     }
 
     fn portfolio(&mut self, owner: &Keypair, deposit: u128) -> Pubkey {
-        let portfolio = Pubkey::new_unique();
+        let portfolio_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let portfolio = portfolio_kp.pubkey();
         if self.svm.get_balance(&owner.pubkey()).unwrap_or(0) == 0 {
             self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
         }
@@ -488,9 +490,9 @@ impl Env {
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[owner],
+            &[owner, &portfolio_kp],
         )
         .expect("init portfolio");
         if deposit > 0 {

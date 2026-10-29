@@ -813,7 +813,34 @@ fn v16_wrapper_permissionless_crank_rejects_w3_legacy_wire_fields() {
 }
 
 fn run_ix(ix: Instruction, accounts: &mut [&mut TestAccount]) -> Result<(), ProgramError> {
-    run_ix_data(&ix.encode(), accounts)
+    with_d26_init_signer(&ix, accounts, |a| run_ix_data(&ix.encode(), a))
+}
+
+/// D26 (S1-13 / S1-30): InitMarket (every encoding) requires the market account (index 1) to
+/// sign and InitPortfolio the portfolio account (index 2). The harness's accounts are plain
+/// pubkeys, so grant the signature for the duration of the call (the real client's
+/// createAccount keypair signs); the refusal tests drive `run_ix_data` directly, unaltered.
+fn with_d26_init_signer<R>(
+    ix: &Instruction,
+    accounts: &mut [&mut TestAccount],
+    f: impl FnOnce(&mut [&mut TestAccount]) -> R,
+) -> R {
+    let idx = match ix {
+        Instruction::InitMarket { .. }
+        | Instruction::InitMarketV19 { .. }
+        | Instruction::InitMarketLotV22 { .. }
+        | Instruction::InitMarketV22 { .. } => Some(1),
+        Instruction::InitPortfolio => Some(2),
+        _ => None,
+    };
+    let Some(i) = idx.filter(|i| *i < accounts.len()) else {
+        return f(accounts);
+    };
+    let was = accounts[i].is_signer;
+    accounts[i].is_signer = true;
+    let r = f(accounts);
+    accounts[i].is_signer = was;
+    r
 }
 
 /// `run_ix` WITHOUT the on-Err snapshot/restore that `run_ix_data` performs.
@@ -847,8 +874,10 @@ fn run_ix_no_rollback(
     ix: Instruction,
     accounts: &mut [&mut TestAccount],
 ) -> Result<(), ProgramError> {
-    let infos: Vec<AccountInfo> = accounts.iter_mut().map(|a| a.to_info()).collect();
-    processor::process_instruction(&program_id(), &infos, &ix.encode())
+    with_d26_init_signer(&ix, accounts, |accounts| {
+        let infos: Vec<AccountInfo> = accounts.iter_mut().map(|a| a.to_info()).collect();
+        processor::process_instruction(&program_id(), &infos, &ix.encode())
+    })
 }
 
 fn configure_base_ewma_mark(
@@ -29461,4 +29490,59 @@ fn s1_marketauth_cannot_drain_idle_depositors_through_the_maintenance_fee() {
         victim_capital == 1_000_000 && cranker_capital == 1,
         "S1 A-1: victim capital {victim_capital} (was 1_000_000), creator's cranker capital {cranker_capital} (was 1)"
     );
+}
+
+// D26 (S1-13 / S1-30): InitMarket and InitPortfolio require the market / portfolio ACCOUNT to sign,
+// so a separately created account cannot be front-run by a third party (create + init in one tx).
+#[test]
+fn d26_init_market_requires_the_market_account_signature() {
+    let mut admin = signer();
+    let mut market = market_account();
+    market.is_signer = false;
+    let mut mint = mint_account();
+    let before = market.data.clone();
+    let refused = run_ix_data(
+        &default_init_market_ix().encode(),
+        &mut [&mut admin, &mut market, &mut mint],
+    );
+    assert_eq!(
+        refused,
+        Err(ProgramError::Custom(6)),
+        "an unsigned market account must be refused with ExpectedSigner"
+    );
+    assert_eq!(market.data, before, "refused InitMarket must not touch the account");
+
+    market.is_signer = true;
+    run_ix_data(
+        &default_init_market_ix().encode(),
+        &mut [&mut admin, &mut market, &mut mint],
+    )
+    .expect("a signed market account initialises");
+}
+
+#[test]
+fn d26_init_portfolio_requires_the_portfolio_account_signature() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut owner = signer();
+    let mut portfolio = portfolio_account();
+    init_market(&mut admin, &mut market);
+
+    portfolio.is_signer = false;
+    let before_market = market.data.clone();
+    let before_portfolio = portfolio.data.clone();
+    let refused = run_ix_data(
+        &Instruction::InitPortfolio.encode(),
+        &mut [&mut owner, &mut market, &mut portfolio],
+    );
+    assert_eq!(
+        refused,
+        Err(ProgramError::Custom(6)),
+        "an unsigned portfolio account must be refused with ExpectedSigner"
+    );
+    assert_eq!(market.data, before_market);
+    assert_eq!(portfolio.data, before_portfolio);
+
+    portfolio.is_signer = true;
+    init_portfolio(&mut owner, &mut market, &mut portfolio);
 }

@@ -416,7 +416,7 @@ impl World {
         let admin = self.env.admin.insecure_clone();
         self.env.svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
         let r = self.send(
-            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: 0, oi_reservation_threshold_bps: 0, domain: 0 },
+            ProgInstruction::CreateLpVault { fee_share_bps: 0, redemption_cooldown_slots: percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS, oi_reservation_threshold_bps: 0, domain: 0 },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(m, false),
@@ -547,6 +547,12 @@ impl World {
         let dst = self.new_token(owner.pubkey(), 0);
         let (m, v, va, payer) = (self.env.market, self.env.vault, self.env.vault_authority, self.env.payer.pubkey());
         let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
+        // #569 / D22: a bound vault's cooldown is >= 150 slots; let the request mature (setup only).
+        if self.p3.is_some() {
+            let s = self.slot() + percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS;
+            self.env.svm.warp_to_slot(s);
+        }
+
         self.send(
             ProgInstruction::ExecuteRedemption { domain },
             vec![

@@ -34,6 +34,22 @@ fn p3_so() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/deploy/percolator_prog.so"))
 }
 
+// #569 / D22: a vault BOUND as the vault LP must carry a redemption cooldown of at least
+// MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS (150). Harness change only: the vault is created
+// with that cooldown and an ExecuteRedemption first lets the clock pass request + cooldown
+// (it used to run in the request's slot at cooldown 0). No assertion is changed.
+const BOUND_COOLDOWN: u64 = percolator_prog::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS;
+thread_local! { static LAST_REQ_SLOT: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+fn bound_cooldown_note(svm: &litesvm::LiteSVM) {
+    LAST_REQ_SLOT.with(|c| c.set(svm.get_sysvar::<solana_sdk::clock::Clock>().slot));
+}
+fn bound_cooldown_wait(svm: &mut litesvm::LiteSVM) {
+    let need = LAST_REQ_SLOT.with(|c| c.get()) + BOUND_COOLDOWN;
+    if svm.get_sysvar::<solana_sdk::clock::Clock>().slot < need {
+        svm.warp_to_slot(need);
+    }
+}
+
 struct P3 {
     env: V16CuEnv,
     matcher: Pubkey,
@@ -237,7 +253,9 @@ impl P3 {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ];
-        self.send(ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 }, metas, &[who])
+        let r = self.send(ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 }, metas, &[who]);
+        if r.is_ok() { bound_cooldown_note(&self.env.svm); }
+        r
     }
 
     fn execute_redeem(&mut self, who: &Keypair, bound: bool) -> (Pubkey, Result<u64, String>) {
@@ -263,6 +281,7 @@ impl P3 {
             metas.push(AccountMeta::new(self.state_pda, false));
             metas.push(AccountMeta::new(self.lp, false));
         }
+        bound_cooldown_wait(&mut self.env.svm);
         let r = self.send(ProgInstruction::ExecuteRedemption { domain: 0 }, metas, &[]);
         (dest, r)
     }
@@ -677,8 +696,8 @@ thread_local! { static FORCE_SHARE_ATA: std::cell::Cell<Option<Pubkey>> = std::c
 thread_local! { static C7_ONE_SENIOR: std::cell::Cell<bool> = std::cell::Cell::new(false); }
 /// C-7 variant: configure permissionless stale resolve (rehearsal: 216,000 slots) and resolve by tag 39.
 thread_local! { static C7_STALE_RESOLVE: std::cell::Cell<u64> = std::cell::Cell::new(0); }
-/// Earn redemption cooldown for CreateLpVault (default 0).
-thread_local! { static TL_COOLDOWN: std::cell::Cell<u64> = std::cell::Cell::new(0); }
+/// Earn redemption cooldown for CreateLpVault (default: the bound-vault minimum, #569 / D22).
+thread_local! { static TL_COOLDOWN: std::cell::Cell<u64> = std::cell::Cell::new(BOUND_COOLDOWN); }
 thread_local! { static TL_FEE_SHARE: std::cell::Cell<Option<u16>> = std::cell::Cell::new(None); }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
@@ -1007,6 +1026,7 @@ impl P3 {
             AccountMeta::new(self.state_pda, false),
             AccountMeta::new(self.lp, false),
         ];
+        bound_cooldown_wait(&mut self.env.svm);
         let r = self.send(ProgInstruction::ExecuteRedemption { domain }, metas, &[]);
         (dest, r)
     }
@@ -2722,19 +2742,25 @@ fn rehearsal23_one_senior_both_domains_redeems_after_stale_resolve() {
 struct TimingWorld { w: P3, a: Keypair, a_ata: Pubkey, v: Keypair, v_ata: Pubkey, t: Keypair, tp: Pubkey, lp: Pubkey }
 
 fn timing_world(cooldown: u64) -> TimingWorld {
+    timing_world_try(cooldown).unwrap_or_else(|e| panic!("timing world cooldown {cooldown}: {e}"))
+}
+
+/// Same world; `Err` is the refusal of the vault-LP bind (tag 94). #569 / D22: a bound vault needs
+/// a redemption cooldown >= `BOUND_COOLDOWN`, so the old cooldown-0 world cannot be built any more.
+fn timing_world_try(cooldown: u64) -> Result<TimingWorld, String> {
     TL_IM.with(|c| c.set(1_000));
     TL_FEE_SHARE.with(|c| c.set(Some(1_000)));
     TL_COOLDOWN.with(|c| c.set(cooldown));
     let mut w = P3::new();
     TL_FEE_SHARE.with(|c| c.set(None));
     w.create_vault();
-    TL_COOLDOWN.with(|c| c.set(0));
+    TL_COOLDOWN.with(|c| c.set(BOUND_COOLDOWN));
     let (a, v) = (Keypair::new(), Keypair::new());
     let a_ata = w.earn_deposit_domain(&a, 5_000_000, false, 0).unwrap();
     let v_ata = w.earn_deposit_domain(&v, 5_000_000, false, 0).unwrap();
     let _ = w.earn_deposit_domain(&Keypair::new(), 1_000, false, 1).unwrap();
     let admin = w.env.admin.insecure_clone();
-    w.init_vault_lp(&admin, 1_000).unwrap();
+    w.init_vault_lp(&admin, 1_000)?;
     let up = w.upgrade.insecure_clone();
     w.set_risk(&up, 50_000).unwrap();
     w.junior_deposit(&admin, 300_000).unwrap();
@@ -2744,7 +2770,19 @@ fn timing_world(cooldown: u64) -> TimingWorld {
     let mut want: i128 = 1_300_000;
     for _ in 0..6 { if want <= 0 { break; } let b = w.pos(tp); let _ = w.trade_vs_lp_fee(&t, tp, want.min(500_000), 30); want -= w.pos(tp) - b; }
     MARK.with(|c| c.set(PRICE));
-    TimingWorld { w, a, a_ata, v, v_ata, t, tp, lp }
+    Ok(TimingWorld { w, a, a_ata, v, v_ata, t, tp, lp })
+}
+
+/// #569 / D22: the bind (tag 94) refuses every cooldown below 150 with InvalidInstruction, and an
+/// UNBOUND vault with cooldown 0 stays legal (the vault is created, only the bind is refused).
+fn assert_bind_refused_below_min(cooldown: u64) {
+    match timing_world_try(cooldown) {
+        Ok(_) => panic!("cooldown {cooldown}: the vault-LP bind must be refused (#569)"),
+        Err(e) => assert!(
+            e.contains(&format!("Custom({})", percolator_prog::error::PercolatorError::InvalidInstruction as u32)),
+            "cooldown {cooldown}: wrong refusal: {e}"
+        ),
+    }
 }
 
 fn timing_move(w: &mut P3, tp: Pubkey, lp: Pubkey, up: bool, steps: usize) {
@@ -2795,23 +2833,31 @@ fn timing_b(cooldown: u64) -> (u128, u128, u128) {
     (n_paid, a_paid, v_paid)
 }
 
+/// #569 / D22. Cooldown 0 on a BOUND vault let a senior 76+77 in one slot ahead of an already-published
+/// adverse push, be paid par, and leave the stayer the whole loss (A 4,999,935 vs V 4,669,149 against a
+/// fair 4,834,040). The fix is at the bind: tag 94 refuses cooldown < 150. This test proves BOTH halves:
+/// the cooldown-0 (and 149) world cannot be built, and at the minimum legal cooldown (150) and at 600 the
+/// two seniors split the loss fairly.
 #[test]
 fn timing_a_exit_one_slot_before_deficit_push_cooldown0_vs_long() {
-    let (a0, v0) = timing_a(0);
+    assert_bind_refused_below_min(0);
+    assert_bind_refused_below_min(BOUND_COOLDOWN - 1);
+    let (a0, v0) = timing_a(BOUND_COOLDOWN);
     let (a1, v1) = timing_a(600);
-    eprintln!("TIMING(a) SUMMARY: cooldown 0: A {a0} V {v0} (A-V gap {}); cooldown 600: A {a1} V {v1} (gap {})", a0 as i128 - v0 as i128, a1 as i128 - v1 as i128);
+    eprintln!("TIMING(a) SUMMARY: cooldown {BOUND_COOLDOWN}: A {a0} V {v0} (A-V gap {}); cooldown 600: A {a1} V {v1} (gap {})", a0 as i128 - v0 as i128, a1 as i128 - v1 as i128);
     // Fair: the two seniors each bear half of the ~331k loss beyond the junior.
     let fair = 5_000_000u128 - RACE_BEYOND / 2;
     assert!(v1 + 2_000 >= fair, "cooldown 600: the stayer bore more than its half: {v1} < {fair}");
-    assert!(v0 + 2_000 >= fair, "COOLDOWN 0 FRONT-RUN: a senior exiting one slot before the deficit push leaves the stayer with {v0} < fair {fair} (A took {a0})");
+    assert!(v0 + 2_000 >= fair, "cooldown {BOUND_COOLDOWN} (the minimum legal): a senior exiting one slot before the deficit push leaves the stayer with {v0} < fair {fair} (A took {a0})");
 }
 
 #[test]
 fn timing_b_deposit_redeem_around_recovery_push_cooldown0_vs_long() {
-    let (n0, a0, v0) = timing_b(0);
+    assert_bind_refused_below_min(0);
+    let (n0, a0, v0) = timing_b(BOUND_COOLDOWN);
     let (n1, a1, v1) = timing_b(600);
-    eprintln!("TIMING(b) SUMMARY: cooldown 0: newcomer gain {} incumbents {} ; cooldown 600: newcomer gain {} incumbents {}", n0 as i128 - 5_000_000, a0 + v0, n1 as i128 - 5_000_000, a1 + v1);
-    assert!(n0 == 0 || n0 <= 5_000_000 + 2_000, "cooldown 0: the newcomer captured the incumbents' recovery: out {n0} for 5,000,000 in");
+    eprintln!("TIMING(b) SUMMARY: cooldown {BOUND_COOLDOWN}: newcomer gain {} incumbents {} ; cooldown 600: newcomer gain {} incumbents {}", n0 as i128 - 5_000_000, a0 + v0, n1 as i128 - 5_000_000, a1 + v1);
+    assert!(n0 == 0 || n0 <= 5_000_000 + 2_000, "cooldown {BOUND_COOLDOWN}: the newcomer captured the incumbents' recovery: out {n0} for 5,000,000 in");
 }
 
 /// Conservation to the atom after the terminal wind-down: every atom left in the vault is owned --

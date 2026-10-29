@@ -669,6 +669,12 @@ pub mod constants {
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
     pub const LEV_GUARD_REQUIRED_ON_EVERY_GROWTH_ASSET: bool = cfg!(not(feature = "devnet"));
+    /// D12 / GH#614: mainnet builds treat a guard whose base-mint authorities were never proven
+    /// (`GUARD_FLAG_PERM_PROVEN` clear) as if the mint/freeze authority were LIVE, so the open gate
+    /// applies the authority-live overlay (L 2x, N $200) -- fail tight, never refuse. Tag 124 op 3
+    /// (permissionless, needs the UA `DepthSourceV22` pin) sets the bit. Devnet builds keep the old
+    /// behaviour so the armed devnet markets are unaffected.
+    pub const LEV_GUARD_PERM_PROOF_REQUIRED: bool = cfg!(not(feature = "devnet"));
     /// Tag 123 `op`: 0 = clear the pin (mode 2 refused afterwards), 1 = set / replace it.
     pub const DEPTH_SOURCE_OP_CLEAR: u8 = 0;
     pub const DEPTH_SOURCE_OP_SET: u8 = 1;
@@ -1084,6 +1090,12 @@ pub mod constants {
     /// (`setup_vault(0)` throughout tests/v16_fork_lp_vault_redeem.rs). The bug in
     /// #440 is unbounded ABOVE; that is what is bounded.
     pub const MAX_LP_REDEMPTION_COOLDOWN_SLOTS: u64 = 78_840_000;
+    /// #569: minimum `redemption_cooldown_slots` for a vault that is BOUND as the vault LP
+    /// (tag 94 InitVaultLp). With cooldown 0 a senior can 76 + 77 in one slot ahead of an
+    /// already-published adverse push, is priced at par, and the stayers bear the whole
+    /// loss. Decided policy (2026-09-30): not 0, not 20, at least 150 slots; both clients
+    /// already use 150. Enforced at the bind only: unbound vaults keep 0 legal (#440).
+    pub const MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS: u64 = 150;
     /// Upper bound for `insurance_withdraw_cooldown_slots` (#427). Same magnitude and
     /// same reason as `MAX_LP_REDEMPTION_COOLDOWN_SLOTS`: ~1 year at 2.5 slots/s.
     ///
@@ -16619,6 +16631,10 @@ pub mod processor {
         let mint_ai = account(accounts, 2)?;
         solana_program::log::sol_log(crate::PERCOLATOR_BUILD_FLAVOR);
         expect_signer(admin)?;
+        // D26 / S1-30: the market account itself must sign (it is created by a top-level
+        // system `createAccount` in the SAME transaction, whose new-account keypair signs), so
+        // a separately created, not-yet-initialised slab cannot be front-run by a third party.
+        expect_signer(market_ai)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
@@ -16986,6 +17002,9 @@ pub mod processor {
         let market_ai = account(accounts, 1)?;
         let portfolio_ai = account(accounts, 2)?;
         expect_signer(owner)?;
+        // D26 / S1-13: the portfolio account itself must sign (create + init in one tx), so a
+        // separately created portfolio cannot be initialised by a third party.
+        expect_signer(portfolio_ai)?;
         expect_writable(market_ai)?;
         expect_writable(portfolio_ai)?;
         expect_owner(market_ai, program_id)?;
@@ -36824,6 +36843,12 @@ pub mod processor {
         if state::registry_vault_lp_bound(&registry)? {
             return Err(PercolatorError::VaultLpAlreadyBound.into());
         }
+        // #569: a bound vault must carry a real redemption cooldown (same-slot 76+77 front-run).
+        if registry.redemption_cooldown_slots
+            < crate::constants::MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
         let (own_ledger_pda, _) =
             state::derive_lp_backing_ledger(program_id, market_ai.key, registry.domain);
         expect_key(own_ledger_ai, &own_ledger_pda)?;
@@ -44808,7 +44833,7 @@ pub mod processor {
         lev_observe(&mut gd, lev_target_price(&cfg, &group, a), now, sigma_1h, l_now, n_now);
         let pb = gd.price_band();
         let frozen = lg::frozen(&pb, now);
-        let ov = lg::merge_overlay(band, &gd.report(), &gd.perm(), now);
+        let ov = lg::merge_overlay(band, &gd.report(), &gd.perm_for_gate(constants::LEV_GUARD_PERM_PROOF_REQUIRED), now);
         let mmr = group.header.config.maintenance_margin_bps.get();
         let engine_imr = group.header.config.initial_margin_bps.get();
         // Leverage: L_trader (dump term, report cap, m_oracle, freeze), floored at L_floor, never above the ceiling; σ = burst memory (dec. 28). Day1 (dec. 1): + the vol profile as a TIGHTEN-ONLY floor, OFF (`lev_profile_v22::open_gate_floor`); the short cap below keeps the raw MMR.
@@ -45070,6 +45095,9 @@ pub mod processor {
         }
         let (mint_live, freeze_live) = lg::mint_authorities(&mint_ai.try_borrow_data()?).ok_or_else(bad)?;
         let mut flags = gd.flags & !(lg::GUARD_FLAG_MINT_AUTH | lg::GUARD_FLAG_FREEZE_AUTH);
+        // D12: the authorities have been read, so "never checked" is over. Both flags below may come
+        // out clear (a clean mint); this bit is what separates that from a mint nobody looked at.
+        flags |= lg::GUARD_FLAG_PERM_PROVEN;
         if mint_live {
             flags |= lg::GUARD_FLAG_MINT_AUTH;
         }
@@ -45326,7 +45354,9 @@ pub mod processor {
                 return Err(PercolatorError::LpStopNotTriggered.into());
             }
             let keep = lg::w1_keep_bps_users(users_opp, lp_net.unsigned_abs(), target);
-            if keep >= 10_000 {
+            // D11: "within target" also covers a leftover below one minimum leg: no whole leg can be
+            // cut for it, so a round would never converge and would only re-open every hour.
+            if keep >= 10_000 || lg::w1_leftover_below_leg(lp_net.unsigned_abs(), target, min_leg_q) {
                 // The stop holds but the LP is already within λ_eff·C_m: acknowledge it (the
                 // reference resets), nothing to cut.
                 gd.set_nav(&lg::nav_stop_reset(&nav));
@@ -45413,7 +45443,11 @@ pub mod processor {
         }
         // Close the round once the LP is within the round's target.
         let (lp_after, _, _, _) = lev_w1_market_state(market_ai, lp_ai, a, eq)?;
-        if lp_after.unsigned_abs() <= gd.round_target() {
+        // D11: ... or once the leftover excess is below one minimum leg (no whole leg is admitted
+        // below that, so the round could not converge). The reference resets as on any close.
+        if lp_after.unsigned_abs() <= gd.round_target()
+            || lg::w1_leftover_below_leg(lp_after.unsigned_abs(), gd.round_target(), min_leg_q)
+        {
             gd.round_active = 0;
             gd.set_nav(&lg::nav_stop_reset(&gd.nav()));
             solana_program::log::sol_log(&alloc::format!("lev_w1_round_done id={} lp_net={}", gd.round_id, lp_after));
