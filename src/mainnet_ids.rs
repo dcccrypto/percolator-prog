@@ -21,7 +21,7 @@
 //!
 //! RELEASE STEP (the only edit needed, one commit, reviewed together with percolator-stake):
 //!   1. Deploy percolator-stake and the wrapper to mainnet; note both program ids.
-//!   2. Replace the two `RELEASE-STEP` placeholders below with `pubkey!("<id>")` values.
+//!   2. Replace the five `RELEASE-STEP` placeholders below with `pubkey!("<id>")` values.
 //!   3. In percolator-stake: add the matching `declare_id!` arm for the mainnet stake id and
 //!      change `PERCOLATOR_MAINNET` in `processor.rs` (and percolator-nft `cpi_v16.rs`) to the
 //!      mainnet WRAPPER id above (today `ESa89R5…` is the old v12-era wrapper, not v2.2).
@@ -31,10 +31,13 @@
 //!      `PCLR-PIN:NONE`, a test-placeholder build `PCLR-PIN:TEST-PLACEHOLDERS`, both rejected) and
 //!      `scripts/mainnet-flavour-tests.sh <so>`.
 //!   5. Record all ids and the `.so` sha256 in `ledger/deployments.md`.
-//! The pinned set is FOUR values, all distinct and non-zero: the stake program, the wrapper program,
+//! The pinned set is FIVE values, all distinct and non-zero: the stake program, the wrapper program,
 //! the vault-LP canonical matcher program (tag 94; without it no vault LP can exist on mainnet, so
-//! G9, W-4, Earn and tags 97/98/102/103 are unreachable) and the protocol fee authority (the key
-//! `InitMarket` stamps as the protocol-fee destination; a devnet EOA must never ship).
+//! G9, W-4, Earn and tags 97/98/102/103 are unreachable), the protocol fee authority (the key
+//! `InitMarket` stamps as the protocol-fee destination; a devnet EOA must never ship) and the
+//! percolator-nft program (GH#548 / GH#576: the only program whose `["mint_authority"]` PDA may
+//! move a portfolio's owner, unwrap an escrow or authorize as an NFT holder; without it tags
+//! 72 / 73 / 82 fail closed forever, which is safe but silently kills the NFT feature).
 //! Do not invent ids: a wrong stake id hands tag 87 a destination nobody controls.
 
 use solana_program::pubkey::Pubkey;
@@ -67,6 +70,12 @@ pub const MAINNET_MATCHER_PROGRAM_ID_BYTES: [u8; 32] = UNSET; // RELEASE-STEP
 #[cfg(not(feature = "mainnet-ids-test-placeholders"))]
 pub const MAINNET_FEE_AUTHORITY_BYTES: [u8; 32] = UNSET; // RELEASE-STEP
 
+/// RELEASE-STEP: the mainnet percolator-nft program id (GH#548 trust root for tags 72 / 73 / 82 and
+/// NFT-holder auth; GH#576: it was missing from the pinned set, so a `mainnet-ids` build compiled
+/// with every NFT path permanently fail-closed). PLACEHOLDER (unset).
+#[cfg(not(feature = "mainnet-ids-test-placeholders"))]
+pub const MAINNET_NFT_PROGRAM_ID_BYTES: [u8; 32] = UNSET; // RELEASE-STEP
+
 /// TEST ONLY: dummy ids for the mainnet flavour under test. Not real addresses.
 #[cfg(feature = "mainnet-ids-test-placeholders")]
 pub const MAINNET_STAKE_PROGRAM_ID_BYTES: [u8; 32] = [0xA1; 32];
@@ -76,6 +85,8 @@ pub const MAINNET_WRAPPER_PROGRAM_ID_BYTES: [u8; 32] = [0xA2; 32];
 pub const MAINNET_MATCHER_PROGRAM_ID_BYTES: [u8; 32] = [0xA3; 32];
 #[cfg(feature = "mainnet-ids-test-placeholders")]
 pub const MAINNET_FEE_AUTHORITY_BYTES: [u8; 32] = [0xA4; 32];
+#[cfg(feature = "mainnet-ids-test-placeholders")]
+pub const MAINNET_NFT_PROGRAM_ID_BYTES: [u8; 32] = [0xA5; 32];
 
 pub const MAINNET_STAKE_PROGRAM_ID: Pubkey = Pubkey::new_from_array(MAINNET_STAKE_PROGRAM_ID_BYTES);
 pub const MAINNET_WRAPPER_PROGRAM_ID: Pubkey =
@@ -83,6 +94,7 @@ pub const MAINNET_WRAPPER_PROGRAM_ID: Pubkey =
 pub const MAINNET_MATCHER_PROGRAM_ID: Pubkey =
     Pubkey::new_from_array(MAINNET_MATCHER_PROGRAM_ID_BYTES);
 pub const MAINNET_FEE_AUTHORITY: Pubkey = Pubkey::new_from_array(MAINNET_FEE_AUTHORITY_BYTES);
+pub const MAINNET_NFT_PROGRAM_ID: Pubkey = Pubkey::new_from_array(MAINNET_NFT_PROGRAM_ID_BYTES);
 
 /// P-2: the pin marker carried in the binary's read-only data. Exactly one is compiled in, so a
 /// release script can tell a pinned build from a test-placeholder build and from an unpinned
@@ -138,19 +150,20 @@ pub const fn ids_consistent(ids: &[[u8; 32]]) -> bool {
     true
 }
 
-/// The pinned set, in a fixed order (stake, wrapper, matcher, fee authority).
-pub const PINNED_SET: [[u8; 32]; 4] = [
+/// The pinned set, in a fixed order (stake, wrapper, matcher, fee authority, nft).
+pub const PINNED_SET: [[u8; 32]; 5] = [
     MAINNET_STAKE_PROGRAM_ID_BYTES,
     MAINNET_WRAPPER_PROGRAM_ID_BYTES,
     MAINNET_MATCHER_PROGRAM_ID_BYTES,
     MAINNET_FEE_AUTHORITY_BYTES,
+    MAINNET_NFT_PROGRAM_ID_BYTES,
 ];
 
 #[cfg(feature = "mainnet-ids")]
 const _: () = assert!(
     ids_consistent(&PINNED_SET),
-    "mainnet-ids: the mainnet stake id, wrapper id, vault-LP matcher id and fee authority must ALL be \
-     set (non-zero, pairwise distinct) in src/mainnet_ids.rs before a mainnet build; see the RELEASE \
+    "mainnet-ids: the mainnet stake id, wrapper id, vault-LP matcher id, fee authority and NFT \
+     program id must ALL be set (non-zero, pairwise distinct) in src/mainnet_ids.rs before a mainnet build; see the RELEASE \
      STEP there"
 );
 
@@ -165,7 +178,11 @@ mod tests {
         let b = [2u8; 32];
         let c = [3u8; 32];
         let d = [4u8; 32];
+        let n = [5u8; 32];
         assert!(ids_consistent(&[a, b, c, d]));
+        assert!(ids_consistent(&[a, b, c, d, n]));
+        assert!(!ids_consistent(&[a, b, c, d, z]), "nft unset (GH#576)");
+        assert!(!ids_consistent(&[a, b, c, d, a]), "nft == stake");
         assert!(!ids_consistent(&[z, b, c, d]), "stake unset");
         assert!(!ids_consistent(&[a, z, c, d]), "wrapper unset");
         assert!(!ids_consistent(&[a, b, z, d]), "matcher unset");
@@ -192,22 +209,31 @@ mod tests {
 
     #[cfg(feature = "mainnet-ids-test-placeholders")]
     #[test]
-    fn test_placeholders_pass_the_assertion_and_pin_all_four() {
+    fn test_placeholders_pass_the_assertion_and_pin_all_five() {
         assert!(ids_consistent(&PINNED_SET));
         assert_eq!(crate::constants::STAKE_PROGRAM_ID, MAINNET_STAKE_PROGRAM_ID);
         assert_eq!(crate::constants::WRAPPER_PROGRAM_ID, MAINNET_WRAPPER_PROGRAM_ID);
         assert_eq!(crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM, MAINNET_MATCHER_PROGRAM_ID);
         assert_eq!(crate::constants::PROTOCOL_FEE_AUTHORITY_DEFAULT, MAINNET_FEE_AUTHORITY);
         assert!(crate::constants::STAKE_PINNED);
+        // GH#576: the NFT program is pinned by the same release step. Before the fix a
+        // `mainnet-ids` build had no NFT arm at all, so tags 72 / 73 / 82 and NFT-holder auth
+        // failed closed forever on mainnet while the build, the pin script and this test passed.
+        assert_eq!(crate::constants::NFT_PROGRAM_ID, MAINNET_NFT_PROGRAM_ID);
+        assert!(crate::constants::is_pinned_nft_program(&MAINNET_NFT_PROGRAM_ID_BYTES));
+        assert!(!crate::constants::is_pinned_nft_program(
+            &solana_program::pubkey!("27LWmR72Ru1NCkbN2xgxB7BgYcTUrU7qeEJoV3D8sZh1").to_bytes()
+        ), "the devnet NFT program must never be trusted by a mainnet-flavour build");
     }
 
     #[test]
-    fn pinned_set_covers_all_four_values() {
-        assert_eq!(PINNED_SET.len(), 4);
+    fn pinned_set_covers_all_five_values() {
+        assert_eq!(PINNED_SET.len(), 5);
         assert_eq!(PINNED_SET[0], MAINNET_STAKE_PROGRAM_ID_BYTES);
         assert_eq!(PINNED_SET[1], MAINNET_WRAPPER_PROGRAM_ID_BYTES);
         assert_eq!(PINNED_SET[2], MAINNET_MATCHER_PROGRAM_ID_BYTES);
         assert_eq!(PINNED_SET[3], MAINNET_FEE_AUTHORITY_BYTES);
+        assert_eq!(PINNED_SET[4], MAINNET_NFT_PROGRAM_ID_BYTES, "GH#576: the NFT program is in the set");
     }
 
     /// P-2: exactly one of three distinct markers per flavour, all the same length and none a
