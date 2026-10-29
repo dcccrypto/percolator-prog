@@ -2085,6 +2085,43 @@ mod tests {
         assert!(!lp_stop_triggered(&off_ref));
     }
 
+    /// GH#627 follow-up: the division form is the doubling form wherever `2 · navps` does not
+    /// overflow, so the fix changes nothing below saturation. Boundary values around every
+    /// power of two and odd/even halves, plus pseudo-random triples, against the exact
+    /// (non-saturating) doubling.
+    #[test]
+    fn lp_stop_division_matches_exact_doubling_below_saturation() {
+        let exact = |st: &NavState| -> bool {
+            let twice = st.navps.checked_mul(2).expect("domain: 2 * navps fits");
+            twice <= st.peak() || twice <= st.ref_navps
+        };
+        let mut vals: alloc::vec::Vec<u128> = alloc::vec![0, 1, 2, 3, NAV_ONE, NAV_ONE / 2, NAV_ONE / 2 + 1];
+        for k in 1..128u32 {
+            let p = 1u128 << k;
+            vals.extend([p - 1, p, p + 1]);
+        }
+        vals.extend([u128::MAX, u128::MAX - 1, u128::MAX / 2, u128::MAX / 2 + 1]);
+        let mut x: u64 = 0x2545_f491_4f6c_dd1d;
+        for _ in 0..2_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let hi = (x as u128) << 64 | (x.rotate_left(29) as u128);
+            vals.push(hi >> (x % 128));
+        }
+        let mut checked = 0u64;
+        for &n in vals.iter().filter(|&&n| n != 0 && n <= u128::MAX / 2) {
+            for &p in vals.iter() {
+                for &r in [0u128, n, p, p / 2, n.saturating_mul(2), u128::MAX].iter() {
+                    let st = NavState { navps: n, peak_cur: p, peak_prev: 0, ref_navps: r, ..NavState::default() };
+                    assert_eq!(lp_stop_triggered(&st), exact(&st), "navps {n} peak {p} ref {r}");
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000_000, "checked {checked}");
+    }
+
     #[test]
     fn mint_authority_parse() {
         let mut d = [0u8; 82];
