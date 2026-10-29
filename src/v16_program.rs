@@ -45350,7 +45350,9 @@ pub mod processor {
                 return Err(PercolatorError::LpStopNotTriggered.into());
             }
             let keep = lg::w1_keep_bps_users(users_opp, lp_net.unsigned_abs(), target);
-            if keep >= 10_000 {
+            // D11: "within target" also covers a leftover below one minimum leg: no whole leg can be
+            // cut for it, so a round would never converge and would only re-open every hour.
+            if keep >= 10_000 || lg::w1_leftover_below_leg(lp_net.unsigned_abs(), target, min_leg_q) {
                 // The stop holds but the LP is already within λ_eff·C_m: acknowledge it (the
                 // reference resets), nothing to cut.
                 gd.set_nav(&lg::nav_stop_reset(&nav));
@@ -45437,7 +45439,11 @@ pub mod processor {
         }
         // Close the round once the LP is within the round's target.
         let (lp_after, _, _, _) = lev_w1_market_state(market_ai, lp_ai, a, eq)?;
-        if lp_after.unsigned_abs() <= gd.round_target() {
+        // D11: ... or once the leftover excess is below one minimum leg (no whole leg is admitted
+        // below that, so the round could not converge). The reference resets as on any close.
+        if lp_after.unsigned_abs() <= gd.round_target()
+            || lg::w1_leftover_below_leg(lp_after.unsigned_abs(), gd.round_target(), min_leg_q)
+        {
             gd.round_active = 0;
             gd.set_nav(&lg::nav_stop_reset(&gd.nav()));
             solana_program::log::sol_log(&alloc::format!("lev_w1_round_done id={} lp_net={}", gd.round_id, lp_after));
