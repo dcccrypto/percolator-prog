@@ -796,7 +796,13 @@ pub const LEV_GUARD_VERSION: u8 = 1;
 /// `flags` bit 0 / 1: the pinned base mint was last proven to have a live mint / freeze authority.
 pub const GUARD_FLAG_MINT_AUTH: u8 = 1 << 0;
 pub const GUARD_FLAG_FREEZE_AUTH: u8 = 1 << 1;
-pub const GUARD_FLAGS_KNOWN: u8 = GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH;
+/// D12 / GH#614 bit 2 (`0x04`): op 3 has read the pinned base mint's authorities at least once.
+/// Bits 0/1 alone cannot tell "proven clean" from "never looked". A record written before this bit
+/// existed reads 0 = never proven, which is the tight answer. The record layout is unchanged: this
+/// is a previously spare flag bit (`validate_guard` used to refuse it).
+pub const GUARD_FLAG_PERM_PROVEN: u8 = 1 << 2;
+pub const GUARD_FLAGS_KNOWN: u8 =
+    GUARD_FLAG_MINT_AUTH | GUARD_FLAG_FREEZE_AUTH | GUARD_FLAG_PERM_PROVEN;
 
 /// Tag 124 ops.
 pub const OP_INIT: u8 = 0;
@@ -903,6 +909,23 @@ impl LevGuardV22 {
             n_mult_bps: self.rep_n_mult_bps,
             slot: self.rep_slot,
         }
+    }
+    /// D12: have the mint/freeze authorities ever been read by op 3?
+    pub fn perm_proven(&self) -> bool {
+        self.flags & GUARD_FLAG_PERM_PROVEN != 0
+    }
+    /// D12 (fail TIGHT): the permissionless facts the open gate feeds to `merge_overlay`. Where
+    /// `proof_required` (mainnet builds) and the authorities were never proven, both read as LIVE,
+    /// so the existing authority-live clamp (L_floor 2x, N_floor $200) applies instead of the
+    /// no-clamp path a never-checked mint used to take. Once op 3 has proven the mint, the stored
+    /// bits speak (clean = full limits, live = clamp).
+    pub fn perm_for_gate(&self, proof_required: bool) -> PermFacts {
+        let mut p = self.perm();
+        if proof_required && !self.perm_proven() {
+            p.mint_auth_live = true;
+            p.freeze_auth_live = true;
+        }
+        p
     }
     pub fn perm(&self) -> PermFacts {
         PermFacts {
@@ -1885,7 +1908,7 @@ mod tests {
         assert!(validate_guard(&g));
         // structural refusals
         let mut b = g;
-        b.flags = 4;
+        b.flags = 8; // bit 2 is GUARD_FLAG_PERM_PROVEN now (D12); bit 3 is still spare
         assert!(!validate_guard(&b));
         let mut b = g;
         b.rep_n_mult_bps = 10_001;
@@ -1896,6 +1919,47 @@ mod tests {
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
         assert!(!validate_guard(&b));
+    }
+
+    /// D12: unproven -> the authority-live overlay (L 2x, N $200); proven clean -> full limits;
+    /// proven live -> the same clamp. Devnet (`proof_required = false`) is unchanged.
+    #[test]
+    fn unproven_guard_gets_the_authority_live_overlay_when_proof_is_required() {
+        let now = 10 * SLOTS_PER_DAY;
+        let rep = RiskReport::default();
+        let fresh = new_guard([3u8; 32], 0, 1, 255);
+        assert!(!fresh.perm_proven());
+        let ov = |g: &LevGuardV22, req: bool| merge_overlay(AgeBand::Mature, &rep, &g.perm_for_gate(req), now);
+        // unproven, required: clamped exactly like a proven-live authority
+        let live = merge_overlay(
+            AgeBand::Mature,
+            &rep,
+            &PermFacts { mint_auth_live: true, ..Default::default() },
+            now,
+        );
+        assert_eq!((live.l_cap_x100, live.n_mult_bps), (1, 0));
+        assert_eq!(ov(&fresh, true), live, "unproven: tight (L 2x floor, N $200 floor)");
+        // unproven, not required (devnet): as before, no clamp
+        assert_eq!(ov(&fresh, false).l_cap_x100, u16::MAX);
+        assert_eq!(ov(&fresh, false).n_mult_bps, 10_000);
+        // proven clean: full limits either way
+        let mut clean = fresh;
+        clean.flags = GUARD_FLAG_PERM_PROVEN;
+        assert!(validate_guard(&clean));
+        assert_eq!(ov(&clean, true).l_cap_x100, u16::MAX);
+        assert_eq!(ov(&clean, true).n_mult_bps, 10_000);
+        // proven with a live mint authority / freeze authority: the clamp
+        for bit in [GUARD_FLAG_MINT_AUTH, GUARD_FLAG_FREEZE_AUTH] {
+            let mut g = fresh;
+            g.flags = GUARD_FLAG_PERM_PROVEN | bit;
+            assert!(validate_guard(&g));
+            assert_eq!((ov(&g, true).l_cap_x100, ov(&g, true).n_mult_bps), (1, 0));
+        }
+        // the holder-dump proof is untouched by the substitution
+        let mut h = fresh;
+        h.holder_dump_bps = 1_234;
+        h.holder_dump_slot = now;
+        assert_eq!(h.perm_for_gate(true).holder_dump_bps, 1_234);
     }
 
     #[test]
