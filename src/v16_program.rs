@@ -669,6 +669,12 @@ pub mod constants {
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
     pub const LEV_GUARD_REQUIRED_ON_EVERY_GROWTH_ASSET: bool = cfg!(not(feature = "devnet"));
+    /// D12 / GH#614: mainnet builds treat a guard whose base-mint authorities were never proven
+    /// (`GUARD_FLAG_PERM_PROVEN` clear) as if the mint/freeze authority were LIVE, so the open gate
+    /// applies the authority-live overlay (L 2x, N $200) -- fail tight, never refuse. Tag 124 op 3
+    /// (permissionless, needs the UA `DepthSourceV22` pin) sets the bit. Devnet builds keep the old
+    /// behaviour so the armed devnet markets are unaffected.
+    pub const LEV_GUARD_PERM_PROOF_REQUIRED: bool = cfg!(not(feature = "devnet"));
     /// Tag 123 `op`: 0 = clear the pin (mode 2 refused afterwards), 1 = set / replace it.
     pub const DEPTH_SOURCE_OP_CLEAR: u8 = 0;
     pub const DEPTH_SOURCE_OP_SET: u8 = 1;
@@ -44813,7 +44819,7 @@ pub mod processor {
         lev_observe(&mut gd, lev_target_price(&cfg, &group, a), now, sigma_1h, l_now, n_now);
         let pb = gd.price_band();
         let frozen = lg::frozen(&pb, now);
-        let ov = lg::merge_overlay(band, &gd.report(), &gd.perm(), now);
+        let ov = lg::merge_overlay(band, &gd.report(), &gd.perm_for_gate(constants::LEV_GUARD_PERM_PROOF_REQUIRED), now);
         let mmr = group.header.config.maintenance_margin_bps.get();
         let engine_imr = group.header.config.initial_margin_bps.get();
         // Leverage: L_trader (dump term, report cap, m_oracle, freeze), floored at L_floor, never above the ceiling; σ = burst memory (dec. 28). Day1 (dec. 1): + the vol profile as a TIGHTEN-ONLY floor, OFF (`lev_profile_v22::open_gate_floor`); the short cap below keeps the raw MMR.
@@ -45075,6 +45081,9 @@ pub mod processor {
         }
         let (mint_live, freeze_live) = lg::mint_authorities(&mint_ai.try_borrow_data()?).ok_or_else(bad)?;
         let mut flags = gd.flags & !(lg::GUARD_FLAG_MINT_AUTH | lg::GUARD_FLAG_FREEZE_AUTH);
+        // D12: the authorities have been read, so "never checked" is over. Both flags below may come
+        // out clear (a clean mint); this bit is what separates that from a mint nobody looked at.
+        flags |= lg::GUARD_FLAG_PERM_PROVEN;
         if mint_live {
             flags |= lg::GUARD_FLAG_MINT_AUTH;
         }
