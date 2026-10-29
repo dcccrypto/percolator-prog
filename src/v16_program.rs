@@ -3367,6 +3367,22 @@ pub mod state {
         assert!(ASSET_ADL_EPISODE_OFF + ASSET_ADL_EPISODE_LEN == ASSET_RISK_LIMITS_OFF + ASSET_RISK_LIMITS_LEN);
     /// P2b L2: default bound, about one hour of slots (400 ms slots).
     pub const ADL_WIND_DOWN_DEFAULT_MAX_EPISODE_SLOTS: u32 = 9_000;
+    /// D24 / #554: tag 104 may force-close a healthy leg only while the asset's worse side has
+    /// `A < ADL_WIND_DOWN_A_THRESHOLD_BPS / 10_000 * ADL_ONE` (strict). A is monotone down within
+    /// a side epoch (`ADL_ONE` -> `MIN_A_SIDE` = 10% is the whole engine range), so the threshold
+    /// marks "at least 1% of one side's open interest has been ADL-scaled away", which a single
+    /// unit through the designated exit (tag 44) cannot do on a real book; it takes a real
+    /// reduction of >= 1% of the side's open interest, at the reducer's own cost. 99% is the
+    /// "e.g. a_side < 99%" of the D24 decision (and of the lock-exits audit it echoes), kept as
+    /// the one tunable named constant.
+    pub const ADL_WIND_DOWN_A_THRESHOLD_BPS: u128 = 9_900;
+    /// D24 / #554: is `min(a_long, a_short)` below the wind-down threshold?
+    pub fn adl_wind_down_a_below_threshold(a_long: u128, a_short: u128) -> bool {
+        let worst = a_long.min(a_short);
+        // worst * 10_000 < ADL_ONE * threshold_bps, cross-multiplied (no rounding). Both sides are
+        // <= ADL_ONE = 1e15, so the products stay far below u128::MAX.
+        worst.saturating_mul(10_000) < percolator::ADL_ONE.saturating_mul(ADL_WIND_DOWN_A_THRESHOLD_BPS)
+    }
     /// P2b L2 (review I-1): a side whose remaining effective notional is at or below ONE
     /// WHOLE UNIT of collateral (10^decimals atoms, read from the market's collateral mint)
     /// may be wound down at once, without waiting for the episode.
@@ -24106,13 +24122,21 @@ pub mod processor {
         let stored = state::asset_risk_limits_from_wrapper_bytes(
             &group.markets[asset_index].wrapper[..],
         )?;
-        let (limits, expired) = adl_episode_step(
-            stored,
-            asset.market_id,
-            asset.epoch_long,
-            asset.epoch_short,
-            authenticated_now_slot,
-        );
+        // D24 / #554: the episode clock (and with it the force-close of HEALTHY legs) only runs
+        // while a side's A is below the wind-down threshold. A shallow A (e.g. a one-unit tag-44
+        // exit) neither arms the episode nor ever expires it; only the engine's dust bound (a leg
+        // worth at most one whole collateral unit) can act, as before.
+        let (limits, expired) = if state::adl_wind_down_a_below_threshold(asset.a_long, asset.a_short) {
+            adl_episode_step(
+                stored,
+                asset.market_id,
+                asset.epoch_long,
+                asset.epoch_short,
+                authenticated_now_slot,
+            )
+        } else {
+            (stored, false)
+        };
         if limits != stored {
             state::asset_risk_limits_to_wrapper_bytes(
                 &mut group.markets[asset_index].wrapper[..],
