@@ -761,6 +761,21 @@ pub fn junior_stake_ok(net_after: u128, min_atoms: u128) -> bool {
     net_after == 0 || net_after >= min_atoms
 }
 
+/// D1: the junior's VALUE after a withdrawal of `amount`: the junior layer of the three-way
+/// waterfall (`tranche_split3`) on the vault value left. Tag 97 tests THIS against the creator
+/// minimum (not net deposits): after any loss net deposits can never reach 0, which locked the
+/// whole stake. Value 0 (a full exit) or value >= the minimum is allowed (`junior_stake_ok`); the
+/// junior floor (`junior_withdraw_allowed3`) is a separate gate and still binds.
+pub fn junior_value_after_withdraw(vault_value: u128, amount: u128, senior_claim_eff: u128, bond_claim: u128) -> u128 {
+    crate::bond_v20::tranche_split3(vault_value.saturating_sub(amount), senior_claim_eff, bond_claim).junior
+}
+
+/// D1: tag 103 allocates senior (Earn) capital only while the junior's current VALUE is at least
+/// the creator minimum.
+pub fn junior_value_allows_allocation(vault_value: u128, senior_claim_eff: u128, bond_claim: u128, min_atoms: u128) -> bool {
+    crate::bond_v20::tranche_split3(vault_value, senior_claim_eff, bond_claim).junior >= min_atoms
+}
+
 // ── the permissionless holder proof ──────────────────────────────────────────────────────────
 
 /// The CPMM price drop when a holder sells `q` base tokens into a pool holding `r` base tokens:
@@ -1830,6 +1845,58 @@ mod tests {
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
         assert!(!validate_guard(&b));
+    }
+
+    /// D1: the creator minimum is tested on VALUE. $500 in, $100 lost, $400 left: a full $400
+    /// exit leaves value 0 (allowed by the stake rule; net deposits would say $100 and refuse it),
+    /// a partial exit leaving $300 is refused, and the junior floor still binds on its own.
+    #[test]
+    fn creator_stake_is_tested_on_value_with_an_exit_to_zero() {
+        use crate::bond_v20::junior_withdraw_allowed3;
+        let min = min_creator_stake_atoms(6).unwrap(); // $500
+        let usd = |d: u128| d * 1_000_000;
+        let (dep, withdrawn) = (usd(500), 0u128);
+        let value = usd(400); // after the $100 loss; no senior: V is all junior
+        // the old rule, for the record: net after a full exit of the value is $100, in (0, min)
+        let net_after = junior_net(dep, withdrawn + value);
+        assert_eq!(net_after, usd(100));
+        assert!(!junior_stake_ok(net_after, min), "rc23: refused");
+        // the new rule
+        let after = junior_value_after_withdraw(value, value, 0, 0);
+        assert_eq!(after, 0);
+        assert!(junior_stake_ok(after, min), "full exit at value: allowed");
+        let after = junior_value_after_withdraw(value, usd(100), 0, 0);
+        assert_eq!(after, usd(300));
+        assert!(!junior_stake_ok(after, min), "leaves $300: refused");
+        let after = junior_value_after_withdraw(usd(600), usd(100), 0, 0);
+        assert!(junior_stake_ok(after, min), "leaves exactly $500: allowed");
+        assert!(!junior_stake_ok(junior_value_after_withdraw(usd(600), usd(100) + 1, 0, 0), min), "leaves $500 - 1 atom");
+        // a withdrawal larger than the vault value cannot underflow
+        assert_eq!(junior_value_after_withdraw(usd(10), usd(20), 0, 0), 0);
+        // the junior floor still binds: Earn senior claim $1000 (floor 20%), junior value $400
+        let (v, c, b) = (usd(1_400), usd(1_000), 0u128);
+        assert_eq!(junior_value_after_withdraw(v, usd(400), c, b), 0, "the stake rule alone would allow it");
+        assert!(!junior_withdraw_allowed3(v, c, b, c, usd(400), 2_000), "...but the floor refuses the full exit");
+        assert!(junior_withdraw_allowed3(v, c, b, c, usd(200), 2_000), "up to junior - floor");
+        // bonds sit between the senior and the junior: the junior value excludes them
+        assert_eq!(junior_value_after_withdraw(usd(1_400), 0, usd(1_000), usd(300)), usd(100));
+    }
+
+    /// D1: tag 103 allocates Earn money only while the stake's current value is at least $500.
+    #[test]
+    fn allocation_needs_the_stake_value_not_the_net_deposit() {
+        let min = min_creator_stake_atoms(6).unwrap();
+        let usd = |d: u128| d * 1_000_000;
+        // $500 deposited, $100 lost: V = senior $1000 + junior $400
+        assert!(!junior_value_allows_allocation(usd(1_400), usd(1_000), 0, min));
+        assert!(junior_value_allows_allocation(usd(1_500), usd(1_000), 0, min));
+        assert!(!junior_value_allows_allocation(usd(1_500) - 1, usd(1_000), 0, min));
+        // a profitable stake clears the minimum even though net deposits are below it
+        assert!(junior_value_allows_allocation(usd(1_000) + usd(520), usd(1_000), 0, min));
+        // no stake at all
+        assert!(!junior_value_allows_allocation(usd(1_000), usd(1_000), 0, min));
+        // the bond's claim comes out before the junior
+        assert!(!junior_value_allows_allocation(usd(1_800), usd(1_000), usd(400), min));
     }
 
     #[test]

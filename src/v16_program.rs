@@ -37615,14 +37615,13 @@ pub mod processor {
                     }
                 }
             }
-            // v2.2 lev build (decision 7): a withdrawal may not leave the junior stake in (0, min).
+            // v2.2 lev build (decision 7 / D1): a withdrawal may not leave the junior's VALUE in
+            // (0, min). Value, not net deposits: after a loss net can never reach 0, which locked
+            // the whole stake. A full exit (value 0) is allowed here; the floor above still binds.
             lev_require_creator_stake(
                 &group,
                 st.asset_index as usize,
-                crate::lev_guard_v22::junior_net(
-                    st.junior_deposited_atoms,
-                    st.junior_withdrawn_atoms.saturating_add(amount),
-                ),
+                crate::lev_guard_v22::junior_value_after_withdraw(v, amount, c_eff, bond_claim),
             )?;
             group.withdraw_not_atomic(&mut lp, amount).map_err(map_v16_error)?;
             // Phase 2b A4 lock (defence in depth: the engine withdraw above is flat-only).
@@ -38180,6 +38179,14 @@ pub mod processor {
         let lp_value = if cert.certified_equity > 0 { cert.certified_equity as u128 } else { 0 };
         let v = vault_lp_v18::vault_value(nav, harvestable, lp_value)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // v2.2 lev build (decision 7 / D1): no senior capital is allocated to the vault LP of a
+        // growth asset unless the creator's stake is worth at least the $500 minimum NOW (value,
+        // not net deposits: a stake the market has eaten into no longer backs new Earn money).
+        if let Some(min) = lev_min_creator_stake_view(group, a)? {
+            if !crate::lev_guard_v22::junior_value_allows_allocation(v, c_eff, bond_claim, min) {
+                return Err(PercolatorError::CreatorStakeBelowMinimum.into());
+            }
+        }
         if !vault_lp_v18::vault_lp_alloc_admitted(
             st.senior_draw_outstanding_atoms,
             draw_pending,
@@ -40613,18 +40620,6 @@ pub mod processor {
             state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::VaultLpAllocateRefused.into());
-        }
-        // v2.2 lev build (decision 7): no senior capital is allocated to the vault LP of a growth
-        // asset until the creator's stake reaches the $500 minimum.
-        {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
-            let net = crate::lev_guard_v22::junior_net(st.junior_deposited_atoms, st.junior_withdrawn_atoms);
-            if let Some(min) = lev_min_creator_stake_view(&group, st.asset_index as usize)? {
-                if net < min {
-                    return Err(PercolatorError::CreatorStakeBelowMinimum.into());
-                }
-            }
         }
         let mut x = load_or_create_vault_lp_ext(
             program_id,
