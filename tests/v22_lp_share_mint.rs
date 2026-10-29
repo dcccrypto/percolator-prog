@@ -469,7 +469,7 @@ fn try_redeem(env: &mut Env, d: &Depositor, shares: u128) -> Result<u64, String>
         pid,
         &payer,
         vec![(
-            ProgInstruction::RequestRedeemLpShares { shares },
+            ProgInstruction::RequestRedeemLpSharesV22 { shares, min_payout_atoms: 1, keeper_ok: 0 },
             vec![
                 AccountMeta::new(kp.pubkey(), true),
                 AccountMeta::new(env.registry, false),
