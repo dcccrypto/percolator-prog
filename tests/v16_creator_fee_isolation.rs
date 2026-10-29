@@ -257,10 +257,21 @@ fn run_ix(ix: Instruction, accounts: &mut [&mut TestAccount]) -> Result<(), Prog
         .iter()
         .map(|a| (a.lamports, a.data.clone()))
         .collect();
+    // D26 (S1-30): InitMarket requires the market account (index 1) to sign. This harness's
+    // accounts are plain pubkeys, so grant the signature for the call (the real client's
+    // createAccount keypair signs) and restore it afterwards.
+    let grant_market_signature = matches!(ix, Instruction::InitMarket { .. }) && accounts.len() > 1;
+    let market_was_signer = grant_market_signature && accounts[1].is_signer;
+    if grant_market_signature {
+        accounts[1].is_signer = true;
+    }
     let result = {
         let infos: Vec<AccountInfo> = accounts.iter_mut().map(|a| a.to_info()).collect();
         processor::process_instruction(&program_id(), &infos, &data)
     };
+    if grant_market_signature {
+        accounts[1].is_signer = market_was_signer;
+    }
     if result.is_err() {
         for (account, (lamports, data)) in accounts.iter_mut().zip(snapshots) {
             account.lamports = lamports;

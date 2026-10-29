@@ -356,6 +356,7 @@ struct CrosscutEnv {
     payer: Keypair,
     admin: Keypair,
     market: Pubkey,
+    market_kp: Keypair, // D26: InitMarket requires the market account's signature
     mint: Pubkey,
     vault: Pubkey,
     vault_authority: Pubkey,
@@ -380,7 +381,8 @@ impl CrosscutEnv {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new();
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         // PDA derived under MAINNET — the error-prone re-key.
         let (vault_authority, _) =
@@ -439,6 +441,7 @@ impl CrosscutEnv {
             payer,
             admin,
             market,
+            market_kp,
             mint,
             vault,
             vault_authority,
@@ -450,6 +453,7 @@ impl CrosscutEnv {
         };
 
         let admin = env.admin.insecure_clone();
+        let market_kp = env.market_kp.insecure_clone();
         env.try_wrapper(
             ProgInstruction::InitMarket {
                 max_portfolio_assets: CROSSCUT_MAX_ASSETS,
@@ -477,10 +481,10 @@ impl CrosscutEnv {
             },
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(env.market, false),
+                AccountMeta::new(env.market, true),
                 AccountMeta::new_readonly(env.mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("init market @ MAINNET");
         env
@@ -545,14 +549,16 @@ impl CrosscutEnv {
 
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let portfolio = Pubkey::new_unique();
-        self.init_portfolio_at(owner, portfolio);
+        let portfolio_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let portfolio = portfolio_kp.pubkey();
+        self.init_portfolio_at(owner, &portfolio_kp);
         portfolio
     }
 
     /// InitPortfolio into the (empty, wrapper-owned) account `portfolio`. Used both for a new
     /// keypair and to RE-CREATE a closed one (S1-2).
-    fn init_portfolio_at(&mut self, owner: &Keypair, portfolio: Pubkey) {
+    fn init_portfolio_at(&mut self, owner: &Keypair, portfolio_kp: &Keypair) {
+        let portfolio = portfolio_kp.pubkey();
         self.svm
             .set_account(
                 portfolio,
@@ -570,9 +576,9 @@ impl CrosscutEnv {
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[owner],
+            &[owner, portfolio_kp],
         )
         .expect("init portfolio");
     }
@@ -3654,7 +3660,12 @@ fn s12_close_then_recreate_same_keypair_gets_a_new_incarnation_and_the_old_nft_d
     env.svm.airdrop(&buyer.pubkey(), 10_000_000_000).unwrap();
 
     // Incarnation 1: portfolio P, NFT1 minted for it (crafted as the NFT program leaves it).
-    let portfolio = env.create_portfolio(&seller);
+    // D26: InitPortfolio requires the portfolio account's signature, so keep P's keypair (the
+    // re-creation below is by the SAME keypair).
+    env.svm.airdrop(&seller.pubkey(), 1_000_000_000).unwrap();
+    let portfolio_kp = Keypair::new();
+    let portfolio = portfolio_kp.pubkey();
+    env.init_portfolio_at(&seller, &portfolio_kp);
     let (id1, _, _) = env.portfolio_identity(portfolio);
     let market = env.market;
     let (nft1_pda, _m1, seller_ata) = attach_nft_with_incarnation(&mut env, &seller, portfolio, 3, &market, id1);
@@ -3675,7 +3686,7 @@ fn s12_close_then_recreate_same_keypair_gets_a_new_incarnation_and_the_old_nft_d
             Account { lamports: 1_000_000_000, data: vec![0u8; env.portfolio_len], owner: env.program_id, executable: false, rent_epoch: 0 },
         )
         .unwrap();
-    env.init_portfolio_at(&seller, portfolio);
+    env.init_portfolio_at(&seller, &portfolio_kp);
     let (id2, _, _) = env.portfolio_identity(portfolio);
     assert_ne!(id1, id2, "a re-created portfolio keypair gets a new permanent id");
 

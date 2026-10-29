@@ -235,7 +235,8 @@ impl Env {
         svm.add_program(matcher, &std::fs::read(&matcher_so).unwrap());
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         svm.airdrop(&payer.pubkey(), 1_000_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000_000).unwrap();
@@ -340,10 +341,10 @@ impl Env {
             init,
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(market, false),
+                AccountMeta::new(market, true),
                 AccountMeta::new_readonly(mint, false),
             ],
-            &[&admin],
+            &[&admin, &market_kp],
         )
         .expect("init market");
         let seq = env.oracle_seq() + 1;
@@ -500,7 +501,14 @@ impl Env {
     }
 
     fn new_program_account(&mut self, len: usize) -> Pubkey {
-        let key = Pubkey::new_unique();
+        self.new_program_account_kp(len).pubkey()
+    }
+
+    /// D26: a program-owned account that HOLDS its keypair, for instructions that require the new
+    /// account's signature (InitPortfolio).
+    fn new_program_account_kp(&mut self, len: usize) -> Keypair {
+        let kp = Keypair::new();
+        let key = kp.pubkey();
         self.svm
             .set_account(
                 key,
@@ -513,7 +521,7 @@ impl Env {
                 },
             )
             .unwrap();
-        key
+        kp
     }
 
     // ── P3 instructions ─────────────────────────────────────────────────────────────────
@@ -998,15 +1006,16 @@ impl Env {
     fn new_trader(&mut self, capital: u64) -> Trader {
         let kp = Keypair::new();
         self.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
-        let portfolio = self.new_program_account(self.plen);
+        let portfolio_kp = self.new_program_account_kp(self.plen);
+        let portfolio = portfolio_kp.pubkey();
         self.send(
             ProgInstruction::InitPortfolio,
             vec![
                 AccountMeta::new(kp.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[&kp.insecure_clone()],
+            &[&kp.insecure_clone(), &portfolio_kp],
         )
         .expect("init portfolio");
         let t = Trader { kp, portfolio };

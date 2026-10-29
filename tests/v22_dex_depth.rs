@@ -640,7 +640,9 @@ impl Env {
         for k in [&payer, &admin, &ua] {
             svm.airdrop(&k.pubkey(), 100_000_000_000).unwrap();
         }
-        let market = Pubkey::new_from_array([0x11; 32]);
+        // D26: InitMarket requires the market account's signature, so the market is a seeded keypair.
+        let market_kp = seeded_keypair(0x11);
+        let market = market_kp.pubkey();
         let acct = |data: Vec<u8>, owner: Pubkey| Account { lamports: 1_000_000_000, data, owner, executable: false, rent_epoch: 0 };
         // every fixture account at its real address
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/depth_src");
@@ -704,8 +706,8 @@ impl Env {
         let admin = env.admin.insecure_clone();
         env.send(
             init,
-            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false), AccountMeta::new_readonly(collateral, false)],
-            &[&admin],
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, true), AccountMeta::new_readonly(collateral, false)],
+            &[&admin, &market_kp],
         )
         .expect("init market");
         let seq = env.oracle_seq() + 1;

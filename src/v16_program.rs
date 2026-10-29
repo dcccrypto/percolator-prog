@@ -16619,6 +16619,10 @@ pub mod processor {
         let mint_ai = account(accounts, 2)?;
         solana_program::log::sol_log(crate::PERCOLATOR_BUILD_FLAVOR);
         expect_signer(admin)?;
+        // D26 / S1-30: the market account itself must sign (it is created by a top-level
+        // system `createAccount` in the SAME transaction, whose new-account keypair signs), so
+        // a separately created, not-yet-initialised slab cannot be front-run by a third party.
+        expect_signer(market_ai)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
@@ -16986,6 +16990,9 @@ pub mod processor {
         let market_ai = account(accounts, 1)?;
         let portfolio_ai = account(accounts, 2)?;
         expect_signer(owner)?;
+        // D26 / S1-13: the portfolio account itself must sign (create + init in one tx), so a
+        // separately created portfolio cannot be initialised by a third party.
+        expect_signer(portfolio_ai)?;
         expect_writable(market_ai)?;
         expect_writable(portfolio_ai)?;
         expect_owner(market_ai, program_id)?;

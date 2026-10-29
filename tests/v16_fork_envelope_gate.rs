@@ -88,6 +88,7 @@ struct EnvelopeEnv {
     payer: Keypair,
     admin: Keypair,
     market: Pubkey,
+    market_kp: Keypair,
     mint: Pubkey,
 }
 
@@ -100,7 +101,8 @@ impl EnvelopeEnv {
 
         let payer = Keypair::new();
         let admin = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         svm.airdrop(&payer.pubkey(), 100_000_000_000).unwrap();
         svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
@@ -134,6 +136,7 @@ impl EnvelopeEnv {
             payer,
             admin,
             market,
+            market_kp,
             mint,
         }
     }
@@ -143,7 +146,7 @@ impl EnvelopeEnv {
             program_id: self.program_id,
             accounts: vec![
                 AccountMeta::new(self.admin.pubkey(), true),
-                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.market, true),
                 AccountMeta::new_readonly(self.mint, false),
             ],
             data: ix.encode(),
@@ -155,7 +158,7 @@ impl EnvelopeEnv {
                 instruction,
             ],
             Some(&self.payer.pubkey()),
-            &[&self.payer, &self.admin],
+            &[&self.payer, &self.admin, &self.market_kp],
             self.svm.latest_blockhash(),
         );
         self.svm

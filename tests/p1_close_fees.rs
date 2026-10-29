@@ -89,6 +89,7 @@ struct Env {
     admin: Keypair,
     fee_auth: Keypair,
     market: Pubkey,
+    market_kp: Keypair, // D26: InitMarket requires the market account's signature
     mint: Pubkey,
     vault: Pubkey,
     vault_authority: Pubkey,
@@ -130,7 +131,8 @@ impl Env {
         let payer = Keypair::new();
         let admin = Keypair::new();
         let fee_auth = Keypair::new();
-        let market = Pubkey::new_unique();
+        let market_kp = Keypair::new(); // D26: InitMarket requires the market account's signature
+        let market = market_kp.pubkey();
         let mint = Pubkey::new_unique();
         let (vault_authority, _) =
             Pubkey::find_program_address(&[b"vault", market.as_ref()], &PERCOLATOR_MAINNET);
@@ -153,6 +155,7 @@ impl Env {
             admin,
             fee_auth,
             market,
+            market_kp,
             mint,
             vault,
             vault_authority,
@@ -286,10 +289,10 @@ impl Env {
             .encode(),
             vec![
                 AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(self.market, false),
+                AccountMeta::new(self.market, true),
                 AccountMeta::new_readonly(self.mint, false),
             ],
-            &[&admin],
+            &[&admin, &self.market_kp.insecure_clone()],
         )
         .expect("InitMarket");
     }
@@ -392,7 +395,8 @@ impl Env {
 
     fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
-        let portfolio = Pubkey::new_unique();
+        let portfolio_kp = Keypair::new(); // D26: InitPortfolio requires the portfolio account's signature
+        let portfolio = portfolio_kp.pubkey();
         let len = state::portfolio_account_len_for_market_slots(MAX_ASSETS as usize).unwrap();
         self.plant(portfolio, vec![0u8; len], PERCOLATOR_MAINNET);
         self.send(
@@ -400,9 +404,9 @@ impl Env {
             vec![
                 AccountMeta::new(owner.pubkey(), true),
                 AccountMeta::new(self.market, false),
-                AccountMeta::new(portfolio, false),
+                AccountMeta::new(portfolio, true),
             ],
-            &[owner],
+            &[owner, &portfolio_kp],
         )
         .expect("InitPortfolio");
         portfolio
