@@ -42326,7 +42326,9 @@ pub mod processor {
             .c_b_atoms
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        if !bond_v20::bond_cap_ok(c_b_after, c_eff, split.junior, t.bond_cap_bps_of_c) {
+        // GH#574: the cap's junior is read at the SAME worse-for-the-vault price as the impairment
+        // check above, not at the effective price.
+        if !bond_v20::bond_deposit_cap_ok_at_worse(v_worse, c_eff, t.c_b_atoms, c_b_after, t.bond_cap_bps_of_c) {
             return Err(PercolatorError::BondDepositAboveCap.into());
         }
         // Not impaired => the tranche is worth exactly its claim: mint at par.
