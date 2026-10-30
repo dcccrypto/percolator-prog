@@ -191,11 +191,13 @@ cargo test --features devnet --no-fail-fast 2>&1 | tee /tmp/ci_test.log | tail -
 # #581: cargo's own exit status, which the pipe above would otherwise discard. 0 = all passed,
 # 101 = some test failed (expected: the allowlist). Anything else is not a verdict.
 cargo_rc=${PIPESTATUS[0]}
+# CI colours cargo's status lines (ESC[1mESC[92m   Running ...): strip the escapes before counting.
+sed $'s/\x1b\\[[0-9;]*m//g' /tmp/ci_test.log > /tmp/ci_test.plain.log
 echo "::endgroup::"
 
 # Bare test names, as before, for the allowlist diff.
 # #581: any `test <name> ... FAILED` line, including doc-tests (`test src/x.rs - item (line N) ... FAILED`).
-grep -E "^test .+ \.\.\. FAILED$" /tmp/ci_test.log | sed "s/^test //;s/ \.\.\. FAILED$//" | sort -u > /tmp/ci_failing.txt
+grep -E "^test .+ \.\.\. FAILED$" /tmp/ci_test.plain.log | sed "s/^test //;s/ \.\.\. FAILED$//" | sort -u > /tmp/ci_failing.txt
 # The same failures QUALIFIED by the suite they came from. `cargo test` prints the test name
 # alone, so the owning binary has to be tracked from the preceding "Running tests/<x>.rs" line.
 awk '
@@ -203,11 +205,11 @@ awk '
   /^[[:space:]]*Running /   { s=$0; sub(/^.*Running (unittests )?/,"",s); sub(/[[:space:]]*\(.*$/,"",s);
                               sub(/^tests\//,"",s); sub(/\.rs$/,"",s); suite=s; next }
   /^test .* \.\.\. FAILED$/ { n=$0; sub(/^test /,"",n); sub(/ \.\.\. FAILED$/,"",n); print suite "\t" n }
-' /tmp/ci_test.log | sort -u > /tmp/ci_failing_qualified.txt
+' /tmp/ci_test.plain.log | sort -u > /tmp/ci_failing_qualified.txt
 grep -vE "^\s*(#|$)" tests/KNOWN_FAILING.txt | sort -u > /tmp/ci_known.txt
 
-passed=$(grep -E "^test result:" /tmp/ci_test.log | awk '{p+=$4} END{print p}')
-failed=$(grep -E "^test result:" /tmp/ci_test.log | awk '{f+=$6} END{print f}')
+passed=$(grep -E "^test result:" /tmp/ci_test.plain.log | awk '{p+=$4} END{print p}')
+failed=$(grep -E "^test result:" /tmp/ci_test.plain.log | awk '{f+=$6} END{print f}')
 echo "TOTALS: passed=$passed failed=$failed  (allowlisted: $(wc -l < /tmp/ci_known.txt))  NFT_PIN=$NFT_PIN"
 
 # PROOF OF LIFE for the parsers: a `cargo test` output shape change would otherwise turn
@@ -220,8 +222,8 @@ fi
 # #581: every test binary that starts must finish with a `test result:` line. A binary that
 # aborts (SIGSEGV, stack overflow, OOM kill) prints no FAILED lines and no result line, so its
 # failures would vanish from every set comparison below.
-started=$(grep -cE "^[[:space:]]*(Running|Doc-tests) " /tmp/ci_test.log || true)
-finished=$(grep -cE "^test result:" /tmp/ci_test.log || true)
+started=$(grep -cE "^[[:space:]]*(Running|Doc-tests) " /tmp/ci_test.plain.log || true)
+finished=$(grep -cE "^test result:" /tmp/ci_test.plain.log || true)
 if [ "$started" != "$finished" ]; then
   echo "::error::$started test binaries started but $finished printed a 'test result:' line — a binary aborted and its failures are lost"; exit 1
 fi
