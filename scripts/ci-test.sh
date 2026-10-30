@@ -188,16 +188,21 @@ echo "::group::cargo test --no-fail-fast"
 # binary that names a devnet-only constant (CANONICAL_VAULT_LP_MATCHER_PROGRAM: p3_senior_draw,
 # p3_resolved_lock, indep_p3_*, ...) failed to COMPILE and the job parsed 0 passing tests.
 cargo test --features devnet --no-fail-fast 2>&1 | tee /tmp/ci_test.log | tail -40
+# #581: cargo's own exit status, which the pipe above would otherwise discard. 0 = all passed,
+# 101 = some test failed (expected: the allowlist). Anything else is not a verdict.
+cargo_rc=${PIPESTATUS[0]}
 echo "::endgroup::"
 
 # Bare test names, as before, for the allowlist diff.
-grep -E "^test [A-Za-z0-9_:]+ \.\.\. FAILED$" /tmp/ci_test.log | sed "s/^test //;s/ \.\.\. FAILED$//" | sort -u > /tmp/ci_failing.txt
+# #581: any `test <name> ... FAILED` line, including doc-tests (`test src/x.rs - item (line N) ... FAILED`).
+grep -E "^test .+ \.\.\. FAILED$" /tmp/ci_test.log | sed "s/^test //;s/ \.\.\. FAILED$//" | sort -u > /tmp/ci_failing.txt
 # The same failures QUALIFIED by the suite they came from. `cargo test` prints the test name
 # alone, so the owning binary has to be tracked from the preceding "Running tests/<x>.rs" line.
 awk '
+  /^[[:space:]]*Doc-tests /  { suite="doctest"; next }
   /^[[:space:]]*Running /   { s=$0; sub(/^.*Running (unittests )?/,"",s); sub(/[[:space:]]*\(.*$/,"",s);
                               sub(/^tests\//,"",s); sub(/\.rs$/,"",s); suite=s; next }
-  /^test .* \.\.\. FAILED$/ { n=$2; print suite "\t" n }
+  /^test .* \.\.\. FAILED$/ { n=$0; sub(/^test /,"",n); sub(/ \.\.\. FAILED$/,"",n); print suite "\t" n }
 ' /tmp/ci_test.log | sort -u > /tmp/ci_failing_qualified.txt
 grep -vE "^\s*(#|$)" tests/KNOWN_FAILING.txt | sort -u > /tmp/ci_known.txt
 
@@ -210,6 +215,22 @@ echo "TOTALS: passed=$passed failed=$failed  (allowlisted: $(wc -l < /tmp/ci_kno
 [ -n "${passed:-}" ] && [ "${passed:-0}" -gt 0 ] || { echo "::error::parsed 0 passing tests — the cargo output parser missed; every verdict below would be vacuous"; exit 1; }
 if [ -s /tmp/ci_failing.txt ] && [ ! -s /tmp/ci_failing_qualified.txt ]; then
   echo "::error::failures were found but NONE could be attributed to a suite — the 'Running tests/<x>.rs' parser missed"; exit 1
+fi
+
+# #581: every test binary that starts must finish with a `test result:` line. A binary that
+# aborts (SIGSEGV, stack overflow, OOM kill) prints no FAILED lines and no result line, so its
+# failures would vanish from every set comparison below.
+started=$(grep -cE "^[[:space:]]*(Running|Doc-tests) " /tmp/ci_test.log || true)
+finished=$(grep -cE "^test result:" /tmp/ci_test.log || true)
+if [ "$started" != "$finished" ]; then
+  echo "::error::$started test binaries started but $finished printed a 'test result:' line — a binary aborted and its failures are lost"; exit 1
+fi
+case "$cargo_rc" in
+  0|101) ;;
+  *) echo "::error::cargo test exited $cargo_rc (expected 0 or 101) — the run is not a verdict"; exit 1 ;;
+esac
+if [ "$cargo_rc" = 0 ] && [ "${failed:-0}" != 0 ]; then
+  echo "::error::cargo exited 0 but $failed failures were counted"; exit 1
 fi
 
 new_failures=$(comm -23 /tmp/ci_failing.txt /tmp/ci_known.txt)
@@ -236,6 +257,15 @@ fi
 if [ -n "$new_failures" ]; then
   echo "::error::NEW failures not in tests/KNOWN_FAILING.txt — this is a regression:"
   echo "$new_failures" | sed 's/^/    /'
+  rc=1
+fi
+# #581: the failures are matched by bare name above, so a same-named test in another suite would
+# hide behind an allowlist entry. The suite-qualified count and the summed `failed` total must
+# both equal the allowlist size too; a lost or masked failure breaks one of the three.
+nq=$(wc -l < /tmp/ci_failing_qualified.txt | tr -d ' ')
+nk=$(wc -l < /tmp/ci_known.txt | tr -d ' ')
+if [ "$nq" != "$nk" ] || [ "${failed:-0}" != "$nk" ]; then
+  echo "::error::failure counts disagree: qualified=$nq summed-failed=${failed:-0} allowlist=$nk"
   rc=1
 fi
 [ $rc -eq 0 ] && echo "OK: failing set matches the allowlist exactly (NFT_PIN=${NFT_PIN} -> nft ${want_nft}, engine ${have_engine})"
