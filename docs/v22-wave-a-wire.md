@@ -27,7 +27,7 @@ l_launch_x100 u16`) forms. NEW lot form: growth block + `lot_exp u8` (+5 bytes),
 lands, follows `lot_exp`.
 
 **Precision floor.** Every growth market must open at `initial_price >= 10_000_000` (=$10 per lot),
-and EVERY ConfigureAuthMark (tag 62) on a growth asset is floored too (security review R2-1).
+and EVERY ConfigureAuthMark (tag 62) and ConfigureEwmaMark (tag 35, GH#573) on a growth asset is floored too (security review R2-1).
 RestartAssetOracle -- the exit from asset Recovery -- is the one exemption (A2), so an asset whose
 mark fell below $10 per lot by ordinary pushes can be revived at its true price. Choose
 `lot_exp` so the per-lot price at launch is in [$10, $10,000]:
