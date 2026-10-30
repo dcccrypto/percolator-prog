@@ -3506,3 +3506,44 @@ fn gh561_resolved_bond_payout_is_not_netted_by_a_residual_backstop() {
     let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
     assert_eq!(st.backstop_outstanding_atoms, 3_500 * U, "vacuity: the residual exceeded the junior cushion during the exit");
 }
+/// GH#593. seniors 10,000, junior 2,500 (default cushion: 50% of the leg, target 20% of C_eff =
+/// 2,000, so the junior is ABOVE target and the creator-fee vesting bit clears), a fee leg
+/// harvested by tag 78. With a 1,000 G9 backstop receivable outstanding (STATE POKE on the
+/// vault-LP state; it is senior to the junior) the junior level nets to ~1,500 < target: the cushion must still be funded and
+/// the vesting bit must STAY set (creator fees locked). Control: receivable 0 -> cushion 0,
+/// vested.
+#[test]
+fn gh593_tag78_junior_level_nets_the_backstop_receivable() {
+    let run = |backstop: u64| -> (u128, u8) {
+        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 2_500, 0, 0);
+        env.slot += 500_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let f = env.new_trader(20_000 * U);
+        for _ in 0..6 {
+            env.trade(&f, &lp, 200 * UQ).expect("fee open");
+            env.trade(&f, &lp, -200 * UQ).expect("fee close");
+        }
+        {
+            let mut acct = env.svm.get_account(&env.vault_lp).unwrap();
+            let mut st = state::read_vault_lp_state(&acct.data).unwrap();
+            st.backstop_outstanding_atoms = backstop * U;
+            state::write_vault_lp_state(&mut acct.data, &st).unwrap();
+            env.svm.set_account(env.vault_lp, acct).unwrap();
+        }
+        let (cfg, _) = env.market_state();
+        let leg = cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms;
+        assert!(leg > 0, "vacuity: a fee leg");
+        let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
+        env.crank_fees_bond(lp.portfolio).expect("78");
+        let cushion = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0) - k0;
+        let vest = env.asset_rec().p2b_flags & 1;
+        eprintln!("GH593 backstop={backstop}: leg {leg} cushion {cushion} vesting-bit {vest}");
+        (cushion, vest)
+    };
+    let (cushion_c, vest_c) = run(0);
+    let (cushion_b, vest_b) = run(1_000);
+    assert_eq!((cushion_c, vest_c), (0, 0), "control: junior above target, nothing to fund, vested");
+    assert!(cushion_b > 0, "backstop outstanding: the junior is below target, the cushion is funded");
+    assert_eq!(vest_b, 1, "backstop outstanding: creator fees stay locked");
+}
