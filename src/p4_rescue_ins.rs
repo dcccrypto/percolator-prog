@@ -402,6 +402,23 @@ pub fn vault_value_net_of_backstop(vault_value: u128, outstanding: u128) -> u128
     vault_value.saturating_sub(outstanding)
 }
 
+/// Tag 78 fee-waterfall junior level (GH#593): the vault value NET of the G9 backstop receivable,
+/// less the effective senior claim, the harvested leg and the bond claim. The backstop is senior to
+/// the junior, so an outstanding receivable must not count as junior cushion (it would clear the
+/// creator-fee vesting flag early). Identical to the un-netted level when `backstop == 0`.
+pub fn waterfall_junior_level(
+    vault_value: u128,
+    backstop_outstanding: u128,
+    c_eff: u128,
+    leg: u128,
+    bond_claim: u128,
+) -> u128 {
+    vault_value_net_of_backstop(vault_value, backstop_outstanding)
+        .saturating_sub(c_eff)
+        .saturating_sub(leg)
+        .saturating_sub(bond_claim)
+}
+
 /// Recovery split with the backstop FIRST: `(to_backstop, rest)`, `to_backstop + rest ==
 /// recovery`. `rest` then goes seniors-first (`vault_lp_v18::vault_lp_recovery_split`).
 pub fn backstop_recovery_split(recovery: u128, outstanding: u128) -> (u128, u128) {
@@ -568,6 +585,19 @@ pub fn rescue_par_per_share_not_raised(c: u128, s: u128, m: u128, dc: u128) -> b
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gh593_backstop_is_not_junior_cushion_for_creator_fee_vesting() {
+        use crate::vault_lp_v18::creator_fee_vested;
+        // V 12,000, c_eff 9,000, leg 500, no bond: un-netted junior 2,500.
+        let (v, c_eff, leg) = (12_000u128, 9_000u128, 500u128);
+        assert_eq!(waterfall_junior_level(v, 0, c_eff, leg, 0), 2_500);
+        // 3,000 of that is lent insurance, senior to the junior: nothing is junior cushion.
+        assert_eq!(waterfall_junior_level(v, 3_000, c_eff, leg, 0), 0);
+        // Target 20% of c_eff = 1,800: vests un-netted, must NOT vest with the receivable out.
+        assert!(creator_fee_vested(waterfall_junior_level(v, 0, c_eff, leg, 0), c_eff, 5_000, 2_000));
+        assert!(!creator_fee_vested(waterfall_junior_level(v, 3_000, c_eff, leg, 0), c_eff, 5_000, 2_000));
+    }
 
     #[test]
     fn units_genesis_and_pro_rata() {
