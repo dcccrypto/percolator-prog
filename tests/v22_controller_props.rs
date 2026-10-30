@@ -54,6 +54,9 @@ proptest! {
 }
 
 #[test]
+// #575: the 7_000 band literal is only admitted where ALLOC_ALPHA_MAX_BAND_BPS = 7_000 (devnet);
+// a non-devnet host build caps it at 6_000, so the mutant path returns None. CI runs --features devnet.
+#[cfg(feature = "devnet")]
 fn r3_item1_mutants_are_caught() {
     // GAP-8: a 70% stored band dial allocates at most 50% now; the round-2 rule would allow 70%.
     assert_eq!(gv::alloc_alpha_in_force_bps_for(false, 7_000), 5_000);
