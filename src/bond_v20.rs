@@ -218,6 +218,21 @@ pub fn bond_cap_ok(bond_claim_after: u128, senior_claim_eff: u128, junior: u128,
     }
 }
 
+/// Tag 108 concentration cap read at the price WORSE for the vault (GH#574): the junior is
+/// `tranche_split3(v_worse, ..).junior`, the same reading the impairment check uses, so a lagging
+/// price cannot admit a deposit the worse-price reading would refuse. `v_worse` must already be
+/// net of any G9 backstop receivable.
+pub fn bond_deposit_cap_ok_at_worse(
+    v_worse: u128,
+    senior_claim_eff: u128,
+    bond_claim_before: u128,
+    bond_claim_after: u128,
+    cap_bps: u16,
+) -> bool {
+    let junior = tranche_split3(v_worse, senior_claim_eff, bond_claim_before).junior;
+    bond_cap_ok(bond_claim_after, senior_claim_eff, junior, cap_bps)
+}
+
 // ── Lock against open interest (I-T6, the self-funding attack) ───────────────────────────────
 
 /// A bond withdrawal (tag 110) executes only if the vault LP's growth capacity AFTER the
@@ -413,6 +428,24 @@ pub fn bond_impairment(vault_value: u128, senior_claim: u128, bond_claim: u128) 
 mod tests {
     use super::*;
     use crate::vault_lp_v18::{alloc_junior_ok, junior_withdraw_allowed, tranche_split};
+
+    #[test]
+    fn gh574_cap_is_read_at_the_worse_price() {
+        // nav 10,000 + LP at eff 5,000, worse-lag equity 2,000: v = 15,000, v_worse = 12,000.
+        let (nav, lp_eff, worse) = (10_000u128, 5_000u128, 2_000i128);
+        let (c_eff, c_b, after, cap) = (9_000u128, 1_000u128, 2_500u128, 2_000u16);
+        let v = nav + lp_eff;
+        let v_worse = vault_value_worse(nav, lp_eff, worse);
+        assert_eq!(v_worse, 12_000);
+        // The old reading (junior at v, 5,000 -> cap 2,800) admits; the worse reading
+        // (junior 2,000 -> cap 2,200) refuses.
+        assert!(bond_cap_ok(after, c_eff, tranche_split3(v, c_eff, c_b).junior, cap));
+        assert!(!bond_deposit_cap_ok_at_worse(v_worse, c_eff, c_b, after, cap));
+        // No lag: both readings agree and the helper admits within the cap.
+        assert!(bond_deposit_cap_ok_at_worse(v, c_eff, c_b, 2_800, cap));
+        assert!(!bond_deposit_cap_ok_at_worse(v, c_eff, c_b, 2_801, cap));
+    }
+
 
     #[test]
     fn split3_examples_and_two_tranche_equivalence() {
