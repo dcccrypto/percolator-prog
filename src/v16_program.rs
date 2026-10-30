@@ -34477,10 +34477,15 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // The harvested leg is already in the pots (in `nav`) and belongs to the seniors unless
         // the waterfall says otherwise, so the junior's level excludes it.
-        let junior_level = v
-            .saturating_sub(c_eff)
-            .saturating_sub(base.0)
-            .saturating_sub(bond_claim);
+        // GH#593: the G9 backstop receivable is senior to the junior, so it is netted off V first
+        // (as the coupon gate does).
+        let junior_level = crate::p4_rescue_ins::waterfall_junior_level(
+            v,
+            st.backstop_outstanding_atoms as u128,
+            c_eff,
+            base.0,
+            bond_claim,
+        );
         let (senior, cushion) = vault_lp_v18::cushion_split(
             base.0,
             x.cushion_share_bps,
