@@ -600,9 +600,12 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
     n.last_slot = now;
     let since = now.saturating_sub(n.bucket_start);
     if since >= 2 * SLOTS_PER_DAY {
-        // Both buckets are older than the window: the peak restarts at the current value.
-        n.peak_prev = navps;
-        n.peak_cur = navps;
+        // Both buckets are older than the window: the peak restarts, but never below the LAST
+        // OBSERVED index (`st.navps`): a fall that happened inside a keeper gap must still be
+        // seen by the peak arm (C1, 2026-10-30: the restart at the current value laundered it).
+        let carried = if st.navps > navps { st.navps } else { navps };
+        n.peak_prev = carried;
+        n.peak_cur = carried;
         n.bucket_start = now;
     } else if since >= SLOTS_PER_DAY {
         n.peak_prev = n.peak_cur;
@@ -1506,7 +1509,8 @@ mod tests {
         for (i, e) in [900u128, 800, 700, 600, 501].iter().enumerate() {
             s = nav_sample(&s, *e, 0, 0, (i as u64 + 1) * 2 * SLOTS_PER_DAY + 1);
         }
-        assert_eq!(s.peak(), NAV_ONE * 501 / 1_000);
+        // C1: a >= 2-day gap carries the last observed index as the peak (never launders a fall)
+        assert_eq!(s.peak(), NAV_ONE * 600 / 1_000);
         assert!(!lp_stop_triggered(&s));
         s = nav_sample(&s, 500, 0, 0, 12 * SLOTS_PER_DAY);
         assert!(lp_stop_triggered(&s), "ref trigger");

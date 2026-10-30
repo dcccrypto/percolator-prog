@@ -28633,6 +28633,9 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
+            // GH#573: the item 7 precision floor binds a lot-0 growth asset here exactly as it
+            // does on ConfigureAuthMark (tag 62); a non-growth asset is unchanged.
+            require_lot_reanchor_floor_view(&group, asset_index_usize, initial_mark_e6)?;
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
@@ -42331,7 +42334,9 @@ pub mod processor {
             .c_b_atoms
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        if !bond_v20::bond_cap_ok(c_b_after, c_eff, split.junior, t.bond_cap_bps_of_c) {
+        // GH#574: the cap's junior is read at the SAME worse-for-the-vault price as the impairment
+        // check above, not at the effective price.
+        if !bond_v20::bond_deposit_cap_ok_at_worse(v_worse, c_eff, t.c_b_atoms, c_b_after, t.bond_cap_bps_of_c) {
             return Err(PercolatorError::BondDepositAboveCap.into());
         }
         // Not impaired => the tranche is worth exactly its claim: mint at par.
