@@ -422,6 +422,85 @@ fn lot_exp_is_immutable_and_the_floor_binds_the_launch_anchor() {
     assert_eq!(profile0(&env).oracle_mode, 2);
 }
 
+/// GH#573: the item 7 precision floor binds ConfigureEwmaMark (tag 35) on a lot-0 growth asset
+/// exactly as it binds ConfigureAuthMark (tag 62). A lot-0 growth market is legal (4-byte growth
+/// trailer) and passes the "EWMA cannot carry a lot" refusal, so before the fix the oracle
+/// authority could re-anchor it at 1 e6, the untrackable micro-price R2-1 closed.
+/// CONTROL 1: tag 62 one unit below the floor is refused (119), proving the asset is floored.
+/// CONTROL 2: tag 35 AT the floor still succeeds. CONTROL 3: a non-growth market is unchanged.
+#[test]
+fn gh573_ewma_reanchor_below_the_floor_is_refused_on_a_lot0_growth_asset() {
+    let mut env = V16CuEnv::new();
+    init_on_fresh(&mut env, growth_init(LOT_PRICE_FLOOR_E6, None)).expect("lot-0 growth market");
+    env.svm.warp_to_slot(2);
+    let admin = env.admin.insecure_clone();
+    let market = env.market;
+    let metas = || vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)];
+    let ewma = |env: &mut V16CuEnv, mark: u64| {
+        let seq = env.control_sequences(0).oracle_observation + 1;
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::ConfigureEwmaMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: 2,
+                initial_mark_e6: mark,
+                mark_ewma_halflife_slots: 10,
+                mark_min_fee: 0,
+                observation_sequence: seq,
+            },
+            metas(),
+            &[&admin],
+        )
+    };
+    // CONTROL 1: tag 62 below the floor is refused.
+    let seq = env.control_sequences(0).oracle_observation + 1;
+    let r62 = env.send(
+        ProgInstruction::ConfigureAuthMark {
+            asset_index: 0,
+            market_id: 1,
+            now_slot: 2,
+            initial_mark_e6: LOT_PRICE_FLOOR_E6 - 1,
+            observation_sequence: seq,
+        },
+        metas(),
+        &[&admin],
+    );
+    assert_eq!(code(&r62), Some(ERR_LOT), "{r62:?}");
+    // The bug: tag 35 at a micro price and one unit below the floor.
+    for mark in [1, LOT_PRICE_FLOOR_E6 - 1] {
+        let r = ewma(&mut env, mark);
+        assert_eq!(code(&r), Some(ERR_LOT), "tag 35 @ {mark}: {r:?}");
+        assert_eq!(profile0(&env).oracle_mode, 0, "a refused re-anchor changes nothing");
+    }
+    // CONTROL 2: AT the floor is accepted.
+    ewma(&mut env, LOT_PRICE_FLOOR_E6).expect("tag 35 at the floor");
+    assert_eq!(profile0(&env).oracle_mode, 2);
+    assert_eq!(profile0(&env).mark_ewma_e6, LOT_PRICE_FLOOR_E6);
+    // CONTROL 3: a legacy (non-growth) market keeps the legacy rule: any valid price.
+    let mut legacy = V16CuEnv::new();
+    init_on_fresh(&mut legacy, base_init(LOT_PRICE_FLOOR_E6)).expect("non-growth market");
+    legacy.svm.warp_to_slot(2);
+    let admin = legacy.admin.insecure_clone();
+    let market = legacy.market;
+    let seq = legacy.control_sequences(0).oracle_observation + 1;
+    legacy
+        .send(
+            ProgInstruction::ConfigureEwmaMark {
+                market_id: 1,
+                asset_index: 0,
+                now_slot: 2,
+                initial_mark_e6: 1,
+                mark_ewma_halflife_slots: 10,
+                mark_min_fee: 0,
+                observation_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+            &[&admin],
+        )
+        .expect("non-growth markets are not floored");
+}
+
 // ─────────────────────────── security review A2 regressions ─────────────────────────────────
 
 /// STATE POKE (test only): asset 0 -> Recovery. `state::write_market` (an off-chain fixture
