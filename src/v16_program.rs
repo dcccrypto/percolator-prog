@@ -28633,6 +28633,9 @@ pub mod processor {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             require_asset_active_for_oracle_reconfiguration_view(&group, asset_index_usize)?;
+            // GH#573: the item 7 precision floor binds a lot-0 growth asset here exactly as it
+            // does on ConfigureAuthMark (tag 62); a non-growth asset is unchanged.
+            require_lot_reanchor_floor_view(&group, asset_index_usize, initial_mark_e6)?;
             let existing_profile = read_oracle_profile_from_view(&group, &cfg, asset_index_usize)?;
             // Asset 0 has a real stored profile; gate oracle reconfiguration on its
             // oracle_authority exactly like permissionless assets 1..N.
