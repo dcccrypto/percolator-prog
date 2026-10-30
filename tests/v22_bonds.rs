@@ -3506,3 +3506,52 @@ fn gh561_resolved_bond_payout_is_not_netted_by_a_residual_backstop() {
     let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
     assert_eq!(st.backstop_outstanding_atoms, 3_500 * U, "vacuity: the residual exceeded the junior cushion during the exit");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Handler-level tests for GH#574 (tag 108 cap read at the worse price) and GH#593 (tag 78
+// junior level nets the G9 backstop). They drive the real BPF handlers; reverting ONLY the
+// call-site change (the pure helper stays) fails them. Evidence in the PR description.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+/// GH#574. seniors 10,000, junior 2,000, no bonds yet, cap 50% of (C + junior). A trader is long
+/// 1,000 units against the vault LP and the mark target jumps +100% while the effective price has
+/// moved one step: the lag-worse equity sits ~950 below the effective one. At the effective price
+/// the cap is ~5,975 (junior ~1,950); at the worse price it is ~5,500 (junior ~1,000). A 5,700
+/// deposit passes the old reading and must be refused with BondDepositAboveCap by tag 108. A
+/// 5,400 deposit is inside both readings and is admitted (the control), and with NO lag the
+/// 5,700 deposit is admitted (vacuity: the refusal is due to the lag, not the size).
+#[test]
+fn gh574_tag108_cap_is_read_at_the_worse_for_the_vault_price() {
+    let run = |lag: bool, amount: u64| -> Result<(), String> {
+        let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 2_000, 0, 0);
+        env.hold(1, &[lp.portfolio]);
+        let t = env.new_trader(5_000 * U);
+        env.trade(&t, &lp, 1_000 * UQ).expect("long 1,000 vs the vault LP");
+        let target = if lag { 2 * PRICE } else { PRICE };
+        let admin = env.admin.insecure_clone();
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+        let seq = env.oracle_seq() + 1;
+        let m = env.market;
+        env.send(
+            ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: env.slot, mark_e6: target, observation_sequence: seq },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("push mark");
+        if lag {
+            env.crank(lp.portfolio).expect("crank vault LP");
+            env.crank(t.portfolio).expect("crank trader");
+        }
+        let g = env.market_state().1;
+        if lag {
+            assert!(g.assets[0].effective_price < g.assets[0].raw_oracle_target_price, "vacuity: a pending lag");
+        }
+        let r = env.bond_deposit(&h, lp.portfolio, amount * U, 1);
+        eprintln!("GH574 lag={lag} amount={amount}: 108 -> {:?}", r.as_ref().map_err(|e| e.chars().take(70).collect::<String>()));
+        r
+    };
+    err_has(&run(true, 5_700), PercolatorError::BondDepositAboveCap);
+    run(true, 5_400).expect("control: inside the worse-price cap too");
+    run(false, 5_700).expect("control: no lag, the same deposit is inside the cap");
+}
