@@ -4289,7 +4289,7 @@ fn gh571_random_sequences_match_the_reference_model_and_are_fair() {
                         let minted = bond_v20::bond_shares_for_deposit(amt as u128, m.b, m.cb + m.a).unwrap();
                         m.cb += amt as u128;
                         m.b += minted;
-                        assert_eq!(env.bond_pos(&holders[i]).shares > 0, true);
+                        assert!(env.bond_pos(&holders[i]).shares > 0);
                         fair[i] += amt as f64;
                         net[i] -= amt as f64;
                         fair_net[i] -= amt as f64;
