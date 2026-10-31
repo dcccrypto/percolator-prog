@@ -92,7 +92,10 @@ fn b1_round_trip_dilution_gives_volatility_drag_false_trip() {
 
 /// C1 (BROKEN, pre-existing; severity LOW, needs a >=48 h sampling gap, e.g. a dead keeper):
 // C1 (2-day gap launders the peak) is FIXED: see tests/onchain_1030_nav_attacks.rs::c1_*.
-// A1 / B1 below PIN KNOWN, UNFIXED behaviour (owner decision: sample NAV at the flow handlers, v2.3).
+// A1 / B1 below pin the behaviour of the SINGLE-SAMPLE function `nav_sample` (unchanged by #636).
+// The on-chain fix (#636) is that the flow handlers 96/97/98/103 sample the NAV AT the flow
+// (`nav_sample_at_flow`), so a flow no longer lands inside an unsampled interval: see
+// tests/nav636_flow_sample.rs and `navcheck_636_*` / `lev_w1_a1_*_636` in tests/p3_vault_lp.rs.
 
 /// W1 (held, by design): a wiped LP that is refilled stays triggered until op 5 acknowledges --
 /// no number of pokes/deposits/gains clears it. Documents the stale-latch exposure window.

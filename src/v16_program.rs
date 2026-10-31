@@ -7036,8 +7036,12 @@ pub mod state {
         pub cushion_share_bps: u16, // 102..104
         pub version: u8, // 104
         pub bump: u8,    // 105
-        pub _padding: [u8; 6], // 106..112
-        pub _reserved: [u8; 16], // 112..128
+        /// #636b: cumulative value that entered / left the vault LP's equity through flows that
+        /// have no counter of their own: in = tag 102 (Live), 108, 111 mode 0; out = tag 110
+        /// (Live), 111 modes 1 / 3. Two 88-bit little-endian counters (`[106..117)` in,
+        /// `[117..128)` out) carved from the former `_padding[6] + _reserved[16]` (all zero on every
+        /// existing ext, so no layout change and no migration). Monotonic; saturate at 2^88 - 1.
+        pub other_flow: [u8; 22], // 106..128
     }
     const _: () = assert!(core::mem::size_of::<VaultLpExtV19>() == 128);
     const _: () = assert!(core::mem::offset_of!(VaultLpExtV19, allocated_atoms) == 32);
@@ -7059,12 +7063,40 @@ pub mod state {
             || x.cushion_target_bps > 10_000
             || x.cushion_share_bps > 10_000
             || (x.cushion_target_bps == 0) != (x.cushion_share_bps == 0)
-            || x._padding != [0u8; 6]
-            || x._reserved != [0u8; 16]
         {
             return Err(ProgramError::InvalidAccountData);
         }
         Ok(())
+    }
+
+    /// Width of one `other_flow` counter in bytes (88 bits).
+    pub const OTHER_FLOW_BYTES: usize = 11;
+    const OTHER_FLOW_MAX: u128 = (1u128 << 88) - 1;
+
+    impl VaultLpExtV19 {
+        fn other_flow_get(&self, out: bool) -> u128 {
+            let o = if out { OTHER_FLOW_BYTES } else { 0 };
+            let mut b = [0u8; 16];
+            b[..OTHER_FLOW_BYTES].copy_from_slice(&self.other_flow[o..o + OTHER_FLOW_BYTES]);
+            u128::from_le_bytes(b)
+        }
+        fn other_flow_add(&mut self, out: bool, amount: u128) {
+            let v = self.other_flow_get(out).saturating_add(amount).min(OTHER_FLOW_MAX);
+            let o = if out { OTHER_FLOW_BYTES } else { 0 };
+            self.other_flow[o..o + OTHER_FLOW_BYTES].copy_from_slice(&v.to_le_bytes()[..OTHER_FLOW_BYTES]);
+        }
+        /// Cumulative value in through tags 102 / 108 / 111-draw (see `other_flow`).
+        pub fn other_in_atoms(&self) -> u128 {
+            self.other_flow_get(false)
+        }
+        /// Cumulative value out through tags 110 / 111-restore (see `other_flow`).
+        pub fn other_out_atoms(&self) -> u128 {
+            self.other_flow_get(true)
+        }
+        pub fn add_other_flow(&mut self, din: u128, dout: u128) {
+            self.other_flow_add(false, din);
+            self.other_flow_add(true, dout);
+        }
     }
 
     /// The record a fresh ext starts from: alpha 50%, buffer 30%, and (v2.2 round 3, GAP-8) the
@@ -37447,6 +37479,8 @@ pub mod processor {
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(source_balance, amount_u64)?;
         ensure_portfolio_storage_for_market_slots(lp_ai, max_market_slots)?;
+        // #636: NAV sample at the flow ([7] lev guard, [8] vault ext).
+        let nav_before = lev_nav_flow_begin(program_id, accounts, 7, 8, market_ai, lp_ai, vault_lp_ai)?;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -37480,7 +37514,7 @@ pub mod processor {
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 7, 8, market_ai, lp_ai, vault_lp_ai, nav_before, (0, 0))
     }
 
     /// P3 — WithdrawJuniorTranche (tag 97). Junior-owner-gated, Live only.
@@ -37572,6 +37606,8 @@ pub mod processor {
         let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)?
             .map(|(_, t)| t.c_b_atoms)
             .unwrap_or(0);
+        // #636: NAV sample at the flow ([11] vault ext, [12] bond tranche slot, [13] lev guard).
+        let nav_before = lev_nav_flow_begin(program_id, accounts, 13, 11, market_ai, lp_ai, vault_lp_ai)?;
         {
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
@@ -37721,7 +37757,7 @@ pub mod processor {
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 13, 11, market_ai, lp_ai, vault_lp_ai, nav_before, (0, 0))
     }
 
     /// P3 — VaultLpRecall (tag 98). PERMISSIONLESS, Live only.
@@ -37794,6 +37830,8 @@ pub mod processor {
         // Phase 2b: once the market's VaultLpExtV19 exists, [8] is REQUIRED (fail closed) so the
         // allocation counter always falls with the recall (98 is tag 103's inverse).
         let ext = load_vault_lp_ext_if_flagged(program_id, accounts, 8, market_ai.key, &registry)?;
+        // #636: NAV sample at the flow ([8] vault ext, [9] lev guard).
+        let nav_before = lev_nav_flow_begin(program_id, accounts, 9, 8, market_ai, lp_ai, vault_lp_ai)?;
         expect_writable(target_ledger_ai)?;
         if target_ledger_ai.data_is_empty() {
             let len = state::backing_domain_ledger_account_len();
@@ -37972,7 +38010,7 @@ pub mod processor {
             x.allocated_atoms = after;
             state::write_vault_lp_ext(&mut ext_ai.try_borrow_mut_data()?, &x)?;
         }
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 9, 8, market_ai, lp_ai, vault_lp_ai, nav_before, (0, 0))
     }
 
     // ── Phase 2b (2026-10-05): Earn as the counterparty ────────────────────────────────────
@@ -39640,6 +39678,8 @@ pub mod processor {
     /// Accounts: `[0]` cranker (signer, w) · `[1]` market (w) · `[2]` registry · `[3]`
     /// vault_lp_state (w) · `[4]` vault LP portfolio (w) · `[5]` own ledger (w) · `[6]` sibling
     /// ledger (w) · `[7..]` `InsuranceUnitsV20` (w; REQUIRED on a units market).
+    /// #636b: modes 0 / 1 / 3 also need the vault ext PDA and the lev guard PDA (both w, REQUIRED
+    /// on a growth market) somewhere in `[7..]` (found by key, any order, like the units account).
     ///
     /// PROPOSE (`mode` 2) / DRAW (`mode` 0), W-2 (security review 2026-10-05). Both run the
     /// senior draw and book it first (junior, then every senior pot) and both require the vault
@@ -39729,6 +39769,16 @@ pub mod processor {
         );
         expect_key(sibling_ledger_ai, &sibling_ledger_pda)?;
         let units_ai = ins_units_find(program_id, market_ai.key, accounts, 7)?;
+        // #636b: NAV sample at the flow for every mode that moves value (all but PROPOSE). The vault
+        // ext and the lev guard ride in the tail (like the units / feed accounts: found by their
+        // PDA at index >= 7, any order); REQUIRED on a growth market.
+        let (nav_before, g_idx, e_idx) = if mode == 2 {
+            (None, usize::MAX, usize::MAX)
+        } else {
+            let g = lev_find_idx(accounts, 7, &state::derive_lev_guard(program_id, market_ai.key).0);
+            let e = lev_find_idx(accounts, 7, &state::derive_vault_lp_ext(program_id, market_ai.key).0);
+            (lev_nav_flow_begin(program_id, accounts, g, e, market_ai, lp_ai, vault_lp_ai)?, g, e)
+        };
         // Draw and book first: the junior and the senior pots always go before insurance.
         vault_lp_draw_then_book(
             program_id,
@@ -40049,6 +40099,9 @@ pub mod processor {
             moved
         };
         state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        // #636b: draw (mode 0) = value in; restore (modes 1 / 3) = value out of the LP's equity.
+        let other = if mode == 0 { (moved, 0) } else { (0, moved) };
+        lev_nav_flow_end(program_id, accounts, g_idx, e_idx, market_ai, lp_ai, vault_lp_ai, nav_before, other)?;
         // v2.2 move event (tag 111): the amount decided on chain and the backstop receivable left
         // outstanding. A PROPOSE (mode 2) moves nothing and emits nothing.
         //   mode 0 draw (insurance -> vault LP capital) and mode 1 restore (vault LP capital ->
@@ -40692,6 +40745,8 @@ pub mod processor {
         let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)?
             .map(|(_, t)| t.c_b_atoms)
             .unwrap_or(0);
+        // #636: NAV sample at the flow ([7] vault ext, [9] bond tranche slot, [10] lev guard).
+        let nav_before = lev_nav_flow_begin(program_id, accounts, 10, 7, market_ai, lp_ai, vault_lp_ai)?;
         // Fund an insolvent vault LP and book any pending draw FIRST (both refuse below).
         vault_lp_draw_then_book(
             program_id,
@@ -40760,7 +40815,7 @@ pub mod processor {
             .checked_add(moved)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_vault_lp_ext(&mut ext_ai.try_borrow_mut_data()?, &x)?;
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 10, 7, market_ai, lp_ai, vault_lp_ai, nav_before, (0, 0))
     }
 
     /// P3 — VaultLpSettleResolved (tag 101). PERMISSIONLESS, Resolved only (P3-H1).
@@ -41252,7 +41307,9 @@ pub mod processor {
     /// P3 — VaultLpReleaseSurplus (tag 102). Junior-owner-gated, Live only (P3-M1).
     ///
     /// Accounts: 0 junior_owner [signer] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
-    /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger [w].
+    /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger [w] · (Resolved: 7..10 token
+    /// accounts, 11 bond tranche) · #636b Live tail: [12] vault ext [w] · [13] lev guard [w]
+    /// (both REQUIRED on a growth market; Live callers pad [7..11] with any account).
     ///
     /// Junior value can land in the backing pots (a recall that over-covered after C later fell,
     /// or fee cranks on a vault with no real senior shares). The junior exits only through the
@@ -41340,6 +41397,12 @@ pub mod processor {
                 .unwrap_or(0)
         } else {
             0
+        };
+        // #636b: Live only (Resolved pays SPL out of a closed LP). [12] vault ext, [13] lev guard.
+        let nav_before = if resolved {
+            None
+        } else {
+            lev_nav_flow_begin(program_id, accounts, 13, 12, market_ai, lp_ai, vault_lp_ai)?
         };
         {
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
@@ -41485,7 +41548,7 @@ pub mod processor {
             p2b_refresh_senior_floor(market_ai, &registry, &registry_pda, &st, own_ledger_ai, sibling_ledger_ai)?;
         }
         let _ = &mut st;
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 13, 12, market_ai, lp_ai, vault_lp_ai, nav_before, (amount, 0))
     }
 
     /// P3 — VaultLpConvertPnl (tag 100). PERMISSIONLESS.
@@ -42106,7 +42169,8 @@ pub mod processor {
     /// 1 market [w] · 2 registry · 3 vault_lp_state [w] · 4 lp_portfolio [w] · 5 own ledger [w] ·
     /// 6 sibling ledger [w] · 7 bond_tranche [w] · 8 bond_position [w] (`["bond", market,
     /// depositor]`, created if absent) · 9 source token [w] · 10 vault token [w] ·
-    /// 11 token_program · 12 system_program.
+    /// 11 token_program · 12 system_program · #636b tail: 13 vault ext [w] · 14 lev guard [w]
+    /// (both REQUIRED on a growth market).
     ///
     /// The SPL `amount` becomes vault-LP ENGINE CAPITAL (like the junior's tag 96), so it raises
     /// `C_m`, growth's `N_cap = lambda * C_m / P` and the H2 exposure cap: N_cap counts junior +
@@ -42157,6 +42221,9 @@ pub mod processor {
         if mode != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
+        // #636b: NAV sample at the flow ([13] vault ext, [14] lev guard); the deposit is capital,
+        // not P&L, so the LP-stop index must not read it as a gain.
+        let nav_before = lev_nav_flow_begin(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai)?;
         // v2.2 D-1 (combined release): the bond share price reads the vault LP equity at P_last.
         reject_market_price_lagged_ai(market_ai)?;
         let mint = primary_collateral_mint(&cfg);
@@ -42257,7 +42324,7 @@ pub mod processor {
             "bond_deposit amount={} minted={} c_b={} b={}",
             amount, minted, t.c_b_atoms, t.b_shares_total
         ));
-        Ok(())
+        lev_nav_flow_end(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai, nav_before, (amount, 0))
     }
 
     /// The value side of tag 108 inside one market borrow: pricing, gates, the engine deposit.
@@ -42384,7 +42451,8 @@ pub mod processor {
     /// Accounts: 0 holder [signer] · 1 market [w] · 2 registry · 3 vault_lp_state [w] ·
     /// 4 lp_portfolio [w] · 5 own ledger [w] · 6 sibling ledger [w] · 7 bond_tranche [w] ·
     /// 8 bond_position [w] · 9 dest token [w] (owner = holder) · 10 vault token [w] ·
-    /// 11 vault_authority · 12 token_program.
+    /// 11 vault_authority · 12 token_program · #636b tail (Live): 13 vault ext [w] · 14 lev guard
+    /// [w] (both REQUIRED on a growth market; Resolved does not read them).
     ///
     /// Redeems EVERY pending share, after `request_slot + bond_cooldown_slots`, at the bond
     /// value priced at the price WORSE for the vault; `C_b` falls by the pro-rata slice
@@ -42461,6 +42529,12 @@ pub mod processor {
             // P_last, so it waits (21) while any asset lags. Resolved has no live mark.
             reject_market_price_lagged_ai(market_ai)?;
         }
+        // #636b: NAV sample at the flow (Live only), see tag 108.
+        let nav_before = if live {
+            lev_nav_flow_begin(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai)?
+        } else {
+            None
+        };
         // Fund an insolvent vault LP (Live) and book any pending draw FIRST, in both modes (the
         // 102 order): the bonds are priced against the booked senior claim.
         vault_lp_draw_then_book(
@@ -42569,7 +42643,8 @@ pub mod processor {
             "bond_withdraw shares={} payout={} c_b={} b={} impairment={}",
             shares, payout, t.c_b_atoms, t.b_shares_total, impairment
         ));
-        Ok(())
+        let other = if live { (0, payout) } else { (0, 0) };
+        lev_nav_flow_end(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai, nav_before, other)
     }
 
     /// Tag 110 Live value side inside one market borrow. `args = [shares, min_out,
@@ -45181,6 +45256,25 @@ pub mod processor {
         if lp_ai.key.to_bytes() != st.lp_portfolio {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
+        let (flow_in, flow_out) = lev_flow_counters(program_id, market_ai, vault_lp_ai, ext_ai)?;
+        let (_, _, max_market_slots, _) =
+            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
+        let mut lp_data = lp_ai.try_borrow_mut_data()?;
+        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
+        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
+        let eq = vault_lp_v18::conservative_equity(lp.header.capital.get(), lp.header.pnl.get(), lp.header.fee_credits.get())
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        Ok((eq, flow_in, flow_out))
+    }
+
+    /// The cumulative `(flow_in, flow_out)` of `lev_lp_flows`, without the LP portfolio.
+    fn lev_flow_counters<'a>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        vault_lp_ai: &AccountInfo<'a>,
+        ext_ai: Option<&AccountInfo<'a>>,
+    ) -> Result<(u128, u128), ProgramError> {
+        let st = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?;
         // Night audit 2026-10-28 (F2): the ext is REQUIRED at its PDA. Optional, a caller could
         // drop it (allocated_total read 0, `flow_in` went backwards, the epoch restarted at 1.0 and
         // the peak / reference were wiped: a permissionless reset that masks any loss) or drop it
@@ -45191,24 +45285,129 @@ pub mod processor {
         if *ext_ai.key != ext_pda {
             return Err(PercolatorError::VaultLpNotBound.into());
         }
-        let allocated_total = if ext_ai.data_is_empty() {
-            0
+        let (allocated_total, other_in, other_out) = if ext_ai.data_is_empty() {
+            (0, 0, 0)
         } else {
-            load_vault_lp_ext(program_id, ext_ai, market_ai.key)?.allocated_total_atoms
+            let x = load_vault_lp_ext(program_id, ext_ai, market_ai.key)?;
+            (x.allocated_total_atoms, x.other_in_atoms(), x.other_out_atoms())
         };
+        // #636b: `other_*` = value moved by tags 102 / 108 / 110 / 111 (see `VaultLpExtV19::other_flow`).
         let flow_in = st
             .junior_deposited_atoms
             .saturating_add(allocated_total)
-            .saturating_add(st.senior_drawn_atoms);
-        let flow_out = st.junior_withdrawn_atoms.saturating_add(st.recalled_atoms);
-        let (_, _, max_market_slots, _) =
-            state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?;
-        let mut lp_data = lp_ai.try_borrow_mut_data()?;
-        let lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
-        expect_portfolio_view_account_key(&lp, lp_ai.key)?;
-        let eq = vault_lp_v18::conservative_equity(lp.header.capital.get(), lp.header.pnl.get(), lp.header.fee_credits.get())
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        Ok((eq, flow_in, flow_out))
+            .saturating_add(st.senior_drawn_atoms)
+            .saturating_add(other_in);
+        let flow_out = st
+            .junior_withdrawn_atoms
+            .saturating_add(st.recalled_atoms)
+            .saturating_add(other_out);
+        Ok((flow_in, flow_out))
+    }
+
+    /// #636 (A1 / B1): the NAV sample AT a flow. The flow handlers (96, 97, 98, 103) take the
+    /// market's lev guard as a trailing account and sample the NAV index twice around the value
+    /// they move: once for the interval up to the flow (read at the equity the flow found,
+    /// `equity_after + Δout − Δin`: a pure P&L reading, no flow in it, so no base can mask a loss
+    /// or dilute a gain) and once for the flow itself (a pure flow: neither the index nor the
+    /// peaks move, the baseline becomes the post-flow equity and counters). `begin` only needs
+    /// the flow counters, so it does not read the LP portfolio.
+    ///
+    /// The guard is REQUIRED (key checked at its PDA) when the vault's asset has growth on (the
+    /// only markets the LP stop runs on); a missing or wrong account is refused (LevGuardInvalid),
+    /// so a caller cannot skip the sample by omitting it. When the market has no growth, or the
+    /// guard PDA is not yet initialised (system-owned / empty: nobody can fake that at the PDA),
+    /// nothing is sampled. `ext_idx` is the vault's ext PDA slot, needed for the allocation counter.
+    ///
+    /// Returns the pre-flow counters `(flow_in, flow_out)` for `lev_nav_flow_end`; `None` = nothing
+    /// to sample.
+    #[inline(never)]
+    fn lev_nav_flow_begin<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        guard_idx: usize,
+        ext_idx: usize,
+        market_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        vault_lp_ai: &AccountInfo<'a>,
+    ) -> Result<Option<(u128, u128)>, ProgramError> {
+        let asset = load_vault_lp_state(program_id, vault_lp_ai, market_ai.key)?.asset_index as usize;
+        let growth_on = {
+            let mut md = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut md)?;
+            asset_growth_view(&group, asset)?.is_some()
+        };
+        let guard_ai = match accounts.get(guard_idx) {
+            Some(g) => g,
+            None if growth_on => return Err(PercolatorError::LevGuardInvalid.into()),
+            None => return Ok(None),
+        };
+        let (pda, _) = state::derive_lev_guard(program_id, market_ai.key);
+        if *guard_ai.key != pda {
+            if growth_on {
+                return Err(PercolatorError::LevGuardInvalid.into());
+            }
+            return Ok(None);
+        }
+        if guard_ai.owner != program_id || guard_ai.data_is_empty() {
+            return Ok(None);
+        }
+        expect_writable(guard_ai)?;
+        lev_guard_read(program_id, guard_ai, market_ai.key)?;
+        let _ = lp_ai;
+        let (fin, fout) = lev_flow_counters(program_id, market_ai, vault_lp_ai, accounts.get(ext_idx))?;
+        Ok(Some((fin, fout)))
+    }
+
+    /// #636b: index of the account with `key` in `accounts[from..]` (`usize::MAX` = absent; an
+    /// `accounts.get(usize::MAX)` is `None`, which `lev_nav_flow_begin` treats as a missing guard).
+    fn lev_find_idx(accounts: &[AccountInfo<'_>], from: usize, key: &Pubkey) -> usize {
+        accounts
+            .iter()
+            .enumerate()
+            .skip(from)
+            .find(|(_, a)| a.key == key)
+            .map(|(i, _)| i)
+            .unwrap_or(usize::MAX)
+    }
+
+    /// The post-flow half of `lev_nav_flow_begin`: call AFTER the handler's last state write.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn lev_nav_flow_end<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        guard_idx: usize,
+        ext_idx: usize,
+        market_ai: &AccountInfo<'a>,
+        lp_ai: &AccountInfo<'a>,
+        vault_lp_ai: &AccountInfo<'a>,
+        before: Option<(u128, u128)>,
+        other: (u128, u128),
+    ) -> ProgramResult {
+        let Some(b) = before else { return Ok(()) };
+        // #636b liveness: a growth market bound without the vault ext (tag 94 without [11], no 103 /
+        // 107 yet) has nowhere to book `other_*`. Such a market cannot hold a bond (107 creates the
+        // ext), so only 102 / 111 reach here: run them exactly as before this change (no sample)
+        // instead of failing them. 96/97/98/103 book no `other` and keep their #640 behaviour.
+        if other != (0, 0) && account(accounts, ext_idx).map_or(true, |e| e.data_is_empty()) {
+            return Ok(());
+        }
+        let guard_ai = account(accounts, guard_idx)?;
+        // #636b: tags 102 / 108 / 110 / 111 book their flow in the ext's `other_flow` counters
+        // (the ext is required: `lev_flow_counters` refuses without it) BEFORE the post reading.
+        if other != (0, 0) {
+            let ext_ai = account(accounts, ext_idx)?;
+            expect_writable(ext_ai)?;
+            let mut x = load_vault_lp_ext(program_id, ext_ai, market_ai.key)?;
+            x.add_other_flow(other.0, other.1);
+            state::write_vault_lp_ext(&mut ext_ai.try_borrow_mut_data()?, &x)?;
+        }
+        let after = lev_lp_flows(program_id, market_ai, lp_ai, vault_lp_ai, accounts.get(ext_idx))?;
+        let now = authenticated_slot_or_fallback(0);
+        let mut gd = lev_guard_read(program_id, guard_ai, market_ai.key)?;
+        let n = crate::lev_guard_v22::nav_sample_at_flow(&gd.nav(), b, after, now);
+        gd.set_nav(&n);
+        lev_guard_store(guard_ai, &gd)
     }
 
     /// Op 4: sample the price band and the LP's NAV per share (permissionless; the keeper runs

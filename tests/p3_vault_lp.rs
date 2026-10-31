@@ -814,6 +814,9 @@ impl Env {
                 AccountMeta::new(src, false),
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                // #636: [7] lev guard, [8] vault ext (the NAV sample at the flow)
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
             ],
             &[signer],
         );
@@ -2011,6 +2014,13 @@ impl Env {
                 AccountMeta::new(lp, false),
                 AccountMeta::new(self.ledger, false),
                 AccountMeta::new(self.sibling, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&signer.insecure_clone()],
         )
@@ -4077,6 +4087,9 @@ impl Env {
                 AccountMeta::new(self.sibling, false),
                 AccountMeta::new(ext, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                // #636: [9] (bond tranche slot, unused), [10] lev guard
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&cranker],
         )
@@ -4099,6 +4112,7 @@ impl Env {
                 AccountMeta::new(self.sibling, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new(ext, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&cranker],
         )
@@ -4123,6 +4137,8 @@ impl Env {
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(ext, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[signer],
         );
@@ -6216,12 +6232,12 @@ fn lev_min_creator_stake_deposit_and_withdraw_boundaries() {
     env.junior_deposit_as(&admin, lp.portfolio, 100).expect("top-up");
     assert_eq!(env.vlp().junior_deposited_atoms, 600);
     // a withdrawal that would leave 499 (in (0, min)): refused
-    let r = env.junior_withdraw_as(&admin, lp.portfolio, 101);
+    let r = env.junior_withdraw_ext(&admin, lp.portfolio, 101);
     assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 499: {r:?}");
     // leave exactly the minimum: lands
-    env.junior_withdraw_as(&admin, lp.portfolio, 100).expect("leave 500");
+    env.junior_withdraw_ext(&admin, lp.portfolio, 100).expect("leave 500");
     // full exit (net 0): the rule allows it (other locks decide)
-    let r = env.junior_withdraw_as(&admin, lp.portfolio, LEV_MIN_STAKE);
+    let r = env.junior_withdraw_ext(&admin, lp.portfolio, LEV_MIN_STAKE);
     assert!(!r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "full exit is not a stake refusal: {r:?}");
 }
 
@@ -6316,12 +6332,12 @@ fn d1_creator_exit_to_zero_at_value_after_a_loss() {
     eprintln!("d1: stake value {value} of 600 deposited");
     assert!(value < LEV_MIN_STAKE && value > 300, "a real loss below the minimum: {value}");
     // a partial exit that leaves value in (0, min): refused
-    let r = env.junior_withdraw_as(&admin, lp.portfolio, value - 300);
+    let r = env.junior_withdraw_ext(&admin, lp.portfolio, value - 300);
     assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 300: {r:?}");
-    let r = env.junior_withdraw_as(&admin, lp.portfolio, value - 1);
+    let r = env.junior_withdraw_ext(&admin, lp.portfolio, value - 1);
     assert!(r.as_ref().err().is_some_and(|e| e.contains(LEV_STAKE_ERR)), "leave 1: {r:?}");
     // the full exit at value: allowed (the junior floor is 0: no Earn money in)
-    env.junior_withdraw_as(&admin, lp.portfolio, value).expect("exit to zero at value");
+    env.junior_withdraw_ext(&admin, lp.portfolio, value).expect("exit to zero at value");
     assert_eq!(env.portfolio(lp.portfolio).capital, 0);
 }
 
@@ -6521,6 +6537,138 @@ fn lev_w1_deposit_then_small_loss_does_not_trip_f1() {
     assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
 }
 
+/// #636 A1 (on chain, tag 96): a real 60 % loss, then a huge creator deposit BEFORE any sample.
+/// On the old handler the poke after the deposit read the loss against the deposit's base
+/// (`navps` ~1.0, no stop); the handler now samples at the flow, so the loss is read in full.
+#[test]
+fn lev_w1_a1_loss_then_deposit_is_read_in_full_636() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10); // -60 %, nobody sampled yet
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000 * U).expect("deposit (flow sample)");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    let nav = lev_w1::guard(&env).nav();
+    assert!(nav.navps < lg::NAV_ONE / 2, "the 60 % loss is read in full: navps {}", nav.navps);
+    assert!(lg::lp_stop_triggered(&nav), "stop holds");
+    // op 5 accepts (a round opens, or the LP is already within target after the deposit); on the
+    // old handler it refused with LpStopNotTriggered (Custom(135)).
+    lev_w1::w1(&mut env, &lp, &[users[0].portfolio]).expect("W1 is not refused: the stop holds");
+}
+
+/// #636: the flow handlers REQUIRE the guard on a growth market (a caller cannot skip the sample
+/// by leaving the account out or passing another one), and the 4 handlers still work with it.
+#[test]
+fn lev_w1_flow_handlers_require_the_guard_636() {
+    let (mut env, lp, _users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    let src = env.token_account(env.mint, admin.pubkey(), 1_000 * U);
+    let mk = |env: &Env, extra: Vec<AccountMeta>| {
+        let mut m = vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new(src, false),
+            AccountMeta::new(env.vault_token, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ];
+        m.extend(extra);
+        m
+    };
+    let ix = || ProgInstruction::DepositJuniorTranche { amount: (1_000 * U) as u128 };
+    // no guard at all
+    let m = mk(&env, vec![]);
+    err_has(&env.send(ix(), m, &[&admin]), PercolatorError::LevGuardInvalid);
+    // a wrong account in the guard slot
+    env.svm.expire_blockhash();
+    let m = mk(&env, vec![AccountMeta::new(env.payer.pubkey(), false), AccountMeta::new(state::derive_vault_lp_ext(&env.pid, &env.market).0, false)]);
+    err_has(&env.send(ix(), m, &[&admin]), PercolatorError::LevGuardInvalid);
+    // the right ones: fine
+    env.svm.expire_blockhash();
+    let m = mk(&env, vec![
+        AccountMeta::new(lev_w1::guard_key(&env), false),
+        AccountMeta::new(state::derive_vault_lp_ext(&env.pid, &env.market).0, false),
+    ]);
+    env.send(ix(), m, &[&admin]).expect("deposit with the guard");
+}
+
+/// #636: 97, 98 and 103 REQUIRE the guard too (each refuses with LevGuardInvalid without it, and
+/// is past that check with it).
+#[test]
+fn lev_w1_tags_97_98_103_require_the_guard_636() {
+    let (mut env, lp, _users) = lev_w1::world();
+    let admin = env.admin.insecure_clone();
+    let ext = state::derive_vault_lp_ext(&env.pid, &env.market).0;
+    let guard = lev_w1::guard_key(&env);
+    let sys = solana_sdk::system_program::ID;
+    let cranker = Keypair::new();
+    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
+    let dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let not_134 = |r: &Result<(), String>| {
+        let c = code(PercolatorError::LevGuardInvalid);
+        assert!(r.as_ref().err().map_or(true, |e| !e.contains(&c)), "guard accepted: {r:?}");
+    };
+    for with_guard in [false, true] {
+        // 98
+        let mut m = vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new_readonly(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new(env.ledger, false),
+            AccountMeta::new(env.sibling, false),
+            AccountMeta::new_readonly(sys, false),
+            AccountMeta::new(ext, false),
+        ];
+        if with_guard {
+            m.push(AccountMeta::new(guard, false));
+        }
+        let r = env.send(ProgInstruction::VaultLpRecall { amount: 1, target_domain: DOMAIN }, m, &[&cranker]);
+        if with_guard { not_134(&r) } else { err_has(&r, PercolatorError::LevGuardInvalid) }
+        // 97
+        let mut m = vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new_readonly(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new_readonly(env.ledger, false),
+            AccountMeta::new_readonly(env.sibling, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault_token, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ext, false),
+            AccountMeta::new_readonly(sys, false),
+        ];
+        if with_guard {
+            m.push(AccountMeta::new(guard, false));
+        }
+        let r = env.send(ProgInstruction::WithdrawJuniorTranche { amount: 1 }, m, &[&admin]);
+        if with_guard { not_134(&r) } else { err_has(&r, PercolatorError::LevGuardInvalid) }
+        // 103
+        let mut m = vec![
+            AccountMeta::new(cranker.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new(env.ledger, false),
+            AccountMeta::new(env.sibling, false),
+            AccountMeta::new(ext, false),
+            AccountMeta::new_readonly(sys, false),
+            AccountMeta::new_readonly(sys, false),
+        ];
+        if with_guard {
+            m.push(AccountMeta::new(guard, false));
+        }
+        let r = env.send(ProgInstruction::VaultLpAllocate { amount: 1 }, m, &[&cranker]);
+        if with_guard { not_134(&r) } else { err_has(&r, PercolatorError::LevGuardInvalid) }
+    }
+}
+
 /// Night audit 2026-10-28 F2: the NAV sample REQUIRES the vault-LP ext at its PDA. On a0c1337d a
 /// permissionless poke could drop it: `flow_in` went backwards, the epoch restarted at 1.0 and
 /// the peak / reference were wiped (a loss masked), or pass a wrong account.
@@ -6629,7 +6777,7 @@ fn gh627_dust_base_cycle_cannot_hide_a_real_lp_stop() {
     assert_eq!(env.position(lp.portfolio), 0);
     // 2. withdraw all but one atom of the last SAMPLED equity, in the same interval (tag 97)
     let out = (e0 - 1) as u64;
-    env.junior_withdraw_as(&admin, lp.portfolio, out).expect("tag 97 on a flat LP, P + 1 left");
+    env.junior_withdraw_ext(&admin, lp.portfolio, out).expect("tag 97 on a flat LP, P + 1 left");
     lev_w1::poke(&mut env, &lp).expect("sample");
     let nav = lev_w1::guard(&env).nav();
     let gained = nav.last_equity - 1; // P: the value left standing is P + 1
@@ -6726,9 +6874,10 @@ fn navcheck_earn_world() -> (Env, Lp, Vec<Trader>) {
 /// the junior still covers the 5 % floor -- and sample in the same breath. The loss is then read
 /// on the larger base, op 5 refuses, and the seniors' 5k sits in an LP whose stop was silenced.
 /// Control: with the routine poke first (the honest ordering) the same loss fires W1.
-/// Pinned as the CURRENT behaviour; only sampling at the flow (v2.3) removes it.
+/// #636: FIXED. Tag 103 now samples the NAV at the flow (before moving value), so BOTH orderings
+/// read the loss in full and fire W1 (this test pinned the masking before the fix).
 #[test]
-fn navcheck_residual_f1_permissionless_allocation_masks_a_real_loss() {
+fn navcheck_636_permissionless_allocation_cannot_mask_a_real_loss() {
     use percolator_prog::lev_guard_v22 as lg;
     for poke_first in [true, false] {
         let (mut env, lp, users) = navcheck_earn_world();
@@ -6759,9 +6908,11 @@ fn navcheck_residual_f1_permissionless_allocation_masks_a_real_loss() {
             r.expect("honest ordering: the real loss fires W1");
             assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
         } else {
-            assert_eq!(nav.navps, lg::mul_div_floor_sat(lg::NAV_ONE, eq + a, e0 + a), "read on (L + X)");
-            assert!(!lg::lp_stop_triggered(&nav), "masked: {}", nav.navps);
-            assert!(r.as_ref().err().is_some_and(|e| e.contains("Custom(135)")), "masked: {r:?}");
+            // #636: the flow handler sampled the loss BEFORE the allocation landed
+            assert_eq!(nav.navps, lg::mul_div_floor_sat(lg::NAV_ONE, eq, e0), "read on the pre-flow equity");
+            assert!(lg::lp_stop_triggered(&nav), "not masked: {}", nav.navps);
+            r.expect("the real loss fires W1 even with no poke before the allocation");
+            assert!(env.position(users[0].portfolio) < tok(GPRICE, 4_000));
         }
     }
 }
@@ -6769,9 +6920,10 @@ fn navcheck_residual_f1_permissionless_allocation_masks_a_real_loss() {
 /// #630 residual (new with the gross cap), end to end: a real gain of a FLAT vault LP (a trade it
 /// won, closed) is diluted toward zero by permissionless 103 / 98 round trips landed before the
 /// sample. Under F1 alone the same interval read the gain exactly; with the routine poke first it
-/// is exact under #630 too. Pinned as the CURRENT behaviour; only sampling at the flow removes it.
+/// is exact under #630 too. #636: FIXED for flows that land after the gain (this test pinned the
+/// dilution before): 103 / 98 sample the gain at the flow, so ten round trips read it exactly.
 #[test]
-fn navcheck_residual_630_permissionless_round_trips_dilute_a_real_gain() {
+fn navcheck_636_permissionless_round_trips_cannot_dilute_a_real_gain() {
     use percolator_prog::lev_guard_v22 as lg;
     let run = |cycles: u32| -> (u128, u128, u128) {
         let mut env = Env::new(growth_params());
@@ -6823,6 +6975,6 @@ fn navcheck_residual_630_permissionless_round_trips_dilute_a_real_gain() {
         (griefed - lg::NAV_ONE) as f64 / 1e10
     );
     assert!(griefed > lg::NAV_ONE, "still a gain (I6)");
-    assert!((griefed - lg::NAV_ONE) * 5 < honest - lg::NAV_ONE, "diluted to under a fifth of the real gain");
+    assert_eq!(griefed, honest, "#636: the gain is read exactly, the round trips dilute nothing");
 }
 
