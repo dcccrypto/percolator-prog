@@ -851,9 +851,11 @@ fn kani_growth_t6_ratchet_single_step() {
     let ps: u64 = kani::any();
     let tgt: u16 = kani::any();
     let fl: u16 = kani::any();
-    let force: bool = kani::any();
+    // v2.2 signature: graded `stress: u8` (was a bool `force`); the h-lock is stress >= STRESS_HLOCK.
+    let stress: u8 = kani::any();
+    let force = stress >= crate::growth_v19::STRESS_HLOCK;
     let now: u64 = kani::any();
-    let (out, _) = ratchet_ceiling_x100(prev, ps, tgt, fl, force, now);
+    let (out, _) = ratchet_ceiling_x100(prev, ps, tgt, fl, stress, now);
     assert!(out <= prev.max(tgt));
     if out > prev {
         assert!(out as u32 <= prev as u32 + RATCHET_STEP_X100 as u32);
