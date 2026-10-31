@@ -4201,15 +4201,117 @@ pub mod state {
         Ok((next, next_control))
     }
 
+    /// port135 (ADOPT upstream `0c5d4f4f`, "invalidate stale matcher capabilities", upstream
+    /// issue 406; + the `0b838425` expiry clear): the packed-control transition of a position
+    /// episode bump. A mutation the configured matcher did NOT observe (`matcher_synchronized ==
+    /// false`) clears the ENABLED bit; a fill through the configured matcher keeps it. The episode
+    /// and the LP's fee cap are preserved either way. Verbatim upstream (Kani:
+    /// `kani_v16_position_epoch_sync_policy_is_total_and_exact`).
     #[inline]
-    pub fn bump_portfolio_position_epoch(data: &mut [u8]) -> Result<u64, ProgramError> {
+    pub fn next_portfolio_position_control_for_matcher_sync(
+        control: u64,
+        matcher_synchronized: bool,
+    ) -> Result<(u64, u64), ProgramError> {
+        let (next, mut next_control) = next_portfolio_position_control(control)?;
+        if !matcher_synchronized {
+            next_control &= !PortfolioMatcherConfigV16::ENABLED_MASK;
+        }
+        Ok((next, next_control))
+    }
+
+    /// port135 (fork adaptation of upstream 0c5d4f4f): the matcher programs that the wrapper
+    /// hands the LP's authoritative engine position on EVERY call (`ext_version = 2`,
+    /// matcher-inventory-sync 2026-10-03: the canonical matcher prices and caps against that
+    /// value, never against its own `inventory_base` counter). Such a matcher has observed every
+    /// position mutation by construction, so an out-of-matcher mutation does not desynchronize
+    /// it and its capability is NOT invalidated. A default build (no canonical matcher) has none:
+    /// there the policy is upstream's verbatim. Single source of truth for
+    /// `processor::matcher_takes_lp_position` too, so the wire and the policy cannot diverge.
+    #[inline]
+    pub fn matcher_program_is_position_synced(matcher_program: &[u8; 32]) -> bool {
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+        {
+            *matcher_program == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes()
+        }
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
+        {
+            let _ = matcher_program;
+            false
+        }
+    }
+
+    /// port135: is the portfolio's CONFIGURED matcher position-synced (see above)? Reads only the
+    /// 32-byte program field (an unconfigured portfolio has all-zero bytes: not synced).
+    #[inline]
+    fn portfolio_matcher_is_position_synced(data: &[u8]) -> Result<bool, ProgramError> {
+        let program: [u8; 32] = data
+            .get(PORTFOLIO_MATCHER_CONFIG_OFF..PORTFOLIO_MATCHER_CONFIG_OFF + 32)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .try_into()
+            .map_err(|_| PercolatorError::InvalidAccountLen)?;
+        Ok(matcher_program_is_position_synced(&program))
+    }
+
+    #[inline]
+    fn bump_portfolio_position_epoch_with_matcher_state(
+        data: &mut [u8],
+        matcher_synchronized: bool,
+    ) -> Result<u64, ProgramError> {
         check_header(data, KIND_PORTFOLIO)?;
+        let matcher_synchronized =
+            matcher_synchronized || portfolio_matcher_is_position_synced(data)?;
         let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
-        let (next, next_control) = next_portfolio_position_control(control)?;
+        let (next, next_control) =
+            next_portfolio_position_control_for_matcher_sync(control, matcher_synchronized)?;
         data.get_mut(PORTFOLIO_MATCHER_CONTROL_OFF..PORTFOLIO_MATCHER_CONTROL_OFF + 8)
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(&next_control.to_le_bytes());
+        if !matcher_synchronized {
+            write_portfolio_matcher_expiry(data, 0)?;
+        }
         Ok(next)
+    }
+
+    /// A position-episode bump for a mutation OUTSIDE the configured matcher (liquidation,
+    /// recovery, force-close, wind-down, dust sweep / eviction victim, cure, ...): also
+    /// invalidates the matcher capability unless that matcher is position-synced (port135).
+    #[inline]
+    pub fn bump_portfolio_position_epoch(data: &mut [u8]) -> Result<u64, ProgramError> {
+        bump_portfolio_position_epoch_with_matcher_state(data, false)
+    }
+
+    /// Upstream API (0c5d4f4f): a bump for a fill through the portfolio's OWN configured matcher
+    /// keeps the capability. No production caller in this fork (trades do not advance the
+    /// position epoch here, AUD-S1-23); kept for grep parity and the ported unit test.
+    #[inline]
+    pub fn bump_portfolio_position_epoch_after_matcher_fill(
+        data: &mut [u8],
+    ) -> Result<u64, ProgramError> {
+        bump_portfolio_position_epoch_with_matcher_state(data, true)
+    }
+
+    /// port135 (fork adaptation of 0c5d4f4f): invalidate the matcher capability after a
+    /// position mutation the configured matcher did not observe, WITHOUT advancing the position
+    /// epoch. Used where upstream bumps the epoch but this fork does not (the trade family's
+    /// non-matcher sides, RebalanceReduce, ForfeitRecoveryLeg, and the band forced closes against
+    /// the vault LP), so retained-action epoch bindings are unchanged. No-op for a position-synced
+    /// matcher or an already-disabled capability (no write at all then).
+    #[inline]
+    pub fn invalidate_unsynchronized_matcher_capability(
+        data: &mut [u8],
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+        if control & PortfolioMatcherConfigV16::ENABLED_MASK == 0
+            || portfolio_matcher_is_position_synced(data)?
+        {
+            return Ok(());
+        }
+        let next_control = control & !PortfolioMatcherConfigV16::ENABLED_MASK;
+        data.get_mut(PORTFOLIO_MATCHER_CONTROL_OFF..PORTFOLIO_MATCHER_CONTROL_OFF + 8)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&next_control.to_le_bytes());
+        write_portfolio_matcher_expiry(data, 0)
     }
 
     /// Upstream's `expected_sequence` (upstream's own helper name is
@@ -15655,17 +15757,29 @@ pub mod processor {
                 now_slot,
             } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
             // AUD-S1-23: the swept victim's (account 2) position changed without its owner.
+            // port135: the bound vault LP (account 3) is the forced close's counterparty, outside
+            // its matcher.
             Instruction::SweepBandDustLeg { asset_index } => with_position_epoch_bumps(
                 accounts,
                 &[2],
-                || handle_sweep_band_dust_leg(program_id, accounts, asset_index),
+                || {
+                    with_matcher_invalidations(program_id, accounts, &[3], || {
+                        handle_sweep_band_dust_leg(program_id, accounts, asset_index)
+                    })
+                },
             ),
             // AUD-S1-23: the evicted victim (account 0); the taker's own trade is not bumped
             // (trades do not advance position_epoch in this fork).
+            // port135: the taker (account 3) traded through ANOTHER portfolio's matcher; the vault
+            // LP (account 4) absorbed the victim's forced close outside its matcher.
             Instruction::EvictAndTradeCpi { trade } => with_position_epoch_bumps(
                 accounts,
                 &[0],
-                || handle_evict_and_trade_cpi(program_id, accounts, &trade),
+                || {
+                    with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                        handle_evict_and_trade_cpi(program_id, accounts, &trade)
+                    })
+                },
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -15697,20 +15811,24 @@ pub mod processor {
                 exec_price,
                 fee_bps,
                 backing_fee_cap_bps,
-            } => handle_trade_nocpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                asset_index,
-                market_id,
-                size_q,
-                exec_price,
-                fee_bps,
-                backing_fee_cap_bps,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                // port135 (upstream 0c5d4f4f): a signed bilateral fill moves both portfolios
+                // outside either configured matcher.
+                handle_trade_nocpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    asset_index,
+                    market_id,
+                    size_q,
+                    exec_price,
+                    fee_bps,
+                    backing_fee_cap_bps,
+                )
+            }),
             Instruction::TradeCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
@@ -15723,36 +15841,43 @@ pub mod processor {
                 fee_bps,
                 limit_price,
                 backing_fee_cap_bps,
-            } => handle_trade_cpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                account_b_matcher_sequence,
-                asset_index,
-                market_id,
-                size_q,
-                fee_bps,
-                limit_price,
-                backing_fee_cap_bps,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135 (upstream 0c5d4f4f): the LP (account 3) filled through its own matcher
+                // and keeps its capability; the taker (account 2) did not use its own.
+                handle_trade_cpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    account_b_matcher_sequence,
+                    asset_index,
+                    market_id,
+                    size_q,
+                    fee_bps,
+                    limit_price,
+                    backing_fee_cap_bps,
+                )
+            }),
             Instruction::BatchTradeNoCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 legs,
-            } => handle_batch_trade_nocpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                &legs,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                // port135: as TradeNoCpi.
+                handle_batch_trade_nocpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    &legs,
+                )
+            }),
             Instruction::BatchTradeCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
@@ -15762,18 +15887,21 @@ pub mod processor {
                 max_fee_atoms,
                 account_b_matcher_sequence,
                 legs,
-            } => handle_batch_trade_cpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                max_slippage_atoms,
-                max_fee_atoms,
-                account_b_matcher_sequence,
-                &legs,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: as TradeCpi.
+                handle_batch_trade_cpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    max_slippage_atoms,
+                    max_fee_atoms,
+                    account_b_matcher_sequence,
+                    &legs,
+                )
+            }),
             Instruction::SetMatcherConfig {
                 portfolio_id,
                 expected_sequence,
@@ -16217,27 +16345,33 @@ pub mod processor {
                 position_epoch,
                 asset_index,
                 b_loss_atom_budget,
-            } => handle_forfeit_recovery_leg(
-                program_id,
-                accounts,
-                portfolio_id,
-                position_epoch,
-                asset_index,
-                b_loss_atom_budget,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: the owner's forfeit closes a leg outside the matcher.
+                handle_forfeit_recovery_leg(
+                    program_id,
+                    accounts,
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    b_loss_atom_budget,
+                )
+            }),
             Instruction::RebalanceReduce {
                 portfolio_id,
                 position_epoch,
                 asset_index,
                 reduce_q,
-            } => handle_rebalance_reduce(
-                program_id,
-                accounts,
-                portfolio_id,
-                position_epoch,
-                asset_index,
-                reduce_q,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: the owner's tag-44 exit reduces outside the matcher.
+                handle_rebalance_reduce(
+                    program_id,
+                    accounts,
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    reduce_q,
+                )
+            }),
             Instruction::FinalizeResetSide { asset_index, side } => {
                 handle_finalize_reset_side(program_id, accounts, asset_index, side)
             }
@@ -16594,7 +16728,18 @@ pub mod processor {
                 market_id,
             } => handle_set_depth_source(program_id, accounts, op, asset_index, market_id),
             Instruction::LevGuard { op, t0, key, report } => {
-                handle_lev_guard(program_id, accounts, op, t0, key, report)
+                if op == crate::lev_guard_v22::OP_LP_STOP {
+                    // port135: the LP stop force-reduces the listed opposing portfolios
+                    // (accounts 6..) against the bound vault LP (account 3), outside any matcher.
+                    let mut idxs = alloc::vec::Vec::with_capacity(accounts.len());
+                    idxs.push(3usize);
+                    idxs.extend(6..accounts.len());
+                    with_matcher_invalidations(program_id, accounts, &idxs, || {
+                        handle_lev_guard(program_id, accounts, op, t0, key, report)
+                    })
+                } else {
+                    handle_lev_guard(program_id, accounts, op, t0, key, report)
+                }
             }
             Instruction::ProposeG9FeedAllowlist { entries } => {
                 handle_propose_g9_feed_allowlist(program_id, accounts, &entries)
@@ -30635,6 +30780,59 @@ pub mod processor {
         }
     }
 
+    /// port135 (ADOPT upstream `0c5d4f4f`, adapted): run `f`; then, on success, invalidate the
+    /// matcher capability of each `accounts[idxs]` whose position vector `f` changed, when that
+    /// portfolio had an ENABLED capability on a matcher that is NOT position-synced
+    /// (`state::matcher_program_is_position_synced`). The epoch is NOT advanced (this fork's
+    /// trades and owner exits do not advance it, AUD-S1-23). Cost on the common path (no
+    /// enabled legacy matcher): one 104-byte config read per listed account, no snapshot.
+    /// Non-portfolio, foreign-owned or read-only entries are ignored (LP_STOP may list skipped
+    /// accounts); an index past the end is ignored.
+    #[inline(never)]
+    fn with_matcher_invalidations<'a, F: FnOnce() -> ProgramResult>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        idxs: &[usize],
+        f: F,
+    ) -> ProgramResult {
+        let mut watched: alloc::vec::Vec<(usize, PositionVector)> = alloc::vec::Vec::new();
+        for &i in idxs {
+            if let Some(ai) = accounts.get(i) {
+                if let Some(before) = unsynchronized_matcher_watch(program_id, ai) {
+                    watched.push((i, before));
+                }
+            }
+        }
+        f()?;
+        for (i, before) in watched {
+            let ai = &accounts[i];
+            if snapshot_position_vector(ai).as_ref() != Some(&before) {
+                let mut data = ai.try_borrow_mut_data()?;
+                state::invalidate_unsynchronized_matcher_capability(&mut data)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// port135: the pre-call position vector of a writable, program-owned portfolio whose matcher
+    /// capability is enabled on a NON-position-synced matcher; `None` otherwise (nothing to
+    /// invalidate).
+    #[inline(never)]
+    fn unsynchronized_matcher_watch(
+        program_id: &Pubkey,
+        ai: &AccountInfo<'_>,
+    ) -> Option<PositionVector> {
+        if ai.owner != program_id || !ai.is_writable {
+            return None;
+        }
+        let data = ai.try_borrow_data().ok()?;
+        let cfg = state::read_portfolio_matcher_config(&data).ok()?;
+        if cfg.enabled() != 1 || state::matcher_program_is_position_synced(&cfg.matcher_program) {
+            return None;
+        }
+        state::portfolio_position_vector(&data)
+    }
+
     /// Run `f`, then advance `position_epoch` on each of `accounts[idxs]` whose position vector
     /// it changed (AUD-S1-23). Snapshots are taken only when `f` will run; on an error nothing is
     /// bumped (the instruction fails).
@@ -43862,15 +44060,8 @@ pub mod processor {
     /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
-        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
-        {
-            *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
-        }
-        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
-        {
-            let _ = matcher_prog;
-            false
-        }
+        // port135: one predicate for the ext-v2 wire AND the stale-capability policy.
+        state::matcher_program_is_position_synced(&matcher_prog.to_bytes())
     }
 
     // FIX W2 (upstream #147 + #160): a CPI trade route (TradeCpi/BatchTradeCpi) previously
@@ -50476,15 +50667,74 @@ pub mod processor {
             state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 1);
 
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
             assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 2);
             let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
-            assert_eq!(matcher_after.enabled(), 1, "enabled bit must survive a position_epoch bump");
+            // port135 (upstream 0c5d4f4f): an out-of-matcher position mutation invalidates a
+            // (non-position-synced) matcher capability; upstream 0b838425 clears its expiry too.
+            assert_eq!(
+                matcher_after.enabled(),
+                0,
+                "an out-of-matcher position mutation invalidates matcher state"
+            );
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
             assert_eq!(
                 matcher_after.trade_fee_cap_bps(),
                 250,
                 "trade_fee_cap_bps must survive a position_epoch bump"
             );
             assert_eq!(matcher_after.position_epoch(), 2);
+
+            // A fill through the configured matcher keeps the capability (and its expiry).
+            let mut matcher = matcher_after;
+            matcher.set_enabled(1).unwrap();
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
+            assert_eq!(
+                state::bump_portfolio_position_epoch_after_matcher_fill(&mut data).unwrap(),
+                3
+            );
+            let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(
+                matcher_after.enabled(),
+                1,
+                "a fill through the configured matcher keeps its inventory synchronized"
+            );
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 77);
+            assert_eq!(matcher_after.trade_fee_cap_bps(), 250);
+            assert_eq!(matcher_after.position_epoch(), 3);
+
+            // port135 (fork): the no-epoch invalidation used by the trade family / owner exits.
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(matcher_after.enabled(), 0);
+            assert_eq!(matcher_after.position_epoch(), 3, "invalidation alone keeps the epoch");
+            assert_eq!(matcher_after.trade_fee_cap_bps(), 250);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
+            // Idempotent on a disabled capability: no byte changes.
+            let before = data.clone();
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            assert_eq!(data, before);
+        }
+
+        /// port135 (fork departure): a portfolio whose configured matcher is the position-synced
+        /// canonical program keeps its capability across an out-of-matcher bump/invalidation.
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+        #[test]
+        fn portfolio_position_synced_matcher_survives_out_of_matcher_mutation() {
+            let mut data = init_test_portfolio(1);
+            let mut matcher = state::read_portfolio_matcher_config(&data).unwrap();
+            matcher.matcher_program = crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes();
+            matcher.set_enabled(1).unwrap();
+            matcher.set_trade_fee_cap_bps(250).unwrap();
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
+            assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 1);
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            let after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(after.enabled(), 1);
+            assert_eq!(after.position_epoch(), 1);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 77);
         }
 
         #[test]

@@ -28672,3 +28672,858 @@ fn d26_init_market_and_init_portfolio_refuse_an_account_that_did_not_sign() {
     )
     .expect("a signed portfolio account initialises");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// Issue 406 / upstream 0c5d4f4f ("fix: invalidate stale matcher capabilities", upstream
+// percolator-prog PR #135), ported to v2.2 rc23 (port135, 2026-10-31).
+//
+// Obligation (upstream INV-012, adapted): a matcher capability is portfolio-local,
+// owner-controlled, and valid only while the configured matcher has observed every position
+// mutation. A mutation outside that matcher must invalidate the capability; a fill through the
+// configured matcher may retain it for the participating LP only.
+//
+// Fork adaptation (departure, see the PR body): a matcher program that the wrapper hands the
+// LP's REAL engine position on every call (`ext_version = 2`, the canonical devnet matcher,
+// matcher-inventory-sync 2026-10-03) has observed every mutation by construction, so its
+// capability is NOT invalidated. Every other matcher (the 24-byte legacy wire; in these tests
+// the official matcher deployed at a random, non-canonical program id) is.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+fn issue406_matcher_inventory(data: &[u8]) -> i128 {
+    // 64-byte return slot + MatcherCtx.inventory_base at +96.
+    i128::from_le_bytes(data[160..176].try_into().unwrap())
+}
+
+fn issue406_crank_observations(asset_index: u16) -> Vec<CrankObservationHint> {
+    vec![CrankObservationHint {
+        asset_index,
+        oracle_accounts: 0,
+    }]
+}
+
+impl V16CuEnv {
+    fn issue406_matcher_config(&self, portfolio: Pubkey) -> state::PortfolioMatcherConfigV16 {
+        state::read_portfolio_matcher_config(&self.svm.get_account(&portfolio).unwrap().data)
+            .unwrap()
+    }
+
+    fn issue406_market_id(&self, asset_index: u16) -> u64 {
+        state::read_market_trade_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+        )
+        .unwrap()
+        .3
+    }
+
+    fn issue406_official_matcher(&mut self) -> Pubkey {
+        let matcher_program = Pubkey::new_unique();
+        let bytes = std::fs::read(matcher_program_path()).expect("read official matcher SBF");
+        self.svm.add_program(matcher_program, &bytes);
+        matcher_program
+    }
+
+    /// SetMatcherConfig (tag 68) by the LP owner, at the LIVE sequence / frontier.
+    #[allow(clippy::too_many_arguments)]
+    fn issue406_set_matcher_config(
+        &mut self,
+        matcher_program: Pubkey,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        ctx: Pubkey,
+        delegate: Pubkey,
+        enabled: u8,
+        trade_fee_cap_bps: u16,
+    ) -> Result<u64, String> {
+        let (portfolio_id, expected_sequence, _) = self.portfolio_identity(portfolio);
+        let asset_generation_frontier = state::read_market_asset_generation_frontier(
+            &self.svm.get_account(&self.market).unwrap().data,
+        )
+        .unwrap();
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::SetMatcherConfig {
+                portfolio_id,
+                expected_sequence,
+                asset_generation_frontier,
+                enabled,
+                trade_fee_cap_bps,
+                expiry_slot: u64::MAX,
+            },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            &[owner],
+        )
+    }
+
+    /// Repeats a crank until the engine reports no further progress (upstream `crank_steps`).
+    fn issue406_crank_steps(&mut self, portfolio: Pubkey, now_slot: u64, attempts: usize) {
+        let mut progressed = false;
+        for _ in 0..attempts {
+            self.svm.expire_blockhash();
+            match self.send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot,
+                    observations: issue406_crank_observations(0),
+                },
+                vec![
+                    AccountMeta::new(self.payer.pubkey(), true),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(portfolio, false),
+                ],
+                &[],
+            ) {
+                Ok(_) => progressed = true,
+                Err(err) if progressed && err.contains("Custom(22)") => break,
+                Err(err) => panic!("crank: {err}"),
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue406_batch_trade_no_cpi(
+        &mut self,
+        owner_a: &Keypair,
+        account_a: Pubkey,
+        owner_b: &Keypair,
+        account_b: Pubkey,
+        asset_index: u16,
+        size_q: i128,
+        exec_price: u64,
+    ) -> Result<u64, String> {
+        let (a_id, _, a_pe) = self.portfolio_identity(account_a);
+        let (b_id, _, b_pe) = self.portfolio_identity(account_b);
+        let market_id = self.issue406_market_id(asset_index);
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::BatchTradeNoCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_pe,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_pe,
+                legs: vec![percolator_prog::ix::BatchTradeLeg {
+                    asset_index,
+                    market_id,
+                    size_q,
+                    exec_price,
+                    fee_bps: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(owner_a.pubkey(), true),
+                AccountMeta::new(owner_b.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(account_a, false),
+                AccountMeta::new(account_b, false),
+            ],
+            &[owner_a, owner_b],
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn issue406_batch_trade_cpi(
+        &mut self,
+        taker_owner: &Keypair,
+        taker: Pubkey,
+        lp: Pubkey,
+        matcher_program: Pubkey,
+        ctx: Pubkey,
+        delegate: Pubkey,
+        asset_index: u16,
+        size_q: i128,
+    ) -> Result<u64, String> {
+        let (a_id, _, a_pe) = self.portfolio_identity(taker);
+        let (b_id, b_seq, b_pe) = self.portfolio_identity(lp);
+        let market_id = self.issue406_market_id(asset_index);
+        self.svm.expire_blockhash();
+        self.send(
+            ProgInstruction::BatchTradeCpi {
+                account_a_portfolio_id: a_id,
+                account_a_position_epoch: a_pe,
+                account_b_portfolio_id: b_id,
+                account_b_position_epoch: b_pe,
+                account_b_matcher_sequence: b_seq,
+                max_slippage_atoms: u128::MAX,
+                max_fee_atoms: u128::MAX,
+                legs: vec![percolator_prog::ix::BatchTradeCpiLeg {
+                    asset_index,
+                    market_id,
+                    size_q,
+                    fee_bps: 0,
+                    limit_price: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(taker_owner.pubkey(), true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(taker, false),
+                AccountMeta::new(lp, false),
+                AccountMeta::new_readonly(matcher_program, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            &[taker_owner],
+        )
+    }
+}
+
+fn issue406_signed_trade_invalidates_both_matchers(batch: bool) {
+    let mut env = V16CuEnv::new();
+    let matcher_program = env.issue406_official_matcher();
+    let owner_a = Keypair::new();
+    let owner_b = Keypair::new();
+    let account_a = env.create_portfolio(&owner_a);
+    let account_b = env.create_portfolio(&owner_b);
+    env.deposit(&owner_a, account_a, 1_000_000);
+    env.deposit(&owner_b, account_b, 1_000_000);
+    env.init_matcher_context(&owner_a, matcher_program, account_a);
+    env.init_matcher_context(&owner_b, matcher_program, account_b);
+    assert_eq!(env.issue406_matcher_config(account_a).enabled(), 1);
+    assert_eq!(env.issue406_matcher_config(account_b).enabled(), 1);
+    let epochs_before = (
+        env.issue406_matcher_config(account_a).position_epoch(),
+        env.issue406_matcher_config(account_b).position_epoch(),
+    );
+
+    if batch {
+        env.issue406_batch_trade_no_cpi(
+            &owner_a,
+            account_a,
+            &owner_b,
+            account_b,
+            0,
+            POS_SCALE as i128,
+            100,
+        )
+        .expect("signed batch trade");
+    } else {
+        env.trade_asset_with_cu(
+            0,
+            &owner_a,
+            account_a,
+            &owner_b,
+            account_b,
+            POS_SCALE as i128,
+            100,
+            0,
+        );
+    }
+
+    for (account, epoch_before) in [(account_a, epochs_before.0), (account_b, epochs_before.1)] {
+        let config = env.issue406_matcher_config(account);
+        assert_eq!(
+            config.enabled(),
+            0,
+            "batch={batch}: a signed trade outside either configured matcher invalidates that matcher"
+        );
+        // Fork: trades do not advance position_epoch here (AUD-S1-23); upstream bumps it.
+        assert_eq!(config.position_epoch(), epoch_before);
+        assert_eq!(config.trade_fee_cap_bps(), 10_000);
+        assert_eq!(
+            state::read_portfolio_matcher_expiry(&env.svm.get_account(&account).unwrap().data)
+                .unwrap(),
+            0,
+            "upstream 0b838425: the invalidated grant's expiry is cleared too"
+        );
+    }
+}
+
+/// Upstream INV-012 issue-406 matrix: TradeNoCpi and BatchTradeNoCpi (both owners sign) move
+/// both positions outside either configured matcher, so both capabilities are invalidated.
+#[test]
+fn v16_program_issue406_signed_trade_routes_invalidate_both_matcher_capabilities() {
+    issue406_signed_trade_invalidates_both_matchers(false);
+    issue406_signed_trade_invalidates_both_matchers(true);
+}
+
+fn issue406_matcher_trade_preserves_only_participating_lp(batch: bool) {
+    let mut env = V16CuEnv::new();
+    let matcher_program = env.issue406_official_matcher();
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, 1_000_000);
+    env.deposit(&lp_owner, lp, 1_000_000);
+    env.init_matcher_context(&taker_owner, matcher_program, taker);
+    let (ctx, delegate, _) = env.init_matcher_context(&lp_owner, matcher_program, lp);
+
+    let execute = |env: &mut V16CuEnv, size_q: i128| {
+        if batch {
+            env.issue406_batch_trade_cpi(
+                &taker_owner,
+                taker,
+                lp,
+                matcher_program,
+                ctx,
+                delegate,
+                0,
+                size_q,
+            )
+            .expect("batch matcher fill");
+        } else {
+            env.trade_cpi_with_cu_on_asset(
+                &taker_owner,
+                taker,
+                &lp_owner,
+                lp,
+                matcher_program,
+                ctx,
+                delegate,
+                0,
+                size_q,
+                0,
+            );
+        }
+    };
+
+    execute(&mut env, POS_SCALE as i128);
+    assert_eq!(
+        env.issue406_matcher_config(taker).enabled(),
+        0,
+        "batch={batch}: the taker's unrelated matcher did not participate and must be invalidated"
+    );
+    assert_eq!(
+        env.issue406_matcher_config(lp).enabled(),
+        1,
+        "batch={batch}: the LP matcher remains synchronized after its own fill"
+    );
+    execute(&mut env, -(POS_SCALE as i128));
+    assert_eq!(env.issue406_matcher_config(lp).enabled(), 1);
+    assert!(!has_active_leg_for_asset(&env.portfolio_state(lp), 0));
+}
+
+/// Upstream INV-012 issue-406 matrix: a TradeCpi / BatchTradeCpi fill keeps the participating
+/// LP's capability (its matcher observed the fill) and invalidates the taker's own, unrelated
+/// matcher capability.
+#[test]
+fn v16_program_issue406_matcher_trade_routes_preserve_only_participating_lp_capability() {
+    issue406_matcher_trade_preserves_only_participating_lp(false);
+    issue406_matcher_trade_preserves_only_participating_lp(true);
+}
+
+/// Upstream INV-012 issue-406 matrix: a permissionless force-close moves the LP outside its
+/// matcher; the stale capability must not revive when the asset slot is retired and reused.
+#[test]
+fn v16_program_issue406_force_close_and_reuse_require_fresh_lp_matcher_capability() {
+    const ASSET: u16 = 1;
+    const POSITION_Q: u128 = POS_SCALE;
+    const SHUTDOWN_SLOT: u64 = 3;
+    const FORCE_CLOSE_SLOT: u64 = 8;
+    const REUSE_SLOT: u64 = 9;
+
+    let mut env = V16CuEnv::new();
+    let old_creator = Keypair::new();
+    let new_insurance = Keypair::new();
+    let new_operator = Keypair::new();
+    let new_backing = Keypair::new();
+    let new_oracle = Keypair::new();
+    let cranker = Keypair::new();
+    env.configure_permissionless_resolve_with_cu(9000, FORCE_CLOSE_SLOT - SHUTDOWN_SLOT);
+    env.update_market_init_fee_policy_with_cu(1);
+    env.svm.warp_to_slot(1);
+    env.activate_permissionless_asset_with_fee(
+        &old_creator,
+        ASSET,
+        1,
+        100,
+        old_creator.pubkey(),
+        old_creator.pubkey(),
+        old_creator.pubkey(),
+        old_creator.pubkey(),
+        1,
+    );
+    env.configure_auth_mark_for_asset_with_authority(ASSET, &old_creator, 1, 100);
+
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, 10_000);
+    env.deposit(&lp_owner, lp, 10_000);
+    let matcher_program = env.issue406_official_matcher();
+    let mut init = encode_matcher_init_passive(POSITION_Q);
+    init[50..66].copy_from_slice(&POSITION_Q.to_le_bytes());
+    let (ctx, delegate, _) =
+        env.init_matcher_context_with_data(&lp_owner, matcher_program, lp, init);
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        matcher_program,
+        ctx,
+        delegate,
+        ASSET,
+        POSITION_Q as i128,
+        0,
+    );
+    assert_eq!(env.issue406_matcher_config(lp).enabled(), 1);
+    let matcher_after_fill = env.svm.get_account(&ctx).unwrap();
+
+    env.svm.warp_to_slot(SHUTDOWN_SLOT);
+    env.update_asset_lifecycle_as_admin_with_cu(
+        processor::ASSET_ACTION_SHUTDOWN,
+        ASSET,
+        SHUTDOWN_SLOT,
+        0,
+    );
+    env.svm.warp_to_slot(FORCE_CLOSE_SLOT);
+    env.force_close_abandoned_asset_with_cu(
+        &cranker,
+        taker,
+        lp,
+        ASSET,
+        FORCE_CLOSE_SLOT,
+        POSITION_Q,
+    );
+    assert!(!has_active_leg_for_asset(
+        &env.portfolio_state(taker),
+        ASSET as usize
+    ));
+    assert!(!has_active_leg_for_asset(
+        &env.portfolio_state(lp),
+        ASSET as usize
+    ));
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), matcher_after_fill);
+    assert_eq!(
+        env.issue406_matcher_config(lp).enabled(),
+        0,
+        "force-close must invalidate matcher inventory that it cannot update"
+    );
+    assert_eq!(
+        state::read_portfolio_matcher_expiry(&env.svm.get_account(&lp).unwrap().data).unwrap(),
+        0,
+        "upstream 0b838425: the invalidated grant's expiry is cleared too"
+    );
+
+    env.update_asset_lifecycle_as_admin_with_cu(
+        processor::ASSET_ACTION_RETIRE,
+        ASSET,
+        FORCE_CLOSE_SLOT,
+        0,
+    );
+    env.svm.warp_to_slot(REUSE_SLOT);
+    env.activate_asset_with_authorities(
+        ASSET,
+        REUSE_SLOT,
+        250,
+        new_insurance.pubkey(),
+        new_operator.pubkey(),
+        new_backing.pubkey(),
+        new_oracle.pubkey(),
+    );
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&taker).unwrap();
+    let lp_before = env.svm.get_account(&lp).unwrap();
+    let ctx_before = env.svm.get_account(&ctx).unwrap();
+    env.svm.expire_blockhash();
+    let stale_reuse_fill = env.try_trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        matcher_program,
+        ctx,
+        delegate,
+        ASSET,
+        -(POSITION_Q as i128),
+        0,
+    );
+    let err = stale_reuse_fill
+        .expect_err("asset reuse must not revive a force-close-desynchronized matcher capability");
+    assert!(err.contains("Custom(8)"), "expected Unauthorized, got {err}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&taker).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&lp).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&ctx).unwrap(), ctx_before);
+
+    env.issue406_set_matcher_config(matcher_program, &lp_owner, lp, ctx, delegate, 1, 10_000)
+        .expect("owner re-authorizes");
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        matcher_program,
+        ctx,
+        delegate,
+        ASSET,
+        -(POSITION_Q as i128),
+        0,
+    );
+    assert_eq!(
+        active_leg_for_asset(&env.portfolio_state(lp), ASSET as usize).basis_pos_q,
+        POSITION_Q as i128,
+        "a fresh LP signature restores the replacement-asset matcher route"
+    );
+}
+
+/// Fork addition (no upstream counterpart: upstream's RebalanceReduce bumps the position epoch
+/// through `with_one_portfolio_view`, ours does not): the LP owner's own tag-44 exit moves the
+/// position outside the matcher, so the capability is invalidated.
+#[test]
+fn v16_program_issue406_rebalance_reduce_invalidates_lp_matcher_capability() {
+    let mut env = V16CuEnv::new();
+    let matcher_program = env.issue406_official_matcher();
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, 1_000_000);
+    env.deposit(&lp_owner, lp, 1_000_000);
+    let (ctx, delegate, _) = env.init_matcher_context(&lp_owner, matcher_program, lp);
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        matcher_program,
+        ctx,
+        delegate,
+        0,
+        (2 * POS_SCALE) as i128,
+        0,
+    );
+    assert_eq!(env.issue406_matcher_config(lp).enabled(), 1);
+    env.rebalance_reduce_with_cu(&lp_owner, lp, 0, POS_SCALE);
+    assert_eq!(
+        active_leg_for_asset(&env.portfolio_state(lp), 0).basis_pos_q,
+        -(POS_SCALE as i128)
+    );
+    assert_eq!(
+        issue406_matcher_inventory(&env.svm.get_account(&ctx).unwrap().data),
+        -((2 * POS_SCALE) as i128),
+        "the owner's tag-44 exit cannot reach the matcher counter"
+    );
+    let config = env.issue406_matcher_config(lp);
+    assert_eq!(config.enabled(), 0, "an owner exit outside the matcher invalidates it");
+    assert_eq!(config.trade_fee_cap_bps(), 10_000);
+    assert_eq!(
+        state::read_portfolio_matcher_expiry(&env.svm.get_account(&lp).unwrap().data).unwrap(),
+        0,
+        "upstream 0b838425: the invalidated grant's expiry is cleared too"
+    );
+    env.svm.expire_blockhash();
+    let err = env
+        .try_trade_cpi_with_cu_on_asset(
+            &taker_owner,
+            taker,
+            &lp_owner,
+            lp,
+            matcher_program,
+            ctx,
+            delegate,
+            0,
+            -(POS_SCALE as i128),
+            0,
+        )
+        .expect_err("the stale capability is refused");
+    assert!(err.contains("Custom(8)"), "expected Unauthorized, got {err}");
+}
+
+struct Issue406Liquidated {
+    taker_owner: Keypair,
+    lp_owner: Keypair,
+    attack_taker: Pubkey,
+    lp: Pubkey,
+    ctx: Pubkey,
+    delegate: Pubkey,
+}
+
+const ISSUE406_MAX_INV_Q: u128 = 2 * POS_SCALE;
+const ISSUE406_CROSS_REQUEST_Q: u128 = 2 * ISSUE406_MAX_INV_Q;
+
+/// Shared setup (upstream issue-406 liquidation case, adapted to this engine): the LP sells its
+/// whole configured matcher cap through `matcher_program`, a public crank partially liquidates
+/// it (outside the matcher), and -- because this engine closes a liquidation by ADL-scaling the
+/// opposite side and then refuses every risk-increasing trade while `A != ADL_ONE` (P2b E7),
+/// which upstream's engine does not -- the long side is drained by the taker's own tag-44 exit
+/// and both sides are reset, so trading is open again. End state: the LP is flat, its matcher
+/// still holds the pre-liquidation counter -MAX_INV, the market is back to normal trading.
+fn issue406_liquidated_lp(env: &mut V16CuEnv, matcher_program: Pubkey) -> Issue406Liquidated {
+    const PRICE: u64 = 1_000_000;
+    env.update_liquidation_fee_policy_with_cu(0);
+    env.configure_auth_mark_with_cu(0, PRICE);
+
+    let taker_owner = Keypair::new();
+    let lp_owner = Keypair::new();
+    let taker = env.create_portfolio(&taker_owner);
+    let attack_taker = env.create_portfolio(&taker_owner);
+    let lp = env.create_portfolio(&lp_owner);
+    env.deposit(&taker_owner, taker, 100_000_000);
+    env.deposit(&taker_owner, attack_taker, 100_000_000);
+    env.deposit(&lp_owner, lp, 200_000);
+
+    let mut init = encode_matcher_init_passive(ISSUE406_CROSS_REQUEST_Q);
+    init[50..66].copy_from_slice(&ISSUE406_MAX_INV_Q.to_le_bytes());
+    let (ctx, delegate, _) =
+        env.init_matcher_context_with_data(&lp_owner, matcher_program, lp, init);
+
+    env.trade_cpi_with_cu_on_asset(
+        &taker_owner,
+        taker,
+        &lp_owner,
+        lp,
+        matcher_program,
+        ctx,
+        delegate,
+        0,
+        ISSUE406_MAX_INV_Q as i128,
+        0,
+    );
+    assert_eq!(
+        issue406_matcher_inventory(&env.svm.get_account(&ctx).unwrap().data),
+        -(ISSUE406_MAX_INV_Q as i128)
+    );
+    assert_eq!(
+        active_leg_for_asset(&env.portfolio_state(lp), 0).basis_pos_q,
+        -(ISSUE406_MAX_INV_Q as i128)
+    );
+    assert_eq!(
+        env.issue406_matcher_config(lp).enabled(),
+        1,
+        "a fill through the LP's own matcher keeps its capability"
+    );
+
+    let before_liquidation_q = active_leg_for_asset(&env.portfolio_state(lp), 0)
+        .basis_pos_q
+        .unsigned_abs();
+    for slot in 1..=30u64 {
+        env.svm.warp_to_slot(slot);
+        env.push_auth_mark_with_cu(slot, 1_060_000);
+        env.svm.expire_blockhash();
+        let _ = env.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: issue406_crank_observations(0),
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(lp, false),
+            ],
+            &[],
+        );
+    }
+    let after_liquidation_q = active_leg_for_asset(&env.portfolio_state(lp), 0)
+        .basis_pos_q
+        .unsigned_abs();
+    assert!(
+        after_liquidation_q < before_liquidation_q && after_liquidation_q != 0,
+        "setup requires a public partial liquidation: before={before_liquidation_q}, after={after_liquidation_q}"
+    );
+    assert_eq!(
+        issue406_matcher_inventory(&env.svm.get_account(&ctx).unwrap().data),
+        -(ISSUE406_MAX_INV_Q as i128),
+        "permissionless liquidation cannot reconcile the external matcher inventory"
+    );
+
+    // Drain the ADL-scaled long side (the taker's own exit) and reset both sides.
+    env.issue406_crank_steps(taker, 30, 4);
+    let taker_raw = active_leg_for_asset(&env.portfolio_state(taker), 0)
+        .basis_pos_q
+        .unsigned_abs();
+    env.svm.expire_blockhash();
+    env.rebalance_reduce_with_cu(&taker_owner, taker, 0, taker_raw);
+    for side in 0..2u8 {
+        env.svm.expire_blockhash();
+        let _ = env.send(
+            ProgInstruction::FinalizeResetSide {
+                asset_index: 0,
+                side,
+            },
+            vec![AccountMeta::new(env.market, false)],
+            &[],
+        );
+    }
+    env.deposit(&lp_owner, lp, 5_000_000);
+    env.issue406_crank_steps(lp, 30, 4);
+    for side in 0..2u8 {
+        env.svm.expire_blockhash();
+        let _ = env.send(
+            ProgInstruction::FinalizeResetSide {
+                asset_index: 0,
+                side,
+            },
+            vec![AccountMeta::new(env.market, false)],
+            &[],
+        );
+    }
+    let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+    let asset = &group.assets[0];
+    assert_eq!(
+        (asset.a_long, asset.a_short, asset.mode_long, asset.mode_short),
+        (ADL_ONE, ADL_ONE, SideModeV16::Normal, SideModeV16::Normal),
+        "setup: both sides reset, normal trading"
+    );
+    assert!(
+        !has_active_leg_for_asset(&env.portfolio_state(lp), 0),
+        "setup: the LP is flat after the drain"
+    );
+    assert_eq!(
+        issue406_matcher_inventory(&env.svm.get_account(&ctx).unwrap().data),
+        -(ISSUE406_MAX_INV_Q as i128),
+        "setup: the external counter still holds the pre-liquidation inventory"
+    );
+    Issue406Liquidated {
+        taker_owner,
+        lp_owner,
+        attack_taker,
+        lp,
+        ctx,
+        delegate,
+    }
+}
+
+/// THE BUG (reproduction on rc23 tip 64a18e99, upstream issue 406): a public partial
+/// liquidation moves the LP outside its (non-canonical, legacy-wire) matcher, whose
+/// `inventory_base` keeps the pre-liquidation value. An UNSIGNED taker then routes a fill through
+/// the still-enabled stale capability; the matcher prices and caps against the stale counter and
+/// the LP lands at TWICE the inventory cap it configured. Fixed: the liquidation invalidates the
+/// capability, the stale fill is refused (Unauthorized) with exact rollback, and a fresh owner
+/// signature restores the same fill (non-vacuity control, as upstream).
+#[test]
+fn v16_program_issue406_liquidation_invalidates_stale_lp_matcher_capability() {
+    let mut env = V16CuEnv::new_with_init_params(production_risk_params());
+    let matcher_program = env.issue406_official_matcher();
+    let s = issue406_liquidated_lp(&mut env, matcher_program);
+
+    let market_before = env.svm.get_account(&env.market).unwrap();
+    let taker_before = env.svm.get_account(&s.attack_taker).unwrap();
+    let lp_before = env.svm.get_account(&s.lp).unwrap();
+    let ctx_before = env.svm.get_account(&s.ctx).unwrap();
+    env.svm.expire_blockhash();
+    let stale_fill = env.try_trade_cpi_with_cu_on_asset(
+        &s.taker_owner,
+        s.attack_taker,
+        &s.lp_owner,
+        s.lp,
+        matcher_program,
+        s.ctx,
+        s.delegate,
+        0,
+        -(ISSUE406_CROSS_REQUEST_Q as i128),
+        0,
+    );
+    if stale_fill.is_ok() {
+        let lp_now = active_leg_for_asset(&env.portfolio_state(s.lp), 0).basis_pos_q;
+        panic!(
+            "BUG (issue 406): an unsigned taker used the stale matcher capability; the LP's \
+             engine position is now {lp_now} against a configured matcher cap of \
+             {ISSUE406_MAX_INV_Q} (matcher counter {})",
+            issue406_matcher_inventory(&env.svm.get_account(&s.ctx).unwrap().data)
+        );
+    }
+    let err = stale_fill.unwrap_err();
+    assert!(
+        err.contains("Custom(8)"),
+        "the stale capability is refused as Unauthorized (Custom(8)), got {err}"
+    );
+    assert_eq!(env.svm.get_account(&env.market).unwrap(), market_before);
+    assert_eq!(env.svm.get_account(&s.attack_taker).unwrap(), taker_before);
+    assert_eq!(env.svm.get_account(&s.lp).unwrap(), lp_before);
+    assert_eq!(env.svm.get_account(&s.ctx).unwrap(), ctx_before);
+    let config = env.issue406_matcher_config(s.lp);
+    assert_eq!(
+        config.enabled(),
+        0,
+        "an out-of-matcher liquidation must invalidate the stale LP capability"
+    );
+    assert_eq!(config.trade_fee_cap_bps(), 10_000, "invalidation preserves the signed fee cap");
+    assert_eq!(
+        state::read_portfolio_matcher_expiry(&env.svm.get_account(&s.lp).unwrap().data).unwrap(),
+        0,
+        "upstream 0b838425: the invalidated grant's expiry is cleared too"
+    );
+
+    // Non-vacuity control: a fresh LP signature can deliberately authorize this exact context.
+    // The same fill then passes every market/health/matcher gate and demonstrates the stale
+    // context would otherwise place the engine position above its configured inventory cap.
+    env.issue406_set_matcher_config(
+        matcher_program,
+        &s.lp_owner,
+        s.lp,
+        s.ctx,
+        s.delegate,
+        1,
+        10_000,
+    )
+    .expect("owner re-authorizes");
+    env.trade_cpi_with_cu_on_asset(
+        &s.taker_owner,
+        s.attack_taker,
+        &s.lp_owner,
+        s.lp,
+        matcher_program,
+        s.ctx,
+        s.delegate,
+        0,
+        -(ISSUE406_CROSS_REQUEST_Q as i128),
+        0,
+    );
+    assert_eq!(
+        issue406_matcher_inventory(&env.svm.get_account(&s.ctx).unwrap().data),
+        ISSUE406_MAX_INV_Q as i128,
+        "the matcher itself believes it is within its configured cap"
+    );
+    assert!(
+        active_leg_for_asset(&env.portfolio_state(s.lp), 0).basis_pos_q
+            > ISSUE406_MAX_INV_Q as i128,
+        "control proves stale inventory would exceed the real LP cap without invalidation"
+    );
+}
+
+/// Fork departure guard (devnet build only): the CANONICAL matcher receives the LP's real engine
+/// position on every call (ext v2, matcher-inventory-sync), so a liquidation does NOT invalidate
+/// its capability -- and the same over-cap request that breaks a legacy matcher above is capped
+/// against the LP's real position. This is the evidence that keeping the canonical capability
+/// alive is safe; the vault LP (always this matcher unless the upgrade authority approves
+/// another) is never halted by a sweep, eviction, LP stop or liquidation that its owner (the
+/// registry PDA) cannot re-sign.
+#[cfg(feature = "devnet")]
+#[test]
+fn v16_program_issue406_canonical_synced_matcher_survives_liquidation_within_real_cap() {
+    let mut env = V16CuEnv::new_with_init_params(production_risk_params());
+    let matcher_program = percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM;
+    let bytes = std::fs::read(matcher_program_path()).expect("read official matcher SBF");
+    env.svm.add_program(matcher_program, &bytes);
+    let s = issue406_liquidated_lp(&mut env, matcher_program);
+    assert_eq!(
+        env.issue406_matcher_config(s.lp).enabled(),
+        1,
+        "a position-synced (ext v2) matcher keeps its capability across a liquidation"
+    );
+    env.svm.expire_blockhash();
+    let fill = env.try_trade_cpi_with_cu_on_asset(
+        &s.taker_owner,
+        s.attack_taker,
+        &s.lp_owner,
+        s.lp,
+        matcher_program,
+        s.ctx,
+        s.delegate,
+        0,
+        -(ISSUE406_CROSS_REQUEST_Q as i128),
+        0,
+    );
+    let lp_after = env
+        .portfolio_state(s.lp)
+        .legs
+        .iter()
+        .find(|l| l.active && l.asset_index == 0)
+        .map_or(0, |l| l.basis_pos_q);
+    assert!(
+        lp_after <= ISSUE406_MAX_INV_Q as i128,
+        "the canonical matcher caps against the REAL position: LP at {lp_after}, cap \
+         {ISSUE406_MAX_INV_Q} (fill result {fill:?})"
+    );
+    assert!(fill.is_ok() && lp_after > 0, "non-vacuity: the capped fill still lands ({fill:?})");
+}
