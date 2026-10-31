@@ -23840,7 +23840,9 @@ pub mod processor {
                     // Permissionless payout: the destination is FIXED, the payee's canonical ATA
                     // for the vault mint, and must be unencumbered (no delegate / close
                     // authority: the W5 rule every permissionless payout here applies).
-                    let balance = verify_withdrawable_token_accounts(
+                    // The mint comes back from the one canonical parse (dest.mint ==
+                    // vault.mint); no second unpack of the destination.
+                    let (balance, dest_mint) = verify_withdrawable_token_accounts_with_mint(
                         dest_token,
                         &payee,
                         vault_token,
@@ -23848,7 +23850,6 @@ pub mod processor {
                         &cfg,
                         true,
                     )?;
-                    let dest_mint = unpack_token_account(dest_token)?.mint;
                     if *dest_token.key != canonical_vault_address(&payee, &dest_mint) {
                         return Err(PercolatorError::CreatorFeePayeeInvalid.into());
                     }
@@ -49724,6 +49725,29 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
     ) -> Result<u64, ProgramError> {
+        verify_withdrawable_token_accounts_with_mint(
+            dest_token_ai,
+            expected_dest_owner,
+            vault_token_ai,
+            expected_vault_owner,
+            cfg,
+            require_unencumbered_dest,
+        )
+        .map(|(vault_balance, _mint)| vault_balance)
+    }
+
+    // prog#587: same canonical parse, also threading back the validated mint (dest.mint ==
+    // vault.mint, a withdrawable collateral mint) so a caller that must pin the destination
+    // ADDRESS (the creator-fee payee's canonical ATA, tag 90 payee route) reuses the fact
+    // instead of unpacking the destination a second time (W4-TOKEN22 single-gateway rule).
+    fn verify_withdrawable_token_accounts_with_mint(
+        dest_token_ai: &AccountInfo,
+        expected_dest_owner: &Pubkey,
+        vault_token_ai: &AccountInfo,
+        expected_vault_owner: &Pubkey,
+        cfg: &WrapperConfigV16,
+        require_unencumbered_dest: bool,
+    ) -> Result<(u64, Pubkey), ProgramError> {
         // Hardening (security review of d1fb6023): a payout never lands back in the vault.
         if dest_token_ai.key == vault_token_ai.key {
             return Err(PercolatorError::InvalidTokenAccount.into());
@@ -49761,7 +49785,7 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
-        Ok(vault.amount)
+        Ok((vault.amount, vault.mint))
     }
 
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): returns the balance instead of `()`.
