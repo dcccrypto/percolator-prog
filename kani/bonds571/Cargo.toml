@@ -1,0 +1,19 @@
+[package]
+name = "bonds571-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: proves the EXACT production files ../../src/bond_v20.rs and ../../src/vault_lp_v18.rs
+# (pure, no deps). GH#571 carried-coupon arithmetic. Run locally, never in CI.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+# Negative controls: run_mutants.sh writes mutants/bond_v20_mutant.rs.
+bond_mutant = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

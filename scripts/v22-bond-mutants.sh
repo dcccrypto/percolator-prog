@@ -5,6 +5,8 @@
 #
 #   scripts/v22-bond-mutants.sh pure   # MP1..MP7 against tests/v22_bonds_pure.rs (native)
 #   scripts/v22-bond-mutants.sh bpf    # MB1..MB4: build a mutant BPF, run one LiteSVM test on it
+#   scripts/v22-bond-mutants.sh pure571  # GH#571 M571a..g against tests/v22_bond_carry_571_pure.rs
+#   scripts/v22-bond-mutants.sh bpf571   # GH#571 MB571a..g: mutant BPF vs the gh571_* LiteSVM tests
 #
 # Exit 0 iff EVERY mutant was killed. Logs: $MUT_LOG_DIR (default ../logs/mutants).
 set -uo pipefail
@@ -44,6 +46,12 @@ expect_killed() { # name log-file rc
 run_pure() { # name file old new
   save "$2"; mutate "$2" "$3" "$4" || { restore "$2"; echo "ANCHOR $1"; FAILS=$((FAILS + 1)); return; }
   cargo test --features devnet --test v22_bonds_pure > "$LOGS/$1.log" 2>&1; rc=$?
+  restore "$2"; expect_killed "$1" "$LOGS/$1.log" $rc
+}
+
+run_pure571() { # name file old new
+  save "$2"; mutate "$2" "$3" "$4" || { restore "$2"; echo "ANCHOR $1"; FAILS=$((FAILS + 1)); return; }
+  cargo test --features devnet --test v22_bond_carry_571_pure > "$LOGS/$1.log" 2>&1; rc=$?
   restore "$2"; expect_killed "$1" "$LOGS/$1.log" $rc
 }
 
@@ -156,7 +164,7 @@ bond_junior_cannot_withdraw_bond_value_and_tranche_is_required
     let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)' \
 '    let _ = due;
-    (0, available)' bond_coupon_first_conserves_and_is_noncumulative
+    (0, available)' bond_coupon_first_conserves_and_carries_arrears_gh571
   # ── security review fixes (2026-10-05) ──
   run_bpf MB5_107_after_earn_M2 $W \
 '        if registry.total_lp_shares_outstanding != 0 || st.senior_claim_atoms != 0 {' \
@@ -164,7 +172,7 @@ bond_junior_cannot_withdraw_bond_value_and_tranche_is_required
 bond_tranche_refused_after_the_first_earn_deposit
   run_bpf MB6_coupon_cap_removed_M2 $B \
 '    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);' \
-'    let cap = available;' bond_coupon_first_conserves_and_is_noncumulative
+'    let cap = available;' bond_coupon_first_conserves_and_carries_arrears_gh571
   # MB7: the coupon gate blind to tranche impairment (the base stays min(C_b, value); MP11 covers
   # the base on its own).
   run_bpf MB7_coupon_on_full_claim_while_impaired_M1 $B \
@@ -188,6 +196,86 @@ sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed
   run_bpf MB10_coupon_ignores_lag_worse $W \
 '            if worse < certified { worse } else { certified }' \
 '            let _ = worse; certified' bond_coupon_gate_uses_the_lag_worse_value_like_108_110
+  ;;
+pure571)
+  # GH#571: the carry, the cap, the base and the redemption slice.
+  run_pure571 M571a_settle_noncumulative $B \
+'    let a = arrears.checked_add(accrued)?;' \
+'    let a = accrued; let _ = arrears;'
+  run_pure571 M571b_accrual_base_principal_only $B \
+'    let accrued = coupon_due(coupon_base(k, bond_value), rate_bps, dslots)?;' \
+'    let accrued = coupon_due(coupon_base(bond_principal, bond_value), rate_bps, dslots)?; let _ = k;'
+  run_pure571 M571c_redemption_ignores_arrears $B \
+'    let a_slice = total_slice.checked_sub(c_slice)?;' \
+'    let a_slice = 0u128; let _ = total_slice;'
+  run_pure571 M571d_arrears_uncapped $B \
+'    let ceiling = if cap > arrears { cap } else { arrears };' \
+'    let ceiling = u128::MAX; let _ = cap;'
+  run_pure571 M571e_pay_forfeits_rest $B \
+'    (coupon, rest, arrears - coupon)' \
+'    (coupon, rest, 0 * arrears)'
+  run_pure571 M571f_checkpoint_never_holds $B \
+'    !open || arrears_after != arrears_before || arrears_before >= cap' \
+'    let _ = (open, arrears_after, arrears_before, cap); true'
+  run_pure571 M571g_settle_rounds_up $B \
+'    let a = arrears.checked_add(accrued)?;' \
+'    let a = arrears.checked_add(accrued + 1)?;'
+  ;;
+bpf571)
+  # MB571a: 108 prices new shares at C_b (ignores the carried arrears): the newcomer takes a
+  # share of the incumbents' accrual; the program diverges from the reference model.
+  run_bpf MB571a_108_prices_at_principal $W \
+'        let split = bond_v20::tranche_split3(v, c_eff, k);' \
+'        let split = bond_v20::tranche_split3(v, c_eff, t.c_b_atoms);' \
+gh571_random_sequences_match_the_reference_model_and_are_fair
+  # MB571b: 97 reads the stored claim only (no unsettled accrual): the junior can withdraw the
+  # coupon the bonds are accruing.
+  run_bpf MB571b_97_ignores_unsettled_accrual $W \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,' \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_total()?,' \
+gh571_junior_cannot_withdraw_the_bonds_accrual_and_arrears_cap_at_one_year
+  # MB571c: 78 forfeits the unpaid part again (the dust-crank grief).
+  run_bpf MB571c_78_forfeits_unpaid $W \
+'            bond_v20::coupon_pay_from_leg(available, due)' \
+'            { let (c, r, _) = bond_v20::coupon_pay_from_leg(available, due); (c, r, 0) }' \
+gh571_dust_trade_crank_carries_instead_of_forfeiting
+  # MB571d: 78 always moves the checkpoint (no hold): a crank every slot grinds the coupon to 0.
+  run_bpf MB571d_78_no_checkpoint_hold $W \
+'        if moves && now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.last_util_bps = u_now;' \
+'        if (moves || true) && now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.last_util_bps = u_now;' \
+gh571_crank_every_slot_cannot_grind_the_coupon
+  # MB571e: 78 accrues whatever the gate says (drawn / impaired tranche still earns coupon).
+  run_bpf MB571e_78_accrues_through_closed_gate $W \
+'            now.saturating_sub(t.last_coupon_slot),
+            open,
+            bond_value,' \
+'            now.saturating_sub(t.last_coupon_slot),
+            true,
+            k,' \
+gh571_no_accrual_while_drawn_or_impaired_and_settled_arrears_are_kept
+  # MB571f: 103 reads the stored claim only (no unsettled accrual).
+  run_bpf MB571f_103_ignores_unsettled_accrual $W \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,' \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_total()?,' \
+gh571_103_allocation_reserves_the_bonds_accrual
+  # MB571g: 108 prices BEFORE settling (the newcomer buys at the stale claim and shares the
+  # incumbents' unsettled accrual).
+  run_bpf MB571g_108_prices_before_settling $W \
+'        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0, false)?;
+        let k = t.claim_total()?;' \
+'        let k = t.claim_total()?;
+        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0, false)?;' \
+gh571_newcomer_priced_with_arrears_is_neutral_both_ways
   ;;
 esac
 rm -rf "$BAK"
