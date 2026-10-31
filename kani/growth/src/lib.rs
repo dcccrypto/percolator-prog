@@ -12,5 +12,11 @@ pub mod vault_lp_v18;
 #[cfg_attr(feature = "growth_mutant", path = "../mutants/growth_v19_mutant.rs")]
 pub mod growth_v19;
 
+// growth_v19 reads percolator::band_rent (engine-shim) and one depth_src_v22 constant: same
+// satisfaction as ../contlev (see its lib.rs); contlev_exhaustive checks the constant.
+pub mod depth_src_v22 {
+    pub const DEPTH_MODE_DEX: u8 = 2;
+}
+
 #[cfg(kani)]
 mod proofs;
