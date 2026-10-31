@@ -1,0 +1,95 @@
+# Kani nightly harness list (.github/workflows/kani-nightly.yml): the 85 harnesses that hit the
+# --harness-timeout with NO VERDICT in the 2026-10-30/31 rc23 triage (prog 9df63149 / 3c6a579d,
+# engine 292f8e78, kani 0.67.0, 4-15 min caps). Source: ledger v22-followup-2026-10-30/kanitriage.md;
+# names taken from the 'Verification failed for - <harness>' lines of the raw logs in
+# ~/wt-followup-1030/pin/kani/{lib-*,sub2-*,sub3-growth,tests2}.log minus the 3 real-check failures
+# (kani_r3_item6_vol_term, kani_growth_t1_requirement_never_below_engine_or_per_asset: fixed in this PR;
+# kani_dex_pin_check_all_or_nothing: Kani artefact, see docs/KANI.md). NOT a list of passes.
+# Columns: <group>\t<harness path passed to `--harness ... --exact`>. Groups -> crate + flags:
+# scripts/kani-nightly-shard.sh. Remove a row only once it has a SUCCESSFUL verdict elsewhere
+# or the harness is deleted; the workflow's plan job fails if a row names no `fn` in the tree.
+lib	depth_src_v22::kani_proofs::kani_dex_valuation_floor
+lib	depth_src_v22::kani_proofs::kani_dex_isqrt_exact_u64
+lib	depth_src_v22::kani_proofs::kani_dex_depth_floor_exact
+lib	f1_refresh_liq_v22::f1_kani_proofs::kani_f1_always_when_below_and_eligible
+lib	lev_guard_v22::proofs::kani_lev_nav_pure_flow_any_state
+lib	r3_kani_proofs::kani_r3_gap8_alpha_cap
+lib	g8_kani_proofs::kani_g8_off_band_identity
+lib	g8_kani_proofs::kani_g8_ncap_le_kappa_depth_when_fresh
+lib	g8_kani_proofs::kani_r2_sticky_cap_never_uncapped_and_monotone
+lib	p1_kani_proofs::kani_p1_cap_check_monotone_no_overflow
+lib	p1_kani_proofs::kani_p1_cap_fast_path_matches_division
+lib	p1_kani_proofs::kani_p1_exposure_cap_monotone_no_overflow
+lib	p1_kani_proofs::kani_p1_exec_band_check_sound
+contlev	proofs::kani_contlev_n_cap_q_monotone_lemma
+contlev	proofs::kani_contlev_n_cap_step_identity
+contlev	proofs::kani_contlev_curve_monotone_and_min
+contlev	proofs::kani_contlev_interp_facts
+p3	proofs::kani_p3_autopin_caps_finite_nonzero_bounded
+p3	proofs::kani_p3_h2_exposure_cap_exact_and_reducing_always_allowed
+p3	proofs::kani_p3_leverage_gate_exact
+p3	proofs::kani_p3_step_imr_bounds_and_monotone
+p3	proofs::kani_p3_skew_monotone_in_imbalance
+p3	proofs::kani_p3_skew_sign_bound_zero
+p3	proofs::kani_p3_junior_withdraw_keeps_floor_and_senior_backing
+p3	proofs::kani_p3_effective_senior_claim
+p3	proofs::kani_p3_fee_split_and_bps_exact
+p3	proofs::kani_p3_redemption_rejects_bad_inputs
+p3	proofs::kani_p3_redemption_no_dilution
+p3	proofs::kani_p3_deposit_no_dilution
+p3-engine	proofs::kani_p3e_skew_funding_conserves_const_divisor
+p3-engine	proofs::kani_p3e_skew_funding_conserves_fixed_asym_a
+p3-engine	proofs::kani_p3e_skew_funding_conserves_through_engine_kernel
+growth	proofs::kani_growth_r15c_closes_never_pay
+growth	proofs::kani_growth_r15b_util_fee_monotone_in_max
+growth	proofs::kani_growth_r15ab_util_fee_shape_and_monotone
+growth	proofs::kani_growth_r11_capacity_invariant_inductive
+growth	proofs::kani_growth_r2_r12_every_open_faces_the_bound_vault_lp
+growth	proofs::kani_growth_h2_admit_iff_within_ncap
+growth	proofs::kani_growth_t7_rule_implies_gap_solvency
+growth	proofs::kani_growth_t5_at_capacity_costs_full_margin
+growth	proofs::kani_growth_t5_capacity_invariant
+growth	proofs::kani_growth_t4_overflow_fails_closed
+growth	proofs::kani_growth_t2_required_shape_engine_domain
+growth	proofs::kani_growth_t2_dyn_shape_in_ncap
+growth	proofs::kani_growth_t2_dyn_shape_in_lp
+growth	proofs::kani_growth_l4_floor_monotone_in_a
+growth	proofs::kani_growth_l3_ceil_antitone_in_d
+growth	proofs::kani_growth_l2_ceil_monotone_in_a
+growth	proofs::kani_growth_l1_ceil_monotone_in_b
+growth	proofs::kani_growth_t1_required_imr_bounds
+growth	proofs::kani_growth_g_util_fee_on_fill_bps
+growth	proofs::kani_growth_c_util_fee_on_fill_bps
+growth	proofs::kani_growth_g_utilisation_fee_bps
+growth	proofs::kani_growth_c_utilisation_fee_bps
+growth	proofs::kani_growth_c_risk_notional_ceil
+growth	proofs::kani_growth_g_leg_im_req
+growth	proofs::kani_growth_g_dyn_imr_bps
+growth	proofs::kani_growth_c_dyn_imr_bps
+growth	proofs::kani_growth_g_liquidity_notional_e6
+growth	proofs::kani_growth_g_n_cap_q
+growth	proofs::kani_growth_c_n_cap_q
+growth	proofs::kani_growth_c_mul_div_ceil
+tests	kani_growth_r6_tag93_v19_roundtrip
+tests	kani_design_p1_fast_cap_equals_division_engine_domain
+tests	kani_design_p1_cap_exact_floor_engine_domain
+tests	kani_design_p1_band_equals_interval_full_width
+tests	kani_fee_split_conserves
+tests	kani_protocol_skim_never_exceeds_fee_share_bps
+tests	kani_v16_every_active_payload_rejects_one_byte_truncation
+tests	kani_v16_unknown_or_truncated_tags_reject
+tests	kani_v16_oracle_asset_payloads_reject_trailing_byte
+tests	kani_v16_admin_policy_payloads_reject_trailing_byte
+tests	kani_v16_trade_and_crank_payloads_reject_trailing_byte
+tests	kani_v16_init_market_payload_rejects_trailing_byte
+tests	kani_v16_configure_hybrid_oracle_decode_preserves_wire_fields
+tests	kani_v16_base_unit_payloads_decode_preserves_wire_fields
+tests	kani_v16_update_authority_decode_preserves_wire_fields
+tests	kani_v16_permissionless_crank_rejects_legacy_close_q_fee_bps_wire_payload
+tests	kani_v16_permissionless_crank_rejects_oversized_hint_count
+tests	kani_v16_permissionless_crank_decode_preserves_wire_fields
+tests	kani_v16_tradecpi_decode_preserves_wire_fields
+tests	kani_v16_tradenocpi_decode_preserves_wire_fields
+tests	kani_v16_asset_lifecycle_decode_preserves_wire_fields
+tests	kani_v16_amount_instructions_decode_preserves_wire_fields
+tests	kani_v16_init_market_decode_preserves_wire_fields
