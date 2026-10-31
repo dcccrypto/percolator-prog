@@ -6571,3 +6571,135 @@ fn r572_band_off_market_rent_unchanged() {
     assert_eq!((rl, rs), (0, 0), "band off: utilisation rent only (0 here)");
     env.assert_conservation();
 }
+
+/// prog#572 gaming (task item 2): a dust griefer (or the vault LP's own controller) fills a side
+/// past the knee with minimum legs, holds, then exits. Pinned here:
+/// * the rate is bounded by `rent_max`, and once the griefer has left an accrual charges 0 again;
+/// * the rent paid (honest + griefer) lands in the vault LP's CAPITAL through tag 106 and the
+///   insurance fund falls by exactly the routed amount (no insurance surplus is kept);
+/// * FINDING-1 (cost asymmetry, design): rent is per NOTIONAL while the scarce resource is the
+///   SLOT, so 5 legs of $10 move $150k of honest longs from 0 to `rent_max`; the griefer pays the
+///   same rate on its $50 only. Nobody but the vault LP profits (the rent goes there);
+/// * FINDING-2 (back-dating, pre-existing mechanism shared with utilisation rent): while an
+///   asset's interval is zero-move (flat price, no funding, rent 0) a trade does not catch the
+///   asset up (`zero_move_funding_path_for_profile_view` returns None), so the griefer can push
+///   the count past the knee on a LAGGING asset; the next accrual then charges the whole lagged
+///   gap at the new rate, including slots before the griefer arrived. Bounded by the lag (the
+///   keeper's crank cadence) times the rate; a further risk-increasing trade is refused until the
+///   gap is accrued. Utilisation rent has the same exposure for OI crossing the kink.
+#[test]
+fn r572_dust_griefer_bounded_rent_lands_in_lp_capital_and_lag_backdating_pinned() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let mut victims = Vec::new();
+    // cap 20 (poked below): the knee is 17 (85%); 15 honest longs = 75%.
+    for i in 0..15u32 {
+        let t = env.trader_n(i, 5_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10_000 * Q).expect("honest $10k long");
+        victims.push(t);
+    }
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    assert_eq!(env.pos_counts().0, 15);
+    let vps: Vec<Pubkey> = victims.iter().map(|t| t.1).collect();
+    let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
+    assert_eq!(rl, 0, "75%: no rent");
+    let mut pre = vps.clone();
+    pre.push(lp.account);
+    env.sweep(&pre);
+    let vcap0: Vec<u128> = vps.iter().map(|p| env.portfolio_state(*p).capital).collect();
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q; // $10, the market minimum
+
+    // FINDING-2: 10 slots pass with no accrual (rate 0: nothing to settle), then 3 dust legs take
+    // the side from 15 to 18 (past the knee) WITHOUT the asset catching up.
+    let idx_pre = env.engine_asset().rent_index_long_num;
+    let lag_from = env.engine_asset().slot_last;
+    const LAG: u64 = 10;
+    env.warp(LAG);
+    env.push(PRICE);
+    let mut dust = Vec::new();
+    for i in 0..3u32 {
+        let t = env.trader_n(1_000 + i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("griefer $10 long on a lagging zero-rate asset");
+        dust.push(t);
+    }
+    assert_eq!(env.pos_counts().0, 18);
+    assert_eq!(env.engine_asset().slot_last, lag_from, "the asset did not catch up");
+    let t4 = env.trader_n(1_003, 100 * USD);
+    let r = env.trade_cpi(&t4.0, t4.1, &lp, dust_q);
+    assert!(r.is_err(), "past the knee the rate is nonzero: a further increase needs the gap accrued first");
+    let occ18 = percolator_prog::growth_v19::rent_occupancy_rate_e9(18, 20, RENT_MAX as u64);
+    assert_eq!(occ18, 3);
+    for _ in 0..4 {
+        env.crank_current(lp.account);
+    }
+    assert_eq!(env.engine_asset().slot_last, env.slot, "gap accrued");
+    let gap = env.slot - lag_from;
+    let d_gap = env.engine_asset().rent_index_long_num - idx_pre;
+    eprintln!("R572 FINDING-2: {gap} lagged slots accrued after the griefer crossed the knee: dR = {d_gap} = price x {} x {gap}", d_gap / PRICE as u128 / gap as u128);
+    assert_eq!(d_gap, PRICE as u128 * occ18 as u128 * gap as u128, "FINDING-2: the whole gap is charged at the post-entry rate");
+
+    // Fill to 20/20 and hold 50 slots at rent_max.
+    let mut all = vps.clone();
+    all.extend(dust.iter().map(|t| t.1));
+    all.push(lp.account);
+    env.sweep(&all);
+    env.trade_cpi(&t4.0, t4.1, &lp, dust_q).expect("griefer $10 long");
+    dust.push(t4);
+    let t5 = env.trader_n(1_004, 100 * USD);
+    env.trade_cpi(&t5.0, t5.1, &lp, dust_q).expect("griefer $10 long");
+    dust.push(t5);
+    assert_eq!(env.pos_counts().0, 20, "full");
+    let dps: Vec<Pubkey> = dust.iter().map(|t| t.1).collect();
+    let mut all = vps.clone();
+    all.extend(dps.iter().copied());
+    all.push(lp.account);
+    env.sweep(&all);
+    let dcap0: Vec<u128> = dps.iter().map(|p| env.portfolio_state(*p).capital).collect();
+    let vcap_h: Vec<u128> = vps.iter().map(|p| env.portfolio_state(*p).capital).collect();
+    let unrouted_h0 = env.engine_asset().rent_unrouted_atoms;
+    const H: u128 = 50;
+    let idx0 = env.engine_asset().rent_index_long_num;
+    for _ in 0..H {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(lp.account);
+    }
+    assert_eq!(env.engine_asset().rent_index_long_num - idx0, PRICE as u128 * RENT_MAX as u128 * H, "rent_max while held, never more");
+    env.sweep(&all);
+    let g_paid: u128 = dps.iter().zip(&dcap0).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).sum();
+    let v_hold: u128 = vps.iter().zip(&vcap_h).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).sum();
+    // Route (before any TradeCpi with the LP, which routes too): tag 106 moves every unrouted
+    // atom to the vault LP's capital, out of insurance.
+    let unrouted = env.engine_asset().rent_unrouted_atoms;
+    eprintln!("R572 hold: honest paid {v_hold}, griefer paid {g_paid}, unrouted {unrouted_h0} -> {unrouted}");
+    assert!(unrouted - unrouted_h0 >= v_hold + g_paid, "every atom of the hold's rent is the LP's claim");
+    let ins0 = env.engine_header().2;
+    let lp_cap0 = env.portfolio_state(lp.account).capital;
+    env.settle_rent(vps[0], lp.account).expect("tag 106");
+    let lp_gain = env.portfolio_state(lp.account).capital - lp_cap0;
+    eprintln!("R572 route: unrouted {unrouted} -> vault LP capital +{lp_gain}, insurance -{}", ins0 - env.engine_header().2);
+    assert_eq!(lp_gain, unrouted, "the vault LP's capital receives exactly the unrouted rent");
+    assert_eq!(ins0 - env.engine_header().2, unrouted, "insurance falls by exactly the routed rent: no surplus kept");
+    assert_eq!(env.engine_asset().rent_unrouted_atoms, 0);
+    for t in &dust {
+        env.trade_cpi(&t.0, t.1, &lp, -dust_q).expect("griefer exits");
+    }
+    assert_eq!(env.pos_counts().0, 15, "griefer gone");
+    // After the exit an accrual charges 0 (the count is back at 15/20).
+    let idx_exit = env.engine_asset().rent_index_long_num;
+    env.warp(LAG);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    assert_eq!(env.engine_asset().rent_index_long_num, idx_exit, "no rent after the griefer left");
+    env.sweep(&pre);
+    let v_paid: u128 = vps.iter().zip(&vcap0).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).sum();
+    let den = percolator::band_rent::RENT_INDEX_DEN;
+    let notional = 15 * 10_000 * Q as u128 * PRICE as u128;
+    let want_v = (notional * occ18 as u128 * gap as u128 + notional * RENT_MAX as u128 * H) / den;
+    eprintln!("R572 FINDING-1: 5 x $10 griefer legs, {H} slots full: honest longs paid {v_paid} (~{want_v}) atoms, griefer paid {g_paid} over the hold");
+    assert!(v_paid + 30 >= want_v && v_paid <= want_v + 30, "honest longs paid the gap at 3 and the hold at rent_max: {v_paid} vs {want_v}");
+    assert!(v_paid > 1_000 * g_paid.max(1), "FINDING-1: the griefer pays a tiny fraction of what it imposes");
+
+    env.assert_conservation();
+}
