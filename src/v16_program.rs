@@ -794,7 +794,10 @@ pub mod constants {
     // v2.2: +33 B per engine leg (band_epoch_snap, band_liq_pending, rent_snap, rent_carry)
     // x 16 legs = +528 B, and (variant -rem) +32 B per leg of K/F remainders x 16 = +512 B:
     // 9563 -> 10603. A v2.2 re-seed; old portfolios fail closed on the discriminator.
-    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_10603: () = assert!(PORTFOLIO_ACCOUNT_LEN == 10603);
+    // Engine #299/#302 (a100d54d): `PortfolioAccountV16Account::loss_provenance` (u32) appended
+    // LAST to the engine body (discriminator 19 -> 20): 10603 -> 10607. Every wrapper tail offset
+    // (matcher config, identity trailer) derives from PORTFOLIO_ENGINE_ACCOUNT_LEN and moves +4.
+    #[cfg(not(kani))] const _ASSERT_PORTFOLIO_ACCOUNT_LEN_10607: () = assert!(PORTFOLIO_ACCOUNT_LEN == 10607);
     // Bit-layout non-collision (6b627b43's ENABLED_MASK bit0 / TRADE_FEE_CAP bits
     // 50..63 vs this unit's position_epoch bits 1..49): checked against the
     // struct's own consts below (`_ASSERT_POSITION_EPOCH_BIT_LAYOUT_*` in the
@@ -50447,15 +50450,16 @@ pub mod processor {
         }
 
         #[test]
-        fn portfolio_account_len_is_10603_with_full_identity_trailer() {
+        fn portfolio_account_len_is_10607_with_full_identity_trailer() {
             let data = init_test_portfolio(7);
             assert_eq!(
                 data.len(),
                 constants::PORTFOLIO_ACCOUNT_LEN,
                 "the wrapper tail contains matcher config, portfolio ID, sequence, and expiry"
             );
-            // v2.2: engine legs +33 B (band / rent) +32 B (K/F remainders) each => 9563 + 528 + 512.
-            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 10603);
+            // v2.2: engine legs +33 B (band / rent) +32 B (K/F remainders) each => 9563 + 528 + 512,
+            // + 4 B engine `loss_provenance` (#299/#302, discriminator 20).
+            assert_eq!(constants::PORTFOLIO_ACCOUNT_LEN, 10607);
             assert_eq!(state::read_portfolio_id(&data).unwrap(), 7);
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 0);
             assert_eq!(state::read_portfolio_matcher_sequence(&data).unwrap(), 0);

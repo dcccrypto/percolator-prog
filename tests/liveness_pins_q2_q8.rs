@@ -129,8 +129,24 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
             "book_bankruptcy_residual_chunk_for_account_core",
             "certify_account_after_local_settlement_with_price_override",
             "charge_account_fee_after_full_refresh_not_atomic",
+            // engine #299/#302 (a100d54d src/v16.rs liquidate_account_not_atomic ~21690-21760,
+            // charge_recorded_domain_up_to_capacity ~23526). Reviewed against `f1_follow_on_wanted`
+            // 2026-10-31: the explicit-error set above is unchanged; `domain_asset_side` /
+            // `insurance_domain_index` refuse only InvalidLeg / ArithmeticOverflow (structural: the
+            // closed leg is a materialized active leg, and a recorded domain is range-checked by
+            // `validate_loss_provenance_for_market` at account load);
+            // `liquidation_residual_exceeds_single_step_capacity` is the predicate
+            // `preflight_liquidation_residual_durability` already ran (read-only);
+            // `charge_recorded_domain_up_to_capacity` is composed only of helpers pinned in this
+            // list (insurance, close-progress ledger, B chunk, set_account_pnl, h-lock) and declares
+            // no Recovery. #302 REMOVES refusals (a locked flat close is resolved live, never
+            // RecoveryRequired), so the follow-on screen needs no new input.
+            "charge_recorded_domain_up_to_capacity",
             "consume_domain_insurance_for_negative_pnl",
             "declare_permissionless_recovery",
+            "domain_asset_side",
+            "insurance_domain_index",
+            "liquidation_residual_exceeds_single_step_capacity",
             "mark_bankruptcy_hlock_event",
             "position_delta_touches_pending_domain_loss_barrier",
             "preflight_liquidation_residual_durability",
