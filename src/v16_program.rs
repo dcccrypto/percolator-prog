@@ -45380,6 +45380,13 @@ pub mod processor {
         other: (u128, u128),
     ) -> ProgramResult {
         let Some(b) = before else { return Ok(()) };
+        // #636b liveness: a growth market bound without the vault ext (tag 94 without [11], no 103 /
+        // 107 yet) has nowhere to book `other_*`. Such a market cannot hold a bond (107 creates the
+        // ext), so only 102 / 111 reach here: run them exactly as before this change (no sample)
+        // instead of failing them. 96/97/98/103 book no `other` and keep their #640 behaviour.
+        if other != (0, 0) && account(accounts, ext_idx).map_or(true, |e| e.data_is_empty()) {
+            return Ok(());
+        }
         let guard_ai = account(accounts, guard_idx)?;
         // #636b: tags 102 / 108 / 110 / 111 book their flow in the ext's `other_flow` counters
         // (the ext is required: `lev_flow_counters` refuses without it) BEFORE the post reading.

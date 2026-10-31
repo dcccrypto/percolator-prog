@@ -3880,3 +3880,35 @@ fn n636b_backstop_restore_is_a_flow_not_a_loss() {
     let st0 = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
     assert_eq!(st0.backstop_outstanding_atoms, 600 * U, "the refusal changed nothing");
 }
+
+/// Growth market, guard live, NO vault ext (bound without [11], no 103 / 107 yet). att-641 found
+/// that 102 (Live) and 111 RESTORE, which work on rc23 and on #640, were refused on 2133354 (the
+/// counter had no ext to live in). They must keep working (run as before, no sample).
+fn n636b_extless_world() -> (Env, Lp) {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, Some(lp.portfolio)).expect("75");
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("96");
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("epoch start");
+    assert!(env.ext().is_none(), "vacuity: no ext in this world");
+    (env, lp)
+}
+
+#[test]
+fn n636b_extless_growth_market_keeps_102_and_111_restore_alive() {
+    let (mut env, lp) = n636b_extless_world();
+    let admin = env.admin.insecure_clone();
+    poke_senior_claim(&mut env, 6_000 * U as u128);
+    let cap0 = env.portfolio(lp.portfolio).capital;
+    env.release_surplus(&admin, lp.portfolio, 100 * U as u128, DOMAIN).expect("102 on an ext-less growth market");
+    assert_eq!(env.portfolio(lp.portfolio).capital, cap0 + 100 * U as u128, "vacuity: the release moved value");
+    let (mut env2, lp2) = n636b_extless_world();
+    n636b_units_and_backstop(&mut env2, 600 * U);
+    n636b_restore(&mut env2, &lp2, 1, 0, true).expect("111 RESTORE on an ext-less growth market");
+    let st = state::read_vault_lp_state(&env2.svm.get_account(&env2.vault_lp).unwrap().data).unwrap();
+    assert!(st.backstop_outstanding_atoms < 600 * U, "vacuity: the repayment moved value");
+    assert!(env2.ext().is_none(), "no ext was created behind the caller's back");
+}
