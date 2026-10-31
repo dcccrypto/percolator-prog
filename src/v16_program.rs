@@ -7230,20 +7230,24 @@ pub mod state {
         )
     }
 
-    /// The market's capacity-bond tranche (`bond_v20`): the pooled principal claim `C_b`, the
-    /// carried coupon arrears `A`, the share supply `B` and the coupon / cooldown / cap dials
-    /// (immutable after tag 107). 144 bytes, `#[repr(C)]` Pod with no implicit padding.
+    /// The market's capacity-bond tranche (`bond_v20`): the bonds' pooled claim `K`, the coupon
+    /// receivable `R`, the cap meter `U`, the share supply `B` and the coupon / cooldown / cap
+    /// dials (immutable after tag 107). 176 bytes, `#[repr(C)]` Pod with no implicit padding.
     ///
-    /// LAYOUT v2 (GH#571, 2026-10-31): v1 was 128 bytes. Bytes 0..128 are unchanged; v2 appends
-    /// `coupon_arrears_atoms: u128` at 128..144 and stamps `version = 2`. A v1 account (shorter, or
-    /// version 1) fails every load (`InvalidAccountLen` / `InvalidAccountData`): bond markets are
-    /// re-seeded, there is no in-place migration.
+    /// LAYOUT v2 (GH#571, 2026-10-31): v1 was 128 bytes. Bytes 0..128 keep their offsets
+    /// (`c_b_atoms` now holds the whole claim `K`, settled coupon included); v2 appends
+    /// `coupon_arrears_atoms` (`R`) at 128..144, `coupon_unfunded_atoms` (`U`) at 144..160,
+    /// `coupon_accrual_rem` at 160..168 and `coupon_gate_seen` at 168..176, and stamps
+    /// `version = 2`. A v1 account (shorter, or version 1) fails every load
+    /// (`InvalidAccountLen` / `InvalidAccountData`): bond markets are re-seeded, there is no
+    /// in-place migration.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct BondTrancheV20 {
         pub market_group: [u8; 32], // 0..32
-        /// `C_b`: deposits + credited coupons - redeemed pro-rata slices. Never written down by a
-        /// draw: the bond's VALUE is the middle layer of `bond_v20::tranche_split3`.
+        /// `K`: the bonds' whole claim = deposits + every SETTLED coupon (GH#571) - redeemed
+        /// pro-rata slices. Never written down by a draw: the bond's VALUE is the middle layer of
+        /// `bond_v20::tranche_split3(.., K)`. Shares are priced at `K / B`.
         pub c_b_atoms: u128, // 32..48
         /// `B`: bond shares outstanding (sum of every `BondPositionV20::shares`).
         pub b_shares_total: u128, // 48..64
@@ -7253,11 +7257,9 @@ pub mod state {
         /// Informational mirror of the impairment (`C_b - bond value`) observed the last time a
         /// bond instruction priced the tranche. Nothing prices off it.
         pub bond_drawn_outstanding_atoms: u128, // 80..96
-        /// Coupon accrual checkpoint: every slot up to it is SETTLED into
-        /// `coupon_arrears_atoms` (gate open) or was forfeited (gate closed). Moved to "now" by a
-        /// settlement (tags 78 / 108 / 110) except that 78 / Live 110 HOLD it when an open-gate
-        /// interval floored to 0 atoms below the cap (`bond_v20::coupon_checkpoint_moves`, no
-        /// grinding). Moving it never drops settled arrears (GH#571).
+        /// Coupon accrual checkpoint: every slot up to it is SETTLED into `K` / `R` (gate open;
+        /// the sub-atom remainder carried in `coupon_accrual_rem`) or was forfeited (gate closed).
+        /// Moved to "now" by every settlement (tags 78 incl. a zero-leg 78, 108, 110).
         pub last_coupon_slot: u64, // 96..104
         pub coupon_bps_per_year: u16,   // 104..106
         pub coupon_util_bonus_bps: u16, // 106..108
@@ -7270,23 +7272,37 @@ pub mod state {
         /// uses `min(last, now)`.
         pub last_util_bps: u16, // 116..118
         pub _padding: [u8; 2], // 118..120
-        /// Cumulative coupon atoms credited to `C_b` (saturating; for the realised-APY readout).
+        /// Cumulative coupon atoms PAID by fee legs (tag 78; saturating; a readout only).
         pub coupon_paid_total_atoms: u64, // 120..128
-        /// GH#571 `A`: coupon accrued and settled but not yet paid from a fee leg. A CLAIM of
-        /// the bonds (`bond_v20` I-T7): the bonds' full claim is `C_b + A`, junior to the
-        /// seniors and the backstop, senior to the junior. Capped at one year of coupon on `C_b`.
-        /// Zero whenever `B == 0`.
+        /// GH#571 `R`: the coupon RECEIVABLE, settled coupon (already inside `K`) that no fee leg
+        /// has funded yet, i.e. what the fee legs still owe the junior that fronted it
+        /// (`bond_v20` I-T7). Paid by tag 78 at <= 1/2 of each leg; exits never reduce it (it
+        /// can outlive `B == 0`).
         pub coupon_arrears_atoms: u128, // 128..144
+        /// GH#571 `U`: the cap meter, the unfunded coupon carried by the CURRENT shares at the
+        /// pool's per-share ratio (108 labels new shares at it, 110 removes its slice, 78's
+        /// payment lowers it). Accrual stops while `U >= 1y of coupon on K - U`. `U <= K`.
+        pub coupon_unfunded_atoms: u128, // 144..160
+        /// GH#571: carried sub-atom accrual numerator, `< bond_v20::COUPON_DENOM` (so cranking
+        /// often never grinds the coupon away). Zeroed by tag 108 and when the cap binds.
+        pub coupon_accrual_rem: u64, // 160..168
+        /// GH#571 (att649 F2) gate memory of the last settlement: bits 0..63 = the low 63 bits of
+        /// `VaultLpStateV18::senior_drawn_atoms` (cumulative, monotone) then; bit 63 = the coupon
+        /// gate was CLOSED then. The next interval accrues only if the gate is open at BOTH ends
+        /// and no senior draw was booked inside it (`bond_interval_clean`), so a closed window is
+        /// forfeited even if it reopened before anyone settled.
+        pub coupon_gate_seen: u64, // 168..176
     }
-    const _: () = assert!(core::mem::size_of::<BondTrancheV20>() == 144);
+    const _: () = assert!(core::mem::size_of::<BondTrancheV20>() == 176);
     const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_arrears_atoms) == 128);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_unfunded_atoms) == 144);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_accrual_rem) == 160);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_gate_seen) == 168);
 
     impl BondTrancheV20 {
-        /// GH#571: the bonds' full claim `K = C_b + A` as of the last settlement. Every tranche
-        /// split reads this, never `c_b_atoms` alone.
+        /// GH#571: the bonds' whole claim `K` as of the last settlement (= `c_b_atoms`).
         pub fn claim_total(&self) -> Result<u128, ProgramError> {
-            crate::bond_v20::bond_claim_total(self.c_b_atoms, self.coupon_arrears_atoms)
-                .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+            Ok(self.c_b_atoms)
         }
 
         /// GH#571: `K` plus the accrual not yet settled since `last_coupon_slot`, assuming the gate
@@ -7299,17 +7315,18 @@ pub mod state {
                 self.coupon_util_bonus_bps,
                 crate::vault_lp_v18::BPS as u16,
             );
-            let k = self.claim_total()?;
-            let a = crate::bond_v20::coupon_settle(
+            let (x, _) = crate::bond_v20::coupon_settle(
                 self.c_b_atoms,
-                self.coupon_arrears_atoms,
+                self.coupon_unfunded_atoms,
+                self.coupon_accrual_rem,
                 rate,
                 now.saturating_sub(self.last_coupon_slot),
                 self.c_b_atoms > 0,
-                k,
+                self.c_b_atoms,
             )
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            crate::bond_v20::bond_claim_total(self.c_b_atoms, a)
+            self.c_b_atoms
+                .checked_add(x)
                 .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
         }
     }
@@ -7324,8 +7341,9 @@ pub mod state {
     }
 
     /// Reachable-state validation: dials inside the protocol bounds, padding zero, and
-    /// `C_b == 0 <=> B == 0` (a full redemption removes the whole claim; the genesis deposit
-    /// creates both together).
+    /// `K == 0 <=> B == 0` (a full redemption removes the whole claim; the genesis deposit
+    /// creates both together). GH#571: the receivable `R` is independent of `B` (it outlives the
+    /// last bond); the carried remainder is a sub-atom.
     pub fn validate_bond_tranche(t: &BondTrancheV20) -> Result<(), ProgramError> {
         if t.version != crate::constants::BOND_TRANCHE_VERSION
             || t.market_group == [0u8; 32]
@@ -7338,8 +7356,8 @@ pub mod state {
             || t.last_util_bps as u128 > crate::vault_lp_v18::BPS
             || t._padding != [0u8; 2]
             || (t.c_b_atoms == 0) != (t.b_shares_total == 0)
-            // GH#571: no shares, no arrears (a full redemption removes the whole claim).
-            || (t.b_shares_total == 0 && t.coupon_arrears_atoms != 0)
+            || t.coupon_accrual_rem as u128 >= crate::bond_v20::COUPON_DENOM
+            || t.coupon_unfunded_atoms > t.c_b_atoms
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -34607,23 +34625,24 @@ pub mod processor {
     }
 
     /// Phase 4 item 3: take the capacity-bond coupon off the TOP of one harvested LP fee leg
-    /// (tag 78's bound tail). Returns `(coupon, rest, C_b + A after)`; `(0, available, 0)` when the
+    /// (tag 78's bound tail). Returns `(coupon, rest, K after)`; `(0, available, 0)` when the
     /// market has no bond tranche. Once the registry's bond flag is set, [9] bond_tranche (w) is
     /// REQUIRED (fail closed; [7] ext and [8] the vault LP portfolio must then be passed too).
     ///
-    /// `coupon = min(coupon_due, available / 2)` (M-2: never more than half of a leg) with
-    /// `coupon_due = min(C_b, bond value) * rate * dt / (1e4 * 1y)` (M-1),
-    /// `rate = base + bonus * min(u_last, u_now)` (bonus forced 0, L-2) and `dt` since the last
-    /// checkpoint. The coupon
-    /// atoms stay in the pots (already harvested there as principal) and are credited to `C_b`, so
-    /// the split hands them to the bonds. CUMULATIVE (GH#571): the interval's accrual is first
-    /// SETTLED into the arrears `A` (`bond_v20::coupon_settle`, capped at one year of coupon), then
-    /// `min(A, leg / 2)` is paid and the rest of `A` is carried; `C_b + A` is unchanged by the
-    /// payment. Closed (nothing accrues, nothing is paid, settled `A` kept) unless Live, the
-    /// tranche is non-empty and whole INCLUDING its arrears, and NO senior principal loss is
-    /// outstanding: the coupon never takes priority over Earn principal (I-T7). The
-    /// utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward the
-    /// seniors), never as full.
+    /// CUMULATIVE (GH#571, `bond_v20` I-T7): first SETTLE the interval since the checkpoint
+    /// (`bond_v20::coupon_settle` on `K = c_b_atoms`, rate `base + bonus * min(u_last, u_now)`,
+    /// bonus forced 0 by L-2; the sub-atom remainder carried; capped): `K += x`, `R += x`. Then
+    /// PAY `min(R, leg / 2)` (M-2) off the top of the leg: `R` drops and `K` is unchanged, so the
+    /// coupon atoms (already harvested into the pots) land in the junior's residual: the junior is
+    /// reimbursed for the coupon it fronted. Accrual gate: Live, `K > 0`, the tranche whole
+    /// (M-1, its layer of V BEFORE this leg), NO senior draw outstanding, AND the interval clean
+    /// (`bond_interval_clean`, att649 F2: the gate was open at the last settlement and no draw was
+    /// booked since, so a closed window is forfeited even if it reopened before this crank).
+    /// Payment gate: the gate NOW (Live, `K > 0`, whole, no draw outstanding; the interval rule
+    /// does not apply to paying), or Live + no draw outstanding + an EMPTY tranche (the
+    /// receivable outlives the last bond).
+    /// The utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward
+    /// the seniors), never as full.
     #[inline(never)]
     fn bond_coupon_take<'a>(
         program_id: &Pubkey,
@@ -34638,74 +34657,78 @@ pub mod processor {
         else {
             return Ok((0, available, 0));
         };
-        // GH#571: every split reads the full claim `K = C_b + A`.
-        let k = t.claim_total()?;
+        let k = t.c_b_atoms;
         expect_writable(t_ai)?;
         let now = authenticated_slot_or_fallback(t.last_coupon_slot);
         let live = state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
             == MarketModeV16::Live;
-        // M-1 (security review 2026-10-05): the coupon accrues on min(C_b, bond value) and is
+        let draw = st.senior_draw_outstanding_atoms;
+        // M-1 (security review 2026-10-05): the coupon accrues on min(K, bond value) and is
         // forfeited while the tranche is impaired. The bond value is its layer of V BEFORE this
         // crank's leg.
         // N-1 (re-review 2026-10-06): if the vault LP cannot be valued now (stale certificate with
         // inventory) the crank FAILS CLOSED (`VaultLpValuationStale`) instead of harvesting the leg
         // with the coupon deferred: a deferral let anyone time 78 ahead of the keeper's LP refresh
         // and starve the bonds. The vault-LP crank is permissionless; bundle it before 78.
-        let pre_open = live && t.c_b_atoms > 0 && st.senior_draw_outstanding_atoms == 0;
+        let pre_open = live && k > 0 && draw == 0;
         let bond_value = if pre_open {
             bond_value_before_leg(program_id, accounts, st, registry, k, available)?
         } else {
             0
         };
-        let open = bond_v20::coupon_gate_open(live, k, st.senior_draw_outstanding_atoms, bond_value);
+        // the gate NOW, and whether the interval since the last settlement may accrue (F2)
+        let open_now = bond_v20::coupon_gate_open(live, k, draw, bond_value);
+        let open = open_now && bond_interval_clean(&t, st);
         let u_now = if open && t.coupon_util_bonus_bps != 0 {
             bond_util_now_bps(program_id, accounts, st).unwrap_or(0)
         } else {
             0
         };
         let u_eff = if u_now < t.last_util_bps { u_now } else { t.last_util_bps };
-        // GH#571: settle the interval into the arrears (gate closed: forfeited, `A` kept), then
-        // pay `min(A, leg / 2)`; the unpaid rest of `A` is carried, never forfeited.
         let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff);
-        let due = bond_v20::coupon_settle(
-            t.c_b_atoms,
-            t.coupon_arrears_atoms,
+        let (accrued, rem) = bond_v20::coupon_settle(
+            k,
+            t.coupon_unfunded_atoms,
+            t.coupon_accrual_rem,
             rate,
             now.saturating_sub(t.last_coupon_slot),
             open,
             bond_value,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // A sub-atom interval HOLDS the checkpoint (no grinding the coupon away by cranking).
-        let moves = bond_v20::coupon_checkpoint_moves(
-            open,
-            t.coupon_arrears_atoms,
-            due,
-            bond_v20::coupon_arrears_cap(t.c_b_atoms, rate).ok_or(PercolatorError::EngineArithmeticOverflow)?,
-        );
-        let (coupon, rest, arrears) = if open {
-            bond_v20::coupon_pay_from_leg(available, due)
-        } else {
-            (0, available, due)
-        };
-        t.coupon_arrears_atoms = arrears;
-        t.c_b_atoms = t
-            .c_b_atoms
-            .checked_add(coupon)
+        t.c_b_atoms = k.checked_add(accrued).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let r = t
+            .coupon_arrears_atoms
+            .checked_add(accrued)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let u = t
+            .coupon_unfunded_atoms
+            .checked_add(accrued)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_accrual_rem = rem;
+        // the PAYMENT depends on the gate now only (the interval rule is about accrual)
+        let (coupon, rest, r_after) = if bond_v20::coupon_pay_open(open_now, live, k, draw) {
+            bond_v20::coupon_pay_from_leg(available, r)
+        } else {
+            (0, available, r)
+        };
+        t.coupon_arrears_atoms = r_after;
+        // a payment funds the current shares' unfunded coupon first (frees their cap headroom)
+        t.coupon_unfunded_atoms = u.saturating_sub(coupon);
         t.coupon_paid_total_atoms = t
             .coupon_paid_total_atoms
             .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
-        if moves && now > t.last_coupon_slot {
+        if now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
+        t.coupon_gate_seen = bond_gate_seen(st, open_now);
         t.last_util_bps = u_now;
         state::write_bond_tranche(&mut t_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_coupon available={} due={} coupon={} c_b={} arrears={} bond_value={} open={}",
-            available, due, coupon, t.c_b_atoms, t.coupon_arrears_atoms, bond_value, open
+            "bond_coupon available={} accrued={} coupon={} k={} receivable={} bond_value={} open={}",
+            available, accrued, coupon, t.c_b_atoms, t.coupon_arrears_atoms, bond_value, open
         ));
-        Ok((coupon, rest, t.claim_total()?))
+        Ok((coupon, rest, t.c_b_atoms))
     }
 
     /// M-1: the bonds' layer of the vault value BEFORE the fee leg `available` that tag 78 just
@@ -34850,7 +34873,7 @@ pub mod processor {
         st: &state::VaultLpStateV18,
         available: u128,
         // Phase 4 item 3: the bonds' claim AFTER this crank's coupon (0 without a tranche), incl.
-        // the carried arrears (GH#571). The junior's level excludes it: bond value (and coupon
+        // its settled coupon (GH#571: `K`). The junior's level excludes it: bond value (and coupon
         // the bonds are owed) is never the junior's cushion.
         bond_claim: u128,
     ) -> Result<(u128, u128), ProgramError> {
@@ -38008,7 +38031,7 @@ pub mod processor {
         // Phase 4 item 3: once the market's bond tranche exists, [12] is REQUIRED (fail closed):
         // the junior is the residual over the seniors AND the bonds' claim, so it can never
         // withdraw bond value. ([11] must then be passed too, as the ext slot.)
-        // GH#571: the claim is `C_b + A` plus the accrual not yet settled (an upper bound), so the
+        // GH#571: the claim `K` plus the accrual not yet settled (an upper bound), so the
         // junior cannot withdraw coupon the bonds are accruing between settlements.
         let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
             Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,
@@ -41150,7 +41173,7 @@ pub mod processor {
         )?;
         // Phase 4 item 3: once the bond tranche exists, [9] is REQUIRED (fail closed) so L-3
         // measures the junior net of the bonds' claim.
-        // GH#571: `C_b + A` plus the unsettled accrual (upper bound), as tag 97.
+        // GH#571: `K` plus the unsettled accrual (upper bound), as tag 97.
         let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
             Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,
             None => 0,
@@ -41802,7 +41825,7 @@ pub mod processor {
         // exists, [11] is REQUIRED there (fail closed). The Live path only moves pot surplus into
         // vault-LP capital (value-neutral), so it does not read the tranche.
         let bond_claim = if resolved {
-            // GH#571: the full claim incl. the settled arrears (nothing accrues once Resolved).
+            // GH#571: the whole claim `K` incl. the settled coupon (nothing accrues once Resolved).
             match load_bond_tranche_if_flagged(program_id, accounts, 11, market_ai.key, &registry)? {
                 Some((_, t)) => t.claim_total()?,
                 None => 0,
@@ -42318,7 +42341,7 @@ pub mod processor {
     //
     // Pure math: `bond_v20`. Loss order junior -> bonds -> Earn seniors -> insurance -> winner
     // haircut. The bonds' VALUE is the middle layer of `bond_v20::tranche_split3(V, C_s, C_b)`;
-    // `C_b` moves only with 108 (+amount), 110 (-pro-rata slice) and the 78 coupon (+coupon).
+    // `C_b` moves only with 108 (+amount), 110 (-pro-rata slice) and every coupon settlement (+x, tags 78 / 108 / 110; GH#571).
     // The P3 senior draw needs no bond booking: it already treats all pot value above C_eff
     // (junior AND bond) as subordinate (see the `bond_v20` module doc).
 
@@ -42575,29 +42598,63 @@ pub mod processor {
         Ok((registry, registry_pda, st, t))
     }
 
-    /// GH#571: settle the coupon accrued since `t.last_coupon_slot` into `t.coupon_arrears_atoms`
-    /// (off tag 78: base rate, nothing is paid) and move the checkpoint to `now` (never back).
-    /// `open == false` forfeits the interval's accrual (M-1, unchanged) but keeps settled arrears.
+    /// GH#571 (att649 F2): the gate memory a settlement leaves behind (`coupon_gate_seen`): the
+    /// low 63 bits of the cumulative, monotone `senior_drawn_atoms`, and bit 63 set iff the
+    /// coupon gate is CLOSED as of this settlement.
+    fn bond_gate_seen(st: &state::VaultLpStateV18, open_now: bool) -> u64 {
+        let drawn = st.senior_drawn_atoms as u64 & !(1u64 << 63);
+        if open_now { drawn } else { drawn | (1u64 << 63) }
+    }
+
+    /// GH#571 (att649 F2): may the interval since the last settlement accrue? Only if the gate was
+    /// OPEN at that settlement and no senior draw was booked since (the drawn counter is
+    /// unchanged). With the gate open NOW (checked by the caller) the interval is open at both
+    /// ends; a window that closed and reopened between settlements is forfeited (conservative:
+    /// an impairment that both starts and ends strictly inside one interval is not seen, inherent
+    /// to sampling at settlement points).
+    fn bond_interval_clean(t: &state::BondTrancheV20, st: &state::VaultLpStateV18) -> bool {
+        t.coupon_gate_seen == bond_gate_seen(st, true)
+    }
+
+    /// GH#571: settle the coupon accrued since `t.last_coupon_slot` (off tag 78: base rate, nothing
+    /// is paid): `K += x`, `R += x`, the sub-atom remainder carried, and move the checkpoint to
+    /// `now` (never back). `open_now` is the coupon gate NOW; the interval accrues only if it is
+    /// open AND the interval is clean (`bond_interval_clean`); otherwise it is forfeited (M-1 /
+    /// att649 F2) and everything settled is kept. Records the gate memory. `zero_rem` (tag 108):
+    /// drop the carried sub-atom so the newcomer never shares the incumbents' unsettled accrual
+    /// (the INCUMBENTS forfeit < 1 atom).
     #[inline(never)]
-    fn bond_settle_coupon_to(t: &mut state::BondTrancheV20, now: u64, open: bool, may_hold: bool) -> ProgramResult {
-        let k = t.claim_total()?;
+    fn bond_settle_coupon_to(
+        t: &mut state::BondTrancheV20,
+        st: &state::VaultLpStateV18,
+        now: u64,
+        open_now: bool,
+        zero_rem: bool,
+    ) -> ProgramResult {
+        let open = open_now && bond_interval_clean(t, st);
         let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, 0);
-        let before = t.coupon_arrears_atoms;
-        t.coupon_arrears_atoms = bond_v20::coupon_settle(
+        let (x, rem) = bond_v20::coupon_settle(
             t.c_b_atoms,
-            before,
+            t.coupon_unfunded_atoms,
+            t.coupon_accrual_rem,
             rate,
             now.saturating_sub(t.last_coupon_slot),
             open,
-            k,
+            t.c_b_atoms,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // `may_hold` (tag 110): a sub-atom interval holds the checkpoint, so the LEAVER forfeits
-        // its fraction and the stayers keep theirs. Tag 108 always moves (rounding against the
-        // newcomer: it must not share the incumbents' unsettled interval).
-        let cap = bond_v20::coupon_arrears_cap(t.c_b_atoms, rate).ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        let moves = !may_hold || bond_v20::coupon_checkpoint_moves(open, before, t.coupon_arrears_atoms, cap);
-        if moves && now > t.last_coupon_slot {
+        t.coupon_unfunded_atoms = t
+            .coupon_unfunded_atoms
+            .checked_add(x)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.c_b_atoms = t.c_b_atoms.checked_add(x).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_arrears_atoms = t
+            .coupon_arrears_atoms
+            .checked_add(x)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_accrual_rem = if zero_rem { 0 } else { rem };
+        t.coupon_gate_seen = bond_gate_seen(st, open_now);
+        if now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
         Ok(())
@@ -42692,8 +42749,8 @@ pub mod processor {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
         let now = Clock::get()?.slot;
-        // GH#571: the core SETTLES the coupon accrued up to `now` into the arrears (never forfeits
-        // it) and prices the new shares on the full claim `C_b + A`.
+        // GH#571: the core SETTLES the coupon accrued up to `now` into `K` and `R` (never forfeits
+        // it) and prices the new shares on the whole claim `K` (settled coupon included).
         let minted = bond_deposit_core(
             program_id,
             accounts,
@@ -42743,6 +42800,9 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)?;
         let amount = amount as u128;
+        // GH#571: the new shares carry the pool's unfunded-coupon ratio (per-share cap)
+        t.coupon_unfunded_atoms = bond_v20::coupon_meter_after_deposit(t.coupon_unfunded_atoms, t.c_b_atoms, amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         t.c_b_atoms = t
             .c_b_atoms
             .checked_add(amount)
@@ -42756,12 +42816,13 @@ pub mod processor {
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // GH#571: the checkpoint was moved to `now` by the settlement inside the core, AFTER the
-        // accrual up to `now` was carried into `coupon_arrears_atoms`: nothing earned is
-        // forfeited, and the newcomer, who paid `C_b + A` per share, accrues only from now.
+        // accrual up to `now` was settled into `K` (and `R`): nothing earned is forfeited (but the
+        // incumbents' carried sub-atom), and the newcomer, who paid `K / B` per share, accrues
+        // only from now.
         t.bond_drawn_outstanding_atoms = 0;
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_deposit amount={} minted={} c_b={} arrears={} b={}",
+            "bond_deposit amount={} minted={} k={} receivable={} b={}",
             amount, minted, t.c_b_atoms, t.coupon_arrears_atoms, t.b_shares_total
         ));
         lev_nav_flow_end(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai, nav_before, (amount, 0))
@@ -42769,7 +42830,7 @@ pub mod processor {
 
     /// The value side of tag 108 inside one market borrow: pricing, gates, the engine deposit.
     /// `args = [amount, min_shares, max_market_slots, now]`. Returns the shares minted; SETTLES
-    /// the coupon into `t` (GH#571: `coupon_arrears_atoms`, `last_coupon_slot`).
+    /// the coupon into `t` (GH#571: `K`, `R`, the remainder, `last_coupon_slot`).
     #[inline(never)]
     fn bond_deposit_core<'a>(
         program_id: &Pubkey,
@@ -42837,15 +42898,20 @@ pub mod processor {
         if v_worse < c_eff || bond_v20::bond_impaired(v_worse, c_eff, t.claim_total()?) {
             return Err(PercolatorError::BondTrancheImpaired.into());
         }
-        // GH#571: SETTLE the coupon accrued since the checkpoint into the arrears. The gate is
-        // open here whenever `C_b > 0` (Live; no senior draw / backstop, refused by the caller;
-        // whole incl. `A` at the worse price, just checked), so the base is `C_b + A`. Rate: the
-        // base rate (the utilisation term is `min(u_last, u_now)` and counts as 0 off tag 78,
-        // toward the seniors; the bonus is forced 0 by L-2 anyway).
-        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0, false)?;
+        // GH#571: SETTLE the coupon accrued since the checkpoint (`K += x`, `R += x`). The gate is
+        // open here whenever `K > 0` (Live; no senior draw / backstop, refused by the caller;
+        // whole at the worse price, just checked) unless a draw was booked since the last
+        // settlement (forfeit). Rate: the base rate (the utilisation term is `min(u_last, u_now)`
+        // and counts as 0 off tag 78, toward the seniors; the bonus is forced 0 by L-2 anyway).
+        // The carried sub-atom is DROPPED (the incumbents forfeit < 1 atom; the newcomer never
+        // shares their unsettled accrual).
+        bond_settle_coupon_to(t, st, now as u64, t.c_b_atoms > 0, true)?;
+        // After a successful deposit the gate is OPEN going forward (Live, `K > 0`, no draw, whole
+        // at the worse price), also for the genesis deposit (whose settlement saw `K == 0`).
+        t.coupon_gate_seen = bond_gate_seen(st, true);
         let k = t.claim_total()?;
         // The settled claim must itself be covered at the worse price: a deposit never buys into
-        // arrears the vault cannot back.
+        // settled coupon the vault cannot back.
         if bond_v20::bond_impaired(v_worse, c_eff, k) {
             return Err(PercolatorError::BondTrancheImpaired.into());
         }
@@ -42854,12 +42920,12 @@ pub mod processor {
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // GH#574: the cap's junior is read at the SAME worse-for-the-vault price as the impairment
-        // check above, not at the effective price. GH#571: on the full claim `C_b + A`.
+        // check above, not at the effective price. GH#571: on the whole claim `K`.
         if !bond_v20::bond_deposit_cap_ok_at_worse(v_worse, c_eff, k, k_after, t.bond_cap_bps_of_c) {
             return Err(PercolatorError::BondDepositAboveCap.into());
         }
-        // Not impaired => the tranche is worth exactly its claim `C_b + A`: mint at that price,
-        // so the newcomer pays for the incumbents' carried arrears (GH#571 newcomer neutrality).
+        // Not impaired => the tranche is worth exactly its claim `K`: mint at `K / B`,
+        // so the newcomer pays for the incumbents' settled coupon (GH#571 newcomer neutrality).
         let minted = bond_v20::bond_shares_for_deposit(amount, t.b_shares_total, split.bond)
             .ok_or(PercolatorError::BondTrancheImpaired)?;
         if minted == 0 || minted < min_shares {
@@ -43022,7 +43088,7 @@ pub mod processor {
         }
         let (payout, impairment) = match mode {
             MarketModeV16::Live => {
-                // GH#571: the core SETTLES the coupon up to `now` into the arrears before pricing.
+                // GH#571: the core SETTLES the coupon up to `now` into `K` and `R` before pricing.
                 bond_withdraw_live_core(
                     accounts,
                     &registry,
@@ -43044,8 +43110,8 @@ pub mod processor {
                 expect_writable(source_ledger_ai)?;
                 expect_owner(source_ledger_ai, program_id)?;
                 // GH#571: nothing accrues once the market is not Live (gate closed); the settled
-                // arrears stay in the claim and are paid from the pots' surplus below.
-                bond_settle_coupon_to(&mut t, now, false, false)?;
+                // coupon stays in `K` and is paid from the pots' surplus below.
+                bond_settle_coupon_to(&mut t, &st, now, false, false)?;
                 bond_withdraw_resolved_core(
                     accounts,
                     &registry,
@@ -43073,13 +43139,14 @@ pub mod processor {
             )?;
         }
         let total = t.b_shares_total;
-        // GH#571: remove the redeemed shares' pro-rata slice of the FULL claim `C_b + A` (the
-        // payout above when whole); the remaining holders keep exactly their own arrears.
-        let (c_b, arrears) =
-            bond_v20::bond_claims_after_redemption(t.c_b_atoms, t.coupon_arrears_atoms, shares, total)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-        t.c_b_atoms = c_b;
-        t.coupon_arrears_atoms = arrears;
+        // GH#571: remove the redeemed shares' pro-rata slice `floor(sh * K / B)` of the claim (the
+        // payout above when whole). The receivable `R` is NOT touched (att649 F1): an exit never
+        // cancels what the fee legs owe the junior, so a deposit/redeem round trip is neutral.
+        t.c_b_atoms = bond_v20::bond_claim_after_redemption(t.c_b_atoms, shares, total)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        // the cap meter leaves with the shares (the stayers' per-share headroom is unchanged)
+        t.coupon_unfunded_atoms = bond_v20::coupon_meter_after_redemption(t.coupon_unfunded_atoms, shares, total)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
         t.b_shares_total = total
             .checked_sub(shares)
             .ok_or(PercolatorError::EngineCounterUnderflow)?;
@@ -43087,7 +43154,7 @@ pub mod processor {
             t.principal_in_lp_atoms = t.principal_in_lp_atoms.saturating_sub(payout);
         }
         // GH#571: the checkpoint was moved by the settlement above, after the accrual up to now
-        // was carried into the arrears (Live) -- nothing earned is forfeited.
+        // was settled into `K` (Live) -- nothing earned is forfeited.
         t.bond_drawn_outstanding_atoms = if t.c_b_atoms == 0 { 0 } else { impairment };
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         pos.shares = pos
@@ -43100,7 +43167,7 @@ pub mod processor {
         // vault LP's capital does, and the halt compares that capital against T live).
         let _ = (&registry, &registry_pda, &st);
         solana_program::log::sol_log(&alloc::format!(
-            "bond_withdraw shares={} payout={} c_b={} arrears={} b={} impairment={}",
+            "bond_withdraw shares={} payout={} k={} receivable={} b={} impairment={}",
             shares, payout, t.c_b_atoms, t.coupon_arrears_atoms, t.b_shares_total, impairment
         ));
         let other = if live { (0, payout) } else { (0, 0) };
@@ -43109,7 +43176,7 @@ pub mod processor {
 
     /// Tag 110 Live value side inside one market borrow. `args = [shares, min_out,
     /// max_market_slots, now]`. Returns `(payout, impairment observed)`. SETTLES the coupon into
-    /// `t` (GH#571) before the bond is priced on its full claim `C_b + A`.
+    /// `t` (GH#571) before the bond is priced on its whole claim `K`.
     #[inline(never)]
     fn bond_withdraw_live_core<'a>(
         accounts: &'a [AccountInfo<'a>],
@@ -43172,11 +43239,12 @@ pub mod processor {
             bond_v20::vault_value_worse(nav, lp_value, worse),
             st.backstop_outstanding_atoms as u128,
         );
-        // GH#571: settle the accrual up to now into the arrears. Gate (the 78 rule): Live, no
-        // senior draw (halted by the caller), tranche whole incl. `A` at the worse price;
-        // otherwise the interval's accrual is forfeited (M-1) and the settled `A` is kept.
+        // GH#571: settle the accrual up to now. Gate (the 78 rule): Live, no senior draw (halted by
+        // the caller) and none booked since the last settlement, tranche whole at the worse price;
+        // otherwise the interval's accrual is forfeited (M-1 / F2) and everything settled is kept.
+        // The sub-atom remainder stays carried (the leaver forfeits its share of < 1 atom).
         let whole = !bond_v20::bond_impaired(v_worse, c_eff, t.claim_total()?);
-        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0 && whole, true)?;
+        bond_settle_coupon_to(t, st, now as u64, t.c_b_atoms > 0 && whole, false)?;
         let k = t.claim_total()?;
         let bond_value = bond_v20::tranche_split3(v_worse, c_eff, k).bond;
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
@@ -43247,7 +43315,7 @@ pub mod processor {
             return Err(PercolatorError::LpVaultAuthorityMismatch.into());
         }
         let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
-        // GH#571: the bonds' full claim incl. the settled arrears, ahead of the junior (102).
+        // GH#571: the bonds whole claim `K` incl. settled coupon, ahead of the junior (102).
         let k = t.claim_total()?;
         let bond_value = bond_v20::resolved_bond_value(physical, st.senior_claim_atoms, k);
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
