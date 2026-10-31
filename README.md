@@ -668,8 +668,11 @@ cargo test
 # CU benchmark (requires BPF binary)
 cargo test --release --test cu_benchmark -- --nocapture
 
-# Kani harnesses (requires kani toolchain)
-cargo kani --tests
+# Kani harnesses (requires kani 0.67.0; run locally, never in PR CI). Full list, flags,
+# sub-crates and the nightly workflow: docs/KANI.md
+cargo kani --lib --features devnet -Z stubbing
+cargo kani --tests --features devnet -Z stubbing -Z function-contracts
+(cd kani/growth && cargo kani -Z stubbing -Z function-contracts)   # also kani/contlev, kani/p3, kani/p3-engine
 ```
 
 ---

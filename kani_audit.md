@@ -1,5 +1,9 @@
 # Kani proof audit — percolator-prog (81 harnesses)
 
+> **Historical (note added 2026-10-31).** This audit describes the 81 harnesses of `tests/kani.rs`, which no
+> longer exists in this tree. Current harness set, commands (`--features devnet`, `-Z stubbing`,
+> `-Z function-contracts`) and the latest verdicts: `docs/KANI.md`.
+
 Status: **81 / 81 SUCCESSFUL** (`cargo kani --tests -j`, 11m05s).
 
 Each proof was read and classified along two axes:

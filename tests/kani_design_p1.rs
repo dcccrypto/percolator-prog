@@ -6,7 +6,8 @@
 //! functions directly (no copies of processor glue); domains are the ENGINE's own bounds or
 //! full width; specs are written independently of the implementation; every meaningful branch
 //! has a `kani::cover!`; each harness has a planned mutation that must turn it red.
-//! Run locally only: cargo kani --tests --exact --harness <name>
+//! Run locally only: cargo kani --tests --features devnet -Z stubbing -Z function-contracts --exact --harness <name>
+//! (`--features devnet` is required: without it tests/common/mod.rs fails E0425 on STAKE_PROGRAM_ID; docs/KANI.md)
 #![cfg(kani)]
 
 extern crate kani;

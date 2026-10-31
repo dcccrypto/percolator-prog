@@ -614,7 +614,7 @@ pub fn decode_depth_mode(mode: u8, depth_e6: u64) -> Option<DepthMode> {
 }
 
 /// Kani harnesses (R2.1 item 4). WRITTEN, NOT RUN in this change (run locally, one at a time:
-/// `cargo kani --harness <name>`). Inputs are bounded (u32 reserves, symbolic keys); the
+/// `cargo kani --lib --features devnet -Z stubbing --harness <name>`; docs/KANI.md). Inputs are bounded (u32 reserves, symbolic keys); the
 /// full-width claims are the proptests in `tests/v22_dex_depth.rs` (neither alone is the claim).
 #[cfg(kani)]
 mod kani_proofs {
