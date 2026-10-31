@@ -12,7 +12,7 @@
 //!   claim compounds at the coupon rate over every settled interval; nobody ever reads `K / B`).
 //!   No excess either way beyond the stated rounding bound.
 //!
-//! Negative controls: the mutants in `scripts/v22-bond-mutants.sh` (M571a..M571d) must make this
+//! Negative controls: the mutants in `scripts/v22-bond-mutants.sh` (M571a..M571g) must make this
 //! file FAIL.
 
 use percolator_prog::bond_v20::*;
@@ -77,7 +77,9 @@ proptest! {
     /// Redemption slices the full claim; remaining per-share claim never falls; the C_b slice is
     /// exactly the pre-#571 slice; C_b == 0 <=> B == 0 and B == 0 => A == 0 survive.
     #[test]
-    fn redemption_slices_the_full_claim(cb in 1u128..=SPL, a in 0u128..=SPL / 4, b in 1u128..=SPL, sh_frac in 0u128..=1_000_000) {
+    fn redemption_slices_the_full_claim(cb in 1u128..=SPL, a0 in 0u128..=SPL / 4, b in 1u128..=SPL, sh_frac in 0u128..=1_000_000) {
+        // domain: the claim fits the token supply, K <= u64::MAX (see the fn doc)
+        let a = a0.min(SPL - cb);
         let sh = b / 1_000_000 * sh_frac + (b % 1_000_000) * sh_frac / 1_000_000;
         let (cb2, a2) = bond_claims_after_redemption(cb, a, sh, b).unwrap();
         let k = cb + a;
@@ -100,7 +102,14 @@ proptest! {
     #[test]
     fn redemption_rejects_bad_inputs(cb in any::<u64>(), a in any::<u64>(), sh in any::<u64>(), b in any::<u64>()) {
         let r = bond_claims_after_redemption(cb as u128, a as u128, sh as u128, b as u128);
-        if b == 0 || sh > b { prop_assert!(r.is_none()); } else { prop_assert!(r.is_some()); }
+        if b == 0 || sh > b {
+            prop_assert!(r.is_none());
+        } else if cb as u128 + a as u128 <= SPL {
+            prop_assert!(r.is_some());
+        } else {
+            // a claim above the token supply: fails closed exactly when sh * K overflows u128
+            prop_assert_eq!(r.is_none(), (sh as u128).checked_mul(cb as u128 + a as u128).is_none());
+        }
     }
 }
 
@@ -130,10 +139,19 @@ impl Pool {
     fn k(&self) -> u128 {
         bond_claim_total(self.cb, self.a).unwrap()
     }
-    fn settle(&mut self, now: u64) {
+    /// `may_hold`: tags 78 / 110 hold the checkpoint on a sub-atom interval
+    /// (`coupon_checkpoint_moves`); tag 108 always moves it.
+    fn settle_h(&mut self, now: u64, may_hold: bool) {
         let k = self.k();
-        self.a = coupon_settle(self.cb, self.a, self.rate, now - self.t0, self.cb > 0, k).unwrap();
-        self.t0 = now;
+        let before = self.a;
+        self.a = coupon_settle(self.cb, before, self.rate, now - self.t0, self.cb > 0, k).unwrap();
+        let cap = coupon_arrears_cap(self.cb, self.rate).unwrap();
+        if !may_hold || coupon_checkpoint_moves(self.cb > 0, before, self.a, cap) {
+            self.t0 = now;
+        }
+    }
+    fn settle(&mut self, now: u64) {
+        self.settle_h(now, false)
     }
     /// tag 108 (settle, price at K, credit principal). Returns shares minted (0 = refused).
     fn deposit(&mut self, now: u64, amount: u128) -> u128 {
@@ -148,7 +166,7 @@ impl Pool {
     }
     /// tag 78 with a leg of `leg` atoms. Returns the coupon credited.
     fn crank(&mut self, now: u64, leg: u128) -> u128 {
-        self.settle(now);
+        self.settle_h(now, true);
         let (coupon, _rest, a2) = coupon_pay_from_leg(leg, self.a);
         self.cb += coupon;
         self.a = a2;
@@ -156,7 +174,7 @@ impl Pool {
     }
     /// tag 110 (settle, pay the whole-tranche value of `sh`, slice the full claim).
     fn redeem(&mut self, now: u64, sh: u128) -> u128 {
-        self.settle(now);
+        self.settle_h(now, true);
         let pay = bond_atoms_for_redemption(sh, self.b, self.k()).unwrap();
         let (cb, a) = bond_claims_after_redemption(self.cb, self.a, sh, self.b).unwrap();
         self.cb = cb;
@@ -328,4 +346,72 @@ proptest! {
         prop_assert!(paid <= dust_leg as u128 / 2);
         prop_assert_eq!(g2.k(), clean.k(), "the claim survives the dust crank exactly");
     }
+}
+
+// ── Grinding and rounding direction ──────────────────────────────────────────────────────
+
+proptest! {
+    #![proptest_config(ProptestConfig::with_cases(2_000))]
+
+    /// A permissionless crank EVERY `step` slots (dust legs) on a small tranche cannot grind the
+    /// coupon away: the checkpoint holds while an interval floors to 0, so the arrears after
+    /// `n` cranks are within one atom per checkpoint move of the single-settlement accrual.
+    /// Without the hold (every crank moves the checkpoint) a tranche whose per-step accrual is
+    /// below one atom earns NOTHING.
+    #[test]
+    fn crank_every_slot_cannot_grind_the_coupon(c in 1_000u64..=400_000_000, rate in 1u32..=2_000, step in 1u64..=50, n in 1u64..=400) {
+        let mut ground = Pool { rate, ..Default::default() };
+        ground.deposit(0, c as u128);
+        let mut moves = 0u128;
+        for i in 1..=n {
+            let t0 = ground.t0;
+            ground.crank(i * step, 0);
+            if ground.t0 != t0 { moves += 1; }
+        }
+        let mut once = Pool { rate, ..Default::default() };
+        once.deposit(0, c as u128);
+        once.crank(n * step, 0);
+        // the unsettled tail since the held checkpoint is still owed (settled at the next point)
+        ground.settle(n * step);
+        prop_assert!(ground.a <= once.a + 1 + once.a / 1_000, "never more than compounding: {} vs {}", ground.a, once.a);
+        prop_assert!(ground.a + moves + 1 >= once.a, "at most one atom lost per settlement that moves: {} + {} vs {}", ground.a, moves, once.a);
+        // the checkpoint only moves on an interval worth >= 1 atom, and floor(x) >= x / 2 there:
+        // the ground total is at least half the single-settlement accrual (the no-hold mutant
+        // earns 0 and fails this whenever `once.a >= 2`)
+        prop_assert!(moves <= ground.a, "moves {} only on >= 1 atom intervals (a {})", moves, ground.a);
+        prop_assert!(2 * ground.a + 1 >= once.a, "grind: {} vs {}", ground.a, once.a);
+    }
+
+    /// Rounding is always against the actor: the 108 newcomer never receives shares worth more
+    /// than it paid; the 110 leaver is never paid more than the claim it gives up, and the claim
+    /// removed is at least the payout; the 78 coupon never exceeds A or half the leg; one
+    /// settlement never credits more than the exact (real) accrual.
+    #[test]
+    fn rounding_is_against_the_actor(cb in 1u128..=SPL, a in 0u128..=SPL / 4, b in 1u128..=SPL, d in 1u128..=SPL, sh_frac in 0u128..=1_000_000, leg in any::<u64>(), rate in 0u32..=2_000, dt in 0u64..=Y) {
+        let k = cb + a;
+        // 108: m * K <= d * B (the newcomer pays at least K / B per share)
+        let m = bond_shares_for_deposit(d, b, k).unwrap();
+        prop_assert!(mul(m, k) <= mul(d, b));
+        // 110: pay * B <= sh * K, removed claim >= pay
+        let sh = b * sh_frac / 1_000_000;
+        let pay = bond_atoms_for_redemption(sh, b, k).unwrap();
+        prop_assert!(mul(pay, b) <= mul(sh, k));
+        let (cb2, a2) = bond_claims_after_redemption(cb, a, sh, b).unwrap();
+        prop_assert!(k - (cb2 + a2) >= pay);
+        // 78
+        let (coupon, rest, a3) = coupon_pay_from_leg(leg as u128, a);
+        prop_assert!(coupon <= a && coupon <= leg as u128 / 2 && coupon + rest == leg as u128 && a3 == a - coupon);
+        // settlement: accrued * D <= K * rate * dt (floor)
+        let a4 = coupon_settle(cb, a, rate, dt, true, k).unwrap();
+        prop_assert!(mul(a4 - a, 10_000 * SLOTS_PER_YEAR) <= mul(k, rate as u128 * dt as u128));
+    }
+}
+
+/// The hold rule itself: moves unless (open, nothing accrued, below the cap).
+#[test]
+fn checkpoint_hold_rule() {
+    assert!(coupon_checkpoint_moves(false, 5, 5, 100), "closed: always moves (forfeit)");
+    assert!(coupon_checkpoint_moves(true, 5, 6, 100), "accrued: moves");
+    assert!(!coupon_checkpoint_moves(true, 5, 5, 100), "open, floored to 0: holds");
+    assert!(coupon_checkpoint_moves(true, 100, 100, 100), "at the cap: moves (accrual forfeited)");
 }

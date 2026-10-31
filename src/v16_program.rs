@@ -34328,15 +34328,23 @@ pub mod processor {
         let u_eff = if u_now < t.last_util_bps { u_now } else { t.last_util_bps };
         // GH#571: settle the interval into the arrears (gate closed: forfeited, `A` kept), then
         // pay `min(A, leg / 2)`; the unpaid rest of `A` is carried, never forfeited.
+        let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff);
         let due = bond_v20::coupon_settle(
             t.c_b_atoms,
             t.coupon_arrears_atoms,
-            bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff),
+            rate,
             now.saturating_sub(t.last_coupon_slot),
             open,
             bond_value,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // A sub-atom interval HOLDS the checkpoint (no grinding the coupon away by cranking).
+        let moves = bond_v20::coupon_checkpoint_moves(
+            open,
+            t.coupon_arrears_atoms,
+            due,
+            bond_v20::coupon_arrears_cap(t.c_b_atoms, rate).ok_or(PercolatorError::EngineArithmeticOverflow)?,
+        );
         let (coupon, rest, arrears) = if open {
             bond_v20::coupon_pay_from_leg(available, due)
         } else {
@@ -34350,7 +34358,7 @@ pub mod processor {
         t.coupon_paid_total_atoms = t
             .coupon_paid_total_atoms
             .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
-        if now > t.last_coupon_slot {
+        if moves && now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
         t.last_util_bps = u_now;
@@ -42233,18 +42241,25 @@ pub mod processor {
     /// (off tag 78: base rate, nothing is paid) and move the checkpoint to `now` (never back).
     /// `open == false` forfeits the interval's accrual (M-1, unchanged) but keeps settled arrears.
     #[inline(never)]
-    fn bond_settle_coupon_to(t: &mut state::BondTrancheV20, now: u64, open: bool) -> ProgramResult {
+    fn bond_settle_coupon_to(t: &mut state::BondTrancheV20, now: u64, open: bool, may_hold: bool) -> ProgramResult {
         let k = t.claim_total()?;
+        let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, 0);
+        let before = t.coupon_arrears_atoms;
         t.coupon_arrears_atoms = bond_v20::coupon_settle(
             t.c_b_atoms,
-            t.coupon_arrears_atoms,
-            bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, 0),
+            before,
+            rate,
             now.saturating_sub(t.last_coupon_slot),
             open,
             k,
         )
         .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        if now > t.last_coupon_slot {
+        // `may_hold` (tag 110): a sub-atom interval holds the checkpoint, so the LEAVER forfeits
+        // its fraction and the stayers keep theirs. Tag 108 always moves (rounding against the
+        // newcomer: it must not share the incumbents' unsettled interval).
+        let cap = bond_v20::coupon_arrears_cap(t.c_b_atoms, rate).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let moves = !may_hold || bond_v20::coupon_checkpoint_moves(open, before, t.coupon_arrears_atoms, cap);
+        if moves && now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
         Ok(())
@@ -42489,7 +42504,7 @@ pub mod processor {
         // whole incl. `A` at the worse price, just checked), so the base is `C_b + A`. Rate: the
         // base rate (the utilisation term is `min(u_last, u_now)` and counts as 0 off tag 78,
         // toward the seniors; the bonus is forced 0 by L-2 anyway).
-        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0)?;
+        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0, false)?;
         let k = t.claim_total()?;
         // The settled claim must itself be covered at the worse price: a deposit never buys into
         // arrears the vault cannot back.
@@ -42692,7 +42707,7 @@ pub mod processor {
                 expect_owner(source_ledger_ai, program_id)?;
                 // GH#571: nothing accrues once the market is not Live (gate closed); the settled
                 // arrears stay in the claim and are paid from the pots' surplus below.
-                bond_settle_coupon_to(&mut t, now, false)?;
+                bond_settle_coupon_to(&mut t, now, false, false)?;
                 bond_withdraw_resolved_core(
                     accounts,
                     &registry,
@@ -42823,7 +42838,7 @@ pub mod processor {
         // senior draw (halted by the caller), tranche whole incl. `A` at the worse price;
         // otherwise the interval's accrual is forfeited (M-1) and the settled `A` is kept.
         let whole = !bond_v20::bond_impaired(v_worse, c_eff, t.claim_total()?);
-        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0 && whole)?;
+        bond_settle_coupon_to(t, now as u64, t.c_b_atoms > 0 && whole, true)?;
         let k = t.claim_total()?;
         let bond_value = bond_v20::tranche_split3(v_worse, c_eff, k).bond;
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)

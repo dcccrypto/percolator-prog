@@ -11,5 +11,9 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[features]
+# Negative controls: run_mutants.sh writes mutants/bond_v20_mutant.rs.
+bond_mutant = []
+
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

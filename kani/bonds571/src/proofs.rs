@@ -135,8 +135,9 @@ fn kani_571_newcomer_neutral_within_rounding() {
     let (cb1, a1) = (cb + d, a);
     let k1 = cb1 + a1;
     let a2 = coupon_settle(cb1, a1, rate, dt as u64, true, k1).unwrap();
-    // the cap does not bind (its effect is pro rata on every share; covered separately)
-    kani::assume(a2 == a1 + coupon_due(k1, rate, dt as u64).unwrap());
+    // the cap does not bind (its effect is pro rata on every share; covered separately). Stated
+    // without reference to the accrual base, so a wrong base cannot hide behind the assumption.
+    kani::assume(a2 < coupon_arrears_cap(cb1, rate).unwrap());
     let k2 = cb1 + a2;
     let bt = b + m;
     let growth = rate as u128 * dt as u128; // r dt = growth / D
@@ -145,4 +146,68 @@ fn kani_571_newcomer_neutral_within_rounding() {
     // incumbents: b * k2 / bt >= k * (D + growth) / D - 1
     assert!(b * k2 * D + bt * D >= bt * k * (D + growth));
     kani::cover!(a > 0 && growth > 0 && a2 > a1, "carried arrears + new accrual");
+}
+
+/// The read-only junior gates (97 / 103) reserve `claim_upper_bound_at`: a settlement at the
+/// MAXIMUM rate (full utilisation bonus), gate assumed open, base = the full claim. Every real
+/// settlement (78 at `min(u_last, u_now)`, 108 / 110 at utilisation 0, any gate state, any
+/// coupon base `min(K, value)`) is at most that bound, so the junior can never withdraw value
+/// the next settlement hands to the bonds.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_571_junior_gate_bound_dominates_every_settlement() {
+    let cb: u8 = kani::any();
+    let a: u8 = kani::any();
+    let base: u16 = kani::any();
+    let bonus: u16 = kani::any();
+    let u: u16 = kani::any();
+    kani::assume(base <= 2_000 && bonus <= 2_000 && u as u128 <= crate::vault_lp_v18::BPS);
+    let value: u8 = kani::any();
+    let dt: u32 = kani::any();
+    let open: bool = kani::any();
+    let (cb, a) = (cb as u128, a as u128);
+    let r_real = bond_coupon_rate_bps(base, bonus, u);
+    let r_max = bond_coupon_rate_bps(base, bonus, crate::vault_lp_v18::BPS as u16);
+    assert!(r_real <= r_max);
+    kani::assume(r_max <= 4_000);
+    let real = coupon_settle(cb, a, r_real, dt as u64, open, value as u128).unwrap();
+    let bound = coupon_settle(cb, a, r_max, dt as u64, cb > 0, cb + a).unwrap();
+    // `cb == 0` (empty tranche) has `a == 0` and nothing to bound
+    if cb > 0 {
+        assert!(real <= bound);
+    }
+    kani::cover!(cb > 0 && open && real > a && real < bound, "strictly inside the bound");
+    kani::cover!(cb > 0 && open && real == bound && real > a, "bound tight");
+}
+
+/// The checkpoint hold rule (tags 78 / 110): the checkpoint stays put ONLY on an open-gate
+/// interval that settled 0 atoms below the cap; holding loses nothing (the held interval is
+/// settled in full later: monotone in time); a closed gate always moves (M-1 forfeit).
+#[kani::proof]
+#[kani::solver(cadical)]
+fn kani_571_checkpoint_hold_rule() {
+    let cb: u8 = kani::any();
+    let a: u8 = kani::any();
+    let rate: u16 = kani::any();
+    kani::assume(rate <= 2_000);
+    let dt: u32 = kani::any();
+    let more: u32 = kani::any();
+    let open: bool = kani::any();
+    let (cb, a) = (cb as u128, a as u128);
+    let cap = coupon_arrears_cap(cb, rate as u32).unwrap();
+    let a1 = coupon_settle(cb, a, rate as u32, dt as u64, open, cb + a).unwrap();
+    let moves = coupon_checkpoint_moves(open, a, a1, cap);
+    if !moves {
+        assert!(open && a1 == a && a < cap);
+        // held: the later settlement over the WHOLE interval is >= the moved alternative
+        let held = coupon_settle(cb, a, rate as u32, dt as u64 + more as u64, true, cb + a).unwrap();
+        let moved = coupon_settle(cb, a1, rate as u32, more as u64, true, cb + a1).unwrap();
+        assert!(held >= moved);
+        kani::cover!(held > moved, "the hold recovers a sub-atom accrual");
+    }
+    if !open {
+        assert!(moves);
+    }
+    kani::cover!(!moves && dt > 0, "holds on a sub-atom interval");
+    kani::cover!(moves && open && a1 > a, "moves on an accruing interval");
 }

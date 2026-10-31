@@ -280,6 +280,13 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 // * Settlement points: tag 78 (then pays `min(A, leg / 2)`, M-2 unchanged), tag 108 and tag 110
 //   (accrue to now, pay nothing: the fee leg is harvested before either runs). None of them
 //   forfeits settled arrears, so a 1-atom deposit or a dust-trade crank cannot wipe the coupon.
+//   Tags 78 / 110 HOLD the checkpoint when an open-gate interval floors to 0 atoms
+//   (`coupon_checkpoint_moves`), so cranking every slot cannot grind a small tranche's coupon to
+//   0. Tag 108 always moves it (the newcomer never shares the incumbents' unsettled interval).
+// * Rounding: always against the actor. 108 mints `floor(d * B / K)`; 110 pays
+//   `floor(sh * layer(K) / B)` and removes `floor(sh * K / B)` of claim (the stayers keep the
+//   remainder); 78 pays `min(A, floor(leg / 2))`; accrual is floored (the bonds lose < 1 atom
+//   per settlement, never more, because of the hold).
 // * Seniority: `A` sits in the bond layer of `tranche_split3`, i.e. JUNIOR to the Earn seniors
 //   and to the G9 backstop, SENIOR to the junior (creator) tranche and its cushion. Unpaid
 //   arrears therefore reduce the junior's residual (tags 97 / 102 / 103, the G6 cushion level)
@@ -407,6 +414,16 @@ pub fn coupon_settle(
     Some(if a < ceiling { a } else { ceiling })
 }
 
+/// GH#571: does a settlement move the coupon checkpoint to "now"? `false` (HOLD the checkpoint)
+/// only when the gate was open, the floor of the interval's accrual was 0 and the cap was not
+/// binding: otherwise a crank every few slots on a small tranche floors every interval to 0 and
+/// grinds the coupon away. Holding carries the sub-atom accrual into the next settlement.
+/// Gate closed: always moves (the interval is forfeited, M-1). Tag 108 never holds: a newcomer
+/// must not share the incumbents' unsettled interval (it always moves, rounding against it).
+pub fn coupon_checkpoint_moves(open: bool, arrears_before: u128, arrears_after: u128, cap: u128) -> bool {
+    !open || arrears_after != arrears_before || arrears_before >= cap
+}
+
 /// GH#571, tag 78: pay the settled arrears `A` off the top of one fee leg.
 /// Returns `(coupon, rest, A - coupon)`; `coupon + rest == available`, `coupon <= A`,
 /// `coupon <= floor(available / 2)` (M-2).
@@ -420,7 +437,9 @@ pub fn coupon_pay_from_leg(available: u128, arrears: u128) -> (u128, u128, u128)
 /// is whole), split as `C_b` slice `floor(shares * C_b / B)` (exactly the pre-#571 slice) and the
 /// arrears slice = the rest (`<= A`). Redeeming every share leaves `(0, 0)`; any other redemption
 /// leaves `C_b' > 0` (`C_b == 0 <=> B == 0` holds). Every remaining share's claim is
-/// non-decreasing. `None` (fail closed) on `B == 0`, `shares > B` or overflow.
+/// non-decreasing. `None` (fail closed) on `B == 0`, `shares > B` or overflow; `shares * K`
+/// fits u128 whenever `K <= u64::MAX` (a claim within the token supply, since `shares <= B`
+/// and `B` is bounded by the atoms ever deposited at a price `K / B >= 1`).
 pub fn bond_claims_after_redemption(
     bond_principal: u128,
     arrears: u128,
