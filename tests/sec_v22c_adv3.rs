@@ -1839,7 +1839,16 @@ impl Env {
     }
 
     fn tranche(&self) -> state::BondTrancheV20 {
-        state::read_bond_tranche(&self.svm.get_account(&self.tranche_key()).unwrap().data).unwrap()
+        let mut d = self.svm.get_account(&self.tranche_key()).unwrap().data;
+        // GH#571 negative controls (`P1_WRAPPER_SO=<base .so>`): a v1 (128 B body) account is
+        // read as v2 with zero arrears, so the control fails on the economics, not on the parse.
+        let full = state::bond_tranche_account_len();
+        if d.len() < full {
+            let h = full - core::mem::size_of::<state::BondTrancheV20>();
+            d.resize(full, 0);
+            d[h + 114] = percolator_prog::constants::BOND_TRANCHE_VERSION;
+        }
+        state::read_bond_tranche(&d).unwrap()
     }
 
     fn bond_pos(&self, h: &BondHolder) -> state::BondPositionV20 {

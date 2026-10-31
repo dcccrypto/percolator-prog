@@ -243,8 +243,14 @@ gh571_junior_cannot_withdraw_the_bonds_accrual_and_arrears_cap_at_one_year
 gh571_dust_trade_crank_carries_instead_of_forfeiting
   # MB571d: 78 always moves the checkpoint (no hold): a crank every slot grinds the coupon to 0.
   run_bpf MB571d_78_no_checkpoint_hold $W \
-'        if moves && now > t.last_coupon_slot {' \
-'        if (moves || true) && now > t.last_coupon_slot {' \
+'        if moves && now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.last_util_bps = u_now;' \
+'        if (moves || true) && now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        t.last_util_bps = u_now;' \
 gh571_crank_every_slot_cannot_grind_the_coupon
   # MB571e: 78 accrues whatever the gate says (drawn / impaired tranche still earns coupon).
   run_bpf MB571e_78_accrues_through_closed_gate $W \

@@ -355,8 +355,8 @@ pub fn coupon_gate_open(live: bool, bond_claim: u128, senior_draw_outstanding: u
 
 /// The claim the coupon accrues on: `min(bond_claim, bond value)` (security review M-1; equals the
 /// explicit model's written-down principal). GH#571: `bond_claim = K = C_b + A`, and with the gate
-/// above the base is `K` whenever anything accrues; kept separate so the base can never exceed the bond's value even if the gate is
-/// relaxed later.
+/// above the base is `K` whenever anything accrues; kept separate so the base can never exceed
+/// the bond's value even if the gate is relaxed later.
 pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
     if bond_value < bond_claim {
         bond_value

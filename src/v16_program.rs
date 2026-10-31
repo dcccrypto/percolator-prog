@@ -7225,8 +7225,10 @@ pub mod state {
         /// bond instruction priced the tranche. Nothing prices off it.
         pub bond_drawn_outstanding_atoms: u128, // 80..96
         /// Coupon accrual checkpoint: every slot up to it is SETTLED into
-        /// `coupon_arrears_atoms` (gate open) or was forfeited (gate closed). Moved to "now" by
-        /// every settlement (tags 78 / 108 / 110); moving it never drops settled arrears (GH#571).
+        /// `coupon_arrears_atoms` (gate open) or was forfeited (gate closed). Moved to "now" by a
+        /// settlement (tags 78 / 108 / 110) except that 78 / Live 110 HOLD it when an open-gate
+        /// interval floored to 0 atoms below the cap (`bond_v20::coupon_checkpoint_moves`, no
+        /// grinding). Moving it never drops settled arrears (GH#571).
         pub last_coupon_slot: u64, // 96..104
         pub coupon_bps_per_year: u16,   // 104..106
         pub coupon_util_bonus_bps: u16, // 106..108
