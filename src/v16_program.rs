@@ -15715,7 +15715,12 @@ pub mod processor {
             }
             _ => None,
         };
-        process_instruction_dispatch(program_id, accounts, instruction_data)?;
+        let ix = Instruction::decode(instruction_data)?;
+        // port135 (upstream 0c5d4f4f, att645 F1/F1b): the instruction-level out-of-matcher
+        // position sweep. See `out_of_matcher_sweep_snapshot`.
+        let sweep = out_of_matcher_sweep_snapshot(program_id, accounts, &ix);
+        dispatch_decoded(program_id, accounts, ix)?;
+        out_of_matcher_sweep_apply(accounts, sweep)?;
         if let Some(before) = reserve {
             resolved_receipt_reserve_check(program_id, accounts, &before)?;
         }
@@ -15833,13 +15838,122 @@ pub mod processor {
         }
     }
 
+    /// Nested dispatch (EvictAndTradeCpi's inner TradeCpi): decode, then `dispatch_decoded`.
+    /// The out-of-matcher sweep runs once, in the outer `process_instruction`.
     #[inline(never)]
     fn process_instruction_dispatch<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        match Instruction::decode(instruction_data)? {
+        dispatch_decoded(program_id, accounts, Instruction::decode(instruction_data)?)
+    }
+
+    /// port135: the instructions that apply their OWN position-episode / matcher policy and are
+    /// therefore excluded from the instruction-level out-of-matcher sweep. Each one's dispatch
+    /// arm is wrapped in `with_matcher_invalidations` (and, for forced-close victims,
+    /// `with_position_epoch_bumps`); pinned by `tests/port135_position_sweep_guard.rs`.
+    /// - the trade family: a fill through a portfolio's OWN configured matcher keeps its
+    ///   capability, every other side is invalidated WITHOUT an epoch bump (AUD-S1-23: trades
+    ///   do not advance `position_epoch` in this fork);
+    /// - the owner's own position-bound exits (RebalanceReduce, ForfeitRecoveryLeg): invalidated
+    ///   without a bump (D2);
+    /// - the band forced closes (SweepBandDustLeg, EvictAndTradeCpi, LevGuard OP_LP_STOP):
+    ///   victims per AUD-S1-23, the vault LP / taker invalidated.
+    /// Every OTHER instruction is swept: whatever handler or helper moved a writable portfolio's
+    /// position vector (an engine Refresh clearing a side-reset leg, a liquidation, a wind-down,
+    /// a resolved close, ...), it did so outside that portfolio's matcher.
+    pub(crate) fn instruction_manages_own_position_policy(ix: &Instruction) -> bool {
+        match ix {
+            Instruction::TradeNoCpi { .. }
+            | Instruction::TradeCpi { .. }
+            | Instruction::BatchTradeNoCpi { .. }
+            | Instruction::BatchTradeCpi { .. }
+            | Instruction::EvictAndTradeCpi { .. }
+            | Instruction::SweepBandDustLeg { .. }
+            | Instruction::RebalanceReduce { .. }
+            | Instruction::ForfeitRecoveryLeg { .. } => true,
+            Instruction::LevGuard { op, .. } => *op == crate::lev_guard_v22::OP_LP_STOP,
+            _ => false,
+        }
+    }
+
+    /// port135 (ADOPT upstream `0c5d4f4f`, structural form; att645 F1/F1b): before an instruction
+    /// that does not manage its own position policy, snapshot `(position_epoch, position vector)`
+    /// of every distinct writable, program-owned portfolio account it was given. Upstream bumps
+    /// (and so invalidates) at each out-of-matcher mutation site; this fork has many more such
+    /// sites (vault-LP draws, Earn flows, bond flows, rent, backstop, ...) that run the engine
+    /// Refresh, which can clear a side-reset leg. Checking at the instruction boundary covers
+    /// all of them, and any future handler, without a per-site wrapper.
+    #[inline(never)]
+    fn out_of_matcher_sweep_snapshot(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo<'_>],
+        ix: &Instruction,
+    ) -> Vec<(usize, u64, PositionVector)> {
+        let mut out = Vec::new();
+        if instruction_manages_own_position_policy(ix) {
+            return out;
+        }
+        for (i, ai) in accounts.iter().enumerate() {
+            if ai.owner != program_id || !ai.is_writable {
+                continue;
+            }
+            if accounts[..i].iter().any(|prev| prev.key == ai.key) {
+                continue;
+            }
+            let Ok(data) = ai.try_borrow_data() else {
+                continue;
+            };
+            let Some(vector) = state::portfolio_position_vector(&data) else {
+                continue;
+            };
+            let Ok(epoch) = state::read_portfolio_position_epoch(&data) else {
+                continue;
+            };
+            out.push((i, epoch, vector));
+        }
+        out
+    }
+
+    /// port135: after the instruction succeeded, every swept portfolio whose position vector
+    /// changed and whose `position_epoch` the handler did not already advance gets ONE
+    /// out-of-matcher episode bump: `position_epoch + 1`, and its matcher capability is cleared
+    /// (ENABLED bit + expiry) unless the configured matcher is position-synced
+    /// (`state::bump_portfolio_position_epoch`). A portfolio that no longer decodes (closed) is
+    /// skipped.
+    #[inline(never)]
+    fn out_of_matcher_sweep_apply(
+        accounts: &[AccountInfo<'_>],
+        swept: Vec<(usize, u64, PositionVector)>,
+    ) -> ProgramResult {
+        for (i, epoch_before, before) in swept {
+            let ai = &accounts[i];
+            let bump = {
+                let data = ai.try_borrow_data()?;
+                match (
+                    state::portfolio_position_vector(&data),
+                    state::read_portfolio_position_epoch(&data),
+                ) {
+                    (Some(after), Ok(epoch_now)) => after != before && epoch_now == epoch_before,
+                    _ => false,
+                }
+            };
+            if bump {
+                let mut data = ai.try_borrow_mut_data()?;
+                state::bump_portfolio_position_epoch(&mut data)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn dispatch_decoded<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        ix: Instruction,
+    ) -> ProgramResult {
+        match ix {
             ix @ Instruction::InitMarket { .. } => {
                 dispatch_init_market(program_id, accounts, &ix, None, 0, None)
             }
@@ -15882,14 +15996,12 @@ pub mod processor {
                 lot_exp,
                 Some(phase4),
             ),
-            // port135 (att645 F1): the engine Refresh inside can clear a side-reset leg of the
-            // target (2) or the vault LP (3) outside any matcher; bump + invalidate as the crank.
+            // port135 (att645 F1): its engine Refresh can clear a side-reset leg; covered by the
+            // instruction-level out-of-matcher position sweep (`process_instruction`).
             Instruction::SettleHoldingRent {
                 asset_index,
                 now_slot,
-            } => with_position_epoch_bumps(accounts, &[2, 3], || {
-                handle_settle_holding_rent(program_id, accounts, asset_index, now_slot)
-            }),
+            } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
             // AUD-S1-23: the swept victim's (account 2) position changed without its owner.
             // port135: the bound vault LP (account 3) is the forced close's counterparty, outside
             // its matcher.
@@ -16142,20 +16254,19 @@ pub mod processor {
                 authority_epoch,
             ),
             // port135 (att645 F1): the conditional Refresh can clear a side-reset leg; upstream
-            // bumps here unconditionally (with_one_portfolio_view), the fork bumps on a change.
+            // bumps here unconditionally (with_one_portfolio_view), the fork bumps on a change
+            // through the instruction-level out-of-matcher position sweep.
             Instruction::ConvertReleasedPnl {
                 portfolio_id,
                 position_epoch,
                 amount,
-            } => with_position_epoch_bumps(accounts, &[2], || {
-                handle_convert_released_pnl(
-                    program_id,
-                    accounts,
-                    portfolio_id,
-                    position_epoch,
-                    amount,
-                )
-            }),
+            } => handle_convert_released_pnl(
+                program_id,
+                accounts,
+                portfolio_id,
+                position_epoch,
+                amount,
+            ),
             Instruction::CloseResolved { fee_rate_per_slot } => {
                 handle_close_resolved(program_id, accounts, fee_rate_per_slot)
             }
@@ -16779,13 +16890,10 @@ pub mod processor {
             Instruction::WithdrawJuniorTranche { amount } => {
                 handle_withdraw_junior_tranche(program_id, accounts, amount)
             }
-            // port135 (att645 F1): the vault LP (4) refresh can clear a side-reset leg.
             Instruction::VaultLpRecall {
                 amount,
                 target_domain,
-            } => with_position_epoch_bumps(accounts, &[4], || {
-                handle_vault_lp_recall(program_id, accounts, amount, target_domain)
-            }),
+            } => handle_vault_lp_recall(program_id, accounts, amount, target_domain),
             Instruction::SetVaultLpRisk {
                 asset_index,
                 skew_slope_e9,
@@ -16857,11 +16965,8 @@ pub mod processor {
             Instruction::BondExecuteWithdraw { min_out, source_domain } => {
                 handle_bond_execute_withdraw(program_id, accounts, min_out, source_domain)
             }
-            // port135 (att645 F1): the vault LP (4) full refresh can clear a side-reset leg.
             Instruction::InsuranceBackstopDraw { mode, max_amount } => {
-                with_position_epoch_bumps(accounts, &[4], || {
-                    handle_insurance_backstop_draw(program_id, accounts, mode, max_amount)
-                })
+                handle_insurance_backstop_draw(program_id, accounts, mode, max_amount)
             }
             Instruction::RescueDeposit {
                 tranche,
@@ -16911,11 +17016,8 @@ pub mod processor {
                 amount,
                 source_domain,
             } => handle_vault_lp_release_surplus(program_id, accounts, amount, source_domain),
-            // port135 (att645 F1): the vault LP (3) refresh can clear a side-reset leg.
             Instruction::VaultLpConvertPnl { amount } => {
-                with_position_epoch_bumps(accounts, &[3], || {
-                    handle_vault_lp_convert_pnl(program_id, accounts, amount)
-                })
+                handle_vault_lp_convert_pnl(program_id, accounts, amount)
             }
             Instruction::AdlWindDown {
                 now_slot,
