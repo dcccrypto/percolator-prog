@@ -15,6 +15,9 @@ name: Kani nightly (no-verdict harnesses)
 on:
   schedule:
     - cron: "0 20 * * *"   # 20:00 UTC; two waves of <= 6 h shards finish by ~08:00 UTC
+  push:   # TEMPORARY (registration only; removed in the next commit)
+    branches: [kani/n1-housekeeping-rc23]
+    paths: [.github/workflows/kani-nightly.yml]
   workflow_dispatch:
     inputs:
       harness_timeout:
