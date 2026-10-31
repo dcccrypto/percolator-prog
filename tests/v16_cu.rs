@@ -27517,6 +27517,7 @@ fn v22_leg_above_cap_is_refused_by_trade_instructions() {
             .unwrap_or_else(|e| panic!("TradeNoCpi leg {asset} within the cap must open: {e}"));
     }
     assert_eq!(x1g_legs(&env, long_account), 2);
+    env.port135_reauthorize_after_nocpi(matcher_program, &short_owner, short_account, ctx, delegate);
     let snap = |env: &V16CuEnv| (env.svm.get_account(&env.market).unwrap(), env.svm.get_account(&long_account).unwrap(), env.svm.get_account(&short_account).unwrap());
     let before = snap(&env);
     env.svm.expire_blockhash();
@@ -28093,6 +28094,7 @@ fn v22_p1_fifth_position_is_refused_with_the_position_cap_code() {
     }
     assert_eq!(x1g_legs(&env, long), cap as u32);
     assert_eq!(x1g_legs(&env, short), cap as u32);
+    env.port135_reauthorize_after_nocpi(matcher_program, &short_owner, short, ctx, delegate);
 
     let before = p1_snap(&env, &[long, short]);
     p1_expect_code(p1_trade(&mut env, cap, &long_owner, long, &short_owner, short, P1_LOT), P1_POSITION_CAP, "TradeNoCpi 5th position");
@@ -28321,6 +28323,7 @@ fn v22_p1_at_the_cap_flip_reduce_and_matcher_route() {
         p1_trade(&mut env, asset, &long_owner, long, &short_owner, short, 2 * P1_LOT).expect("open up to the cap");
     }
     assert_eq!(x1g_legs(&env, short), cap as u32);
+    env.port135_reauthorize_after_nocpi(matcher_program, &short_owner, short, ctx, delegate);
 
     // 127 on the matcher route: a fresh taker, the matcher LP at its cap, a new asset.
     let before = p1_snap(&env, &[fresh, short, ctx]);
@@ -28377,6 +28380,7 @@ fn v22_p1_compute_of_the_three_crank_trade_at_the_cap() {
         for asset in 0..cap {
             p1_trade(&mut env, asset, &long_owner, long, &short_owner, short, P1_LOT).expect("open up to the cap");
         }
+        env.port135_reauthorize_after_nocpi(matcher_program, &short_owner, short, ctx, delegate);
         // Traded asset = the LAST leg slot (the longest walk).
         let asset = cap - 1;
         env.svm.expire_blockhash();
@@ -28760,6 +28764,23 @@ impl V16CuEnv {
             ],
             &[owner],
         )
+    }
+
+    /// port135 (upstream 0c5d4f4f): a TradeNoCpi setup fill moved the matcher LP outside its
+    /// matcher, which invalidated its capability. Assert that, then have the LP owner re-sign
+    /// tag 68 (same fee cap) so the test can keep routing through the matcher, as a real LP must.
+    fn port135_reauthorize_after_nocpi(
+        &mut self,
+        matcher_program: Pubkey,
+        owner: &Keypair,
+        portfolio: Pubkey,
+        ctx: Pubkey,
+        delegate: Pubkey,
+    ) {
+        let cfg = self.issue406_matcher_config(portfolio);
+        assert_eq!(cfg.enabled(), 0, "port135: the NoCpi fill invalidated the LP's matcher capability");
+        self.issue406_set_matcher_config(matcher_program, owner, portfolio, ctx, delegate, 1, cfg.trade_fee_cap_bps())
+            .expect("port135: LP owner re-authorizes its matcher");
     }
 
     /// Repeats a crank until the engine reports no further progress (upstream `crank_steps`).

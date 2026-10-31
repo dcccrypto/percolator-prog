@@ -15755,10 +15755,14 @@ pub mod processor {
                 lot_exp,
                 Some(phase4),
             ),
+            // port135 (att645 F1): the engine Refresh inside can clear a side-reset leg of the
+            // target (2) or the vault LP (3) outside any matcher; bump + invalidate as the crank.
             Instruction::SettleHoldingRent {
                 asset_index,
                 now_slot,
-            } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
+            } => with_position_epoch_bumps(accounts, &[2, 3], || {
+                handle_settle_holding_rent(program_id, accounts, asset_index, now_slot)
+            }),
             // AUD-S1-23: the swept victim's (account 2) position changed without its owner.
             // port135: the bound vault LP (account 3) is the forced close's counterparty, outside
             // its matcher.
@@ -16010,17 +16014,21 @@ pub mod processor {
                 amount,
                 authority_epoch,
             ),
+            // port135 (att645 F1): the conditional Refresh can clear a side-reset leg; upstream
+            // bumps here unconditionally (with_one_portfolio_view), the fork bumps on a change.
             Instruction::ConvertReleasedPnl {
                 portfolio_id,
                 position_epoch,
                 amount,
-            } => handle_convert_released_pnl(
-                program_id,
-                accounts,
-                portfolio_id,
-                position_epoch,
-                amount,
-            ),
+            } => with_position_epoch_bumps(accounts, &[2], || {
+                handle_convert_released_pnl(
+                    program_id,
+                    accounts,
+                    portfolio_id,
+                    position_epoch,
+                    amount,
+                )
+            }),
             Instruction::CloseResolved { fee_rate_per_slot } => {
                 handle_close_resolved(program_id, accounts, fee_rate_per_slot)
             }
@@ -16631,10 +16639,13 @@ pub mod processor {
             Instruction::WithdrawJuniorTranche { amount } => {
                 handle_withdraw_junior_tranche(program_id, accounts, amount)
             }
+            // port135 (att645 F1): the vault LP (4) refresh can clear a side-reset leg.
             Instruction::VaultLpRecall {
                 amount,
                 target_domain,
-            } => handle_vault_lp_recall(program_id, accounts, amount, target_domain),
+            } => with_position_epoch_bumps(accounts, &[4], || {
+                handle_vault_lp_recall(program_id, accounts, amount, target_domain)
+            }),
             Instruction::SetVaultLpRisk {
                 asset_index,
                 skew_slope_e9,
@@ -16706,8 +16717,11 @@ pub mod processor {
             Instruction::BondExecuteWithdraw { min_out, source_domain } => {
                 handle_bond_execute_withdraw(program_id, accounts, min_out, source_domain)
             }
+            // port135 (att645 F1): the vault LP (4) full refresh can clear a side-reset leg.
             Instruction::InsuranceBackstopDraw { mode, max_amount } => {
-                handle_insurance_backstop_draw(program_id, accounts, mode, max_amount)
+                with_position_epoch_bumps(accounts, &[4], || {
+                    handle_insurance_backstop_draw(program_id, accounts, mode, max_amount)
+                })
             }
             Instruction::RescueDeposit {
                 tranche,
@@ -16757,8 +16771,11 @@ pub mod processor {
                 amount,
                 source_domain,
             } => handle_vault_lp_release_surplus(program_id, accounts, amount, source_domain),
+            // port135 (att645 F1): the vault LP (3) refresh can clear a side-reset leg.
             Instruction::VaultLpConvertPnl { amount } => {
-                handle_vault_lp_convert_pnl(program_id, accounts, amount)
+                with_position_epoch_bumps(accounts, &[3], || {
+                    handle_vault_lp_convert_pnl(program_id, accounts, amount)
+                })
             }
             Instruction::AdlWindDown {
                 now_slot,
@@ -30851,6 +30868,11 @@ pub mod processor {
         f()?;
         for (k, &i) in idxs.iter().enumerate().take(2) {
             if let Some(ai) = accounts.get(i) {
+                // port135: the same portfolio passed at both indices (e.g. SettleHoldingRent on
+                // the vault LP itself) is bumped once.
+                if k == 1 && idxs.first().and_then(|&j| accounts.get(j)).map(|a| a.key) == Some(ai.key) {
+                    continue;
+                }
                 bump_position_epoch_if_reshaped(ai, before[k].take())?;
             }
         }
