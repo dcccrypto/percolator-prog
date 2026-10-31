@@ -1444,6 +1444,13 @@ impl Env {
                 AccountMeta::new(lp, false),
                 AccountMeta::new(self.ledger, false),
                 AccountMeta::new(self.sibling, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&signer.insecure_clone()],
         )
@@ -1943,6 +1950,8 @@ impl Env {
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
         )
     }
@@ -1989,6 +1998,8 @@ impl Env {
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
         )
     }
@@ -3565,4 +3576,339 @@ fn gh574_tag108_cap_is_read_at_the_worse_for_the_vault_price() {
     err_has(&run(true, 5_700), PercolatorError::BondDepositAboveCap);
     run(true, 5_400).expect("control: inside the worse-price cap too");
     run(false, 5_700).expect("control: no lag, the same deposit is inside the cap");
+}
+// ===================== #636b: LP-stop NAV vs the counter-less value flows (tags 102 / 108 / 110 / 111) =====================
+mod lev_w1 {
+    use super::*;
+    use percolator_prog::lev_guard_v22 as lg;
+
+    pub fn guard_key(env: &Env) -> Pubkey {
+        state::derive_lev_guard(&env.pid, &env.market).0
+    }
+
+    fn ix(op: u8) -> ProgInstruction {
+        ProgInstruction::LevGuard { op, t0: 0, key: [0; 32], report: [0; 4] }
+    }
+
+    /// The upgrade authority (the ProgramData mock points at `admin` after `bind`) binds the guard.
+    pub fn init(env: &mut Env) {
+        let admin = env.admin.insecure_clone();
+        let pd = Pubkey::find_program_address(&[env.pid.as_ref()], &solana_sdk::bpf_loader_upgradeable::id()).0;
+        let (m, g) = (env.market, guard_key(env));
+        env.send(
+            ix(lg::OP_INIT),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new_readonly(pd, false),
+                AccountMeta::new(m, false),
+                AccountMeta::new(g, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+            ],
+            &[&admin],
+        )
+        .expect("guard init");
+    }
+
+    fn base_metas(env: &Env, lp: &Lp) -> Vec<AccountMeta> {
+        vec![
+            AccountMeta::new_readonly(env.admin.pubkey(), false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(guard_key(env), false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new_readonly(env.vault_lp, false),
+            AccountMeta::new_readonly(state::derive_vault_lp_ext(&env.pid, &env.market).0, false),
+        ]
+    }
+
+    pub fn poke(env: &mut Env, lp: &Lp) -> Result<(), String> {
+        env.svm.expire_blockhash(); // LiteSVM replays a byte-identical transaction's old result
+        let metas = base_metas(env, lp);
+        env.send(ix(lg::OP_POKE), metas, &[])
+    }
+
+    pub fn w1(env: &mut Env, lp: &Lp, victims: &[Pubkey]) -> Result<(), String> {
+        env.svm.expire_blockhash(); // LiteSVM replays a byte-identical transaction's old result
+        let mut metas = base_metas(env, lp);
+        for v in victims {
+            metas.push(AccountMeta::new(*v, false));
+        }
+        env.send(ix(lg::OP_LP_STOP), metas, &[])
+    }
+
+    pub fn guard(env: &Env) -> lg::LevGuardV22 {
+        state::read_lev_guard(&env.svm.get_account(&guard_key(env)).unwrap().data).unwrap()
+    }
+
+    /// State poke: the LP portfolio loses `(1 - num/den)` of its capital (a loss as far as the
+    /// NAV index can tell: no flow counter moves). Market totals follow, as `force_capital`.
+    pub fn lose_capital(env: &mut Env, lp: Pubkey, num: u128, den: u128) {
+        let mut market_account = env.svm.get_account(&env.market).unwrap();
+        let mut pd = env.svm.get_account(&lp).unwrap();
+        let (cfg, mut group) = state::read_market(&market_account.data).unwrap();
+        let mut p = state::read_portfolio(&pd.data).unwrap();
+        let old = p.capital;
+        let new = old * num / den;
+        group.c_tot -= old - new;
+        group.vault -= old - new;
+        p.capital = new;
+        p.health_cert.valid = false;
+        state::write_market(&mut market_account.data, &cfg, &group).unwrap();
+        state::write_portfolio(&mut pd.data, &p).unwrap();
+        env.svm.set_account(env.market, market_account).unwrap();
+        env.svm.set_account(lp, pd).unwrap();
+    }
+}
+
+fn a640_world(bond_cap_junior: u64) -> (Env, Lp, BondHolder) {
+    let (mut env, lp, _d, h) = bond_world(growth_params(), 10_000, bond_cap_junior, 0, 800);
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("epoch start");
+    (env, lp, h)
+}
+
+fn a640_show(tag: &str, env: &Env) {
+    let n = lev_w1::guard(env).nav();
+    eprintln!("A640 {tag}: navps {} peak {} ref {} last_equity {} trig {}", n.navps, n.peak(), n.ref_navps, n.last_equity,
+        percolator_prog::lev_guard_v22::lp_stop_triggered(&n));
+}
+
+
+fn n636b_navps(env: &Env) -> u128 {
+    lev_w1::guard(env).nav().navps
+}
+
+fn n636b_stop(env: &Env) -> bool {
+    percolator_prog::lev_guard_v22::lp_stop_triggered(&lev_w1::guard(env).nav())
+}
+
+fn n636b_other(env: &Env) -> (u128, u128) {
+    let x = env.ext().expect("ext");
+    (x.other_in_atoms(), x.other_out_atoms())
+}
+
+/// 108 + 110 are flows. A bond deposit that doubles the LP's equity must leave the index at 1.0;
+/// the round trip (deposit, request, cooldown, execute) must not trip the stop. The flow counters
+/// read exactly the deposit and the payout.
+/// NEGATIVE CONTROL: on the #640 head the deposit reads 2.0 and the withdrawal trips the stop.
+#[test]
+fn n636b_bond_round_trip_is_a_flow_not_pnl() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, h) = a640_world(2_000);
+    env.bond_deposit(&h, lp.portfolio, 2_000 * U, 1).expect("108 doubles the LP equity");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    assert_eq!(n636b_navps(&env), lg::NAV_ONE, "a bond deposit is capital, not profit");
+    assert_eq!(n636b_other(&env), (2_000 * U as u128, 0), "counter = the deposit");
+    env.bond_request(&h, 2_000 * U as u128).expect("109");
+    env.wait_cooldown(&[lp.portfolio]);
+    let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    assert_eq!(n636b_navps(&env), lg::NAV_ONE, "a bond withdrawal is capital, not a loss");
+    assert!(!n636b_stop(&env), "no loss, no stop");
+    assert_eq!(n636b_other(&env), (2_000 * U as u128, paid as u128), "counters = deposit / payout");
+    env.assert_conserved("n636b round trip");
+}
+
+/// A real 60% loss, then a 3,000 bond deposit BEFORE the next poke: the loss is read in full and
+/// the stop fires (it did not on the #640 head: index 1.90).
+#[test]
+fn n636b_bond_deposit_cannot_mask_a_real_loss() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, h) = a640_world(2_000);
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    env.bond_deposit(&h, lp.portfolio, 3_000 * U, 1).expect("108 after the loss");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    let n = lev_w1::guard(&env).nav();
+    assert!(n.navps <= lg::NAV_ONE * 45 / 100, "the 60% loss is read in full: {}", n.navps);
+    assert!(lg::lp_stop_triggered(&n), "stop fires");
+}
+
+/// Dilution (mirror image): a big bond deposit first, then a real 60% loss of everything: the
+/// loss is not read against an inflated base.
+#[test]
+fn n636b_bond_deposit_cannot_dilute_a_later_loss() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, h) = a640_world(2_000);
+    env.bond_deposit(&h, lp.portfolio, 3_000 * U, 1).expect("108");
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    let n = lev_w1::guard(&env).nav();
+    assert!(n.navps <= lg::NAV_ONE * 45 / 100, "60% loss read as such: {}", n.navps);
+    assert!(lg::lp_stop_triggered(&n));
+}
+
+/// Tag 102 (surplus release, junior owner): pots -> LP capital is a flow. Index stays 1.0.
+#[test]
+fn n636b_surplus_release_is_a_flow_not_a_gain() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, _h) = a640_world(2_000);
+    let admin = env.admin.insecure_clone();
+    poke_senior_claim(&mut env, 6_000 * U as u128);
+    env.release_surplus(&admin, lp.portfolio, 3_000 * U as u128, DOMAIN).expect("102");
+    lev_w1::poke(&mut env, &lp).expect("poke");
+    assert_eq!(n636b_navps(&env), lg::NAV_ONE, "released surplus is capital, not profit");
+    assert_eq!(n636b_other(&env), (3_000 * U as u128, 0));
+    env.assert_conserved("n636b 102");
+}
+
+/// A growth market REQUIRES the guard and the ext on 108 / 110 / 102 (a caller cannot skip the
+/// sample by leaving them out). The guard-less call is refused LevGuardInvalid and changes nothing.
+#[test]
+fn n636b_flows_require_the_guard_and_ext_on_a_growth_market() {
+    let (mut env, lp, h) = a640_world(2_000);
+    let admin = env.admin.insecure_clone();
+    let g = lev_w1::guard_key(&env);
+    let x = state::derive_vault_lp_ext(&env.pid, &env.market).0;
+    let mut run = |env: &mut Env, ix: (ProgInstruction, Vec<AccountMeta>), kp: &Keypair, drop_key: Pubkey| -> Result<(), String> {
+        env.svm.expire_blockhash();
+        let (i, m) = ix;
+        let m: Vec<AccountMeta> = m.into_iter().filter(|a| a.pubkey != drop_key).collect();
+        env.send(i, m, &[kp])
+    };
+    let hk = h.kp.insecure_clone();
+    // 108 without the guard: refused, no state change.
+    let before = n636b_other(&env);
+    let ix = env.bond_deposit_ix(&h, lp.portfolio, 100 * U, 1);
+    err_has(&run(&mut env, ix, &hk, g), PercolatorError::LevGuardInvalid);
+    // 108 with the guard but without the ext: refused (the counter has nowhere to go).
+    let ix = env.bond_deposit_ix(&h, lp.portfolio, 100 * U, 1);
+    assert!(run(&mut env, ix, &hk, x).is_err(), "no ext, no flow");
+    assert_eq!(n636b_other(&env), before);
+    // 102 without the guard: refused.
+    poke_senior_claim(&mut env, 6_000 * U as u128);
+    let (i, mut m) = (
+        ProgInstruction::VaultLpReleaseSurplus { amount: 100 * U as u128, source_domain: DOMAIN },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new_readonly(env.registry, false),
+            AccountMeta::new(env.vault_lp, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new(env.ledger, false),
+            AccountMeta::new(env.sibling, false),
+        ],
+    );
+    env.svm.expire_blockhash();
+    let r = env.send(i.clone(), m.clone(), &[&admin]);
+    err_has(&r, PercolatorError::LevGuardInvalid);
+    for _ in 0..5 {
+        m.push(AccountMeta::new_readonly(solana_sdk::system_program::ID, false));
+    }
+    m.push(AccountMeta::new(x, false));
+    m.push(AccountMeta::new(lp.portfolio, false)); // wrong key at the guard slot
+    env.svm.expire_blockhash();
+    err_has(&env.send(i, m, &[&admin]), PercolatorError::LevGuardInvalid);
+    // 110 without the guard (after a clean 108 + cooldown): refused.
+    env.bond_deposit(&h, lp.portfolio, 100 * U, 1).expect("108");
+    env.bond_request(&h, 100 * U as u128).expect("109");
+    env.wait_cooldown(&[lp.portfolio]);
+    let dest = env.token_account(env.mint, h.kp.pubkey(), 0);
+    let ix = env.bond_execute_ix(&h, lp.portfolio, dest, 0);
+    err_has(&run(&mut env, ix, &hk, g), PercolatorError::LevGuardInvalid);
+}
+
+/// Tag 111 setup on this suite's world: create the insurance-units ledger (tag 116 path, flips the
+/// profile flag), then STATE-POKE an outstanding backstop of `b` atoms consistently (vault-LP
+/// state, halt mirror, units receivable). Reaching `backstop_due` for a real DRAW needs the G9
+/// world of `p4_wave_d.rs`; RESTORE only needs an outstanding receivable.
+fn n636b_units_and_backstop(env: &mut Env, b: u64) {
+    let payer = env.payer.pubkey();
+    let units = state::derive_insurance_units(&env.pid, &env.market).0;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::InitInsuranceUnits,
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(units, false),
+            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+        ],
+        &[],
+    )
+    .expect("tag 116: units ledger");
+    poke_backstop_consistent(env, b);
+    let mut a = env.svm.get_account(&units).unwrap();
+    let mut u = state::read_insurance_units(&a.data).unwrap();
+    u.backstop_receivable_atoms = b as u128;
+    state::write_insurance_units(&mut a.data, &u).unwrap();
+    env.svm.set_account(units, a).unwrap();
+}
+
+/// Tag 111 (permissionless) mode 1 RESTORE: tail = [units, vault ext, lev guard] (any order).
+fn n636b_restore(env: &mut Env, lp: &Lp, mode: u8, max_amount: u128, with_guard: bool) -> Result<(), String> {
+    let payer = env.payer.pubkey();
+    let units = state::derive_insurance_units(&env.pid, &env.market).0;
+    let mut m = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new_readonly(env.registry, false),
+        AccountMeta::new(env.vault_lp, false),
+        AccountMeta::new(lp.portfolio, false),
+        AccountMeta::new(env.ledger, false),
+        AccountMeta::new(env.sibling, false),
+        AccountMeta::new(units, false),
+        AccountMeta::new(state::derive_vault_lp_ext(&env.pid, &env.market).0, false),
+    ];
+    if with_guard {
+        m.push(AccountMeta::new(lev_w1::guard_key(env), false));
+    }
+    env.svm.expire_blockhash();
+    env.send(ProgInstruction::InsuranceBackstopDraw { mode, max_amount }, m, &[])
+}
+
+/// Tag 111 RESTORE (modes 1 and 3), permissionless: LP capital -> insurance is a flow OUT. A
+/// 600-atom repayment must not read as a 30% loss of a 2,000 LP; the index stays 1.0 and the
+/// counter reads the amount. Without the guard on a growth market the call is refused.
+#[test]
+fn n636b_backstop_restore_is_a_flow_not_a_loss() {
+    use percolator_prog::lev_guard_v22 as lg;
+    for mode in [1u8, 3u8] {
+        let (mut env, lp, _h) = a640_world(2_000);
+        n636b_units_and_backstop(&mut env, 600 * U);
+        n636b_restore(&mut env, &lp, mode, 0, true).unwrap_or_else(|e| panic!("111 mode {mode}: {e}"));
+        let st = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+        let repaid = 600 * U - st.backstop_outstanding_atoms;
+        assert!(repaid > 0, "vacuity: the restore moved value (mode {mode})");
+        lev_w1::poke(&mut env, &lp).expect("poke");
+        assert_eq!(n636b_navps(&env), lg::NAV_ONE, "a repayment to insurance is a flow, not a loss (mode {mode})");
+        assert!(!n636b_stop(&env));
+        assert_eq!(n636b_other(&env), (0, repaid as u128), "counter = the repayment (mode {mode})");
+    }
+    // The guard is required on a growth market: refused, nothing changed.
+    let (mut env, lp, _h) = a640_world(2_000);
+    n636b_units_and_backstop(&mut env, 600 * U);
+    err_has(&n636b_restore(&mut env, &lp, 1, 0, false), PercolatorError::LevGuardInvalid);
+    let st0 = state::read_vault_lp_state(&env.svm.get_account(&env.vault_lp).unwrap().data).unwrap();
+    assert_eq!(st0.backstop_outstanding_atoms, 600 * U, "the refusal changed nothing");
+}
+
+/// Growth market, guard live, NO vault ext (bound without [11], no 103 / 107 yet). att-641 found
+/// that 102 (Live) and 111 RESTORE, which work on rc23 and on #640, were refused on 2133354 (the
+/// counter had no ext to live in). They must keep working (run as before, no sample).
+fn n636b_extless_world() -> (Env, Lp) {
+    let mut env = Env::new(growth_params());
+    let lp = env.bind(2_000);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000 * U, Some(lp.portfolio)).expect("75");
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 2_000 * U).expect("96");
+    lev_w1::init(&mut env);
+    lev_w1::poke(&mut env, &lp).expect("epoch start");
+    assert!(env.ext().is_none(), "vacuity: no ext in this world");
+    (env, lp)
+}
+
+#[test]
+fn n636b_extless_growth_market_keeps_102_and_111_restore_alive() {
+    let (mut env, lp) = n636b_extless_world();
+    let admin = env.admin.insecure_clone();
+    poke_senior_claim(&mut env, 6_000 * U as u128);
+    let cap0 = env.portfolio(lp.portfolio).capital;
+    env.release_surplus(&admin, lp.portfolio, 100 * U as u128, DOMAIN).expect("102 on an ext-less growth market");
+    assert_eq!(env.portfolio(lp.portfolio).capital, cap0 + 100 * U as u128, "vacuity: the release moved value");
+    let (mut env2, lp2) = n636b_extless_world();
+    n636b_units_and_backstop(&mut env2, 600 * U);
+    n636b_restore(&mut env2, &lp2, 1, 0, true).expect("111 RESTORE on an ext-less growth market");
+    let st = state::read_vault_lp_state(&env2.svm.get_account(&env2.vault_lp).unwrap().data).unwrap();
+    assert!(st.backstop_outstanding_atoms < 600 * U, "vacuity: the repayment moved value");
+    assert!(env2.ext().is_none(), "no ext was created behind the caller's back");
 }

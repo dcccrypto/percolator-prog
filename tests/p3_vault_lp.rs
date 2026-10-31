@@ -2014,6 +2014,13 @@ impl Env {
                 AccountMeta::new(lp, false),
                 AccountMeta::new(self.ledger, false),
                 AccountMeta::new(self.sibling, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&signer.insecure_clone()],
         )
