@@ -6703,3 +6703,106 @@ fn r572_dust_griefer_bounded_rent_lands_in_lp_capital_and_lag_backdating_pinned(
 
     env.assert_conservation();
 }
+
+// ===========================================================================
+// att647 (independent attacker on PR #647): occupancy rent past the knee turns every accrual
+// into a rent-index move, which marks every stored leg of that side stale
+// (`kernel_mark_kf_stale_cohorts`), and the asset-level `LossStale` gate (121) then refuses
+// every risk-increasing trade on BOTH sides until each leg is re-touched IN THE SAME SLOT.
+// A griefer only needs 218/256 min-size legs on ONE side (rate 1 e9/slot) for this, versus
+// 512 non-evictable legs for the #572 full-side lock-out.
+// Safety property asserted: one slot after a complete keeper sweep, an honest entrant can open.
+// Expected: passes on base rc23 (rate 0 => no index move), FAILS on PR #647 at 218/256.
+// ===========================================================================
+#[test]
+fn att647_occupancy_past_knee_does_not_lock_out_opens() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let side_cap = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
+    assert_eq!(side_cap, 256);
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q; // $10, the market minimum
+    let mut legs: Vec<Pubkey> = Vec::new();
+    for i in 0..217u32 {
+        let t = env.trader_n(20_000 + i, 50 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("griefer $10 long");
+        legs.push(t.1);
+    }
+    legs.push(lp.account);
+    assert_eq!(env.pos_counts().0, 217);
+    // 217/256 (at the knee): a full sweep, one slot passes, an honest SHORT opens.
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    env.sweep(&legs);
+    env.warp(1);
+    env.push(PRICE);
+    let h1 = env.trader_n(30_000, 10_000 * USD);
+    let r = env.trade_cpi(&h1.0, h1.1, &lp, -100 * Q);
+    eprintln!("ATT647 217/256: honest short open one slot after a full sweep: {r:?}");
+    r.expect("217/256: honest open after a sweep");
+    // Close it again so the short side count is unchanged.
+    env.trade_cpi(&h1.0, h1.1, &lp, 100 * Q).expect("honest close");
+
+    // One more $10 leg: 218/256 (85.2%).
+    let t = env.trader_n(20_217, 50 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("griefer 218th $10 long");
+    legs.push(t.1);
+    legs.push(h1.1);
+    assert_eq!(env.pos_counts().0, 218);
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("ATT647 218/256: charged rent {rl}/{rs} e9/slot");
+    // Keeper does its job: full sweep (one crank per leg).
+    env.sweep(&legs);
+    env.warp(1);
+    env.push(PRICE);
+    let h2 = env.trader_n(30_001, 10_000 * USD);
+    let r_short = env.trade_cpi(&h2.0, h2.1, &lp, -100 * Q);
+    eprintln!("ATT647 218/256: honest SHORT (other side, 1/256) open one slot after a full sweep: {r_short:?}");
+    let a = env.engine_asset();
+    eprintln!(
+        "ATT647 218/256: after that attempt slot_last={} slot={} stale long/short = {}/{}",
+        a.slot_last, env.slot, a.stale_account_count_long, a.stale_account_count_short
+    );
+    let h3 = env.trader_n(30_002, 10_000 * USD);
+    let r_long = env.trade_cpi(&h3.0, h3.1, &lp, 100 * Q);
+    eprintln!("ATT647 218/256: honest LONG open in the same slot: {r_long:?}");
+    // A keeper crank in the same slot does not help: the side stays stale until every leg is re-touched.
+    env.crank_current(lp.account);
+    let r_after_crank = env.trade_cpi(&h2.0, h2.1, &lp, -100 * Q);
+    eprintln!("ATT647 218/256: honest short after a same-slot crank of the LP: {r_after_crank:?}");
+    // Only a full re-sweep in the SAME slot (219 txs on chain) lets an open through.
+    env.sweep(&legs);
+    let r_after_sweep = env.trade_cpi(&h2.0, h2.1, &lp, -100 * Q);
+    eprintln!("ATT647 218/256: honest short after a same-slot full sweep of 219 legs: {r_after_sweep:?}");
+    assert!(r_short.is_ok(), "LOCK-OUT: one slot after a full sweep an honest short is refused at 218/256: {r_short:?}");
+    assert!(r_long.is_ok(), "LOCK-OUT: honest long refused at 218/256: {r_long:?}");
+}
+
+/// att647 pre-existing parity probe (not an assertion of safety): with UTILISATION rent above
+/// the kink (no occupancy term, 17 legs on cap 256), is an honest open one slot after a full
+/// sweep refused the same way? Prints the outcome on base and on the PR.
+#[test]
+fn att647_probe_util_rent_above_kink_open_one_slot_after_sweep() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let mut ps: Vec<Pubkey> = Vec::new();
+    for n in 0..16u32 {
+        let t = env.trader_n(n, 1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        ps.push(t.1);
+    }
+    let big = env.trader_n(16, 1_000 * USD);
+    env.trade_cpi(&big.0, big.1, &lp, 640 * Q).expect("long");
+    ps.push(big.1);
+    ps.push(lp.account);
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("ATT647-UTIL 17/256 u=80%: charged {rl}/{rs}");
+    env.sweep(&ps);
+    env.warp(1);
+    env.push(PRICE);
+    let h = env.trader_n(30_100, 10_000 * USD);
+    let r = env.trade_cpi(&h.0, h.1, &lp, -10 * Q);
+    eprintln!("ATT647-UTIL honest short one slot after a full sweep: {}", match &r { Ok(cu) => format!("Ok({cu})"), Err(e) => e.chars().take(90).collect() });
+}
