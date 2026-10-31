@@ -1,7 +1,7 @@
 //! growth-v19 Kani harnesses that need the full wrapper crate (instruction wire, P1 fee
 //! allocation). Design: ~/percolator-ops/ledger/kani-growth-v19-design-2026-10-04.md rev 5
 //! (R6 wire round trip, R15d fee-channel conservation). Run once, locally:
-//!   cargo kani --tests --harness <name>
+//!   cargo kani --tests --features devnet -Z stubbing -Z function-contracts --harness <name>   (docs/KANI.md)
 #![cfg(kani)]
 
 extern crate kani;
