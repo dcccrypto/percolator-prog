@@ -431,25 +431,66 @@ pub fn coupon_settle(
     open: bool,
     bond_value: u128,
 ) -> Option<(u128, u64)> {
+    coupon_settle_in(bond_claim, unfunded, rem, rate_bps, dslots, open, bond_value, SLOTS_PER_YEAR, COUPON_DENOM)
+}
+
+/// `coupon_settle` for a general one-year length `year` and denominator `denom` (production:
+/// `SLOTS_PER_YEAR`, `COUPON_DENOM = BPS * year`). The same law at every `(year, denom)`; the
+/// Kani harnesses (`kani/bonds571`) prove it over a bounded family of small parameters, the
+/// full-width proptests check the production constants. The cap here is
+/// `floor((K - U) * rate * year / denom)` = `coupon_arrears_cap` at the production constants.
+#[allow(clippy::too_many_arguments)]
+pub fn coupon_settle_in(
+    bond_claim: u128,
+    unfunded: u128,
+    rem: u64,
+    rate_bps: u32,
+    dslots: u64,
+    open: bool,
+    bond_value: u128,
+    year: u128,
+    denom: u128,
+) -> Option<(u128, u64)> {
     if !open {
         return Some((0, rem));
     }
-    let dt = if (dslots as u128) > SLOTS_PER_YEAR {
-        SLOTS_PER_YEAR
-    } else {
-        dslots as u128
-    };
+    if denom == 0 {
+        return None;
+    }
+    let dt = if (dslots as u128) > year { year } else { dslots as u128 };
     let num = coupon_base(bond_claim, bond_value)
         .checked_mul(rate_bps as u128)?
         .checked_mul(dt)?
         .checked_add(rem as u128)?;
-    let due = num / COUPON_DENOM;
-    let room = coupon_arrears_cap(bond_funded_claim(bond_claim, unfunded), rate_bps)?.saturating_sub(unfunded);
+    let due = num / denom;
+    let cap = bond_funded_claim(bond_claim, unfunded)
+        .checked_mul(rate_bps as u128)?
+        .checked_mul(year)?
+        / denom;
+    let room = cap.saturating_sub(unfunded);
     if due > room {
         Some((room, 0))
     } else {
-        Some((due, (num % COUPON_DENOM) as u64))
+        Some((due, u64::try_from(num % denom).ok()?))
     }
+}
+
+/// GH#571 (att649 F2): the gate memory a settlement leaves behind (`coupon_gate_seen`): the low
+/// 63 bits of the cumulative, monotone `senior_drawn_atoms`, and bit 63 set iff the coupon gate
+/// is CLOSED as of this settlement.
+pub fn coupon_gate_seen(senior_drawn: u128, open_now: bool) -> u64 {
+    let drawn = senior_drawn as u64 & !(1u64 << 63);
+    if open_now { drawn } else { drawn | (1u64 << 63) }
+}
+
+/// GH#571 (att649 F2): may the interval since the last settlement accrue? Only if the gate was
+/// OPEN at that settlement and no senior draw was booked since (the drawn counter is unchanged).
+/// With the gate open NOW (checked by the caller) the interval is open at both ends; a window
+/// that closed and reopened between settlements is forfeited. (Conservative: an impairment that
+/// both starts and ends strictly inside one interval without a draw is not seen, inherent to
+/// sampling at settlement points.)
+pub fn coupon_interval_clean(seen: u64, senior_drawn: u128) -> bool {
+    seen == coupon_gate_seen(senior_drawn, true)
 }
 
 /// GH#571, tag 78: pay the receivable `R` off the top of one fee leg.

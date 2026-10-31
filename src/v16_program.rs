@@ -42598,22 +42598,14 @@ pub mod processor {
         Ok((registry, registry_pda, st, t))
     }
 
-    /// GH#571 (att649 F2): the gate memory a settlement leaves behind (`coupon_gate_seen`): the
-    /// low 63 bits of the cumulative, monotone `senior_drawn_atoms`, and bit 63 set iff the
-    /// coupon gate is CLOSED as of this settlement.
+    /// GH#571 (att649 F2): `bond_v20::coupon_gate_seen` of the vault-LP state.
     fn bond_gate_seen(st: &state::VaultLpStateV18, open_now: bool) -> u64 {
-        let drawn = st.senior_drawn_atoms as u64 & !(1u64 << 63);
-        if open_now { drawn } else { drawn | (1u64 << 63) }
+        bond_v20::coupon_gate_seen(st.senior_drawn_atoms, open_now)
     }
 
-    /// GH#571 (att649 F2): may the interval since the last settlement accrue? Only if the gate was
-    /// OPEN at that settlement and no senior draw was booked since (the drawn counter is
-    /// unchanged). With the gate open NOW (checked by the caller) the interval is open at both
-    /// ends; a window that closed and reopened between settlements is forfeited (conservative:
-    /// an impairment that both starts and ends strictly inside one interval is not seen, inherent
-    /// to sampling at settlement points).
+    /// GH#571 (att649 F2): `bond_v20::coupon_interval_clean` for this tranche and vault-LP state.
     fn bond_interval_clean(t: &state::BondTrancheV20, st: &state::VaultLpStateV18) -> bool {
-        t.coupon_gate_seen == bond_gate_seen(st, true)
+        bond_v20::coupon_interval_clean(t.coupon_gate_seen, st.senior_drawn_atoms)
     }
 
     /// GH#571: settle the coupon accrued since `t.last_coupon_slot` (off tag 78: base rate, nothing

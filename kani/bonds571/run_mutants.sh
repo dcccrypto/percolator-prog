@@ -20,20 +20,22 @@ PY
   local v=$(grep -E "VERIFICATION:-" "logs/mutants/$1.log" | tail -1)
   if [ $rc -ne 0 ] && echo "$v" | grep -q FAILED; then echo "$1 | $2 | KILLED | $(( $(date +%s) - start ))s"; else echo "$1 | $2 | SURVIVED rc=$rc $v"; fi
 }
-run K1_pay_forfeits_rest kani_571_pay_conserves_leg_and_claim \
-  '    (coupon, rest, arrears - coupon)' '    (coupon, rest, 0 * arrears)'
-run K2_arrears_uncapped kani_571_settle_monotone_capped_no_overflow \
-  '    let ceiling = if cap > arrears { cap } else { arrears };' '    let ceiling = u128::MAX; let _ = cap;'
-run K3_closed_gate_drops_arrears kani_571_settle_monotone_capped_no_overflow \
-  '    if !open {
-        return Some(arrears);' '    if !open {
-        return Some(0);'
-run K4_redemption_ignores_arrears kani_571_redemption_slices_full_claim \
-  '    let a_slice = total_slice.checked_sub(c_slice)?;' '    let a_slice = 0u128; let _ = total_slice;'
-run K5_accrual_base_principal_only kani_571_newcomer_neutral_within_rounding \
-  '    let accrued = coupon_due(coupon_base(k, bond_value), rate_bps, dslots)?;' '    let accrued = coupon_due(coupon_base(bond_principal, bond_value), rate_bps, dslots)?; let _ = k;'
-run K6_hold_ignores_cap kani_571_checkpoint_hold_rule \
-  '    !open || arrears_after != arrears_before || arrears_before >= cap' '    let _ = cap; !open || arrears_after != arrears_before'
-run K7_settle_not_monotone_in_time kani_571_settle_monotone_in_time \
-  '    let a = arrears.checked_add(accrued)?;' '    let a = arrears.checked_add(accrued % 7)?;'
+run K1_pay_forfeits_rest kani_571_pay_conserves_leg_and_receivable \
+  '    (coupon, rest, receivable - coupon)' '    (coupon, rest, 0 * receivable)'
+run K2_cap_ignored kani_571_settle_cap_closed_exact_remainder \
+  '    let room = cap.saturating_sub(unfunded);' '    let room = u128::MAX; let _ = cap;'
+run K3_closed_gate_drops_remainder kani_571_settle_cap_closed_exact_remainder \
+  '        return Some((0, rem));' '        return Some((0, 0));'
+run K4_remainder_dropped kani_571_split_interval_is_exact \
+  '        Some((due, u64::try_from(num % denom).ok()?))' '        Some((due, 0))'
+run K5_deposit_not_labelled kani_571_deposit_meter_keeps_ratio_and_bound \
+  '    unfunded.checked_add(label)' '    unfunded.checked_add(0 * label)'
+run K6_exit_keeps_meter kani_571_redemption_slices_k_and_meter \
+  '    unfunded.checked_sub(mul_div_floor(shares, unfunded, total_shares)?)' '    let _ = mul_div_floor(shares, unfunded, total_shares)?; Some(unfunded)'
+run K7_accrual_base_funded_only kani_571_newcomer_neutral_within_rounding \
+  '    let num = coupon_base(bond_claim, bond_value)' '    let num = coupon_base(bond_funded_claim(bond_claim, unfunded), bond_value)'
+run K8_gate_memory_ignores_draws kani_571_gate_memory_rule \
+  '    seen == coupon_gate_seen(senior_drawn, true)' '    let _ = senior_drawn; seen >> 63 == 0'
+run K9_base_ignores_the_claim kani_571_junior_gate_bound_dominates_every_settlement \
+  '    let num = coupon_base(bond_claim, bond_value)' '    let num = bond_value'
 rm -f "$OUT"
