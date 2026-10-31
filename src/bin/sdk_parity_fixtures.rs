@@ -148,6 +148,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         Instruction::UpdateMaintenanceFeePerSlot { .. } => "UpdateMaintenanceFeePerSlot",
         Instruction::ExpireBackingBucket { .. } => "ExpireBackingBucket",
         Instruction::WithdrawCreatorFee { .. } => "WithdrawCreatorFee",
+        Instruction::SetCreatorFeePayee { .. } => "SetCreatorFeePayee",
         Instruction::SetAssetRiskLimits { .. }
         | Instruction::SetAssetRiskLimitsV19 { .. }
         | Instruction::SetAssetRiskLimitsV22Tiers { .. } => {
