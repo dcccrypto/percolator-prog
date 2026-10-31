@@ -11,5 +11,12 @@ pub mod vault_lp_v18;
 #[cfg_attr(feature = "bond_mutant", path = "../mutants/bond_v20_mutant.rs")]
 pub mod bond_v20;
 
+/// Shim: `vault_lp_v18` names `crate::growth_v19::ALLOC_ALPHA_MAX_BAND_BPS` (an alloc-band bound
+/// the bond proofs never reach). The real module needs the engine crate; the value is copied from
+/// src/growth_v19.rs (`devnet` build: 7_000; mainnet build: 6_000).
+pub mod growth_v19 {
+    pub const ALLOC_ALPHA_MAX_BAND_BPS: u16 = 7_000;
+}
+
 #[cfg(kani)]
 mod proofs;

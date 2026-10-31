@@ -345,16 +345,17 @@ pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> 
 
 /// Coupon gate: paid only on a Live market, from a non-empty tranche, while NO senior principal
 /// loss is outstanding (the coupon never takes priority over Earn principal) AND while the bond
-/// tranche itself is whole (`bond_value >= C_b`, security review M-1): an impaired tranche earns
-/// nothing, so Earn's fee leg never recapitalises it. `bond_value` is the bonds' layer of the
-/// vault value BEFORE this crank's fee leg.
+/// tranche itself is whole (`bond_value >= bond_claim`, security review M-1): an impaired tranche
+/// earns nothing, so Earn's fee leg never recapitalises it. `bond_value` is the bonds' layer of the
+/// vault value BEFORE this crank's fee leg. GH#571: callers pass `bond_claim = K = C_b + A`, so a
+/// tranche whose carried arrears are not backed is impaired and accrues nothing more.
 pub fn coupon_gate_open(live: bool, bond_claim: u128, senior_draw_outstanding: u128, bond_value: u128) -> bool {
     live && bond_claim > 0 && senior_draw_outstanding == 0 && bond_value >= bond_claim
 }
 
-/// The principal the coupon accrues on: `min(C_b, bond value)` (security review M-1; equals the
-/// explicit model's written-down principal). With the gate above it is `C_b` whenever a coupon is
-/// paid at all; kept separate so the base can never exceed the bond's value even if the gate is
+/// The claim the coupon accrues on: `min(bond_claim, bond value)` (security review M-1; equals the
+/// explicit model's written-down principal). GH#571: `bond_claim = K = C_b + A`, and with the gate
+/// above the base is `K` whenever anything accrues; kept separate so the base can never exceed the bond's value even if the gate is
 /// relaxed later.
 pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
     if bond_value < bond_claim {
