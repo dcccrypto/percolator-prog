@@ -3942,6 +3942,76 @@ fn d_l1_collateral_decimals_above_12_refused() {
 }
 
 // ---------------------------------------------------------------------------
+// rentstale (att647 NEW-1 regression, engine fix/v22-rent-not-lossstale): any rent rate > 0
+// moved the rent index on every accrual and the engine counted that as a K/F change, so every
+// stored leg went stale and the LossStale gate (121) refused every risk-increasing trade on the
+// asset unless every leg was re-touched in the SAME slot. Reproduced on rc23 with utilisation
+// rent above the kink by `att647_probe_util_rent_above_kink_open_one_slot_after_sweep`
+// (att/647 d171fb0d): 121 one slot after a full sweep. With the engine fix a rent-only move
+// restales nothing, opens go through without any sweep, and untouched legs still pay their rent
+// on their next touch.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn rentstale_util_rent_above_kink_opens_without_a_same_slot_sweep() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let mut ps: Vec<Pubkey> = Vec::new();
+    for _ in 0..16 {
+        let t = env.trader(1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        ps.push(t.1);
+    }
+    let big = env.trader(1_000 * USD);
+    env.trade_cpi(&big.0, big.1, &lp, 640 * Q).expect("long");
+    ps.push(big.1);
+    // Non-vacuity: utilisation 80% (> kink) charges long rent on every accrual.
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let r0 = env.engine_asset().rent_index_long_num;
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let a = env.engine_asset();
+    assert!(a.rent_index_long_num > r0, "utilisation rent above the kink moves the index");
+    assert_eq!(
+        (a.stale_account_count_long, a.stale_account_count_short),
+        (0, 0),
+        "a rent-only move restales no leg"
+    );
+    // att647's exact step: a full sweep, one slot passes, an honest short opens (rc23: 121).
+    for p in ps.iter().chain(std::iter::once(&lp.account)) {
+        env.crank_current(*p);
+    }
+    let cap_before = env.total_capital(&ps);
+    env.warp(1);
+    env.push(PRICE);
+    let h = env.trader(10_000 * USD);
+    let r = env.trade_cpi(&h.0, h.1, &lp, -10 * Q);
+    assert!(r.is_ok(), "honest short one slot after a full sweep: {r:?}");
+    // Stronger: 3 slots later, NO sweep — only the keeper's one crank (of the LP) that accrues
+    // the asset to the clock — and another open goes through (rc23: 121 here too, att647 "after a
+    // same-slot LP crank -> 121").
+    env.warp(3);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let a = env.engine_asset();
+    assert!(a.rent_index_long_num > r0, "rent still accruing");
+    let h2 = env.trader(10_000 * USD);
+    let r2 = env.trade_cpi(&h2.0, h2.1, &lp, -10 * Q);
+    assert!(r2.is_ok(), "honest short 3 slots later after one LP crank, no sweep: {r2:?}");
+    // The untouched legs still owe and pay their rent on their next touch.
+    for p in &ps {
+        env.crank_current(*p);
+    }
+    let cap_after = env.total_capital(&ps);
+    assert!(cap_after < cap_before, "untouched legs paid their rent when touched: {cap_before} -> {cap_after}");
+    env.assert_conservation();
+}
+
+// ---------------------------------------------------------------------------
 // v2.2 F1 (2026-10-14): a permissionless refresh that leaves an account below maintenance
 // continues into ONE liquidation step in the same instruction (ledger
 // `v22-f1-refresh-liquidation-2026-10-14.md`). Negative controls run the DEPLOYED bytes
