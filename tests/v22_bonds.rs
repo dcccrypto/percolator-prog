@@ -2146,7 +2146,19 @@ impl Env {
     /// conservative equity (no lag on a flat LP), C_s, C_b.
     fn split3(&self, lp: Pubkey) -> bond_v20::TrancheSplit3 {
         let (nav, lpv, c) = self.p2b_v(lp);
-        bond_v20::tranche_split3(nav + lpv, c, self.tranche().c_b_atoms)
+        bond_v20::tranche_split3(nav + lpv, c, self.tranche().claim_total().unwrap())
+    }
+
+    /// GH#571: the split a Live tag 110 prices at NOW: the claim is first settled to the current
+    /// slot (gate open iff the tranche is whole incl. its arrears; base rate, no utilisation term).
+    fn split3_settled(&self, lp: Pubkey) -> bond_v20::TrancheSplit3 {
+        let (nav, lpv, c) = self.p2b_v(lp);
+        let tr = self.tranche();
+        let k = tr.claim_total().unwrap();
+        let open = tr.c_b_atoms > 0 && !bond_v20::bond_impaired(nav + lpv, c, k);
+        let rate = bond_v20::bond_coupon_rate_bps(tr.coupon_bps_per_year, tr.coupon_util_bonus_bps, 0);
+        let a = bond_v20::coupon_settle(tr.c_b_atoms, tr.coupon_arrears_atoms, rate, self.slot - tr.last_coupon_slot, open, k).unwrap();
+        bond_v20::tranche_split3(nav + lpv, c, tr.c_b_atoms + a)
     }
 }
 
@@ -2543,7 +2555,9 @@ fn bond_waterfall_order_under_losses() {
         // bond exit pays exactly its layer (case 0: par; case 1: the impaired value)
         env.bond_request(&h, 1_000 * U as u128).expect("109");
         env.wait_cooldown(&[lp.portfolio]);
-        let s = env.split3(lp.portfolio);
+        // GH#571: 110 settles the cooldown's accrual first (case 0, whole); nothing accrues on
+        // the impaired tranche (case 1).
+        let s = env.split3_settled(lp.portfolio);
         let paid_b = env.bond_execute(&h, lp.portfolio, 0).expect("110");
         assert_eq!(paid_b as u128, s.bond, "bond paid its split layer exactly");
         assert_eq!(env.tranche().c_b_atoms, 0);
@@ -2605,11 +2619,11 @@ fn bond_does_not_count_as_l3_junior() {
 
 /// Coupon first: on tag 78 the bonds take `min(due, half the LP fee leg)` (M-2 cap) before the
 /// seniors, credited to C_b (value conserved: coupon + senior credit == the leg); the holder
-/// exits at principal + coupon. NON-CUMULATIVE: an interval whose leg could not cover the due is
-/// not carried. Negative control for the cap: mutant MB6 (cap removed) gives the whole thin leg
+/// exits at principal + coupon. CUMULATIVE since GH#571: an interval whose leg could not cover the
+/// due CARRIES the rest as arrears, paid by the next leg (pre-#571 this test asserted the opposite). Negative control for the cap: mutant MB6 (cap removed) gives the whole thin leg
 /// to the coupon and fails this test.
 #[test]
-fn bond_coupon_first_conserves_and_is_noncumulative() {
+fn bond_coupon_first_conserves_and_carries_arrears_gh571() {
     let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
     let t = env.new_trader(10_000 * U);
     let round = |env: &mut Env, n: u32| {
@@ -2658,23 +2672,37 @@ fn bond_coupon_first_conserves_and_is_noncumulative() {
     assert!(due2 > leg2, "vacuity: the leg cannot cover the due");
     assert_eq!(tr2.c_b_atoms - tr1.c_b_atoms, leg2 / 2, "the coupon takes at most half the leg (M-2)");
     assert_eq!(env.vlp().senior_claim_atoms - c1, leg2 - leg2 / 2, "Earn keeps the other half");
-    // ... interval 3: SHORT (1 slot) with a fat leg -> only that slot's due; the shortfall of
-    // interval 2 is NOT carried
+    // GH#571: the unpaid rest is CARRIED as arrears, not forfeited
+    assert_eq!(tr2.coupon_arrears_atoms, due2 - leg2 / 2, "carried arrears");
+    // ... interval 3: SHORT (1 slot) with a fat leg -> that slot's due on the full claim PLUS the
+    // arrears carried from interval 2 (GH#571: cumulative)
     env.hold(1, &[lp.portfolio]);
     round(&mut env, 6);
-    let due3 = bond_v20::coupon_due(tr2.c_b_atoms, 2_000, env.slot - tr2.last_coupon_slot).unwrap();
+    let due3 = bond_v20::coupon_settle(
+        tr2.c_b_atoms,
+        tr2.coupon_arrears_atoms,
+        2_000,
+        env.slot - tr2.last_coupon_slot,
+        true,
+        tr2.claim_total().unwrap(),
+    )
+    .unwrap();
     let c2 = env.vlp().senior_claim_atoms;
     env.crank_fees_bond(lp.portfolio).expect("78 short");
     let tr3 = env.tranche();
-    assert_eq!(tr3.c_b_atoms - tr2.c_b_atoms, due3, "non-cumulative: only this interval's due");
+    assert!(due3 > tr2.coupon_arrears_atoms, "vacuity: the carry plus this slot");
+    assert_eq!(tr3.c_b_atoms - tr2.c_b_atoms, due3, "cumulative: the carried arrears + this interval's due");
+    assert_eq!(tr3.coupon_arrears_atoms, 0);
     assert!(env.vlp().senior_claim_atoms > c2, "seniors take the rest");
-    // the holder exits at principal + every coupon
+    // the holder exits at principal + every coupon (+ the accrual 110 settles over the cooldown)
     env.bond_request(&h, 3_000 * U as u128).expect("109");
     env.wait_cooldown(&[lp.portfolio]);
     let _ = env.crank_fees_bond(lp.portfolio);
-    let cb = env.tranche().c_b_atoms;
+    let tr4 = env.tranche();
+    let k = tr4.claim_total().unwrap();
+    let settle = bond_v20::coupon_settle(tr4.c_b_atoms, tr4.coupon_arrears_atoms, 2_000, env.slot - tr4.last_coupon_slot, true, k).unwrap();
     let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110");
-    assert_eq!(paid as u128, cb, "principal + coupons");
+    assert_eq!(paid as u128, tr4.c_b_atoms + settle, "principal + coupons + the settled accrual");
     assert!(paid as u128 > 3_000 * U as u128);
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
@@ -2743,7 +2771,9 @@ fn bond_error_codes_and_tags_are_pinned() {
         assert_eq!(e[0], tag);
         assert_eq!(ProgInstruction::decode(&e).unwrap().encode(), e, "round trip");
     }
-    assert_eq!(std::mem::size_of::<state::BondTrancheV20>(), 128);
+    // GH#571 layout v2: 128 -> 144 (coupon_arrears_atoms appended at 128..144).
+    assert_eq!(std::mem::size_of::<state::BondTrancheV20>(), 144);
+    assert_eq!(percolator_prog::constants::BOND_TRANCHE_VERSION, 2);
     assert_eq!(std::mem::size_of::<state::BondPositionV20>(), 96);
 }
 
@@ -3952,4 +3982,376 @@ fn n636b_extless_growth_market_keeps_102_and_111_restore_alive() {
     let st = state::read_vault_lp_state(&env2.svm.get_account(&env2.vault_lp).unwrap().data).unwrap();
     assert!(st.backstop_outstanding_atoms < 600 * U, "vacuity: the repayment moved value");
     assert!(env2.ext().is_none(), "no ext was created behind the caller's back");
+}
+
+// ── GH#571: the carried (cumulative) coupon ────────────────────────────────────────────────
+//
+// Every test below measures ECONOMICS (SPL paid out, C_b credited at a crank, what the junior can
+// withdraw) through a RAW reader that works on both tranche layouts (v1 128 B and v2 144 B), so
+// the negative control (`P1_WRAPPER_SO=<780013c .so>`) fails on the economic assertion, not on a
+// layout parse.
+
+/// Raw tranche reader: `(C_b, B, last_coupon_slot, arrears)`; arrears read 0 on a v1 account.
+fn tranche_raw(env: &Env) -> (u128, u128, u64, u128) {
+    let d = env.svm.get_account(&env.tranche_key()).unwrap().data;
+    let h = state::bond_tranche_account_len() - core::mem::size_of::<state::BondTrancheV20>();
+    let u128_at = |o: usize| u128::from_le_bytes(d[h + o..h + o + 16].try_into().unwrap());
+    let last = u64::from_le_bytes(d[h + 96..h + 104].try_into().unwrap());
+    let arrears = if d.len() >= h + 144 { u128_at(128) } else { 0 };
+    (u128_at(32), u128_at(48), last, arrears)
+}
+
+/// The fee leg 78 would harvest now.
+fn leg_now(env: &Env) -> u128 {
+    let (cfg, _) = env.market_state();
+    cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
+}
+
+/// `bond_world` with an explicit junior floor (bps of C).
+fn bond_world_floor(p: Params, floor_bps: u16, senior: u64, junior: u64, bond: u64, coupon_bps: u16) -> (Env, Lp, Depositor, BondHolder) {
+    let mut env = Env::new(p);
+    let lp = env.bind(floor_bps);
+    env.init_bonds(coupon_bps);
+    let d = env.new_depositor();
+    env.earn_deposit(&d, senior * U, Some(lp.portfolio)).expect("75 senior (bound)");
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, junior * U).expect("96 junior");
+    let h = env.new_bond_holder();
+    if bond > 0 {
+        env.bond_deposit(&h, lp.portfolio, bond * U, 1).expect("108 bond deposit");
+    }
+    (env, lp, d, h)
+}
+
+fn fat_leg(env: &mut Env, t: &Trader, lp: &Lp) {
+    for _ in 0..6 {
+        env.trade(t, lp, 1_000 * UQ).expect("open");
+        env.trade(t, lp, -1_000 * UQ).expect("close");
+    }
+}
+
+/// GH#571 path 1: a 1-atom-class bond deposit (tag 108) during a quiet stretch used to move the
+/// coupon checkpoint for every holder and wipe the stretch's coupon. Now it SETTLES the accrual
+/// into the arrears; the next harvest pays it. Two worlds, identical except for the grief deposit
+/// 1,500 slots before trading resumes: the coupon credited at the harvest must be the same (the
+/// grief world pays at most a few atoms more, the griefer's own accrual).
+/// NEGATIVE CONTROL (780013c): the grief world's coupon is ~0.35% of the clean one.
+#[test]
+fn gh571_tiny_bond_deposit_no_longer_wipes_the_accrued_coupon() {
+    let run = |grief: bool| -> (u128, u128, u128) {
+        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+        let t = env.new_trader(10_000 * U);
+        env.slot += 432_000; // a quiet weekend
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let mut grief_amt = 0;
+        if grief {
+            let g = env.new_bond_holder();
+            // the smallest deposit that mints a share (K / B > 1 once arrears are carried)
+            grief_amt = (1..=8u64).find(|a| env.bond_deposit(&g, lp.portfolio, *a, 1).is_ok()).expect("a tiny deposit mints") as u128;
+        }
+        env.slot += 1_500;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        fat_leg(&mut env, &t, &lp);
+        let leg = leg_now(&env);
+        let (cb0, ..) = tranche_raw(&env);
+        env.crank_fees_bond(lp.portfolio).expect("78");
+        let (cb1, _, _, a1) = tranche_raw(&env);
+        env.assert_conserved("gh571 grief");
+        assert!(cb1 - cb0 < leg / 2, "vacuity: the leg covers the whole due");
+        (cb1 - cb0, a1, grief_amt)
+    };
+    let (clean, a_clean, _) = run(false);
+    let (grief, a_grief, amt) = run(true);
+    eprintln!("GH571 108-grief: clean coupon {clean} grief coupon {grief} (grief deposit {amt} atoms)");
+    assert!(clean > 3_000_000, "vacuity: ~2 days of 20% on 3,000 USDC is ~3.3 USDC");
+    assert!(grief + 1 >= clean, "a tiny deposit forfeits nothing: grief {grief} vs clean {clean}");
+    assert!(grief <= clean + 10, "and adds only the griefer's own dust accrual");
+    assert_eq!((a_clean, a_grief), (0, 0), "a fat leg pays every carried atom");
+}
+
+/// GH#571 path 2 (explainV item 5): after a quiet stretch, a DUST trade plus a permissionless
+/// tag 78 used to pay at most half the dust leg and reset the clock, forfeiting the stretch. Now
+/// the unpaid part is CARRIED; the next fat-leg crank pays it. Total paid over the two cranks ==
+/// the stretch's due (compounded per settlement, so >= the simple-interest due).
+/// NEGATIVE CONTROL (780013c): the total is a few atoms of dust leg + one slot of accrual.
+#[test]
+fn gh571_dust_trade_crank_carries_instead_of_forfeiting() {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
+    let t = env.new_trader(10_000 * U);
+    let (cb_start, _, last_start, _) = tranche_raw(&env);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.trade(&t, &lp, 10 * UQ).expect("dust open");
+    env.trade(&t, &lp, -10 * UQ).expect("dust close");
+    let dust = leg_now(&env);
+    env.crank_fees_bond(lp.portfolio).expect("78 on the dust leg (permissionless)");
+    let (cb1, _, _, a1) = tranche_raw(&env);
+    let paid1 = cb1 - cb_start;
+    assert!(paid1 <= dust / 2, "M-2 still holds: at most half the dust leg");
+    env.hold(1, &[lp.portfolio]);
+    fat_leg(&mut env, &t, &lp);
+    env.crank_fees_bond(lp.portfolio).expect("78 fat");
+    let (cb2, _, _, a2) = tranche_raw(&env);
+    let total = cb2 - cb_start;
+    let simple = bond_v20::coupon_due(cb_start, 2_000, env.slot - last_start).unwrap();
+    eprintln!("GH571 dust-crank: dust leg {dust} paid1 {paid1} carried {a1} total {total} simple due {simple}");
+    assert!(simple > 3_000_000, "vacuity");
+    // two settlement floors can lose one atom against the single-interval floor
+    assert!(total + 1 >= simple, "nothing forfeited: total {total} vs simple-interest due {simple}");
+    assert!(total <= simple + simple / 1_000, "and only the per-settlement compounding on top");
+    assert_eq!(a2, 0);
+    assert!(a1 > 0 && a1 + paid1 >= simple - simple / 1_000, "the dust crank carried the rest");
+    env.assert_conserved("gh571 dust crank");
+}
+
+/// GH#571: tag 110 SETTLES before pricing, so a leaver is paid principal + ITS accrued coupon
+/// (out of the vault LP's capital: arrears are a claim senior to the junior), and the stayer
+/// keeps exactly its own arrears. No fee leg ever runs in this test.
+/// NEGATIVE CONTROL (780013c): the leaver is paid principal only.
+#[test]
+fn gh571_withdraw_settles_the_leavers_coupon_and_keeps_the_stayers() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+    let h2 = env.new_bond_holder();
+    env.bond_deposit(&h2, lp.portfolio, 2_000 * U, 1).expect("second holder, same slot");
+    let (cb0, b0, last0, _) = tranche_raw(&env);
+    let sh = env.bond_pos(&h).shares;
+    env.bond_request(&h, sh).expect("109");
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let dt = env.slot - last0;
+    let accrued = bond_v20::coupon_due(cb0, 2_000, dt).unwrap();
+    let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110 Live") as u128;
+    eprintln!("GH571 110: dt {dt} pool accrual {accrued} leaver paid {paid}");
+    assert!(accrued > 5_000_000, "vacuity: 500k slots of 20% on 4,000 USDC ~ 5 USDC");
+    let fair = 2_000 * U as u128 + accrued * sh / b0;
+    assert!(paid + 2 >= fair && paid <= fair, "leaver gets principal + its half: paid {paid} fair {fair}");
+    let (cb1, b1, _, a1) = tranche_raw(&env);
+    assert_eq!(b1, b0 - sh);
+    assert!((cb1 + a1).abs_diff(cb0 / 2 + accrued / 2) <= 2, "stayer keeps exactly its own claim");
+    // the stayer's own exit, later, is principal + its full accrual too (the arrears survived)
+    let sh2 = env.bond_pos(&h2).shares;
+    env.bond_request(&h2, sh2).expect("109 stayer");
+    env.wait_cooldown(&[lp.portfolio]);
+    let (_, _, last1, _) = tranche_raw(&env);
+    let more = bond_v20::coupon_due(cb1 + a1, 2_000, env.slot - last1).unwrap();
+    let paid2 = env.bond_execute(&h2, lp.portfolio, 0).expect("110 stayer") as u128;
+    assert!(paid2.abs_diff(cb1 + a1 + more) <= 2, "stayer paid {paid2} want {}", cb1 + a1 + more);
+    assert_eq!(tranche_raw(&env), (0, 0, env.slot, 0), "the last exit empties C_b AND the arrears");
+    env.assert_conserved("gh571 withdraw");
+}
+
+/// GH#571 seniority: unsettled accrual is reserved from the junior. After a long quiet stretch
+/// the creator's max tag 97 withdrawal leaves the bonds' accrued coupon behind, and the bond
+/// holder exits at principal + the capped (one year) coupon.
+/// NEGATIVE CONTROL (780013c): the junior withdraws down to its floor and the holder gets only
+/// principal.
+#[test]
+fn gh571_junior_cannot_withdraw_the_bonds_accrual_and_arrears_cap_at_one_year() {
+    let (mut env, lp, _d, h) = bond_world_floor(Params::default(), 100, 10_000, 3_000, 2_000, 2_000);
+    let sh = env.bond_pos(&h).shares;
+    env.bond_request(&h, sh).expect("109");
+    let (cb0, ..) = tranche_raw(&env);
+    env.slot += 2 * SLOTS_PER_YEAR_U64; // two years: the cap binds at one year of coupon
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let cap = bond_v20::coupon_arrears_cap(cb0, 2_000).unwrap();
+    assert_eq!(cap, 400 * U as u128, "one year of 20% on 2,000 USDC");
+    let out = env.max_junior_out_bond(lp.portfolio);
+    eprintln!("GH571 97: junior max out {out} (cap {cap})");
+    let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110") as u128;
+    eprintln!("GH571 97: bond exit paid {paid}");
+    assert!(paid + 2 >= cb0 + cap && paid <= cb0 + cap, "principal + exactly the one-year cap: {paid}");
+    assert!(out + cap <= 3_000 * U as u128 - 100 * U as u128, "the junior left the arrears behind: out {out}");
+    env.assert_conserved("gh571 junior");
+}
+const SLOTS_PER_YEAR_U64: u64 = bond_v20::SLOTS_PER_YEAR as u64;
+
+/// GH#571 resolve path: arrears settled while Live survive resolution as a claim senior to the
+/// junior: the junior's terminal sweep (102) is the physical surplus over the seniors AND
+/// `C_b + A`, and the Resolved 110 pays principal + carried coupon from the pots.
+/// NEGATIVE CONTROL (780013c): the junior may sweep the arrears; the bond gets principal only.
+#[test]
+fn gh571_resolved_exit_pays_carried_coupon_before_the_junior() {
+    let (mut env, lp, d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+    let admin = env.admin.insecure_clone();
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    // a Live settlement point: another holder's deposit settles the accrual into the arrears
+    let h2 = env.new_bond_holder();
+    env.bond_deposit(&h2, lp.portfolio, U, 1).expect("108 settles");
+    let (cb, b, _, a) = tranche_raw(&env);
+    let sh = env.bond_pos(&h).shares;
+    env.bond_request(&h, sh).expect("109");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    let t = Some(env.tranche_key());
+    // the pre-#571 junior allowance: physical 15,001 - C 10,000 - C_b 2,001 = 3,000
+    let old_allowance = 3_000 * U as u128;
+    let expected_a = bond_v20::coupon_due(2_000 * U as u128, 2_000, 500_001).unwrap();
+    assert!(expected_a > 2_000_000, "vacuity: ~2.5 USDC carried");
+    err_has(&env.release_surplus_resolved_bond(&admin, lp.portfolio, old_allowance, junior_dest, t), PercolatorError::VaultLpReleaseRefused);
+    env.slot += COOLDOWN as u64;
+    env.svm.warp_to_slot(env.slot);
+    let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110 Resolved") as u128;
+    let want = (cb + a) * sh / b;
+    eprintln!("GH571 resolved: C_b {cb} A {a} paid {paid} want {want}");
+    assert!(paid + 1 >= want && paid <= want && paid > 2_000 * U as u128 + expected_a - 2, "principal + carried coupon from the pots");
+    // the junior gets exactly what is left over the seniors and the remaining bond claim
+    let (cb2, _, _, a2) = tranche_raw(&env);
+    let junior = 15_001 * U as u128 - paid - 10_000 * U as u128 - (cb2 + a2);
+    err_has(&env.release_surplus_resolved_bond(&admin, lp.portfolio, junior + 1, junior_dest, t), PercolatorError::VaultLpReleaseRefused);
+    let before = env.tok(junior_dest);
+    env.release_surplus_resolved_bond(&admin, lp.portfolio, junior, junior_dest, t).expect("junior sweep");
+    assert_eq!((env.tok(junior_dest) - before) as u128, junior);
+    env.paid_out += junior;
+    let shares = env.lp_shares(&d);
+    env.earn_request(&d, shares);
+    env.earn_execute(&d, Some(lp.portfolio)).expect("senior");
+    env.assert_conserved("gh571 resolved");
+}
+
+/// GH#571 newcomer / leaver fairness on RANDOM sequences against the real BPF: deposits,
+/// withdrawals (109 + cooldown + 110), quiet gaps, dust and fat cranks by up to 3 holders. After
+/// EVERY step the on-chain tranche (C_b, A, B, checkpoint) and every payout equal an exact
+/// integer reference model built from the production pure functions (the same model the pure
+/// proptest `v22_bond_carry_571_pure::holders_get_exactly_their_own_accrual` proves fair against
+/// an independent per-holder ledger), and each holder's realised value is within rounding of its
+/// own compounded claim. Seeds are fixed (deterministic CI).
+#[test]
+fn gh571_random_sequences_match_the_reference_model_and_are_fair() {
+    struct Model {
+        cb: u128,
+        a: u128,
+        b: u128,
+        t0: u64,
+    }
+    impl Model {
+        fn settle(&mut self, now: u64, rate: u32) {
+            let k = self.cb + self.a;
+            self.a = bond_v20::coupon_settle(self.cb, self.a, rate, now - self.t0, self.cb > 0, k).unwrap();
+            self.t0 = now;
+        }
+    }
+    let rate = 2_000u32;
+    for seed in [571u64, 0x5eed, 0xc0ffee] {
+        let mut rng = seed;
+        let mut next = |n: u64| {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng % n
+        };
+        let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 4_000, 0, 2_000);
+        let t = env.new_trader(10_000 * U);
+        let holders: Vec<BondHolder> = (0..3).map(|_| env.new_bond_holder()).collect();
+        let (_, _, t0, _) = tranche_raw(&env);
+        let mut m = Model { cb: 0, a: 0, b: 0, t0 };
+        let g = |dt: u64| 1.0 + rate as f64 / 10_000.0 * dt as f64 / bond_v20::SLOTS_PER_YEAR as f64;
+        let mut fair = [0f64; 3];
+        let mut net = [0f64; 3]; // SPL out - SPL in
+        let mut fair_net = [0f64; 3];
+        let mut last_ref = t0;
+        let mut steps = 0f64;
+        for _ in 0..14 {
+            let now0 = env.slot;
+            // reference compounding is applied at every settlement the program performs
+            let settle_ref = |now: u64, fair: &mut [f64; 3], last_ref: &mut u64| {
+                let f = g(now - *last_ref);
+                for x in fair.iter_mut() { *x *= f; }
+                *last_ref = now;
+            };
+            match next(4) {
+                0 => {
+                    env.slot += 1 + next(400_000);
+                    env.svm.warp_to_slot(env.slot);
+                    env.hold(1, &[lp.portfolio]);
+                }
+                1 => {
+                    let i = next(3) as usize;
+                    let amt = (1 + next(800)) * U;
+                    if env.bond_deposit(&holders[i], lp.portfolio, amt, 1).is_ok() {
+                        settle_ref(env.slot, &mut fair, &mut last_ref);
+                        m.settle(env.slot, rate);
+                        let minted = bond_v20::bond_shares_for_deposit(amt as u128, m.b, m.cb + m.a).unwrap();
+                        m.cb += amt as u128;
+                        m.b += minted;
+                        assert_eq!(env.bond_pos(&holders[i]).shares > 0, true);
+                        fair[i] += amt as f64;
+                        net[i] -= amt as f64;
+                        fair_net[i] -= amt as f64;
+                        steps += 1.0;
+                    }
+                }
+                2 => {
+                    if next(2) == 0 {
+                        env.trade(&t, &lp, 10 * UQ).expect("dust open");
+                        env.trade(&t, &lp, -10 * UQ).expect("dust close");
+                    } else {
+                        fat_leg(&mut env, &t, &lp);
+                    }
+                    let leg = leg_now(&env);
+                    if leg > 0 {
+                        env.crank_fees_bond(lp.portfolio).expect("78");
+                        settle_ref(env.slot, &mut fair, &mut last_ref);
+                        m.settle(env.slot, rate);
+                        if m.cb > 0 {
+                            let (coupon, _, a2) = bond_v20::coupon_pay_from_leg(leg, m.a);
+                            m.cb += coupon;
+                            m.a = a2;
+                        }
+                        steps += 1.0;
+                    }
+                }
+                _ => {
+                    let i = next(3) as usize;
+                    let held = env.bond_pos(&holders[i]).shares;
+                    if held == 0 { continue; }
+                    let sh = 1.max(held * (1 + next(4)) as u128 / 4);
+                    env.bond_request(&holders[i], sh).expect("109");
+                    env.wait_cooldown(&[lp.portfolio]);
+                    let paid = env.bond_execute(&holders[i], lp.portfolio, 0).expect("110") as u128;
+                    settle_ref(env.slot, &mut fair, &mut last_ref);
+                    m.settle(env.slot, rate);
+                    let want = bond_v20::bond_atoms_for_redemption(sh, m.b, m.cb + m.a).unwrap();
+                    assert_eq!(paid, want, "seed {seed}: 110 payout equals the model");
+                    let (cb, a) = bond_v20::bond_claims_after_redemption(m.cb, m.a, sh, m.b).unwrap();
+                    m.cb = cb;
+                    m.a = a;
+                    m.b -= sh;
+                    let ref_out = fair[i] * sh as f64 / held as f64;
+                    fair[i] -= ref_out;
+                    fair_net[i] += ref_out;
+                    net[i] += paid as f64;
+                    steps += 1.0;
+                }
+            }
+            let (cb, b, last, a) = tranche_raw(&env);
+            assert_eq!((cb, a, b), (m.cb, m.a, m.b), "seed {seed}: on-chain tranche == model (slot {} from {now0})", env.slot);
+            if m.t0 > t0 { assert_eq!(last, m.t0, "seed {seed}: checkpoint"); }
+        }
+        // value everything at a final settlement point (no write: value from the model at now)
+        let now = env.slot;
+        let mut fin = Model { cb: m.cb, a: m.a, b: m.b, t0: m.t0 };
+        fin.settle(now, rate);
+        let f = g(now - last_ref);
+        for (i, h) in holders.iter().enumerate() {
+            let sh = env.bond_pos(h).shares;
+            let held = if fin.b == 0 { 0 } else { bond_v20::bond_atoms_for_redemption(sh, fin.b, fin.cb + fin.a).unwrap() };
+            let got = net[i] + held as f64;
+            let want = fair_net[i] + fair[i] * f;
+            let tol = 2.0 * steps + 4.0;
+            eprintln!("GH571 seed {seed} holder {i}: got {got:.0} want {want:.1} (tol {tol})");
+            assert!(got <= want + 1.0, "seed {seed} holder {i}: excess to the holder");
+            assert!(got >= want - tol, "seed {seed} holder {i}: holder short-changed");
+        }
+        env.assert_conserved("gh571 random");
+    }
 }

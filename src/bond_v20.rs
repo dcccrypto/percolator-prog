@@ -263,7 +263,30 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
     now_slot >= request_slot.saturating_add(cooldown_slots as u64)
 }
 
-// ── Coupon (I-T7) ────────────────────────────────────────────────────────────────────────────
+// ── Coupon (I-T7, cumulative since GH#571) ─────────────────────────────────────────────────
+//
+// I-T7 (GH#571, 2026-10-31, founder decision "carried-over coupon"): the coupon is CUMULATIVE.
+// Accrued-but-unpaid coupon is carried in `BondTrancheV20::coupon_arrears_atoms` (`A`) as a
+// CLAIM of the bonds. The bonds' full claim is `K = C_b + A`; every tranche split reads `K`.
+//
+// * Accrual: `A += coupon_due(min(K, bond value), rate, dt)` while the gate is open
+//   (`coupon_gate_open` on `K`: Live, no senior draw outstanding, tranche whole INCLUDING its
+//   arrears). The base is `K`, not `C_b`, so every atom of claim earns the same rate (arrears
+//   compound per settlement); that is what makes share pricing at `K / B` newcomer-neutral.
+//   While the gate is closed the interval's accrual is forfeited (unchanged M-1 policy) but
+//   `A` already settled is kept.
+// * Cap: `A <= coupon_due(C_b, rate, 1y)` (one year of coupon on the principal); accrual above
+//   it is forfeited. This replaces the old one-year `dt` clamp as the bound on a "jumbo" claim.
+// * Settlement points: tag 78 (then pays `min(A, leg / 2)`, M-2 unchanged), tag 108 and tag 110
+//   (accrue to now, pay nothing: the fee leg is harvested before either runs). None of them
+//   forfeits settled arrears, so a 1-atom deposit or a dust-trade crank cannot wipe the coupon.
+// * Seniority: `A` sits in the bond layer of `tranche_split3`, i.e. JUNIOR to the Earn seniors
+//   and to the G9 backstop, SENIOR to the junior (creator) tranche and its cushion. Unpaid
+//   arrears therefore reduce the junior's residual (tags 97 / 102 / 103, the G6 cushion level)
+//   and a bond exit (110) is paid `shares * layer(K) / B`, i.e. it takes its arrears out of the
+//   junior's capital when the fee legs have not funded them yet.
+// * Resolve: nothing accrues once the market is not Live. Settled `A` stays in `K` and is paid by
+//   the Resolved 110 out of the pots' physical surplus over the seniors, before the junior (102).
 
 /// Utilisation of the bond-backed capacity, bps: `min(1, max side OI / N_cap)`. 0 with no OI;
 /// full with OI but no capacity number.
@@ -298,9 +321,9 @@ pub fn bond_coupon_rate_bps(base_bps: u16, util_bonus_bps: u16, util_bps: u16) -
 /// Coupon accrued over `dslots` on the pooled principal claim `C_b`:
 /// `floor(C_b * rate * min(dslots, 1y) / (10_000 * SLOTS_PER_YEAR))`.
 ///
-/// NON-CUMULATIVE: the caller resets the checkpoint to "now" on every crank whatever was paid, so
-/// arrears are never a claim (I-T7). The interval is clamped to one year so an idle tranche cannot
-/// build a jumbo first crank. `None` only on a corrupt `C_b`: the product
+/// One accrual interval only; the CARRY lives in `coupon_settle` (GH#571: arrears are a claim,
+/// I-T7 above). The interval is clamped to one year (the arrears cap bounds the total anyway).
+/// `None` only on a corrupt `C_b`: the product
 /// `C_b * rate * SLOTS_PER_YEAR` must fit u128, i.e. `C_b < 2^128 / (3_000 * 78.84e6) ~ 2^90.2`,
 /// ~2^26 above any SPL-representable (u64) claim.
 pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> {
@@ -337,11 +360,81 @@ pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
 /// Take the coupon off the TOP of one harvested LP fee leg: `(coupon, rest)` with
 /// `coupon = min(due, floor(available * BOND_COUPON_MAX_LEG_BPS / 1e4))` and
 /// `coupon + rest == available`. Paid only from the fee leg, never from principal, never more than
-/// half of it (M-2); the unpaid part of `due` is forfeited (non-cumulative).
+/// half of it (M-2). Tag 78 passes the SETTLED arrears `A` as `due`; the unpaid part stays in
+/// `A` (GH#571, cumulative), `coupon_arrears_after_payment`.
 pub fn bond_coupon_split(available: u128, due: u128) -> (u128, u128) {
     let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);
     let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)
+}
+
+/// GH#571: the bonds' full claim `K = C_b + A` (principal incl. credited coupons + carried
+/// arrears). Every tranche split reads this, never `C_b` alone. `None` on overflow (fail closed).
+pub fn bond_claim_total(bond_principal: u128, arrears: u128) -> Option<u128> {
+    bond_principal.checked_add(arrears)
+}
+
+/// GH#571: the arrears cap, one year of coupon on the principal `C_b` at `rate_bps`.
+pub fn coupon_arrears_cap(bond_principal: u128, rate_bps: u32) -> Option<u128> {
+    coupon_due(bond_principal, rate_bps, SLOTS_PER_YEAR as u64)
+}
+
+/// GH#571: settle the coupon accrued over `dslots` into the arrears. Returns the new arrears.
+///
+/// * gate closed (`open == false`): the interval's accrual is forfeited, `A` is kept unchanged;
+/// * gate open: `A' = min(A + coupon_due(min(K, bond_value), rate, dslots), max(A, cap))` with
+///   `K = C_b + A` and `cap = coupon_arrears_cap(C_b, rate)`. Never below `A` (settled arrears are
+///   never forfeited by a settlement), never above `max(A, cap)`.
+///
+/// `bond_value` is the bonds' layer of the vault value (`tranche_split3(.., K).bond`); with the
+/// gate open it is `K`, so the base is `K`. `None` on overflow (fail closed).
+pub fn coupon_settle(
+    bond_principal: u128,
+    arrears: u128,
+    rate_bps: u32,
+    dslots: u64,
+    open: bool,
+    bond_value: u128,
+) -> Option<u128> {
+    if !open {
+        return Some(arrears);
+    }
+    let k = bond_claim_total(bond_principal, arrears)?;
+    let accrued = coupon_due(coupon_base(k, bond_value), rate_bps, dslots)?;
+    let cap = coupon_arrears_cap(bond_principal, rate_bps)?;
+    let ceiling = if cap > arrears { cap } else { arrears };
+    let a = arrears.checked_add(accrued)?;
+    Some(if a < ceiling { a } else { ceiling })
+}
+
+/// GH#571, tag 78: pay the settled arrears `A` off the top of one fee leg.
+/// Returns `(coupon, rest, A - coupon)`; `coupon + rest == available`, `coupon <= A`,
+/// `coupon <= floor(available / 2)` (M-2).
+pub fn coupon_pay_from_leg(available: u128, arrears: u128) -> (u128, u128, u128) {
+    let (coupon, rest) = bond_coupon_split(available, arrears);
+    (coupon, rest, arrears - coupon)
+}
+
+/// GH#571, tag 110: `(C_b', A')` after `shares` of `B` are redeemed. The removed claim is the
+/// pro-rata slice of `K = C_b + A`, `floor(shares * K / B)` (equal to the payout when the tranche
+/// is whole), split as `C_b` slice `floor(shares * C_b / B)` (exactly the pre-#571 slice) and the
+/// arrears slice = the rest (`<= A`). Redeeming every share leaves `(0, 0)`; any other redemption
+/// leaves `C_b' > 0` (`C_b == 0 <=> B == 0` holds). Every remaining share's claim is
+/// non-decreasing. `None` (fail closed) on `B == 0`, `shares > B` or overflow.
+pub fn bond_claims_after_redemption(
+    bond_principal: u128,
+    arrears: u128,
+    shares: u128,
+    total_shares: u128,
+) -> Option<(u128, u128)> {
+    if total_shares == 0 || shares > total_shares {
+        return None;
+    }
+    let k = bond_claim_total(bond_principal, arrears)?;
+    let total_slice = mul_div_floor(shares, k, total_shares)?;
+    let c_slice = mul_div_floor(shares, bond_principal, total_shares)?;
+    let a_slice = total_slice.checked_sub(c_slice)?;
+    Some((bond_principal.checked_sub(c_slice)?, arrears.checked_sub(a_slice)?))
 }
 
 /// The full Phase 4 fee waterfall of one harvested LP leg (the composition tag 78 runs):
