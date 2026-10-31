@@ -9,14 +9,18 @@
 #   SUCCESSFUL   kani "VERIFICATION:- SUCCESSFUL" and every cover property SATISFIED (or none declared)
 #   VACUOUS      SUCCESSFUL but some cover property not satisfied -- the pass proves less than claimed
 #   FAILED       a real check failed (a counterexample exists)
-#   TIMEOUT      CBMC hit --harness-timeout (or the watchdog fired): NO VERDICT, not a pass, not a failure
-#   ERROR        anything else (compile error, harness name not found, crash)
+#   TIMEOUT      the log says "CBMC timed out" (--harness-timeout), or the watchdog fired: rc 124/137 AND
+#                the elapsed time reached the watchdog limit. NO VERDICT, not a pass, not a failure
+#   ERROR        anything else (compile error, harness name not found, crash, and any kill BEFORE the
+#                watchdog limit: OOM killer / SIGKILL 137, SIGTERM 143 -- red, never a TIMEOUT warning)
 # Always exits 0 once verdicts are written; the workflow's summary job decides red/green.
 # Local (from the repo root, engine checked out as ../percolator at ENGINE_CI_SIBLING):
 #   scripts/kani-nightly-shard.sh p3-engine 0 3 30m 2 /tmp/kn
 set -uo pipefail
 group=$1; chunk=$2; size=$3; tmo=$4; jobs=$5; out=$6
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
+# shellcheck source=scripts/kani-nightly-lib.sh
+. "$ROOT/scripts/kani-nightly-lib.sh"   # classify()
 LIST="$ROOT/ci/kani-nightly-harnesses.tsv"
 Z="-Z unstable-options -Z function-contracts -Z stubbing"
 case "$group" in
@@ -54,22 +58,19 @@ tail -3 "$out/logs/_build.log"; echo "::endgroup::"
 run_one() {
   local h=$1 log="$out/logs/$(echo "$1" | tr ':/' '__').log" t0 t1 v fc cov
   t0=$(date +%s)
-  "$TMO_BIN" --kill-after=60 "${wd}m" cargo kani $args --harness-timeout "$tmo" --harness "$h" --exact > "$log" 2>&1
-  local rc=$?
+  # timeout(1) makes itself a process-group leader; after it returns, kill whatever is left in that
+  # group (kani's own --harness-timeout can leave cbmc/z3 orphans that slow the next harness).
+  "$TMO_BIN" --kill-after=60 "${wd}m" cargo kani $args --harness-timeout "$tmo" --harness "$h" --exact > "$log" 2>&1 &
+  local pid=$!
+  wait "$pid"; local rc=$?
+  kill -KILL -- "-$pid" 2>/dev/null || true
   t1=$(date +%s)
-  cov=$(grep -Eo '[0-9]+ of [0-9]+ cover properties satisfied' "$log" | tail -1)
-  fc=$(grep -Eo '\*\* [0-9]+ of [0-9]+ failed' "$log" | tail -1 | sed 's/\*\* //')
-  if [ $rc -eq 124 ] || [ $rc -eq 137 ]; then v=TIMEOUT; fc="watchdog ${wd}m"
-  elif grep -q 'CBMC timed out' "$log"; then v=TIMEOUT
-  elif grep -q 'VERIFICATION:- SUCCESSFUL' "$log" && grep -q 'Complete - 1 successfully verified harnesses, 0 failures' "$log"; then
-    v=SUCCESSFUL
-    if [ -n "$cov" ]; then set -- $cov; [ "$1" = "$3" ] || v=VACUOUS; fi
-  elif echo "$fc" | grep -Eq '^[1-9][0-9]* of'; then v=FAILED
-  else v=ERROR; fi
+  classify "$log" "$rc" "$((t1-t0))" "$((wd*60))"
   printf '%s\t%s\t%s\t%s\t%s\n' "$h" "$v" "$((t1-t0))" "${fc:--}" "${cov:-no covers}" >> "$out/verdicts.tsv"
   echo "$v  $h  ($((t1-t0)) s; ${fc:--}; ${cov:-no covers})"
 }
-export -f run_one; export args tmo wd out TMO_BIN
+
+export -f run_one classify; export args tmo wd out TMO_BIN
 printf '%s\n' "${hs[@]}" | xargs -P "$jobs" -I{} bash -c 'run_one "$@"' _ {}
 echo "---"; cat "$out/verdicts.tsv"
 exit 0

@@ -65,13 +65,34 @@ array-equality lowering. The pin logic is covered natively by `cargo test --lib 
 `.github/workflows/kani-nightly.yml` runs exactly the harnesses in `ci/kani-nightly-harnesses.tsv`
 (the 85 no-verdict harnesses of the run above, names taken from the raw logs), sharded per crate
 (`scripts/kani-nightly-shard.sh`), each harness in its own `cargo kani` process with a longer
-`--harness-timeout` (default 70m, two per runner, every job under the 6 h limit). Every shard uploads
-`verdicts.tsv` + per-harness logs; the summary job uploads `kani-nightly-verdicts` and goes RED
-on any FAILED, VACUOUS (SUCCESSFUL with an unsatisfied cover) or ERROR verdict. TIMEOUTs are listed
-separately as warnings, never as failures and never as passes.
+`--harness-timeout` (default 70m; watchdog = timeout + 10 min). The `lib` and `tests` groups build the
+whole wrapper crate, so they run ONE harness per runner, at most 4 per shard (2 per runner made all
+three `tests` shards of run 41174122838 die with "runner has received a shutdown signal", exit 143,
+after 26-69 min). The sub-crate groups use the `chunk` / `jobs_per_runner` inputs (default 8 / 2).
+The plan job refuses any layout that could exceed the 350 min job limit.
 
-GitHub only fires `schedule:` from the default branch: the nightly is live only once this file is
-on `main`. Until then run it by hand: `gh workflow run kani-nightly.yml --ref <branch>`
-(inputs: `harness_timeout`, `chunk`, `jobs_per_runner`, `groups`).
+Verdicts (`scripts/kani-nightly-lib.sh`, `classify`):
+- TIMEOUT (no verdict, a warning): only when the log says "CBMC timed out", or the watchdog fired
+  (rc 124/137 AND elapsed >= watchdog limit).
+- ERROR (red): any other kill (OOM killer SIGKILL 137, SIGTERM 143, ...) before the watchdog limit,
+  build failures, name rot, crashes.
+- SUCCESSFUL needs rc 0, the VERIFICATION line and "1 successfully verified, 0 failures", and every
+  cover satisfied (else VACUOUS, red). FAILED = a real check failed (red).
 
-Local equivalent of one shard: `scripts/kani-nightly-shard.sh p3-engine 0 3 30m 2 /tmp/kn`.
+Shard artifacts are named `kani-shard-<group>-<chunk>`; the summary job downloads only `kani-shard-*`
+(never an earlier `kani-nightly-verdicts`), then `scripts/kani-nightly-summary.sh` goes RED unless
+there is exactly one verdict row per selected harness (names from the TSV for the selected groups:
+missing, duplicate or unselected rows are red), and on any FAILED, VACUOUS or ERROR row, or any
+shard job that did not succeed. TIMEOUTs are listed separately as warnings, never as failures and
+never as passes. A green run therefore means "nothing failed", not "everything proved": read the
+SUCCESSFUL count.
+
+**Schedule: there is no nightly today.** GitHub fires `schedule:` only from the default branch
+(`main`), and a scheduled run checks out main's tree. Under the v2.2 rule that nothing goes to
+`main`, the workflow runs by **manual dispatch only**, until a human decides between accepting that
+or a main-hosted scheduler that dispatches against the release branch:
+`gh workflow run kani-nightly.yml --ref <branch>` (inputs: `harness_timeout`, `chunk`,
+`jobs_per_runner`, `groups`).
+
+Local equivalent of one shard: `scripts/kani-nightly-shard.sh p3-engine 0 3 30m 2 /tmp/kn`
+(needs coreutils `timeout`/`gtimeout`). Judge locally: `scripts/kani-nightly-summary.sh <shards-dir> <names-file> success /tmp/out`.
