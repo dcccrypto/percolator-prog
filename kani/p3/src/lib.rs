@@ -13,5 +13,15 @@
 )]
 pub mod vault_lp_v18;
 
+// growth_v19 (read by vault_lp_v18::vault_lp_alloc_limit for ALLOC_ALPHA_MAX_BAND_BPS) is the
+// PRODUCTION file; its two non-pure reads are satisfied exactly as in ../contlev: the engine
+// band_rent/wide_math via ../contlev/engine-shim, and the one depth_src_v22 constant it reads.
+#[path = "../../../src/growth_v19.rs"]
+pub mod growth_v19;
+
+pub mod depth_src_v22 {
+    pub const DEPTH_MODE_DEX: u8 = 2;
+}
+
 #[cfg(kani)]
 mod proofs;

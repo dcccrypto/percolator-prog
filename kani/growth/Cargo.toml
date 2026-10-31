@@ -11,6 +11,9 @@ publish = false
 [lib]
 path = "src/lib.rs"
 
+[dependencies]
+percolator = { path = "../contlev/engine-shim" }
+
 [features]
 # Negative controls: swap in mutants/growth_v19_mutant.rs.
 growth_mutant = []

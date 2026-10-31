@@ -182,7 +182,7 @@ pub fn steps_after(steps_taken: u8, liquidated: bool) -> u8 {
 }
 
 /// Kani harnesses (design first, run ONCE on the final code, one at a time):
-/// `cargo kani --features devnet --harness kani_f1_<name>`. Every harness carries
+/// `cargo kani --lib --features devnet -Z stubbing --harness kani_f1_<name>` (docs/KANI.md). Every harness carries
 /// `kani::cover!` for both branches; a verdict counts only with every cover SATISFIED.
 #[cfg(kani)]
 mod f1_kani_proofs {

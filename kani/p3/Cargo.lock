@@ -111,8 +111,13 @@ checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 name = "p3-vault-lp-proofs"
 version = "0.1.0"
 dependencies = [
+ "percolator",
  "proptest",
 ]
+
+[[package]]
+name = "percolator"
+version = "0.0.0"
 
 [[package]]
 name = "ppv-lite86"
