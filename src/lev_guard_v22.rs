@@ -522,7 +522,9 @@ pub fn nav_epoch_start(equity: u128, flow_in: u128, flow_out: u128, now: u64) ->
 /// small loss read as a loss of the PRE-flow equity (a 6 % loss after a 9× allocation read as
 /// 60 %), firing W1 against healthy users. For a pure outflow the end reading is already the
 /// higher one, so withdrawals behave as before. Residual: a loss in the same interval as an
-/// inflow is measured against the larger base (bounded masking; exact needs a sample at the flow).
+/// inflow is measured against the larger base (bounded masking). #636: the flow handlers (96, 97,
+/// 98, 103) now sample AT the flow (`nav_sample_at_flow`), so the flows they book never share an
+/// interval with a P&L; this reading only decides flows booked elsewhere (senior draws).
 ///
 /// GH#627 root cause: "the higher reading wins" also picks the SMALLER base for a gain, and a
 /// base is not bounded below by anything real -- earn `P`, withdraw all but one atom, sample, and
@@ -616,6 +618,35 @@ pub fn nav_sample(st: &NavState, equity: u128, flow_in: u128, flow_out: u128, no
         n.peak_cur = navps;
     }
     n
+}
+
+/// #636 (A1 / B1): the NAV sample taken AT a flow, by the flow handlers (tags 96, 97, 98, 103), so
+/// that the interval a P&L is measured in never contains a flow the program cannot place.
+///
+/// `before` is the cumulative `(flow_in, flow_out)` the handler read BEFORE it moved value;
+/// `after` is `(equity, flow_in, flow_out)` read once it has (equity = the LP's conservative
+/// equity). The flow lands at the END of the interval it closes, so the equity it found is exactly
+///   `equity_before = equity_after + Δout − Δin`
+/// and EVERYTHING else the interval (and the handler: a maintenance fee, a settlement) did to the
+/// equity is P&L. Two same-slot samples:
+///  (1) the interval up to the flow, read at `equity_before` against the counters as they were:
+///      no flow of this handler is in it, so no base can mask a loss (A1) or dilute a gain (B1).
+///      Flows booked elsewhere since the last sample (senior draws; bond / surplus / backstop
+///      value, which have no flow counter) still read as `nav_sample` reads them;
+///  (2) the flow itself: a pure flow (`econ == last`, no division) that moves neither the index nor
+///      the peaks and leaves the baseline at the post-flow equity and counters.
+/// Whatever follows is measured against that baseline. No new constant; `nav_sample` unchanged.
+pub fn nav_sample_at_flow(
+    st: &NavState,
+    before: (u128, u128),
+    after: (u128, u128, u128),
+    now: u64,
+) -> NavState {
+    let din = after.1.saturating_sub(before.0);
+    let dout = after.2.saturating_sub(before.1);
+    let equity_before = after.0.saturating_add(dout).saturating_sub(din);
+    let pre = nav_sample(st, equity_before, before.0, before.1, now);
+    nav_sample(&pre, after.0, after.1, after.2, now)
 }
 
 /// `navps · num / den` (floored), exactly `navps` when `num == den` (a pure flow, or no P&L): no

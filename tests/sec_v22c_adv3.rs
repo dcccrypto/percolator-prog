@@ -924,6 +924,8 @@ impl Env {
                 AccountMeta::new(src, false),
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
             ],
             &[signer],
         );
@@ -1399,6 +1401,13 @@ impl Env {
                 AccountMeta::new(lp, false),
                 AccountMeta::new(self.ledger, false),
                 AccountMeta::new(self.sibling, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&signer.insecure_clone()],
         )
@@ -1604,6 +1613,8 @@ impl Env {
                 AccountMeta::new(self.sibling, false),
                 AccountMeta::new(ext, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&cranker],
         )
@@ -1626,6 +1637,7 @@ impl Env {
                 AccountMeta::new(self.sibling, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new(ext, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[&cranker],
         )
@@ -1650,6 +1662,8 @@ impl Env {
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new(ext, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
             &[signer],
         );
@@ -1893,6 +1907,8 @@ impl Env {
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
         )
     }
@@ -1939,6 +1955,8 @@ impl Env {
                 AccountMeta::new(self.vault_token, false),
                 AccountMeta::new_readonly(self.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new(state::derive_vault_lp_ext(&self.pid, &self.market).0, false),
+                AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false),
             ],
         )
     }
@@ -1999,9 +2017,11 @@ impl Env {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(ext, false),
         ];
-        if let Some(t) = tranche {
-            accts.push(AccountMeta::new_readonly(t, false));
+        match tranche {
+            Some(t) => accts.push(AccountMeta::new_readonly(t, false)),
+            None => accts.push(AccountMeta::new_readonly(solana_sdk::system_program::ID, false)),
         }
+        accts.push(AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false));
         let r = self.send(ProgInstruction::WithdrawJuniorTranche { amount: amount as u128 }, accts, &[signer]);
         if r.is_ok() {
             assert_eq!(self.tok(dest), amount);
@@ -2041,9 +2061,11 @@ impl Env {
             AccountMeta::new(ext, false),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
         ];
-        if let Some(t) = tranche {
-            accts.push(AccountMeta::new_readonly(t, false));
+        match tranche {
+            Some(t) => accts.push(AccountMeta::new_readonly(t, false)),
+            None => accts.push(AccountMeta::new_readonly(solana_sdk::system_program::ID, false)),
         }
+        accts.push(AccountMeta::new(state::derive_lev_guard(&self.pid, &self.market).0, false));
         self.send(ProgInstruction::VaultLpAllocate { amount }, accts, &[&cranker])
     }
 
