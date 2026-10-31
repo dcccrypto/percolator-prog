@@ -6875,4 +6875,6 @@ fn att647_probe_util_rent_above_kink_open_one_slot_after_sweep() {
     let h = env.trader_n(30_100, 10_000 * USD);
     let r = env.trade_cpi(&h.0, h.1, &lp, -10 * Q);
     eprintln!("ATT647-UTIL honest short one slot after a full sweep: {}", match &r { Ok(cu) => format!("Ok({cu})"), Err(e) => e.chars().take(90).collect() });
+    // rentstale: regression (was 121 on rc23 and on #647 before the engine fix).
+    assert!(r.is_ok(), "utilisation rent above the kink must not lock opens: {r:?}");
 }
