@@ -1457,3 +1457,158 @@ fn kani_growth_clip_iff_gate() {
     kani::cover!(users > n, "side already over");
 }
 
+
+// ── prog#572: slot-occupancy rent (`rent_occupancy_rate_e9`, `rent_side_rate_e9`) ──────────────
+// Design (written before the one run; each harness has covers, and each has a mutant in
+// mutants.py that must turn it red):
+// * occ_c_exact: the EXACT value `ceil(max·ex²/span²)` with the REAL ceil primitive, narrow draws
+//   (cap u8, count u16, max u8; the P1 lift as for the other `c_` harnesses). z3 (the u128
+//   mul-div lever: cadical stalls on symbolic-divisor dividers).
+// * occ_domain_shape: the WHOLE production domain, real primitive: cap = 256 (engine
+//   `BAND_MAX_POSITIONS_PER_SIDE`; InitMarket is the only writer of `band_max_positions_per_side`,
+//   so on chain the cap is 0 or 256), max 0..=10_000 (engine `MAX_RENT_E9_PER_SLOT`), any u64
+//   count. Adjacent monotone (`r(c) <= r(c+1)`, which by induction is monotone in count), the
+//   per-leg step bound, 0 at/below the knee, >= 1 past it, max at a full side. z3.
+// * occ_g_full_width: every u64 input, primitive stub_verified, z3 (cadical stalled on the u128
+//   checked squares in the 10-31 attempt): total (no panic/overflow),
+//   <= max, 0 off-band / at or below the knee, >= 1 past it, max at a full side and out of domain.
+// * occ_side_rate_is_max: the combination for EVERY pair of term values (both terms replaced
+//   by recording stubs): side == max(util, occ), so occ == 0 (H1-H3: band off or at/below the
+//   knee) gives exactly today's rate, and side <= rent_max whenever both terms are.
+// * rent_util_le_max: the utilisation term never exceeds rent_max (full width, primitive
+//   stub_verified), the half of "side <= rent_max" that H1-H3 do not cover.
+// The production cap 256 is asserted against the engine constant by the unit test
+// `r572_hedged_cap_filler_pays_occupancy_rent_to_the_vault_lp` (the shim does not export it).
+
+const OCC_PROD_CAP: u64 = 256;
+const OCC_PROD_MAX_RENT: u64 = 10_000;
+
+fn occ_knee_test(c: u64, cap: u64) -> bool {
+    (core::cmp::min(c, cap) as u128) * 10_000 <= (cap as u128) * (RENT_OCC_KNEE_BPS as u128)
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_growth_occ_c_exact() {
+    let cap = kani::any::<u8>() as u64;
+    let c = kani::any::<u16>() as u64;
+    let max = kani::any::<u8>() as u64;
+    let r = rent_occupancy_rate_e9(c, cap, max);
+    if cap == 0 || max == 0 || occ_knee_test(c, cap) {
+        assert_eq!(r, 0);
+    } else if c >= cap {
+        assert_eq!(r, max, "full side: max");
+    } else {
+        let ex = c as u128 * 10_000 - cap as u128 * RENT_OCC_KNEE_BPS as u128;
+        let span = cap as u128 * (10_000 - RENT_OCC_KNEE_BPS as u128);
+        assert!(spec::ceil_rel(max as u128 * ex * ex, span * span, r as u128), "r = ceil(max·x²)");
+        assert!(r >= 1 && r <= max);
+    }
+    kani::cover!(cap > 0 && max > 0 && c > 0 && r == 0, "zero at/below the knee");
+    kani::cover!(r > 0 && r < max && c < cap, "on the ramp");
+    kani::cover!(r == max && max > 0 && c >= cap, "full side: max");
+    kani::cover!(r == max && max > 1 && c < cap, "rounded up to max below a full side");
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_growth_occ_domain_shape() {
+    let cap = OCC_PROD_CAP;
+    let max: u64 = kani::any();
+    let c: u64 = kani::any();
+    kani::assume(max <= OCC_PROD_MAX_RENT && c < u64::MAX);
+    let r = rent_occupancy_rate_e9(c, cap, max);
+    let rn = rent_occupancy_rate_e9(c + 1, cap, max);
+    assert!(r <= max && rn <= max, "never above rent_max");
+    assert!(r <= rn, "monotone in count (adjacent; induction gives every pair)");
+    if occ_knee_test(c, cap) {
+        assert_eq!(r, 0, "0 at or below 85%");
+    } else if max > 0 {
+        assert!(r >= 1, "past the knee the side pays");
+    }
+    if c >= cap {
+        assert_eq!(r, max, "full side: max");
+    }
+    // no cliff: one more leg moves the rate by at most 2·max/(cap·15%) + 1 (5.2% of max + 1)
+    let step = (rn - r) as u128;
+    assert!(
+        step <= 1 || (step - 1) * (cap as u128) * (10_000 - RENT_OCC_KNEE_BPS as u128) <= 2 * (max as u128) * 10_000,
+        "per-leg step bound"
+    );
+    kani::cover!(r == 0 && rn > 0, "crosses the knee");
+    kani::cover!(r > 0 && rn > r && rn < max, "climbs on the ramp");
+    kani::cover!(r < max && rn == max && c + 1 == cap, "last slot reaches max");
+    kani::cover!(max == OCC_PROD_MAX_RENT && rn - r >= 500, "largest real step (~5% of max)");
+    kani::cover!(c > cap && r == max, "count above cap saturates");
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_occ_g_full_width() {
+    let cap: u64 = kani::any();
+    let max: u64 = kani::any();
+    let c: u64 = kani::any();
+    let r = rent_occupancy_rate_e9(c, cap, max);
+    assert!(r <= max);
+    if cap == 0 || max == 0 || occ_knee_test(c, cap) {
+        assert_eq!(r, 0);
+    } else {
+        assert!(r >= 1, "fail closed: never 0 past the knee");
+        if c >= cap || cap > RENT_OCC_CAP_DOMAIN {
+            assert_eq!(r, max, "full side / out of domain: max");
+        }
+    }
+    kani::cover!(cap == 0 && max > 0 && c > 0 && r == 0, "band off");
+    kani::cover!(cap > 0 && max > 0 && c > 0 && r == 0, "at/below the knee");
+    kani::cover!(r > 0 && r < max && cap > 256, "ramp at a wide in-domain cap");
+    kani::cover!(cap > RENT_OCC_CAP_DOMAIN && c < cap && !occ_knee_test(c, cap) && max > 0 && r == max, "out of domain: fail closed");
+    kani::cover!(c >= cap && cap > 0 && r == max && max > u32::MAX as u64, "full side at a wide max");
+}
+
+static mut OCC_UTIL: u64 = 0;
+static mut OCC_OCC: u64 = 0;
+fn occ_util_rec(_u: u128, _n: u128, _k: u16, _m: u64) -> u64 {
+    unsafe { OCC_UTIL }
+}
+fn occ_occ_rec(_c: u64, _cap: u64, _m: u64) -> u64 {
+    unsafe { OCC_OCC }
+}
+
+#[kani::proof]
+#[kani::stub(crate::growth_v19::rent_rate_e9_fail_closed, occ_util_rec)]
+#[kani::stub(crate::growth_v19::rent_occupancy_rate_e9, occ_occ_rec)]
+fn kani_growth_occ_side_rate_is_max() {
+    let util: u64 = kani::any();
+    let occ: u64 = kani::any();
+    let max: u64 = kani::any();
+    unsafe {
+        OCC_UTIL = util;
+        OCC_OCC = occ;
+    }
+    let side = rent_side_rate_e9(kani::any(), kani::any(), kani::any(), max, kani::any(), kani::any());
+    assert!(side >= util && side >= occ && (side == util || side == occ), "max(util, occ)");
+    if occ == 0 {
+        assert_eq!(side, util, "no occupancy term: exactly today's rate");
+    }
+    if util <= max && occ <= max {
+        assert!(side <= max);
+    }
+    kani::cover!(occ == 0 && util > 0 && side == util, "at/below the knee: today's rent");
+    kani::cover!(occ > util && side == occ, "occupancy dominates");
+    kani::cover!(util > occ && occ > 0 && side == util, "utilisation dominates");
+}
+
+#[kani::proof]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_rent_util_le_max() {
+    let u: u128 = kani::any();
+    let n: u128 = kani::any();
+    let k: u16 = kani::any();
+    let max: u64 = kani::any();
+    let r = rent_rate_e9_fail_closed(u, n, k, max);
+    assert!(r <= max);
+    kani::cover!(r > 0 && r < max, "on the utilisation ramp");
+    kani::cover!(n == 0 && r == max, "fail closed: no N_cap");
+    kani::cover!(r == 0 && max > 0 && n > 0, "at/below the kink");
+}

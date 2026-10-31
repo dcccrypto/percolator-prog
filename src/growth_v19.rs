@@ -2810,6 +2810,86 @@ pub fn rent_rate_e9(
     })
 }
 
+/// prog#572: the slot-occupancy knee of the holding-fee rent, in bps of the band market's
+/// per-side position cap (`band_max_positions_per_side`, 256). Below or at it the occupancy term
+/// is 0 and rent is exactly the utilisation rent (`rent_rate_e9`).
+pub const RENT_OCC_KNEE_BPS: u16 = 8_500;
+
+/// prog#572: the largest per-side cap the occupancy ramp computes (the engine refuses a band
+/// config above `band_rent::BAND_MAX_POSITIONS_PER_SIDE` = 256). With `cap <= 2^16` every
+/// product below fits u128 (`max * ex^2 < 2^64 * 2^54`); past the knee a larger cap fails closed
+/// to `max`.
+pub const RENT_OCC_CAP_DOMAIN: u64 = 1 << 16;
+
+/// prog#572: the per-side slot-occupancy rent rate, e9 of notional per slot.
+///
+/// ```text
+/// o = min(count, cap) / cap,  k = RENT_OCC_KNEE_BPS / 1e4,  x = (o - k) / (1 - k)
+/// r = 0                       o <= k
+///   = ceil(max * x^2)         k < o            (x = 1, r = max, at a full side)
+/// ```
+///
+/// A quadratic ramp, not a cliff: 0 with zero slope at the knee, so one more leg near the knee
+/// costs nothing, and no single leg moves the rate by more than `2 * max / (cap * (1 - k)) + 1`
+/// (5.2% of `max` + 1 at cap 256), so a griefer cannot flip a side to the maximum with one leg.
+/// Why: rent priced only on open interest vs LP capacity is 0 for a hedged filler holding every
+/// slot with legs just above the tag-119 eviction bound (4x the minimum leg); this term makes a
+/// held full side pay `max` whatever the LP's size.
+///
+/// Total for every input: 0 if `cap == 0` (band off) or `max == 0`; 0 at or below the knee;
+/// otherwise in `1..=max` (never 0 past the knee: fail closed), `max` at a full side or (out of
+/// the engine's domain) a cap above `RENT_OCC_CAP_DOMAIN`. Monotone non-decreasing in `count`.
+pub fn rent_occupancy_rate_e9(count: u64, cap: u64, max_e9_per_slot: u64) -> u64 {
+    if cap == 0 || max_e9_per_slot == 0 {
+        return 0;
+    }
+    let c = count.min(cap) as u128;
+    // c <= cap <= u64::MAX: both products fit u128.
+    let lhs = c * BPS;
+    let knee = cap as u128 * RENT_OCC_KNEE_BPS as u128;
+    if lhs <= knee {
+        return 0;
+    }
+    // A full side pays the ceiling (x = 1), and a cap outside the engine's domain fails closed
+    // to it; both without the divider.
+    if c >= cap as u128 || cap > RENT_OCC_CAP_DOMAIN {
+        return max_e9_per_slot;
+    }
+    // 0 < ex <= span < 2^27, so ex^2, span^2 < 2^54 and max * ex^2 < 2^118.
+    let ex = lhs - knee;
+    let span = cap as u128 * (BPS - RENT_OCC_KNEE_BPS as u128);
+    let r = match (ex.checked_mul(ex), span.checked_mul(span)) {
+        (Some(ex2), Some(span2)) => mul_div_ceil_u128(max_e9_per_slot as u128, ex2, span2),
+        _ => None,
+    };
+    // Past the knee the rate is in 1..=max: ceil of a positive value is >= 1 (the `max(1)` only
+    // states it), and the clamp (x < 1 here, so unreachable) and any `None` fail closed to max.
+    match r {
+        Some(r) if r < max_e9_per_slot as u128 => (r as u64).max(1),
+        _ => max_e9_per_slot,
+    }
+}
+
+/// prog#572: the per-side rent rate charged: `max(utilisation rent, occupancy rent)`. Equals
+/// `rent_rate_e9_fail_closed` exactly while the side's occupancy is at or below the knee (no
+/// change for any market below 85% of its slots, and none on a band-off market, `cap == 0`).
+pub fn rent_side_rate_e9(
+    users_q: u128,
+    n_cap_q: u128,
+    kink_bps: u16,
+    rent_max: u64,
+    side_count: u64,
+    side_cap: u64,
+) -> u64 {
+    let util = rent_rate_e9_fail_closed(users_q, n_cap_q, kink_bps, rent_max);
+    let occ = rent_occupancy_rate_e9(side_count, side_cap, rent_max);
+    if occ > util {
+        occ
+    } else {
+        util
+    }
+}
+
 // ── Matcher call extension v3 ───────────────────────────────────────────────────────────────
 
 pub const CALL_EXT_V3_VERSION: u8 = 3;
