@@ -9,6 +9,11 @@
 //! provenance discriminator and every wrapper account's header VERSION, and leaves every other
 //! byte untouched, so the replays keep exercising the live v2.1 state. Mirrors the engine's
 //! `tests/p2b_live_replay.rs` upgrader.
+//!
+//! Engine #299/#302 (layout discriminator 19 -> 20) appended `loss_provenance: u32` LAST to
+//! `PortfolioAccountV16Account`. A v2.1 portfolio has no record, which is exactly
+//! `LOSS_PROVENANCE_NONE` (0): the upgrader inserts those 4 zero bytes at the end of the engine
+//! body (before the wrapper's matcher-config tail), the projection removes them and asserts zero.
 #![allow(dead_code)]
 
 use percolator::{
@@ -27,6 +32,12 @@ pub const V21_LAYOUT_DISCRIMINATOR: u16 = 18;
 pub const V22_CONFIG_EXTRA: usize = 6 * 8;
 pub const V22_ASSET_EXTRA: usize = 8 * 8 + 3 * 16;
 const V22_LEG_EXTRA: usize = 8 + 1 + 16 + 8;
+/// #299/#302: `PortfolioAccountV16Account::loss_provenance` (u32), the last field of the engine body.
+pub const V22_PORTFOLIO_TAIL_EXTRA: usize = 4;
+const _: () = assert!(
+    core::mem::offset_of!(PortfolioAccountV16Account, loss_provenance) + V22_PORTFOLIO_TAIL_EXTRA
+        == core::mem::size_of::<PortfolioAccountV16Account>()
+);
 /// -rem variant: per-leg K/F remainders (`k_rem_num`, `f_rem_num`), 32 B inserted after `f_snap`.
 pub const V22_LEG_REM_EXTRA: usize = 32;
 /// fix/v21-funding-scale appended this many bytes of K/F drift-generation state to the END of
@@ -94,7 +105,14 @@ fn upgrade_portfolio(old: &[u8]) -> Vec<u8> {
         out.extend_from_slice(&leg[rem_cut..]);
         out.extend_from_slice(&[0u8; V22_LEG_EXTRA]);
     }
-    out.extend_from_slice(&state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * old_leg_len..]);
+    // Rest of the v2.1 engine body (after the legs), then the zero `loss_provenance`
+    // (= LOSS_PROVENANCE_NONE), then the wrapper tail (matcher config + identity trailer).
+    let old_body_len = core::mem::size_of::<PortfolioAccountV16Account>()
+        - V16_MAX_PORTFOLIO_ASSETS_N * (V22_LEG_EXTRA + V22_LEG_REM_EXTRA)
+        - V22_PORTFOLIO_TAIL_EXTRA;
+    out.extend_from_slice(&state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * old_leg_len..old_body_len]);
+    out.extend_from_slice(&percolator::LOSS_PROVENANCE_NONE.to_le_bytes());
+    out.extend_from_slice(&state[old_body_len..]);
     let disc_off = HEADER_LEN
         + core::mem::offset_of!(PortfolioAccountV16Account, provenance_header)
         + core::mem::offset_of!(percolator::ProvenanceHeaderV16Account, layout_discriminator);
@@ -191,7 +209,14 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
                 out.extend_from_slice(&leg[rem_cut + V22_LEG_REM_EXTRA..leg_len - V22_LEG_EXTRA]);
                 zero(&leg[leg_len - V22_LEG_EXTRA..], "leg");
             }
-            out.extend_from_slice(&state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * leg_len..]);
+            let body_len = core::mem::size_of::<PortfolioAccountV16Account>();
+            out.extend_from_slice(
+                &state[legs_off + V16_MAX_PORTFOLIO_ASSETS_N * leg_len..body_len - V22_PORTFOLIO_TAIL_EXTRA],
+            );
+            // #299/#302: a v2.1 portfolio has no loss record; the projection only exists for
+            // accounts whose record is still LOSS_PROVENANCE_NONE (asserted, never dropped silently).
+            zero(&state[body_len - V22_PORTFOLIO_TAIL_EXTRA..body_len], "portfolio loss_provenance");
+            out.extend_from_slice(&state[body_len..]);
             let disc_off = HEADER_LEN
                 + core::mem::offset_of!(PortfolioAccountV16Account, provenance_header)
                 + core::mem::offset_of!(
@@ -213,7 +238,7 @@ pub fn v21_market_len(v22_len: usize, slots: usize) -> usize {
 }
 
 pub fn v21_portfolio_len(v22_len: usize) -> usize {
-    v22_len - V16_MAX_PORTFOLIO_ASSETS_N * (V22_LEG_EXTRA + V22_LEG_REM_EXTRA)
+    v22_len - V16_MAX_PORTFOLIO_ASSETS_N * (V22_LEG_EXTRA + V22_LEG_REM_EXTRA) - V22_PORTFOLIO_TAIL_EXTRA
 }
 
 pub fn deployed_market_len(v22_len: usize, slots: usize) -> usize {

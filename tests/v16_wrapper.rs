@@ -6984,13 +6984,20 @@ fn v16_wrapper_account_layout_constants_match_serialized_state() {
     // slots grew by 33 B (band_epoch_snap u64, band_liq_pending u8, rent_snap u128,
     // rent_carry u64): 9563 + 16 * 33 = 10091.
     assert_eq!(
-        PORTFOLIO_ACCOUNT_LEN, 10603,
-        "v2.2 combined (-rem): canonical portfolio account length is 10603 (9563 TB-1a + 528 band/rent + 512 K/F remainders)"
+        PORTFOLIO_ACCOUNT_LEN, 10607,
+        "v2.2 combined (-rem) + #299/#302: canonical portfolio account length is 10607 \
+         (9563 TB-1a + 528 band/rent + 512 K/F remainders + 4 loss_provenance)"
     );
     assert_eq!(
         PORTFOLIO_ACCOUNT_LEN,
-        9563 + percolator::V16_MAX_PORTFOLIO_ASSETS_N * (33 + 32),
-        "the whole v2.2 growth is the per-leg band/rent words and the K/F remainders"
+        9563 + percolator::V16_MAX_PORTFOLIO_ASSETS_N * (33 + 32) + 4,
+        "the whole v2.2 growth is the per-leg band/rent words, the K/F remainders and the \
+         engine's u32 loss_provenance (appended last to PortfolioAccountV16Account)"
+    );
+    assert_eq!(
+        core::mem::offset_of!(percolator::PortfolioAccountV16Account, loss_provenance) + 4,
+        core::mem::size_of::<percolator::PortfolioAccountV16Account>(),
+        "loss_provenance is the LAST field of the engine body: no earlier engine offset moved"
     );
     // portfolio_account_len_for_market_slots returns PORTFOLIO_ACCOUNT_LEN regardless of slots.
     assert_eq!(
@@ -24448,10 +24455,15 @@ fn f01_w19_version_is_18_and_every_kind_is_stamped_with_it() {
         19,
         "W-19 policy, v2.2 Wave B bump 18 -> 19 (src/v16_program.rs constants::VERSION)"
     );
+    // Engine #299/#302 moved the discriminator 19 -> 20 (+4 B loss_provenance). The wrapper
+    // VERSION is deliberately NOT bumped in the repin (it is vendored by percolator-nft for exact
+    // equality; a VERSION flag day is an owner decision). Old layout-19 portfolios still fail
+    // closed: the engine provenance check refuses discriminator 19, and the length gate refuses
+    // 10603-byte accounts.
     assert_eq!(
         percolator::V16_LAYOUT_DISCRIMINATOR,
-        19,
-        "engine feat/v22-band-rent:src/v16.rs — the layout bump this VERSION tracks"
+        20,
+        "engine feat/v22-engine-rc23 a100d54d:src/v16.rs:39 — #299/#302 loss_provenance layout"
     );
 
     let (_admin, _owner, market, portfolio, _mint) = f01_w19_fixture();
