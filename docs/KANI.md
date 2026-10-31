@@ -63,27 +63,39 @@ array-equality lowering. The pin logic is covered natively by `cargo test --lib 
 ## Nightly: the 85 timeouts
 
 `.github/workflows/kani-nightly.yml` runs exactly the harnesses in `ci/kani-nightly-harnesses.tsv`
-(the 85 no-verdict harnesses of the run above, names taken from the raw logs), sharded per crate
-(`scripts/kani-nightly-shard.sh`), each harness in its own `cargo kani` process with a longer
-`--harness-timeout` (default 70m; watchdog = timeout + 10 min). The `lib` and `tests` groups build the
-whole wrapper crate, so they run ONE harness per runner, at most 4 per shard (2 per runner made all
-three `tests` shards of run 41174122838 die with "runner has received a shutdown signal", exit 143,
-after 26-69 min). The sub-crate groups use the `chunk` / `jobs_per_runner` inputs (default 8 / 2).
-The plan job refuses any layout that could exceed the 350 min job limit.
+(the 85 no-verdict harnesses of the run above, names taken from the raw logs), **one GitHub job per
+harness** (the plan job builds the matrix: 85 entries, under GitHub's 256 limit; `max_parallel`
+default 8), each with a longer `--harness-timeout` (default 70m; watchdog = timeout + 10 min; the plan
+refuses a timeout whose build + watchdog would not fit the 350 min job limit) and a **memory cap**
+(`mem_cap`, default 13G, applied as a cgroup-v2 `memory.max` with swap 0 via passwordless sudo;
+`ulimit -v` fallback) below the 16 GB of the ubuntu-latest VM.
+
+Why: in run 41183972352 (groups=tests, 4 harnesses per shard, 1 at a time) all 6 shards died with
+"The runner has received a shutdown signal", exit 143, after 43 min to 5 h 7 min, and lost every row
+(artifacts upload at the end of a job). None came near the 350 min job limit, and the one harness
+that reached kani's own 70 min timeout (`kani_v16_asset_lifecycle_decode_preserves_wire_fields`) got
+its TIMEOUT line; the others died mid-harness at varying times, which points to the VM running out of
+memory (CBMC), not to the time limit. With one harness per job, a dying harness can only lose its own
+row; with the cap, CBMC is OOM-killed inside its cgroup before the VM is, and the row says OOM (the job
+log also gets a memory sample every 2 min and the row records the cgroup's peak MiB).
 
 Verdicts (`scripts/kani-nightly-lib.sh`, `classify`):
 - TIMEOUT (no verdict, a warning): only when the log says "CBMC timed out", or the watchdog fired
   (rc 124/137 AND elapsed >= watchdog limit).
-- ERROR (red): any other kill (OOM killer SIGKILL 137, SIGTERM 143, ...) before the watchdog limit,
-  build failures, name rot, crashes.
+- OOM (no verdict, a warning): the memory cap was hit and kani did not exit 0 (cgroup
+  `memory.events` oom_kill > 0, or an allocation failure in the log under the `ulimit -v` fallback).
+  oom_kill > 0 with exit 0 is ERROR (a process was killed, the success is not trusted).
+- ERROR (red): any other kill (SIGKILL 137 / SIGTERM 143 without OOM evidence) before the watchdog
+  limit, build failures, name rot, crashes.
 - SUCCESSFUL needs rc 0, the VERIFICATION line and "1 successfully verified, 0 failures", and every
   cover satisfied (else VACUOUS, red). FAILED = a real check failed (red).
 
-Shard artifacts are named `kani-shard-<group>-<chunk>`; the summary job downloads only `kani-shard-*`
+Per-harness artifacts are named `kani-shard-<group>-<index>`; the summary job downloads only `kani-shard-*`
 (never an earlier `kani-nightly-verdicts`), then `scripts/kani-nightly-summary.sh` goes RED unless
 there is exactly one verdict row per selected harness (names from the TSV for the selected groups:
 missing, duplicate or unselected rows are red), and on any FAILED, VACUOUS or ERROR row, or any
-shard job that did not succeed. TIMEOUTs are listed separately as warnings, never as failures and
+harness job that did not succeed. A missing row (job died) is red. TIMEOUT and OOM rows are listed
+separately as warnings, never as failures and
 never as passes. A green run therefore means "nothing failed", not "everything proved": read the
 SUCCESSFUL count.
 
@@ -91,8 +103,9 @@ SUCCESSFUL count.
 (`main`), and a scheduled run checks out main's tree. Under the v2.2 rule that nothing goes to
 `main`, the workflow runs by **manual dispatch only**, until a human decides between accepting that
 or a main-hosted scheduler that dispatches against the release branch:
-`gh workflow run kani-nightly.yml --ref <branch>` (inputs: `harness_timeout`, `chunk`,
-`jobs_per_runner`, `groups`).
+`gh workflow run kani-nightly.yml --ref <branch>` (inputs: `harness_timeout`, `mem_cap`,
+`max_parallel`, `groups`).
 
-Local equivalent of one shard: `scripts/kani-nightly-shard.sh p3-engine 0 3 30m 2 /tmp/kn`
-(needs coreutils `timeout`/`gtimeout`). Judge locally: `scripts/kani-nightly-summary.sh <shards-dir> <names-file> success /tmp/out`.
+Local equivalent of one job: `scripts/kani-nightly-shard.sh <group> <harness> 30m /tmp/kn [13G]`
+(needs coreutils `timeout`/`gtimeout`). Logic test (no kani; also run by the plan job, where it checks
+the real cgroup cap with a fake kani that allocates 1 GiB under 128M): `scripts/kani-nightly-selftest.sh`. Judge locally: `scripts/kani-nightly-summary.sh <shards-dir> <names-file> success /tmp/out`.

@@ -4,10 +4,15 @@ name: Kani nightly (no-verdict harnesses)
 # triage -- exactly the rows of ci/kani-nightly-harnesses.tsv -- with longer budgets than a laptop
 # can give. Not part of PR CI (hours of CBMC). Design + commands: docs/KANI.md.
 #
+# ONE JOB PER HARNESS (matrix built by the plan job): a dying harness can only lose its own row.
+# Each harness runs under a memory cap below the runner's RAM (cgroup memory.max, default 13G of the
+# 16 GB ubuntu-latest VM) and a wall limit below the job limit, so CBMC is killed first and the row
+# says OOM / TIMEOUT instead of the runner VM dying and taking the row with it (run 41183972352: all
+# 6 multi-harness tests shards died with "runner has received a shutdown signal", 0 rows).
 # Verdicts: one row per harness (scripts/kani-nightly-shard.sh). The summary job is RED on any
 # FAILED (counterexample), VACUOUS (SUCCESSFUL with an unsatisfied cover) or ERROR (build / name
-# rot / crash) verdict. TIMEOUT = still no verdict: reported separately as a warning, never as a
-# failure and never as a pass.
+# rot / crash) verdict and on any MISSING row. TIMEOUT / OOM = still no verdict: reported
+# separately as warnings, never as a failure and never as a pass.
 #
 # NOTE: GitHub fires `schedule` only from the DEFAULT branch (main), and a schedule run checks out
 # main's tree. Under the v2.2 no-main rule this file is not on main, so there is NO nightly: it runs
@@ -16,18 +21,18 @@ name: Kani nightly (no-verdict harnesses)
 
 on:
   schedule:
-    - cron: "0 20 * * *"   # 20:00 UTC; two waves of <= 6 h shards finish by ~08:00 UTC
+    - cron: "0 20 * * *"   # 20:00 UTC (fires only from the default branch, see the NOTE above)
   workflow_dispatch:
     inputs:
       harness_timeout:
-        description: "kani --harness-timeout per harness (e.g. 70m). Watchdog = this + 10 min."
+        description: "kani --harness-timeout per harness (e.g. 70m). Watchdog = this + 10 min; the plan refuses > 300m (job limit 350)."
         default: "70m"
-      chunk:
-        description: "harnesses per shard for the sub-crate groups. lib/tests (whole wrapper crate) always use min(chunk, 4). The plan refuses a layout over the job limit."
+      mem_cap:
+        description: "memory cap per harness (cgroup memory.max, swap 0), below the runner's 16 GB RAM"
+        default: "13G"
+      max_parallel:
+        description: "harness jobs running at once (leave runner slots for PR CI)"
         default: "8"
-      jobs_per_runner:
-        description: "harnesses verified concurrently on one runner, sub-crate groups only (lib/tests always run 1 per runner)"
-        default: "2"
       groups:
         description: "comma list of groups to run (lib,tests,contlev,p3,p3-engine,growth) or 'all'"
         default: "all"
@@ -44,26 +49,33 @@ env:
 
 jobs:
   plan:
-    name: plan shards
+    name: plan (one job per harness)
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
       timeout: ${{ steps.plan.outputs.timeout }}
+      memcap: ${{ steps.plan.outputs.memcap }}
+      maxpar: ${{ steps.plan.outputs.maxpar }}
       expected: ${{ steps.plan.outputs.expected }}
     steps:
       - uses: actions/checkout@v4
-      - name: check the list against the tree, build the shard matrix
+      # Runs here (not only at the end) so a broken verdict rule or memory cap fails before hours of
+      # CBMC. On this runner it also checks the real cgroup cap: a 1 GiB allocation under 128M -> OOM row.
+      - name: self-test the verdict rules and the memory cap (fake kani)
+        run: ./scripts/kani-nightly-selftest.sh
+      - name: check the list against the tree, build the per-harness matrix
         id: plan
         env:
           IN_TIMEOUT: ${{ github.event.inputs.harness_timeout || '70m' }}
-          IN_CHUNK: ${{ github.event.inputs.chunk || '8' }}
-          IN_JOBS: ${{ github.event.inputs.jobs_per_runner || '2' }}
+          IN_MEMCAP: ${{ github.event.inputs.mem_cap || '13G' }}
+          IN_MAXPAR: ${{ github.event.inputs.max_parallel || '8' }}
           IN_GROUPS: ${{ github.event.inputs.groups || 'all' }}
         run: |
           set -euo pipefail
           [[ "$IN_TIMEOUT" =~ ^[0-9]+[smh]$ ]] || { echo "bad harness_timeout $IN_TIMEOUT"; exit 1; }
-          [[ "$IN_CHUNK" =~ ^[1-9][0-9]*$ && "$IN_JOBS" =~ ^[1-9]$ ]] || { echo "bad chunk/jobs"; exit 1; }
+          [[ "$IN_MEMCAP" =~ ^[0-9]+[MG]$ ]] || { echo "bad mem_cap $IN_MEMCAP"; exit 1; }
+          [[ "$IN_MAXPAR" =~ ^[1-9][0-9]?$ ]] || { echo "bad max_parallel $IN_MAXPAR"; exit 1; }
           [[ "$IN_GROUPS" =~ ^[a-z0-9,-]+$ ]] || { echo "bad groups"; exit 1; }
           python3 - <<'EOF'
           import json, os, re, subprocess, math
@@ -78,46 +90,41 @@ jobs:
               if r.returncode != 0: missing.append(f'{g}\t{h}')
           if missing:
               print('::error::harness rows with no matching fn in the tree:\n' + '\n'.join(missing)); raise SystemExit(1)
+          dup = sorted({h for _, h in rows if sum(1 for _, x in rows if x == h) > 1})
+          if dup: print('::error::harness names listed twice: ' + ', '.join(dup)); raise SystemExit(1)
           want = os.environ['IN_GROUPS']
           sel = None if want == 'all' else set(want.split(','))
           if sel and not sel <= set(dirs): print(f'::error::unknown group(s) {sel - set(dirs)}'); raise SystemExit(1)
-          # lib/tests compile the whole wrapper crate: 1 harness per runner and at most 4 per shard
-          # (2 per runner died with "runner has received a shutdown signal", exit 143, run 41174122838).
-          heavy = {'lib', 'tests'}
-          size_in, jobs_in = int(os.environ['IN_CHUNK']), int(os.environ['IN_JOBS'])
           t = os.environ['IN_TIMEOUT']
           tmin = int(t[:-1]) * {'s': 1 / 60, 'm': 1, 'h': 60}[t[-1]]
-          wd = math.floor(tmin) + 10                     # the shard script's watchdog, minutes
+          wd = math.floor(tmin) + 10                     # the harness script's watchdog, minutes
+          # job budget: checkout + kani install + build <= 25 min, then one harness <= watchdog + 1 min
+          if 25 + wd + 1 > 350:
+              print(f'::error::harness_timeout {t} (watchdog {wd}m) does not fit the 350 min job limit'); raise SystemExit(1)
           order = ['lib', 'tests', 'growth', 'p3', 'contlev', 'p3-engine']
-          inc, expected, over = [], [], []
+          inc, expected = [], []
           for g in order:
-              names = [r[1] for r in rows if r[0] == g]
-              if not names or (sel and g not in sel): continue
-              size, jobs = (min(size_in, 4), 1) if g in heavy else (size_in, jobs_in)
-              # job budget: install + build ~15 min, then ceil(size/jobs) waves of <= watchdog+1 min
-              if 15 + math.ceil(size / jobs) * (wd + 1) > 350: over.append(f'{g}: {size} per shard, {jobs} at a time, watchdog {wd}m')
-              expected += names
-              for c in range(math.ceil(len(names) / size)):
-                  inc.append({'group': g, 'chunk': c, 'size': size, 'jobs': jobs, 'n': min(size, len(names) - c * size)})
-          if over:
-              print('::error::shard layout exceeds the 350 min job limit:\n' + '\n'.join(over)); raise SystemExit(1)
+              if sel and g not in sel: continue
+              for i, h in enumerate(r[1] for r in rows if r[0] == g):
+                  inc.append({'group': g, 'idx': i, 'harness': h}); expected.append(h)
           if not inc: print('::error::no harnesses selected'); raise SystemExit(1)
-          print(f'{len(rows)} harnesses listed; {len(expected)} selected in {len(inc)} shards')
-          for i in inc: print(f"  {i['group']} #{i['chunk']}: {i['n']} harnesses, {i['jobs']} at a time")
+          if len(inc) > 256: print(f'::error::{len(inc)} harness jobs > GitHub matrix limit 256'); raise SystemExit(1)
+          print(f'{len(rows)} harnesses listed; {len(expected)} selected = {len(inc)} jobs, '
+                f'{os.environ["IN_MAXPAR"]} at a time, timeout {t} (watchdog {wd}m), mem cap {os.environ["IN_MEMCAP"]}')
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write('matrix=' + json.dumps({'include': inc}) + '\n')
               f.write('expected=' + json.dumps(expected) + '\n')
-              f.write(f"timeout={t}\n")
+              f.write(f"timeout={t}\nmemcap={os.environ['IN_MEMCAP']}\nmaxpar={os.environ['IN_MAXPAR']}\n")
           EOF
 
   shard:
-    name: "kani ${{ matrix.group }} chunk ${{ matrix.chunk }} (${{ matrix.n }} harnesses, ${{ matrix.jobs }} at a time)"
+    name: "kani ${{ matrix.group }} ${{ matrix.harness }}"
     needs: plan
     runs-on: ubuntu-latest
-    timeout-minutes: 350   # GitHub-hosted job limit is 360
+    timeout-minutes: 350   # GitHub-hosted job limit is 360; the plan keeps build + watchdog below it
     strategy:
       fail-fast: false
-      max-parallel: 8      # leave runner slots for PR CI (account-wide concurrent job limit)
+      max-parallel: ${{ fromJson(needs.plan.outputs.maxpar) }}
       matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
     steps:
       - name: checkout percolator-prog
@@ -146,37 +153,39 @@ jobs:
           fi
           cargo kani setup
           cargo kani --version
-      - name: run shard
+      - name: run harness (memory cap ${{ needs.plan.outputs.memcap }}, timeout ${{ needs.plan.outputs.timeout }})
         working-directory: percolator-prog
+        env:
+          GROUP: ${{ matrix.group }}
+          HARNESS: ${{ matrix.harness }}
+          TMO: ${{ needs.plan.outputs.timeout }}
+          MEMCAP: ${{ needs.plan.outputs.memcap }}
         run: |
-          ./scripts/kani-nightly-shard.sh '${{ matrix.group }}' '${{ matrix.chunk }}' \
-            '${{ matrix.size }}' '${{ needs.plan.outputs.timeout }}' \
-            '${{ matrix.jobs }}' "$RUNNER_TEMP/kn"
+          nproc; free -m; df -h / | tail -1
+          ./scripts/kani-nightly-shard.sh "$GROUP" "$HARNESS" "$TMO" "$RUNNER_TEMP/kn" "$MEMCAP"
           {
-            echo "### kani ${{ matrix.group }} #${{ matrix.chunk }}"
-            echo '| harness | verdict | s | failed checks | covers |'
-            echo '|---|---|---|---|---|'
-            awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}' "$RUNNER_TEMP/kn/verdicts.tsv"
+            echo "### kani $GROUP \`$HARNESS\`"
+            echo '| harness | verdict | s | failed checks | covers | peak MiB |'
+            echo '|---|---|---|---|---|---|'
+            awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5, $6}' "$RUNNER_TEMP/kn/verdicts.tsv"
           } >> "$GITHUB_STEP_SUMMARY"
-      - name: upload verdicts + logs
+      - name: upload verdict + log
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: kani-shard-${{ matrix.group }}-${{ matrix.chunk }}
+          name: kani-shard-${{ matrix.group }}-${{ matrix.idx }}
           path: ${{ runner.temp }}/kn
           if-no-files-found: warn
           retention-days: 30
 
   summary:
-    name: verdicts (red on FAILED / VACUOUS / ERROR)
+    name: verdicts (red on FAILED / VACUOUS / ERROR / missing row)
     needs: [plan, shard]
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
-      - name: self-test the verdict rules (fake logs and rows)
-        run: ./scripts/kani-nightly-selftest.sh
       # Only this run's shard artifacts (kani-shard-*): never an earlier kani-nightly-verdicts.
       - uses: actions/download-artifact@v4
         with: { pattern: kani-shard-*, path: shards }
