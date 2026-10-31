@@ -1,0 +1,200 @@
+name: Kani nightly (no-verdict harnesses)
+
+# Runs the Kani harnesses that had NO VERDICT (CBMC --harness-timeout) in the 2026-10-30/31 rc23
+# triage -- exactly the rows of ci/kani-nightly-harnesses.tsv -- with longer budgets than a laptop
+# can give. Not part of PR CI (hours of CBMC). Design + commands: docs/KANI.md.
+#
+# Verdicts: one row per harness (scripts/kani-nightly-shard.sh). The summary job is RED on any
+# FAILED (counterexample), VACUOUS (SUCCESSFUL with an unsatisfied cover) or ERROR (build / name
+# rot / crash) verdict. TIMEOUT = still no verdict: reported separately as a warning, never as a
+# failure and never as a pass.
+#
+# NOTE: GitHub fires `schedule` only from the DEFAULT branch. Until this file is on main the
+# nightly does not run by itself; use `gh workflow run kani-nightly.yml --ref <branch>`.
+
+on:
+  schedule:
+    - cron: "0 20 * * *"   # 20:00 UTC; two waves of <= 6 h shards finish by ~08:00 UTC
+  workflow_dispatch:
+    inputs:
+      harness_timeout:
+        description: "kani --harness-timeout per harness (e.g. 70m). Watchdog = this + 10 min."
+        default: "70m"
+      chunk:
+        description: "harnesses per shard (runner). Keep ceil(chunk/jobs_per_runner) * timeout under ~5h30."
+        default: "8"
+      jobs_per_runner:
+        description: "harnesses verified concurrently on one runner (4 vCPU / 16 GB)"
+        default: "2"
+      groups:
+        description: "comma list of groups to run (lib,tests,contlev,p3,p3-engine,growth) or 'all'"
+        default: "all"
+
+concurrency:
+  group: kani-nightly-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  KANI_VERSION: "0.67.0"
+
+jobs:
+  plan:
+    name: plan shards
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      timeout: ${{ steps.plan.outputs.timeout }}
+      chunk: ${{ steps.plan.outputs.chunk }}
+      jobs: ${{ steps.plan.outputs.jobs }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: check the list against the tree, build the shard matrix
+        id: plan
+        env:
+          IN_TIMEOUT: ${{ github.event.inputs.harness_timeout || '70m' }}
+          IN_CHUNK: ${{ github.event.inputs.chunk || '8' }}
+          IN_JOBS: ${{ github.event.inputs.jobs_per_runner || '2' }}
+          IN_GROUPS: ${{ github.event.inputs.groups || 'all' }}
+        run: |
+          set -euo pipefail
+          [[ "$IN_TIMEOUT" =~ ^[0-9]+[smh]$ ]] || { echo "bad harness_timeout $IN_TIMEOUT"; exit 1; }
+          [[ "$IN_CHUNK" =~ ^[1-9][0-9]*$ && "$IN_JOBS" =~ ^[1-9]$ ]] || { echo "bad chunk/jobs"; exit 1; }
+          [[ "$IN_GROUPS" =~ ^[a-z0-9,-]+$ ]] || { echo "bad groups"; exit 1; }
+          python3 - <<'EOF'
+          import json, os, re, subprocess, math
+          rows = [l.rstrip('\n').split('\t') for l in open('ci/kani-nightly-harnesses.tsv') if l.strip() and not l.startswith('#')]
+          dirs = {'lib': ['src'], 'tests': ['tests'], 'contlev': ['kani/contlev/src'], 'p3': ['kani/p3/src'],
+                  'p3-engine': ['kani/p3-engine/src'], 'growth': ['kani/growth/src']}
+          missing = []
+          for g, h in rows:
+              if g not in dirs: missing.append(f'{g}\t{h} (unknown group)'); continue
+              fn = h.split('::')[-1]
+              r = subprocess.run(['grep', '-rqE', rf'fn {re.escape(fn)}\b', *dirs[g]])
+              if r.returncode != 0: missing.append(f'{g}\t{h}')
+          if missing:
+              print('::error::harness rows with no matching fn in the tree:\n' + '\n'.join(missing)); raise SystemExit(1)
+          want = os.environ['IN_GROUPS']
+          sel = None if want == 'all' else set(want.split(','))
+          if sel and not sel <= set(dirs): print(f'::error::unknown group(s) {sel - set(dirs)}'); raise SystemExit(1)
+          size = int(os.environ['IN_CHUNK'])
+          order = ['lib', 'tests', 'growth', 'p3', 'contlev', 'p3-engine']
+          inc = []
+          for g in order:
+              n = sum(1 for r in rows if r[0] == g)
+              if n == 0 or (sel and g not in sel): continue
+              for c in range(math.ceil(n / size)):
+                  inc.append({'group': g, 'chunk': c, 'n': min(size, n - c * size)})
+          print(f'{len(rows)} harnesses listed; {sum(i["n"] for i in inc)} selected in {len(inc)} shards')
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write('matrix=' + json.dumps({'include': inc}) + '\n')
+              f.write(f"timeout={os.environ['IN_TIMEOUT']}\nchunk={size}\njobs={os.environ['IN_JOBS']}\n")
+          EOF
+
+  shard:
+    name: "kani ${{ matrix.group }} chunk ${{ matrix.chunk }} (${{ matrix.n }} harnesses)"
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub-hosted job limit is 360
+    strategy:
+      fail-fast: false
+      max-parallel: 8      # leave runner slots for PR CI (account-wide concurrent job limit)
+      matrix: ${{ fromJson(needs.plan.outputs.matrix) }}
+    steps:
+      - name: checkout percolator-prog
+        uses: actions/checkout@v4
+        with: { path: percolator-prog }
+      - name: load canonical deployed refs
+        id: refs
+        run: grep -E '^[A-Z_]+=' percolator-prog/ci/deployed-refs.env >> "$GITHUB_OUTPUT"
+      - name: checkout engine (path dependency, pinned to ENGINE_CI_SIBLING)
+        uses: actions/checkout@v4
+        with: { repository: dcccrypto/percolator, path: percolator, ref: '${{ steps.refs.outputs.ENGINE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: dtolnay/rust-toolchain@stable
+      - name: cache kani
+        id: kcache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/cargo-kani
+            ~/.cargo/bin/kani
+            ~/.kani
+          key: kani-${{ env.KANI_VERSION }}-${{ runner.os }}-v1
+      - name: install kani ${{ env.KANI_VERSION }}
+        run: |
+          if ! cargo kani --version 2>/dev/null | grep -q "$KANI_VERSION"; then
+            cargo install --locked kani-verifier --version "$KANI_VERSION"
+          fi
+          cargo kani setup
+          cargo kani --version
+      - name: run shard
+        working-directory: percolator-prog
+        run: |
+          ./scripts/kani-nightly-shard.sh '${{ matrix.group }}' '${{ matrix.chunk }}' \
+            '${{ needs.plan.outputs.chunk }}' '${{ needs.plan.outputs.timeout }}' \
+            '${{ needs.plan.outputs.jobs }}' "$RUNNER_TEMP/kn"
+          {
+            echo "### kani ${{ matrix.group }} #${{ matrix.chunk }}"
+            echo '| harness | verdict | s | failed checks | covers |'
+            echo '|---|---|---|---|---|'
+            awk -F'\t' '{printf "| `%s` | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}' "$RUNNER_TEMP/kn/verdicts.tsv"
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: upload verdicts + logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: kani-nightly-${{ matrix.group }}-${{ matrix.chunk }}
+          path: ${{ runner.temp }}/kn
+          if-no-files-found: warn
+          retention-days: 30
+
+  summary:
+    name: verdicts (red on FAILED / VACUOUS / ERROR)
+    needs: [plan, shard]
+    if: always() && needs.plan.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v4
+        with: { pattern: kani-nightly-*, path: shards }
+      - name: merge and judge
+        env:
+          SHARD_RESULT: ${{ needs.shard.result }}
+        run: |
+          set -uo pipefail
+          mkdir -p out
+          cat shards/*/verdicts.tsv 2>/dev/null | sort > out/verdicts.tsv || true
+          total=$(wc -l < out/verdicts.tsv | tr -d ' ')
+          {
+            echo "## Kani nightly: $total verdict rows (shard jobs: $SHARD_RESULT)"
+            for v in SUCCESSFUL TIMEOUT FAILED VACUOUS ERROR; do
+              echo "- $v: $(awk -F'\t' -v v=$v '$2==v' out/verdicts.tsv | wc -l | tr -d ' ')"
+            done
+            for v in FAILED VACUOUS ERROR TIMEOUT SUCCESSFUL; do
+              n=$(awk -F'\t' -v v=$v '$2==v' out/verdicts.tsv | wc -l | tr -d ' ')
+              [ "$n" = 0 ] && continue
+              echo; echo "### $v"
+              awk -F'\t' -v v=$v '$2==v {printf "- `%s` (%s s; %s; %s)\n", $1, $3, $4, $5}' out/verdicts.tsv
+            done
+          } | tee out/SUMMARY.md >> "$GITHUB_STEP_SUMMARY"
+          awk -F'\t' '$2=="TIMEOUT" {print "::warning title=Kani TIMEOUT (no verdict)::" $1}' out/verdicts.tsv
+          bad=$(awk -F'\t' '$2=="FAILED" || $2=="VACUOUS" || $2=="ERROR"' out/verdicts.tsv)
+          rc=0
+          if [ -n "$bad" ]; then
+            echo "$bad" | awk -F'\t' '{print "::error title=Kani " $2 "::" $1 " (" $4 "; " $5 ")"}'
+            rc=1
+          fi
+          if [ "$SHARD_RESULT" != "success" ]; then
+            echo "::error::a shard job did not finish cleanly ($SHARD_RESULT): its harnesses have no verdict row"
+            rc=1
+          fi
+          exit $rc
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: kani-nightly-verdicts
+          path: out
+          retention-days: 90
