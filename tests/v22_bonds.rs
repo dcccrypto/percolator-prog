@@ -4569,3 +4569,117 @@ fn gh571_103_allocation_reserves_the_bonds_accrual() {
         }
     }
 }
+
+// ── att649 (independent attacker, PR #649) ────────────────────────────────────────────────────
+
+/// ATT649-F1: a zero-cost deposit -> 109 -> cooldown -> 110 ROUND TRIP by a third party
+/// reclassifies the incumbents' carried arrears `A` into principal `C_b`.
+/// 108 adds the whole deposit to `C_b` (A unchanged); 110 removes a PRO-RATA slice of BOTH. The
+/// round-tripper therefore leaves with `d * A / (K + d)` of `A` it never accrued; the incumbents'
+/// `K = C_b + A` is unchanged but `A` (the part future fee legs pay, i.e. the junior's
+/// reimbursement for the arrears it fronted) shrinks by that amount and the 1-year cap
+/// (`A <= coupon_due(C_b, r, 1y)`) gets fresh headroom. Two worlds, identical except for the
+/// round trip; the same fat legs run afterwards in both.
+#[test]
+fn att649_f1_round_trip_reclassifies_arrears_junior_pays_seniors_keep_the_leg() {
+    let run = |round_trip: bool| -> (u128, u128, u128, u128, u128, u128) {
+        let (mut env, lp, _d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 2_000, 2_000);
+        let t = env.new_trader(10_000 * U);
+        // a long quiet stretch, then a dust crank: the stretch's coupon is carried as arrears
+        env.slot += 20_000_000;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        dust_trade(&mut env, &t, &lp);
+        env.crank_fees_bond(lp.portfolio).expect("78 dust");
+        let (_, _, _, a_before) = tranche_raw(&env);
+        // the round trip (or the same wait without it)
+        if round_trip {
+            let x = env.new_bond_holder();
+            env.bond_deposit(&x, lp.portfolio, 4_000 * U, 1).expect("108 round-trip in");
+            let m = env.bond_pos(&x).shares;
+            env.bond_request(&x, m).expect("109");
+            env.wait_cooldown(&[lp.portfolio]);
+            let got = env.bond_execute(&x, lp.portfolio, 0).expect("110 round-trip out") as u128;
+            eprintln!("ATT649-F1 round-tripper: paid in {} got back {got}", 4_000 * U);
+            assert!(got <= 4_000 * U as u128 + 4_000 * U as u128 * 2_000 * 9_100 / (10_000 * bond_v20::SLOTS_PER_YEAR) + 2, "round-tripper earns only its own cooldown coupon");
+        } else {
+            env.wait_cooldown(&[lp.portfolio]);
+            // settle at the same slot as the other world's 110 (a 1-atom deposit settles)
+            let y = env.new_bond_holder();
+            let _ = (1..=8u64).find(|a| env.bond_deposit(&y, lp.portfolio, *a, 1).is_ok()).expect("tiny settle");
+        }
+        let (cb_mid, b_mid, _, a_mid) = tranche_raw(&env);
+        let h_sh = env.bond_pos(&h).shares;
+        let h_value = (cb_mid + a_mid) * h_sh / b_mid;
+        // identical fee history afterwards: fat legs until the carried arrears are paid
+        for _ in 0..12 {
+            env.hold(1, &[lp.portfolio]);
+            fat_leg(&mut env, &t, &lp);
+            env.crank_fees_bond(lp.portfolio).expect("78 fat");
+        }
+        let (_, _, _, a_end) = tranche_raw(&env);
+        let s = env.split3(lp.portfolio);
+        env.assert_conserved("att649 f1");
+        (a_before, a_mid, h_value, s.junior, env.vlp().senior_claim_atoms, a_end)
+    };
+    let (a0, a_ctl, hv_ctl, j_ctl, s_ctl, ae_ctl) = run(false);
+    let (a0b, a_att, hv_att, j_att, s_att, ae_att) = run(true);
+    eprintln!(
+        "ATT649-F1: arrears after stretch {a0}/{a0b}; after (no)round-trip ctl {a_ctl} att {a_att}; \
+         incumbent value ctl {hv_ctl} att {hv_att}; junior ctl {j_ctl} att {j_att} (diff {}); \
+         senior claim ctl {s_ctl} att {s_att} (diff {}); arrears end {ae_ctl}/{ae_att}",
+        j_ctl as i128 - j_att as i128,
+        s_att as i128 - s_ctl as i128
+    );
+    assert!(a0 > 50 * U as u128, "vacuity: > 50 USDC carried");
+    assert!(hv_att.abs_diff(hv_ctl) <= 3, "the incumbent bondholder's value is the same in both worlds");
+    assert!(a_att * 2 < a_ctl, "the round trip removed most of the fee-leg-payable arrears");
+    assert_eq!((ae_ctl, ae_att), (0, 0), "both worlds' fat legs paid every remaining carried atom");
+    // the junior ends poorer by the reclassified arrears; the Earn seniors keep that part of the leg
+    assert!(j_ctl > j_att + (a_ctl - a_att) / 2, "junior lost the reclassified arrears");
+    assert!(s_att > s_ctl, "seniors kept the fee-leg share that would have reimbursed the junior");
+}
+
+/// ATT649-F1b (same root cause): the 1-year arrears cap does not bound what the junior fronts.
+/// After 2 quiet years the cap binds (A == 1y of coupon on C_b). A third-party round trip
+/// reclassifies most of A into C_b; a further quiet half-year then accrues again. Without the
+/// round trip the incumbent stays at principal + exactly one year of coupon (no fee leg ever
+/// runs in either world).
+#[test]
+fn att649_f1b_round_trip_resets_the_one_year_arrears_cap() {
+    let run = |round_trip: bool| -> (u128, u128, u128) {
+        let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+        let (cb0, ..) = tranche_raw(&env);
+        env.slot += 2 * SLOTS_PER_YEAR_U64;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let x = env.new_bond_holder();
+        if round_trip {
+            env.bond_deposit(&x, lp.portfolio, 3_000 * U, 1).expect("108 round-trip in");
+            let m = env.bond_pos(&x).shares;
+            env.bond_request(&x, m).expect("109");
+            env.wait_cooldown(&[lp.portfolio]);
+            env.bond_execute(&x, lp.portfolio, 0).expect("110 round-trip out");
+        } else {
+            let _ = (1..=8u64).find(|a| env.bond_deposit(&x, lp.portfolio, *a, 1).is_ok()).expect("tiny settle");
+            env.wait_cooldown(&[lp.portfolio]);
+        }
+        let (cb1, _, _, a1) = tranche_raw(&env);
+        // half a year more of quiet, then the incumbent exits (110 settles first)
+        let sh = env.bond_pos(&h).shares;
+        env.bond_request(&h, sh).expect("109 incumbent");
+        env.slot += SLOTS_PER_YEAR_U64 / 2;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110 incumbent") as u128;
+        eprintln!("ATT649-F1b rt={round_trip}: C_b0 {cb0} after (C_b {cb1}, A {a1}); incumbent paid {paid} (principal + 1y cap = {})", cb0 + bond_v20::coupon_arrears_cap(cb0, 2_000).unwrap());
+        env.assert_conserved("att649 f1b");
+        (cb0, a1, paid)
+    };
+    let (cb0, a_ctl, p_ctl) = run(false);
+    let (_, a_att, p_att) = run(true);
+    let cap = bond_v20::coupon_arrears_cap(cb0, 2_000).unwrap();
+    assert!(p_ctl <= cb0 + cap + 2, "control: principal + at most one year of coupon");
+    assert!(a_att < a_ctl / 2, "the round trip reclassified most of the arrears");
+    assert!(p_att > cb0 + cap + cap / 4, "attack: the incumbent is paid > 1.25 years of coupon with no fee leg: {p_att}");
+}
