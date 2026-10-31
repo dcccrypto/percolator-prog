@@ -6485,3 +6485,89 @@ fn r572_occupancy_rate_shape_exhaustive_and_extremes() {
         assert_eq!(rent_side_rate_e9(u, n, kink, max, 256, 256), max, "full side: max");
     }
 }
+
+impl Env {
+    /// Clear the asset's vault-LP binding (the record a market has before tag 94 binds a vault).
+    fn unbind_vault_lp(&mut self) {
+        let mut mk = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&mk.data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        state::asset_vault_lp_to_wrapper_bytes(
+            &mut mk.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &state::AssetVaultLpV18::default(),
+        )
+        .unwrap();
+        self.svm.set_account(self.market, mk).unwrap();
+    }
+}
+
+/// prog#572 no bound vault LP: rent has no destination, so a FULL side (20/20 after a cap poke)
+/// pays no occupancy rent either; nothing is booked as unrouted rent and insurance is not
+/// credited by rent. Same gate as utilisation rent (`rent_rates_view` returns (0, 0) before
+/// either term without a bound vault LP).
+/// No-regression test (passes on base by design); negative control = mutant that charges the
+/// occupancy term before the bound-LP gate (fails: rate 23 at 20/20).
+#[test]
+fn r572_no_bound_vault_lp_no_occupancy_rent() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let mut longs = Vec::new();
+    for i in 0..20u32 {
+        if i == 17 {
+            env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+        }
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("small long");
+        longs.push(t.1);
+    }
+    assert_eq!(env.pos_counts().0, 20, "the long side is full");
+    env.unbind_vault_lp();
+    let ins0 = env.engine_header().2;
+    let unrouted0 = env.engine_asset().rent_unrouted_atoms;
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("R572 no bound vault LP, 20/20: charged {rl}/{rs}");
+    assert_eq!((rl, rs), (0, 0), "no bound vault LP: no rent, occupancy included");
+    for _ in 0..10 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(lp.account);
+    }
+    longs.push(lp.account);
+    env.sweep(&longs);
+    assert_eq!(env.engine_asset().rent_unrouted_atoms, unrouted0, "no unrouted rent booked");
+    assert_eq!(env.engine_header().2, ins0, "insurance not credited by rent");
+    env.assert_conservation();
+}
+
+/// prog#572 band-off market: a rent-only market (band_bps 0) carries cap 0 (the engine refuses
+/// to load a band-off config with a nonzero `band_max_positions_per_side`, `V16Config` shape
+/// rules), so there is no occupancy term: 230 longs (90% of the band markets' 256) pay exactly
+/// today's utilisation rent (0 with a $20M LP). No-regression test (passes on base by design);
+/// negative control = mutant reading the engine constant 256 instead of the market's cap
+/// (fails: 230/256 is past the knee).
+#[test]
+fn r572_band_off_market_rent_unchanged() {
+    let mut c = band_cfg();
+    c.phase4 = Some(phase4(0, RENT_MAX));
+    c.r_gap = 400;
+    let mut env = Env::new(c);
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    assert_eq!(env.engine_header().6, RENT_MAX as u64, "rent on");
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::read_market(&data).unwrap();
+    assert_eq!((group.config.band_bps, group.config.band_max_positions_per_side), (0, 0), "band off, cap 0");
+    let mut longs = Vec::new();
+    for i in 0..230u32 {
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("small long");
+        longs.push(t.1);
+    }
+    assert_eq!(env.pos_counts().0, 230);
+    assert!(env.growth().rent_n_cap_q > 0, "rent is live: N_cap measured, vault LP bound");
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("R572 band-off rent market, 230 longs: charged {rl}/{rs}");
+    assert_eq!((rl, rs), (0, 0), "band off: utilisation rent only (0 here)");
+    env.assert_conservation();
+}

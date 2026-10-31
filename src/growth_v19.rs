@@ -2850,7 +2850,9 @@ pub fn rent_occupancy_rate_e9(count: u64, cap: u64, max_e9_per_slot: u64) -> u64
     if lhs <= knee {
         return 0;
     }
-    if cap > RENT_OCC_CAP_DOMAIN {
+    // A full side pays the ceiling (x = 1), and a cap outside the engine's domain fails closed
+    // to it; both without the divider.
+    if c >= cap as u128 || cap > RENT_OCC_CAP_DOMAIN {
         return max_e9_per_slot;
     }
     // 0 < ex <= span < 2^27, so ex^2, span^2 < 2^54 and max * ex^2 < 2^118.
@@ -2860,8 +2862,10 @@ pub fn rent_occupancy_rate_e9(count: u64, cap: u64, max_e9_per_slot: u64) -> u64
         (Some(ex2), Some(span2)) => mul_div_ceil_u128(max_e9_per_slot as u128, ex2, span2),
         _ => None,
     };
+    // Past the knee the rate is in 1..=max: ceil of a positive value is >= 1 (the `max(1)` only
+    // states it), and the clamp (x < 1 here, so unreachable) and any `None` fail closed to max.
     match r {
-        Some(r) if r < max_e9_per_slot as u128 => r as u64,
+        Some(r) if r < max_e9_per_slot as u128 => (r as u64).max(1),
         _ => max_e9_per_slot,
     }
 }
