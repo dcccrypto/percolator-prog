@@ -3987,12 +3987,17 @@ fn rentstale_util_rent_above_kink_opens_without_a_same_slot_sweep() {
     let h = env.trader(10_000 * USD);
     let r = env.trade_cpi(&h.0, h.1, &lp, -10 * Q);
     assert!(r.is_ok(), "honest short one slot after a full sweep: {r:?}");
-    // Stronger: several slots later, with NO sweep at all, another open goes through.
+    // Stronger: 3 slots later, NO sweep — only the keeper's one crank (of the LP) that accrues
+    // the asset to the clock — and another open goes through (rc23: 121 here too, att647 "after a
+    // same-slot LP crank -> 121").
     env.warp(3);
     env.push(PRICE);
+    env.crank_current(lp.account);
+    let a = env.engine_asset();
+    assert!(a.rent_index_long_num > r0, "rent still accruing");
     let h2 = env.trader(10_000 * USD);
     let r2 = env.trade_cpi(&h2.0, h2.1, &lp, -10 * Q);
-    assert!(r2.is_ok(), "honest short 3 slots later without any sweep: {r2:?}");
+    assert!(r2.is_ok(), "honest short 3 slots later after one LP crank, no sweep: {r2:?}");
     // The untouched legs still owe and pay their rent on their next touch.
     for p in &ps {
         env.crank_current(*p);
@@ -6148,3 +6153,4 @@ fn lev_guard_vol_profile_floor_off_is_unchanged_on_only_tightens() {
         assert!(lgt::has(&r2, lgt::REFUSED), "OFF: over L(OFF) {l_off} refused: {r2:?}");
     }
 }
+
