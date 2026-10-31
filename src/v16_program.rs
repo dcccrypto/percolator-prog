@@ -51009,7 +51009,7 @@ pub mod risk {
 /// P1 (2026-09-29) Kani harnesses for `risk_limits_v17`. Lives in the lib (not
 /// `tests/v16_kani.rs`) because that file no longer compiles against the v18 wire at the
 /// deployed lineage (stale `Instruction` field sets), which blocks `cargo kani --tests`.
-/// Run: `cargo kani --harness kani_p1_<name>`. Every harness carries `kani::cover!`; a
+/// Run: `cargo kani --lib --features devnet -Z stubbing --harness kani_p1_<name>` (docs/KANI.md). Every harness carries `kani::cover!`; a
 /// verdict counts only with every cover SATISFIED.
 #[cfg(kani)]
 mod p1_kani_proofs {
@@ -51543,7 +51543,7 @@ mod p1_position_cap_kani_proofs {
 /// (not `kani/growth/`) because `growth_v19::band_r_gap_bps` now calls the engine
 /// (`percolator::band_rent`), which the standalone `kani/growth` crate cannot resolve (it
 /// fails to compile at the base 64e52533 for that reason). WRITTEN, NOT RUN (design first, run
-/// ONCE on the final code): `cargo kani --features devnet --harness kani_g8_<name>`. Every
+/// ONCE on the final code): `cargo kani --lib --features devnet -Z stubbing --harness kani_g8_<name>`. Every
 /// harness carries `kani::cover!` for each branch; a verdict counts only with every cover
 /// SATISFIED. Inputs are bounded (u8 / u16 / u32 cast up) like `kani/growth`.
 #[cfg(kani)]
@@ -52138,7 +52138,7 @@ mod g8_kani_proofs {
 
 /// v2.2 round 3 (2026-10-14, adaptive-controller design §4) Kani harnesses, one group per item,
 /// on the new PURE functions in `growth_v19` / `vault_lp_v18`. WRITTEN, NOT RUN (Khubair runs
-/// them once): `cargo kani --features devnet --harness kani_r3_<name>`. Every harness carries a
+/// them once): `cargo kani --lib --features devnet -Z stubbing --harness kani_r3_<name>`. Every harness carries a
 /// `kani::cover!` per branch (a verdict counts only with every cover SATISFIED); inputs are
 /// bounded (u8 / u16 / u32 cast up). Each doc lists the mutants the harness must refute.
 #[cfg(kani)]
@@ -52321,9 +52321,11 @@ mod r3_kani_proofs {
     /// none for `dt == 0` or no previous mark; the first EWMA value is >= the seed (no data -> no
     /// loosening); an update lies between the old value and the sample; L_vol is monotone
     /// NON-INCREASING in sigma, never above `1e6 / IMR` (so never above L_tier), and no data reads
-    /// launch; the flags validator accepts exactly bit 0, and bit 1 only with bit 0.
+    /// launch; the flags validator accepts exactly bits 0-2 (bit 2 = GROWTH_FLAG_LEV_GUARD, #601),
+    /// and bit 1 only with bit 0.
     /// Mutants: seed skipped (first calm sample loosens); `+` for `-` on a fall; sigma floored
-    /// (understates); `min` for `max` with the IMR; no data read as "no cap"; bit 1 without bit 0.
+    /// (understates); `min` for `max` with the IMR; no data read as "no cap"; bit 1 without bit 0;
+    /// bit 2 dropped from the validator mask (a lev-guard-bound record rejected); bit 3 accepted.
     #[kani::proof]
     fn kani_r3_item6_vol_term() {
         let p0: u32 = kani::any();
@@ -52356,12 +52358,15 @@ mod r3_kani_proofs {
         let launch: u16 = kani::any();
         assert_eq!(l_signal_with_vol(sig, None, launch), core::cmp::min(sig, launch), "no data: launch");
         let f: u8 = kani::any();
-        assert_eq!(growth_flags_ok(f), f & !0x03 == 0 && (f & 0x02 == 0 || f & 0x01 != 0));
+        // Oracle written as literals on purpose (not the GROWTH_FLAG_* consts the validator uses).
+        assert_eq!(growth_flags_ok(f), f & !0x07 == 0 && (f & 0x02 == 0 || f & 0x01 != 0));
         kani::cover!(!has && x < VOL_VAR_SEED_X100 && v2 == VOL_VAR_SEED_X100, "seeded");
         kani::cover!(has && x > var && v2 > var, "rises toward a storm");
         kani::cover!(has && x < var && v2 < var, "decays toward calm");
         kani::cover!(lb < la, "more volatility, less leverage");
         kani::cover!(smp.is_some_and(|v| v > 0), "a real move");
+        kani::cover!(f & 0x04 != 0 && growth_flags_ok(f), "lev-guard bit accepted");
+        kani::cover!(f & 0x02 != 0 && f & 0x01 == 0 && !growth_flags_ok(f), "bit 1 without bit 0 refused");
     }
 
     /// Item 7 (GAP-10): the rent snapshot rises at once, and a fall is exactly
