@@ -6083,3 +6083,226 @@ fn lev_guard_vol_profile_floor_off_is_unchanged_on_only_tightens() {
         assert!(lgt::has(&r2, lgt::REFUSED), "OFF: over L(OFF) {l_off} refused: {r2:?}");
     }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+// att645 (independent attack on PR #645, port of upstream 0c5d4f4f "invalidate stale matcher
+// capabilities"): a permissionless SettleHoldingRent (tag 104 family, fork-only) refreshes an
+// arbitrary portfolio through the engine's Refresh, which clears a prior-reset leg -- a position
+// change outside the LP's matcher. That handler is wrapped by NEITHER `with_position_epoch_bumps`
+// NOR `with_matcher_invalidations`, so a NON-canonical (legacy-wire) matcher capability survives
+// with its stale `inventory_base`, and an unsigned taker then fills the LP past its configured cap.
+// ═══════════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn att645_lp(&mut self, deposit: u128, max_inventory_abs: u128, bind: bool) -> Lp {
+        let owner = self.signer();
+        let account = self.portfolio(&owner, deposit);
+        let ctx = self.key();
+        let delegate = matcher_delegate_key(
+            &self.program_id,
+            &self.market,
+            &account,
+            &owner.pubkey(),
+            &self.matcher_program,
+            &ctx,
+        );
+        self.svm
+            .set_account(
+                delegate,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![],
+                    owner: Pubkey::default(),
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let mp = self.matcher_program;
+        self.svm
+            .set_account(
+                ctx,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; MATCHER_CONTEXT_LEN],
+                    owner: mp,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.identity(account);
+        let asset_generation_frontier = state::read_market_asset_generation_frontier(
+            &self.svm.get_account(&self.market).unwrap().data,
+        )
+        .unwrap();
+        let m = self.market;
+        self.send(
+            ProgInstruction::SetMatcherConfig {
+                portfolio_id,
+                expected_sequence,
+                asset_generation_frontier,
+                enabled: 1,
+                trade_fee_cap_bps: 10_000,
+                expiry_slot: u64::MAX,
+            },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(m, false),
+                AccountMeta::new(account, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new_readonly(ctx, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            &[&owner],
+        )
+        .expect("set matcher config");
+        self.send(
+            ProgInstruction::InitMatcherCtx {
+                kind: 0,
+                trading_fee_bps: 0,
+                base_spread_bps: 0,
+                max_total_bps: 100,
+                impact_k_bps: 0,
+                liquidity_notional_e6: 0,
+                max_fill_abs: u128::MAX,
+                max_inventory_abs,
+                fee_to_insurance_bps: 0,
+                skew_spread_mult_bps: 0,
+            },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new_readonly(m, false),
+                AccountMeta::new(account, false),
+                AccountMeta::new(ctx, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new_readonly(delegate, false),
+            ],
+            &[&owner],
+        )
+        .expect("init matcher ctx");
+        if bind {
+        let mut mk = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&mk.data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        let rec = state::AssetVaultLpV18 {
+            vault_lp_portfolio: account.to_bytes(),
+            flags: state::ASSET_VAULT_LP_FLAG_BOUND,
+            ..Default::default()
+        };
+        state::asset_vault_lp_to_wrapper_bytes(
+            &mut mk.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &rec,
+        )
+        .unwrap();
+        self.svm.set_account(self.market, mk).unwrap();
+        }
+        Lp { owner, account, ctx, delegate }
+    }
+
+    fn att645_finalize_both(&mut self) -> (Result<u64, String>, Result<u64, String>) {
+        let m = self.market;
+        let l = self.send(
+            ProgInstruction::FinalizeResetSide { asset_index: 0, side: 0 },
+            vec![AccountMeta::new(m, false)],
+            &[],
+        );
+        let s = self.send(
+            ProgInstruction::FinalizeResetSide { asset_index: 0, side: 1 },
+            vec![AccountMeta::new(m, false)],
+            &[],
+        );
+        (l, s)
+    }
+}
+
+fn att645_ctx_inventory(env: &Env, ctx: Pubkey) -> i128 {
+    // 64-byte return slot + MatcherCtx.inventory_base at +96 (as v16_cu.rs issue406 tests).
+    let d = env.svm.get_account(&ctx).unwrap().data;
+    i128::from_le_bytes(d[160..176].try_into().unwrap())
+}
+
+fn att645_enabled(env: &Env, p: Pubkey) -> u64 {
+    state::read_portfolio_matcher_config(&env.svm.get_account(&p).unwrap().data).unwrap().enabled()
+}
+
+/// `refresh_via_rent`: true = the attack (SettleHoldingRent clears the LP's reset leg);
+/// false = the control (a PermissionlessCrank clears it, which IS wrapped).
+fn att645_run(refresh_via_rent: bool) -> (Result<u64, String>, i128, i128, u64) {
+    att645_run_with(refresh_via_rent, false)
+}
+
+/// `third_party`: the attacked LP is an ordinary (NOT the bound vault LP) portfolio; a separate
+/// portfolio is the asset's bound vault LP (needed only as SettleHoldingRent's account 3).
+fn att645_run_with(refresh_via_rent: bool, third_party: bool) -> (Result<u64, String>, i128, i128, u64) {
+    const MAX_INV: i128 = 50 * Q;
+    // (third_party = true is not reachable on a v2.2 market: every v2.2 asset is a growth asset and
+    // an open against a non-vault LP is refused GrowthNeedsLpCounterparty, Custom(95). Kept for
+    // a legacy/non-growth market.)
+    let mut env = f1_env(None, f1_off_band_cfg());
+    env.auth_mark();
+    let vault = if third_party { Some(env.lp(100_000 * USD)) } else { None };
+    let lp = env.att645_lp(100_000 * USD, MAX_INV as u128, !third_party);
+    let vault_key = vault.as_ref().map_or(lp.account, |v| v.account);
+    let (t_owner, t) = env.trader(10_000 * USD);
+    let (a_owner, a) = env.trader(10_000 * USD);
+
+    // 1. The LP sells its whole matcher cap to T through its own (non-canonical) matcher.
+    env.trade_cpi(&t_owner, t, &lp, MAX_INV).expect("open: LP sells its cap");
+    assert_eq!(env.pos(lp.account), -MAX_INV);
+    assert_eq!(att645_ctx_inventory(&env, lp.ctx), -MAX_INV);
+    assert_eq!(att645_enabled(&env, lp.account), 1);
+
+    // 2. T exits (its own owner-signed tag 44): the long side drains, the short side resets;
+    //    the LP's leg becomes a prior-reset obligation. Nothing touched the LP's portfolio.
+    env.rebalance_reduce(&t_owner, t, MAX_INV as u128).expect("taker exit");
+    assert_eq!(att645_enabled(&env, lp.account), 1, "the LP was not touched");
+    let _ = env.att645_finalize_both();
+
+    // 3. Clear the LP's reset leg.
+    if refresh_via_rent {
+        env.settle_rent(lp.account, vault_key).expect("ATTACK: permissionless SettleHoldingRent refresh of the LP");
+    } else {
+        env.crank(lp.account).expect("CONTROL: permissionless crank refresh of the LP");
+    }
+    let (fl, fs) = env.att645_finalize_both();
+    let asset = env.engine_asset();
+    eprintln!(
+        "att645 after refresh: lp_pos={} ctx_inv={} enabled={} finalize=({fl:?},{fs:?}) a_long={} a_short={} modes=({:?},{:?})",
+        env.pos(lp.account),
+        att645_ctx_inventory(&env, lp.ctx),
+        att645_enabled(&env, lp.account),
+        asset.a_long,
+        asset.a_short,
+        asset.mode_long,
+        asset.mode_short,
+    );
+    assert_eq!(env.pos(lp.account), 0, "setup: the LP is flat after its reset leg is cleared");
+    assert_eq!(att645_ctx_inventory(&env, lp.ctx), -MAX_INV, "setup: matcher counter is stale");
+
+    // 4. An UNSIGNED taker routes a 2x-cap sell into the LP through the LP's matcher.
+    let r = env.trade_cpi(&a_owner, a, &lp, -2 * MAX_INV);
+    (r, env.pos(lp.account), att645_ctx_inventory(&env, lp.ctx), att645_enabled(&env, lp.account))
+}
+
+#[test]
+fn att645_settle_holding_rent_refresh_leaves_stale_matcher_capability() {
+    const MAX_INV: i128 = 50 * Q;
+    let (r, lp_pos, ctx_inv, enabled) = att645_run(true);
+    eprintln!("att645 ATTACK: fill={r:?} lp_pos={lp_pos} ctx_inv={ctx_inv} enabled={enabled}");
+    assert!(
+        r.is_err() && lp_pos <= MAX_INV,
+        "BUG (PR #645 gap): after a permissionless SettleHoldingRent refresh cleared the LP's leg, \
+         its stale non-canonical matcher capability stayed enabled and an unsigned taker filled \
+         the LP to {lp_pos} against a configured matcher cap of {MAX_INV} (matcher counter {ctx_inv})"
+    );
+}
+
+#[test]
+fn att645_control_crank_refresh_invalidates_stale_matcher_capability() {
+    let (r, lp_pos, ctx_inv, enabled) = att645_run(false);
+    eprintln!("att645 CONTROL: fill={r:?} lp_pos={lp_pos} ctx_inv={ctx_inv} enabled={enabled}");
+    assert!(r.unwrap_err().contains("Custom(8)"), "the crank path invalidates the capability");
+    assert_eq!(enabled, 0);
+}
+
