@@ -1469,7 +1469,8 @@ fn kani_growth_clip_iff_gate() {
 //   so on chain the cap is 0 or 256), max 0..=10_000 (engine `MAX_RENT_E9_PER_SLOT`), any u64
 //   count. Adjacent monotone (`r(c) <= r(c+1)`, which by induction is monotone in count), the
 //   per-leg step bound, 0 at/below the knee, >= 1 past it, max at a full side. z3.
-// * occ_g_full_width: every u64 input, primitive stub_verified: total (no panic/overflow),
+// * occ_g_full_width: every u64 input, primitive stub_verified, z3 (cadical stalled on the u128
+//   checked squares in the 10-31 attempt): total (no panic/overflow),
 //   <= max, 0 off-band / at or below the knee, >= 1 past it, max at a full side and out of domain.
 // * occ_side_rate_is_max: the combination for EVERY pair of term values (both terms replaced
 //   by recording stubs): side == max(util, occ), so occ == 0 (H1-H3: band off or at/below the
@@ -1542,6 +1543,7 @@ fn kani_growth_occ_domain_shape() {
 }
 
 #[kani::proof]
+#[kani::solver(z3)]
 #[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
 fn kani_growth_occ_g_full_width() {
     let cap: u64 = kani::any();
