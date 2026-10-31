@@ -854,9 +854,17 @@ pub mod constants {
     /// only by tag 125 (live `asset_admin`), carried by every profile rebuild, cleared when a slot
     /// is (re-)activated for a new creator. With `asset_admin` burned it makes tag 90
     /// permissionless to the payee's ATA and keeps CloseSlab from re-booking the pot.
-    pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = 1 << 3;
+    pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = crate::creator_fee_payee_v22::P4_FLAG_CREATOR_FEE_PAYEE;
     pub const P4_FLAGS_KNOWN_MASK: u8 =
         P4_FLAG_INS_UNITS_REQUIRED | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT | P4_FLAG_CREATOR_FEE_PAYEE;
+    // prog#587: bit 3 is one bit, disjoint from bit0 (INS_UNITS_REQUIRED), bit1 (reserved for
+    // item 4) and bit2 (EXIT_REQUIRES_LOSS_CURRENT).
+    const _: () = assert!(
+        P4_FLAG_CREATOR_FEE_PAYEE.count_ones() == 1
+            && P4_FLAG_CREATOR_FEE_PAYEE
+                & (P4_FLAG_INS_UNITS_REQUIRED | (1 << 1) | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT)
+                == 0
+    );
     /// Item 8: the most stale positioned portfolios one ExecuteRedemption may refresh
     /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
@@ -7772,7 +7780,7 @@ pub mod state {
     /// prog#587: the profile's creator-fee-payee bit (`p4_flags` bit 3).
     #[inline]
     pub fn profile_has_creator_fee_payee(profile: &AssetOracleProfileV16) -> bool {
-        profile_p4_flags(profile) & crate::constants::P4_FLAG_CREATOR_FEE_PAYEE != 0
+        crate::creator_fee_payee_v22::has_payee_bit(profile_p4_flags(profile))
     }
 
     /// Decision 16 (night 2026-10-28): the pool claim (`["pool_claim", pool]`, kind 18).
@@ -24023,8 +24031,8 @@ pub mod processor {
                 return Err(PercolatorError::CreatorFeePayeeInvalid.into());
             }
             advance_authority_epoch_view(&mut group, idx, authority_epoch)?;
-            profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX] |=
-                crate::constants::P4_FLAG_CREATOR_FEE_PAYEE;
+            profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX] =
+                crate::creator_fee_payee_v22::with_payee_bit(state::profile_p4_flags(&profile), true);
             write_oracle_profile_to_view(&mut group, idx, &profile)?;
             group.validate_shape().map_err(map_v16_error)?;
         }
@@ -27992,8 +28000,11 @@ pub mod processor {
                     // prog#587: a (re-)activated slot is a new creator's asset; it never inherits
                     // an earlier generation's creator-fee payee (RETIRE already wrote a fresh
                     // profile; this pins it for any other activation source).
-                    profile._padding0[constants::PROFILE_P4_FLAGS_IDX] &=
-                        !constants::P4_FLAG_CREATOR_FEE_PAYEE;
+                    profile._padding0[constants::PROFILE_P4_FLAGS_IDX] =
+                        crate::creator_fee_payee_v22::with_payee_bit(
+                            state::profile_p4_flags(&profile),
+                            false,
+                        );
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
                     }

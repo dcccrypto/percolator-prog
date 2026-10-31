@@ -19,6 +19,27 @@
 pub const CREATOR_FEE_PAYEE_SEED: &[u8] = b"creator_fee_payee";
 pub const CREATOR_FEE_PAYEE_VERSION: u8 = 1;
 
+/// Profile `p4_flags` bit 3 (profile byte +20): a payee is recorded for this asset. The wrapper's
+/// `constants::P4_FLAG_CREATOR_FEE_PAYEE` is this value; a const assert there pins it disjoint
+/// from bits 0..2 (INS_UNITS_REQUIRED, item 4's reserved bit 1, EXIT_REQUIRES_LOSS_CURRENT).
+pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = 1 << 3;
+
+/// The only way the wrapper writes bit 3: tag 125 sets it (`on = true`), an asset activation
+/// clears it (`on = false`). Every other `p4_flags` bit passes through unchanged.
+#[inline]
+pub fn with_payee_bit(p4_flags: u8, on: bool) -> u8 {
+    if on {
+        p4_flags | P4_FLAG_CREATOR_FEE_PAYEE
+    } else {
+        p4_flags & !P4_FLAG_CREATOR_FEE_PAYEE
+    }
+}
+
+#[inline]
+pub fn has_payee_bit(p4_flags: u8) -> bool {
+    p4_flags & P4_FLAG_CREATOR_FEE_PAYEE != 0
+}
+
 /// The per-asset payee record (after the 16-byte program header, kind 19). 72 bytes.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -165,6 +186,14 @@ mod tests {
     }
 
     #[test]
+    fn payee_bit_rules() {
+        assert_eq!(with_payee_bit(0b0000_0101, true), 0b0000_1101);
+        assert_eq!(with_payee_bit(0b0000_1101, false), 0b0000_0101);
+        assert!(has_payee_bit(0b1000_1000));
+        assert!(!has_payee_bit(0b1111_0111));
+    }
+
+    #[test]
     fn record_rules() {
         let mut r = CreatorFeePayeeV22 {
             market: A,
@@ -239,6 +268,24 @@ mod kani_proofs {
         }
         kani::cover!(r == ClaimRoute::Payee, "burned + payee");
         kani::cover!(creator_pot_orphaned(&admin, flag, pot), "orphan re-book");
+    }
+
+    /// The payee bit is bit 3 only: setting / clearing it changes no other `p4_flags` bit (so
+    /// it never collides with bits 0..2 or any later bit), and the read-back is exact.
+    #[kani::proof]
+    fn kani_587_payee_bit_isolated() {
+        let flags: u8 = kani::any();
+        let on: bool = kani::any();
+        let out = with_payee_bit(flags, on);
+        assert_eq!(out & !P4_FLAG_CREATOR_FEE_PAYEE, flags & !P4_FLAG_CREATOR_FEE_PAYEE);
+        assert_eq!(has_payee_bit(out), on);
+        assert_eq!(P4_FLAG_CREATOR_FEE_PAYEE.count_ones(), 1);
+        // Any other single bit k != 3 is read identically before and after.
+        let k: u8 = kani::any();
+        kani::assume(k < 8 && k != 3);
+        assert_eq!(out & (1u8 << k), flags & (1u8 << k));
+        kani::cover!(on && !has_payee_bit(flags), "bit newly set");
+        kani::cover!(!on && has_payee_bit(flags) && flags != P4_FLAG_CREATOR_FEE_PAYEE, "bit cleared, others kept");
     }
 
     /// Conservation of a claim: the counters drop by exactly `amount`, neither grows, and an

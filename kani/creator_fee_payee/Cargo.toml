@@ -1,0 +1,23 @@
+[package]
+name = "creator-fee-payee-proofs"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Standalone: proves the EXACT production file ../../src/creator_fee_payee_v22.rs (prog#587).
+# Pure module (core + bytemuck only), so the harnesses run in seconds.
+[workspace]
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+bytemuck = { version = "1", features = ["derive"] }
+
+[features]
+# Negative controls: compile mutants/creator_fee_payee_v22_mutant.rs (one deliberate defect,
+# written by run_mutants.sh) instead of the production file, so the named harness FAILS.
+mutant = []
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(kani)'] }

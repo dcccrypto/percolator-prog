@@ -7,8 +7,10 @@
 //! same as there (crafted stake pool, mint supply) plus planted SPL token accounts (the payee's
 //! ATA, attacker accounts) and, in the spoof test, a forged program-owned record.
 //!
-//! NEGATIVE CONTROL: every test here fails on the rc23-tip wrapper (64a18e99): tag 125 does not
-//! exist there, and a burned asset's creator pot has no claim path.
+//! NEGATIVE CONTROLS (PR body): tests 1-6, 8, 9 fail on the rc23 wrapper (1adcb05b): tag 125 does not
+//! exist there, and a burned asset's creator pot has no claim path. Test 7 pins UNCHANGED
+//! behaviour (no payee => refused + re-booked), so it passes there by design; its control is a
+//! mutant that stops the re-book. Every guard in the fix has its own mutant (PR body table).
 mod common;
 
 use common::{
@@ -786,10 +788,11 @@ impl Env {
     ) -> Result<(), TransactionError> {
         self.fund(&signer.pubkey());
         let pda = payee_pda(&self.market, asset_index);
+        let market_id = self.generation(asset_index);
         self.send(
             ProgInstruction::SetCreatorFeePayee {
                 asset_index,
-                market_id: 1,
+                market_id,
                 payee: payee.to_bytes(),
                 authority_epoch,
             }
@@ -802,6 +805,17 @@ impl Env {
             ],
             &[signer],
         )
+    }
+
+    /// The asset slot's LIVE generation (`market_id`), as tag 125 binds it.
+    fn generation(&self, asset_index: u16) -> u64 {
+        state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            false,
+        )
+        .unwrap()
+        .0
     }
 
     fn fund(&mut self, k: &Pubkey) {
@@ -1100,4 +1114,341 @@ impl Env {
         }
         self.svm.set_account(self.market, acct).unwrap();
     }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// prog#587 helpers for the lifecycle / rebuild tests
+// ─────────────────────────────────────────────────────────────────────────────
+const GENERATION_MISMATCH: u32 = 65;
+
+impl Env {
+    /// `send`, but prints the program log on a refusal (diagnosis of lifecycle preconditions).
+    fn send_logged(
+        &mut self,
+        ix_data: Vec<u8>,
+        accounts: Vec<AccountMeta>,
+        signers: &[&Keypair],
+    ) -> Result<(), TransactionError> {
+        let payer = self.payer.insecure_clone();
+        self.svm.expire_blockhash();
+        let ix = Instruction { program_id: PERCOLATOR_MAINNET, accounts, data: ix_data };
+        let mut all_signers = vec![&payer];
+        all_signers.extend_from_slice(signers);
+        let tx = solana_sdk::transaction::Transaction::new_signed_with_payer(
+            &[common::heap_ix(), common::cu_ix(), ix],
+            Some(&payer.pubkey()),
+            &all_signers,
+            self.svm.latest_blockhash(),
+        );
+        self.svm.send_transaction(tx).map(|_| ()).map_err(|e| {
+            for l in &e.meta.logs {
+                println!("  log: {l}");
+            }
+            e.err
+        })
+    }
+
+    fn clock_slot(&self) -> u64 {
+        self.svm.get_sysvar::<solana_sdk::clock::Clock>().slot
+    }
+
+    fn profile(&self, asset_index: usize) -> state::AssetOracleProfileV16 {
+        state::read_asset_oracle_profile(&self.svm.get_account(&self.market).unwrap().data, asset_index)
+            .unwrap()
+    }
+
+    fn payee_bit(&self, asset_index: usize) -> bool {
+        state::profile_has_creator_fee_payee(&self.profile(asset_index))
+    }
+
+    /// Real tag 40 signed by `marketauth` (= `admin` here). ACTIVATE binds the generation
+    /// frontier, every other action the slot's live `market_id`; the epoch is asset 0's lane.
+    fn lifecycle(&mut self, action: u8, asset_index: u16) -> Result<(), TransactionError> {
+        let admin = self.admin.insecure_clone();
+        let activation = action == percolator_prog::processor::ASSET_ACTION_ACTIVATE;
+        let (current, next) = state::read_asset_lifecycle_generation_preflight(
+            &self.svm.get_account(&self.market).unwrap().data,
+            asset_index as usize,
+            activation,
+        )
+        .unwrap();
+        let a = admin.pubkey().to_bytes();
+        let (auth, price) = if activation { (a, PRICE) } else { ([0u8; 32], 0) };
+        // RETIRE stamps `retired_slot` from the Clock and canonicalisation refuses 0.
+        let now_slot = self.clock_slot() + 1;
+        self.svm.warp_to_slot(now_slot);
+        let authority_epoch = self.authority_epoch(0);
+        self.send_logged(
+            ProgInstruction::UpdateAssetLifecycle {
+                action,
+                asset_index,
+                market_id: if activation { next } else { current },
+                authority_epoch,
+                now_slot,
+                initial_price: price,
+                max_init_fee: u128::MAX,
+                insurance_authority: auth,
+                insurance_operator: auth,
+                backing_bucket_authority: auth,
+                oracle_authority: auth,
+            }
+            .encode(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(self.market, false),
+            ],
+            &[&admin],
+        )
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 6. The payee record and the destination cannot be spoofed: owner / kind / market / asset /
+//    version / length tampering of the REAL PDA, and every wrong-destination shape.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn f587_payee_record_and_destination_spoofs_refused() {
+    use percolator_prog::constants::{HEADER_LEN, KIND_POOL_CLAIM};
+    use percolator_prog::error::PercolatorError as E;
+    let payee = Pubkey::new_unique();
+    let (mut env, ..) = traded_flat_market_in(first_loss_env(payee));
+    let owed = env.legs().creator_owed();
+    let legs0 = env.legs();
+    let ata = env.plant_ata(payee);
+    let pda = payee_pda(&env.market, 0);
+    let cranker = Keypair::new();
+    let real = env.svm.get_account(&pda).unwrap();
+    assert_eq!(real.owner, PERCOLATOR_MAINNET);
+    assert_eq!(real.data.len(), state::creator_fee_payee_account_len());
+    assert_eq!(real.data[10], percolator_prog::constants::KIND_CREATOR_FEE_PAYEE);
+    assert_eq!(&real.data[HEADER_LEN + 32..HEADER_LEN + 64], payee.as_ref());
+
+    // (1) record tampering, each on the REAL PDA address, restored after.
+    let h = HEADER_LEN;
+    let mut cases: Vec<(&str, Account)> = Vec::new();
+    let mut a = real.clone();
+    a.owner = spl_token_classic_id();
+    cases.push(("owner = token program", a));
+    let mut a = real.clone();
+    a.owner = solana_sdk::system_program::id();
+    cases.push(("owner = system program", a));
+    let mut a = real.clone();
+    a.data[10] = KIND_POOL_CLAIM;
+    cases.push(("header kind 18", a));
+    let mut a = real.clone();
+    a.data[h..h + 32].copy_from_slice(Pubkey::new_unique().as_ref());
+    cases.push(("stored market differs", a));
+    let mut a = real.clone();
+    a.data[h + 64..h + 66].copy_from_slice(&1u16.to_le_bytes());
+    cases.push(("stored asset index differs", a));
+    let mut a = real.clone();
+    a.data[h + 66] = 2;
+    cases.push(("version", a));
+    let mut a = real.clone();
+    a.data[h + 32..h + 64].fill(0);
+    cases.push(("zero payee", a));
+    let mut a = real.clone();
+    a.data.push(0);
+    cases.push(("length + 1", a));
+    for (label, acct) in cases {
+        env.svm.set_account(pda, acct).unwrap();
+        assert_custom(env.claim_as(&cranker, owed, ata, Some(pda)), PAYEE_INVALID, label);
+        env.svm.set_account(pda, real.clone()).unwrap();
+    }
+
+    // (2) destination shapes.
+    // close authority set on the payee's canonical ATA (W5: encumbered).
+    {
+        let a0 = env.svm.get_account(&ata).unwrap();
+        let mut a = a0.clone();
+        let mut t = TokenAccount::unpack(&a.data).unwrap();
+        t.close_authority = solana_program::program_option::COption::Some(cranker.pubkey());
+        TokenAccount::pack(t, &mut a.data).unwrap();
+        env.svm.set_account(ata, a).unwrap();
+        assert_custom(
+            env.claim_as(&cranker, owed, ata, Some(pda)),
+            E::InvalidTokenAccount as u32,
+            "close-authority ATA",
+        );
+        env.svm.set_account(ata, a0).unwrap();
+    }
+    // the canonical ATA ADDRESS holding an account owned by someone else.
+    {
+        let a0 = env.svm.get_account(&ata).unwrap();
+        let mut a = a0.clone();
+        let mut t = TokenAccount::unpack(&a.data).unwrap();
+        t.owner = cranker.pubkey();
+        TokenAccount::pack(t, &mut a.data).unwrap();
+        env.svm.set_account(ata, a).unwrap();
+        assert_custom(
+            env.claim_as(&cranker, owed, ata, Some(pda)),
+            E::InvalidTokenAccount as u32,
+            "right address, wrong owner",
+        );
+        env.svm.set_account(ata, a0).unwrap();
+    }
+    // the payee's canonical ATA for ANOTHER mint.
+    let other_mint = Pubkey::new_unique();
+    let other_ata = canonical_vault_ata(&payee, &other_mint);
+    env.plant(other_ata, make_token_data(other_mint, payee, 0), spl_token_classic_id());
+    assert_custom(env.claim_as(&cranker, owed, other_ata, Some(pda)), E::InvalidMint as u32, "other-mint ATA");
+    // the vault itself.
+    let vault = env.vault;
+    assert_custom(env.claim_as(&cranker, owed, vault, Some(pda)), E::InvalidTokenAccount as u32, "vault as dest");
+
+    // Nothing moved; the untampered claim then pays the payee in full.
+    assert_eq!(env.legs(), legs0);
+    env.claim_as(&cranker, owed, ata, Some(pda)).expect("control: untampered claim pays");
+    assert_eq!(env.token_amount(ata) as u128, owed);
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 7. No payee recorded before the burn: behaviour unchanged. Tag 90 refused for everyone and
+//    CloseSlab re-books the creator pot to the protocol leg.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn f587_no_payee_burned_market_unchanged_close_rebooks_to_protocol() {
+    let (mut env, _fees) = terminal_empty_market_with_fees_in(Env::build(true, true));
+    assert!(!env.payee_bit(0));
+    let legs0 = env.legs();
+    let owed = legs0.creator_owed();
+    assert!(owed > 0);
+    let stranger = Keypair::new();
+    let ata = env.plant_ata(stranger.pubkey());
+    let pda = payee_pda(&env.market, 0);
+    assert_custom(env.claim_as(&stranger, owed, ata, Some(pda)), UNAUTHORIZED, "no payee: refused");
+    assert_custom(env.claim_as(&stranger, owed, ata, None), UNAUTHORIZED, "no payee, no [6]: refused");
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab re-book step");
+    let legs1 = env.legs();
+    assert_eq!(legs1.creator_owed(), 0, "orphaned creator pot re-booked");
+    assert_eq!(legs1.protocol_accrued, legs0.protocol_accrued + owed, "to the protocol leg");
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 8. Generation hygiene: a slot re-activated for a new creator does NOT inherit the previous
+//    generation's payee bit (RETIRE carries p4 flags; the activation clears bit 3), and tag 125
+//    is bound to the slot's live generation.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn f587_reactivated_asset_does_not_inherit_payee() {
+    use percolator_prog::processor::{ASSET_ACTION_ACTIVATE, ASSET_ACTION_RETIRE};
+    let mut env = Env::build(false, false);
+    let admin = env.admin.insecure_clone();
+    // Cycle asset 1 once so its asset_admin is known to be the activator (marketauth).
+    env.lifecycle(ASSET_ACTION_RETIRE, 1).expect("retire asset 1");
+    env.lifecycle(ASSET_ACTION_ACTIVATE, 1).expect("activate asset 1");
+    assert_eq!(env.profile(1).asset_admin, admin.pubkey().to_bytes());
+    let gen1 = env.generation(1);
+
+    // Tag 125 for asset 1, generation-bound.
+    let p1 = Pubkey::new_unique();
+    let e = env.authority_epoch(1);
+    // A stale generation is refused (encode by hand with market_id - 1).
+    {
+        let pda = payee_pda(&env.market, 1);
+        let res = env.send(
+            ProgInstruction::SetCreatorFeePayee {
+                asset_index: 1,
+                market_id: gen1 - 1,
+                payee: p1.to_bytes(),
+                authority_epoch: e,
+            }
+            .encode(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(pda, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+            &[&admin],
+        );
+        assert_custom(res, GENERATION_MISMATCH, "stale generation");
+        // Another asset's PDA address is refused.
+        let wrong = payee_pda(&env.market, 0);
+        let res = env.send(
+            ProgInstruction::SetCreatorFeePayee {
+                asset_index: 1,
+                market_id: gen1,
+                payee: p1.to_bytes(),
+                authority_epoch: e,
+            }
+            .encode(),
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(wrong, false),
+                AccountMeta::new_readonly(solana_sdk::system_program::id(), false),
+            ],
+            &[&admin],
+        );
+        assert_custom(res, PAYEE_INVALID, "asset-0 PDA for asset 1");
+    }
+    // Griefing: someone pre-funds the PDA address (a system account with lamports) before the
+    // first tag 125; creation must still succeed (allocate + assign path).
+    env.svm.airdrop(&payee_pda(&env.market, 1), 1).unwrap();
+    env.set_payee_as(&admin, 1, p1, e).expect("tag 125 on asset 1 (pre-funded PDA)");
+    assert!(env.payee_bit(1));
+    assert!(!env.payee_bit(0), "asset 0 untouched");
+
+    // RETIRE carries p4 flags (I-P1) ...
+    env.lifecycle(ASSET_ACTION_RETIRE, 1).expect("retire again");
+    // ... but the re-activation for the next creator clears the payee bit.
+    env.lifecycle(ASSET_ACTION_ACTIVATE, 1).expect("re-activate");
+    assert_ne!(env.generation(1), gen1, "new generation");
+    let prof = env.profile(1);
+    assert!(!state::profile_has_creator_fee_payee(&prof), "payee bit cleared on re-activation");
+    assert_ne!(
+        state::profile_p4_flags(&prof) & percolator_prog::constants::P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT,
+        0,
+        "the other carried p4 bits are untouched"
+    );
+    // The new generation's admin can record a payee afresh over the stale PDA (even the same
+    // key: with the bit clear there is no "current" payee).
+    let e2 = env.authority_epoch(1);
+    env.set_payee_as(&admin, 1, p1, e2).expect("fresh tag 125 in the new generation");
+    assert!(env.payee_bit(1));
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 9. A profile REBUILD (tag 62 ConfigureAuthMark, by the surviving oracle authority after the
+//    burn) keeps the payee bit, and the payee route keeps working.
+// ─────────────────────────────────────────────────────────────────────────────
+#[test]
+fn f587_profile_rebuild_keeps_payee() {
+    let payee = Pubkey::new_unique();
+    let (mut env, ..) = traded_flat_market_in(first_loss_env(payee));
+    let owed = env.legs().creator_owed();
+    let admin = env.admin.insecure_clone();
+    assert_eq!(env.profile(0).oracle_authority, admin.pubkey().to_bytes());
+    let mode0 = env.profile(0).oracle_mode;
+    let obs = state::read_asset_control_sequences(&env.svm.get_account(&env.market).unwrap().data, 0)
+        .unwrap()
+        .oracle_observation;
+    let now_slot = env.clock_slot().max(1);
+    let market_id = env.generation(0);
+    env.send(
+        ProgInstruction::ConfigureAuthMark {
+            asset_index: 0,
+            market_id,
+            now_slot,
+            initial_mark_e6: PRICE,
+            observation_sequence: obs + 1,
+        }
+        .encode(),
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("tag 62 rebuilds asset 0's profile");
+    let prof = env.profile(0);
+    assert_ne!(prof.oracle_mode, mode0, "the profile was really rebuilt");
+    assert_eq!(prof.asset_admin, [0u8; 32]);
+    assert!(state::profile_has_creator_fee_payee(&prof), "payee bit survives the rebuild");
+    let ata = env.plant_ata(payee);
+    let pda = payee_pda(&env.market, 0);
+    env.claim_as(&Keypair::new(), owed, ata, Some(pda)).expect("payee route after the rebuild");
+    assert_eq!(env.token_amount(ata) as u128, owed);
 }
