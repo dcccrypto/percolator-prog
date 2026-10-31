@@ -2658,8 +2658,12 @@ fn sec4_tag119_refused_while_lagged_and_while_pinned() {
     assert_err(&r, &code(PercolatorError::EngineLockActive), "tag 119 while pinned");
 }
 
-/// A self-hedging cap-filler cannot starve honest entrants any more, but it can re-fill: each
-/// eviction costs the filler its slot, and an honest entrant pays >= 2x the smallest notional.
+/// Tag 119 frees a slot only from a SMALL filler leg (notional <= 4x the market minimum, N-8):
+/// each eviction costs the filler its slot, and an honest entrant pays >= 2x the victim's
+/// notional. It does NOT stop a filler whose legs are all above 4x the minimum: those can never
+/// be evicted and lock the side (prog#572). Since #572 such a held full side pays the maximum
+/// holding rent to the vault LP (slot-occupancy rent, `r572_hedged_cap_filler_pays_occupancy_rent_to_the_vault_lp`);
+/// it is priced, not prevented.
 /// Cost of evicting a victim of notional N: the evictor's own trade fee and exposure on 2N.
 #[test]
 fn sec4_tag119_evictor_cost_and_no_profit_from_evict_then_reverse() {
@@ -6081,5 +6085,403 @@ fn lev_guard_vol_profile_floor_off_is_unchanged_on_only_tightens() {
         let t2 = env.trader(1_000 * USD);
         let r2 = lgt::tg(&mut env, &t2, &lp, lgt::usd_q(1_000 * l_off / 100 * 110 / 100));
         assert!(lgt::has(&r2, lgt::REFUSED), "OFF: over L(OFF) {l_off} refused: {r2:?}");
+    }
+}
+
+// ===========================================================================
+// prog#572: slot-occupancy rent. A hedged cap-filler holding every slot of both sides with
+// legs just above the tag-119 eviction bound (4x the minimum) used to pay 0 rent on a large
+// vault LP (utilisation rent reads OI vs LP capacity only). The occupancy term ramps the rate
+// from 0 at 85% of the per-side cap to `rent_max` at a full side, paid to the vault LP through
+// the existing rent index / tag 106 route.
+// ===========================================================================
+
+impl Env {
+    /// A trader whose owner, portfolio and token-source keys are derived from `i` (u32), so a
+    /// test can create more than the ~80 traders `Env::trader`'s u8 key counter allows.
+    fn trader_n(&mut self, i: u32, deposit: u128) -> (Keypair, Pubkey) {
+        let seed = |tag: u8| {
+            let mut s = [0x57u8; 32];
+            s[0] = 0xC5;
+            s[1] = tag;
+            s[2..6].copy_from_slice(&i.to_le_bytes());
+            s
+        };
+        let owner = solana_sdk::signer::keypair::keypair_from_seed(&seed(1)).unwrap();
+        let portfolio_kp = solana_sdk::signer::keypair::keypair_from_seed(&seed(2)).unwrap();
+        let source = Pubkey::new_from_array(seed(3));
+        let portfolio = portfolio_kp.pubkey();
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        self.svm
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; self.portfolio_account_len],
+                    owner: self.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let m = self.market;
+        self.send(
+            ProgInstruction::InitPortfolio,
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, true),
+            ],
+            &[&owner, &portfolio_kp],
+        )
+        .expect("init portfolio");
+        let mint = self.mint;
+        self.svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(mint, owner.pubkey(), deposit as u64),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.identity(portfolio);
+        let (m, v) = (self.market, self.vault);
+        self.send(
+            ProgInstruction::Deposit { portfolio_id, expected_sequence, amount: deposit },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&owner],
+        )
+        .expect("deposit");
+        (owner, portfolio)
+    }
+
+    /// Refresh every leg (a keeper sweep): a rent / funding index move marks the whole side's
+    /// cohort stale, and risk-increasing trades refuse with EngineLossStale (121) until each leg
+    /// is settled (engine `kernel_mark_kf_stale_cohorts`; pre-existing, as for utilisation rent).
+    fn sweep(&mut self, ps: &[Pubkey]) {
+        for p in ps {
+            self.crank_current(*p);
+        }
+        let a = self.engine_asset();
+        assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 0), "sweep settled every leg");
+    }
+
+    fn pos_counts(&self) -> (u64, u64) {
+        let a = self.engine_asset();
+        (a.stored_pos_count_long, a.stored_pos_count_short)
+    }
+
+    /// The per-side rent RATE the handlers actually charged over one slot (e9 of notional per
+    /// slot): advance one slot, accrue it (AuthMark push + crank), and read the rent index
+    /// increments back (`dR = price * rate * 1`, engine `rent_index_delta`). Price is held flat.
+    fn charged_rent_rates_one_slot(&mut self, crank_target: Pubkey) -> (u64, u64) {
+        // Catch the asset up first (one settling slot), then measure exactly one slot.
+        self.warp(1);
+        self.push(PRICE);
+        self.crank_current(crank_target);
+        let a0 = self.engine_asset();
+        assert_eq!(a0.slot_last, self.slot, "asset caught up before the probe");
+        self.warp(1);
+        self.push(PRICE);
+        self.crank_current(crank_target);
+        let a1 = self.engine_asset();
+        assert_eq!(a1.slot_last, self.slot, "exactly one slot accrued");
+        let p = a1.effective_price as u128;
+        assert_eq!(p, PRICE as u128, "flat price");
+        let dl = a1.rent_index_long_num - a0.rent_index_long_num;
+        let ds = a1.rent_index_short_num - a0.rent_index_short_num;
+        assert_eq!(dl % p, 0);
+        assert_eq!(ds % p, 0);
+        ((dl / p) as u64, (ds / p) as u64)
+    }
+}
+
+/// prog#572 handler-level, the full attack at the real cap (256 per side): 512 hedged filler legs
+/// of $41 (> 4x the $10 minimum, so tag 119 cannot evict any of them) against a $20M vault LP
+/// (utilisation ~0.05%, far below the 50% kink: utilisation rent 0 on every build).
+///
+/// * Below/at the knee (217/256 = 84.8%) both sides pay exactly 0, as before (no regression).
+/// * From 218/256 the charged rate follows the ramp `ceil(max * x^2)` (continuous: 1 e9/slot just
+///   past the knee, never a jump of more than ~5% of max per leg) up to `rent_max` at 256/256.
+/// * At 256/256 honest opens on both sides are refused and tag 119 cannot evict a filler, but the
+///   filler now pays `rent_max` per slot on every leg, and tag 106 routes it to the vault LP.
+///
+/// Negative control: on the base program (rc23 64a18e99) the charged rate is 0 at 218/256 and at
+/// 256/256 (fails at the first checkpoint past the knee).
+#[test]
+fn r572_hedged_cap_filler_pays_occupancy_rent_to_the_vault_lp() {
+    use percolator_prog::growth_v19::rent_occupancy_rate_e9;
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let rent_max = env.engine_header().6;
+    assert_eq!(rent_max, RENT_MAX as u64);
+    let side_cap = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
+    assert_eq!(side_cap, 256);
+    let leg = 41 * Q; // $41 > 4 x $10: not evictable (N-8)
+    let mut fillers: Vec<(Keypair, Pubkey)> = Vec::new();
+    let checkpoints = [217u64, 218, 219, 230, 243, 255];
+    let mut prev_rate = 0u64;
+    for i in 0..side_cap as u32 {
+        let l = env.trader_n(2 * i, 20 * USD);
+        env.trade_cpi(&l.0, l.1, &lp, leg).expect("filler long");
+        let s = env.trader_n(2 * i + 1, 20 * USD);
+        env.trade_cpi(&s.0, s.1, &lp, -leg).expect("filler short");
+        fillers.push(l);
+        fillers.push(s);
+        let n = i as u64 + 1;
+        let ps: Vec<Pubkey> = fillers.iter().map(|f| f.1).collect();
+        assert_eq!(env.pos_counts(), (n, n), "hedged: the vault LP is flat, every slot is a filler's");
+        if checkpoints.contains(&n) {
+            let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+            let want = rent_occupancy_rate_e9(n, side_cap, rent_max);
+            eprintln!(
+                "R572 {n}/256 ({:.1}%): charged rent {rl}/{rs} e9/slot (ramp {want}) = {:.4}%/day of notional",
+                n as f64 / 2.56,
+                rl as f64 * 216_000.0 / 1e7
+            );
+            assert_eq!((rl, rs), (want, want), "charged rate = the occupancy ramp at {n}/256");
+            if n <= 217 {
+                assert_eq!(rl, 0, "at or below the 85% knee: 0, exactly as before");
+            } else {
+                assert!(rl >= 1, "past the knee the side pays rent");
+            }
+            assert!(rl >= prev_rate, "monotone in occupancy");
+            prev_rate = rl;
+            env.sweep(&ps);
+        }
+    }
+    assert_eq!(env.pos_counts(), (256, 256));
+    // The lock-out is real: honest opens refused on both sides, a filler is not evictable.
+    let honest = env.trader_n(10_000, 10_000 * USD);
+    let r = env.trade_cpi(&honest.0, honest.1, &lp, 100 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "long side full");
+    let r = env.trade_cpi(&honest.0, honest.1, &lp, -100 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "short side full");
+    let r = env.evict_and_trade(fillers[0].1, &honest.0, honest.1, &lp, 820 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "a $41 filler leg is not evictable");
+    // Full side: the maximum rate on both sides, whatever the LP's size.
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    assert_eq!((rl, rs), (rent_max, rent_max), "a full side pays rent_max");
+    // Hold for 100 more slots; one filler leg's charge = floor(q * dR / (POS_SCALE * 1e9)).
+    let f = fillers[0].1;
+    env.crank_current(f);
+    let cap0 = env.portfolio_state(f).capital;
+    let unrouted0 = env.engine_asset().rent_unrouted_atoms;
+    let idx0 = env.engine_asset().rent_index_long_num;
+    for _ in 0..100 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(lp.account);
+    }
+    env.crank_current(f);
+    let idx1 = env.engine_asset().rent_index_long_num;
+    assert_eq!(idx1 - idx0, PRICE as u128 * rent_max as u128 * 100, "100 slots at rent_max");
+    let paid = cap0 - env.portfolio_state(f).capital;
+    let leg_q = leg as u128;
+    let rent_den = percolator::band_rent::RENT_INDEX_DEN;
+    assert!(paid >= leg_q * (idx1 - idx0) / rent_den, "the filler leg paid the full-side rate");
+    assert!(paid <= leg_q * (idx1 - idx0) / rent_den + 1, "carry: at most one atom from earlier slots");
+    let per_leg_day = leg_q * PRICE as u128 * rent_max as u128 * 216_000 / rent_den;
+    eprintln!(
+        "R572 full side: one $41 filler leg pays {paid} atoms per 100 slots = {per_leg_day} atoms/day; 512 legs = ${:.2}/day (refundable margin only before #572)",
+        (per_leg_day * 512) as f64 / USD as f64
+    );
+    // Rent reaches the vault LP: tag 106 routes every unrouted atom to it.
+    let unrouted = env.engine_asset().rent_unrouted_atoms;
+    assert!(unrouted >= unrouted0 + paid, "the filler's rent is an LP claim");
+    let lp_cap0 = env.portfolio_state(lp.account).capital;
+    let fcap1 = env.portfolio_state(f).capital;
+    env.warp(1);
+    env.push(PRICE);
+    env.settle_rent(f, lp.account).expect("tag 106");
+    let newest = fcap1 - env.portfolio_state(f).capital;
+    let lp_gain = env.portfolio_state(lp.account).capital - lp_cap0;
+    assert_eq!(lp_gain, unrouted + newest, "the vault LP receives the occupancy rent");
+    assert_eq!(env.engine_asset().rent_unrouted_atoms, 0);
+    env.assert_conservation();
+}
+
+/// prog#572 handler-level ramp on a small cap (poked to 20 per side, so 17 = 85% is the knee
+/// exactly): rates 0, 3, 11, 23 at 17..20 (= ceil(23 x^2), x = 0, 1/3, 2/3, 1). The 20th leg is a
+/// $5M whale (extreme notional): it pays rent_max on $5M with no overflow and conservation holds.
+/// A $20M LP keeps utilisation <= the 50% kink, so utilisation rent is 0 throughout.
+/// Negative control: base charges 0 at 18, 19 and 20.
+#[test]
+fn r572_occupancy_ramp_is_continuous_at_the_knee_and_bounded_at_full() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let mut longs = Vec::new();
+    for i in 0..17u32 {
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("small long");
+        longs.push(t);
+    }
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    // The LP holds the short side (one stored leg there): 1/20, far below the knee.
+    assert_eq!(env.pos_counts(), (17, 1));
+    let mut rates = Vec::new();
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    assert_eq!(rs, 0);
+    rates.push(rl);
+    for i in 17..19u32 {
+        let ps: Vec<Pubkey> = longs.iter().map(|t| t.1).collect();
+        env.sweep(&ps);
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("small long");
+        longs.push(t);
+        rates.push(env.charged_rent_rates_one_slot(lp.account).0);
+    }
+    let ps: Vec<Pubkey> = longs.iter().map(|t| t.1).collect();
+    env.sweep(&ps);
+    let whale = env.trader_n(99, 2_000_000 * USD);
+    env.trade_cpi(&whale.0, whale.1, &lp, 5_000_000 * Q).expect("$5M whale takes the last slot");
+    assert_eq!(env.pos_counts().0, 20);
+    rates.push(env.charged_rent_rates_one_slot(lp.account).0);
+    let mut ps: Vec<Pubkey> = longs.iter().map(|t| t.1).collect();
+    ps.push(whale.1);
+    env.sweep(&ps);
+    eprintln!("R572 cap 20: rates at 17,18,19,20 = {rates:?} e9/slot (rent_max {RENT_MAX})");
+    assert_eq!(rates, vec![0, 3, 11, RENT_MAX as u64], "quadratic ramp from the knee to rent_max");
+    let more = env.trader_n(500, 100 * USD);
+    let r = env.trade_cpi(&more.0, more.1, &lp, 10 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "the side is full");
+    // The whale pays rent_max on $5M for 10 slots, exactly, with no overflow.
+    env.crank_current(whale.1);
+    let cap0 = env.portfolio_state(whale.1).capital;
+    for _ in 0..10 {
+        env.warp(1);
+        env.push(PRICE);
+        env.crank_current(lp.account);
+    }
+    env.crank_current(whale.1);
+    let paid = cap0 - env.portfolio_state(whale.1).capital;
+    let want = 5_000_000u128 * Q as u128 * PRICE as u128 * RENT_MAX as u128 * 10 / percolator::band_rent::RENT_INDEX_DEN;
+    eprintln!("R572 $5M whale at a full side: {paid} atoms per 10 slots (want {want})");
+    assert!(paid >= want && paid <= want + 1, "whale charged rent_max: {paid} vs {want}");
+    env.assert_conservation();
+}
+
+/// prog#572 no regression: at or below the knee the charged rate is EXACTLY today's utilisation
+/// rent (`rent_rate_e9` on users OI vs the N_cap snapshot), with a crowd above the 50% kink.
+/// Passes on base and on the fix (the fix adds nothing at 17/20 = 85%); above the knee a larger
+/// utilisation rate still wins (`max`, not a sum).
+#[test]
+fn r572_below_the_knee_rent_is_exactly_the_utilisation_rent() {
+    use percolator_prog::growth_v19::{rent_occupancy_rate_e9, rent_rate_e9};
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    // 17 longs, 800 units in all (u = 80% of the $1,000 LP's N_cap at lambda 1x).
+    let mut n = 0u32;
+    let mut longs3: Vec<Pubkey> = Vec::new();
+    for _ in 0..16 {
+        let t = env.trader_n(n, 1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        longs3.push(t.1);
+        n += 1;
+    }
+    let big = env.trader_n(n, 1_000 * USD);
+    env.trade_cpi(&big.0, big.1, &lp, 640 * Q).expect("long");
+    longs3.push(big.1);
+    n += 1;
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    assert_eq!(env.pos_counts().0, 17);
+    let util_rate = |env: &Env| {
+        let g = env.growth();
+        let a = env.engine_asset();
+        // users OI long = OI minus the LP's own long (the LP is short here: all of it).
+        rent_rate_e9(a.oi_eff_long_q, g.rent_n_cap_q as u128, g.rent_kink_bps, RENT_MAX as u64).unwrap()
+    };
+    let want = util_rate(&env);
+    assert!(want > 0, "the crowd is above the kink");
+    let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("R572 17/20 (85%): charged {rl}, utilisation rent {want}");
+    assert_eq!(rl, want, "at the knee: exactly the utilisation rent");
+    let mut ps = longs3.clone();
+    ps.push(lp.account);
+    env.sweep(&ps);
+    // 18/20 = 90%: occupancy ramp 3 < utilisation rent: the larger one is charged, not a sum.
+    let t = env.trader_n(n, 1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+    let want = util_rate(&env);
+    let occ = rent_occupancy_rate_e9(18, 20, RENT_MAX as u64);
+    assert!(want > occ);
+    let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
+    assert_eq!(rl, want, "max(util, occupancy), never the sum");
+    env.assert_conservation();
+}
+
+/// prog#572 pure shape, exhaustive over the engine's domain (cap 1..=256, every count up to cap +
+/// 40) and a spread of ceilings: 0 at/below the knee, never above max, monotone, max at a full
+/// side, and no single leg moves the rate by more than `2 * max / (cap * 15%) + 1`. Plus the
+/// out-of-domain extremes (u64::MAX everywhere): no panic, bounded.
+#[test]
+fn r572_occupancy_rate_shape_exhaustive_and_extremes() {
+    use percolator_prog::growth_v19::{
+        rent_occupancy_rate_e9 as occ, rent_rate_e9_fail_closed, rent_side_rate_e9, RENT_OCC_KNEE_BPS,
+    };
+    let k = RENT_OCC_KNEE_BPS as u128;
+    for cap in 1..=256u64 {
+        for max in [0u64, 1, 10, 23, 100, 9_999, 10_000] {
+            let mut prev = 0u64;
+            for c in 0..=cap + 40 {
+                let r = occ(c, cap, max);
+                assert!(r <= max);
+                assert!(r >= prev, "monotone: cap {cap} max {max} count {c}");
+                if (c.min(cap) as u128) * 10_000 <= k * cap as u128 {
+                    assert_eq!(r, 0, "zero at/below the knee");
+                }
+                if c >= cap {
+                    assert_eq!(r, max, "max at a full side");
+                }
+                // step bound: (r - prev - 1) * cap * (1e4 - k) <= 2 * max * 1e4
+                if c > 0 && r > prev + 1 {
+                    assert!(
+                        ((r - prev - 1) as u128) * cap as u128 * (10_000 - k) <= 2 * max as u128 * 10_000,
+                        "cliff: cap {cap} max {max} count {c}: {prev} -> {r}"
+                    );
+                }
+                prev = r;
+            }
+        }
+    }
+    // Real cap: the largest single-leg step at rent_max 10_000 is 514 (5.1%), at 100 it is 5.
+    let worst = |max: u64| (0..256u64).map(|c| occ(c + 1, 256, max) - occ(c, 256, max)).max().unwrap();
+    assert_eq!(worst(100), 5);
+    assert_eq!(worst(10_000), 514);
+    // Extremes: no panic, bounded, fail closed (never 0 past the knee).
+    for (c, cap, max) in [
+        (u64::MAX, u64::MAX, u64::MAX),
+        (u64::MAX, 1, u64::MAX),
+        (u64::MAX - 1, u64::MAX, u64::MAX),
+        (u64::MAX, u64::MAX, 1),
+        (0, u64::MAX, u64::MAX),
+        (u64::MAX, 0, u64::MAX),
+    ] {
+        let r = occ(c, cap, max);
+        assert!(r <= max);
+        if cap != 0 && c >= cap {
+            assert_eq!(r, max);
+        }
+    }
+    assert_eq!(occ(u64::MAX, 0, 23), 0, "cap 0 = band off: no occupancy term");
+    // rent_side_rate_e9 = today's rate whenever the occupancy term is 0.
+    for (u, n, kink, max) in [(800u128, 1_000u128, 5_000u16, 23u64), (0, 1, 0, 23), (u128::MAX, 1, 0, 10_000), (5, 0, 5_000, 23)] {
+        assert_eq!(rent_side_rate_e9(u, n, kink, max, 217, 256), rent_rate_e9_fail_closed(u, n, kink, max));
+        assert_eq!(rent_side_rate_e9(u, n, kink, max, 256, 0), rent_rate_e9_fail_closed(u, n, kink, max));
+        assert_eq!(rent_side_rate_e9(u, n, kink, max, 256, 256), max, "full side: max");
     }
 }

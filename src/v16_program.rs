@@ -47567,6 +47567,9 @@ pub mod processor {
     /// slot. 0 unless the engine config carries a rent ceiling, the asset's growth record is on
     /// with a measured `N_cap` snapshot, and the asset has a bound vault LP. Users OI per side
     /// excludes the vault LP's own leg (the N-1 definition, from the `lp_net_q` snapshot).
+    /// prog#572: each side's rate is `max(utilisation rent, slot-occupancy rent)`; the occupancy
+    /// term is 0 at or below 85% of `band_max_positions_per_side` and ramps (quadratic) to the
+    /// ceiling at a full side, so a held full side pays rent however large the vault LP is.
     #[inline(never)]
     fn rent_rates_view(
         group: &state::MarketViewMutV16<'_>,
@@ -47587,9 +47590,25 @@ pub mod processor {
         let n_cap = g.rent_n_cap_q as u128;
         let users_long = growth_v19::users_side_oi_q(oi_long, rec.lp_net_q, true);
         let users_short = growth_v19::users_side_oi_q(oi_short, rec.lp_net_q, false);
+        // prog#572: the slot-occupancy term. The same count and cap the engine's "side full"
+        // check (`band_side_is_full`, BandPositionCap) reads; cap 0 (band off) adds nothing.
+        let (count_long, count_short, side_cap) = {
+            let asset = &group
+                .markets
+                .get(asset_index)
+                .ok_or(PercolatorError::EngineInvalidLeg)?
+                .engine
+                .asset;
+            let cap = if group.header.config.band_bps.get() == 0 {
+                0
+            } else {
+                group.header.config.band_max_positions_per_side.get()
+            };
+            (asset.stored_pos_count_long.get(), asset.stored_pos_count_short.get(), cap)
+        };
         Ok((
-            growth_v19::rent_rate_e9_fail_closed(users_long, n_cap, g.rent_kink_bps, rent_max),
-            growth_v19::rent_rate_e9_fail_closed(users_short, n_cap, g.rent_kink_bps, rent_max),
+            growth_v19::rent_side_rate_e9(users_long, n_cap, g.rent_kink_bps, rent_max, count_long, side_cap),
+            growth_v19::rent_side_rate_e9(users_short, n_cap, g.rent_kink_bps, rent_max, count_short, side_cap),
         ))
     }
 
