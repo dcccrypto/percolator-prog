@@ -3414,3 +3414,52 @@ fn kani_s12_zero_live_id_rejects() {
     );
     assert!(!ok, "a zero portfolio id must never authorize");
 }
+
+/// port135 (ADOPT upstream 0c5d4f4f `inv_004` harness + cf76ff41 nonvacuity covers): the packed
+/// position-control transition used by production, over every `u64` control word: exact
+/// increment, fee-cap preservation, policy-prescribed matcher state (a synchronized fill keeps the
+/// enabled bit, an out-of-matcher mutation clears it), and fail-closed on an invalid cap or an
+/// exhausted episode.
+#[kani::proof]
+fn kani_v16_position_epoch_sync_policy_is_total_and_exact() {
+    use percolator_prog::state;
+    let control: u64 = kani::any();
+    let matcher_synchronized: bool = kani::any();
+    let config = state::PortfolioMatcherConfigV16 {
+        control,
+        ..state::PortfolioMatcherConfigV16::default()
+    };
+    let epoch = config.position_epoch();
+    let result =
+        state::next_portfolio_position_control_for_matcher_sync(control, matcher_synchronized);
+
+    kani::cover!(
+        result.is_ok() && matcher_synchronized,
+        "a synchronized matcher episode advances"
+    );
+    kani::cover!(
+        result.is_ok() && !matcher_synchronized,
+        "an unsynchronized mutation advances and disables"
+    );
+    kani::cover!(result.is_err(), "invalid or exhausted packed control rejects");
+
+    if config.trade_fee_cap_bps() > 10_000
+        || epoch == state::PortfolioMatcherConfigV16::position_epoch_max()
+    {
+        assert!(result.is_err());
+    } else {
+        let (next_epoch, next_control) = result.unwrap();
+        let next_config = state::PortfolioMatcherConfigV16 {
+            control: next_control,
+            ..state::PortfolioMatcherConfigV16::default()
+        };
+        assert_eq!(next_epoch, epoch + 1);
+        assert_eq!(next_config.position_epoch(), next_epoch);
+        assert_eq!(next_config.trade_fee_cap_bps(), config.trade_fee_cap_bps());
+        if matcher_synchronized {
+            assert_eq!(next_config.enabled(), config.enabled());
+        } else {
+            assert_eq!(next_config.enabled(), 0);
+        }
+    }
+}
