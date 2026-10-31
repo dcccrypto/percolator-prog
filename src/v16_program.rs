@@ -82,6 +82,10 @@ pub mod lev_guard_v22;
 /// the guarded-open gate as a TIGHTEN-ONLY floor, OFF by default (`lev_profile_v22::VOL_PROFILE_LIVE`).
 pub mod lev_profile_v22;
 
+/// prog#587 (2026-10-31): the frozen creator-fee payee of a burned (admin-free) asset (tag 125,
+/// PDA kind 19) and tag 90's permissionless payee route. Pure rules + Kani harnesses.
+pub mod creator_fee_payee_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -665,6 +669,12 @@ pub mod constants {
     pub const KIND_LEV_GUARD: u8 = 17;
     /// Night 2026-10-28 (decision 16): `["pool_claim", pool]`, one growth market per spot pool.
     pub const KIND_POOL_CLAIM: u8 = 18;
+    /// prog#587 (2026-10-31): `SetCreatorFeePayee`. Signed by the asset's LIVE `asset_admin`; records
+    /// the wallet that receives the asset's creator fee once `asset_admin` is burned
+    /// (`creator_fee_payee_v22`). Wire `[125][asset_index u16][market_id u64][payee 32][authority_epoch u64]`.
+    pub const TAG_SET_CREATOR_FEE_PAYEE: u8 = 125;
+    /// prog#587: `CreatorFeePayeeV22` at `["creator_fee_payee", market, asset_index_le]`.
+    pub const KIND_CREATOR_FEE_PAYEE: u8 = 19;
     /// Mainnet builds refuse a risk-increasing fill on ANY clamp-enforced growth asset without a
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
@@ -719,7 +729,7 @@ pub mod constants {
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
-        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, 206, 207,
+        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, TAG_SET_CREATOR_FEE_PAYEE, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -843,7 +853,21 @@ pub mod constants {
     pub const P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT: u8 = 1 << 2;
     /// Bits the validator accepts: the v2.2 UNION of Wave D bit0 (INS_UNITS_REQUIRED) and
     /// Wave A bit2 (EXIT_REQUIRES_LOSS_CURRENT). Append item 4's bit1 when it lands.
-    pub const P4_FLAGS_KNOWN_MASK: u8 = P4_FLAG_INS_UNITS_REQUIRED | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT;
+    /// prog#587: bit3 = a creator-fee payee is recorded for this asset (`CreatorFeePayeeV22`). Set
+    /// only by tag 125 (live `asset_admin`), carried by every profile rebuild, cleared when a slot
+    /// is (re-)activated for a new creator. With `asset_admin` burned it makes tag 90
+    /// permissionless to the payee's ATA and keeps CloseSlab from re-booking the pot.
+    pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = crate::creator_fee_payee_v22::P4_FLAG_CREATOR_FEE_PAYEE;
+    pub const P4_FLAGS_KNOWN_MASK: u8 =
+        P4_FLAG_INS_UNITS_REQUIRED | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT | P4_FLAG_CREATOR_FEE_PAYEE;
+    // prog#587: bit 3 is one bit, disjoint from bit0 (INS_UNITS_REQUIRED), bit1 (reserved for
+    // item 4) and bit2 (EXIT_REQUIRES_LOSS_CURRENT).
+    const _: () = assert!(
+        P4_FLAG_CREATOR_FEE_PAYEE.count_ones() == 1
+            && P4_FLAG_CREATOR_FEE_PAYEE
+                & (P4_FLAG_INS_UNITS_REQUIRED | (1 << 1) | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT)
+                == 0
+    );
     /// Item 8: the most stale positioned portfolios one ExecuteRedemption may refresh
     /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
@@ -1989,7 +2013,12 @@ VaultLpMultiAssetMarket,
         /// Tag 124 op 5 (W1) while the LP stop does not hold or nothing is left to reduce.
         /// Custom(135).
         LpStopNotTriggered = 135,
+        /// prog#587: tag 125 / tag 90's payee route refused: wrong signer (not the live
+        /// `asset_admin`), zero or unchanged payee, a payee account that is not this asset's PDA or
+        /// does not validate, or a destination that is not the payee's canonical ATA. Custom(136).
+        CreatorFeePayeeInvalid = 136,
     }
+    const _: () = assert!(PercolatorError::CreatorFeePayeeInvalid as u32 == 136);
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::GrowthTierConfigInvalid as u32 == 130);
@@ -7690,6 +7719,73 @@ pub mod state {
         Ok(())
     }
 
+    // ── prog#587: `CreatorFeePayeeV22` (kind 19, `["creator_fee_payee", market, asset_index_le]`).
+    pub use crate::creator_fee_payee_v22::CreatorFeePayeeV22;
+
+    pub const fn creator_fee_payee_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<CreatorFeePayeeV22>()
+    }
+
+    pub fn derive_creator_fee_payee(
+        program_id: &solana_program::pubkey::Pubkey,
+        market: &solana_program::pubkey::Pubkey,
+        asset_index: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[
+                crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_SEED,
+                market.as_ref(),
+                &asset_index.to_le_bytes(),
+            ],
+            program_id,
+        )
+    }
+
+    /// Reads a payee record: exact length, kind 19 header, structurally valid. Every failure is
+    /// `CreatorFeePayeeInvalid`.
+    pub fn read_creator_fee_payee(data: &[u8]) -> Result<CreatorFeePayeeV22, ProgramError> {
+        if data.len() != creator_fee_payee_account_len()
+            || check_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE).is_err()
+        {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let r: CreatorFeePayeeV22 = bytemuck::pod_read_unaligned(&data[HEADER_LEN..]);
+        if !crate::creator_fee_payee_v22::validate_creator_fee_payee(&r) {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        Ok(r)
+    }
+
+    /// Writes a payee record (validated first). `fresh`: the account was just created (all-zero)
+    /// and gets the kind 19 header; otherwise the existing header must already be kind 19.
+    pub fn write_creator_fee_payee(
+        data: &mut [u8],
+        r: &CreatorFeePayeeV22,
+        fresh: bool,
+    ) -> Result<(), ProgramError> {
+        if data.len() != creator_fee_payee_account_len()
+            || !crate::creator_fee_payee_v22::validate_creator_fee_payee(r)
+        {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        if fresh {
+            if is_initialized(data) {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            write_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE)?;
+        } else if check_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE).is_err() {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(r));
+        Ok(())
+    }
+
+    /// prog#587: the profile's creator-fee-payee bit (`p4_flags` bit 3).
+    #[inline]
+    pub fn profile_has_creator_fee_payee(profile: &AssetOracleProfileV16) -> bool {
+        crate::creator_fee_payee_v22::has_payee_bit(profile_p4_flags(profile))
+    }
+
     /// Decision 16 (night 2026-10-28): the pool claim (`["pool_claim", pool]`, kind 18).
     pub const fn pool_claim_account_len() -> usize {
         HEADER_LEN + core::mem::size_of::<crate::depth_src_v22::PoolClaimV22>()
@@ -9482,6 +9578,18 @@ pub mod ix {
         /// everything available" the way `WithdrawProtocolFee` (tag 84) reads
         /// it: this instruction's contract is an exact debit of the counter,
         /// and a silent 0-atom transfer is a caller bug, not a claim.
+        /// prog#587 SetCreatorFeePayee (tag 125). Signed by `asset_index`'s LIVE `asset_admin`.
+        /// Creates or replaces the asset's `CreatorFeePayeeV22` PDA and sets profile `p4_flags`
+        /// bit 3. Live mode only; generation-checked (`market_id`); CAS + advance of the asset's
+        /// `authority_epoch` (a payee change is a rotation). Accounts: `[0]` asset_admin (signer,
+        /// writable: pays the PDA rent on first use), `[1]` market (w), `[2]` payee PDA (w),
+        /// `[3]` system program. After `asset_admin` is burned nothing can call this again.
+        SetCreatorFeePayee {
+            asset_index: u16,
+            market_id: u64,
+            payee: [u8; 32],
+            authority_epoch: u64,
+        },
         WithdrawCreatorFee {
             amount: u128,
             /// GH#420: WHICH asset's creator fees. Appended after `amount`, so the
@@ -10413,6 +10521,12 @@ pub mod ix {
                 },
                 89 => Self::ExpireBackingBucket {
                     domain: read_u16(&mut rest)?,
+                },
+                crate::constants::TAG_SET_CREATOR_FEE_PAYEE => Self::SetCreatorFeePayee {
+                    asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
+                    payee: read_bytes32(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 90 => Self::WithdrawCreatorFee {
                     amount: read_u128(&mut rest)?,
@@ -11466,6 +11580,18 @@ pub mod ix {
                 Self::ExpireBackingBucket { domain } => {
                     out.push(89);
                     push_u16(&mut out, domain);
+                }
+                Self::SetCreatorFeePayee {
+                    asset_index,
+                    market_id,
+                    payee,
+                    authority_epoch,
+                } => {
+                    out.push(crate::constants::TAG_SET_CREATOR_FEE_PAYEE);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
+                    out.extend_from_slice(&payee);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawCreatorFee {
                     amount,
@@ -13799,6 +13925,7 @@ pub mod lag_policy {
             Instruction::UpdateMaintenanceFeePerSlot { .. } => entry("UpdateMaintenanceFeePerSlot", LagPolicy::MarkFree, "fee dial"),
             Instruction::ExpireBackingBucket { .. } => entry("ExpireBackingBucket", LagPolicy::MarkFree, "expires a lapsed bucket"),
             Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::SetCreatorFeePayee { .. } => entry("SetCreatorFeePayee", LagPolicy::MarkFree, "records a payee key; moves no value"),
             Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV22Tiers { .. } => entry("InitVaultLpV22Tiers", LagPolicy::MarkFree, "binds a vault LP"),
@@ -16429,6 +16556,19 @@ pub mod processor {
                 asset_index,
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
+            Instruction::SetCreatorFeePayee {
+                asset_index,
+                market_id,
+                payee,
+                authority_epoch,
+            } => handle_set_creator_fee_payee(
+                program_id,
+                accounts,
+                asset_index,
+                market_id,
+                payee,
+                authority_epoch,
+            ),
             Instruction::InitVaultLp { junior_floor_bps } => {
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)?;
                 init_vault_lp_min_leg_guard(program_id, accounts)?;
@@ -23652,9 +23792,28 @@ pub mod processor {
             // legitimate asset 1 as InvalidInstruction — one invariant, one owner.
             let mut claim_profile =
                 read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
-            if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
-                return Err(PercolatorError::Unauthorized.into());
-            }
+            // prog#587: a burned (`[0; 32]`) `asset_admin` with a recorded payee routes the claim to
+            // that payee, permissionlessly; a live admin keeps the signed path above byte for byte;
+            // a burned admin with no payee stays refused (CloseSlab re-books that pot).
+            use crate::creator_fee_payee_v22::{claim_route, ClaimRoute};
+            let payee_dest_owner: Option<Pubkey> = match claim_route(
+                &claim_profile.asset_admin,
+                state::profile_has_creator_fee_payee(&claim_profile),
+            ) {
+                ClaimRoute::AdminSigned => {
+                    if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
+                    None
+                }
+                ClaimRoute::Payee => Some(read_bound_creator_fee_payee(
+                    program_id,
+                    market_ai.key,
+                    asset_index,
+                    account(accounts, 6)?,
+                )?),
+                ClaimRoute::Refused => return Err(PercolatorError::Unauthorized.into()),
+            };
             // W4-AE-EXTEND: gate-2-class replay protection -- a direct
             // fund-withdrawal instruction, signer-gated on this asset's OWN
             // `asset_admin` with zero prior replay protection (the same
@@ -23668,14 +23827,35 @@ pub mod processor {
             require_authority_epoch_view(&group, asset_index as usize, expected_authority_epoch)?;
             // Phase 2b G6: creator fees vest only once the junior cushion is at target.
             p2b_creator_fee_vesting_check(&group, asset_index as usize)?;
-            let vault_balance = verify_withdrawable_token_accounts(
-                dest_token,
-                authority.key,
-                vault_token,
-                &vault_authority,
-                &cfg,
-                false,
-            )?;
+            let vault_balance = match payee_dest_owner {
+                None => verify_withdrawable_token_accounts(
+                    dest_token,
+                    authority.key,
+                    vault_token,
+                    &vault_authority,
+                    &cfg,
+                    false,
+                )?,
+                Some(payee) => {
+                    // Permissionless payout: the destination is FIXED, the payee's canonical ATA
+                    // for the vault mint, and must be unencumbered (no delegate / close
+                    // authority: the W5 rule every permissionless payout here applies).
+                    // The mint comes back from the one canonical parse (dest.mint ==
+                    // vault.mint); no second unpack of the destination.
+                    let (balance, dest_mint) = verify_withdrawable_token_accounts_with_mint(
+                        dest_token,
+                        &payee,
+                        vault_token,
+                        &vault_authority,
+                        &cfg,
+                        true,
+                    )?;
+                    if *dest_token.key != canonical_vault_address(&payee, &dest_mint) {
+                        return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+                    }
+                    balance
+                }
+            };
             // Exact capacity check, in u128 so an `amount` above u64::MAX is an
             // over-claim (rejected) rather than a `try_from` panic-adjacent
             // edge case. Reject-not-saturate, and reject the no-op zero claim.
@@ -23726,20 +23906,16 @@ pub mod processor {
             // `checked_sub` cannot fail after the clamp above; both are kept so a
             // future edit that weakens the clamp still fails closed rather than
             // wrapping a counter to ~1.8e19 claimable atoms.
-            let amount_u64 = amount as u64;
-            let from_asset = amount_u64.min(claim_profile.creator_fee_claimable_atoms);
-            claim_profile.creator_fee_claimable_atoms = claim_profile
-                .creator_fee_claimable_atoms
-                .checked_sub(from_asset)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let from_legacy = amount_u64
-                .checked_sub(from_asset)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            if from_legacy != 0 {
-                cfg.creator_fee_claimable_atoms = cfg
-                    .creator_fee_claimable_atoms
-                    .checked_sub(from_legacy)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            // prog#587: one pure exact-debit rule (Kani `kani_587_claim_debit_conserves`).
+            let (asset_after, legacy_after) = crate::creator_fee_payee_v22::split_claim_debit(
+                claim_profile.creator_fee_claimable_atoms,
+                legacy_pot,
+                transfer_amount_u64,
+            )
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            claim_profile.creator_fee_claimable_atoms = asset_after;
+            if asset_index == 0 {
+                cfg.creator_fee_claimable_atoms = legacy_after;
             }
             write_oracle_profile_to_view(&mut group, asset_index as usize, &claim_profile)?;
             group.validate_shape().map_err(map_v16_error)?;
@@ -23760,6 +23936,144 @@ pub mod processor {
             transfer_amount_u64,
             signer_seeds,
         )
+    }
+
+    /// prog#587: reads and binds the payee PDA tag 90 takes as `[6]` on a burned asset's payee
+    /// route. The account must be THIS market + asset's PDA, owned by this program, a valid kind 19
+    /// record whose stored market / asset index match. Returns the payee wallet.
+    fn read_bound_creator_fee_payee(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        asset_index: u16,
+        payee_ai: &AccountInfo,
+    ) -> Result<Pubkey, ProgramError> {
+        let (pda, _) = state::derive_creator_fee_payee(program_id, market_key, asset_index);
+        if *payee_ai.key != pda || payee_ai.owner != program_id {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let rec = state::read_creator_fee_payee(&payee_ai.try_borrow_data()?)?;
+        if !crate::creator_fee_payee_v22::record_binds(&rec, &market_key.to_bytes(), asset_index) {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        Ok(Pubkey::new_from_array(rec.payee))
+    }
+
+    /// SetCreatorFeePayee (tag 125, prog#587). Records the wallet that receives `asset_index`'s
+    /// creator fee once its `asset_admin` is burned.
+    ///
+    /// Spec fit (upstream README, "Authority model"): `asset_admin` rotates an asset's
+    /// sub-authorities and burning it freezes their current holders. The payee is treated exactly
+    /// like such a holder: only the LIVE `asset_admin` may set or replace it (it could already
+    /// withdraw the whole creator pot to any account it owns, so this grants nothing new), and
+    /// after the burn no key can change it. Like tag 65 it is Live-only, generation-checked, and a
+    /// CAS + advance of the asset's `authority_epoch` lane (a held, stale "set payee" intent cannot
+    /// replay over a later one); a no-op (same payee) is refused (AUD-S1-9).
+    #[inline(never)]
+    fn handle_set_creator_fee_payee<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        market_id: u64,
+        payee: [u8; 32],
+        authority_epoch: u64,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let payee_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
+        expect_signer(admin)?;
+        expect_writable(market_ai)?;
+        expect_writable(payee_ai)?;
+        expect_owner(market_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (pda, bump) = state::derive_creator_fee_payee(program_id, market_ai.key, asset_index);
+        if *payee_ai.key != pda {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let fresh = payee_ai.data_is_empty();
+        let current_payee: Option<[u8; 32]> = if fresh {
+            None
+        } else {
+            if payee_ai.owner != program_id {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            let old = state::read_creator_fee_payee(&payee_ai.try_borrow_data()?)?;
+            if !crate::creator_fee_payee_v22::record_binds(&old, &market_ai.key.to_bytes(), asset_index)
+                || old.bump != bump
+            {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            Some(old.payee)
+        };
+        {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let idx = asset_index as usize;
+            if idx >= group.header.config.max_market_slots.get() as usize {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            require_asset_generation_view(&group, idx, market_id)?;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, idx)?;
+            // A burned admin can never pass: `payee_update_allowed` requires a non-zero admin
+            // equal to the signer (Kani `kani_587_payee_frozen_after_burn`).
+            let current_ref = if state::profile_has_creator_fee_payee(&profile) {
+                current_payee.as_ref()
+            } else {
+                None
+            };
+            // att644 L-1: the market's own vault_authority can never be the payee (its canonical
+            // ATA is the vault, which every payout refuses as a destination).
+            let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+            if !crate::creator_fee_payee_v22::payee_update_allowed(
+                &profile.asset_admin,
+                &admin.key.to_bytes(),
+                current_ref,
+                &payee,
+                &vault_authority.to_bytes(),
+            ) {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            advance_authority_epoch_view(&mut group, idx, authority_epoch)?;
+            profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX] =
+                crate::creator_fee_payee_v22::with_payee_bit(state::profile_p4_flags(&profile), true);
+            write_oracle_profile_to_view(&mut group, idx, &profile)?;
+            group.validate_shape().map_err(map_v16_error)?;
+        }
+        if fresh {
+            expect_writable(admin)?;
+            let bump_bytes = [bump];
+            let idx_bytes = asset_index.to_le_bytes();
+            let seeds: &[&[u8]] = &[
+                crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_SEED,
+                market_ai.key.as_ref(),
+                idx_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(
+                admin,
+                payee_ai,
+                system_program_ai,
+                state::creator_fee_payee_account_len(),
+                program_id,
+                seeds,
+            )?;
+        }
+        let rec = state::CreatorFeePayeeV22 {
+            market: market_ai.key.to_bytes(),
+            payee,
+            asset_index,
+            version: crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_VERSION,
+            bump,
+            _reserved: [0u8; 4],
+        };
+        state::write_creator_fee_payee(&mut payee_ai.try_borrow_mut_data()?, &rec, fresh)?;
+        solana_program::log::sol_log("creator_fee_payee_set");
+        Ok(())
     }
 
     /// SetProtocolFeeAuthority (tag 85, design §3.2). Rotates
@@ -24973,7 +25287,14 @@ pub mod processor {
             moved = true;
         }
         // Legacy market-wide creator pot: claimable by asset 0's admin (GH#420).
-        if cfg.creator_fee_claimable_atoms != 0 && asset0.asset_admin == [0u8; 32] {
+        // prog#587: a burned admin's pot is orphaned ONLY when no payee was recorded before the
+        // burn; a payee-backed pot keeps its tag 90 exit and stays owed (CloseSlab waits for it).
+        use crate::creator_fee_payee_v22::creator_pot_orphaned;
+        if creator_pot_orphaned(
+            &asset0.asset_admin,
+            state::profile_has_creator_fee_payee(&asset0),
+            cfg.creator_fee_claimable_atoms,
+        ) {
             cfg.protocol_fee_accrued_atoms = cfg
                 .protocol_fee_accrued_atoms
                 .checked_add(cfg.creator_fee_claimable_atoms as u128)
@@ -24989,7 +25310,11 @@ pub mod processor {
                 .get(..constants::ASSET_ORACLE_PROFILE_LEN)
                 .ok_or(PercolatorError::InvalidAccountLen)?;
             let mut profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(bytes);
-            if profile.creator_fee_claimable_atoms != 0 && profile.asset_admin == [0u8; 32] {
+            if creator_pot_orphaned(
+                &profile.asset_admin,
+                state::profile_has_creator_fee_payee(&profile),
+                profile.creator_fee_claimable_atoms,
+            ) {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
                     .checked_add(profile.creator_fee_claimable_atoms as u128)
@@ -27680,6 +28005,14 @@ pub mod processor {
                     profile.backing_bucket_authority = backing_bucket_authority;
                     profile.oracle_authority = oracle_authority;
                     profile.asset_admin = authority.key.to_bytes();
+                    // prog#587: a (re-)activated slot is a new creator's asset; it never inherits
+                    // an earlier generation's creator-fee payee (RETIRE already wrote a fresh
+                    // profile; this pins it for any other activation source).
+                    profile._padding0[constants::PROFILE_P4_FLAGS_IDX] =
+                        crate::creator_fee_payee_v22::with_payee_bit(
+                            state::profile_p4_flags(&profile),
+                            false,
+                        );
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
                     }
@@ -49396,6 +49729,29 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
     ) -> Result<u64, ProgramError> {
+        verify_withdrawable_token_accounts_with_mint(
+            dest_token_ai,
+            expected_dest_owner,
+            vault_token_ai,
+            expected_vault_owner,
+            cfg,
+            require_unencumbered_dest,
+        )
+        .map(|(vault_balance, _mint)| vault_balance)
+    }
+
+    // prog#587: same canonical parse, also threading back the validated mint (dest.mint ==
+    // vault.mint, a withdrawable collateral mint) so a caller that must pin the destination
+    // ADDRESS (the creator-fee payee's canonical ATA, tag 90 payee route) reuses the fact
+    // instead of unpacking the destination a second time (W4-TOKEN22 single-gateway rule).
+    fn verify_withdrawable_token_accounts_with_mint(
+        dest_token_ai: &AccountInfo,
+        expected_dest_owner: &Pubkey,
+        vault_token_ai: &AccountInfo,
+        expected_vault_owner: &Pubkey,
+        cfg: &WrapperConfigV16,
+        require_unencumbered_dest: bool,
+    ) -> Result<(u64, Pubkey), ProgramError> {
         // Hardening (security review of d1fb6023): a payout never lands back in the vault.
         if dest_token_ai.key == vault_token_ai.key {
             return Err(PercolatorError::InvalidTokenAccount.into());
@@ -49433,7 +49789,7 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
-        Ok(vault.amount)
+        Ok((vault.amount, vault.mint))
     }
 
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): returns the balance instead of `()`.
