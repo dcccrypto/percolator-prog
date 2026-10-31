@@ -13,7 +13,8 @@ Passing:
 
 - `cargo check --release --lib`
 - `cargo test --release -- --nocapture`
-- `cargo kani --tests --output-format terse`
+- `cargo kani --tests --output-format terse` (at the time; the current command needs
+  `--features devnet -Z stubbing -Z function-contracts`, and not every harness has a verdict at rc23: see `docs/KANI.md`)
 
 The old v12 integration tests are compiled out on this branch with
 `#![cfg(any())]`; they target the removed global slab ABI and cannot be

@@ -1,5 +1,5 @@
 //! Kani harnesses for `vault_lp_v18` (the production file). Run locally, never in CI:
-//!   cargo kani --harness <name>
+//!   cargo kani -Z stubbing -Z function-contracts --harness <name>   (from kani/p3; docs/KANI.md)
 //! Every harness carries `kani::cover!` witnesses; a harness whose covers are not ALL
 //! satisfied is vacuous and does not count as a pass.
 //!

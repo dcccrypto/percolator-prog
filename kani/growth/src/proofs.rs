@@ -487,12 +487,27 @@ fn kani_growth_t1_required_imr_bounds() {
 
 /// V4: the composition `growth_margin_required` for EVERY leg value: `leg_im_req` is an
 /// arbitrary function of its IMR (the two legs share notional and min). Full width.
+///
+/// Preconditions (2026-10-31, N1): the composition only meets the engine certificate when the
+/// per-asset IMR is at least the engine IMR AND the leg is monotone in its IMR; without them the
+/// harness FAILED (`dy < eng` with `leg(dy) < leg(eng)` gives `cert - leg(eng) + leg(dy) < cert`).
+/// Both hold at the ONE production call site, `growth_gate` (src/growth_v19.rs), which passes
+/// `imr = growth_required_imr_bps(g)?`:
+///  (1) `dy >= eng`: `growth_required_imr_bps` refuses `base < g.engine_imr_bps`
+///      (src/growth_v19.rs:457, `if base > MAX_IMR_BPS || base < g.engine_imr_bps { return
+///      Err(LeverageExceeded) }`) and returns either `base` or `dyn_imr_bps(.., base, ..)`, which is
+///      `base` (L307) or `min(base + extra, MAX_IMR_BPS)` with `base <= MAX_IMR_BPS` (L313-317), so
+///      `dy >= base >= eng` (also the harness `kani_growth_t1_required_imr_bounds`: `r >= engine`).
+///  (2) leg monotone in IMR: `leg_im_req` = `max(ceil(n * imr / 1e4), min)` (src/growth_v19.rs:342),
+///      non-decreasing in `imr` (`kani_growth_l1_ceil_monotone_in_b` for the ceil); modelled here
+///      as `leg(dy) >= leg(eng)` whenever both are `Some`.
 #[kani::proof]
 #[kani::stub(crate::growth_v19::leg_im_req, leg_static)]
 fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
     let n: u128 = kani::any();
     let eng: u64 = kani::any();
     let dy: u64 = kani::any();
+    kani::assume(dy >= eng); // (1) growth_v19.rs:457 + dyn_imr_bps >= base
     let m: u128 = kani::any();
     let cert: Option<u128> = kani::any();
     unsafe {
@@ -502,6 +517,9 @@ fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
     }
     let dyn_leg = leg_static(n, dy, m);
     let eng_leg = leg_static(n, eng, m);
+    if let (Some(d), Some(e)) = (dyn_leg, eng_leg) {
+        kani::assume(d >= e); // (2) leg_im_req monotone in its IMR
+    }
     let r = growth_margin_required(cert, n, eng, dy, m);
     if let Some(r) = r {
         assert!(dyn_leg.is_some_and(|d| r >= d), "never below the per-asset (dyn) leg");
@@ -518,6 +536,7 @@ fn kani_growth_t1_requirement_never_below_engine_or_per_asset() {
     kani::cover!(cert.is_none() && r.is_some(), "no cert");
     kani::cover!(cert.is_some_and(|c| eng_leg.is_some_and(|e| c < e)) && r.is_some(), "saturating path");
     kani::cover!(r.is_none(), "None refused");
+    kani::cover!(dy > eng && dyn_leg.is_some_and(|d| eng_leg.is_some_and(|e| d > e)) && cert.is_some_and(|c| eng_leg.is_some_and(|e| c >= e)) && r.is_some(), "dyn above engine, cert path");
 }
 
 // ── Target 2 ──────────────────────────────────────────────────────────────────────────────
