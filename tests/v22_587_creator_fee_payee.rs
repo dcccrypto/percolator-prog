@@ -1452,3 +1452,31 @@ fn f587_profile_rebuild_keeps_payee() {
     env.claim_as(&Keypair::new(), owed, ata, Some(pda)).expect("payee route after the rebuild");
     assert_eq!(env.token_amount(ata) as u128, owed);
 }
+
+/// 10. att644 L-1 (adapted from att644_a1, branch att/644 448b9049): the market's own
+/// `vault_authority` PDA can never be recorded as payee. Its canonical ATA IS the vault, which
+/// every payout refuses as a destination, and a recorded payee disables the CloseSlab re-book,
+/// so after the burn the pot would be stranded and CloseSlab refused for ever. Tag 125 refuses
+/// it (136) both as a first payee and as a rotation target, and nothing is written: no p4 bit,
+/// no epoch advance, the earlier payee stays.
+#[test]
+fn f587_vault_authority_payee_refused_at_set_time() {
+    let mut env = Env::build(true, false);
+    let va = env.vault_authority;
+    assert_eq!(canonical_vault_ata(&va, &env.mint), env.vault, "premise: the payee ATA would be the vault");
+    let admin = env.admin.insecure_clone();
+    let e = env.authority_epoch(0);
+    assert_custom(env.set_payee_as(&admin, 0, va, e), PAYEE_INVALID, "first payee = vault_authority");
+    assert_eq!(env.authority_epoch(0), e, "refusal does not advance the epoch");
+    assert!(!state::profile_has_creator_fee_payee(&env.profile(0)), "no payee bit");
+    assert!(env.svm.get_account(&payee_pda(&env.market, 0)).map_or(true, |a| a.data.is_empty()), "no record");
+    // Rotation from an honest payee to the vault authority is refused too; the honest one stays.
+    let honest = Pubkey::new_unique();
+    env.set_payee(honest);
+    let e = env.authority_epoch(0);
+    assert_custom(env.set_payee_as(&admin, 0, va, e), PAYEE_INVALID, "rotate payee -> vault_authority");
+    assert_eq!(env.authority_epoch(0), e);
+    assert!(state::profile_has_creator_fee_payee(&env.profile(0)));
+    let rec = state::read_creator_fee_payee(&env.svm.get_account(&payee_pda(&env.market, 0)).unwrap().data).unwrap();
+    assert_eq!(rec.payee, honest.to_bytes(), "earlier payee kept");
+}

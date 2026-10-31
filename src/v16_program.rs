@@ -24026,11 +24026,15 @@ pub mod processor {
             } else {
                 None
             };
+            // att644 L-1: the market's own vault_authority can never be the payee (its canonical
+            // ATA is the vault, which every payout refuses as a destination).
+            let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
             if !crate::creator_fee_payee_v22::payee_update_allowed(
                 &profile.asset_admin,
                 &admin.key.to_bytes(),
                 current_ref,
                 &payee,
+                &vault_authority.to_bytes(),
             ) {
                 return Err(PercolatorError::CreatorFeePayeeInvalid.into());
             }

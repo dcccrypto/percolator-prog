@@ -36,6 +36,10 @@ mutate burned_admin_can_set kani_587_payee_frozen_after_burn \
   '    *asset_admin != [0u8; 32]
         && *asset_admin == *signer' \
   '    *asset_admin == *signer' || rc=1
+mutate vault_authority_payee_allowed kani_587_payee_frozen_after_burn \
+  '        && *new_payee != *vault_authority
+' \
+  '' || rc=1
 mutate orphan_takes_payee_pot kani_587_claim_route_exact \
   'pot != 0 && claim_route(asset_admin, payee_flag) == ClaimRoute::Refused' \
   'pot != 0 && claim_route(asset_admin, payee_flag) != ClaimRoute::AdminSigned' || rc=1

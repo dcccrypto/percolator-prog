@@ -102,16 +102,23 @@ pub fn claim_route(asset_admin: &[u8; 32], payee_flag: bool) -> ClaimRoute {
 /// to a non-zero payee that differs from the one stored (a no-op would still advance the asset's
 /// shared authority-epoch lane, AUD-S1-9). After the burn this is `false` for every signer, which
 /// is what makes the payee immutable.
+///
+/// The payee must not be the market's own `vault_authority` PDA (att644 L-1): its canonical ATA
+/// IS the vault, every payout refuses `dest == vault`, and a recorded payee disables the CloseSlab
+/// re-book, so after the burn the pot would be stranded and CloseSlab refused for ever. Refused
+/// here, at set time, because nothing can change the payee once the admin is burned.
 #[inline]
 pub fn payee_update_allowed(
     asset_admin: &[u8; 32],
     signer: &[u8; 32],
     current_payee: Option<&[u8; 32]>,
     new_payee: &[u8; 32],
+    vault_authority: &[u8; 32],
 ) -> bool {
     *asset_admin != [0u8; 32]
         && *asset_admin == *signer
         && *new_payee != [0u8; 32]
+        && *new_payee != *vault_authority
         && current_payee != Some(new_payee)
 }
 
@@ -148,6 +155,7 @@ mod tests {
     const A: [u8; 32] = [7u8; 32];
     const B: [u8; 32] = [9u8; 32];
     const Z: [u8; 32] = [0u8; 32];
+    const V: [u8; 32] = [5u8; 32];
 
     #[test]
     fn route_table() {
@@ -159,12 +167,14 @@ mod tests {
 
     #[test]
     fn update_rules() {
-        assert!(payee_update_allowed(&A, &A, None, &B));
-        assert!(payee_update_allowed(&A, &A, Some(&A), &B));
-        assert!(!payee_update_allowed(&A, &A, Some(&B), &B), "no-op refused");
-        assert!(!payee_update_allowed(&A, &B, None, &B), "non-admin refused");
-        assert!(!payee_update_allowed(&Z, &Z, None, &B), "burned admin: nobody");
-        assert!(!payee_update_allowed(&A, &A, None, &Z), "zero payee refused");
+        assert!(payee_update_allowed(&A, &A, None, &B, &V));
+        assert!(payee_update_allowed(&A, &A, Some(&A), &B, &V));
+        assert!(!payee_update_allowed(&A, &A, Some(&B), &B, &V), "no-op refused");
+        assert!(!payee_update_allowed(&A, &B, None, &B, &V), "non-admin refused");
+        assert!(!payee_update_allowed(&Z, &Z, None, &B, &V), "burned admin: nobody");
+        assert!(!payee_update_allowed(&A, &A, None, &Z, &V), "zero payee refused");
+        assert!(!payee_update_allowed(&A, &A, None, &V, &V), "vault_authority payee refused (L-1)");
+        assert!(!payee_update_allowed(&A, &A, Some(&B), &V, &V), "rotation to vault_authority refused");
     }
 
     #[test]
@@ -233,15 +243,21 @@ mod kani_proofs {
         let cur = any_key();
         let has_cur: bool = kani::any();
         let new = any_key();
+        let vault_authority = any_key();
         let current = if has_cur { Some(&cur) } else { None };
-        assert!(!payee_update_allowed(&[0u8; 32], &signer, current, &new));
-        // And while live, only the admin itself, to a non-zero different payee.
+        assert!(!payee_update_allowed(&[0u8; 32], &signer, current, &new, &vault_authority));
+        // And while live, only the admin itself, to a non-zero different payee that is not the
+        // market's vault_authority (att644 L-1).
         let admin = any_key();
-        if payee_update_allowed(&admin, &signer, current, &new) {
+        if payee_update_allowed(&admin, &signer, current, &new, &vault_authority) {
             assert!(admin != [0u8; 32] && signer == admin && new != [0u8; 32]);
+            assert!(new != vault_authority);
             assert!(current != Some(&new));
         }
-        kani::cover!(payee_update_allowed(&admin, &signer, current, &new), "live admin sets payee");
+        kani::cover!(
+            payee_update_allowed(&admin, &signer, current, &new, &vault_authority),
+            "live admin sets payee"
+        );
     }
 
     /// The route is total and exact: a live admin always keeps the pre-#587 path (non-burned
