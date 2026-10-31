@@ -50826,17 +50826,24 @@ pub mod processor {
 
             let mut data = init_test_portfolio(1);
             state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            // port135 (upstream 0c5d4f4f): only a SYNCHRONIZED bump (a fill through the
+            // configured matcher) preserves bit0; the out-of-matcher bump clears exactly bit0.
             for _ in 0..3 {
-                state::bump_portfolio_position_epoch(&mut data).unwrap();
+                state::bump_portfolio_position_epoch_after_matcher_fill(&mut data).unwrap();
             }
             let after = state::read_portfolio_matcher_config(&data).unwrap();
             assert_eq!(after.position_epoch(), 3);
-            assert_eq!(after.enabled(), 1, "position_epoch bumps must not touch bit0");
+            assert_eq!(after.enabled(), 1, "a synchronized position_epoch bump must not touch bit0");
             assert_eq!(
                 after.trade_fee_cap_bps(),
                 9_999,
                 "position_epoch bumps must not touch bits50..63"
             );
+            state::bump_portfolio_position_epoch(&mut data).unwrap();
+            let after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(after.position_epoch(), 4);
+            assert_eq!(after.enabled(), 0, "an out-of-matcher bump clears exactly bit0");
+            assert_eq!(after.trade_fee_cap_bps(), 9_999);
         }
 
         // ── TB-1b: the 12-tag portfolio-identity BINDING enforcement (ADOPT
