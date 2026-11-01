@@ -263,7 +263,79 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
     now_slot >= request_slot.saturating_add(cooldown_slots as u64)
 }
 
-// ── Coupon (I-T7) ────────────────────────────────────────────────────────────────────────────
+// ── Coupon (I-T7, cumulative since GH#571) ─────────────────────────────────────────────────
+//
+// I-T7 (GH#571, 2026-10-31, founder decision "carried-over coupon"; revised after the att649
+// review): the coupon is CUMULATIVE and is never forfeited by a settlement, a deposit, a dust
+// crank or an exit. Two numbers in `BondTrancheV20`:
+//
+// * `K = c_b_atoms`: the bonds' WHOLE claim (deposits + every settled coupon - redeemed slices).
+//   Every tranche split reads `K`; shares are priced at `K / B`.
+// * `R = coupon_arrears_atoms`: the coupon RECEIVABLE, i.e. settled coupon the fee legs have not
+//   yet funded. Until a fee leg pays it, the junior has fronted it (it sits in `K`, above the
+//   junior in `tranche_split3`), so `R` is what the fee legs still owe the junior. Exits never
+//   reduce it (it can outlive the last bond).
+// * `U = coupon_unfunded_atoms`: the CAP METER, the unfunded coupon carried by the CURRENT
+//   shares, kept at the pool's per-share ratio: a deposit labels the new shares at that ratio,
+//   an exit removes its pro-rata slice, a fee payment lowers it. So the cap is per share: a
+//   round trip, a newcomer or a leaver never resets or starves anyone's headroom.
+//
+// * Accrual (gate open, `coupon_gate_open` on `K`: Live, non-empty, no senior draw outstanding,
+//   tranche whole): `x = floor((min(K, value) * rate * dt + rem) / D)`, `D = 1e4 * 1y`, and
+//   `K += x`, `R += x`, `U += x`; the sub-atom remainder `rem` is CARRIED in `coupon_accrual_rem`, so
+//   settling often (a crank every slot) loses nothing. The base is the whole claim `K`, so every
+//   atom of claim earns the same rate: pricing at `K / B` is newcomer-neutral. Gate closed: the
+//   interval is forfeited (M-1, unchanged); `K`, `R`, `U`, `rem` are kept.
+// * Cap: `U <= coupon_due(K - U, rate, 1y)`, one year of coupon on the current shares' funded
+//   claim. Accrual beyond it is forfeited (and `rem` dropped). The cap bounds the OUTSTANDING
+//   unfunded coupon per share WHILE bonds are outstanding. A full exit realises it (paid out of
+//   the junior's capital, recorded in `R` for the fee legs to repay) and an EMPTY tranche
+//   restarts with `U = 0`: a holder that exits fully and re-enters gets a fresh year (founder
+//   decision 2026-11-01, att649 R2-A). Cumulative unreimbursed fronting (`R`) is therefore not
+//   bounded by one year; it is repaid by fee legs at <= 1/2 of each leg.
+// * Payment (tag 78): `min(R, floor(leg / 2))` (M-2 unchanged) is paid off the top of the fee leg:
+//   `R` drops by the coupon and `U` by `min(U, coupon)`, `K` does NOT change, so the coupon atoms
+//   land in the junior's residual: the junior is reimbursed. Paid while Live with no senior draw outstanding and the tranche whole;
+//   ALSO when the tranche is empty (`K == 0`): the receivable outlives the last bond.
+// * Deposit (108): settles to now (`rem` zeroed: the INCUMBENTS forfeit < 1 atom, the newcomer
+//   never shares their unsettled interval), mints `floor(d * B / K)`, `K += d`,
+//   `U += ceil(d * U / K)` (the new shares carry the pool's ratio); `R` unchanged.
+// * Exit (110): settles to now, pays `floor(sh * layer(K) / B)`, removes `floor(sh * K / B)` from
+//   `K` (`bond_claim_after_redemption`, the pre-#571 slice) and `floor(sh * U / B)` from `U`; `R`
+//   is NOT touched. A deposit/redeem round trip is therefore neutral (att649 F1): it cannot turn
+//   the receivable into funded claim, cannot cancel the junior's reimbursement and cannot reset
+//   the per-share cap while bonds stay outstanding (the ratio `U / K` is preserved; its rounding
+//   goes toward the junior: ceil on entry, floor on exit).
+// * Rounding: always against the actor (108 mint floor, 110 payout floor, 78 coupon floor);
+//   accrual floors only the final sub-atom (carried).
+// * Seniority: `K` sits in the bond layer of `tranche_split3`, JUNIOR to the Earn seniors and the
+//   G9 backstop, SENIOR to the junior (creator) tranche and its cushion (tags 97 / 102 / 103 and
+//   the G6 cushion level read `K`). A 110 exit takes settled coupon out of the junior's capital
+//   when the fee legs have not funded it; `R` records that and later fee legs repay it.
+// * Closed windows (att649 F2): an interval accrues only if the gate is open at BOTH of its ends
+//   (now, and as recorded by the previous settlement in `coupon_gate_seen`) and no senior draw
+//   was booked inside it (the cumulative `senior_drawn_atoms` is unchanged). So a draw window, or
+//   an impairment seen at a settlement, is forfeited even if it reopened before anyone settled;
+//   nobody needs to crank inside the window. Conservative for the junior: the whole interval
+//   that touches a closed sample is forfeited. Not seen: an impairment that starts and ends
+//   strictly between two settlements without a draw (inherent to sampling).
+// * Resolve: nothing accrues once the market is not Live; terminal 78 pays no coupon. Settled
+//   coupon stays in `K` and is paid by the Resolved 110 before the junior (102); an unpaid `R`
+//   is not repaid to the junior after resolution (no more fee legs).
+// * Known residuals (att649 round 2, accepted, 2026-11-01):
+//   - R2-A: the per-share cap restarts when the tranche empties (see Cap above).
+//   - R2-B: an IMPAIRED exit is paid its layer (< its slice of `K`) but leaves `R` intact, so
+//     later fee legs (the Earn seniors' share) reimburse the junior for coupon the bonds, not the
+//     junior, ended up losing. Bounded by `min(R, slice - payout)` per impaired exit.
+//   - R2-C: the meter's rounding (ceil in, floor out) moves `U` up by <= 1 atom per tiny
+//     deposit/exit round trip: in the junior's favour (the stayers lose <= 1 atom of headroom per
+//     loop, each loop costing a cooldown and fees).
+//   - R2-D: `coupon_gate_seen` keeps only the low 63 bits of `senior_drawn_atoms`; draws totalling
+//     an exact multiple of 2^63 atoms inside one interval would be missed (unreachable at USDC
+//     scale: > 9.2e18 atoms; the counter never decreases).
+//   - R2-E: an impairment (or a G9 lend + repay) that starts and ends strictly inside one interval
+//     without a senior draw is not seen; the interval accrues. Bounded by the per-share cap and by
+//     the settlement frequency (78 needs only a fee leg).
 
 /// Utilisation of the bond-backed capacity, bps: `min(1, max side OI / N_cap)`. 0 with no OI;
 /// full with OI but no capacity number.
@@ -298,9 +370,9 @@ pub fn bond_coupon_rate_bps(base_bps: u16, util_bonus_bps: u16, util_bps: u16) -
 /// Coupon accrued over `dslots` on the pooled principal claim `C_b`:
 /// `floor(C_b * rate * min(dslots, 1y) / (10_000 * SLOTS_PER_YEAR))`.
 ///
-/// NON-CUMULATIVE: the caller resets the checkpoint to "now" on every crank whatever was paid, so
-/// arrears are never a claim (I-T7). The interval is clamped to one year so an idle tranche cannot
-/// build a jumbo first crank. `None` only on a corrupt `C_b`: the product
+/// One accrual interval, floored (`coupon_settle` carries the remainder and the receivable,
+/// GH#571 I-T7 above; this is the cap and the pre-#571 form). Clamped to one year.
+/// `None` only on a corrupt `C_b`: the product
 /// `C_b * rate * SLOTS_PER_YEAR` must fit u128, i.e. `C_b < 2^128 / (3_000 * 78.84e6) ~ 2^90.2`,
 /// ~2^26 above any SPL-representable (u64) claim.
 pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> {
@@ -315,17 +387,18 @@ pub fn coupon_due(bond_claim: u128, rate_bps: u32, dslots: u64) -> Option<u128> 
 
 /// Coupon gate: paid only on a Live market, from a non-empty tranche, while NO senior principal
 /// loss is outstanding (the coupon never takes priority over Earn principal) AND while the bond
-/// tranche itself is whole (`bond_value >= C_b`, security review M-1): an impaired tranche earns
-/// nothing, so Earn's fee leg never recapitalises it. `bond_value` is the bonds' layer of the
-/// vault value BEFORE this crank's fee leg.
+/// tranche itself is whole (`bond_value >= bond_claim`, security review M-1): an impaired tranche
+/// earns nothing, so Earn's fee leg never recapitalises it. `bond_value` is the bonds' layer of the
+/// vault value BEFORE this crank's fee leg. GH#571: `bond_claim = K` includes the settled coupon,
+/// so a tranche whose settled coupon is not backed is impaired and accrues nothing more.
 pub fn coupon_gate_open(live: bool, bond_claim: u128, senior_draw_outstanding: u128, bond_value: u128) -> bool {
     live && bond_claim > 0 && senior_draw_outstanding == 0 && bond_value >= bond_claim
 }
 
-/// The principal the coupon accrues on: `min(C_b, bond value)` (security review M-1; equals the
-/// explicit model's written-down principal). With the gate above it is `C_b` whenever a coupon is
-/// paid at all; kept separate so the base can never exceed the bond's value even if the gate is
-/// relaxed later.
+/// The claim the coupon accrues on: `min(bond_claim, bond value)` (security review M-1; equals the
+/// explicit model's written-down principal). GH#571: `bond_claim = K`, and with the gate above
+/// the base is `K` whenever anything accrues; kept separate so the base can never exceed
+/// the bond's value even if the gate is relaxed later.
 pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
     if bond_value < bond_claim {
         bond_value
@@ -337,11 +410,142 @@ pub fn coupon_base(bond_claim: u128, bond_value: u128) -> u128 {
 /// Take the coupon off the TOP of one harvested LP fee leg: `(coupon, rest)` with
 /// `coupon = min(due, floor(available * BOND_COUPON_MAX_LEG_BPS / 1e4))` and
 /// `coupon + rest == available`. Paid only from the fee leg, never from principal, never more than
-/// half of it (M-2); the unpaid part of `due` is forfeited (non-cumulative).
+/// half of it (M-2). Tag 78 passes the receivable `R` as `due`; the unpaid part stays in `R`
+/// (GH#571, cumulative), `coupon_pay_from_leg`.
 pub fn bond_coupon_split(available: u128, due: u128) -> (u128, u128) {
     let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);
     let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)
+}
+
+/// GH#571: the accrual denominator `BPS * SLOTS_PER_YEAR`; a numerator below it is a sub-atom.
+pub const COUPON_DENOM: u128 = BPS * SLOTS_PER_YEAR;
+
+/// GH#571: the FUNDED part of the current shares' claim, `K - U` (saturating).
+pub fn bond_funded_claim(bond_claim: u128, unfunded: u128) -> u128 {
+    bond_claim.saturating_sub(unfunded)
+}
+
+/// GH#571: the cap on the meter `U`, one year of coupon on the funded claim `K - U` at `rate_bps`.
+pub fn coupon_arrears_cap(funded_claim: u128, rate_bps: u32) -> Option<u128> {
+    coupon_due(funded_claim, rate_bps, SLOTS_PER_YEAR as u64)
+}
+
+/// GH#571: settle the coupon accrued over `dslots` (I-T7 above). Returns `(x, rem')`: the atoms
+/// to add to the claim `K`, the receivable `R` and the meter `U`, and the new carried sub-atom
+/// remainder.
+///
+/// * gate closed: `(0, rem)` (the interval is forfeited; nothing settled is touched);
+/// * gate open: `num = min(K, bond_value) * rate * min(dslots, 1y) + rem`,
+///   `x = min(floor(num / D), cap - U)` with `cap = coupon_arrears_cap(K - U, rate)`;
+///   `rem' = num mod D` when the cap does not bind, else 0 (the excess is forfeited).
+///
+/// `None` (fail closed) on overflow: needs `min(K, value) * rate * 1y < 2^128` (`K < ~2^90`).
+pub fn coupon_settle(
+    bond_claim: u128,
+    unfunded: u128,
+    rem: u64,
+    rate_bps: u32,
+    dslots: u64,
+    open: bool,
+    bond_value: u128,
+) -> Option<(u128, u64)> {
+    coupon_settle_in(bond_claim, unfunded, rem, rate_bps, dslots, open, bond_value, SLOTS_PER_YEAR, COUPON_DENOM)
+}
+
+/// `coupon_settle` for a general one-year length `year` and denominator `denom` (production:
+/// `SLOTS_PER_YEAR`, `COUPON_DENOM = BPS * year`). The same law at every `(year, denom)`; the
+/// Kani harnesses (`kani/bonds571`) prove it over a bounded family of small parameters, the
+/// full-width proptests check the production constants. The cap here is
+/// `floor((K - U) * rate * year / denom)` = `coupon_arrears_cap` at the production constants.
+#[allow(clippy::too_many_arguments)]
+pub fn coupon_settle_in(
+    bond_claim: u128,
+    unfunded: u128,
+    rem: u64,
+    rate_bps: u32,
+    dslots: u64,
+    open: bool,
+    bond_value: u128,
+    year: u128,
+    denom: u128,
+) -> Option<(u128, u64)> {
+    if !open {
+        return Some((0, rem));
+    }
+    if denom == 0 {
+        return None;
+    }
+    let dt = if (dslots as u128) > year { year } else { dslots as u128 };
+    let num = coupon_base(bond_claim, bond_value)
+        .checked_mul(rate_bps as u128)?
+        .checked_mul(dt)?
+        .checked_add(rem as u128)?;
+    let due = num / denom;
+    let cap = bond_funded_claim(bond_claim, unfunded)
+        .checked_mul(rate_bps as u128)?
+        .checked_mul(year)?
+        / denom;
+    let room = cap.saturating_sub(unfunded);
+    if due > room {
+        Some((room, 0))
+    } else {
+        Some((due, u64::try_from(num % denom).ok()?))
+    }
+}
+
+/// GH#571 (att649 F2): the gate memory a settlement leaves behind (`coupon_gate_seen`): the low
+/// 63 bits of the cumulative, monotone `senior_drawn_atoms`, and bit 63 set iff the coupon gate
+/// is CLOSED as of this settlement.
+pub fn coupon_gate_seen(senior_drawn: u128, open_now: bool) -> u64 {
+    let drawn = senior_drawn as u64 & !(1u64 << 63);
+    if open_now { drawn } else { drawn | (1u64 << 63) }
+}
+
+/// GH#571 (att649 F2): may the interval since the last settlement accrue? Only if the gate was
+/// OPEN at that settlement and no senior draw was booked since (the drawn counter is unchanged).
+/// With the gate open NOW (checked by the caller) the interval is open at both ends; a window
+/// that closed and reopened between settlements is forfeited. (Conservative: an impairment that
+/// both starts and ends strictly inside one interval without a draw is not seen, inherent to
+/// sampling at settlement points.)
+pub fn coupon_interval_clean(seen: u64, senior_drawn: u128) -> bool {
+    seen == coupon_gate_seen(senior_drawn, true)
+}
+
+/// GH#571, tag 78: pay the receivable `R` off the top of one fee leg.
+/// Returns `(coupon, rest, R - coupon)`; `coupon + rest == available`, `coupon <= R`,
+/// `coupon <= floor(available / 2)` (M-2). The claim `K` is unchanged by the payment.
+pub fn coupon_pay_from_leg(available: u128, receivable: u128) -> (u128, u128, u128) {
+    let (coupon, rest) = bond_coupon_split(available, receivable);
+    (coupon, rest, receivable - coupon)
+}
+
+/// GH#571, tag 108: the meter after a deposit of `amount` into a claim `bond_claim` (before the
+/// deposit): `U + ceil(amount * U / K)`, the new shares carry the pool's ratio (rounded against
+/// the depositor). `K == 0` (genesis): `U` (0). `None` on overflow.
+pub fn coupon_meter_after_deposit(unfunded: u128, bond_claim: u128, amount: u128) -> Option<u128> {
+    if bond_claim == 0 {
+        return Some(unfunded);
+    }
+    let label = amount.checked_mul(unfunded)?.div_ceil(bond_claim);
+    unfunded.checked_add(label)
+}
+
+/// GH#571, tag 110: the meter after `shares` of `total_shares` are redeemed: `U - floor(sh * U / B)`
+/// (the rounding stays in the meter, toward the junior; a full exit leaves 0). `None` on `B == 0`, `sh > B`, overflow.
+pub fn coupon_meter_after_redemption(unfunded: u128, shares: u128, total_shares: u128) -> Option<u128> {
+    if total_shares == 0 || shares > total_shares {
+        return None;
+    }
+    unfunded.checked_sub(mul_div_floor(shares, unfunded, total_shares)?)
+}
+
+/// GH#571, tag 78: may this crank PAY the receivable? Live and no senior draw outstanding
+/// (the coupon never takes priority over Earn principal), and either the accrual gate is open
+/// (tranche whole, M-1) or the tranche is EMPTY (`K == 0`: nothing to recapitalise, the
+/// receivable outlives the last bond and is still the junior's).
+pub fn coupon_pay_open(accrual_open: bool, live: bool, bond_claim: u128, senior_draw_outstanding: u128) -> bool {
+    accrual_open || (live && bond_claim == 0 && senior_draw_outstanding == 0)
 }
 
 /// The full Phase 4 fee waterfall of one harvested LP leg (the composition tag 78 runs):

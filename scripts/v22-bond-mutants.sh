@@ -5,6 +5,8 @@
 #
 #   scripts/v22-bond-mutants.sh pure   # MP1..MP7 against tests/v22_bonds_pure.rs (native)
 #   scripts/v22-bond-mutants.sh bpf    # MB1..MB4: build a mutant BPF, run one LiteSVM test on it
+#   scripts/v22-bond-mutants.sh pure571  # GH#571 M571a..g against tests/v22_bond_carry_571_pure.rs
+#   scripts/v22-bond-mutants.sh bpf571   # GH#571 MB571a..h: mutant BPF vs the gh571_* / att649_* LiteSVM tests
 #
 # Exit 0 iff EVERY mutant was killed. Logs: $MUT_LOG_DIR (default ../logs/mutants).
 set -uo pipefail
@@ -44,6 +46,12 @@ expect_killed() { # name log-file rc
 run_pure() { # name file old new
   save "$2"; mutate "$2" "$3" "$4" || { restore "$2"; echo "ANCHOR $1"; FAILS=$((FAILS + 1)); return; }
   cargo test --features devnet --test v22_bonds_pure > "$LOGS/$1.log" 2>&1; rc=$?
+  restore "$2"; expect_killed "$1" "$LOGS/$1.log" $rc
+}
+
+run_pure571() { # name file old new
+  save "$2"; mutate "$2" "$3" "$4" || { restore "$2"; echo "ANCHOR $1"; FAILS=$((FAILS + 1)); return; }
+  cargo test --features devnet --test v22_bond_carry_571_pure > "$LOGS/$1.log" 2>&1; rc=$?
   restore "$2"; expect_killed "$1" "$LOGS/$1.log" $rc
 }
 
@@ -156,7 +164,7 @@ bond_junior_cannot_withdraw_bond_value_and_tranche_is_required
     let coupon = if due < cap { due } else { cap };
     (coupon, available - coupon)' \
 '    let _ = due;
-    (0, available)' bond_coupon_first_conserves_and_is_noncumulative
+    (0, available)' bond_coupon_first_conserves_and_carries_arrears_gh571
   # ── security review fixes (2026-10-05) ──
   run_bpf MB5_107_after_earn_M2 $W \
 '        if registry.total_lp_shares_outstanding != 0 || st.senior_claim_atoms != 0 {' \
@@ -164,7 +172,7 @@ bond_junior_cannot_withdraw_bond_value_and_tranche_is_required
 bond_tranche_refused_after_the_first_earn_deposit
   run_bpf MB6_coupon_cap_removed_M2 $B \
 '    let cap = bps_floor(available, BOND_COUPON_MAX_LEG_BPS).unwrap_or(0);' \
-'    let cap = available;' bond_coupon_first_conserves_and_is_noncumulative
+'    let cap = available;' bond_coupon_first_conserves_and_carries_arrears_gh571
   # MB7: the coupon gate blind to tranche impairment (the base stays min(C_b, value); MP11 covers
   # the base on its own).
   run_bpf MB7_coupon_on_full_claim_while_impaired_M1 $B \
@@ -188,6 +196,82 @@ sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed
   run_bpf MB10_coupon_ignores_lag_worse $W \
 '            if worse < certified { worse } else { certified }' \
 '            let _ = worse; certified' bond_coupon_gate_uses_the_lag_worse_value_like_108_110
+  ;;
+pure571)
+  # GH#571 (revised after att649): the remainder carry, the cap meter, the base, the payment.
+  run_pure571 M571a_remainder_dropped $B \
+'        Some((due, u64::try_from(num % denom).ok()?))' \
+'        Some((due, 0))'
+  run_pure571 M571b_accrual_base_funded_only $B \
+'    let num = coupon_base(bond_claim, bond_value)' \
+'    let num = coupon_base(bond_funded_claim(bond_claim, unfunded), bond_value)'
+  run_pure571 M571c_deposit_not_labelled $B \
+'    unfunded.checked_add(label)' \
+'    unfunded.checked_add(0 * label)'
+  run_pure571 M571d_cap_ignored $B \
+'    let room = cap.saturating_sub(unfunded);' \
+'    let room = u128::MAX; let _ = cap;'
+  run_pure571 M571e_pay_forfeits_rest $B \
+'    (coupon, rest, receivable - coupon)' \
+'    (coupon, rest, 0 * receivable)'
+  run_pure571 M571f_closed_gate_drops_remainder $B \
+'        return Some((0, rem));' \
+'        return Some((0, 0));'
+  run_pure571 M571g_settle_rounds_up $B \
+'    let due = num / denom;' \
+'    let due = num / denom + 1;'
+  ;;
+bpf571)
+  # MB571a (att649 F1): 110 also slices the receivable pro rata: a round trip cancels the
+  # junior's reimbursement again.
+  run_bpf MB571a_110_slices_the_receivable $W \
+'        // the cap meter leaves with the shares (the stayers'"'"' per-share headroom is unchanged)' \
+'        t.coupon_arrears_atoms -= t.coupon_arrears_atoms * shares / total;' \
+att649_f1_round_trip_is_neutral_for_the_junior
+  # MB571b: 97 reads the stored claim only (no unsettled accrual): the junior can withdraw the
+  # coupon the bonds are accruing.
+  run_bpf MB571b_97_ignores_unsettled_accrual $W \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,' \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_total()?,' \
+gh571_junior_cannot_withdraw_the_bonds_accrual_and_arrears_cap_at_one_year
+  # MB571c: 78 forfeits the unpaid receivable (the dust-crank grief).
+  run_bpf MB571c_78_forfeits_unpaid $W \
+'            bond_v20::coupon_pay_from_leg(available, r)' \
+'            { let (c, rr, _) = bond_v20::coupon_pay_from_leg(available, r); (c, rr, 0) }' \
+gh571_dust_trade_crank_carries_instead_of_forfeiting
+  # MB571d (att649 F3): 78 drops the carried remainder: every-slot cranks grind the coupon.
+  run_bpf MB571d_78_drops_the_remainder $W \
+'        t.coupon_accrual_rem = rem;' \
+'        t.coupon_accrual_rem = 0; let _ = rem;' \
+gh571_crank_every_slot_cannot_grind_the_coupon
+  # MB571e: 78 accrues whatever the gate says (drawn / impaired tranche still earns coupon).
+  run_bpf MB571e_78_accrues_through_closed_gate $W \
+'            now.saturating_sub(t.last_coupon_slot),
+            open,
+            bond_value,' \
+'            now.saturating_sub(t.last_coupon_slot),
+            true,
+            k,' \
+gh571_no_accrual_while_drawn_or_impaired_and_settled_arrears_are_kept
+  # MB571f: 103 reads the stored claim only (no unsettled accrual).
+  run_bpf MB571f_103_ignores_unsettled_accrual $W \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,' \
+'        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_total()?,' \
+gh571_103_allocation_reserves_the_bonds_accrual
+  # MB571g (att649 F1b): 108 does not label the new shares' meter: a round trip resets the cap.
+  run_bpf MB571g_108_meter_not_labelled $W \
+'        t.coupon_unfunded_atoms = bond_v20::coupon_meter_after_deposit(t.coupon_unfunded_atoms, t.c_b_atoms, amount)' \
+'        t.coupon_unfunded_atoms = Some(t.coupon_unfunded_atoms + 0 * amount)' \
+att649_f1b_round_trip_cannot_reset_the_one_year_cap
+  # MB571h (att649 F2): no gate memory: the crank after a closed window accrues the window.
+  run_bpf MB571h_78_no_gate_memory $W \
+'        let open = open_now && bond_interval_clean(&t, st);' \
+'        let open = open_now; let _ = bond_interval_clean(&t, st);' \
+gh571_no_accrual_while_drawn_or_impaired_and_settled_arrears_are_kept
   ;;
 esac
 rm -rf "$BAK"

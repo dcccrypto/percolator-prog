@@ -1839,7 +1839,16 @@ impl Env {
     }
 
     fn tranche(&self) -> state::BondTrancheV20 {
-        state::read_bond_tranche(&self.svm.get_account(&self.tranche_key()).unwrap().data).unwrap()
+        let mut d = self.svm.get_account(&self.tranche_key()).unwrap().data;
+        // GH#571 negative controls (`P1_WRAPPER_SO=<base .so>`): a v1 (128 B body) account is
+        // read as v2 with zero arrears, so the control fails on the economics, not on the parse.
+        let full = state::bond_tranche_account_len();
+        if d.len() < full {
+            let h = full - core::mem::size_of::<state::BondTrancheV20>();
+            d.resize(full, 0);
+            d[h + 114] = percolator_prog::constants::BOND_TRANCHE_VERSION;
+        }
+        state::read_bond_tranche(&d).unwrap()
     }
 
     fn bond_pos(&self, h: &BondHolder) -> state::BondPositionV20 {
@@ -2103,7 +2112,20 @@ impl Env {
     /// conservative equity (no lag on a flat LP), C_s, C_b.
     fn split3(&self, lp: Pubkey) -> bond_v20::TrancheSplit3 {
         let (nav, lpv, c) = self.p2b_v(lp);
-        bond_v20::tranche_split3(nav + lpv, c, self.tranche().c_b_atoms)
+        bond_v20::tranche_split3(nav + lpv, c, self.tranche().claim_total().unwrap())
+    }
+
+    /// GH#571: the split a Live tag 110 prices at NOW: the claim is first settled to the current
+    /// slot (gate open iff the tranche is whole; base rate, no utilisation term; the test worlds
+    /// using this have no draw, so the interval is clean).
+    fn split3_settled(&self, lp: Pubkey) -> bond_v20::TrancheSplit3 {
+        let (nav, lpv, c) = self.p2b_v(lp);
+        let tr = self.tranche();
+        let k = tr.claim_total().unwrap();
+        let open = tr.c_b_atoms > 0 && !bond_v20::bond_impaired(nav + lpv, c, k);
+        let rate = bond_v20::bond_coupon_rate_bps(tr.coupon_bps_per_year, tr.coupon_util_bonus_bps, 0);
+        let (x, _) = settle_expect(&tr, self.slot, rate, open);
+        bond_v20::tranche_split3(nav + lpv, c, k + x)
     }
 }
 
@@ -2467,7 +2489,9 @@ fn bond_waterfall_order_under_losses() {
         // bond exit pays exactly its layer (case 0: par; case 1: the impaired value)
         env.bond_request(&h, 1_000 * U as u128).expect("109");
         env.wait_cooldown(&[lp.portfolio]);
-        let s = env.split3(lp.portfolio);
+        // GH#571: 110 settles the cooldown's accrual first (case 0, whole); nothing accrues on
+        // the impaired tranche (case 1).
+        let s = env.split3_settled(lp.portfolio);
         let paid_b = env.bond_execute(&h, lp.portfolio, 0).expect("110");
         assert_eq!(paid_b as u128, s.bond, "bond paid its split layer exactly");
         assert_eq!(env.tranche().c_b_atoms, 0);
@@ -2529,11 +2553,11 @@ fn bond_does_not_count_as_l3_junior() {
 
 /// Coupon first: on tag 78 the bonds take `min(due, half the LP fee leg)` (M-2 cap) before the
 /// seniors, credited to C_b (value conserved: coupon + senior credit == the leg); the holder
-/// exits at principal + coupon. NON-CUMULATIVE: an interval whose leg could not cover the due is
-/// not carried. Negative control for the cap: mutant MB6 (cap removed) gives the whole thin leg
+/// exits at principal + coupon. CUMULATIVE since GH#571: an interval whose leg could not cover the
+/// due CARRIES the rest as arrears, paid by the next leg (pre-#571 this test asserted the opposite). Negative control for the cap: mutant MB6 (cap removed) gives the whole thin leg
 /// to the coupon and fails this test.
 #[test]
-fn bond_coupon_first_conserves_and_is_noncumulative() {
+fn bond_coupon_first_conserves_and_carries_arrears_gh571() {
     let (mut env, lp, d, h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 3_000, 3_000, 2_000);
     let t = env.new_trader(10_000 * U);
     let round = |env: &mut Env, n: u32| {
@@ -2553,16 +2577,19 @@ fn bond_coupon_first_conserves_and_is_noncumulative() {
         let (cfg, _) = env.market_state();
         cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
     };
-    let due = bond_v20::coupon_due(tr0.c_b_atoms, 2_000, env.slot - tr0.last_coupon_slot).unwrap();
+    // GH#571: the crank first SETTLES the interval into the claim K (and the receivable R), then
+    // pays min(R, leg / 2) off the top of the leg; K does not move on the payment.
+    let (due, _) = settle_expect(&tr0, env.slot, 2_000, true);
     env.crank_fees_bond(lp.portfolio).expect("78");
     let tr1 = env.tranche();
-    let coupon = tr1.c_b_atoms - tr0.c_b_atoms;
+    let coupon = tr1.coupon_paid_total_atoms as u128 - tr0.coupon_paid_total_atoms as u128;
     let senior = env.vlp().senior_claim_atoms - c0;
     eprintln!("COUPON 1: leg {avail} due {due} coupon {coupon} senior {senior}");
     assert!(avail > 0 && due > 0, "vacuity");
+    assert_eq!(tr1.c_b_atoms - tr0.c_b_atoms, due, "the interval is settled into the claim K");
     assert_eq!(coupon, due.min(avail / 2), "coupon = min(due, leg / 2)");
     assert_eq!(coupon + senior, avail, "coupon + senior credit == the leg (cushion off)");
-    assert_eq!(tr1.coupon_paid_total_atoms as u128, coupon);
+    assert_eq!(tr1.coupon_arrears_atoms, due - coupon, "the receivable is what the leg did not pay");
     assert_eq!(tr1.last_coupon_slot, env.slot);
     // interval 2: long again but a THIN leg -> the coupon is capped at HALF the leg (M-2); the
     // seniors keep the other half ...
@@ -2576,29 +2603,39 @@ fn bond_coupon_first_conserves_and_is_noncumulative() {
         let (cfg, _) = env.market_state();
         cfg.lp_fee_accrued_atoms - cfg.lp_fee_withdrawn_atoms
     };
-    let due2 = bond_v20::coupon_due(tr1.c_b_atoms, 2_000, env.slot - tr1.last_coupon_slot).unwrap();
+    let (due2, _) = settle_expect(&tr1, env.slot, 2_000, true);
     env.crank_fees_bond(lp.portfolio).expect("78 thin");
     let tr2 = env.tranche();
     assert!(due2 > leg2, "vacuity: the leg cannot cover the due");
-    assert_eq!(tr2.c_b_atoms - tr1.c_b_atoms, leg2 / 2, "the coupon takes at most half the leg (M-2)");
+    assert_eq!(tr2.c_b_atoms - tr1.c_b_atoms, due2, "settled into K in full");
+    assert_eq!(tr2.coupon_paid_total_atoms - tr1.coupon_paid_total_atoms, (leg2 / 2) as u64, "the coupon takes at most half the leg (M-2)");
     assert_eq!(env.vlp().senior_claim_atoms - c1, leg2 - leg2 / 2, "Earn keeps the other half");
-    // ... interval 3: SHORT (1 slot) with a fat leg -> only that slot's due; the shortfall of
-    // interval 2 is NOT carried
+    // GH#571: the unpaid rest is CARRIED as receivable, not forfeited
+    assert_eq!(tr2.coupon_arrears_atoms, tr1.coupon_arrears_atoms + due2 - leg2 / 2, "carried receivable");
+    // ... interval 3: SHORT (1 slot) with a fat leg -> pays the carried receivable + that slot
     env.hold(1, &[lp.portfolio]);
     round(&mut env, 6);
-    let due3 = bond_v20::coupon_due(tr2.c_b_atoms, 2_000, env.slot - tr2.last_coupon_slot).unwrap();
+    let (due3, _) = settle_expect(&tr2, env.slot, 2_000, true);
     let c2 = env.vlp().senior_claim_atoms;
     env.crank_fees_bond(lp.portfolio).expect("78 short");
     let tr3 = env.tranche();
-    assert_eq!(tr3.c_b_atoms - tr2.c_b_atoms, due3, "non-cumulative: only this interval's due");
+    assert_eq!(tr3.c_b_atoms - tr2.c_b_atoms, due3, "this slot settled into K");
+    assert_eq!(
+        (tr3.coupon_paid_total_atoms - tr2.coupon_paid_total_atoms) as u128,
+        tr2.coupon_arrears_atoms + due3,
+        "cumulative: the carried receivable + this interval's due is paid"
+    );
+    assert_eq!(tr3.coupon_arrears_atoms, 0);
     assert!(env.vlp().senior_claim_atoms > c2, "seniors take the rest");
-    // the holder exits at principal + every coupon
+    // the holder exits at principal + every settled coupon (+ the accrual 110 settles over the
+    // cooldown): the whole claim K
     env.bond_request(&h, 3_000 * U as u128).expect("109");
     env.wait_cooldown(&[lp.portfolio]);
     let _ = env.crank_fees_bond(lp.portfolio);
-    let cb = env.tranche().c_b_atoms;
+    let tr4 = env.tranche();
+    let (settle, _) = settle_expect(&tr4, env.slot, 2_000, true);
     let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110");
-    assert_eq!(paid as u128, cb, "principal + coupons");
+    assert_eq!(paid as u128, tr4.c_b_atoms + settle, "principal + coupons + the settled accrual");
     assert!(paid as u128 > 3_000 * U as u128);
     let shares = env.lp_shares(&d);
     env.earn_request(&d, shares);
@@ -2667,7 +2704,9 @@ fn bond_error_codes_and_tags_are_pinned() {
         assert_eq!(e[0], tag);
         assert_eq!(ProgInstruction::decode(&e).unwrap().encode(), e, "round trip");
     }
-    assert_eq!(std::mem::size_of::<state::BondTrancheV20>(), 128);
+    // GH#571 layout v2: 128 -> 176 (R, U, the carried remainder and the gate memory appended).
+    assert_eq!(std::mem::size_of::<state::BondTrancheV20>(), 176);
+    assert_eq!(percolator_prog::constants::BOND_TRANCHE_VERSION, 2);
     assert_eq!(std::mem::size_of::<state::BondPositionV20>(), 96);
 }
 
@@ -2780,7 +2819,8 @@ fn sec_c1_impaired_bond_earns_no_coupon() {
         let c0 = env.vlp().senior_claim_atoms;
         let k0 = env.ext().map(|x| x.cushion_accrued_atoms).unwrap_or(0);
         env.crank_fees_bond(lp.portfolio).expect("78");
-        let coupon = env.tranche().c_b_atoms - tr0.c_b_atoms;
+        // GH#571: the coupon PAID off the leg (the settled accrual moves K; the payment does not)
+        let coupon = (env.tranche().coupon_paid_total_atoms - tr0.coupon_paid_total_atoms) as u128;
         let senior = env.vlp().senior_claim_atoms - c0;
         // Round 3 (GAP-8): the bond tranche's ext carries the default cushion (20% / 50%), so the
         // Earn side of the leg is seniors + the junior cushion.
@@ -2916,9 +2956,11 @@ fn sec2_n1_fee_crank_on_a_stale_vault_lp_pays_or_fails_closed() {
     let c0 = env.vlp().senior_claim_atoms;
     env.crank_fees_bond(lp.portfolio).expect("78 re-certifies the vault LP and harvests");
     let tr1 = env.tranche();
-    let coupon = tr1.c_b_atoms - tr0.c_b_atoms;
+    // GH#571: the interval is settled into K; the leg pays min(R, leg / 2) of it
+    let coupon = (tr1.coupon_paid_total_atoms - tr0.coupon_paid_total_atoms) as u128;
     eprintln!("N-1 stale-timed crank: leg {leg} due {due} coupon {coupon}");
     assert!(leg > 0 && due > 0, "vacuity");
+    assert_eq!(tr1.c_b_atoms - tr0.c_b_atoms, due, "the full interval settled, not deferred");
     assert_eq!(coupon, due.min(leg / 2), "full coupon, not deferred");
     assert_eq!(coupon + (env.vlp().senior_claim_atoms - c0), leg);
     assert_eq!(tr1.last_coupon_slot, env.slot, "checkpoint moved");
@@ -3031,4 +3073,20 @@ fn sec4_cu_of_78_with_refresh() {
     let tr1 = env.tranche();
     eprintln!("SEC4 coupon {} moved {}", tr1.c_b_atoms - tr0.c_b_atoms, tr1.last_coupon_slot != tr0.last_coupon_slot);
     // third party: refresh forced at will is already possible via tag 5 (PermissionlessCrank)
+}
+
+/// GH#571: what the program's next settlement of `tr` at `now` credits (`(x, rem')`), from the
+/// production pure function: base = the whole claim K (the tranche whole), the cap meter U, the
+/// carried remainder. `open` = the gate as the program sees it (whole, clean interval).
+fn settle_expect(tr: &state::BondTrancheV20, now: u64, rate: u32, open: bool) -> (u128, u64) {
+    bond_v20::coupon_settle(
+        tr.c_b_atoms,
+        tr.coupon_unfunded_atoms,
+        tr.coupon_accrual_rem,
+        rate,
+        now - tr.last_coupon_slot,
+        open && tr.c_b_atoms > 0,
+        tr.c_b_atoms,
+    )
+    .unwrap()
 }
