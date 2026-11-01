@@ -122,12 +122,48 @@ pub fn payee_update_allowed(
         && current_payee != Some(new_payee)
 }
 
-/// CloseSlab re-book: a burned asset's creator pot moves to the protocol leg ONLY when it has no
-/// claim path, i.e. no payee was recorded. A payee-backed pot stays owed (CloseSlab refuses with
-/// `CloseSlabFeesOutstanding` until anyone pays it out through tag 90).
+/// fallback587 (Khubair 2026-11-01, "a market can ALWAYS close"): how long a payee-backed creator
+/// pot on a burned asset stays reserved for the payee after the market resolves: 7 days of
+/// 400 ms slots (`lev_guard_v22::SLOTS_PER_DAY` = 216,000; a const assert in `v16_program.rs`
+/// pins the two together). Long enough for any permissionless cranker (keeper pre-resolve drain,
+/// the SDK close planner, the payee itself) to pay tag 90, and for a payee whose canonical ATA is
+/// encumbered (delegate / close authority), occupied by a wrong-owner account or frozen to fix it.
+/// After it the pot is re-booked to the protocol leg like a no-payee pot, so a payee can no
+/// longer veto CloseSlab for ever (voff2 round 1, att644 departure 3).
+pub const CREATOR_PAYEE_GRACE_SLOTS: u64 = 7 * 216_000;
+
+/// The payee's grace is over: the market is Resolved (terminal) and the CLOCK slot `now_slot` is
+/// at or past `resolved_slot + CREATOR_PAYEE_GRACE_SLOTS`. `resolved_slot` is the engine header's
+/// `resolved_slot`, written once, from the Clock, on the Live -> Resolved transition (tags 19 and
+/// the permissionless stale resolve; nothing writes it afterwards). `now_slot` is `None` when the
+/// Clock sysvar is unavailable: fail closed (never elapsed); the caller passes no fallback, so no
+/// instruction-data slot can move this boundary. An overflowing end slot never elapses.
 #[inline]
-pub fn creator_pot_orphaned(asset_admin: &[u8; 32], payee_flag: bool, pot: u64) -> bool {
-    pot != 0 && claim_route(asset_admin, payee_flag) == ClaimRoute::Refused
+pub fn payee_grace_elapsed(resolved: bool, resolved_slot: u64, now_slot: Option<u64>) -> bool {
+    match (now_slot, resolved_slot.checked_add(CREATOR_PAYEE_GRACE_SLOTS)) {
+        (Some(now), Some(end)) => resolved && now >= end,
+        _ => false,
+    }
+}
+
+/// CloseSlab re-book: a burned asset's creator pot moves to the protocol leg when it has no claim
+/// path (no payee recorded), or when a payee IS recorded but its grace after resolution is over
+/// (`payee_grace_elapsed`). Before that a payee-backed pot stays owed (CloseSlab refuses with
+/// `CloseSlabFeesOutstanding` until anyone pays it out through tag 90; tag 90 keeps working after
+/// the grace too, until the re-book zeroes the pot: first come). A live admin's pot is never taken.
+#[inline]
+pub fn creator_pot_orphaned(
+    asset_admin: &[u8; 32],
+    payee_flag: bool,
+    pot: u64,
+    payee_grace_over: bool,
+) -> bool {
+    pot != 0
+        && match claim_route(asset_admin, payee_flag) {
+            ClaimRoute::Refused => true,
+            ClaimRoute::Payee => payee_grace_over,
+            ClaimRoute::AdminSigned => false,
+        }
 }
 
 /// Tag 90's exact debit of a claim across the asset's own counter and (asset 0 only) the legacy
@@ -179,10 +215,28 @@ mod tests {
 
     #[test]
     fn orphan_rule() {
-        assert!(creator_pot_orphaned(&Z, false, 1));
-        assert!(!creator_pot_orphaned(&Z, true, 1));
-        assert!(!creator_pot_orphaned(&A, false, 1));
-        assert!(!creator_pot_orphaned(&Z, false, 0));
+        for g in [false, true] {
+            assert!(creator_pot_orphaned(&Z, false, 1, g));
+            assert!(!creator_pot_orphaned(&A, false, 1, g));
+            assert!(!creator_pot_orphaned(&A, true, 1, g));
+            assert!(!creator_pot_orphaned(&Z, false, 0, g));
+            assert!(!creator_pot_orphaned(&Z, true, 0, g));
+        }
+        assert!(!creator_pot_orphaned(&Z, true, 1, false), "payee pot kept during the grace");
+        assert!(creator_pot_orphaned(&Z, true, 1, true), "payee pot re-booked after the grace");
+    }
+
+    #[test]
+    fn grace_rule() {
+        let r = 1_000u64;
+        let end = r + CREATOR_PAYEE_GRACE_SLOTS;
+        assert_eq!(CREATOR_PAYEE_GRACE_SLOTS, 1_512_000);
+        assert!(!payee_grace_elapsed(true, r, Some(end - 1)), "end - 1 refused");
+        assert!(payee_grace_elapsed(true, r, Some(end)), "end allowed");
+        assert!(payee_grace_elapsed(true, r, Some(u64::MAX)));
+        assert!(!payee_grace_elapsed(false, r, Some(u64::MAX)), "not Resolved: never");
+        assert!(!payee_grace_elapsed(true, r, None), "no Clock: never");
+        assert!(!payee_grace_elapsed(true, u64::MAX - 1, Some(u64::MAX)), "overflowing end: never");
     }
 
     #[test]
@@ -274,16 +328,67 @@ mod kani_proofs {
         } else {
             assert_eq!(r, ClaimRoute::Refused);
         }
-        // The CloseSlab re-book never takes a pot that still has a claim path.
+        // The CloseSlab re-book never takes a live admin's pot, and takes a payee-backed pot
+        // only once its grace is over (fallback587); a no-payee burned pot as before.
         let pot: u64 = kani::any();
-        if creator_pot_orphaned(&admin, flag, pot) {
-            assert!(r == ClaimRoute::Refused && pot != 0);
+        let grace_over: bool = kani::any();
+        let orphan = creator_pot_orphaned(&admin, flag, pot, grace_over);
+        if orphan {
+            assert!(pot != 0);
+            assert!(r == ClaimRoute::Refused || (r == ClaimRoute::Payee && grace_over));
         }
-        if r != ClaimRoute::Refused {
-            assert!(!creator_pot_orphaned(&admin, flag, pot));
+        if r == ClaimRoute::AdminSigned || (r == ClaimRoute::Payee && !grace_over) {
+            assert!(!orphan);
         }
         kani::cover!(r == ClaimRoute::Payee, "burned + payee");
-        kani::cover!(creator_pot_orphaned(&admin, flag, pot), "orphan re-book");
+        kani::cover!(orphan && r == ClaimRoute::Refused, "orphan re-book (no payee)");
+        kani::cover!(orphan && r == ClaimRoute::Payee, "payee pot re-booked after grace");
+    }
+
+    /// fallback587: the payee's grace cannot end early or on a non-terminal market. For every
+    /// resolution slot, Clock slot (or no Clock) and mode: a payee-backed pot is re-booked ONLY
+    /// if the market is Resolved, a Clock slot exists, and it is >= resolved_slot + GRACE
+    /// (exact boundary: GRACE - 1 slots after resolution is still refused). Once elapsed it
+    /// stays elapsed for every later slot (monotone: no window where the pot flips back).
+    #[kani::proof]
+    fn kani_fallback587_payee_rebook_after_grace_only() {
+        let resolved: bool = kani::any();
+        let resolved_slot: u64 = kani::any();
+        let has_now: bool = kani::any();
+        let now: u64 = kani::any();
+        let now_slot = if has_now { Some(now) } else { None };
+        let pot: u64 = kani::any();
+        let elapsed = payee_grace_elapsed(resolved, resolved_slot, now_slot);
+        let orphan = creator_pot_orphaned(&[0u8; 32], true, pot, elapsed);
+        if orphan {
+            assert!(resolved && has_now && pot != 0);
+            assert!(resolved_slot <= u64::MAX - CREATOR_PAYEE_GRACE_SLOTS);
+            assert!(now >= resolved_slot + CREATOR_PAYEE_GRACE_SLOTS);
+            assert!(now - resolved_slot >= CREATOR_PAYEE_GRACE_SLOTS);
+        }
+        if !resolved || !has_now {
+            assert!(!elapsed);
+        }
+        if has_now && now < resolved_slot.saturating_add(CREATOR_PAYEE_GRACE_SLOTS) {
+            assert!(!elapsed);
+        }
+        // Monotone in the Clock slot.
+        let later: u64 = kani::any();
+        kani::assume(later >= now);
+        if elapsed {
+            assert!(payee_grace_elapsed(resolved, resolved_slot, Some(later)));
+        }
+        kani::cover!(
+            resolved && has_now && resolved_slot <= u64::MAX - CREATOR_PAYEE_GRACE_SLOTS
+                && now == resolved_slot + CREATOR_PAYEE_GRACE_SLOTS - 1 && !elapsed,
+            "end - 1: still reserved for the payee"
+        );
+        kani::cover!(
+            resolved && has_now && resolved_slot <= u64::MAX - CREATOR_PAYEE_GRACE_SLOTS
+                && now == resolved_slot + CREATOR_PAYEE_GRACE_SLOTS && orphan,
+            "end: re-booked"
+        );
+        kani::cover!(!resolved && has_now && now == u64::MAX && !orphan, "Live never re-books");
     }
 
     /// The payee bit is bit 3 only: setting / clearing it changes no other `p4_flags` bit (so

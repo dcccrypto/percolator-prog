@@ -1480,3 +1480,246 @@ fn f587_vault_authority_payee_refused_at_set_time() {
     let rec = state::read_creator_fee_payee(&env.svm.get_account(&payee_pda(&env.market, 0)).unwrap().data).unwrap();
     assert_eq!(rec.payee, honest.to_bytes(), "earlier payee kept");
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// fallback587 (Khubair 2026-11-01): a market can ALWAYS close. A payee-backed creator pot on a
+// burned asset is reserved for the payee for `CREATOR_PAYEE_GRACE_SLOTS` (7 days) after the
+// engine's `resolved_slot`; after that CloseSlab re-books it to the protocol leg like a no-payee
+// pot. Tag 90 to the payee keeps working until the re-book zeroes the pot (first come).
+//
+// NEGATIVE CONTROLS (PR body, notes/fallback587.md): on the rc23 wrapper (0610e08b, no grace)
+// tests 11, 12 and 13 FAIL (the pot is never re-booked; CloseSlab 71 for ever). Tests 14 and 15
+// pin unchanged behaviour (a fully paid pot closes at once; Live / non-terminal never re-books)
+// and pass there by design. Mutants: grace check removed -> 11-14 (+5) fail; boundary moved one
+// slot early -> 11-13 fail at `end - 1`; terminal gate + Resolved condition removed -> 15 fails.
+// ─────────────────────────────────────────────────────────────────────────────
+const GRACE: u64 = percolator_prog::constants::CREATOR_PAYEE_GRACE_SLOTS;
+
+#[derive(Clone, Copy, Debug)]
+enum Block {
+    Frozen,
+    Delegate,
+    CloseAuthority,
+}
+
+impl Env {
+    fn resolved_slot(&self) -> u64 {
+        let mut data = self.svm.get_account(&self.market).unwrap().data;
+        let (_, group) = state::market_view_mut(&mut data).unwrap();
+        group.header.resolved_slot.get()
+    }
+
+    fn warp(&mut self, slot: u64) {
+        assert!(slot >= self.clock_slot(), "warp forward only");
+        self.svm.warp_to_slot(slot);
+        assert_eq!(self.clock_slot(), slot);
+    }
+
+    /// Put `ata` in a state no payout can use (payee-side block).
+    fn block_ata(&mut self, ata: Pubkey, how: Block) {
+        let mut a = self.svm.get_account(&ata).unwrap();
+        let mut t = TokenAccount::unpack(&a.data).unwrap();
+        match how {
+            Block::Frozen => t.state = spl_token::state::AccountState::Frozen,
+            Block::Delegate => {
+                t.delegate = solana_program::program_option::COption::Some(Pubkey::new_unique());
+                t.delegated_amount = u64::MAX;
+            }
+            Block::CloseAuthority => {
+                t.close_authority =
+                    solana_program::program_option::COption::Some(Pubkey::new_unique())
+            }
+        }
+        TokenAccount::pack(t, &mut a.data).unwrap();
+        self.svm.set_account(ata, a).unwrap();
+    }
+}
+
+/// Terminal-empty first-loss market with a payee, the LP->staker re-book done and the protocol +
+/// stake legs claimed, so the payee-backed creator pot is the ONLY thing CloseSlab waits on.
+/// Returns (env, fees, payee ATA, payee PDA, creator owed, protocol claimed, stake received).
+fn only_creator_pot_left(payee: Pubkey) -> (Env, u128, Pubkey, Pubkey, u128, u128, u128) {
+    // Same as `terminal_empty_market_with_fees_in`, but resolved at a NON-ZERO Clock slot so the
+    // anchor is distinguishable from the Live default `resolved_slot = 0`.
+    let (mut env, taker, taker_pf, maker, maker_pf, fees) =
+        traded_flat_market_in(first_loss_env(payee));
+    env.withdraw_all(&taker, taker_pf);
+    env.withdraw_all(&maker, maker_pf);
+    env.close_portfolio(&taker, taker_pf);
+    env.close_portfolio(&maker, maker_pf);
+    env.warp(env.clock_slot() + 12_345);
+    env.resolve();
+    assert_eq!(env.header_mode_ctot_count(), (1, 0, 0), "terminal-empty Resolved");
+    assert_eq!(env.resolved_slot(), env.clock_slot(), "resolved_slot = the Clock slot at resolution");
+    let owed = env.legs().creator_owed();
+    assert!(owed > 0);
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab re-book step (LP -> staker)");
+    assert_eq!(env.legs().creator_owed(), owed, "payee pot NOT re-booked inside the grace");
+    let d = env.withdraw_protocol_fee().expect("tag 84");
+    let protocol_claimed = env.token_amount(d) as u128;
+    let stake_before = env.token_amount(env.stake_vault);
+    env.withdraw_to_stake().expect("tag 87 terminal");
+    let stake_received = (env.token_amount(env.stake_vault) - stake_before) as u128;
+    let (res, _) = env.close_slab();
+    assert_custom(res, FEES_OUTSTANDING, "only the creator leg is owed");
+    let ata = env.plant_ata(payee);
+    let pda = payee_pda(&env.market, 0);
+    (env, fees, ata, pda, owed, protocol_claimed, stake_received)
+}
+
+/// The shared body of tests 11 / 12: payee ATA blocked -> CloseSlab 71 through `end - 1`,
+/// re-booked to the protocol leg at exactly `end`, then the market closes, burning nothing.
+fn blocked_payee_closes_after_grace(how: Block) {
+    let payee = Pubkey::new_unique();
+    let (mut env, fees, ata, pda, owed, protocol_claimed, stake_received) =
+        only_creator_pot_left(payee);
+    let supply0 = env.mint_supply();
+    env.block_ata(ata, how);
+    refused(env.claim_as(&Keypair::new(), owed, ata, Some(pda)), &format!("{how:?} payee ATA"));
+
+    let r = env.resolved_slot();
+    assert!(r > 0 && r <= env.clock_slot(), "resolved_slot is a past Clock slot");
+    let end = r + GRACE;
+    // Inside the grace: refused, pot untouched.
+    env.warp(r + GRACE / 2);
+    let (res, _) = env.close_slab();
+    assert_custom(res, FEES_OUTSTANDING, "mid-grace");
+    // Exact boundary: end - 1 refused.
+    env.warp(end - 1);
+    let legs_pre = env.legs();
+    let (res, _) = env.close_slab();
+    assert_custom(res, FEES_OUTSTANDING, "slot = end - 1");
+    assert_eq!(env.legs(), legs_pre, "nothing moved at end - 1");
+    assert_eq!(env.legs().creator_owed(), owed);
+    // end: the re-book step runs (persisted, the slab is not closed yet).
+    env.warp(end);
+    let (res, _) = env.close_slab();
+    res.expect("slot = end: CloseSlab re-books the payee pot");
+    assert!(!env.market_closed(), "the re-book is its own step");
+    let legs1 = env.legs();
+    assert_eq!(legs1.creator_owed(), 0, "payee pot re-booked");
+    assert_eq!(legs1.protocol_accrued, legs_pre.protocol_accrued + owed, "to the protocol leg, exactly");
+    // No double pay: the pot is gone for the payee even once its ATA is usable again.
+    let fresh_payee_ata = env.plant_ata(payee); // same address, unblocked
+    assert_eq!(fresh_payee_ata, ata);
+    assert_custom(env.claim_as(&Keypair::new(), 1, ata, Some(pda)), OVER_CLAIM, "after re-book");
+    // The protocol claims it (tag 84) and the market closes; conservation to the atom.
+    let d = env.withdraw_protocol_fee().expect("tag 84 after re-book");
+    let rebooked_claimed = env.token_amount(d) as u128;
+    assert_eq!(rebooked_claimed, owed);
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab after the fallback");
+    assert!(env.market_closed());
+    assert_eq!(env.mint_supply(), supply0, "nothing burned");
+    assert_eq!(env.token_amount(ata), 0, "the payee got nothing it could not receive");
+    assert_eq!(fees, protocol_claimed + stake_received + rebooked_claimed, "conservation");
+}
+
+// 11. Frozen payee ATA (mint freeze authority): refused before the grace, re-booked at its end,
+//     with the exact boundary (end - 1 refused, end allowed).
+#[test]
+fn fallback587_frozen_payee_ata_close_refused_until_grace_end_then_rebooked() {
+    blocked_payee_closes_after_grace(Block::Frozen);
+}
+
+// 12. Delegated / close-authority payee ATA (W5 encumbered): same.
+#[test]
+fn fallback587_encumbered_payee_ata_close_refused_until_grace_end_then_rebooked() {
+    blocked_payee_closes_after_grace(Block::Delegate);
+    blocked_payee_closes_after_grace(Block::CloseAuthority);
+}
+
+// 13. Tag 90 to the payee still pays during the grace AND after it until the re-book (first
+//     come); the re-book takes only what is left; no double pay afterwards.
+#[test]
+fn fallback587_payee_paid_during_and_after_grace_until_rebook_no_double_pay() {
+    let payee = Pubkey::new_unique();
+    let (mut env, fees, ata, pda, owed, protocol_claimed, stake_received) =
+        only_creator_pot_left(payee);
+    assert!(owed >= 4);
+    let r = env.resolved_slot();
+    let end = r + GRACE;
+    // During the grace: part 1 pays; CloseSlab still refuses for the rest.
+    env.warp(end - 1);
+    let p1 = owed / 4;
+    env.claim_as(&Keypair::new(), p1, ata, Some(pda)).expect("tag 90 inside the grace");
+    let (res, _) = env.close_slab();
+    assert_custom(res, FEES_OUTSTANDING, "end - 1 with a paid-down pot");
+    // After the grace, before any re-book: tag 90 still pays (first come).
+    env.warp(end + 10);
+    let p2 = owed / 4;
+    env.claim_as(&Keypair::new(), p2, ata, Some(pda)).expect("tag 90 after the grace, before the re-book");
+    assert_eq!(env.token_amount(ata) as u128, p1 + p2);
+    let rest = owed - p1 - p2;
+    assert_eq!(env.legs().creator_owed(), rest);
+    // The re-book takes exactly the remainder.
+    let proto0 = env.legs().protocol_accrued;
+    let (res, _) = env.close_slab();
+    res.expect("re-book of the remainder");
+    assert_eq!(env.legs().creator_owed(), 0);
+    assert_eq!(env.legs().protocol_accrued, proto0 + rest);
+    // No double pay: tag 90 of the old remainder, or of 1 atom, is an over-claim.
+    assert_custom(env.claim_as(&Keypair::new(), rest, ata, Some(pda)), OVER_CLAIM, "remainder after re-book");
+    assert_custom(env.claim_as(&Keypair::new(), 1, ata, Some(pda)), OVER_CLAIM, "1 atom after re-book");
+    assert_eq!(env.token_amount(ata) as u128, p1 + p2, "payee balance unchanged by the refusals");
+    // A second CloseSlab re-books nothing more; the protocol claims, the market closes.
+    let d = env.withdraw_protocol_fee().expect("tag 84");
+    let rebooked_claimed = env.token_amount(d) as u128;
+    assert_eq!(rebooked_claimed, rest);
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab");
+    assert!(env.market_closed());
+    assert_eq!(fees, protocol_claimed + stake_received + p1 + p2 + rebooked_claimed, "conservation");
+}
+
+// 14. A payee paid in full inside the grace: nothing to re-book, the market closes at once
+//     (the fallback never fires on a zero pot and never touches the payee's money).
+#[test]
+fn fallback587_paid_payee_closes_without_waiting() {
+    let payee = Pubkey::new_unique();
+    let (mut env, fees, ata, pda, owed, protocol_claimed, stake_received) =
+        only_creator_pot_left(payee);
+    env.claim_as(&Keypair::new(), owed, ata, Some(pda)).expect("full payout");
+    let r = env.resolved_slot();
+    env.warp(r + GRACE + 1);
+    assert_eq!(env.legs().creator_owed(), 0);
+    let (res, _) = env.close_slab();
+    res.expect("CloseSlab");
+    assert!(env.market_closed(), "closed in one step: no re-book needed");
+    assert_eq!(env.token_amount(ata) as u128, owed);
+    assert_eq!(fees, protocol_claimed + stake_received + owed);
+}
+
+// 15. A Live market, and a Resolved but NOT terminal-empty market, never re-book a payee pot,
+//     however far past `resolved_slot + GRACE` the Clock is.
+#[test]
+fn fallback587_live_or_nonterminal_market_never_rebooks() {
+    // Live: `resolved_slot` is still 0, so a missing mode check would see the grace as over.
+    let payee = Pubkey::new_unique();
+    let (mut env, ..) = traded_flat_market_in(first_loss_env(payee));
+    let (mode, _, _) = env.header_mode_ctot_count();
+    assert_eq!(mode, 0);
+    assert_eq!(env.resolved_slot(), 0);
+    let owed = env.legs().creator_owed();
+    assert!(owed > 0);
+    let legs0 = env.legs();
+    env.warp(env.clock_slot() + 2 * GRACE);
+    let (res, _) = env.close_slab();
+    refused(res, "Live CloseSlab");
+    assert_eq!(env.legs(), legs0, "Live: nothing re-booked");
+
+    // Resolved with the traders still in (not terminal-empty), far past the grace.
+    let (mut env, ..) = traded_flat_market_in(first_loss_env(payee));
+    env.resolve();
+    let (mode, _, count) = env.header_mode_ctot_count();
+    assert_eq!(mode, 1);
+    assert!(count > 0, "portfolios still materialised");
+    let legs0 = env.legs();
+    let r = env.resolved_slot();
+    env.warp(r + 2 * GRACE);
+    let (res, _) = env.close_slab();
+    refused(res, "non-terminal Resolved CloseSlab");
+    assert_eq!(env.legs(), legs0, "non-terminal: nothing re-booked");
+    assert_eq!(env.legs().creator_owed(), owed);
+}
