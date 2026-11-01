@@ -6978,3 +6978,111 @@ fn navcheck_636_permissionless_round_trips_cannot_dilute_a_real_gain() {
     assert_eq!(griefed, honest, "#636: the gain is read exactly, the round trips dilute nothing");
 }
 
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// port135 / att645 F1b: a vault-LP flow's engine Refresh clears the vault LP's side-reset leg
+// outside its matcher. With a NON-position-synced matcher approved by the protocol (tag 99 +
+// tag 95), the instruction-level out-of-matcher sweep must invalidate the capability, so a
+// later unsigned TradeCpi on the stale matcher inventory is refused Custom(8).
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+fn port135_finalize_both(env: &mut Env) {
+    let m = env.market;
+    for side in 0..2u8 {
+        env.svm.expire_blockhash();
+        let _ = env.send(
+            ProgInstruction::FinalizeResetSide { asset_index: 0, side },
+            vec![AccountMeta::new(m, false)],
+            &[],
+        );
+    }
+}
+
+/// Returns (stale fill result, LP enabled bit after the vault flow, LP epoch before/after flow).
+/// `lp_writable`: the Earn deposit's vault-LP tail is passed writable, which is what makes
+/// `vault_lp_draw_then_book` run `vault_lp_physical_draw` (an engine Refresh) on it.
+fn port135_vault_flow_world(lp_writable: bool) -> (Result<(), String>, u64, (u64, u64), i128) {
+    let mut env = Env::new(Params::default());
+    let lp_key = env.init_vault_lp(1_000);
+    // The protocol approves a NON-canonical matcher program for asset 0, then points the vault
+    // LP at it (the only way a vault LP gets a matcher that is not position-synced).
+    let other = Pubkey::new_unique();
+    env.svm.add_program(other, &std::fs::read(matcher_program_path()).unwrap());
+    env.matcher = other;
+    env.approve_matcher();
+    let admin = env.admin.insecure_clone();
+    let lp = env.vault_lp_set_matcher_as(&admin, lp_key).expect("tag 95: non-canonical matcher");
+    env.junior_deposit_as(&admin, lp.portfolio, 10_000_000).expect("junior");
+    let t = env.new_trader(5_000_000);
+    env.trade(&t, &lp, 10 * POS).expect("the vault LP sells 10 through its matcher");
+    assert_eq!(env.position(lp.portfolio), -10 * POS);
+    let enabled = |env: &Env| {
+        state::read_portfolio_matcher_config(&env.svm.get_account(&lp.portfolio).unwrap().data)
+            .unwrap()
+            .enabled()
+    };
+    assert_eq!(enabled(&env), 1, "a fill through the LP's own matcher keeps its capability");
+
+    // The long exits in full (its own tag 44): the long side drains, the short side resets and
+    // the vault LP's leg becomes a prior-reset obligation. Nothing touched the LP's portfolio.
+    let (pid, _, pep) = env.identity(t.portfolio);
+    let kp = t.kp.insecure_clone();
+    let m = env.market;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::RebalanceReduce {
+            portfolio_id: pid,
+            position_epoch: pep,
+            asset_index: 0,
+            reduce_q: (10 * POS) as u128,
+        },
+        vec![
+            AccountMeta::new(kp.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(t.portfolio, false),
+        ],
+        &[&kp],
+    )
+    .expect("tag 44 full exit");
+    port135_finalize_both(&mut env);
+    assert_eq!(enabled(&env), 1, "the LP was not touched by the taker's exit");
+    assert_eq!(env.position(lp.portfolio), -10 * POS, "the reset leg is still on the LP");
+    let epoch_before = env.identity(lp.portfolio).2;
+
+    // Any user's Earn deposit (tag DepositToLpVault, no per-arm wrapper) with the vault LP as a
+    // writable tail: the physical-draw Refresh clears the LP's reset leg.
+    let d = env.new_depositor();
+    let mut accts = env.deposit_accounts(&d, Some(lp.portfolio));
+    let last = accts.len() - 1;
+    accts[last] = AccountMeta::new(lp.portfolio, false);
+    let dkp = d.kp.insecure_clone();
+    env.svm.expire_blockhash();
+    let r = env.send(
+        ProgInstruction::DepositToLpVault { amount: 1_000_000, domain: DOMAIN },
+        if lp_writable { accts } else { env.deposit_accounts(&d, Some(lp.portfolio)) },
+        &[&dkp],
+    );
+    if lp_writable {
+        r.expect("Earn deposit with a writable vault-LP tail");
+    }
+    let lp_pos_after = env.position(lp.portfolio);
+    let epoch_after = env.identity(lp.portfolio).2;
+    let enabled_after = enabled(&env);
+    port135_finalize_both(&mut env);
+
+    // An unsigned taker now routes a fill into the LP on the stale matcher inventory.
+    let a = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    let r = env.trade(&a, &lp, -10 * POS);
+    (r, enabled_after, (epoch_before, epoch_after), lp_pos_after)
+}
+
+#[test]
+fn port135_vault_lp_deposit_refresh_invalidates_stale_matcher_capability() {
+    let (r, enabled, (e0, e1), lp_pos) = port135_vault_flow_world(true);
+    eprintln!("port135 DepositToLpVault: fill={r:?} enabled={enabled} epoch {e0}->{e1} lp_pos={lp_pos}");
+    assert_eq!(lp_pos, 0, "setup: the Earn deposit's vault-LP refresh cleared the reset leg");
+    assert_eq!(enabled, 0, "the refresh that cleared the vault LP's leg must invalidate its capability");
+    assert_eq!(e1, e0 + 1, "one out-of-matcher episode bump");
+    err_has(&r, PercolatorError::Unauthorized);
+}

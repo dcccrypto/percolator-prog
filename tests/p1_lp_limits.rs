@@ -531,6 +531,45 @@ impl Env {
         }
     }
 
+    /// port135 (upstream 0c5d4f4f, issue 406): a TradeNoCpi moves the LP outside its matcher and
+    /// clears its matcher capability, so a test that keeps trading the same LP through the
+    /// matcher (or keeps relying on the matcher-LP role on NoCpi) has the LP owner re-sign
+    /// SetMatcherConfig, as a real LP must. Asserts the capability really was cleared first.
+    fn reauthorize_after_nocpi(&mut self, lp: &Lp) {
+        let data = self.svm.get_account(&lp.account).unwrap().data;
+        assert_eq!(
+            state::read_portfolio_matcher_config(&data).unwrap().enabled(),
+            0,
+            "port135: the NoCpi trade invalidated the LP's matcher capability"
+        );
+        let (portfolio_id, expected_sequence, _) = self.identity(lp.account);
+        let asset_generation_frontier = state::read_market_asset_generation_frontier(
+            &self.svm.get_account(&self.market).unwrap().data,
+        )
+        .unwrap();
+        let mp = self.matcher_program;
+        self.send(
+            ProgInstruction::SetMatcherConfig {
+                portfolio_id,
+                expected_sequence,
+                asset_generation_frontier,
+                enabled: 1,
+                trade_fee_cap_bps: 10_000,
+                expiry_slot: u64::MAX,
+            },
+            vec![
+                AccountMeta::new(lp.owner.pubkey(), true),
+                AccountMeta::new_readonly(self.market, false),
+                AccountMeta::new(lp.account, false),
+                AccountMeta::new_readonly(mp, false),
+                AccountMeta::new_readonly(lp.ctx, false),
+                AccountMeta::new_readonly(lp.delegate, false),
+            ],
+            &[&lp.owner],
+        )
+        .expect("LP owner re-authorizes its matcher");
+    }
+
     fn trade_cpi(
         &mut self,
         taker: &Keypair,
@@ -943,6 +982,7 @@ fn p1_protocol_side_oi_cap_refuses_growth_allows_shrink_all_routes() {
     env.trade_nocpi(&other, other_account, &lp.owner, lp.account, Q)
         .expect("TradeNoCpi growth to exactly the cap");
     assert_eq!(env.oi(), (6 * POS_SCALE, 6 * POS_SCALE));
+    env.reauthorize_after_nocpi(&lp);
 
     // Lower the cap BELOW current OI: shrinking trades still succeed on every route.
     env.set_risk_limits(0, 0, 3 * POS_SCALE);
@@ -1089,6 +1129,7 @@ fn p1_nocpi_lp_exposure_cap_applies_to_matcher_lp() {
     env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 4 * Q)
         .expect("NoCpi within the LP cap");
     assert_eq!(env.pos(lp.account), -4 * Q);
+    env.reauthorize_after_nocpi(&lp);
     let keys = [env.market, trader_account, lp.account];
     let before = env.snapshot(&keys);
     let r = env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 2 * Q);
@@ -1108,6 +1149,7 @@ fn p1_nocpi_lp_floor_halts_growth_allows_reduction() {
     let lp = env.lp(1_000);
     env.trade_nocpi(&trader, trader_account, &lp.owner, lp.account, 3 * Q)
         .expect("open LP -3 via NoCpi");
+    env.reauthorize_after_nocpi(&lp);
     env.set_risk_limits(0, 2_000, 0); // floor above equity 1000
     let keys = [env.market, trader_account, lp.account];
     let before = env.snapshot(&keys);
@@ -1140,6 +1182,7 @@ fn p1_nocpi_same_owner_against_own_lp_only_closes() {
     env.trade_nocpi(&lp.owner, own_trader, &lp.owner, lp.account, -Q)
         .expect("reduce-only close against own LP via NoCpi");
     assert_eq!(env.pos(own_trader), Q);
+    env.reauthorize_after_nocpi(&lp);
     // ... and on TradeCpi (security review LOW: the rule used to block closes).
     env.trade_cpi(&lp.owner, own_trader, &lp, -Q)
         .expect("reduce-only close against own LP via TradeCpi");
