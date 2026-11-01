@@ -287,8 +287,12 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 //   atom of claim earns the same rate: pricing at `K / B` is newcomer-neutral. Gate closed: the
 //   interval is forfeited (M-1, unchanged); `K`, `R`, `U`, `rem` are kept.
 // * Cap: `U <= coupon_due(K - U, rate, 1y)`, one year of coupon on the current shares' funded
-//   claim. Accrual beyond it is forfeited (and `rem` dropped). Every share fronts at most one
-//   year of unfunded coupon, so the junior's exposure is bounded per share.
+//   claim. Accrual beyond it is forfeited (and `rem` dropped). The cap bounds the OUTSTANDING
+//   unfunded coupon per share WHILE bonds are outstanding. A full exit realises it (paid out of
+//   the junior's capital, recorded in `R` for the fee legs to repay) and an EMPTY tranche
+//   restarts with `U = 0`: a holder that exits fully and re-enters gets a fresh year (founder
+//   decision 2026-11-01, att649 R2-A). Cumulative unreimbursed fronting (`R`) is therefore not
+//   bounded by one year; it is repaid by fee legs at <= 1/2 of each leg.
 // * Payment (tag 78): `min(R, floor(leg / 2))` (M-2 unchanged) is paid off the top of the fee leg:
 //   `R` drops by the coupon and `U` by `min(U, coupon)`, `K` does NOT change, so the coupon atoms
 //   land in the junior's residual: the junior is reimbursed. Paid while Live with no senior draw outstanding and the tranche whole;
@@ -300,7 +304,8 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 //   `K` (`bond_claim_after_redemption`, the pre-#571 slice) and `floor(sh * U / B)` from `U`; `R`
 //   is NOT touched. A deposit/redeem round trip is therefore neutral (att649 F1): it cannot turn
 //   the receivable into funded claim, cannot cancel the junior's reimbursement and cannot reset
-//   the per-share cap (the ratio `U / K` is preserved up to rounding against the actor).
+//   the per-share cap while bonds stay outstanding (the ratio `U / K` is preserved; its rounding
+//   goes toward the junior: ceil on entry, floor on exit).
 // * Rounding: always against the actor (108 mint floor, 110 payout floor, 78 coupon floor);
 //   accrual floors only the final sub-atom (carried).
 // * Seniority: `K` sits in the bond layer of `tranche_split3`, JUNIOR to the Earn seniors and the
@@ -317,6 +322,20 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 // * Resolve: nothing accrues once the market is not Live; terminal 78 pays no coupon. Settled
 //   coupon stays in `K` and is paid by the Resolved 110 before the junior (102); an unpaid `R`
 //   is not repaid to the junior after resolution (no more fee legs).
+// * Known residuals (att649 round 2, accepted, 2026-11-01):
+//   - R2-A: the per-share cap restarts when the tranche empties (see Cap above).
+//   - R2-B: an IMPAIRED exit is paid its layer (< its slice of `K`) but leaves `R` intact, so
+//     later fee legs (the Earn seniors' share) reimburse the junior for coupon the bonds, not the
+//     junior, ended up losing. Bounded by `min(R, slice - payout)` per impaired exit.
+//   - R2-C: the meter's rounding (ceil in, floor out) moves `U` up by <= 1 atom per tiny
+//     deposit/exit round trip: in the junior's favour (the stayers lose <= 1 atom of headroom per
+//     loop, each loop costing a cooldown and fees).
+//   - R2-D: `coupon_gate_seen` keeps only the low 63 bits of `senior_drawn_atoms`; draws totalling
+//     an exact multiple of 2^63 atoms inside one interval would be missed (unreachable at USDC
+//     scale: > 9.2e18 atoms; the counter never decreases).
+//   - R2-E: an impairment (or a G9 lend + repay) that starts and ends strictly inside one interval
+//     without a senior draw is not seen; the interval accrues. Bounded by the per-share cap and by
+//     the settlement frequency (78 needs only a fee leg).
 
 /// Utilisation of the bond-backed capacity, bps: `min(1, max side OI / N_cap)`. 0 with no OI;
 /// full with OI but no capacity number.
@@ -513,7 +532,7 @@ pub fn coupon_meter_after_deposit(unfunded: u128, bond_claim: u128, amount: u128
 }
 
 /// GH#571, tag 110: the meter after `shares` of `total_shares` are redeemed: `U - floor(sh * U / B)`
-/// (the stayers keep the rounding; a full exit leaves 0). `None` on `B == 0`, `sh > B`, overflow.
+/// (the rounding stays in the meter, toward the junior; a full exit leaves 0). `None` on `B == 0`, `sh > B`, overflow.
 pub fn coupon_meter_after_redemption(unfunded: u128, shares: u128, total_shares: u128) -> Option<u128> {
     if total_shares == 0 || shares > total_shares {
         return None;
