@@ -6829,6 +6829,117 @@ fn r572_occupancy_clock_survives_the_trade_handlers_profile_write() {
     env.assert_conservation();
 }
 
+// ===========================================================================
+// att647 ROUND 2 (PR #647 per-slot rework, head cc7424b6).
+// R2-1: the tagged occupancy checkpoint in `last_fee_slot` (bit 63 set) vs the engine's
+// `sync_account_fee_to_slot_not_atomic`, which `close_resolved_account_not_atomic` calls
+// UNCONDITIONALLY with `now_slot = resolved_slot` and which returns `Stale` when
+// `now_slot < last_fee_slot` (engine v16.rs:25100). Every band-market portfolio whose leg was
+// opened by a trade carries a tagged checkpoint (`occ_after_position_change_view`).
+// Safety property asserted: after resolution, a trader holding a leg can CloseResolved.
+// Expected: passes on base rc23, FAILED on PR head cc7424b6; regression for the fix
+// (`occ_release_checkpoint_outside_live_view`). Test by att647 (branch att/647r2 78b4613b).
+// ===========================================================================
+#[test]
+fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let t = env.trader_n(40_000, 1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+    let t2 = env.trader_n(40_002, 1_000 * USD);
+    env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q).expect("second long");
+    let ck = env.portfolio_state(t.1).last_fee_slot;
+    let lp_ck = env.portfolio_state(lp.account).last_fee_slot;
+    eprintln!("ATT647R2 trader last_fee_slot = {ck:#x} (tag bit 63: {}), LP last_fee_slot = {lp_ck:#x}", ck >> 63);
+    // A flat trader too (opened, then closed by trade).
+    let f = env.trader_n(40_001, 1_000 * USD);
+    env.trade_cpi(&f.0, f.1, &lp, 10 * Q).expect("long");
+    env.trade_cpi(&f.0, f.1, &lp, -10 * Q).expect("close");
+    eprintln!("ATT647R2 flat trader last_fee_slot = {:#x}", env.portfolio_state(f.1).last_fee_slot);
+    // Resolve: the market admin resolves (tag 19) at the current slot.
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let m = env.market;
+    let data = env.svm.get_account(&m).unwrap().data;
+    let authority_epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+    let asset_generation_frontier = state::read_market_asset_generation_frontier(&data).unwrap();
+    let admin = env.admin.insecure_clone();
+    let r = env.send(
+        ProgInstruction::ResolveMarket { asset_generation_frontier, authority_epoch },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    );
+    eprintln!("ATT647R2 resolve (tag 19): {}", match &r { Ok(c) => format!("Ok({c})"), Err(e) => { let i = e.find("err:").unwrap_or(0); e[i..].chars().take(70).collect() } });
+    r.expect("resolved");
+    env.warp(2_000_000);
+    let mut close = |env: &mut Env, owner: &Keypair, p: Pubkey| -> Result<u64, String> {
+        let dest = env.key();
+        let mint = env.mint;
+        env.svm
+            .set_account(
+                dest,
+                Account { lamports: 1_000_000_000, data: make_token_data(mint, owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 },
+            )
+            .unwrap();
+        let (m, v) = (env.market, env.vault);
+        let authority = Pubkey::find_program_address(&[b"vault", m.as_ref()], &env.program_id).0;
+        let reg = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &env.program_id).0;
+        let o = owner.insecure_clone();
+        env.send(
+            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            vec![
+                AccountMeta::new_readonly(o.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(p, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(reg, false),
+            ],
+            &[&o],
+        )
+    };
+    let short = |r: &Result<u64, String>| match r { Ok(c) => format!("Ok({c})"), Err(e) => { let i = e.find("err:").unwrap_or(0); e[i..].chars().take(70).collect() } };
+    let rf = close(&mut env, &f.0, f.1);
+    eprintln!("ATT647R2 CloseResolved flat trader: {}", short(&rf));
+    let mut rt = Err(String::new());
+    for i in 0..4 {
+        rt = close(&mut env, &t.0, t.1);
+        eprintln!("ATT647R2 CloseResolved trader with a leg, attempt {i}: {}", short(&rt));
+        if rt.is_ok() && env.svm.get_account(&t.1).map(|a| a.data.is_empty() || a.lamports == 0).unwrap_or(true) {
+            break;
+        }
+    }
+    assert!(rt.is_ok(), "STUCK: a band-market trader with a leg cannot CloseResolved: {}", short(&rt));
+    // The resolved auto-crank also runs `close_resolved_account_not_atomic`: a second trader with
+    // a leg (tagged checkpoint) is cranked after resolution, never refused Stale (19), and no
+    // engine call outside Live leaves / sees a tagged word.
+    assert_eq!(env.portfolio_state(t2.1).last_fee_slot >> 63, 1, "tagged while Live");
+    // Resolved: no oracle observation (the market price is frozen at the resolution price).
+    let (payer, slot) = (env.payer.pubkey(), env.slot);
+    let rc = env.send(
+        ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![] },
+        vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(t2.1, false)],
+        &[],
+    );
+    eprintln!("ATT647R2 resolved crank of a second trader with a leg: {}", short(&rc));
+    if let Err(e) = &rc {
+        assert!(!e.contains(&code(PercolatorError::EngineStale)), "resolved crank refused Stale: {e}");
+    }
+    // ... and CloseResolved closes that second trader too.
+    let r2 = close(&mut env, &t2.0, t2.1);
+    eprintln!("ATT647R2 CloseResolved second trader: {}", short(&r2));
+    assert!(r2.is_ok(), "second trader closes: {}", short(&r2));
+    if let Some(a) = env.svm.get_account(&t2.1).filter(|a| rc.is_ok() && !a.data.is_empty()) {
+        if state::read_portfolio(&a.data).is_ok() {
+            assert_eq!(env.portfolio_state(t2.1).last_fee_slot >> 63, 0, "released outside Live");
+        }
+    }
+}
+
 /// prog#572 InitMarket: the Band Safety Law must hold with the rent term at `rent_max x 5`
 /// (utilisation + the occupancy of a minimum leg). At the test market's margins (MMR 5%, band 1%,
 /// E 600) 749 is the largest accepted rent (bisected); 2_000 satisfies the x1 law (rc23 accepts

@@ -30251,6 +30251,8 @@ pub mod processor {
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             // prog#547: the effective legs before the resolved close, for the REDUCE events.
             let legs_before = snapshot_effective_legs_view(&group, &portfolio);
+            // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
+            occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
@@ -30581,6 +30583,8 @@ pub mod processor {
                     max_market_slots,
                 )?;
                 expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
+                // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
+                occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
                 group
                     .permissionless_auto_crank_not_atomic(
                         &mut portfolio,
@@ -30631,6 +30635,8 @@ pub mod processor {
                         .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
                         .map_err(map_v16_error)?;
                     if summary.expired_close {
+                        // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
+                        occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
                         let result = group
                             .permissionless_auto_crank_not_atomic(
                                 &mut portfolio,
@@ -30966,6 +30972,8 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
+            // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
+            occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
             let result = match group.permissionless_auto_crank_s10_not_atomic(
                 &mut portfolio,
                 AutoCrankWorkV16 {
@@ -41830,6 +41838,8 @@ pub mod processor {
                     let insurance_before = group.header.insurance.get();
                     // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
                     let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
+                    // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
+                    occ_release_checkpoint_outside_live_view(&group, &mut lp);
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
@@ -48678,6 +48688,25 @@ pub mod processor {
         }
         portfolio.header.last_fee_slot = percolator::V16PodU64::new(new_ck);
         Ok(())
+    }
+
+    /// prog#572 att647 R2-1: outside Live (Resolved / Recovery) no occupancy accrues (the hooks gate on
+    /// a Live market), and the engine's `close_resolved_account_not_atomic` (CloseResolved, the
+    /// vault-LP resolved close, the resolved auto-crank) calls `sync_account_fee_to_slot_not_atomic(
+    /// resolved_slot)`, which refuses (Stale, 19) a `last_fee_slot` above the anchor, and a tagged
+    /// checkpoint (bit 63) is above every slot. So before any such engine call the tagged word is
+    /// released to 0: the engine then bills `[0, resolved_slot]` at the band market's maintenance
+    /// rate, which is 0. The occupancy between a leg's last Live touch and the resolution is
+    /// forgiven (bounded by the keeper's touch cadence; every leg is cranked each band epoch).
+    fn occ_release_checkpoint_outside_live_view(
+        group: &state::MarketViewMutV16<'_>,
+        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
+    ) {
+        if group.header.mode != 0
+            && portfolio.header.last_fee_slot.get() & growth_v19::OCC_CK_TAG != 0
+        {
+            portfolio.header.last_fee_slot = percolator::V16PodU64::new(0);
+        }
     }
 
     /// prog#572: after a trade changed a portfolio's leg, start a NEW or FLIPPED leg's checkpoint
