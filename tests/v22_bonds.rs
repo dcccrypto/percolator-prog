@@ -4755,3 +4755,38 @@ fn settle_expect(tr: &state::BondTrancheV20, now: u64, rate: u32, open: bool) ->
     )
     .unwrap()
 }
+
+// ── att649 round 2 (independent attacker, PR #649 head a7cd0007) ─────────────────────────────
+
+/// ATT649-R2-A: the per-share cap meter U is reset whenever the tranche EMPTIES (a full exit
+/// leaves K = U = 0, the receivable R stays). A sole holder (or all holders together) can exit
+/// and re-enter: each cycle the junior pays one more year of coupon in cash with NO fee leg, and
+/// R grows past one year of coupon on anything outstanding.
+#[test]
+fn att649_r2a_full_exit_and_reentry_resets_the_cap() {
+    let (mut env, lp, _d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+    let (k0, ..) = tranche_raw(&env);
+    let cap = bond_v20::coupon_arrears_cap(k0, 2_000).unwrap();
+    let mut paid_total = 0u128;
+    for cycle in 0..2 {
+        if cycle > 0 {
+            env.bond_deposit(&h, lp.portfolio, 2_000 * U, 1).expect("108 re-entry into the empty tranche");
+        }
+        env.slot += 2 * SLOTS_PER_YEAR_U64;
+        env.svm.warp_to_slot(env.slot);
+        env.hold(1, &[lp.portfolio]);
+        let sh = env.bond_pos(&h).shares;
+        env.bond_request(&h, sh).expect("109");
+        env.wait_cooldown(&[lp.portfolio]);
+        let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110 full exit") as u128;
+        paid_total += paid;
+        let (k, b, _, r) = tranche_raw(&env);
+        eprintln!("ATT649-R2-A cycle {cycle}: paid {paid}; after: K {k} B {b} R {r} (1y cap on 2,000 = {cap})");
+    }
+    let (_, _, _, r) = tranche_raw(&env);
+    let coupon = paid_total - 2 * k0;
+    eprintln!("ATT649-R2-A: coupon paid from the junior with no fee leg {coupon} (1y cap {cap}); receivable {r}");
+    env.assert_conserved("att649 r2a");
+    assert!(coupon + 4 >= 2 * cap, "two years of coupon came out of the junior's capital");
+    assert!(r + 4 >= 2 * cap, "the receivable is two years of coupon");
+}
