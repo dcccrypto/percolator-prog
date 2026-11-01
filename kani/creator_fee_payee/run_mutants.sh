@@ -41,8 +41,32 @@ mutate vault_authority_payee_allowed kani_587_payee_frozen_after_burn \
 ' \
   '' || rc=1
 mutate orphan_takes_payee_pot kani_587_claim_route_exact \
-  'pot != 0 && claim_route(asset_admin, payee_flag) == ClaimRoute::Refused' \
-  'pot != 0 && claim_route(asset_admin, payee_flag) != ClaimRoute::AdminSigned' || rc=1
+  '            ClaimRoute::Payee => payee_grace_over,' \
+  '            ClaimRoute::Payee => true,' || rc=1
+mutate orphan_takes_admin_pot kani_587_claim_route_exact \
+  '            ClaimRoute::AdminSigned => false,' \
+  '            ClaimRoute::AdminSigned => payee_grace_over,' || rc=1
+# fallback587: the grace on the CloseSlab re-book of a payee-backed pot.
+mutate grace_check_removed kani_fallback587_payee_rebook_after_grace_only \
+  '            ClaimRoute::Payee => payee_grace_over,' \
+  '            ClaimRoute::Payee => true,' || rc=1
+mutate grace_one_slot_early kani_fallback587_payee_rebook_after_grace_only \
+  '(Some(now), Some(end)) => resolved && now >= end,' \
+  '(Some(now), Some(end)) => resolved && now >= end - 1,' || rc=1
+mutate grace_ignores_mode kani_fallback587_payee_rebook_after_grace_only \
+  '(Some(now), Some(end)) => resolved && now >= end,' \
+  '(Some(now), Some(end)) => now >= end,' || rc=1
+mutate grace_no_clock_elapses kani_fallback587_payee_rebook_after_grace_only \
+  '        _ => false,
+    }
+}' \
+  '        (None, Some(_)) => resolved,
+        _ => false,
+    }
+}' || rc=1
+mutate grace_end_saturates kani_fallback587_payee_rebook_after_grace_only \
+  'match (now_slot, resolved_slot.checked_add(CREATOR_PAYEE_GRACE_SLOTS))' \
+  'match (now_slot, Some(resolved_slot.saturating_add(CREATOR_PAYEE_GRACE_SLOTS)))' || rc=1
 mutate bit_collides_with_bit2 kani_587_payee_bit_isolated \
   'pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = 1 << 3;' \
   'pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = 1 << 2;' || rc=1

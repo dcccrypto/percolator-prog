@@ -869,6 +869,12 @@ pub mod constants {
                 & (P4_FLAG_INS_UNITS_REQUIRED | (1 << 1) | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT)
                 == 0
     );
+    /// fallback587: the payee grace after resolution, re-exported for SDK / keeper parity, and
+    /// pinned to exactly 7 days of the program's own slot clock (`lev_guard_v22::SLOTS_PER_DAY`).
+    pub const CREATOR_PAYEE_GRACE_SLOTS: u64 =
+        crate::creator_fee_payee_v22::CREATOR_PAYEE_GRACE_SLOTS;
+    const _: () =
+        assert!(CREATOR_PAYEE_GRACE_SLOTS == 7 * crate::lev_guard_v22::SLOTS_PER_DAY);
     /// Item 8: the most stale positioned portfolios one ExecuteRedemption may refresh
     /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
@@ -25679,13 +25685,24 @@ pub mod processor {
             moved = true;
         }
         // Legacy market-wide creator pot: claimable by asset 0's admin (GH#420).
-        // prog#587: a burned admin's pot is orphaned ONLY when no payee was recorded before the
-        // burn; a payee-backed pot keeps its tag 90 exit and stays owed (CloseSlab waits for it).
-        use crate::creator_fee_payee_v22::creator_pot_orphaned;
+        // prog#587: a burned admin's pot is orphaned when no payee was recorded before the burn.
+        // fallback587 (Khubair 2026-11-01): a payee-backed pot keeps its tag 90 exit and stays
+        // owed (CloseSlab waits for it) only for `CREATOR_PAYEE_GRACE_SLOTS` after resolution;
+        // then it is re-booked like a no-payee pot, so a payee whose ATA cannot receive (delegate,
+        // close authority, frozen, wrong owner) cannot block CloseSlab for ever. Anchor: the
+        // engine's `resolved_slot` (Clock-stamped once at Live -> Resolved). Now: the Clock
+        // sysvar ONLY, no fallback (anti-spoof; no Clock = the grace never ends).
+        use crate::creator_fee_payee_v22::{creator_pot_orphaned, payee_grace_elapsed};
+        let payee_grace_over = payee_grace_elapsed(
+            group.header.mode == 1,
+            group.header.resolved_slot.get(),
+            Clock::get().ok().map(|c| c.slot),
+        );
         if creator_pot_orphaned(
             &asset0.asset_admin,
             state::profile_has_creator_fee_payee(&asset0),
             cfg.creator_fee_claimable_atoms,
+            payee_grace_over,
         ) {
             cfg.protocol_fee_accrued_atoms = cfg
                 .protocol_fee_accrued_atoms
@@ -25706,6 +25723,7 @@ pub mod processor {
                 &profile.asset_admin,
                 state::profile_has_creator_fee_payee(&profile),
                 profile.creator_fee_claimable_atoms,
+                payee_grace_over,
             ) {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
@@ -25950,7 +25968,8 @@ pub mod processor {
         //   * staker leg whose asset-0 `insurance_authority` is not the derived stake-pool
         //     `vault_auth` for THIS market (tag 87 would fail forever) -> protocol leg;
         //   * a creator pot whose `asset_admin` is burned ([0; 32], tag 90 can never be
-        //     signed) -> protocol leg.
+        //     signed) and no payee recorded -> protocol leg; with a payee (prog#587), only once
+        //     `CREATOR_PAYEE_GRACE_SLOTS` have passed since `resolved_slot` (fallback587).
         // Persisted as its own successful step (returns Ok without closing, like the windowed
         // scan's `ScanProgress`), because the refusal below would otherwise roll it back. Only
         // reachable on a terminal-empty Resolved market, after the same authority + epoch
