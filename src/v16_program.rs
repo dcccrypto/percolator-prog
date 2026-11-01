@@ -82,6 +82,10 @@ pub mod lev_guard_v22;
 /// the guarded-open gate as a TIGHTEN-ONLY floor, OFF by default (`lev_profile_v22::VOL_PROFILE_LIVE`).
 pub mod lev_profile_v22;
 
+/// prog#587 (2026-10-31): the frozen creator-fee payee of a burned (admin-free) asset (tag 125,
+/// PDA kind 19) and tag 90's permissionless payee route. Pure rules + Kani harnesses.
+pub mod creator_fee_payee_v22;
+
 pub mod constants {
     use core::mem::size_of;
     use percolator::{
@@ -606,7 +610,8 @@ pub mod constants {
     /// `["bond_tranche", market]`: the market's pooled bond claim, shares and coupon dials.
     pub const KIND_BOND_TRANCHE: u8 = 11;
     pub const BOND_TRANCHE_SEED: &[u8] = b"bond_tranche";
-    pub const BOND_TRANCHE_VERSION: u8 = 1;
+    /// 2 = GH#571 layout (144 B, `coupon_arrears_atoms` appended). v1 accounts fail to load.
+    pub const BOND_TRANCHE_VERSION: u8 = 2;
     /// `["bond", market, owner]`: one holder's bond shares and pending withdrawal.
     pub const KIND_BOND_POSITION: u8 = 12;
     pub const BOND_POSITION_SEED: &[u8] = b"bond";
@@ -665,6 +670,12 @@ pub mod constants {
     pub const KIND_LEV_GUARD: u8 = 17;
     /// Night 2026-10-28 (decision 16): `["pool_claim", pool]`, one growth market per spot pool.
     pub const KIND_POOL_CLAIM: u8 = 18;
+    /// prog#587 (2026-10-31): `SetCreatorFeePayee`. Signed by the asset's LIVE `asset_admin`; records
+    /// the wallet that receives the asset's creator fee once `asset_admin` is burned
+    /// (`creator_fee_payee_v22`). Wire `[125][asset_index u16][market_id u64][payee 32][authority_epoch u64]`.
+    pub const TAG_SET_CREATOR_FEE_PAYEE: u8 = 125;
+    /// prog#587: `CreatorFeePayeeV22` at `["creator_fee_payee", market, asset_index_le]`.
+    pub const KIND_CREATOR_FEE_PAYEE: u8 = 19;
     /// Mainnet builds refuse a risk-increasing fill on ANY clamp-enforced growth asset without a
     /// bound guard (fail closed); devnet builds keep the guard opt-in (growth flag bit 2) so the
     /// existing devnet markets keep trading until the guard is created for them.
@@ -719,7 +730,7 @@ pub mod constants {
         TAG_TRANSFER_PORTFOLIO_OWNERSHIP, TAG_SET_NFT_PROGRAM_ID, TAG_UNWRAP_ESCROWED_PORTFOLIO,
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
-        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, 206, 207,
+        TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, TAG_SET_CREATOR_FEE_PAYEE, 207,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -843,7 +854,21 @@ pub mod constants {
     pub const P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT: u8 = 1 << 2;
     /// Bits the validator accepts: the v2.2 UNION of Wave D bit0 (INS_UNITS_REQUIRED) and
     /// Wave A bit2 (EXIT_REQUIRES_LOSS_CURRENT). Append item 4's bit1 when it lands.
-    pub const P4_FLAGS_KNOWN_MASK: u8 = P4_FLAG_INS_UNITS_REQUIRED | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT;
+    /// prog#587: bit3 = a creator-fee payee is recorded for this asset (`CreatorFeePayeeV22`). Set
+    /// only by tag 125 (live `asset_admin`), carried by every profile rebuild, cleared when a slot
+    /// is (re-)activated for a new creator. With `asset_admin` burned it makes tag 90
+    /// permissionless to the payee's ATA and keeps CloseSlab from re-booking the pot.
+    pub const P4_FLAG_CREATOR_FEE_PAYEE: u8 = crate::creator_fee_payee_v22::P4_FLAG_CREATOR_FEE_PAYEE;
+    pub const P4_FLAGS_KNOWN_MASK: u8 =
+        P4_FLAG_INS_UNITS_REQUIRED | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT | P4_FLAG_CREATOR_FEE_PAYEE;
+    // prog#587: bit 3 is one bit, disjoint from bit0 (INS_UNITS_REQUIRED), bit1 (reserved for
+    // item 4) and bit2 (EXIT_REQUIRES_LOSS_CURRENT).
+    const _: () = assert!(
+        P4_FLAG_CREATOR_FEE_PAYEE.count_ones() == 1
+            && P4_FLAG_CREATOR_FEE_PAYEE
+                & (P4_FLAG_INS_UNITS_REQUIRED | (1 << 1) | P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT)
+                == 0
+    );
     /// Item 8: the most stale positioned portfolios one ExecuteRedemption may refresh
     /// inline (accounts [13..13+n)). Bounded by CU: 8 crank-equivalent refreshes plus the
     /// redemption must fit 1.4M (measured in tests/v22_wave_a.rs).
@@ -1989,7 +2014,12 @@ VaultLpMultiAssetMarket,
         /// Tag 124 op 5 (W1) while the LP stop does not hold or nothing is left to reduce.
         /// Custom(135).
         LpStopNotTriggered = 135,
+        /// prog#587: tag 125 / tag 90's payee route refused: wrong signer (not the live
+        /// `asset_admin`), zero or unchanged payee, a payee account that is not this asset's PDA or
+        /// does not validate, or a destination that is not the payee's canonical ATA. Custom(136).
+        CreatorFeePayeeInvalid = 136,
     }
+    const _: () = assert!(PercolatorError::CreatorFeePayeeInvalid as u32 == 136);
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::GrowthTierConfigInvalid as u32 == 130);
@@ -4204,15 +4234,117 @@ pub mod state {
         Ok((next, next_control))
     }
 
+    /// port135 (ADOPT upstream `0c5d4f4f`, "invalidate stale matcher capabilities", upstream
+    /// issue 406; + the `0b838425` expiry clear): the packed-control transition of a position
+    /// episode bump. A mutation the configured matcher did NOT observe (`matcher_synchronized ==
+    /// false`) clears the ENABLED bit; a fill through the configured matcher keeps it. The episode
+    /// and the LP's fee cap are preserved either way. Verbatim upstream (Kani:
+    /// `kani_v16_position_epoch_sync_policy_is_total_and_exact`).
     #[inline]
-    pub fn bump_portfolio_position_epoch(data: &mut [u8]) -> Result<u64, ProgramError> {
+    pub fn next_portfolio_position_control_for_matcher_sync(
+        control: u64,
+        matcher_synchronized: bool,
+    ) -> Result<(u64, u64), ProgramError> {
+        let (next, mut next_control) = next_portfolio_position_control(control)?;
+        if !matcher_synchronized {
+            next_control &= !PortfolioMatcherConfigV16::ENABLED_MASK;
+        }
+        Ok((next, next_control))
+    }
+
+    /// port135 (fork adaptation of upstream 0c5d4f4f): the matcher programs that the wrapper
+    /// hands the LP's authoritative engine position on EVERY call (`ext_version = 2`,
+    /// matcher-inventory-sync 2026-10-03: the canonical matcher prices and caps against that
+    /// value, never against its own `inventory_base` counter). Such a matcher has observed every
+    /// position mutation by construction, so an out-of-matcher mutation does not desynchronize
+    /// it and its capability is NOT invalidated. A default build (no canonical matcher) has none:
+    /// there the policy is upstream's verbatim. Single source of truth for
+    /// `processor::matcher_takes_lp_position` too, so the wire and the policy cannot diverge.
+    #[inline]
+    pub fn matcher_program_is_position_synced(matcher_program: &[u8; 32]) -> bool {
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+        {
+            *matcher_program == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes()
+        }
+        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
+        {
+            let _ = matcher_program;
+            false
+        }
+    }
+
+    /// port135: is the portfolio's CONFIGURED matcher position-synced (see above)? Reads only the
+    /// 32-byte program field (an unconfigured portfolio has all-zero bytes: not synced).
+    #[inline]
+    fn portfolio_matcher_is_position_synced(data: &[u8]) -> Result<bool, ProgramError> {
+        let program: [u8; 32] = data
+            .get(PORTFOLIO_MATCHER_CONFIG_OFF..PORTFOLIO_MATCHER_CONFIG_OFF + 32)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .try_into()
+            .map_err(|_| PercolatorError::InvalidAccountLen)?;
+        Ok(matcher_program_is_position_synced(&program))
+    }
+
+    #[inline]
+    fn bump_portfolio_position_epoch_with_matcher_state(
+        data: &mut [u8],
+        matcher_synchronized: bool,
+    ) -> Result<u64, ProgramError> {
         check_header(data, KIND_PORTFOLIO)?;
+        let matcher_synchronized =
+            matcher_synchronized || portfolio_matcher_is_position_synced(data)?;
         let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
-        let (next, next_control) = next_portfolio_position_control(control)?;
+        let (next, next_control) =
+            next_portfolio_position_control_for_matcher_sync(control, matcher_synchronized)?;
         data.get_mut(PORTFOLIO_MATCHER_CONTROL_OFF..PORTFOLIO_MATCHER_CONTROL_OFF + 8)
             .ok_or(PercolatorError::InvalidAccountLen)?
             .copy_from_slice(&next_control.to_le_bytes());
+        if !matcher_synchronized {
+            write_portfolio_matcher_expiry(data, 0)?;
+        }
         Ok(next)
+    }
+
+    /// A position-episode bump for a mutation OUTSIDE the configured matcher (liquidation,
+    /// recovery, force-close, wind-down, dust sweep / eviction victim, cure, ...): also
+    /// invalidates the matcher capability unless that matcher is position-synced (port135).
+    #[inline]
+    pub fn bump_portfolio_position_epoch(data: &mut [u8]) -> Result<u64, ProgramError> {
+        bump_portfolio_position_epoch_with_matcher_state(data, false)
+    }
+
+    /// Upstream API (0c5d4f4f): a bump for a fill through the portfolio's OWN configured matcher
+    /// keeps the capability. No production caller in this fork (trades do not advance the
+    /// position epoch here, AUD-S1-23); kept for grep parity and the ported unit test.
+    #[inline]
+    pub fn bump_portfolio_position_epoch_after_matcher_fill(
+        data: &mut [u8],
+    ) -> Result<u64, ProgramError> {
+        bump_portfolio_position_epoch_with_matcher_state(data, true)
+    }
+
+    /// port135 (fork adaptation of 0c5d4f4f): invalidate the matcher capability after a
+    /// position mutation the configured matcher did not observe, WITHOUT advancing the position
+    /// epoch. Used where upstream bumps the epoch but this fork does not (the trade family's
+    /// non-matcher sides, RebalanceReduce, ForfeitRecoveryLeg, and the band forced closes against
+    /// the vault LP), so retained-action epoch bindings are unchanged. No-op for a position-synced
+    /// matcher or an already-disabled capability (no write at all then).
+    #[inline]
+    pub fn invalidate_unsynchronized_matcher_capability(
+        data: &mut [u8],
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_PORTFOLIO)?;
+        let control = read_u64(data, PORTFOLIO_MATCHER_CONTROL_OFF)?;
+        if control & PortfolioMatcherConfigV16::ENABLED_MASK == 0
+            || portfolio_matcher_is_position_synced(data)?
+        {
+            return Ok(());
+        }
+        let next_control = control & !PortfolioMatcherConfigV16::ENABLED_MASK;
+        data.get_mut(PORTFOLIO_MATCHER_CONTROL_OFF..PORTFOLIO_MATCHER_CONTROL_OFF + 8)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(&next_control.to_le_bytes());
+        write_portfolio_matcher_expiry(data, 0)
     }
 
     /// Upstream's `expected_sequence` (upstream's own helper name is
@@ -7200,15 +7332,24 @@ pub mod state {
         )
     }
 
-    /// The market's capacity-bond tranche (`bond_v20`): the pooled principal claim `C_b`, the
-    /// share supply `B` and the coupon / cooldown / cap dials (immutable after tag 107).
-    /// 128 bytes, `#[repr(C)]` Pod with no implicit padding.
+    /// The market's capacity-bond tranche (`bond_v20`): the bonds' pooled claim `K`, the coupon
+    /// receivable `R`, the cap meter `U`, the share supply `B` and the coupon / cooldown / cap
+    /// dials (immutable after tag 107). 176 bytes, `#[repr(C)]` Pod with no implicit padding.
+    ///
+    /// LAYOUT v2 (GH#571, 2026-10-31): v1 was 128 bytes. Bytes 0..128 keep their offsets
+    /// (`c_b_atoms` now holds the whole claim `K`, settled coupon included); v2 appends
+    /// `coupon_arrears_atoms` (`R`) at 128..144, `coupon_unfunded_atoms` (`U`) at 144..160,
+    /// `coupon_accrual_rem` at 160..168 and `coupon_gate_seen` at 168..176, and stamps
+    /// `version = 2`. A v1 account (shorter, or version 1) fails every load
+    /// (`InvalidAccountLen` / `InvalidAccountData`): bond markets are re-seeded, there is no
+    /// in-place migration.
     #[repr(C)]
     #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, bytemuck::Pod, bytemuck::Zeroable)]
     pub struct BondTrancheV20 {
         pub market_group: [u8; 32], // 0..32
-        /// `C_b`: deposits + credited coupons - redeemed pro-rata slices. Never written down by a
-        /// draw: the bond's VALUE is the middle layer of `bond_v20::tranche_split3`.
+        /// `K`: the bonds' whole claim = deposits + every SETTLED coupon (GH#571) - redeemed
+        /// pro-rata slices. Never written down by a draw: the bond's VALUE is the middle layer of
+        /// `bond_v20::tranche_split3(.., K)`. Shares are priced at `K / B`.
         pub c_b_atoms: u128, // 32..48
         /// `B`: bond shares outstanding (sum of every `BondPositionV20::shares`).
         pub b_shares_total: u128, // 48..64
@@ -7218,8 +7359,9 @@ pub mod state {
         /// Informational mirror of the impairment (`C_b - bond value`) observed the last time a
         /// bond instruction priced the tranche. Nothing prices off it.
         pub bond_drawn_outstanding_atoms: u128, // 80..96
-        /// Coupon checkpoint. Reset to "now" by every coupon crank (non-cumulative) and by every
-        /// 108/110 (which require the fee leg harvested first, so nothing earned is forfeited).
+        /// Coupon accrual checkpoint: every slot up to it is SETTLED into `K` / `R` (gate open;
+        /// the sub-atom remainder carried in `coupon_accrual_rem`) or was forfeited (gate closed).
+        /// Moved to "now" by every settlement (tags 78 incl. a zero-leg 78, 108, 110).
         pub last_coupon_slot: u64, // 96..104
         pub coupon_bps_per_year: u16,   // 104..106
         pub coupon_util_bonus_bps: u16, // 106..108
@@ -7232,10 +7374,64 @@ pub mod state {
         /// uses `min(last, now)`.
         pub last_util_bps: u16, // 116..118
         pub _padding: [u8; 2], // 118..120
-        /// Cumulative coupon atoms credited to `C_b` (saturating; for the realised-APY readout).
+        /// Cumulative coupon atoms PAID by fee legs (tag 78; saturating; a readout only).
         pub coupon_paid_total_atoms: u64, // 120..128
+        /// GH#571 `R`: the coupon RECEIVABLE, settled coupon (already inside `K`) that no fee leg
+        /// has funded yet, i.e. what the fee legs still owe the junior that fronted it
+        /// (`bond_v20` I-T7). Paid by tag 78 at <= 1/2 of each leg; exits never reduce it (it
+        /// can outlive `B == 0`).
+        pub coupon_arrears_atoms: u128, // 128..144
+        /// GH#571 `U`: the cap meter, the unfunded coupon carried by the CURRENT shares at the
+        /// pool's per-share ratio (108 labels new shares at it, 110 removes its slice, 78's
+        /// payment lowers it). Accrual stops while `U >= 1y of coupon on K - U`. `U <= K`.
+        pub coupon_unfunded_atoms: u128, // 144..160
+        /// GH#571: carried sub-atom accrual numerator, `< bond_v20::COUPON_DENOM` (so cranking
+        /// often never grinds the coupon away). Zeroed by tag 108 and when the cap binds.
+        pub coupon_accrual_rem: u64, // 160..168
+        /// GH#571 (att649 F2) gate memory of the last settlement: bits 0..63 = the low 63 bits of
+        /// `VaultLpStateV18::senior_drawn_atoms` (cumulative, monotone) then; bit 63 = the coupon
+        /// gate was CLOSED then. The next interval accrues only if the gate is open at BOTH ends
+        /// and no senior draw was booked inside it (`bond_interval_clean`), so a closed window is
+        /// forfeited even if it reopened before anyone settled.
+        pub coupon_gate_seen: u64, // 168..176
     }
-    const _: () = assert!(core::mem::size_of::<BondTrancheV20>() == 128);
+    const _: () = assert!(core::mem::size_of::<BondTrancheV20>() == 176);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_arrears_atoms) == 128);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_unfunded_atoms) == 144);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_accrual_rem) == 160);
+    const _: () = assert!(core::mem::offset_of!(BondTrancheV20, coupon_gate_seen) == 168);
+
+    impl BondTrancheV20 {
+        /// GH#571: the bonds' whole claim `K` as of the last settlement (= `c_b_atoms`).
+        pub fn claim_total(&self) -> Result<u128, ProgramError> {
+            Ok(self.c_b_atoms)
+        }
+
+        /// GH#571: `K` plus the accrual not yet settled since `last_coupon_slot`, assuming the gate
+        /// OPEN and the maximum rate (base + full utilisation bonus). An UPPER bound on the claim
+        /// the next settlement can produce: read-only junior-facing gates (97 / 103) use it so the
+        /// junior can never withdraw value the bonds are accruing between settlements.
+        pub fn claim_upper_bound_at(&self, now: u64) -> Result<u128, ProgramError> {
+            let rate = crate::bond_v20::bond_coupon_rate_bps(
+                self.coupon_bps_per_year,
+                self.coupon_util_bonus_bps,
+                crate::vault_lp_v18::BPS as u16,
+            );
+            let (x, _) = crate::bond_v20::coupon_settle(
+                self.c_b_atoms,
+                self.coupon_unfunded_atoms,
+                self.coupon_accrual_rem,
+                rate,
+                now.saturating_sub(self.last_coupon_slot),
+                self.c_b_atoms > 0,
+                self.c_b_atoms,
+            )
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            self.c_b_atoms
+                .checked_add(x)
+                .ok_or_else(|| PercolatorError::EngineArithmeticOverflow.into())
+        }
+    }
     const _: () = assert!(core::mem::offset_of!(BondTrancheV20, c_b_atoms) == 32);
     const _: () = assert!(core::mem::offset_of!(BondTrancheV20, last_coupon_slot) == 96);
     const _: () = assert!(core::mem::offset_of!(BondTrancheV20, bond_cap_bps_of_c) == 112);
@@ -7247,8 +7443,9 @@ pub mod state {
     }
 
     /// Reachable-state validation: dials inside the protocol bounds, padding zero, and
-    /// `C_b == 0 <=> B == 0` (a full redemption removes the whole claim; the genesis deposit
-    /// creates both together).
+    /// `K == 0 <=> B == 0` (a full redemption removes the whole claim; the genesis deposit
+    /// creates both together). GH#571: the receivable `R` is independent of `B` (it outlives the
+    /// last bond); the carried remainder is a sub-atom.
     pub fn validate_bond_tranche(t: &BondTrancheV20) -> Result<(), ProgramError> {
         if t.version != crate::constants::BOND_TRANCHE_VERSION
             || t.market_group == [0u8; 32]
@@ -7261,6 +7458,8 @@ pub mod state {
             || t.last_util_bps as u128 > crate::vault_lp_v18::BPS
             || t._padding != [0u8; 2]
             || (t.c_b_atoms == 0) != (t.b_shares_total == 0)
+            || t.coupon_accrual_rem as u128 >= crate::bond_v20::COUPON_DENOM
+            || t.coupon_unfunded_atoms > t.c_b_atoms
         {
             return Err(ProgramError::InvalidAccountData);
         }
@@ -7688,6 +7887,73 @@ pub mod state {
         }
         data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(x));
         Ok(())
+    }
+
+    // ── prog#587: `CreatorFeePayeeV22` (kind 19, `["creator_fee_payee", market, asset_index_le]`).
+    pub use crate::creator_fee_payee_v22::CreatorFeePayeeV22;
+
+    pub const fn creator_fee_payee_account_len() -> usize {
+        HEADER_LEN + core::mem::size_of::<CreatorFeePayeeV22>()
+    }
+
+    pub fn derive_creator_fee_payee(
+        program_id: &solana_program::pubkey::Pubkey,
+        market: &solana_program::pubkey::Pubkey,
+        asset_index: u16,
+    ) -> (solana_program::pubkey::Pubkey, u8) {
+        solana_program::pubkey::Pubkey::find_program_address(
+            &[
+                crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_SEED,
+                market.as_ref(),
+                &asset_index.to_le_bytes(),
+            ],
+            program_id,
+        )
+    }
+
+    /// Reads a payee record: exact length, kind 19 header, structurally valid. Every failure is
+    /// `CreatorFeePayeeInvalid`.
+    pub fn read_creator_fee_payee(data: &[u8]) -> Result<CreatorFeePayeeV22, ProgramError> {
+        if data.len() != creator_fee_payee_account_len()
+            || check_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE).is_err()
+        {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let r: CreatorFeePayeeV22 = bytemuck::pod_read_unaligned(&data[HEADER_LEN..]);
+        if !crate::creator_fee_payee_v22::validate_creator_fee_payee(&r) {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        Ok(r)
+    }
+
+    /// Writes a payee record (validated first). `fresh`: the account was just created (all-zero)
+    /// and gets the kind 19 header; otherwise the existing header must already be kind 19.
+    pub fn write_creator_fee_payee(
+        data: &mut [u8],
+        r: &CreatorFeePayeeV22,
+        fresh: bool,
+    ) -> Result<(), ProgramError> {
+        if data.len() != creator_fee_payee_account_len()
+            || !crate::creator_fee_payee_v22::validate_creator_fee_payee(r)
+        {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        if fresh {
+            if is_initialized(data) {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            write_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE)?;
+        } else if check_header(data, crate::constants::KIND_CREATOR_FEE_PAYEE).is_err() {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        data[HEADER_LEN..].copy_from_slice(bytemuck::bytes_of(r));
+        Ok(())
+    }
+
+    /// prog#587: the profile's creator-fee-payee bit (`p4_flags` bit 3).
+    #[inline]
+    pub fn profile_has_creator_fee_payee(profile: &AssetOracleProfileV16) -> bool {
+        crate::creator_fee_payee_v22::has_payee_bit(profile_p4_flags(profile))
     }
 
     /// Decision 16 (night 2026-10-28): the pool claim (`["pool_claim", pool]`, kind 18).
@@ -9482,6 +9748,18 @@ pub mod ix {
         /// everything available" the way `WithdrawProtocolFee` (tag 84) reads
         /// it: this instruction's contract is an exact debit of the counter,
         /// and a silent 0-atom transfer is a caller bug, not a claim.
+        /// prog#587 SetCreatorFeePayee (tag 125). Signed by `asset_index`'s LIVE `asset_admin`.
+        /// Creates or replaces the asset's `CreatorFeePayeeV22` PDA and sets profile `p4_flags`
+        /// bit 3. Live mode only; generation-checked (`market_id`); CAS + advance of the asset's
+        /// `authority_epoch` (a payee change is a rotation). Accounts: `[0]` asset_admin (signer,
+        /// writable: pays the PDA rent on first use), `[1]` market (w), `[2]` payee PDA (w),
+        /// `[3]` system program. After `asset_admin` is burned nothing can call this again.
+        SetCreatorFeePayee {
+            asset_index: u16,
+            market_id: u64,
+            payee: [u8; 32],
+            authority_epoch: u64,
+        },
         WithdrawCreatorFee {
             amount: u128,
             /// GH#420: WHICH asset's creator fees. Appended after `amount`, so the
@@ -10413,6 +10691,12 @@ pub mod ix {
                 },
                 89 => Self::ExpireBackingBucket {
                     domain: read_u16(&mut rest)?,
+                },
+                crate::constants::TAG_SET_CREATOR_FEE_PAYEE => Self::SetCreatorFeePayee {
+                    asset_index: read_u16(&mut rest)?,
+                    market_id: read_u64(&mut rest)?,
+                    payee: read_bytes32(&mut rest)?,
+                    authority_epoch: read_u64(&mut rest)?,
                 },
                 90 => Self::WithdrawCreatorFee {
                     amount: read_u128(&mut rest)?,
@@ -11466,6 +11750,18 @@ pub mod ix {
                 Self::ExpireBackingBucket { domain } => {
                     out.push(89);
                     push_u16(&mut out, domain);
+                }
+                Self::SetCreatorFeePayee {
+                    asset_index,
+                    market_id,
+                    payee,
+                    authority_epoch,
+                } => {
+                    out.push(crate::constants::TAG_SET_CREATOR_FEE_PAYEE);
+                    push_u16(&mut out, asset_index);
+                    push_u64(&mut out, market_id);
+                    out.extend_from_slice(&payee);
+                    push_u64(&mut out, authority_epoch);
                 }
                 Self::WithdrawCreatorFee {
                     amount,
@@ -13799,6 +14095,7 @@ pub mod lag_policy {
             Instruction::UpdateMaintenanceFeePerSlot { .. } => entry("UpdateMaintenanceFeePerSlot", LagPolicy::MarkFree, "fee dial"),
             Instruction::ExpireBackingBucket { .. } => entry("ExpireBackingBucket", LagPolicy::MarkFree, "expires a lapsed bucket"),
             Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
+            Instruction::SetCreatorFeePayee { .. } => entry("SetCreatorFeePayee", LagPolicy::MarkFree, "records a payee key; moves no value"),
             Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV22Tiers { .. } => entry("InitVaultLpV22Tiers", LagPolicy::MarkFree, "binds a vault LP"),
@@ -15486,7 +15783,12 @@ pub mod processor {
             }
             _ => None,
         };
-        process_instruction_dispatch(program_id, accounts, instruction_data)?;
+        let ix = Instruction::decode(instruction_data)?;
+        // port135 (upstream 0c5d4f4f, att645 F1/F1b): the instruction-level out-of-matcher
+        // position sweep. See `out_of_matcher_sweep_snapshot`.
+        let sweep = out_of_matcher_sweep_snapshot(program_id, accounts, &ix);
+        dispatch_decoded(program_id, accounts, ix)?;
+        out_of_matcher_sweep_apply(accounts, sweep)?;
         if let Some(before) = reserve {
             resolved_receipt_reserve_check(program_id, accounts, &before)?;
         }
@@ -15604,13 +15906,122 @@ pub mod processor {
         }
     }
 
+    /// Nested dispatch (EvictAndTradeCpi's inner TradeCpi): decode, then `dispatch_decoded`.
+    /// The out-of-matcher sweep runs once, in the outer `process_instruction`.
     #[inline(never)]
     fn process_instruction_dispatch<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
         instruction_data: &[u8],
     ) -> ProgramResult {
-        match Instruction::decode(instruction_data)? {
+        dispatch_decoded(program_id, accounts, Instruction::decode(instruction_data)?)
+    }
+
+    /// port135: the instructions that apply their OWN position-episode / matcher policy and are
+    /// therefore excluded from the instruction-level out-of-matcher sweep. Each one's dispatch
+    /// arm is wrapped in `with_matcher_invalidations` (and, for forced-close victims,
+    /// `with_position_epoch_bumps`); pinned by `tests/port135_position_sweep_guard.rs`.
+    /// - the trade family: a fill through a portfolio's OWN configured matcher keeps its
+    ///   capability, every other side is invalidated WITHOUT an epoch bump (AUD-S1-23: trades
+    ///   do not advance `position_epoch` in this fork);
+    /// - the owner's own position-bound exits (RebalanceReduce, ForfeitRecoveryLeg): invalidated
+    ///   without a bump (D2);
+    /// - the band forced closes (SweepBandDustLeg, EvictAndTradeCpi, LevGuard OP_LP_STOP):
+    ///   victims per AUD-S1-23, the vault LP / taker invalidated.
+    /// Every OTHER instruction is swept: whatever handler or helper moved a writable portfolio's
+    /// position vector (an engine Refresh clearing a side-reset leg, a liquidation, a wind-down,
+    /// a resolved close, ...), it did so outside that portfolio's matcher.
+    pub(crate) fn instruction_manages_own_position_policy(ix: &Instruction) -> bool {
+        match ix {
+            Instruction::TradeNoCpi { .. }
+            | Instruction::TradeCpi { .. }
+            | Instruction::BatchTradeNoCpi { .. }
+            | Instruction::BatchTradeCpi { .. }
+            | Instruction::EvictAndTradeCpi { .. }
+            | Instruction::SweepBandDustLeg { .. }
+            | Instruction::RebalanceReduce { .. }
+            | Instruction::ForfeitRecoveryLeg { .. } => true,
+            Instruction::LevGuard { op, .. } => *op == crate::lev_guard_v22::OP_LP_STOP,
+            _ => false,
+        }
+    }
+
+    /// port135 (ADOPT upstream `0c5d4f4f`, structural form; att645 F1/F1b): before an instruction
+    /// that does not manage its own position policy, snapshot `(position_epoch, position vector)`
+    /// of every distinct writable, program-owned portfolio account it was given. Upstream bumps
+    /// (and so invalidates) at each out-of-matcher mutation site; this fork has many more such
+    /// sites (vault-LP draws, Earn flows, bond flows, rent, backstop, ...) that run the engine
+    /// Refresh, which can clear a side-reset leg. Checking at the instruction boundary covers
+    /// all of them, and any future handler, without a per-site wrapper.
+    #[inline(never)]
+    fn out_of_matcher_sweep_snapshot(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo<'_>],
+        ix: &Instruction,
+    ) -> Vec<(usize, u64, PositionVector)> {
+        let mut out = Vec::new();
+        if instruction_manages_own_position_policy(ix) {
+            return out;
+        }
+        for (i, ai) in accounts.iter().enumerate() {
+            if ai.owner != program_id || !ai.is_writable {
+                continue;
+            }
+            if accounts[..i].iter().any(|prev| prev.key == ai.key) {
+                continue;
+            }
+            let Ok(data) = ai.try_borrow_data() else {
+                continue;
+            };
+            let Some(vector) = state::portfolio_position_vector(&data) else {
+                continue;
+            };
+            let Ok(epoch) = state::read_portfolio_position_epoch(&data) else {
+                continue;
+            };
+            out.push((i, epoch, vector));
+        }
+        out
+    }
+
+    /// port135: after the instruction succeeded, every swept portfolio whose position vector
+    /// changed and whose `position_epoch` the handler did not already advance gets ONE
+    /// out-of-matcher episode bump: `position_epoch + 1`, and its matcher capability is cleared
+    /// (ENABLED bit + expiry) unless the configured matcher is position-synced
+    /// (`state::bump_portfolio_position_epoch`). A portfolio that no longer decodes (closed) is
+    /// skipped.
+    #[inline(never)]
+    fn out_of_matcher_sweep_apply(
+        accounts: &[AccountInfo<'_>],
+        swept: Vec<(usize, u64, PositionVector)>,
+    ) -> ProgramResult {
+        for (i, epoch_before, before) in swept {
+            let ai = &accounts[i];
+            let bump = {
+                let data = ai.try_borrow_data()?;
+                match (
+                    state::portfolio_position_vector(&data),
+                    state::read_portfolio_position_epoch(&data),
+                ) {
+                    (Some(after), Ok(epoch_now)) => after != before && epoch_now == epoch_before,
+                    _ => false,
+                }
+            };
+            if bump {
+                let mut data = ai.try_borrow_mut_data()?;
+                state::bump_portfolio_position_epoch(&mut data)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn dispatch_decoded<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        ix: Instruction,
+    ) -> ProgramResult {
+        match ix {
             ix @ Instruction::InitMarket { .. } => {
                 dispatch_init_market(program_id, accounts, &ix, None, 0, None)
             }
@@ -15653,22 +16064,36 @@ pub mod processor {
                 lot_exp,
                 Some(phase4),
             ),
+            // port135 (att645 F1): its engine Refresh can clear a side-reset leg; covered by the
+            // instruction-level out-of-matcher position sweep (`process_instruction`).
             Instruction::SettleHoldingRent {
                 asset_index,
                 now_slot,
             } => handle_settle_holding_rent(program_id, accounts, asset_index, now_slot),
             // AUD-S1-23: the swept victim's (account 2) position changed without its owner.
+            // port135: the bound vault LP (account 3) is the forced close's counterparty, outside
+            // its matcher.
             Instruction::SweepBandDustLeg { asset_index } => with_position_epoch_bumps(
                 accounts,
                 &[2],
-                || handle_sweep_band_dust_leg(program_id, accounts, asset_index),
+                || {
+                    with_matcher_invalidations(program_id, accounts, &[3], || {
+                        handle_sweep_band_dust_leg(program_id, accounts, asset_index)
+                    })
+                },
             ),
             // AUD-S1-23: the evicted victim (account 0); the taker's own trade is not bumped
             // (trades do not advance position_epoch in this fork).
+            // port135: the taker (account 3) traded through ANOTHER portfolio's matcher; the vault
+            // LP (account 4) absorbed the victim's forced close outside its matcher.
             Instruction::EvictAndTradeCpi { trade } => with_position_epoch_bumps(
                 accounts,
                 &[0],
-                || handle_evict_and_trade_cpi(program_id, accounts, &trade),
+                || {
+                    with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                        handle_evict_and_trade_cpi(program_id, accounts, &trade)
+                    })
+                },
             ),
             Instruction::InitPortfolio => handle_init_portfolio(program_id, accounts),
             Instruction::Deposit {
@@ -15700,20 +16125,24 @@ pub mod processor {
                 exec_price,
                 fee_bps,
                 backing_fee_cap_bps,
-            } => handle_trade_nocpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                asset_index,
-                market_id,
-                size_q,
-                exec_price,
-                fee_bps,
-                backing_fee_cap_bps,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                // port135 (upstream 0c5d4f4f): a signed bilateral fill moves both portfolios
+                // outside either configured matcher.
+                handle_trade_nocpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    asset_index,
+                    market_id,
+                    size_q,
+                    exec_price,
+                    fee_bps,
+                    backing_fee_cap_bps,
+                )
+            }),
             Instruction::TradeCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
@@ -15726,36 +16155,43 @@ pub mod processor {
                 fee_bps,
                 limit_price,
                 backing_fee_cap_bps,
-            } => handle_trade_cpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                account_b_matcher_sequence,
-                asset_index,
-                market_id,
-                size_q,
-                fee_bps,
-                limit_price,
-                backing_fee_cap_bps,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135 (upstream 0c5d4f4f): the LP (account 3) filled through its own matcher
+                // and keeps its capability; the taker (account 2) did not use its own.
+                handle_trade_cpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    account_b_matcher_sequence,
+                    asset_index,
+                    market_id,
+                    size_q,
+                    fee_bps,
+                    limit_price,
+                    backing_fee_cap_bps,
+                )
+            }),
             Instruction::BatchTradeNoCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
                 account_b_portfolio_id,
                 account_b_position_epoch,
                 legs,
-            } => handle_batch_trade_nocpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                &legs,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[3, 4], || {
+                // port135: as TradeNoCpi.
+                handle_batch_trade_nocpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    &legs,
+                )
+            }),
             Instruction::BatchTradeCpi {
                 account_a_portfolio_id,
                 account_a_position_epoch,
@@ -15765,18 +16201,21 @@ pub mod processor {
                 max_fee_atoms,
                 account_b_matcher_sequence,
                 legs,
-            } => handle_batch_trade_cpi(
-                program_id,
-                accounts,
-                account_a_portfolio_id,
-                account_a_position_epoch,
-                account_b_portfolio_id,
-                account_b_position_epoch,
-                max_slippage_atoms,
-                max_fee_atoms,
-                account_b_matcher_sequence,
-                &legs,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: as TradeCpi.
+                handle_batch_trade_cpi(
+                    program_id,
+                    accounts,
+                    account_a_portfolio_id,
+                    account_a_position_epoch,
+                    account_b_portfolio_id,
+                    account_b_position_epoch,
+                    max_slippage_atoms,
+                    max_fee_atoms,
+                    account_b_matcher_sequence,
+                    &legs,
+                )
+            }),
             Instruction::SetMatcherConfig {
                 portfolio_id,
                 expected_sequence,
@@ -15882,6 +16321,9 @@ pub mod processor {
                 amount,
                 authority_epoch,
             ),
+            // port135 (att645 F1): the conditional Refresh can clear a side-reset leg; upstream
+            // bumps here unconditionally (with_one_portfolio_view), the fork bumps on a change
+            // through the instruction-level out-of-matcher position sweep.
             Instruction::ConvertReleasedPnl {
                 portfolio_id,
                 position_epoch,
@@ -16220,27 +16662,33 @@ pub mod processor {
                 position_epoch,
                 asset_index,
                 b_loss_atom_budget,
-            } => handle_forfeit_recovery_leg(
-                program_id,
-                accounts,
-                portfolio_id,
-                position_epoch,
-                asset_index,
-                b_loss_atom_budget,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: the owner's forfeit closes a leg outside the matcher.
+                handle_forfeit_recovery_leg(
+                    program_id,
+                    accounts,
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    b_loss_atom_budget,
+                )
+            }),
             Instruction::RebalanceReduce {
                 portfolio_id,
                 position_epoch,
                 asset_index,
                 reduce_q,
-            } => handle_rebalance_reduce(
-                program_id,
-                accounts,
-                portfolio_id,
-                position_epoch,
-                asset_index,
-                reduce_q,
-            ),
+            } => with_matcher_invalidations(program_id, accounts, &[2], || {
+                // port135: the owner's tag-44 exit reduces outside the matcher.
+                handle_rebalance_reduce(
+                    program_id,
+                    accounts,
+                    portfolio_id,
+                    position_epoch,
+                    asset_index,
+                    reduce_q,
+                )
+            }),
             Instruction::FinalizeResetSide { asset_index, side } => {
                 handle_finalize_reset_side(program_id, accounts, asset_index, side)
             }
@@ -16429,6 +16877,19 @@ pub mod processor {
                 asset_index,
                 authority_epoch,
             } => handle_withdraw_creator_fee(program_id, accounts, amount, asset_index, authority_epoch),
+            Instruction::SetCreatorFeePayee {
+                asset_index,
+                market_id,
+                payee,
+                authority_epoch,
+            } => handle_set_creator_fee_payee(
+                program_id,
+                accounts,
+                asset_index,
+                market_id,
+                payee,
+                authority_epoch,
+            ),
             Instruction::InitVaultLp { junior_floor_bps } => {
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)?;
                 init_vault_lp_min_leg_guard(program_id, accounts)?;
@@ -16597,7 +17058,18 @@ pub mod processor {
                 market_id,
             } => handle_set_depth_source(program_id, accounts, op, asset_index, market_id),
             Instruction::LevGuard { op, t0, key, report } => {
-                handle_lev_guard(program_id, accounts, op, t0, key, report)
+                if op == crate::lev_guard_v22::OP_LP_STOP {
+                    // port135: the LP stop force-reduces the listed opposing portfolios
+                    // (accounts 6..) against the bound vault LP (account 3), outside any matcher.
+                    let mut idxs = alloc::vec::Vec::with_capacity(accounts.len());
+                    idxs.push(3usize);
+                    idxs.extend(6..accounts.len());
+                    with_matcher_invalidations(program_id, accounts, &idxs, || {
+                        handle_lev_guard(program_id, accounts, op, t0, key, report)
+                    })
+                } else {
+                    handle_lev_guard(program_id, accounts, op, t0, key, report)
+                }
             }
             Instruction::ProposeG9FeedAllowlist { entries } => {
                 handle_propose_g9_feed_allowlist(program_id, accounts, &entries)
@@ -23652,9 +24124,28 @@ pub mod processor {
             // legitimate asset 1 as InvalidInstruction — one invariant, one owner.
             let mut claim_profile =
                 read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
-            if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
-                return Err(PercolatorError::Unauthorized.into());
-            }
+            // prog#587: a burned (`[0; 32]`) `asset_admin` with a recorded payee routes the claim to
+            // that payee, permissionlessly; a live admin keeps the signed path above byte for byte;
+            // a burned admin with no payee stays refused (CloseSlab re-books that pot).
+            use crate::creator_fee_payee_v22::{claim_route, ClaimRoute};
+            let payee_dest_owner: Option<Pubkey> = match claim_route(
+                &claim_profile.asset_admin,
+                state::profile_has_creator_fee_payee(&claim_profile),
+            ) {
+                ClaimRoute::AdminSigned => {
+                    if !live_authority_matches(&claim_profile.asset_admin, authority.key) {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
+                    None
+                }
+                ClaimRoute::Payee => Some(read_bound_creator_fee_payee(
+                    program_id,
+                    market_ai.key,
+                    asset_index,
+                    account(accounts, 6)?,
+                )?),
+                ClaimRoute::Refused => return Err(PercolatorError::Unauthorized.into()),
+            };
             // W4-AE-EXTEND: gate-2-class replay protection -- a direct
             // fund-withdrawal instruction, signer-gated on this asset's OWN
             // `asset_admin` with zero prior replay protection (the same
@@ -23668,14 +24159,35 @@ pub mod processor {
             require_authority_epoch_view(&group, asset_index as usize, expected_authority_epoch)?;
             // Phase 2b G6: creator fees vest only once the junior cushion is at target.
             p2b_creator_fee_vesting_check(&group, asset_index as usize)?;
-            let vault_balance = verify_withdrawable_token_accounts(
-                dest_token,
-                authority.key,
-                vault_token,
-                &vault_authority,
-                &cfg,
-                false,
-            )?;
+            let vault_balance = match payee_dest_owner {
+                None => verify_withdrawable_token_accounts(
+                    dest_token,
+                    authority.key,
+                    vault_token,
+                    &vault_authority,
+                    &cfg,
+                    false,
+                )?,
+                Some(payee) => {
+                    // Permissionless payout: the destination is FIXED, the payee's canonical ATA
+                    // for the vault mint, and must be unencumbered (no delegate / close
+                    // authority: the W5 rule every permissionless payout here applies).
+                    // The mint comes back from the one canonical parse (dest.mint ==
+                    // vault.mint); no second unpack of the destination.
+                    let (balance, dest_mint) = verify_withdrawable_token_accounts_with_mint(
+                        dest_token,
+                        &payee,
+                        vault_token,
+                        &vault_authority,
+                        &cfg,
+                        true,
+                    )?;
+                    if *dest_token.key != canonical_vault_address(&payee, &dest_mint) {
+                        return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+                    }
+                    balance
+                }
+            };
             // Exact capacity check, in u128 so an `amount` above u64::MAX is an
             // over-claim (rejected) rather than a `try_from` panic-adjacent
             // edge case. Reject-not-saturate, and reject the no-op zero claim.
@@ -23726,20 +24238,16 @@ pub mod processor {
             // `checked_sub` cannot fail after the clamp above; both are kept so a
             // future edit that weakens the clamp still fails closed rather than
             // wrapping a counter to ~1.8e19 claimable atoms.
-            let amount_u64 = amount as u64;
-            let from_asset = amount_u64.min(claim_profile.creator_fee_claimable_atoms);
-            claim_profile.creator_fee_claimable_atoms = claim_profile
-                .creator_fee_claimable_atoms
-                .checked_sub(from_asset)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            let from_legacy = amount_u64
-                .checked_sub(from_asset)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            if from_legacy != 0 {
-                cfg.creator_fee_claimable_atoms = cfg
-                    .creator_fee_claimable_atoms
-                    .checked_sub(from_legacy)
-                    .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            // prog#587: one pure exact-debit rule (Kani `kani_587_claim_debit_conserves`).
+            let (asset_after, legacy_after) = crate::creator_fee_payee_v22::split_claim_debit(
+                claim_profile.creator_fee_claimable_atoms,
+                legacy_pot,
+                transfer_amount_u64,
+            )
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            claim_profile.creator_fee_claimable_atoms = asset_after;
+            if asset_index == 0 {
+                cfg.creator_fee_claimable_atoms = legacy_after;
             }
             write_oracle_profile_to_view(&mut group, asset_index as usize, &claim_profile)?;
             group.validate_shape().map_err(map_v16_error)?;
@@ -23760,6 +24268,144 @@ pub mod processor {
             transfer_amount_u64,
             signer_seeds,
         )
+    }
+
+    /// prog#587: reads and binds the payee PDA tag 90 takes as `[6]` on a burned asset's payee
+    /// route. The account must be THIS market + asset's PDA, owned by this program, a valid kind 19
+    /// record whose stored market / asset index match. Returns the payee wallet.
+    fn read_bound_creator_fee_payee(
+        program_id: &Pubkey,
+        market_key: &Pubkey,
+        asset_index: u16,
+        payee_ai: &AccountInfo,
+    ) -> Result<Pubkey, ProgramError> {
+        let (pda, _) = state::derive_creator_fee_payee(program_id, market_key, asset_index);
+        if *payee_ai.key != pda || payee_ai.owner != program_id {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let rec = state::read_creator_fee_payee(&payee_ai.try_borrow_data()?)?;
+        if !crate::creator_fee_payee_v22::record_binds(&rec, &market_key.to_bytes(), asset_index) {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        Ok(Pubkey::new_from_array(rec.payee))
+    }
+
+    /// SetCreatorFeePayee (tag 125, prog#587). Records the wallet that receives `asset_index`'s
+    /// creator fee once its `asset_admin` is burned.
+    ///
+    /// Spec fit (upstream README, "Authority model"): `asset_admin` rotates an asset's
+    /// sub-authorities and burning it freezes their current holders. The payee is treated exactly
+    /// like such a holder: only the LIVE `asset_admin` may set or replace it (it could already
+    /// withdraw the whole creator pot to any account it owns, so this grants nothing new), and
+    /// after the burn no key can change it. Like tag 65 it is Live-only, generation-checked, and a
+    /// CAS + advance of the asset's `authority_epoch` lane (a held, stale "set payee" intent cannot
+    /// replay over a later one); a no-op (same payee) is refused (AUD-S1-9).
+    #[inline(never)]
+    fn handle_set_creator_fee_payee<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+        market_id: u64,
+        payee: [u8; 32],
+        authority_epoch: u64,
+    ) -> ProgramResult {
+        let admin = account(accounts, 0)?;
+        let market_ai = account(accounts, 1)?;
+        let payee_ai = account(accounts, 2)?;
+        let system_program_ai = account(accounts, 3)?;
+        expect_signer(admin)?;
+        expect_writable(market_ai)?;
+        expect_writable(payee_ai)?;
+        expect_owner(market_ai, program_id)?;
+        if system_program_ai.key != &system_program::ID {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let (pda, bump) = state::derive_creator_fee_payee(program_id, market_ai.key, asset_index);
+        if *payee_ai.key != pda {
+            return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+        }
+        let fresh = payee_ai.data_is_empty();
+        let current_payee: Option<[u8; 32]> = if fresh {
+            None
+        } else {
+            if payee_ai.owner != program_id {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            let old = state::read_creator_fee_payee(&payee_ai.try_borrow_data()?)?;
+            if !crate::creator_fee_payee_v22::record_binds(&old, &market_ai.key.to_bytes(), asset_index)
+                || old.bump != bump
+            {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            Some(old.payee)
+        };
+        {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (cfg, mut group) = state::market_view_mut(&mut data)?;
+            if group.header.mode != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+            let idx = asset_index as usize;
+            if idx >= group.header.config.max_market_slots.get() as usize {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            require_asset_generation_view(&group, idx, market_id)?;
+            let mut profile = read_oracle_profile_from_view(&group, &cfg, idx)?;
+            // A burned admin can never pass: `payee_update_allowed` requires a non-zero admin
+            // equal to the signer (Kani `kani_587_payee_frozen_after_burn`).
+            let current_ref = if state::profile_has_creator_fee_payee(&profile) {
+                current_payee.as_ref()
+            } else {
+                None
+            };
+            // att644 L-1: the market's own vault_authority can never be the payee (its canonical
+            // ATA is the vault, which every payout refuses as a destination).
+            let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+            if !crate::creator_fee_payee_v22::payee_update_allowed(
+                &profile.asset_admin,
+                &admin.key.to_bytes(),
+                current_ref,
+                &payee,
+                &vault_authority.to_bytes(),
+            ) {
+                return Err(PercolatorError::CreatorFeePayeeInvalid.into());
+            }
+            advance_authority_epoch_view(&mut group, idx, authority_epoch)?;
+            profile._padding0[crate::constants::PROFILE_P4_FLAGS_IDX] =
+                crate::creator_fee_payee_v22::with_payee_bit(state::profile_p4_flags(&profile), true);
+            write_oracle_profile_to_view(&mut group, idx, &profile)?;
+            group.validate_shape().map_err(map_v16_error)?;
+        }
+        if fresh {
+            expect_writable(admin)?;
+            let bump_bytes = [bump];
+            let idx_bytes = asset_index.to_le_bytes();
+            let seeds: &[&[u8]] = &[
+                crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_SEED,
+                market_ai.key.as_ref(),
+                idx_bytes.as_ref(),
+                bump_bytes.as_ref(),
+            ];
+            create_pda_account(
+                admin,
+                payee_ai,
+                system_program_ai,
+                state::creator_fee_payee_account_len(),
+                program_id,
+                seeds,
+            )?;
+        }
+        let rec = state::CreatorFeePayeeV22 {
+            market: market_ai.key.to_bytes(),
+            payee,
+            asset_index,
+            version: crate::creator_fee_payee_v22::CREATOR_FEE_PAYEE_VERSION,
+            bump,
+            _reserved: [0u8; 4],
+        };
+        state::write_creator_fee_payee(&mut payee_ai.try_borrow_mut_data()?, &rec, fresh)?;
+        solana_program::log::sol_log("creator_fee_payee_set");
+        Ok(())
     }
 
     /// SetProtocolFeeAuthority (tag 85, design §3.2). Rotates
@@ -24973,7 +25619,14 @@ pub mod processor {
             moved = true;
         }
         // Legacy market-wide creator pot: claimable by asset 0's admin (GH#420).
-        if cfg.creator_fee_claimable_atoms != 0 && asset0.asset_admin == [0u8; 32] {
+        // prog#587: a burned admin's pot is orphaned ONLY when no payee was recorded before the
+        // burn; a payee-backed pot keeps its tag 90 exit and stays owed (CloseSlab waits for it).
+        use crate::creator_fee_payee_v22::creator_pot_orphaned;
+        if creator_pot_orphaned(
+            &asset0.asset_admin,
+            state::profile_has_creator_fee_payee(&asset0),
+            cfg.creator_fee_claimable_atoms,
+        ) {
             cfg.protocol_fee_accrued_atoms = cfg
                 .protocol_fee_accrued_atoms
                 .checked_add(cfg.creator_fee_claimable_atoms as u128)
@@ -24989,7 +25642,11 @@ pub mod processor {
                 .get(..constants::ASSET_ORACLE_PROFILE_LEN)
                 .ok_or(PercolatorError::InvalidAccountLen)?;
             let mut profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(bytes);
-            if profile.creator_fee_claimable_atoms != 0 && profile.asset_admin == [0u8; 32] {
+            if creator_pot_orphaned(
+                &profile.asset_admin,
+                state::profile_has_creator_fee_payee(&profile),
+                profile.creator_fee_claimable_atoms,
+            ) {
                 cfg.protocol_fee_accrued_atoms = cfg
                     .protocol_fee_accrued_atoms
                     .checked_add(profile.creator_fee_claimable_atoms as u128)
@@ -27680,6 +28337,14 @@ pub mod processor {
                     profile.backing_bucket_authority = backing_bucket_authority;
                     profile.oracle_authority = oracle_authority;
                     profile.asset_admin = authority.key.to_bytes();
+                    // prog#587: a (re-)activated slot is a new creator's asset; it never inherits
+                    // an earlier generation's creator-fee payee (RETIRE already wrote a fresh
+                    // profile; this pins it for any other activation source).
+                    profile._padding0[constants::PROFILE_P4_FLAGS_IDX] =
+                        crate::creator_fee_payee_v22::with_payee_bit(
+                            state::profile_p4_flags(&profile),
+                            false,
+                        );
                     if asset_index == 0 {
                         mirror_manual_profile_to_base_config(&mut cfg, &profile, true);
                     }
@@ -30638,6 +31303,59 @@ pub mod processor {
         }
     }
 
+    /// port135 (ADOPT upstream `0c5d4f4f`, adapted): run `f`; then, on success, invalidate the
+    /// matcher capability of each `accounts[idxs]` whose position vector `f` changed, when that
+    /// portfolio had an ENABLED capability on a matcher that is NOT position-synced
+    /// (`state::matcher_program_is_position_synced`). The epoch is NOT advanced (this fork's
+    /// trades and owner exits do not advance it, AUD-S1-23). Cost on the common path (no
+    /// enabled legacy matcher): one 104-byte config read per listed account, no snapshot.
+    /// Non-portfolio, foreign-owned or read-only entries are ignored (LP_STOP may list skipped
+    /// accounts); an index past the end is ignored.
+    #[inline(never)]
+    fn with_matcher_invalidations<'a, F: FnOnce() -> ProgramResult>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        idxs: &[usize],
+        f: F,
+    ) -> ProgramResult {
+        let mut watched: alloc::vec::Vec<(usize, PositionVector)> = alloc::vec::Vec::new();
+        for &i in idxs {
+            if let Some(ai) = accounts.get(i) {
+                if let Some(before) = unsynchronized_matcher_watch(program_id, ai) {
+                    watched.push((i, before));
+                }
+            }
+        }
+        f()?;
+        for (i, before) in watched {
+            let ai = &accounts[i];
+            if snapshot_position_vector(ai).as_ref() != Some(&before) {
+                let mut data = ai.try_borrow_mut_data()?;
+                state::invalidate_unsynchronized_matcher_capability(&mut data)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// port135: the pre-call position vector of a writable, program-owned portfolio whose matcher
+    /// capability is enabled on a NON-position-synced matcher; `None` otherwise (nothing to
+    /// invalidate).
+    #[inline(never)]
+    fn unsynchronized_matcher_watch(
+        program_id: &Pubkey,
+        ai: &AccountInfo<'_>,
+    ) -> Option<PositionVector> {
+        if ai.owner != program_id || !ai.is_writable {
+            return None;
+        }
+        let data = ai.try_borrow_data().ok()?;
+        let cfg = state::read_portfolio_matcher_config(&data).ok()?;
+        if cfg.enabled() != 1 || state::matcher_program_is_position_synced(&cfg.matcher_program) {
+            return None;
+        }
+        state::portfolio_position_vector(&data)
+    }
+
     /// Run `f`, then advance `position_epoch` on each of `accounts[idxs]` whose position vector
     /// it changed (AUD-S1-23). Snapshots are taken only when `f` will run; on an error nothing is
     /// bumped (the instruction fails).
@@ -30653,6 +31371,11 @@ pub mod processor {
         f()?;
         for (k, &i) in idxs.iter().enumerate().take(2) {
             if let Some(ai) = accounts.get(i) {
+                // port135: the same portfolio passed at both indices (e.g. SettleHoldingRent on
+                // the vault LP itself) is bumped once.
+                if k == 1 && idxs.first().and_then(|&j| accounts.get(j)).map(|a| a.key) == Some(ai.key) {
+                    continue;
+                }
                 bump_position_epoch_if_reshaped(ai, before[k].take())?;
             }
         }
@@ -34224,20 +34947,24 @@ pub mod processor {
     }
 
     /// Phase 4 item 3: take the capacity-bond coupon off the TOP of one harvested LP fee leg
-    /// (tag 78's bound tail). Returns `(coupon, rest, C_b after)`; `(0, available, 0)` when the
+    /// (tag 78's bound tail). Returns `(coupon, rest, K after)`; `(0, available, 0)` when the
     /// market has no bond tranche. Once the registry's bond flag is set, [9] bond_tranche (w) is
     /// REQUIRED (fail closed; [7] ext and [8] the vault LP portfolio must then be passed too).
     ///
-    /// `coupon = min(coupon_due, available / 2)` (M-2: never more than half of a leg) with
-    /// `coupon_due = min(C_b, bond value) * rate * dt / (1e4 * 1y)` (M-1),
-    /// `rate = base + bonus * min(u_last, u_now)` (bonus forced 0, L-2) and `dt` since the last
-    /// checkpoint. The coupon
-    /// atoms stay in the pots (already harvested there as principal) and are credited to `C_b`, so
-    /// the split hands them to the bonds. NON-CUMULATIVE: the checkpoint moves to "now" whatever
-    /// was paid. Closed (coupon 0) unless Live, the tranche is non-empty and NO senior principal
-    /// loss is outstanding: the coupon never takes priority over Earn principal (I-T7). The
-    /// utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward the
-    /// seniors), never as full.
+    /// CUMULATIVE (GH#571, `bond_v20` I-T7): first SETTLE the interval since the checkpoint
+    /// (`bond_v20::coupon_settle` on `K = c_b_atoms`, rate `base + bonus * min(u_last, u_now)`,
+    /// bonus forced 0 by L-2; the sub-atom remainder carried; capped): `K += x`, `R += x`. Then
+    /// PAY `min(R, leg / 2)` (M-2) off the top of the leg: `R` drops and `K` is unchanged, so the
+    /// coupon atoms (already harvested into the pots) land in the junior's residual: the junior is
+    /// reimbursed for the coupon it fronted. Accrual gate: Live, `K > 0`, the tranche whole
+    /// (M-1, its layer of V BEFORE this leg), NO senior draw outstanding, AND the interval clean
+    /// (`bond_interval_clean`, att649 F2: the gate was open at the last settlement and no draw was
+    /// booked since, so a closed window is forfeited even if it reopened before this crank).
+    /// Payment gate: the gate NOW (Live, `K > 0`, whole, no draw outstanding; the interval rule
+    /// does not apply to paying), or Live + no draw outstanding + an EMPTY tranche (the
+    /// receivable outlives the last bond).
+    /// The utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward
+    /// the seniors), never as full.
     #[inline(never)]
     fn bond_coupon_take<'a>(
         program_id: &Pubkey,
@@ -34252,57 +34979,76 @@ pub mod processor {
         else {
             return Ok((0, available, 0));
         };
+        let k = t.c_b_atoms;
         expect_writable(t_ai)?;
         let now = authenticated_slot_or_fallback(t.last_coupon_slot);
         let live = state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
             == MarketModeV16::Live;
-        // M-1 (security review 2026-10-05): the coupon accrues on min(C_b, bond value) and is
+        let draw = st.senior_draw_outstanding_atoms;
+        // M-1 (security review 2026-10-05): the coupon accrues on min(K, bond value) and is
         // forfeited while the tranche is impaired. The bond value is its layer of V BEFORE this
         // crank's leg.
         // N-1 (re-review 2026-10-06): if the vault LP cannot be valued now (stale certificate with
         // inventory) the crank FAILS CLOSED (`VaultLpValuationStale`) instead of harvesting the leg
         // with the coupon deferred: a deferral let anyone time 78 ahead of the keeper's LP refresh
         // and starve the bonds. The vault-LP crank is permissionless; bundle it before 78.
-        let pre_open = live && t.c_b_atoms > 0 && st.senior_draw_outstanding_atoms == 0;
+        let pre_open = live && k > 0 && draw == 0;
         let bond_value = if pre_open {
-            bond_value_before_leg(program_id, accounts, st, registry, t.c_b_atoms, available)?
+            bond_value_before_leg(program_id, accounts, st, registry, k, available)?
         } else {
             0
         };
-        let open =
-            bond_v20::coupon_gate_open(live, t.c_b_atoms, st.senior_draw_outstanding_atoms, bond_value);
+        // the gate NOW, and whether the interval since the last settlement may accrue (F2)
+        let open_now = bond_v20::coupon_gate_open(live, k, draw, bond_value);
+        let open = open_now && bond_interval_clean(&t, st);
         let u_now = if open && t.coupon_util_bonus_bps != 0 {
             bond_util_now_bps(program_id, accounts, st).unwrap_or(0)
         } else {
             0
         };
         let u_eff = if u_now < t.last_util_bps { u_now } else { t.last_util_bps };
-        let due = if open {
-            bond_v20::coupon_due(
-                bond_v20::coupon_base(t.c_b_atoms, bond_value),
-                bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff),
-                now.saturating_sub(t.last_coupon_slot),
-            )
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?
-        } else {
-            0
-        };
-        let (coupon, rest) = bond_v20::bond_coupon_split(available, due);
-        t.c_b_atoms = t
-            .c_b_atoms
-            .checked_add(coupon)
+        let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, u_eff);
+        let (accrued, rem) = bond_v20::coupon_settle(
+            k,
+            t.coupon_unfunded_atoms,
+            t.coupon_accrual_rem,
+            rate,
+            now.saturating_sub(t.last_coupon_slot),
+            open,
+            bond_value,
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.c_b_atoms = k.checked_add(accrued).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let r = t
+            .coupon_arrears_atoms
+            .checked_add(accrued)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        let u = t
+            .coupon_unfunded_atoms
+            .checked_add(accrued)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_accrual_rem = rem;
+        // the PAYMENT depends on the gate now only (the interval rule is about accrual)
+        let (coupon, rest, r_after) = if bond_v20::coupon_pay_open(open_now, live, k, draw) {
+            bond_v20::coupon_pay_from_leg(available, r)
+        } else {
+            (0, available, r)
+        };
+        t.coupon_arrears_atoms = r_after;
+        // a payment funds the current shares' unfunded coupon first (frees their cap headroom)
+        t.coupon_unfunded_atoms = u.saturating_sub(coupon);
         t.coupon_paid_total_atoms = t
             .coupon_paid_total_atoms
             .saturating_add(u64::try_from(coupon).unwrap_or(u64::MAX));
         if now > t.last_coupon_slot {
             t.last_coupon_slot = now;
         }
+        t.coupon_gate_seen = bond_gate_seen(st, open_now);
         t.last_util_bps = u_now;
         state::write_bond_tranche(&mut t_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_coupon available={} due={} coupon={} c_b={} bond_value={} open={}",
-            available, due, coupon, t.c_b_atoms, bond_value, open
+            "bond_coupon available={} accrued={} coupon={} k={} receivable={} bond_value={} open={}",
+            available, accrued, coupon, t.c_b_atoms, t.coupon_arrears_atoms, bond_value, open
         ));
         Ok((coupon, rest, t.c_b_atoms))
     }
@@ -34448,8 +35194,9 @@ pub mod processor {
         accounts: &'a [AccountInfo<'a>],
         st: &state::VaultLpStateV18,
         available: u128,
-        // Phase 4 item 3: the bonds' claim AFTER this crank's coupon (0 without a tranche). The
-        // junior's level excludes it: bond value is never the junior's cushion.
+        // Phase 4 item 3: the bonds' claim AFTER this crank's coupon (0 without a tranche), incl.
+        // its settled coupon (GH#571: `K`). The junior's level excludes it: bond value (and coupon
+        // the bonds are owed) is never the junior's cushion.
         bond_claim: u128,
     ) -> Result<(u128, u128), ProgramError> {
         let base = vault_lp_v18::split_fee(available, st.senior_fee_share_bps)
@@ -37606,9 +38353,12 @@ pub mod processor {
         // Phase 4 item 3: once the market's bond tranche exists, [12] is REQUIRED (fail closed):
         // the junior is the residual over the seniors AND the bonds' claim, so it can never
         // withdraw bond value. ([11] must then be passed too, as the ext slot.)
-        let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)?
-            .map(|(_, t)| t.c_b_atoms)
-            .unwrap_or(0);
+        // GH#571: the claim `K` plus the accrual not yet settled (an upper bound), so the
+        // junior cannot withdraw coupon the bonds are accruing between settlements.
+        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 12, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,
+            None => 0,
+        };
         // #636: NAV sample at the flow ([11] vault ext, [12] bond tranche slot, [13] lev guard).
         let nav_before = lev_nav_flow_begin(program_id, accounts, 13, 11, market_ai, lp_ai, vault_lp_ai)?;
         {
@@ -40745,9 +41495,11 @@ pub mod processor {
         )?;
         // Phase 4 item 3: once the bond tranche exists, [9] is REQUIRED (fail closed) so L-3
         // measures the junior net of the bonds' claim.
-        let bond_claim = load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)?
-            .map(|(_, t)| t.c_b_atoms)
-            .unwrap_or(0);
+        // GH#571: `K` plus the unsettled accrual (upper bound), as tag 97.
+        let bond_claim = match load_bond_tranche_if_flagged(program_id, accounts, 9, market_ai.key, &registry)? {
+            Some((_, t)) => t.claim_upper_bound_at(Clock::get()?.slot)?,
+            None => 0,
+        };
         // #636: NAV sample at the flow ([7] vault ext, [9] bond tranche slot, [10] lev guard).
         let nav_before = lev_nav_flow_begin(program_id, accounts, 10, 7, market_ai, lp_ai, vault_lp_ai)?;
         // Fund an insolvent vault LP and book any pending draw FIRST (both refuse below).
@@ -41395,9 +42147,11 @@ pub mod processor {
         // exists, [11] is REQUIRED there (fail closed). The Live path only moves pot surplus into
         // vault-LP capital (value-neutral), so it does not read the tranche.
         let bond_claim = if resolved {
-            load_bond_tranche_if_flagged(program_id, accounts, 11, market_ai.key, &registry)?
-                .map(|(_, t)| t.c_b_atoms)
-                .unwrap_or(0)
+            // GH#571: the whole claim `K` incl. the settled coupon (nothing accrues once Resolved).
+            match load_bond_tranche_if_flagged(program_id, accounts, 11, market_ai.key, &registry)? {
+                Some((_, t)) => t.claim_total()?,
+                None => 0,
+            }
         } else {
             0
         };
@@ -41909,7 +42663,7 @@ pub mod processor {
     //
     // Pure math: `bond_v20`. Loss order junior -> bonds -> Earn seniors -> insurance -> winner
     // haircut. The bonds' VALUE is the middle layer of `bond_v20::tranche_split3(V, C_s, C_b)`;
-    // `C_b` moves only with 108 (+amount), 110 (-pro-rata slice) and the 78 coupon (+coupon).
+    // `C_b` moves only with 108 (+amount), 110 (-pro-rata slice) and every coupon settlement (+x, tags 78 / 108 / 110; GH#571).
     // The P3 senior draw needs no bond booking: it already treats all pot value above C_eff
     // (junior AND bond) as subordinate (see the `bond_v20` module doc).
 
@@ -42166,6 +42920,60 @@ pub mod processor {
         Ok((registry, registry_pda, st, t))
     }
 
+    /// GH#571 (att649 F2): `bond_v20::coupon_gate_seen` of the vault-LP state.
+    fn bond_gate_seen(st: &state::VaultLpStateV18, open_now: bool) -> u64 {
+        bond_v20::coupon_gate_seen(st.senior_drawn_atoms, open_now)
+    }
+
+    /// GH#571 (att649 F2): `bond_v20::coupon_interval_clean` for this tranche and vault-LP state.
+    fn bond_interval_clean(t: &state::BondTrancheV20, st: &state::VaultLpStateV18) -> bool {
+        bond_v20::coupon_interval_clean(t.coupon_gate_seen, st.senior_drawn_atoms)
+    }
+
+    /// GH#571: settle the coupon accrued since `t.last_coupon_slot` (off tag 78: base rate, nothing
+    /// is paid): `K += x`, `R += x`, the sub-atom remainder carried, and move the checkpoint to
+    /// `now` (never back). `open_now` is the coupon gate NOW; the interval accrues only if it is
+    /// open AND the interval is clean (`bond_interval_clean`); otherwise it is forfeited (M-1 /
+    /// att649 F2) and everything settled is kept. Records the gate memory. `zero_rem` (tag 108):
+    /// drop the carried sub-atom so the newcomer never shares the incumbents' unsettled accrual
+    /// (the INCUMBENTS forfeit < 1 atom).
+    #[inline(never)]
+    fn bond_settle_coupon_to(
+        t: &mut state::BondTrancheV20,
+        st: &state::VaultLpStateV18,
+        now: u64,
+        open_now: bool,
+        zero_rem: bool,
+    ) -> ProgramResult {
+        let open = open_now && bond_interval_clean(t, st);
+        let rate = bond_v20::bond_coupon_rate_bps(t.coupon_bps_per_year, t.coupon_util_bonus_bps, 0);
+        let (x, rem) = bond_v20::coupon_settle(
+            t.c_b_atoms,
+            t.coupon_unfunded_atoms,
+            t.coupon_accrual_rem,
+            rate,
+            now.saturating_sub(t.last_coupon_slot),
+            open,
+            t.c_b_atoms,
+        )
+        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_unfunded_atoms = t
+            .coupon_unfunded_atoms
+            .checked_add(x)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.c_b_atoms = t.c_b_atoms.checked_add(x).ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_arrears_atoms = t
+            .coupon_arrears_atoms
+            .checked_add(x)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        t.coupon_accrual_rem = if zero_rem { 0 } else { rem };
+        t.coupon_gate_seen = bond_gate_seen(st, open_now);
+        if now > t.last_coupon_slot {
+            t.last_coupon_slot = now;
+        }
+        Ok(())
+    }
+
     /// Phase 4 — BondDeposit (tag 108). Depositor-signed, Live only.
     ///
     /// Accounts: 0 depositor [signer, w] (pays the position's rent on first deposit) ·
@@ -42254,17 +43062,19 @@ pub mod processor {
         if st.senior_draw_outstanding_atoms != 0 || st.backstop_outstanding_atoms != 0 {
             return Err(PercolatorError::VaultLpPausedForSeniorDraw.into());
         }
+        let now = Clock::get()?.slot;
+        // GH#571: the core SETTLES the coupon accrued up to `now` into `K` and `R` (never forfeits
+        // it) and prices the new shares on the whole claim `K` (settled coupon included).
         let minted = bond_deposit_core(
             program_id,
             accounts,
             &registry,
             &registry_pda,
             &st,
-            &t,
-            [amount as u128, min_shares, max_market_slots as u128],
+            &mut t,
+            [amount as u128, min_shares, max_market_slots as u128, now as u128],
         )?;
         transfer_tokens(token_program, source_token, vault_token, depositor, amount)?;
-        let now = Clock::get()?.slot;
         // Position: create on the first deposit.
         let mut pos = if position_ai.data_is_empty() {
             let (pda, bump) =
@@ -42304,6 +43114,9 @@ pub mod processor {
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         state::write_bond_position(&mut position_ai.try_borrow_mut_data()?, &pos)?;
         let amount = amount as u128;
+        // GH#571: the new shares carry the pool's unfunded-coupon ratio (per-share cap)
+        t.coupon_unfunded_atoms = bond_v20::coupon_meter_after_deposit(t.coupon_unfunded_atoms, t.c_b_atoms, amount)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         t.c_b_atoms = t
             .c_b_atoms
             .checked_add(amount)
@@ -42316,22 +43129,22 @@ pub mod processor {
             .principal_in_lp_atoms
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // The fee leg was harvested (refused otherwise), so moving the checkpoint forfeits
-        // nothing earned; the newcomer accrues coupon only from now (no coupon farming).
-        if now > t.last_coupon_slot {
-            t.last_coupon_slot = now;
-        }
+        // GH#571: the checkpoint was moved to `now` by the settlement inside the core, AFTER the
+        // accrual up to `now` was settled into `K` (and `R`): nothing earned is forfeited (but the
+        // incumbents' carried sub-atom), and the newcomer, who paid `K / B` per share, accrues
+        // only from now.
         t.bond_drawn_outstanding_atoms = 0;
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         solana_program::log::sol_log(&alloc::format!(
-            "bond_deposit amount={} minted={} c_b={} b={}",
-            amount, minted, t.c_b_atoms, t.b_shares_total
+            "bond_deposit amount={} minted={} k={} receivable={} b={}",
+            amount, minted, t.c_b_atoms, t.coupon_arrears_atoms, t.b_shares_total
         ));
         lev_nav_flow_end(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai, nav_before, (amount, 0))
     }
 
     /// The value side of tag 108 inside one market borrow: pricing, gates, the engine deposit.
-    /// `args = [amount, min_shares, max_market_slots]`. Returns the shares minted.
+    /// `args = [amount, min_shares, max_market_slots, now]`. Returns the shares minted; SETTLES
+    /// the coupon into `t` (GH#571: `K`, `R`, the remainder, `last_coupon_slot`).
     #[inline(never)]
     fn bond_deposit_core<'a>(
         program_id: &Pubkey,
@@ -42339,10 +43152,10 @@ pub mod processor {
         registry: &state::LpVaultRegistryV16,
         registry_pda: &Pubkey,
         st: &state::VaultLpStateV18,
-        t: &state::BondTrancheV20,
-        args: [u128; 3],
+        t: &mut state::BondTrancheV20,
+        args: [u128; 4],
     ) -> Result<u128, ProgramError> {
-        let [amount, min_shares, max_market_slots] = args;
+        let [amount, min_shares, max_market_slots, now] = args;
         let market_ai = account(accounts, 1)?;
         let lp_ai = account(accounts, 4)?;
         let own_ledger_ai = account(accounts, 5)?;
@@ -42396,20 +43209,37 @@ pub mod processor {
             bond_v20::vault_value_worse(nav, lp_value, worse),
             backstop,
         );
-        if v_worse < c_eff || bond_v20::bond_impaired(v_worse, c_eff, t.c_b_atoms) {
+        if v_worse < c_eff || bond_v20::bond_impaired(v_worse, c_eff, t.claim_total()?) {
             return Err(PercolatorError::BondTrancheImpaired.into());
         }
-        let split = bond_v20::tranche_split3(v, c_eff, t.c_b_atoms);
-        let c_b_after = t
-            .c_b_atoms
+        // GH#571: SETTLE the coupon accrued since the checkpoint (`K += x`, `R += x`). The gate is
+        // open here whenever `K > 0` (Live; no senior draw / backstop, refused by the caller;
+        // whole at the worse price, just checked) unless a draw was booked since the last
+        // settlement (forfeit). Rate: the base rate (the utilisation term is `min(u_last, u_now)`
+        // and counts as 0 off tag 78, toward the seniors; the bonus is forced 0 by L-2 anyway).
+        // The carried sub-atom is DROPPED (the incumbents forfeit < 1 atom; the newcomer never
+        // shares their unsettled accrual).
+        bond_settle_coupon_to(t, st, now as u64, t.c_b_atoms > 0, true)?;
+        // After a successful deposit the gate is OPEN going forward (Live, `K > 0`, no draw, whole
+        // at the worse price), also for the genesis deposit (whose settlement saw `K == 0`).
+        t.coupon_gate_seen = bond_gate_seen(st, true);
+        let k = t.claim_total()?;
+        // The settled claim must itself be covered at the worse price: a deposit never buys into
+        // settled coupon the vault cannot back.
+        if bond_v20::bond_impaired(v_worse, c_eff, k) {
+            return Err(PercolatorError::BondTrancheImpaired.into());
+        }
+        let split = bond_v20::tranche_split3(v, c_eff, k);
+        let k_after = k
             .checked_add(amount)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         // GH#574: the cap's junior is read at the SAME worse-for-the-vault price as the impairment
-        // check above, not at the effective price.
-        if !bond_v20::bond_deposit_cap_ok_at_worse(v_worse, c_eff, t.c_b_atoms, c_b_after, t.bond_cap_bps_of_c) {
+        // check above, not at the effective price. GH#571: on the whole claim `K`.
+        if !bond_v20::bond_deposit_cap_ok_at_worse(v_worse, c_eff, k, k_after, t.bond_cap_bps_of_c) {
             return Err(PercolatorError::BondDepositAboveCap.into());
         }
-        // Not impaired => the tranche is worth exactly its claim: mint at par.
+        // Not impaired => the tranche is worth exactly its claim `K`: mint at `K / B`,
+        // so the newcomer pays for the incumbents' settled coupon (GH#571 newcomer neutrality).
         let minted = bond_v20::bond_shares_for_deposit(amount, t.b_shares_total, split.bond)
             .ok_or(PercolatorError::BondTrancheImpaired)?;
         if minted == 0 || minted < min_shares {
@@ -42572,13 +43402,14 @@ pub mod processor {
         }
         let (payout, impairment) = match mode {
             MarketModeV16::Live => {
+                // GH#571: the core SETTLES the coupon up to `now` into `K` and `R` before pricing.
                 bond_withdraw_live_core(
                     accounts,
                     &registry,
                     &registry_pda,
                     &st,
-                    &t,
-                    [shares, min_out as u128, max_market_slots as u128],
+                    &mut t,
+                    [shares, min_out as u128, max_market_slots as u128, now as u128],
                 )?
             }
             MarketModeV16::Resolved => {
@@ -42592,6 +43423,9 @@ pub mod processor {
                 };
                 expect_writable(source_ledger_ai)?;
                 expect_owner(source_ledger_ai, program_id)?;
+                // GH#571: nothing accrues once the market is not Live (gate closed); the settled
+                // coupon stays in `K` and is paid from the pots' surplus below.
+                bond_settle_coupon_to(&mut t, &st, now, false, false)?;
                 bond_withdraw_resolved_core(
                     accounts,
                     &registry,
@@ -42619,7 +43453,13 @@ pub mod processor {
             )?;
         }
         let total = t.b_shares_total;
+        // GH#571: remove the redeemed shares' pro-rata slice `floor(sh * K / B)` of the claim (the
+        // payout above when whole). The receivable `R` is NOT touched (att649 F1): an exit never
+        // cancels what the fee legs owe the junior, so a deposit/redeem round trip is neutral.
         t.c_b_atoms = bond_v20::bond_claim_after_redemption(t.c_b_atoms, shares, total)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        // the cap meter leaves with the shares (the stayers' per-share headroom is unchanged)
+        t.coupon_unfunded_atoms = bond_v20::coupon_meter_after_redemption(t.coupon_unfunded_atoms, shares, total)
             .ok_or(PercolatorError::EngineCounterUnderflow)?;
         t.b_shares_total = total
             .checked_sub(shares)
@@ -42627,10 +43467,8 @@ pub mod processor {
         if mode == MarketModeV16::Live {
             t.principal_in_lp_atoms = t.principal_in_lp_atoms.saturating_sub(payout);
         }
-        // 110 requires the fee leg harvested (refused otherwise): nothing earned is forfeited.
-        if now > t.last_coupon_slot {
-            t.last_coupon_slot = now;
-        }
+        // GH#571: the checkpoint was moved by the settlement above, after the accrual up to now
+        // was settled into `K` (Live) -- nothing earned is forfeited.
         t.bond_drawn_outstanding_atoms = if t.c_b_atoms == 0 { 0 } else { impairment };
         state::write_bond_tranche(&mut tranche_ai.try_borrow_mut_data()?, &t)?;
         pos.shares = pos
@@ -42643,25 +43481,26 @@ pub mod processor {
         // vault LP's capital does, and the halt compares that capital against T live).
         let _ = (&registry, &registry_pda, &st);
         solana_program::log::sol_log(&alloc::format!(
-            "bond_withdraw shares={} payout={} c_b={} b={} impairment={}",
-            shares, payout, t.c_b_atoms, t.b_shares_total, impairment
+            "bond_withdraw shares={} payout={} k={} receivable={} b={} impairment={}",
+            shares, payout, t.c_b_atoms, t.coupon_arrears_atoms, t.b_shares_total, impairment
         ));
         let other = if live { (0, payout) } else { (0, 0) };
         lev_nav_flow_end(program_id, accounts, 14, 13, market_ai, lp_ai, vault_lp_ai, nav_before, other)
     }
 
     /// Tag 110 Live value side inside one market borrow. `args = [shares, min_out,
-    /// max_market_slots]`. Returns `(payout, impairment observed)`.
+    /// max_market_slots, now]`. Returns `(payout, impairment observed)`. SETTLES the coupon into
+    /// `t` (GH#571) before the bond is priced on its whole claim `K`.
     #[inline(never)]
     fn bond_withdraw_live_core<'a>(
         accounts: &'a [AccountInfo<'a>],
         registry: &state::LpVaultRegistryV16,
         registry_pda: &Pubkey,
         st: &state::VaultLpStateV18,
-        t: &state::BondTrancheV20,
-        args: [u128; 3],
+        t: &mut state::BondTrancheV20,
+        args: [u128; 4],
     ) -> Result<(u128, u128), ProgramError> {
-        let [shares, min_out, max_market_slots] = args;
+        let [shares, min_out, max_market_slots, now] = args;
         let market_ai = account(accounts, 1)?;
         let lp_ai = account(accounts, 4)?;
         let own_ledger_ai = account(accounts, 5)?;
@@ -42714,7 +43553,14 @@ pub mod processor {
             bond_v20::vault_value_worse(nav, lp_value, worse),
             st.backstop_outstanding_atoms as u128,
         );
-        let bond_value = bond_v20::tranche_split3(v_worse, c_eff, t.c_b_atoms).bond;
+        // GH#571: settle the accrual up to now. Gate (the 78 rule): Live, no senior draw (halted by
+        // the caller) and none booked since the last settlement, tranche whole at the worse price;
+        // otherwise the interval's accrual is forfeited (M-1 / F2) and everything settled is kept.
+        // The sub-atom remainder stays carried (the leaver forfeits its share of < 1 atom).
+        let whole = !bond_v20::bond_impaired(v_worse, c_eff, t.claim_total()?);
+        bond_settle_coupon_to(t, st, now as u64, t.c_b_atoms > 0 && whole, false)?;
+        let k = t.claim_total()?;
+        let bond_value = bond_v20::tranche_split3(v_worse, c_eff, k).bond;
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
             .ok_or(PercolatorError::BondConfigInvalid)?;
         if payout < min_out {
@@ -42743,7 +43589,7 @@ pub mod processor {
             p2b_a4_capacity_check(&group, &lp, a, c_m_before)?;
         }
         group.validate_shape().map_err(map_v16_error)?;
-        Ok((payout, bond_v20::bond_impairment(v_worse, c_eff, t.c_b_atoms)))
+        Ok((payout, bond_v20::bond_impairment(v_worse, c_eff, k)))
     }
 
     /// Tag 110 Resolved value side inside one market borrow. `args = [shares, min_out,
@@ -42783,7 +43629,9 @@ pub mod processor {
             return Err(PercolatorError::LpVaultAuthorityMismatch.into());
         }
         let physical = vault_physical_idle_backing_atoms(&group, registry.domain)?;
-        let bond_value = bond_v20::resolved_bond_value(physical, st.senior_claim_atoms, t.c_b_atoms);
+        // GH#571: the bonds whole claim `K` incl. settled coupon, ahead of the junior (102).
+        let k = t.claim_total()?;
+        let bond_value = bond_v20::resolved_bond_value(physical, st.senior_claim_atoms, k);
         let payout = bond_v20::bond_atoms_for_redemption(shares, t.b_shares_total, bond_value)
             .ok_or(PercolatorError::BondConfigInvalid)?;
         if payout < min_out {
@@ -42802,7 +43650,7 @@ pub mod processor {
             )?;
         }
         group.validate_shape().map_err(map_v16_error)?;
-        Ok((payout, bond_v20::bond_impairment(physical, st.senior_claim_atoms, t.c_b_atoms)))
+        Ok((payout, bond_v20::bond_impairment(physical, st.senior_claim_atoms, k)))
     }
 
     /// SetNftProgramId (tag 73) — creates or updates the per-market NftRegistry PDA.
@@ -43865,15 +44713,8 @@ pub mod processor {
     /// call extension (LP engine position). Only the canonical (devnet: CANONICAL_VAULT_LP_MATCHER_PROGRAM, i.e.
     /// the matcher-inventory-sync build) matcher; a default build has none, so it never sends v2.
     fn matcher_takes_lp_position(matcher_prog: &Pubkey) -> bool {
-        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
-        {
-            *matcher_prog == crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM
-        }
-        #[cfg(not(any(feature = "devnet", feature = "mainnet-ids")))]
-        {
-            let _ = matcher_prog;
-            false
-        }
+        // port135: one predicate for the ext-v2 wire AND the stale-capability policy.
+        state::matcher_program_is_position_synced(&matcher_prog.to_bytes())
     }
 
     // FIX W2 (upstream #147 + #160): a CPI trade route (TradeCpi/BatchTradeCpi) previously
@@ -49415,6 +50256,29 @@ pub mod processor {
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
     ) -> Result<u64, ProgramError> {
+        verify_withdrawable_token_accounts_with_mint(
+            dest_token_ai,
+            expected_dest_owner,
+            vault_token_ai,
+            expected_vault_owner,
+            cfg,
+            require_unencumbered_dest,
+        )
+        .map(|(vault_balance, _mint)| vault_balance)
+    }
+
+    // prog#587: same canonical parse, also threading back the validated mint (dest.mint ==
+    // vault.mint, a withdrawable collateral mint) so a caller that must pin the destination
+    // ADDRESS (the creator-fee payee's canonical ATA, tag 90 payee route) reuses the fact
+    // instead of unpacking the destination a second time (W4-TOKEN22 single-gateway rule).
+    fn verify_withdrawable_token_accounts_with_mint(
+        dest_token_ai: &AccountInfo,
+        expected_dest_owner: &Pubkey,
+        vault_token_ai: &AccountInfo,
+        expected_vault_owner: &Pubkey,
+        cfg: &WrapperConfigV16,
+        require_unencumbered_dest: bool,
+    ) -> Result<(u64, Pubkey), ProgramError> {
         // Hardening (security review of d1fb6023): a payout never lands back in the vault.
         if dest_token_ai.key == vault_token_ai.key {
             return Err(PercolatorError::InvalidTokenAccount.into());
@@ -49452,7 +50316,7 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
-        Ok(vault.amount)
+        Ok((vault.amount, vault.mint))
     }
 
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): returns the balance instead of `()`.
@@ -50499,15 +51363,74 @@ pub mod processor {
             state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
             assert_eq!(state::read_portfolio_position_epoch(&data).unwrap(), 1);
 
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
             assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 2);
             let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
-            assert_eq!(matcher_after.enabled(), 1, "enabled bit must survive a position_epoch bump");
+            // port135 (upstream 0c5d4f4f): an out-of-matcher position mutation invalidates a
+            // (non-position-synced) matcher capability; upstream 0b838425 clears its expiry too.
+            assert_eq!(
+                matcher_after.enabled(),
+                0,
+                "an out-of-matcher position mutation invalidates matcher state"
+            );
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
             assert_eq!(
                 matcher_after.trade_fee_cap_bps(),
                 250,
                 "trade_fee_cap_bps must survive a position_epoch bump"
             );
             assert_eq!(matcher_after.position_epoch(), 2);
+
+            // A fill through the configured matcher keeps the capability (and its expiry).
+            let mut matcher = matcher_after;
+            matcher.set_enabled(1).unwrap();
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
+            assert_eq!(
+                state::bump_portfolio_position_epoch_after_matcher_fill(&mut data).unwrap(),
+                3
+            );
+            let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(
+                matcher_after.enabled(),
+                1,
+                "a fill through the configured matcher keeps its inventory synchronized"
+            );
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 77);
+            assert_eq!(matcher_after.trade_fee_cap_bps(), 250);
+            assert_eq!(matcher_after.position_epoch(), 3);
+
+            // port135 (fork): the no-epoch invalidation used by the trade family / owner exits.
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            let matcher_after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(matcher_after.enabled(), 0);
+            assert_eq!(matcher_after.position_epoch(), 3, "invalidation alone keeps the epoch");
+            assert_eq!(matcher_after.trade_fee_cap_bps(), 250);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 0);
+            // Idempotent on a disabled capability: no byte changes.
+            let before = data.clone();
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            assert_eq!(data, before);
+        }
+
+        /// port135 (fork departure): a portfolio whose configured matcher is the position-synced
+        /// canonical program keeps its capability across an out-of-matcher bump/invalidation.
+        #[cfg(any(feature = "devnet", feature = "mainnet-ids"))]
+        #[test]
+        fn portfolio_position_synced_matcher_survives_out_of_matcher_mutation() {
+            let mut data = init_test_portfolio(1);
+            let mut matcher = state::read_portfolio_matcher_config(&data).unwrap();
+            matcher.matcher_program = crate::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes();
+            matcher.set_enabled(1).unwrap();
+            matcher.set_trade_fee_cap_bps(250).unwrap();
+            state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            state::write_portfolio_matcher_expiry(&mut data, 77).unwrap();
+            assert_eq!(state::bump_portfolio_position_epoch(&mut data).unwrap(), 1);
+            state::invalidate_unsynchronized_matcher_capability(&mut data).unwrap();
+            let after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(after.enabled(), 1);
+            assert_eq!(after.position_epoch(), 1);
+            assert_eq!(state::read_portfolio_matcher_expiry(&data).unwrap(), 77);
         }
 
         #[test]
@@ -50599,17 +51522,24 @@ pub mod processor {
 
             let mut data = init_test_portfolio(1);
             state::write_portfolio_matcher_config(&mut data, &matcher).unwrap();
+            // port135 (upstream 0c5d4f4f): only a SYNCHRONIZED bump (a fill through the
+            // configured matcher) preserves bit0; the out-of-matcher bump clears exactly bit0.
             for _ in 0..3 {
-                state::bump_portfolio_position_epoch(&mut data).unwrap();
+                state::bump_portfolio_position_epoch_after_matcher_fill(&mut data).unwrap();
             }
             let after = state::read_portfolio_matcher_config(&data).unwrap();
             assert_eq!(after.position_epoch(), 3);
-            assert_eq!(after.enabled(), 1, "position_epoch bumps must not touch bit0");
+            assert_eq!(after.enabled(), 1, "a synchronized position_epoch bump must not touch bit0");
             assert_eq!(
                 after.trade_fee_cap_bps(),
                 9_999,
                 "position_epoch bumps must not touch bits50..63"
             );
+            state::bump_portfolio_position_epoch(&mut data).unwrap();
+            let after = state::read_portfolio_matcher_config(&data).unwrap();
+            assert_eq!(after.position_epoch(), 4);
+            assert_eq!(after.enabled(), 0, "an out-of-matcher bump clears exactly bit0");
+            assert_eq!(after.trade_fee_cap_bps(), 9_999);
         }
 
         // ── TB-1b: the 12-tag portfolio-identity BINDING enforcement (ADOPT
