@@ -69,7 +69,6 @@ growth	proofs::kani_growth_c_dyn_imr_bps
 growth	proofs::kani_growth_g_liquidity_notional_e6
 growth	proofs::kani_growth_g_n_cap_q
 growth	proofs::kani_growth_c_n_cap_q
-growth	proofs::kani_growth_c_mul_div_ceil
 tests	kani_growth_r6_tag93_v19_roundtrip
 tests	kani_design_p1_fast_cap_equals_division_engine_domain
 tests	kani_design_p1_cap_exact_floor_engine_domain
@@ -99,10 +98,13 @@ tests	kani_v16_init_market_decode_preserves_wire_fields
 # (prog #647): a GLOB, expanded by scripts/kani-nightly-plan.py at run time against the #[kani::proof]
 # fns of kani/growth/src, so whatever occupancy harnesses exist on the branch run (the per-notional
 # redesign may rename or drop them; a glob with no match is a warning, not a failure).
+# kani_growth_c_mul_div_ceil: moved here from group growth (one of the 85, 70m budget): it also hit a
+# 90 min TIMEOUT locally on the #572 per-notional branch (PR #653, coordinator 2026-11-02).
 bonds571	proofs::kani_571_settle_cap_closed_exact_remainder
 bonds571	proofs::kani_571_split_interval_is_exact
 bonds571	proofs::kani_571_settle_monotone_in_time
 bonds571	proofs::kani_571_newcomer_neutral_within_rounding
 bonds571	proofs::kani_571_redemption_slices_k_and_meter
 bonds571	proofs::kani_571_junior_gate_bound_dominates_every_settlement
+growth-occ	proofs::kani_growth_c_mul_div_ceil
 growth-occ	proofs::kani_growth_occ_*

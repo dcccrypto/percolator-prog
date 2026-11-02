@@ -107,7 +107,8 @@ chk "$(plan --groups all)" 1 "plan exact row with no fn (name rot) -> red"
 chk "$(plan --root "$R" --groups bonds571 --out $T/po)" 0 "plan real tree bonds571"
 chk "$(mx | wc -w | tr -d ' ')" 6 "  6 bonds571 jobs"; chk "$(mx | tr ' ' '\n' | cut -d: -f5 | sort -u | tr '\n' ' ')" "315m " "  all at 315m"
 chk "$(plan --root "$R" --groups all --out $T/po)" 0 "plan real tree all groups"
-chk "$(mx | tr ' ' '\n' | grep -c '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:')" 85 "  the 85 no-verdict harnesses still selected"
+chk "$(mx | tr ' ' '\n' | grep -c '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:')" 84 "  the 85 no-verdict harnesses: 84 at 70m (kani_growth_c_mul_div_ceil moved to growth-occ)"
+chk "$(mx | tr " " "\n" | grep -c "^growth-occ:proofs::kani_growth_c_mul_div_ceil:315m:")" 1 "  kani_growth_c_mul_div_ceil in growth-occ at 315m"
 # --- the per-harness script end to end, with a fake `cargo` (needs coreutils timeout; Linux CI) ---
 SH="$R/scripts/kani-nightly-shard.sh"
 H=$(grep -v '^#' "$R/ci/kani-nightly-harnesses.tsv" | awk -F'\t' '$1=="tests" {print $2; exit}')

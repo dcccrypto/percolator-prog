@@ -108,7 +108,7 @@ Two more groups run with `long_timeout` (default **315m**, watchdog 325m; the pl
 | Group | Crate / flags | Rows |
 |---|---|---|
 | `bonds571` | `kani/bonds571`, plain `cargo kani` (no contracts/stubs; solver = the harness attribute, cadical) | the 6 harnesses that hit a 90 min TIMEOUT locally (c571 run r2, 2026-10-31): `kani_571_settle_cap_closed_exact_remainder`, `_split_interval_is_exact`, `_settle_monotone_in_time`, `_newcomer_neutral_within_rounding`, `_redemption_slices_k_and_meter`, `_junior_gate_bound_dominates_every_settlement` |
-| `growth-occ` | `kani/growth`, `-Z stubbing -Z function-contracts` | glob row `proofs::kani_growth_occ_*` |
+| `growth-occ` | `kani/growth`, `-Z stubbing -Z function-contracts` | glob row `proofs::kani_growth_occ_*` (every occupancy harness on the branch at run time) + `proofs::kani_growth_c_mul_div_ceil` (moved from `growth`: 90 min TIMEOUT locally on the #572 per-notional branch, PR #653) |
 
 The TSV may hold a **glob** in the last path segment. `scripts/kani-nightly-plan.py` (the plan job;
 `--help`-style doc at its top) expands it at run time against the `#[kani::proof]` fns of the group's
