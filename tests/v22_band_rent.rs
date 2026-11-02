@@ -7250,3 +7250,70 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
         assert!(*w <= live_slot, "last_fee_slot is a real slot <= now: {w} > {live_slot}");
     }
 }
+
+/// att647 pre-existing parity probe (not an assertion of safety): with UTILISATION rent above
+/// the kink (no occupancy term, 17 legs on cap 256), is an honest open one slot after a full
+/// sweep refused the same way? Prints the outcome on base and on the PR.
+#[test]
+fn att647_probe_util_rent_above_kink_open_one_slot_after_sweep() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let mut ps: Vec<Pubkey> = Vec::new();
+    for n in 0..16u32 {
+        let t = env.trader_n(n, 1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        ps.push(t.1);
+    }
+    let big = env.trader_n(16, 1_000 * USD);
+    env.trade_cpi(&big.0, big.1, &lp, 640 * Q).expect("long");
+    ps.push(big.1);
+    ps.push(lp.account);
+    let (rl, rs) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("ATT647-UTIL 17/256 u=80%: charged {rl}/{rs}");
+    env.sweep(&ps);
+    env.warp(1);
+    env.push(PRICE);
+    let h = env.trader_n(30_100, 10_000 * USD);
+    let r = env.trade_cpi(&h.0, h.1, &lp, -10 * Q);
+    eprintln!("ATT647-UTIL honest short one slot after a full sweep: {}", match &r { Ok(cu) => format!("Ok({cu})"), Err(e) => e.chars().take(90).collect() });
+}
+
+/// att647 round 3 probe: after resolution, the PERMISSIONLESS crank (tag 5) on a portfolio with a
+/// tagged occupancy checkpoint. Prints the outcome (the auto-crank resolved-close release sites).
+#[test]
+fn att647r3_probe_resolved_crank_with_tagged_checkpoint() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let t = env.trader_n(41_000, 1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+    eprintln!("ATT647R3 trader last_fee_slot = {:#x}", env.portfolio_state(t.1).last_fee_slot);
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let m = env.market;
+    let data = env.svm.get_account(&m).unwrap().data;
+    let authority_epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+    let asset_generation_frontier = state::read_market_asset_generation_frontier(&data).unwrap();
+    let admin = env.admin.insecure_clone();
+    env.send(
+        ProgInstruction::ResolveMarket { asset_generation_frontier, authority_epoch },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("resolved");
+    let short = |r: &Result<u64, String>| match r { Ok(c) => format!("Ok({c})"), Err(e) => { let i = e.find("err:").unwrap_or(0); e[i..].chars().take(60).collect() } };
+    for w in [0u64, 1, 2_000_000] {
+        env.warp(w.max(1));
+        let (payer, m2, slot) = (env.payer.pubkey(), env.market, env.slot);
+        let r0 = env.crank(t.1);
+        eprintln!("ATT647R3 (with observation hint): {}", short(&r0));
+        let r = env.send(
+            ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![] },
+            vec![AccountMeta::new(payer, true), AccountMeta::new(m2, false), AccountMeta::new(t.1, false)],
+            &[],
+        );
+        eprintln!("ATT647R3 resolved crank (no observations) of the trader after +{w}: {} ; last_fee_slot now {:#x}", short(&r), env.svm.get_account(&t.1).map(|a| if a.data.is_empty() { 0 } else { state::read_portfolio(&a.data).map(|p| p.last_fee_slot).unwrap_or(0) }).unwrap_or(0));
+    }
+}
