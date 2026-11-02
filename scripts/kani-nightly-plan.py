@@ -10,16 +10,19 @@ Groups (crate + flags: scripts/kani-nightly-shard.sh):
                                               90 min locally, --long-timeout (default 315m)
 A TSV row is either an exact harness path or a glob ('*' in the last path segment), e.g.
   growth-occ  proofs::kani_growth_occ_*
-expanded HERE, at run time, against the `#[kani::proof]` fns of the group's source dirs, so the list
-follows the branch (the #572 occupancy harnesses may be renamed or removed by the per-notional
-redesign). A glob that matches nothing is a ::warning:: (the group simply has no rows), not a failure.
-An exact row with no matching `fn` is an error (name rot).
+expanded HERE, at run time, against the harnesses of the group's source dirs on the branch being run.
+RED (plan fails, nothing runs): a glob that matches nothing, an exact row that is not a harness
+(name rot), and any `kani::proof` / `kani::proof_for_contract` this script cannot tie to a `fn`: a
+harness must never drop out of the selection silently, because a green run would not show it.
+Harness detection (harnesses_in): a small lexer blanks comments and strings, then whole attribute
+blocks are read with bracket balancing, so attribute order, `proof_for_contract`, `cfg_attr(kani, ..)`,
+`unsafe fn` and nested brackets in an attribute are all handled.
 
 Budget per job (timeout-minutes 350): setup (checkout, toolchain, kani from cache, build) + watchdog
 (= harness timeout + 10 min) + 1 min must fit. Setup budget 25 min for the wrapper groups (full
 wrapper build), 15 min for the long sub-crate groups (tiny crates, no engine build).
 Each matrix entry carries its own timeout and whether it needs a z3 binary (harness attribute
-#[kani::solver(z3)] or --solver z3).
+#[kani::solver(z3)], wherever it sits among the attributes, or --solver z3).
 """
 import argparse
 import fnmatch
@@ -39,8 +42,10 @@ LONG = {'bonds571', 'growth-occ'}
 SETUP_MIN = {g: (15 if g in LONG else 25) for g in DIRS}
 JOB_LIMIT = 350
 SOLVERS = {'', 'cadical', 'kissat', 'minisat', 'z3', 'bitwuzla', 'cvc5'}
-# #[kani::proof] then any further attributes, then the fn.
-PROOF_RE = re.compile(r'#\[kani::proof\]((?:\s*(?:#\[[^\]]*\]|//[^\n]*))*)\s*(?:pub(?:\([^)]*\))?\s+)?fn\s+(\w+)')
+PROOF_TOK = re.compile(r'\bkani::proof(?:_for_contract)?\b')
+ATTR_START = re.compile(r'#\s*\[')
+ITEM_FN = re.compile(r'\s*(?:pub(?:\s*\([^)]*\))?\s+)?(?:(?:const|async|unsafe|default)\s+|extern\s*(?:""\s*)?)*fn\s+(\w+)')
+Z3_ATTR = re.compile(r'\bkani::solver\s*\(\s*z3\s*\)')
 
 
 def die(msg):
@@ -52,29 +57,112 @@ def minutes(t):
     return int(t[:-1]) * {'s': 1 / 60, 'm': 1, 'h': 60}[t[-1]]
 
 
+def blank(src):
+    """src with comments and string/char literals blanked; newlines kept, so offsets give line numbers."""
+    out, i, n = [], 0, len(src)
+    while i < n:
+        c = src[i]
+        two = src[i:i + 2]
+        if two == '//':
+            while i < n and src[i] != '\n':
+                i += 1
+        elif two == '/*':
+            depth, i = 1, i + 2
+            while i < n and depth:
+                if src[i:i + 2] == '/*':
+                    depth, i = depth + 1, i + 2
+                elif src[i:i + 2] == '*/':
+                    depth, i = depth - 1, i + 2
+                else:
+                    out.append('\n' if src[i] == '\n' else ' ')
+                    i += 1
+        elif c == '"' or (c in 'rb' and (not i or not (src[i - 1].isalnum() or src[i - 1] == '_'))
+                          and (m := re.match(r'b?r(#*)"|b"', src[i:i + 40]))):
+            if c == '"' or src[i:i + 2] == 'b"':       # ordinary string, escapes apply
+                i += 1 if c == '"' else 2
+                while i < n and src[i] != '"':
+                    if src[i] == '\n':
+                        out.append('\n')
+                    i += 2 if src[i] == '\\' else 1
+                i += 1
+            else:                                      # raw string: ends at "###
+                end = '"' + m.group(1)
+                i += m.end()
+                while i < n and not src.startswith(end, i):
+                    if src[i] == '\n':
+                        out.append('\n')
+                    i += 1
+                i += len(end)
+            out.append('""')
+        elif c == "'" and (m := re.match(r"'(?:\\.[^']*|[^\\'])'", src[i:i + 12])):   # char literal, not a lifetime
+            i += m.end()
+            out.append("' '")
+        else:
+            out.append(c)
+            i += 1
+    return ''.join(out)
+
+
+def attr_end(code, start):
+    """index just past the `]` closing the attribute whose `[` is the first one at or after start."""
+    i, depth = code.index('[', start), 0
+    while i < len(code):
+        depth += (code[i] == '[') - (code[i] == ']')
+        i += 1
+        if depth == 0:
+            return i
+    return -1
+
+
+def harnesses_in(src):
+    """(fn name -> text of its attribute block, [offsets of proof attributes tied to no fn])."""
+    code = blank(src)
+    found, bad, pos, tied = {}, [], 0, 0
+    while (m := ATTR_START.search(code, pos)):
+        i, block = m.start(), []
+        while (a := ATTR_START.match(code, i)):
+            e = attr_end(code, a.start())
+            if e < 0:
+                return found, bad + [a.start()]
+            block.append(code[a.start():e])
+            i = e
+            while i < len(code) and code[i].isspace():
+                i += 1
+        text = ' '.join(block)
+        n = len(PROOF_TOK.findall(text))
+        if n:
+            fn = ITEM_FN.match(code, i)
+            if fn:
+                found[fn.group(1)] = found.get(fn.group(1), '') + text
+                tied += n
+            else:
+                bad.append(m.start())
+                tied += n
+        pos = i
+    if len(PROOF_TOK.findall(code)) != tied:     # a proof attribute outside any attribute block we read
+        bad += [t.start() for t in PROOF_TOK.finditer(code)][:1]
+    return found, bad
+
+
 def proofs_in(root, dirs):
-    """fn name -> attribute text of every #[kani::proof] fn under dirs."""
-    found = {}
+    """fn name -> attribute text of every harness under dirs. Fails closed on what it cannot classify."""
+    found, unknown = {}, []
     for d in dirs:
         for dp, _, files in os.walk(os.path.join(root, d)):
             for f in sorted(files):
-                if f.endswith('.rs'):
-                    with open(os.path.join(dp, f), encoding='utf-8', errors='replace') as fh:
-                        for m in PROOF_RE.finditer(fh.read()):
-                            found[m.group(2)] = m.group(1)
+                if not f.endswith('.rs'):
+                    continue
+                path = os.path.join(dp, f)
+                with open(path, encoding='utf-8', errors='replace') as fh:
+                    src = fh.read()
+                got, bad = harnesses_in(src)
+                for k, v in got.items():
+                    found[k] = found.get(k, '') + v
+                code = blank(src)
+                unknown += [f'{os.path.relpath(path, root)}:{code.count(chr(10), 0, b) + 1}' for b in bad]
+    if unknown:
+        die('kani::proof attribute(s) not tied to a fn; fix the harness or scripts/kani-nightly-plan.py:\n' + '\n'.join(unknown))
     return found
-
-
-def fn_exists(root, dirs, fn):
-    pat = re.compile(rf'fn {re.escape(fn)}\b')
-    for d in dirs:
-        for dp, _, files in os.walk(os.path.join(root, d)):
-            for f in files:
-                if f.endswith('.rs'):
-                    with open(os.path.join(dp, f), encoding='utf-8', errors='replace') as fh:
-                        if pat.search(fh.read()):
-                            return True
-    return False
 
 
 def main():
@@ -113,7 +201,7 @@ def main():
             cache[g] = proofs_in(a.root, DIRS[g])
         return cache[g]
 
-    missing, warnings, expanded = [], [], []   # expanded: (group, harness path, fn)
+    missing, expanded = [], []   # expanded: (group, harness path, fn)
     for g, h in rows:
         if g not in DIRS:
             missing.append(f'{g}\t{h} (unknown group)')
@@ -125,14 +213,14 @@ def main():
         if any(c in fn for c in '*?['):
             hits = sorted(n for n in proofs(g) if fnmatch.fnmatchcase(n, fn))
             if not hits:
-                warnings.append(f'glob row {g}\t{h} matches no #[kani::proof] fn in {DIRS[g]} (group has no rows from it)')
+                missing.append(f'{g}\t{h} (glob matches no harness in {DIRS[g]})')
             expanded += [(g, (prefix + '::' if prefix else '') + n, n) for n in hits]
         else:
-            if not fn_exists(a.root, DIRS[g], fn):
+            if fn not in proofs(g):
                 missing.append(f'{g}\t{h}')
             expanded.append((g, h, fn))
     if missing:
-        die('harness rows with no matching fn in the tree:\n' + '\n'.join(missing))
+        die('harness rows that match no harness in the tree:\n' + '\n'.join(missing))
     names = [h for _, h, _ in expanded]
     dup = sorted({h for h in names if names.count(h) > 1})
     if dup:
@@ -155,12 +243,10 @@ def main():
             if gg != g:
                 continue
             attrs = proofs(g).get(fn, '')
-            z3 = a.solver == 'z3' or (not a.solver and 'kani::solver(z3)' in attrs)
+            z3 = a.solver == 'z3' or (not a.solver and bool(Z3_ATTR.search(attrs)))
             inc.append({'group': g, 'idx': i, 'harness': h, 'timeout': t, 'z3': z3})
             expected.append(h)
             i += 1
-    for w in warnings:
-        print(f'::warning::{w}')
     if not inc:
         die('no harnesses selected')
     if len(inc) > 256:

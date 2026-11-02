@@ -82,7 +82,7 @@ fn kani_growth_occ_helper_not_a_proof() {}
 fn kani_growth_x() {}
 RS
 printf '#[kani::proof]\n#[kani::solver(cadical)]\nfn kani_571_a() {}\n' > $F/kani/bonds571/src/proofs.rs
-printf 'fn kani_lib_a() {}\n' > $F/src/lib.rs
+printf '#[kani::proof]\nfn kani_lib_a() {}\nfn kani_lib_not_a_proof() {}\n' > $F/src/lib.rs
 tsv() { printf '# c\n' > $F/ci/kani-nightly-harnesses.tsv; printf '%b\n' "$@" >> $F/ci/kani-nightly-harnesses.tsv; }
 plan() { rm -f $T/po; python3 "$P" --root $F --out $T/po "$@" > $T/plan.log 2>&1; echo $?; }
 mx() { python3 -c 'import json,sys; m=json.loads([l[7:] for l in open(sys.argv[1]) if l.startswith("matrix=")][0]); print(" ".join(":".join(str(v) for v in (e["group"], e["harness"], e["timeout"], int(e["z3"]))) for e in m["include"]))' $T/po; }
@@ -97,13 +97,64 @@ chk "$(plan --groups lib --timeout 314m)" 0 "plan normal 314m fits (25 + 324 + 1
 chk "$(plan --groups lib --timeout 315m)" 1 "plan normal 315m refused"
 chk "$(plan --groups lib --solver yices)" 1 "plan bad solver refused"
 chk "$(plan --groups nope)" 1 "plan unknown group refused"
-tsv 'lib\tkani_lib_a' 'growth-occ\tproofs::kani_growth_zzz_*'
-chk "$(plan --groups all)" 0 "plan glob matching nothing -> not a failure"; grep -q '::warning::glob row growth-occ' $T/plan.log; chk $? 0 "  ... but a warning"
-chk "$(plan --groups growth-occ)" 1 "plan glob matching nothing, only that group -> no harnesses -> red"
+# a glob matching nothing is RED even when an exact row keeps the group non-empty (v652 B1)
+tsv 'lib\tkani_lib_a' 'growth-occ\tproofs::kani_growth_x' 'growth-occ\tproofs::kani_growth_zzz_*'
+chk "$(plan --groups growth-occ)" 1 "plan glob matching nothing, exact row in the group -> red"; grep -q 'glob matches no harness' $T/plan.log; chk $? 0 "  names the glob"
+chk "$(plan --groups lib)" 1 "plan glob matching nothing, group not even selected -> red"
 tsv 'growth\tproofs::kani_growth_occ_a' 'growth-occ\tproofs::kani_growth_occ_*'
 chk "$(plan --groups all)" 1 "plan name listed twice after glob expansion -> red"
 tsv 'bonds571\tproofs::kani_571_gone'
 chk "$(plan --groups all)" 1 "plan exact row with no fn (name rot) -> red"
+tsv 'lib\tkani_lib_not_a_proof'
+chk "$(plan --groups all)" 1 "plan exact row naming a non-harness fn -> red"
+# harness shapes (v652 B2): none may drop out of a glob, z3 found wherever the attribute sits
+PS=$F/kani/growth/src/proofs.rs; cp $PS $T/proofs.keep
+cat > $PS <<'RS'
+// #[kani::proof] in a comment is not a harness: fn kani_growth_occ_commented() {}
+/* #[kani::proof]
+   /* nested */ fn kani_growth_occ_block_commented() {} */
+const S: &str = "#[kani::proof] fn kani_growth_occ_in_string() {} // not a comment";
+const R: &str = r#"#[kani::proof] "quoted" fn kani_growth_occ_in_raw() {}"#;
+const C: char = '"';
+fn lt<'a>(x: &'a u8) -> &'a u8 { x }
+#[kani::proof_for_contract(crate::m::f)]
+#[kani::solver(z3)]
+fn kani_growth_occ_contract() {}
+#[kani::proof]
+unsafe fn kani_growth_occ_unsafe() {}
+#[kani::proof]
+#[kani::stub(a::<[u8; 4]>::b, c)]
+fn kani_growth_occ_nested() {}
+#[kani::solver(z3)]
+#[kani::proof]
+pub(crate) fn kani_growth_occ_attr_first() {}
+#[cfg_attr(kani, kani::proof)]
+#[kani::solver(cadical)]
+const fn kani_growth_occ_cfg_attr() {}
+#[kani::proof] // trailing comment
+/// doc
+#[kani::unwind(3)]
+fn kani_growth_exact_contract_row() {}
+fn kani_growth_occ_helper() {}
+RS
+tsv 'growth-occ\tproofs::kani_growth_occ_*' 'growth-occ\tproofs::kani_growth_exact_contract_row'
+chk "$(plan --groups growth-occ)" 0 "plan harness shapes"
+chk "$(mx)" "growth-occ:proofs::kani_growth_occ_attr_first:315m:1 growth-occ:proofs::kani_growth_occ_cfg_attr:315m:0 growth-occ:proofs::kani_growth_occ_contract:315m:1 growth-occ:proofs::kani_growth_occ_nested:315m:0 growth-occ:proofs::kani_growth_occ_unsafe:315m:0 growth-occ:proofs::kani_growth_exact_contract_row:315m:0" \
+  "  contract, unsafe, nested brackets, cfg_attr, z3 before proof; comments/strings/helpers skipped"
+printf '#[kani::proof_for_contract(crate::m::f)]\n#[kani::solver(z3)]\nfn kani_growth_occ_only() {}\n' > $PS
+tsv 'growth-occ\tproofs::kani_growth_occ_only'
+chk "$(plan --groups growth-occ)" 0 "plan exact contract row"; chk "$(mx)" "growth-occ:proofs::kani_growth_occ_only:315m:1" "  z3 seen on an exact contract row"
+# fail closed: a proof attribute not tied to a fn
+printf 'macro_rules! m { ($n:ident) => { #[kani::proof] fn $n() {} } }\n#[kani::proof]\nfn kani_growth_occ_ok() {}\n' > $PS
+tsv 'growth-occ\tproofs::kani_growth_occ_*'
+chk "$(plan --groups growth-occ)" 1 "plan proof attribute on a macro-generated fn -> red"; grep -q 'not tied to a fn' $T/plan.log; chk $? 0 "  says so"; grep -q 'kani/growth/src/proofs.rs:1' $T/plan.log; chk $? 0 "  file:line"
+printf 'kani::proof!(x);\n#[kani::proof]\nfn kani_growth_occ_ok() {}\n' > $PS
+chk "$(plan --groups growth-occ)" 1 "plan kani::proof outside an attribute -> red"
+printf '#[kani::proof]\nstruct NotAFn;\n#[kani::proof]\nfn kani_growth_occ_ok() {}\n' > $PS
+chk "$(plan --groups growth-occ)" 1 "plan proof attribute on a non-fn -> red"
+printf '#[kani::proof\nfn kani_growth_occ_ok() {}\n' > $PS
+chk "$(plan --groups growth-occ)" 1 "plan unterminated attribute -> red"
+cp $T/proofs.keep $PS
 chk "$(plan --root "$R" --groups bonds571 --out $T/po)" 0 "plan real tree bonds571"
 chk "$(mx | wc -w | tr -d ' ')" 6 "  6 bonds571 jobs"; chk "$(mx | tr ' ' '\n' | cut -d: -f5 | sort -u | tr '\n' ' ')" "315m " "  all at 315m"
 chk "$(plan --root "$R" --groups all --out $T/po)" 0 "plan real tree all groups"

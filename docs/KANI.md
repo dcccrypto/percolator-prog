@@ -15,7 +15,7 @@ The wrapper builds only with the engine checked out as the sibling `../percolato
 | continuous leverage | `kani/contlev` | `cargo kani -Z stubbing -Z function-contracts` |
 | P3 vault LP | `kani/p3` | `cargo kani -Z stubbing -Z function-contracts` |
 | P3 through the engine kernel | `kani/p3-engine` | `cargo kani -Z stubbing -Z function-contracts` |
-| growth v19 (incl. #572 occupancy `kani_growth_occ_*`; 4 of them use `#[kani::solver(z3)]`, needs a `z3` binary on PATH) | `kani/growth` | `cargo kani -Z stubbing -Z function-contracts` |
+| growth v19 (incl. #572 occupancy `kani_growth_occ_*`; `occ_c_exact`, `occ_domain_shape`, `occ_g_full_width` use `#[kani::solver(z3)]`, needs a `z3` binary on PATH) | `kani/growth` | `cargo kani -Z stubbing -Z function-contracts` |
 | #571 carried bond coupon (prog #649) | `kani/bonds571` | `cargo kani` (add `-Z unstable-options` for `--harness-timeout`) |
 
 Notes:
@@ -108,20 +108,39 @@ Two more groups run with `long_timeout` (default **315m**, watchdog 325m; the pl
 | Group | Crate / flags | Rows |
 |---|---|---|
 | `bonds571` | `kani/bonds571`, plain `cargo kani` (no contracts/stubs; solver = the harness attribute, cadical) | the 6 harnesses that hit a 90 min TIMEOUT locally (c571 run r2, 2026-10-31): `kani_571_settle_cap_closed_exact_remainder`, `_split_interval_is_exact`, `_settle_monotone_in_time`, `_newcomer_neutral_within_rounding`, `_redemption_slices_k_and_meter`, `_junior_gate_bound_dominates_every_settlement` |
-| `growth-occ` | `kani/growth`, `-Z stubbing -Z function-contracts` | glob row `proofs::kani_growth_occ_*` (every occupancy harness on the branch at run time) + `proofs::kani_growth_c_mul_div_ceil` (moved from `growth`: 90 min TIMEOUT locally on the #572 per-notional branch, PR #653) |
+| `growth-occ` | `kani/growth`, `-Z stubbing -Z function-contracts` | glob row `proofs::kani_growth_occ_*` (every occupancy harness on the branch at run time) + `proofs::kani_growth_c_mul_div_ceil` (moved from `growth`: 90 min TIMEOUT locally on #653) |
 
 The TSV may hold a **glob** in the last path segment. `scripts/kani-nightly-plan.py` (the plan job;
 `--help`-style doc at its top) expands it at run time against the `#[kani::proof]` fns of the group's
-source dirs, so the nightly runs whatever occupancy harnesses exist on the branch (the #572 per-notional
-redesign may rename or remove them). A glob that matches nothing is a `::warning::`, not a failure; an
-exact row with no `fn` is red (name rot). To change the set, edit the TSV rows of the group.
+source dirs of the branch being run. Today (rc23 with #653) `growth-occ` is 5 jobs: `kani_growth_c_mul_div_ceil`,
+`kani_growth_occ_c_exact`, `occ_domain_shape`, `occ_g_full_width` (the 4 that hit 90 min locally) and
+`occ_side_rate_is_max` (passes in seconds; the glob includes it).
+
+The plan is RED and nothing runs when a harness could drop out silently: a glob that matches nothing
+(even if another row keeps the group non-empty, and even if the group is not selected), an exact row
+that is not a harness (name rot), or a `kani::proof` / `kani::proof_for_contract` it cannot tie to a
+`fn` (for example a macro-generated harness). To change the set, edit the TSV rows of the group.
 
 Solver: each harness's `#[kani::solver(..)]` attribute is used unless the `solver` input overrides it
 for every selected harness (`--solver`, which kani lets override the attribute). The plan marks every
 job whose harness asks for z3 (attribute or override) and the job installs `z3` from apt (kani does
-not bundle it; CBMC's `--z3` calls the binary). bonds571 harnesses are written for cadical; the
-growth occupancy harnesses `occ_ramp_prod_shape`, `occ_ramp_total`, `occ_charge_step_exact`,
-`occ_split_never_charges_more` for z3.
+not bundle it; CBMC's `--z3` calls the binary). bonds571 harnesses are written for cadical; of the
+growth-occ harnesses `occ_c_exact`, `occ_domain_shape`, `occ_g_full_width` for z3, the other two for cadical.
+
+### Reading the result
+
+- **A green run does not mean proved.** TIMEOUT and OOM are warnings, so a run where every harness
+  times out is green with 0 SUCCESSFUL. Read the SUCCESSFUL count in SUMMARY.md, not the colour.
+- **`kani_growth_occ_g_full_width` is conditional on `kani_growth_c_mul_div_ceil`.** It uses
+  `#[kani::stub_verified(mul_div_ceil_u128)]`, and `c_mul_div_ceil` is that contract's only harness.
+  That harness itself timed out locally, and the summary does not link the two: a SUCCESSFUL on
+  `occ_g_full_width` counts only together with a SUCCESSFUL on `c_mul_div_ceil`.
+- **Known gap (`classify`, older behaviour, not fixed yet):** it ignores the `(N unreachable)` part of
+  kani's result line. A harness with a contradictory assumption and no `kani::cover!` gives rc 0 and
+  ` ** 0 of 1 failed (1 unreachable)`, which classifies as SUCCESSFUL. Covers catch this (VACUOUS), so the
+  exposure is the 15 of the 84 older rows with no cover in the harness body (lib 2, tests 13); all 11 long
+  rows have covers. The fix should show the count in the row and treat all-unreachable as VACUOUS, not
+  make every unreachable red: `occ_side_rate_is_max` has one benign unreachable (`core::fmt`).
 
 ### Schedule
 
