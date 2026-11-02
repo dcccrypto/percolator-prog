@@ -7153,9 +7153,9 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
     env.trade_cpi(&f.0, f.1, &lp, -10 * Q).expect("close");
     env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
     assert_eq!(env.pos_counts().0, 18);
+    // Design checks are recorded here and asserted AFTER the resolved closes, so a build that
+    // charges occupancy some other way (the per-slot head cc7424b6, the NC) reaches the closes.
     let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
-    assert_eq!(rl, percolator_prog::growth_v19::rent_occupancy_rate_e9(18, 20, RENT_MAX as u64));
-    assert!(rl >= 1, "occupancy rent is live");
     let cap0 = env.portfolio_state(t.1).capital;
     for _ in 0..20 {
         env.warp(1);
@@ -7167,11 +7167,9 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
     all.push(f.1);
     env.sweep(&all);
     assert!(env.portfolio_state(t.1).capital < cap0, "the trader paid occupancy rent");
-    for p in &all {
-        let w = env.portfolio_state(*p).last_fee_slot;
-        assert_eq!(w >> 63, 0, "no tagged checkpoint: {w:#x}");
-        assert!(w <= env.slot, "last_fee_slot is a real slot <= now: {w} > {}", env.slot);
-    }
+    let live_slot = env.slot;
+    let words: Vec<u64> = all.iter().map(|p| env.portfolio_state(*p).last_fee_slot).collect();
+    eprintln!("R572/ATT647R2 last_fee_slot words while Live (slot {live_slot}): {words:x?}");
     // Resolve: the market admin resolves (tag 19) at the current slot.
     env.warp(1);
     env.push(PRICE);
@@ -7243,4 +7241,12 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
     let r2 = close(&mut env, &t2.0, t2.1);
     eprintln!("R572/ATT647R2 CloseResolved second trader: {}", short(&r2));
     assert!(r2.is_ok(), "second trader closes: {}", short(&r2));
+    // Design (per-notional): the rent was the occupancy term on the engine index, and no
+    // wrapper word was written into `last_fee_slot` (only real slots, engine-maintained).
+    assert_eq!(rl, percolator_prog::growth_v19::rent_occupancy_rate_e9(18, 20, RENT_MAX as u64));
+    assert!(rl >= 1, "occupancy rent was live");
+    for w in &words {
+        assert_eq!(w >> 63, 0, "no tagged checkpoint: {w:#x}");
+        assert!(*w <= live_slot, "last_fee_slot is a real slot <= now: {w} > {live_slot}");
+    }
 }
