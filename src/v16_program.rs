@@ -5265,41 +5265,10 @@ pub mod state {
     ) -> Result<(), ProgramError> {
         check_header(data, KIND_MARKET)?;
         validate_asset_oracle_profile(profile)?;
-        let preserve_occ = asset_index == 0 && market_band_bps(data)? != 0;
         let range = asset_oracle_profile_range(data, asset_index)?;
-        let dst = data.get_mut(range).ok_or(PercolatorError::InvalidAccountLen)?;
-        write_profile_bytes_preserving_occupancy(dst, profile, preserve_occ)
-    }
-
-    /// prog#572: asset 0's profile bytes `OCC_PROFILE_BYTES` hold the band market's occupancy
-    /// clocks, written in place by `occ_clock_accrue_view` (a band market's maintenance fee and
-    /// its GH#444 checkpoint are always 0, so no profile writer owns them there). A handler that
-    /// read the profile before an occupancy hook ran in the same instruction writes a STALE copy
-    /// back; on a band market's asset 0 every profile write therefore keeps the bytes in place.
-    pub const OCC_PROFILE_BYTES: core::ops::Range<usize> = {
-        let a = core::mem::offset_of!(AssetOracleProfileV16, maintenance_fee_checkpoint_slot);
-        let b = core::mem::offset_of!(AssetOracleProfileV16, maintenance_fee_previous_rate);
-        assert!(b == a + 8, "checkpoint slot and previous rate are adjacent");
-        a..b + 16
-    };
-    const _: () = assert!(OCC_PROFILE_BYTES.end <= crate::constants::ASSET_ORACLE_PROFILE_LEN);
-
-    pub fn write_profile_bytes_preserving_occupancy(
-        dst: &mut [u8],
-        profile: &AssetOracleProfileV16,
-        preserve_occ: bool,
-    ) -> Result<(), ProgramError> {
-        if dst.len() < crate::constants::ASSET_ORACLE_PROFILE_LEN {
-            return Err(PercolatorError::InvalidAccountLen.into());
-        }
-        let mut keep = [0u8; 24];
-        if preserve_occ {
-            keep.copy_from_slice(&dst[OCC_PROFILE_BYTES]);
-        }
-        dst[..crate::constants::ASSET_ORACLE_PROFILE_LEN].copy_from_slice(bytemuck::bytes_of(profile));
-        if preserve_occ {
-            dst[OCC_PROFILE_BYTES].copy_from_slice(&keep);
-        }
+        data.get_mut(range)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(profile));
         Ok(())
     }
 
@@ -14925,13 +14894,13 @@ pub mod processor {
         profile: &state::AssetOracleProfileV16,
     ) -> ProgramResult {
         state::validate_asset_oracle_profile(profile)?;
-        let preserve_occ = asset_index == 0 && group.header.config.band_bps.get() != 0;
         let market = group
             .markets
             .get_mut(asset_index)
             .ok_or(PercolatorError::InvalidInstruction)?;
-        // prog#572: keep the occupancy clocks (see `state::OCC_PROFILE_BYTES`).
-        state::write_profile_bytes_preserving_occupancy(&mut market.wrapper, profile, preserve_occ)
+        market.wrapper[..constants::ASSET_ORACLE_PROFILE_LEN]
+            .copy_from_slice(bytemuck::bytes_of(profile));
+        Ok(())
     }
 
     // ═══════════════════════════════════════════════════════════════════
@@ -15620,16 +15589,7 @@ pub mod processor {
         portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
         now_slot: u64,
     ) -> Result<u128, ProgramError> {
-        if group.header.mode != 0 {
-            return Ok(0);
-        }
-        // prog#572: on a band market (maintenance fee 0 by construction) this crystallization
-        // point charges the per-slot occupancy instead (booked as LP rent, not maintenance).
-        if group.header.config.band_bps.get() != 0 {
-            occ_charge_view(group, portfolio, now_slot)?;
-            return Ok(0);
-        }
-        if cfg.maintenance_fee_per_slot == 0 {
+        if group.header.mode != 0 || cfg.maintenance_fee_per_slot == 0 {
             return Ok(0);
         }
         // GH#555: bill through the CHECKPOINTED path, as `SyncMaintenanceFee` does. The raw
@@ -17460,19 +17420,6 @@ pub mod processor {
             if rent_ok && cfg.validate_public_user_fund().is_err() {
                 return Err(PercolatorError::PriceBandConfigInvalid.into());
             }
-            // prog#572: a band market's legs also pay the per-slot occupancy charge, up to
-            // `rent_max` x 4 x the minimum leg per slot, i.e. up to 4 x `rent_max` of a minimum
-            // leg's notional on top of the utilisation rent. The Band Safety Law must hold with
-            // that rent term (`rent_max x OCC_BSL_RENT_MULTIPLE`), every notional; else 106.
-            if rent_ok && p.rent_max_e9_per_slot != 0 {
-                let mut occ_cfg = *cfg;
-                occ_cfg.rent_max_e9_per_slot = (p.rent_max_e9_per_slot as u64)
-                    .checked_mul(growth_v19::OCC_BSL_RENT_MULTIPLE)
-                    .ok_or(PercolatorError::HoldingRentConfigInvalid)?;
-                if occ_cfg.validate_public_user_fund().is_err() {
-                    return Err(PercolatorError::HoldingRentConfigInvalid.into());
-                }
-            }
         }
         Ok(())
     }
@@ -18234,10 +18181,6 @@ pub mod processor {
                 ),
             }
             .map_err(map_v16_error)?;
-            // prog#572: a new / flipped leg's occupancy starts now (both sides were charged
-            // up to now by the pre-trade crystallization above).
-            occ_after_position_change_view(&mut group, &mut account_a)?;
-            occ_after_position_change_view(&mut group, &mut account_b)?;
             // FIX (ADOPT upstream 3496acf0, "enforce side OI caps"): checked immediately
             // after the engine mutates OI on this trade, before any other post-trade
             // check, so an over-cap post-state aborts the instruction.
@@ -18885,9 +18828,6 @@ pub mod processor {
                 )
             }
             .map_err(map_v16_error)?;
-            // prog#572: start any new / flipped leg's occupancy now (see the single-trade path).
-            occ_after_position_change_view(&mut group, &mut account_a)?;
-            occ_after_position_change_view(&mut group, &mut account_b)?;
             // FIX (ADOPT upstream 42ec8ab6, "bound aggregate batch cpi consent"): for
             // BatchTradeCpi, the taker's signed `max_fee_atoms` is a hard ceiling on the
             // AGGREGATE engine fee charged to account_a across this batch (distinct from
@@ -26616,12 +26556,6 @@ pub mod processor {
                 asset_index as usize,
                 true,
             )?;
-            // prog#572: the owner's exit (the app's close) settles the leg's occupancy through
-            // now first, as the trade paths do (a refusal here is retried after a crank: 19).
-            if group.header.config.band_bps.get() != 0 {
-                let now = authenticated_market_slot_or_fallback_view(group);
-                occ_charge_view(group, portfolio, now).map_err(|_| V16Error::Stale)?;
-            }
             // v2.2 fill events: the side of the leg being reduced (sign of the reduction is the
             // opposite of the position's) and the price the engine reduces at.
             // Best effort: reading the side must never change the instruction's error behaviour.
@@ -28681,14 +28615,6 @@ pub mod processor {
         now_slot: u64,
         current_rate: u128,
     ) -> Result<u128, ProgramError> {
-        // prog#572: a band market's maintenance fee is 0 and asset 0's checkpoint bytes hold the
-        // occupancy clocks; SyncMaintenanceFee (and every caller) charges the occupancy there.
-        if group.header.config.band_bps.get() != 0 {
-            if group.header.mode == 0 {
-                occ_charge_view(group, portfolio, now_slot)?;
-            }
-            return Ok(0);
-        }
         let profile = read_oracle_profile_from_view(group, cfg, 0)?;
         let checkpoint = profile.maintenance_fee_checkpoint_slot;
         let previous_rate = profile.maintenance_fee_previous_rate;
@@ -30251,8 +30177,6 @@ pub mod processor {
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
             // prog#547: the effective legs before the resolved close, for the REDUCE events.
             let legs_before = snapshot_effective_legs_view(&group, &portfolio);
-            // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
-            occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
             let outcome = group
                 .close_resolved_account_not_atomic(&mut portfolio, cfg.maintenance_fee_per_slot)
                 .map_err(map_v16_error)?;
@@ -30583,8 +30507,6 @@ pub mod processor {
                     max_market_slots,
                 )?;
                 expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
-                // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
-                occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
                 group
                     .permissionless_auto_crank_not_atomic(
                         &mut portfolio,
@@ -30635,8 +30557,6 @@ pub mod processor {
                         .build_actionable_summary_at_slot(&portfolio.as_view(), authenticated_now_slot)
                         .map_err(map_v16_error)?;
                     if summary.expired_close {
-                        // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
-                        occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
                         let result = group
                             .permissionless_auto_crank_not_atomic(
                                 &mut portfolio,
@@ -30972,8 +30892,6 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
-            // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
-            occ_release_checkpoint_outside_live_view(&group, &mut portfolio);
             let result = match group.permissionless_auto_crank_s10_not_atomic(
                 &mut portfolio,
                 AutoCrankWorkV16 {
@@ -41838,8 +41756,6 @@ pub mod processor {
                     let insurance_before = group.header.insurance.get();
                     // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
                     let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
-                    // prog#572 R2-1: outside Live the occupancy checkpoint is released before the engine reads it.
-                    occ_release_checkpoint_outside_live_view(&group, &mut lp);
                     let outcome = group
                         .close_resolved_account_not_atomic(&mut lp, cfg.maintenance_fee_per_slot)
                         .map_err(map_v16_error)?;
@@ -48510,235 +48426,6 @@ pub mod processor {
         }
     }
 
-    // ── prog#572: per-SLOT occupancy charge (Khubair 2026-11-01), wrapper-only ─────────────────
-    //
-    // Every occupied leg on a band side past 85% of `band_max_positions_per_side` pays the SAME
-    // flat amount per slot, whatever its notional (`growth_v19::occ_*` for the arithmetic):
-    // `F_side = ramp(count_side) * rent_max * 4 * band_min_leg_notional / 1e9` atoms per slot.
-    //
-    // State (no layout change, nothing new on non-band markets):
-    // * per side, a clock `C_side` (Q32.32 full-occupancy slots) and its last slot, in asset 0's
-    //   profile bytes `maintenance_fee_checkpoint_slot` (last slot) and
-    //   `maintenance_fee_previous_rate` (C_long low 8 B, C_short high 8 B). A band market keeps
-    //   its maintenance fee at 0 (InitMarket and tag 88 refuse anything else, 105), so GH#444's
-    //   checkpoint is never written there; `sync_maintenance_fee_checkpointed` branches to the
-    //   occupancy charge BEFORE reading it, and both profile writers keep these bytes in place
-    //   on a band market (`state::OCC_PROFILE_BYTES`: a stale profile copy written back by the
-    //   same instruction must not roll the clocks back).
-    // * per leg (a band market is single-asset: one leg per portfolio), the clock's integer part
-    //   at its last charge, tagged with the side, in the portfolio's `last_fee_slot`: the engine
-    //   field for "recurring wrapper-owned fees charged through here" (spec §1028). On a band
-    //   market the only recurring wrapper fee is this one; the engine reads the field only
-    //   inside `sync_account_fee_to_slot_not_atomic` (called here with a one-slot window around
-    //   the asset's `slot_last`, then overwritten) and in `close_resolved` (Resolved mode only:
-    //   a tagged value >= `resolved_slot` reads as "fee synced").
-    //
-    // Charge: `charged = min(due, capital)` after the engine settles the account's K/F, rent and
-    // negative PnL from principal (`sync_account_fee_to_slot_not_atomic` ->
-    // `charge_account_fee_current_not_atomic`: 0 while PnL is negative), i.e. only capital no loss
-    // owns: it can never create or grow a deficit. Capital -> insurance, then booked as
-    // `rent_unrouted_atoms`, so it reaches the bound vault LP's capital by the same route as rent
-    // (tag 106 / TradeCpi with the LP) and is excluded from free insurance in the meantime. No
-    // engine index moves: no K/F or rent cohort is restaled (att647 NEW-1 class).
-
-    const OCC_SLOT_OFF: usize = state::OCC_PROFILE_BYTES.start;
-    const OCC_CLOCK_OFF: usize = state::OCC_PROFILE_BYTES.start + 8;
-    const _: () = assert!(
-        growth_v19::OCC_REF_MIN_LEG_MULTIPLE == constants::BAND_EVICT_MAX_VICTIM_MULTIPLE,
-        "the occupancy reference leg is the tag-119 eviction bound"
-    );
-
-    /// prog#572: the side clocks after `occ_clock_accrue_view`, and whether a charge is due at all.
-    #[derive(Clone, Copy)]
-    struct OccClocks {
-        c_long: u64,
-        c_short: u64,
-        /// `F_full * 1e9` (0 = no charge: rent off or no reference leg).
-        full_num: u128,
-        /// The bound vault LP portfolio (the charge's destination; it never pays itself).
-        lp: Option<[u8; 32]>,
-    }
-
-    fn occ_read_u64(w: &[u8], off: usize) -> u64 {
-        let mut b = [0u8; 8];
-        b.copy_from_slice(&w[off..off + 8]);
-        u64::from_le_bytes(b)
-    }
-
-    /// prog#572: bring the side clocks to `now_slot` with the counts as they stand (called before
-    /// any count change in the same instruction, so the integral is exact between touches).
-    /// `None` = not a band market or the market is not Live: no occupancy. With no bound vault
-    /// LP or no rent the clocks are frozen (nothing accrues without a destination) and only the
-    /// slot moves, so a later bind never charges the unbound time.
-    #[inline(never)]
-    fn occ_clock_accrue_view(
-        group: &mut state::MarketViewMutV16<'_>,
-        now_slot: u64,
-    ) -> Result<Option<OccClocks>, ProgramError> {
-        let c = &group.header.config;
-        let cap = if c.band_bps.get() == 0 { 0 } else { c.band_max_positions_per_side.get() };
-        if cap == 0 || group.header.mode != 0 || group.markets.is_empty() {
-            return Ok(None);
-        }
-        let full_num =
-            growth_v19::occ_full_num(c.rent_max_e9_per_slot.get(), c.band_min_leg_notional.get());
-        let rec = read_asset_vault_lp_from_view(group, 0)?;
-        let lp = if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND != 0 {
-            Some(rec.vault_lp_portfolio)
-        } else {
-            None
-        };
-        let asset = &group.markets[0].engine.asset;
-        let (n_long, n_short) =
-            (asset.stored_pos_count_long.get(), asset.stored_pos_count_short.get());
-        let w = &mut group.markets[0].wrapper;
-        if w.len() < constants::ASSET_ORACLE_PROFILE_LEN {
-            return Err(PercolatorError::InvalidAccountLen.into());
-        }
-        let last = occ_read_u64(w, OCC_SLOT_OFF);
-        let mut c_long = occ_read_u64(w, OCC_CLOCK_OFF);
-        let mut c_short = occ_read_u64(w, OCC_CLOCK_OFF + 8);
-        if now_slot > last {
-            if last != 0 && full_num != 0 && lp.is_some() {
-                let dt = now_slot - last;
-                c_long = growth_v19::occ_clock_advance(c_long, growth_v19::occ_ramp_q32(n_long, cap), dt);
-                c_short =
-                    growth_v19::occ_clock_advance(c_short, growth_v19::occ_ramp_q32(n_short, cap), dt);
-            }
-            w[OCC_SLOT_OFF..OCC_SLOT_OFF + 8].copy_from_slice(&now_slot.to_le_bytes());
-            w[OCC_CLOCK_OFF..OCC_CLOCK_OFF + 8].copy_from_slice(&c_long.to_le_bytes());
-            w[OCC_CLOCK_OFF + 8..OCC_CLOCK_OFF + 16].copy_from_slice(&c_short.to_le_bytes());
-        }
-        Ok(Some(OccClocks { c_long, c_short, full_num, lp }))
-    }
-
-    /// prog#572: the side of the portfolio's leg on asset 0 (`Some(true)` = short), `None` = flat.
-    fn occ_leg_side(portfolio: &percolator::PortfolioV16ViewMut<'_>) -> Result<Option<bool>, ProgramError> {
-        for leg in portfolio.header.legs.iter() {
-            if leg.active != 0 && leg.asset_index.get() == 0 {
-                let l = leg.try_to_runtime().map_err(map_v16_error)?;
-                return Ok(Some(matches!(l.side, percolator::SideV16::Short)));
-            }
-        }
-        Ok(None)
-    }
-
-    /// prog#572: charge one portfolio its occupancy since its checkpoint (see the block comment
-    /// above). Callable at any touch, by anyone who can touch the account: what is charged is
-    /// exactly what the clock says the leg owes, never more, whoever triggers it and however
-    /// often (`occ_charge_step`: re-charging the same interval charges 0).
-    #[inline(never)]
-    fn occ_charge_view(
-        group: &mut state::MarketViewMutV16<'_>,
-        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
-        now_slot: u64,
-    ) -> ProgramResult {
-        let Some(clk) = occ_clock_accrue_view(group, now_slot)? else {
-            return Ok(());
-        };
-        let ck = portfolio.header.last_fee_slot.get();
-        let Some(short) = occ_leg_side(portfolio)? else {
-            // Flat: no slot held. Drop a stale checkpoint so a later leg starts fresh.
-            if ck & growth_v19::OCC_CK_TAG != 0 {
-                portfolio.header.last_fee_slot = percolator::V16PodU64::new(0);
-            }
-            return Ok(());
-        };
-        let c_now = if short { clk.c_short } else { clk.c_long };
-        let key = portfolio
-            .header
-            .provenance_header
-            .try_to_runtime()
-            .map_err(map_v16_error)?
-            .portfolio_account_id;
-        if clk.full_num == 0 || clk.lp.is_none() || clk.lp == Some(key) {
-            // Nothing is owed (no destination / rent off) and the vault LP never pays itself.
-            portfolio.header.last_fee_slot =
-                percolator::V16PodU64::new(growth_v19::occ_ck_encode(c_now >> 32, short));
-            return Ok(());
-        }
-        let (new_ck, due) = growth_v19::occ_charge_step(ck, short, c_now, clk.full_num);
-        if due != 0 {
-            // The engine's recurring-fee primitive over a one-slot window `[a - 1, a]` at the
-            // asset's `slot_last` (`a <= now`, and the engine's loss-currentness anchor is
-            // `min(a, slot_last) = a`): `dt = 1`, `rate = due`.
-            let a = group.markets[0].engine.asset.slot_last.get();
-            if a == 0 {
-                return Ok(()); // never accrued: charge at a later touch (checkpoint unchanged)
-            }
-            portfolio.header.last_fee_slot = percolator::V16PodU64::new(a - 1);
-            let charged = match group.sync_account_fee_to_slot_not_atomic(portfolio, a, due) {
-                Ok(x) => x,
-                Err(e) => {
-                    // Restore the checkpoint: a swallowed error (the crank's BStale) must not
-                    // leave an untagged word that would forgive the interval.
-                    portfolio.header.last_fee_slot = percolator::V16PodU64::new(ck);
-                    return Err(map_v16_error(e));
-                }
-            };
-            if charged != 0 {
-                let asset = &mut group.markets[0].engine.asset;
-                let unrouted = asset
-                    .rent_unrouted_atoms
-                    .get()
-                    .checked_add(charged)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                asset.rent_unrouted_atoms = percolator::V16PodU128::new(unrouted);
-            }
-        }
-        portfolio.header.last_fee_slot = percolator::V16PodU64::new(new_ck);
-        Ok(())
-    }
-
-    /// prog#572 att647 R2-1: outside Live (Resolved / Recovery) no occupancy accrues (the hooks gate on
-    /// a Live market), and the engine's `close_resolved_account_not_atomic` (CloseResolved, the
-    /// vault-LP resolved close, the resolved auto-crank) calls `sync_account_fee_to_slot_not_atomic(
-    /// resolved_slot)`, which refuses (Stale, 19) a `last_fee_slot` above the anchor, and a tagged
-    /// checkpoint (bit 63) is above every slot. So before any such engine call the tagged word is
-    /// released to 0: the engine then bills `[0, resolved_slot]` at the band market's maintenance
-    /// rate, which is 0. The occupancy between a leg's last Live touch and the resolution is
-    /// forgiven (bounded by the keeper's touch cadence; every leg is cranked each band epoch).
-    fn occ_release_checkpoint_outside_live_view(
-        group: &state::MarketViewMutV16<'_>,
-        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
-    ) {
-        if group.header.mode != 0
-            && portfolio.header.last_fee_slot.get() & growth_v19::OCC_CK_TAG != 0
-        {
-            portfolio.header.last_fee_slot = percolator::V16PodU64::new(0);
-        }
-    }
-
-    /// prog#572: after a trade changed a portfolio's leg, start a NEW or FLIPPED leg's checkpoint
-    /// at the clock (the pre-trade charge already brought the old leg current). A leg whose
-    /// checkpoint is valid for its side is left alone; a flat portfolio drops its checkpoint.
-    #[inline(never)]
-    fn occ_after_position_change_view(
-        group: &mut state::MarketViewMutV16<'_>,
-        portfolio: &mut percolator::PortfolioV16ViewMut<'_>,
-    ) -> ProgramResult {
-        let now_slot = authenticated_market_slot_or_fallback_view(group);
-        let Some(clk) = occ_clock_accrue_view(group, now_slot)? else {
-            return Ok(());
-        };
-        let ck = portfolio.header.last_fee_slot.get();
-        match occ_leg_side(portfolio)? {
-            None => {
-                if ck & growth_v19::OCC_CK_TAG != 0 {
-                    portfolio.header.last_fee_slot = percolator::V16PodU64::new(0);
-                }
-            }
-            Some(short) => {
-                let c_now = if short { clk.c_short } else { clk.c_long };
-                if growth_v19::occ_ck_decode(ck, short, c_now >> 32).is_none() {
-                    portfolio.header.last_fee_slot =
-                        percolator::V16PodU64::new(growth_v19::occ_ck_encode(c_now >> 32, short));
-                }
-            }
-        }
-        Ok(())
-    }
-
     /// v2.2 item 2: the per-side holding-fee rent rate `(long, short)` in e9 of notional per
     /// slot. 0 unless the engine config carries a rent ceiling, the asset's growth record is on
     /// with a measured `N_cap` snapshot, and the asset has a bound vault LP. Users OI per side
@@ -49213,8 +48900,6 @@ pub mod processor {
                     state::portfolio_view_mut_for_market_slots(&mut pf_data, max_market_slots)?;
                 expect_portfolio_view_account_key(&pf, portfolio_ai.key)?;
                 refresh(&mut group, &mut pf)?;
-                // prog#572: the per-slot occupancy charge, booked as LP rent and routed below.
-                occ_charge_view(&mut group, &mut pf, refresh_now_slot)?;
             }
             let mut lp_data = vault_lp_ai.try_borrow_mut_data()?;
             let mut lp = state::portfolio_view_mut_for_market_slots(&mut lp_data, max_market_slots)?;
