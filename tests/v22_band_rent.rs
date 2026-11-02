@@ -2702,8 +2702,12 @@ fn sec4_tag119_refused_while_lagged_and_while_pinned() {
     assert_err(&r, &code(PercolatorError::EngineLockActive), "tag 119 while pinned");
 }
 
-/// A self-hedging cap-filler cannot starve honest entrants any more, but it can re-fill: each
-/// eviction costs the filler its slot, and an honest entrant pays >= 2x the smallest notional.
+/// Tag 119 frees a slot only from a SMALL filler leg (notional <= 4x the market minimum, N-8):
+/// each eviction costs the filler its slot, and an honest entrant pays >= 2x the victim's
+/// notional. It does NOT stop a filler whose legs are all above 4x the minimum: those can never
+/// be evicted and lock the side (prog#572). Since #572 such a held full side pays the maximum
+/// holding rent to the vault LP (slot-occupancy rent, `r572_hedged_cap_filler_pays_occupancy_rent_to_the_vault_lp`);
+/// it is priced, not prevented.
 /// Cost of evicting a victim of notional N: the evictor's own trade fee and exposure on 2N.
 #[test]
 fn sec4_tag119_evictor_cost_and_no_profit_from_evict_then_reverse() {
@@ -6199,6 +6203,841 @@ fn lev_guard_vol_profile_floor_off_is_unchanged_on_only_tightens() {
     }
 }
 
+// ===========================================================================
+// prog#572: slot occupancy, priced PER SLOT (Khubair 2026-11-01). Every occupied leg on a band
+// side past 85% of `band_max_positions_per_side` pays the SAME flat amount per slot, whatever its
+// notional: `F_side = ramp(count) * rent_max * 4 * band_min_leg_notional / 1e9` atoms per slot,
+// integrated by a per-side clock in the wrapper and charged at every touch from capital no loss
+// owns, booked as LP rent (`rent_unrouted_atoms`) and routed to the bound vault LP (tag 106 /
+// TradeCpi with the LP). The utilisation rent (per notional, on the engine index) is unchanged.
+// ===========================================================================
+
+impl Env {
+    /// A trader whose owner, portfolio and token-source keys are derived from `i` (u32), so a
+    /// test can create more than the ~80 traders `Env::trader`'s u8 key counter allows.
+    fn trader_n(&mut self, i: u32, deposit: u128) -> (Keypair, Pubkey) {
+        let seed = |tag: u8| {
+            let mut s = [0x57u8; 32];
+            s[0] = 0xC5;
+            s[1] = tag;
+            s[2..6].copy_from_slice(&i.to_le_bytes());
+            s
+        };
+        let owner = solana_sdk::signer::keypair::keypair_from_seed(&seed(1)).unwrap();
+        let portfolio_kp = solana_sdk::signer::keypair::keypair_from_seed(&seed(2)).unwrap();
+        let source = Pubkey::new_from_array(seed(3));
+        let portfolio = portfolio_kp.pubkey();
+        self.svm.airdrop(&owner.pubkey(), 1_000_000_000).unwrap();
+        self.svm
+            .set_account(
+                portfolio,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: vec![0u8; self.portfolio_account_len],
+                    owner: self.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let m = self.market;
+        self.send(
+            ProgInstruction::InitPortfolio,
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, true),
+            ],
+            &[&owner, &portfolio_kp],
+        )
+        .expect("init portfolio");
+        let mint = self.mint;
+        self.svm
+            .set_account(
+                source,
+                Account {
+                    lamports: 1_000_000_000,
+                    data: make_token_data(mint, owner.pubkey(), deposit as u64),
+                    owner: spl_token::ID,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = self.identity(portfolio);
+        let (m, v) = (self.market, self.vault);
+        self.send(
+            ProgInstruction::Deposit { portfolio_id, expected_sequence, amount: deposit },
+            vec![
+                AccountMeta::new(owner.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(source, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&owner],
+        )
+        .expect("deposit");
+        (owner, portfolio)
+    }
+
+    /// Refresh every leg (a keeper sweep): a rent / funding index move marks the whole side's
+    /// cohort stale, and risk-increasing trades refuse with EngineLossStale (121) until each leg
+    /// is settled (engine `kernel_mark_kf_stale_cohorts`; pre-existing, as for utilisation rent).
+    fn sweep(&mut self, ps: &[Pubkey]) {
+        for p in ps {
+            self.crank_current(*p);
+        }
+        let a = self.engine_asset();
+        assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 0), "sweep settled every leg");
+    }
+
+    fn pos_counts(&self) -> (u64, u64) {
+        let a = self.engine_asset();
+        (a.stored_pos_count_long, a.stored_pos_count_short)
+    }
+
+    /// The per-side rent RATE the handlers actually charged over one slot (e9 of notional per
+    /// slot): advance one slot, accrue it (AuthMark push + crank), and read the rent index
+    /// increments back (`dR = price * rate * 1`, engine `rent_index_delta`). Price is held flat.
+    fn charged_rent_rates_one_slot(&mut self, crank_target: Pubkey) -> (u64, u64) {
+        // Catch the asset up first (one settling slot), then measure exactly one slot.
+        self.warp(1);
+        self.push(PRICE);
+        self.crank_current(crank_target);
+        let a0 = self.engine_asset();
+        assert_eq!(a0.slot_last, self.slot, "asset caught up before the probe");
+        self.warp(1);
+        self.push(PRICE);
+        self.crank_current(crank_target);
+        let a1 = self.engine_asset();
+        assert_eq!(a1.slot_last, self.slot, "exactly one slot accrued");
+        let p = a1.effective_price as u128;
+        assert_eq!(p, PRICE as u128, "flat price");
+        let dl = a1.rent_index_long_num - a0.rent_index_long_num;
+        let ds = a1.rent_index_short_num - a0.rent_index_short_num;
+        assert_eq!(dl % p, 0);
+        assert_eq!(ds % p, 0);
+        ((dl / p) as u64, (ds / p) as u64)
+    }
+}
+
+
+/// prog#572 tests run with rent_max 500 e9/slot so the occupancy is visible in few slots:
+/// `F_full = 500 * 4 * $10 / 1e9 = 20` atoms per slot per leg at a full side. (The test market's
+/// margins carry at most 749 under the x5 Band Safety Law rule, `r572_init_market_*`.)
+const OCC_RENT: u32 = 500;
+const OCC_F_FULL: u128 = 20;
+
+fn occ_cfg() -> Cfg {
+    Cfg { slots: 1, phase4: Some(phase4(BAND_BPS, OCC_RENT)), r_gap: 0 }
+}
+
+fn occ_full_num() -> u128 {
+    percolator_prog::growth_v19::occ_full_num(OCC_RENT as u64, BAND_MIN_LEG)
+}
+
+impl Env {
+    /// The occupancy clock: `(last slot, C_long, C_short)` (Q32.32), from asset 0's profile.
+    fn occ_clock(&self) -> (u64, u64, u64) {
+        let data = self.svm.get_account(&self.market).unwrap().data;
+        let r = state::asset_growth_range(&data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        let so = std::mem::offset_of!(state::AssetOracleProfileV16, maintenance_fee_checkpoint_slot);
+        let co = std::mem::offset_of!(state::AssetOracleProfileV16, maintenance_fee_previous_rate);
+        let rd = |o: usize| u64::from_le_bytes(data[slot0 + o..slot0 + o + 8].try_into().unwrap());
+        (rd(so), rd(co), rd(co + 8))
+    }
+
+    fn capitals(&self, ps: &[Pubkey]) -> Vec<u128> {
+        ps.iter().map(|p| self.portfolio_state(*p).capital).collect()
+    }
+
+    /// Hold `n` slots: each slot is accrued by a crank of `lp` only (max_accrual_dt_slots = 1);
+    /// no other leg is touched, so nobody is charged until the next sweep.
+    fn hold(&mut self, n: u64, lp: Pubkey) {
+        for _ in 0..n {
+            self.warp(1);
+            self.push(PRICE);
+            self.crank_current(lp);
+        }
+    }
+}
+
+/// The per-leg charge of one touch from checkpoint clock `c0` to `c1` (Q32.32).
+fn occ_due(c0: u64, c1: u64) -> u128 {
+    occ_full_num() * ((c1 >> 32) - (c0 >> 32)) as u128 / 1_000_000_000
+}
+
+/// prog#572 FINDING-1 regression. 15 honest $10k longs + a griefer's 5 legs of $10 (the market
+/// minimum) fill a 20-slot side. Over a 120-slot hold at a full side EVERY leg pays the same
+/// 40 x 120 atoms, so the griefer pays exactly its share of the slots (5/20) of the occupancy,
+/// not ~1/3,100 as under the per-notional design (where 5 x $10 pushed $150k of honest longs to
+/// rent_max). The charge lands in `rent_unrouted`, tag 106 moves it to the vault LP's capital
+/// (insurance falls by exactly that), no engine rent index moves (no K/F / rent cohort restale,
+/// att647 NEW-1 class), and once the griefer leaves the side is below the knee: the clock stops.
+/// Negative control: on rc23 (no occupancy charge) every leg pays 0 (fails at the first assert).
+#[test]
+fn r572_dust_griefer_pays_per_slot_like_an_honest_leg() {
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1); // a live clock (slot > 0): the first trade starts the occupancy clock
+    let lp = env.lp(20_000_000 * USD);
+    let mut honest = Vec::new();
+    for i in 0..15u32 {
+        let t = env.trader_n(i, 5_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10_000 * Q).expect("honest $10k long");
+        honest.push(t.1);
+    }
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q; // $10, the market minimum
+    let mut dust = Vec::new();
+    for i in 0..5u32 {
+        let t = env.trader_n(1_000 + i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("griefer $10 long");
+        dust.push(t);
+    }
+    assert_eq!(env.pos_counts().0, 20, "the long side is full");
+    let mut all = honest.clone();
+    all.extend(dust.iter().map(|t| t.1));
+    let mut swept = all.clone();
+    swept.push(lp.account);
+    env.sweep(&swept);
+    let idx0 = env.engine_asset().rent_index_long_num;
+    let (_, cl0, cs0) = env.occ_clock();
+    let cap0 = env.capitals(&all);
+    let unrouted0 = env.engine_asset().rent_unrouted_atoms;
+    const H: u64 = 120;
+    env.hold(H, lp.account);
+    // No lock-out while the side is past the knee: nothing moved an engine index, so no leg is
+    // stale (the griefer's legs were not touched during the hold).
+    let a = env.engine_asset();
+    assert_eq!((a.stale_account_count_long, a.stale_account_count_short), (0, 0), "no cohort restaled");
+    assert_eq!(a.rent_index_long_num, idx0, "occupancy is not on the engine rent index (utilisation 0 here)");
+    env.sweep(&swept);
+    let (_, cl1, cs1) = env.occ_clock();
+    assert_eq!(cl1 - cl0, H << 32, "a full side: one full-occupancy slot per slot, exactly");
+    assert_eq!(cs1, cs0, "the short side (the LP alone) is far below the knee");
+    let paid: Vec<u128> =
+        all.iter().zip(&cap0).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).collect();
+    let want = OCC_F_FULL * H as u128;
+    assert_eq!(want, occ_due(cl0, cl1));
+    eprintln!("R572 per-slot: {H} slots at 20/20: honest legs paid {:?}, griefer legs paid {:?} (want {want} each)", &paid[..15], &paid[15..]);
+    for (i, x) in paid.iter().enumerate() {
+        assert_eq!(*x, want, "leg {i}: every leg pays the same flat amount per slot");
+    }
+    let g: u128 = paid[15..].iter().sum();
+    let tot: u128 = paid.iter().sum();
+    assert_eq!(g * 20, tot * 5, "the griefer's share of the occupancy = its share of the slots");
+    let unrouted = env.engine_asset().rent_unrouted_atoms;
+    assert_eq!(unrouted - unrouted0, tot, "every charged atom is the vault LP's claim");
+    // Route: tag 106 (same slot, so nothing new is owed) moves it to the LP's capital.
+    let ins0 = env.engine_header().2;
+    let lp_cap0 = env.portfolio_state(lp.account).capital;
+    env.settle_rent(honest[0], lp.account).expect("tag 106");
+    let lp_gain = env.portfolio_state(lp.account).capital - lp_cap0;
+    assert_eq!(lp_gain, unrouted, "the vault LP's capital receives the occupancy");
+    assert_eq!(ins0 - env.engine_header().2, unrouted, "out of insurance, exactly");
+    assert_eq!(env.engine_asset().rent_unrouted_atoms, 0);
+    // The griefer leaves after 10 more slots at a full side. Each exit settles the leg's last
+    // interval first: the tag-44 owner exit (the app's close) and the TradeCpi closes alike.
+    let dps: Vec<Pubkey> = dust.iter().map(|t| t.1).collect();
+    let dcap = env.capitals(&dps);
+    env.hold(10, lp.account);
+    env.rebalance_reduce(&dust[0].0, dust[0].1, dust_q as u128).expect("tag 44 exit");
+    for t in &dust[1..] {
+        env.trade_cpi(&t.0, t.1, &lp, -dust_q).expect("griefer exits");
+    }
+    assert_eq!(env.pos_counts().0, 15);
+    let exit_paid: Vec<u128> =
+        dps.iter().zip(&dcap).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).collect();
+    assert_eq!(exit_paid, vec![OCC_F_FULL * 10; 5], "each exit paid its last 10 slots at a full side");
+    let mut hs = honest.clone();
+    hs.push(lp.account);
+    env.sweep(&hs);
+    let (_, cl2, _) = env.occ_clock();
+    let cap2 = env.capitals(&honest);
+    env.hold(30, lp.account);
+    env.sweep(&hs);
+    assert_eq!(env.occ_clock().1, cl2, "below the knee the clock stands still");
+    assert_eq!(env.capitals(&honest), cap2, "and nobody pays occupancy");
+    env.assert_conservation();
+}
+
+/// prog#572 ramp, flat per leg, no cliff, no lock-out (cap poked to 20: knee = 17). A $10 leg and a
+/// $5M whale on the same side pay the SAME per slot. Over 90-slot holds the long clock advances by
+/// exactly `ramp_q32(n, 20) * 90` (0, 1/9, 4/9, 1 of a full slot per slot at n = 17..20), and each
+/// probe pays `floor(F * dC / 1e9)` from its checkpoint. After each hold the next leg OPENS without
+/// any sweep of the other legs (they were last touched before the hold): no LossStale (121).
+/// Negative control: rc23 charges 0 at 18, 19, 20 (fails at the 18 checkpoint).
+#[test]
+fn r572_occupancy_ramp_is_flat_per_leg_continuous_and_never_locks_opens() {
+    use percolator_prog::growth_v19::occ_ramp_q32;
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1); // a live clock (slot > 0): the first trade starts the occupancy clock
+    let lp = env.lp(20_000_000 * USD);
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q;
+    let small = env.trader_n(0, 100 * USD);
+    env.trade_cpi(&small.0, small.1, &lp, dust_q).expect("$10 probe long");
+    let whale = env.trader_n(1, 2_000_000 * USD);
+    env.trade_cpi(&whale.0, whale.1, &lp, 5_000_000 * Q).expect("$5M whale long");
+    for i in 2..17u32 {
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("long");
+    }
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    let probes = [small.1, whale.1];
+    let mut per_slot = Vec::new();
+    for n in 17u64..=20 {
+        assert_eq!(env.pos_counts().0, n);
+        let mut ps = probes.to_vec();
+        ps.push(lp.account);
+        env.sweep(&ps);
+        let (_, c0, _) = env.occ_clock();
+        let cap0 = env.capitals(&probes);
+        let ck0: Vec<u64> = probes.iter().map(|p| env.portfolio_state(*p).last_fee_slot).collect();
+        env.hold(90, lp.account);
+        env.sweep(&ps);
+        let (_, c1, _) = env.occ_clock();
+        assert_eq!(c1 - c0, occ_ramp_q32(n, 20) as u64 * 90, "clock = ramp x slots at {n}/20");
+        let paid: Vec<u128> =
+            probes.iter().zip(&cap0).map(|(p, c)| c - env.portfolio_state(*p).capital).collect();
+        // The checkpoint holds the clock's integer part with the side bit (long = 0).
+        let want = occ_due(((ck0[0] & !(1 << 63)) >> 1) << 32, c1);
+        assert_eq!(paid[0], want, "probe paid floor(F x dC) at {n}/20");
+        assert_eq!(paid[0], paid[1], "the $10 leg and the $5M whale pay the same at {n}/20");
+        per_slot.push(paid[0]);
+        if n < 20 {
+            // The next leg opens with every other leg untouched since before the hold.
+            let t = env.trader_n(100 + n as u32, 100 * USD);
+            env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("an open past the knee is not locked out");
+        }
+    }
+    eprintln!("R572 ramp: 90-slot charges at 17,18,19,20/20 = {per_slot:?} (F_full x 90 = {})", OCC_F_FULL * 90);
+    assert_eq!(per_slot[0], 0, "at the knee: nothing");
+    assert_eq!(per_slot[1], OCC_F_FULL * 10, "1/9 of full");
+    assert_eq!(per_slot[2], OCC_F_FULL * 40, "4/9 of full");
+    assert_eq!(per_slot[3], OCC_F_FULL * 90, "full: F_full per slot");
+    let more = env.trader_n(500, 100 * USD);
+    let r = env.trade_cpi(&more.0, more.1, &lp, dust_q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "the side is full");
+    env.assert_conservation();
+}
+
+/// prog#572 no regression: the utilisation rent (per notional, engine index) is exactly today's
+/// at and past the knee (the occupancy is NOT added to the index rate any more), with a crowd
+/// above the 50% kink. Passes on rc23 and on the fix by design.
+#[test]
+fn r572_utilisation_rent_on_the_index_is_unchanged() {
+    use percolator_prog::growth_v19::rent_rate_e9;
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(1_000 * USD);
+    let mut n = 0u32;
+    let mut longs: Vec<Pubkey> = Vec::new();
+    for _ in 0..16 {
+        let t = env.trader_n(n, 1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        longs.push(t.1);
+        n += 1;
+    }
+    let big = env.trader_n(n, 1_000 * USD);
+    env.trade_cpi(&big.0, big.1, &lp, 640 * Q).expect("long");
+    longs.push(big.1);
+    n += 1;
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+    let util_rate = |env: &Env| {
+        let g = env.growth();
+        let a = env.engine_asset();
+        rent_rate_e9(a.oi_eff_long_q, g.rent_n_cap_q as u128, g.rent_kink_bps, RENT_MAX as u64).unwrap()
+    };
+    let want = util_rate(&env);
+    assert!(want > 0, "the crowd is above the kink");
+    let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
+    assert_eq!(rl, want, "17/20: exactly the utilisation rent");
+    let mut ps = longs.clone();
+    ps.push(lp.account);
+    env.sweep(&ps);
+    for _ in 0..3 {
+        let t = env.trader_n(n, 1_000 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+        n += 1;
+    }
+    assert_eq!(env.pos_counts().0, 20, "full");
+    let want = util_rate(&env);
+    let (rl, _) = env.charged_rent_rates_one_slot(lp.account);
+    eprintln!("R572 20/20: index rate {rl} = utilisation rent {want} (rent_max {RENT_MAX})");
+    assert_eq!(rl, want, "full side: the index still carries only the utilisation rent");
+    env.assert_conservation();
+}
+
+impl Env {
+    /// Clear the asset's vault-LP binding (the record a market has before tag 94 binds a vault).
+    fn unbind_vault_lp(&mut self) {
+        let mut mk = self.svm.get_account(&self.market).unwrap();
+        let r = state::asset_growth_range(&mk.data, 0).unwrap();
+        let slot0 = r.start - percolator_prog::constants::ASSET_GROWTH_OFF;
+        state::asset_vault_lp_to_wrapper_bytes(
+            &mut mk.data[slot0..slot0 + percolator_prog::constants::ASSET_ORACLE_WRAPPER_LEN],
+            &state::AssetVaultLpV18::default(),
+        )
+        .unwrap();
+        self.svm.set_account(self.market, mk).unwrap();
+    }
+}
+
+
+/// prog#572 no bound vault LP: the charge has no destination, so a FULL side pays no occupancy;
+/// the clocks stand still (a later bind never charges the unbound time), nothing is booked as LP
+/// rent and insurance is not credited. No-regression (passes on rc23 by design); negative control
+/// = mutant that drops the bound-LP gate in `occ_clock_accrue_view` (fails: legs are charged).
+#[test]
+fn r572_no_bound_vault_lp_no_occupancy_charge() {
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1); // a live clock (slot > 0): the first trade starts the occupancy clock
+    let lp = env.lp(20_000_000 * USD);
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q;
+    let mut longs = Vec::new();
+    for i in 0..20u32 {
+        if i == 17 {
+            env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+        }
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("small long");
+        longs.push(t.1);
+    }
+    assert_eq!(env.pos_counts().0, 20, "the long side is full");
+    env.unbind_vault_lp();
+    let mut ps = longs.clone();
+    ps.push(lp.account);
+    env.sweep(&ps);
+    let (_, cl0, cs0) = env.occ_clock();
+    let cap0 = env.capitals(&longs);
+    let ins0 = env.engine_header().2;
+    let unrouted0 = env.engine_asset().rent_unrouted_atoms;
+    env.hold(40, lp.account);
+    env.sweep(&ps);
+    let (_, cl1, cs1) = env.occ_clock();
+    eprintln!("R572 no bound vault LP, 20/20: clocks {cl0}->{cl1} / {cs0}->{cs1}");
+    assert_eq!((cl1, cs1), (cl0, cs0), "frozen without a destination");
+    assert_eq!(env.capitals(&longs), cap0, "no occupancy charged");
+    assert_eq!(env.engine_asset().rent_unrouted_atoms, unrouted0, "nothing booked");
+    assert_eq!(env.engine_header().2, ins0, "insurance not credited");
+    env.assert_conservation();
+}
+
+/// prog#572 band-off market (rent on, band_bps 0, cap 0): no occupancy clock, no charge, the
+/// maintenance-fee checkpoint bytes are untouched (0). No-regression (passes on rc23 by design);
+/// negative control = mutant reading the engine constant 256 as the cap (fails: clock written).
+#[test]
+fn r572_band_off_market_no_occupancy() {
+    let mut c = occ_cfg();
+    c.phase4 = Some(phase4(0, OCC_RENT));
+    c.r_gap = 400;
+    let mut env = Env::new(c);
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    let (_, group) = state::read_market(&data).unwrap();
+    assert_eq!((group.config.band_bps, group.config.band_max_positions_per_side), (0, 0), "band off, cap 0");
+    let mut longs = Vec::new();
+    for i in 0..20u32 {
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("small long");
+        longs.push(t.1);
+    }
+    let cap0 = env.capitals(&longs);
+    env.hold(20, lp.account);
+    for p in &longs {
+        env.crank_current(*p);
+    }
+    assert_eq!(env.occ_clock(), (0, 0, 0), "no occupancy state on a band-off market");
+    assert!(longs.iter().all(|p| env.portfolio_state(*p).last_fee_slot & (1 << 63) == 0), "no checkpoint");
+    let paid: u128 = longs.iter().zip(&cap0).map(|(p, c0)| c0 - env.portfolio_state(*p).capital).sum();
+    assert_eq!(paid, 0, "utilisation rent only (0 with a $20M LP), no occupancy");
+    env.assert_conservation();
+}
+
+/// prog#572 checkpoints: a leg pays only for the slots IT held on its side.
+/// * A newcomer flat for 60 slots at a full side, then opening, pays only from its open.
+/// * A leg that FLIPS from the full long side to the (near-empty) short side pays the long
+///   clock up to the flip, then the short side's (0 here).
+/// Negative control: on rc23 nothing is charged (fails at the newcomer's charge).
+#[test]
+fn r572_new_and_flipped_legs_pay_only_for_their_own_slot_time() {
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1); // a live clock (slot > 0): the first trade starts the occupancy clock
+    let lp = env.lp(20_000_000 * USD);
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q;
+    let mut longs = Vec::new();
+    for i in 0..20u32 {
+        if i == 17 {
+            env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+        }
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("long");
+        longs.push(t);
+    }
+    let newcomer = env.trader_n(900, 100 * USD);
+    // One long leaves: 19/20 for 60 slots while the newcomer is flat.
+    let leaver = longs.pop().unwrap();
+    env.trade_cpi(&leaver.0, leaver.1, &lp, -dust_q).expect("leaver exits");
+    let cap_new0 = env.portfolio_state(newcomer.1).capital;
+    env.hold(60, lp.account);
+    let ps: Vec<Pubkey> = longs.iter().map(|t| t.1).chain([lp.account]).collect();
+    env.sweep(&ps);
+    env.trade_cpi(&newcomer.0, newcomer.1, &lp, dust_q).expect("newcomer opens: 20/20");
+    let (_, c_open, _) = env.occ_clock();
+    let flipper = (longs[0].0.insecure_clone(), longs[0].1);
+    let cap_f0 = env.portfolio_state(flipper.1).capital;
+    let (_, c_f0, _) = env.occ_clock();
+    let ckf = env.portfolio_state(flipper.1).last_fee_slot;
+    env.hold(30, lp.account);
+    // The flipper goes from long $10 to short $10 in the same slot (a band trade does not cross
+    // zero in one fill: close, then open short): the close's pre-trade charge settles the long
+    // side through now, the open's post-trade checkpoint starts on the short clock.
+    env.trade_cpi(&flipper.0, flipper.1, &lp, -dust_q).expect("close the long");
+    env.trade_cpi(&flipper.0, flipper.1, &lp, -dust_q).expect("open short");
+    assert_eq!(env.pos(flipper.1), -dust_q);
+    let (_, c_flip, cs_flip) = env.occ_clock();
+    let paid_long = cap_f0 - env.portfolio_state(flipper.1).capital;
+    assert_eq!(paid_long, occ_due(((ckf & !(1 << 63)) >> 1) << 32, c_flip), "long side paid through the flip");
+    assert!(paid_long > 0);
+    assert!(c_f0 <= c_open);
+    let ck_short = env.portfolio_state(flipper.1).last_fee_slot;
+    assert_eq!(ck_short & 1, 1, "checkpoint on the short side now");
+    assert_eq!((ck_short & !(1 << 63)) >> 1, cs_flip >> 32);
+    let cap_f1 = env.portfolio_state(flipper.1).capital;
+    env.hold(30, lp.account);
+    let mut ps2: Vec<Pubkey> = longs.iter().map(|t| t.1).collect();
+    ps2.push(newcomer.1);
+    ps2.push(lp.account);
+    env.sweep(&ps2);
+    env.crank_current(flipper.1);
+    assert_eq!(env.portfolio_state(flipper.1).capital, cap_f1, "the short side is below the knee: 0");
+    let (_, c_end, _) = env.occ_clock();
+    let paid_new = cap_new0 - env.portfolio_state(newcomer.1).capital;
+    eprintln!("R572 newcomer paid {paid_new} for its own slots (clock {} -> {}); flipper paid {paid_long} long, 0 short", c_open >> 32, c_end >> 32);
+    assert_eq!(paid_new, occ_due(c_open, c_end), "the newcomer pays from its open only, never the 60 flat slots");
+    assert!(paid_new < OCC_F_FULL * 61, "less than its 60-plus slots at full");
+    env.assert_conservation();
+}
+
+/// prog#572 at the REAL cap (256 per side): a hedged cap-filler with 512 legs of $41 (> 4x the $10
+/// minimum: tag 119 cannot evict them) against a $20M vault LP (utilisation rent 0). All 512 opens
+/// land with NO sweep in between (the occupancy moves no engine index: no LossStale lock-out at
+/// any count). The long clock stands still at 217/256 (84.8%), moves by `ramp_q32(218, 256)` per
+/// slot at 218/256, and at 256/256 every filler leg, long or short, pays `F_full` per slot, and
+/// honest opens are refused (the cap) while the filler pays for every slot it holds.
+/// Negative control: rc23 charges nothing (fails at the first full-side charge).
+#[test]
+fn r572_hedged_cap_filler_pays_per_slot_at_the_real_cap() {
+    use percolator_prog::growth_v19::occ_ramp_q32;
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1); // a live clock (slot > 0): the first trade starts the occupancy clock
+    let lp = env.lp(20_000_000 * USD);
+    let side_cap = percolator::band_rent::BAND_MAX_POSITIONS_PER_SIDE;
+    assert_eq!(side_cap, 256);
+    let leg = 41 * Q; // $41
+    let mut fillers: Vec<(Keypair, Pubkey)> = Vec::new();
+    for i in 0..side_cap as u32 {
+        let l = env.trader_n(2 * i, 20 * USD);
+        env.trade_cpi(&l.0, l.1, &lp, leg).expect("filler long (no sweep needed)");
+        let s = env.trader_n(2 * i + 1, 20 * USD);
+        env.trade_cpi(&s.0, s.1, &lp, -leg).expect("filler short (no sweep needed)");
+        fillers.push(l);
+        fillers.push(s);
+        let n = i as u64 + 1;
+        if n == 217 || n == 218 {
+            let (_, c0, s0) = env.occ_clock();
+            env.hold(10, lp.account);
+            let (_, c1, s1) = env.occ_clock();
+            assert_eq!(c1 - c0, occ_ramp_q32(n, 256) * 10, "long clock at {n}/256");
+            assert_eq!(s1 - s0, occ_ramp_q32(n, 256) * 10, "short clock at {n}/256");
+            if n == 217 {
+                assert_eq!(c1, c0, "at/below the knee: nothing accrues");
+            } else {
+                assert!(c1 > c0);
+            }
+        }
+    }
+    assert_eq!(env.pos_counts(), (256, 256));
+    let honest = env.trader_n(10_000, 10_000 * USD);
+    let r = env.trade_cpi(&honest.0, honest.1, &lp, 100 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "long side full");
+    let r = env.evict_and_trade(fillers[0].1, &honest.0, honest.1, &lp, 820 * Q);
+    assert_err(&r, &code(PercolatorError::PriceBandPositionCap), "a $41 filler leg is not evictable");
+    let probes = [fillers[0].1, fillers[1].1, fillers[510].1, fillers[511].1];
+    for p in probes {
+        env.crank_current(p);
+    }
+    let cap0 = env.capitals(&probes);
+    let unrouted0 = env.engine_asset().rent_unrouted_atoms;
+    env.hold(25, lp.account);
+    for p in probes {
+        env.crank_current(p);
+    }
+    let paid: Vec<u128> = probes.iter().zip(&cap0).map(|(p, c)| c - env.portfolio_state(*p).capital).collect();
+    eprintln!("R572 256/256: filler legs (long, short, long, short) paid {paid:?} over 25 slots (F_full {OCC_F_FULL}/slot)");
+    assert!(paid.iter().all(|x| *x == OCC_F_FULL * 25), "every filler leg pays F_full per slot");
+    assert_eq!(env.engine_asset().rent_unrouted_atoms - unrouted0, paid.iter().sum::<u128>());
+    env.assert_conservation();
+}
+
+/// prog#572: the clocks live in asset 0's profile bytes, and the trade handler writes back a
+/// profile copy it read BEFORE the occupancy hooks ran. The 20th leg opens 10 slots after the
+/// last clock touch (19/20 = 4/9 of a full side for those 10 slots): the pre-trade accrual must
+/// survive the handler's write-back, so the clock gains exactly `ramp_q32(19, 20) * 10` and its
+/// slot moves to now. Negative control: without the band-market byte preservation in the profile
+/// writers (mutant mD_nopreserve) the clock is rolled back (gain 0, slot unchanged), and the next
+/// accrual would bill those 10 slots at the new 20/20 count.
+#[test]
+fn r572_occupancy_clock_survives_the_trade_handlers_profile_write() {
+    use percolator_prog::growth_v19::occ_ramp_q32;
+    let mut env = Env::new(occ_cfg());
+    env.auth_mark();
+    env.warp(1);
+    let lp = env.lp(20_000_000 * USD);
+    let dust_q = BAND_MIN_LEG as i128 / 1_000_000 * Q;
+    let mut longs = Vec::new();
+    for i in 0..19u32 {
+        if i == 17 {
+            env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(20));
+        }
+        let t = env.trader_n(i, 100 * USD);
+        env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("long");
+        longs.push(t.1);
+    }
+    let mut ps = longs.clone();
+    ps.push(lp.account);
+    env.sweep(&ps);
+    let (s0, c0, _) = env.occ_clock();
+    assert_eq!(s0, env.slot);
+    env.warp(10);
+    env.push(PRICE);
+    let t = env.trader_n(99, 100 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, dust_q).expect("20th leg opens 10 slots after the last clock touch");
+    let (s1, c1, _) = env.occ_clock();
+    eprintln!("R572 clock across a trade: slot {s0}->{s1}, C {c0}->{c1} (want +{})", occ_ramp_q32(19, 20) * 10);
+    assert_eq!(s1, env.slot, "the pre-trade accrual's slot survives the handler's profile write");
+    assert_eq!(c1 - c0, occ_ramp_q32(19, 20) * 10, "the 10 slots accrue at the pre-trade 19/20");
+    env.assert_conservation();
+}
+
+// ===========================================================================
+// att647 ROUND 2 (PR #647 per-slot rework, head cc7424b6).
+// R2-1: the tagged occupancy checkpoint in `last_fee_slot` (bit 63 set) vs the engine's
+// `sync_account_fee_to_slot_not_atomic`, which `close_resolved_account_not_atomic` calls
+// UNCONDITIONALLY with `now_slot = resolved_slot` and which returns `Stale` when
+// `now_slot < last_fee_slot` (engine v16.rs:25100). Every band-market portfolio whose leg was
+// opened by a trade carries a tagged checkpoint (`occ_after_position_change_view`).
+// Safety property asserted: after resolution, a trader holding a leg can CloseResolved.
+// Expected: passes on base rc23, FAILED on PR head cc7424b6; regression for the fix
+// (`occ_release_checkpoint_outside_live_view`). Test by att647 (branch att/647r2 78b4613b).
+// ===========================================================================
+#[test]
+fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(20_000_000 * USD);
+    let t = env.trader_n(40_000, 1_000 * USD);
+    env.trade_cpi(&t.0, t.1, &lp, 10 * Q).expect("long");
+    let t2 = env.trader_n(40_002, 1_000 * USD);
+    env.trade_cpi(&t2.0, t2.1, &lp, 10 * Q).expect("second long");
+    let ck = env.portfolio_state(t.1).last_fee_slot;
+    let lp_ck = env.portfolio_state(lp.account).last_fee_slot;
+    eprintln!("ATT647R2 trader last_fee_slot = {ck:#x} (tag bit 63: {}), LP last_fee_slot = {lp_ck:#x}", ck >> 63);
+    // A flat trader too (opened, then closed by trade).
+    let f = env.trader_n(40_001, 1_000 * USD);
+    env.trade_cpi(&f.0, f.1, &lp, 10 * Q).expect("long");
+    env.trade_cpi(&f.0, f.1, &lp, -10 * Q).expect("close");
+    eprintln!("ATT647R2 flat trader last_fee_slot = {:#x}", env.portfolio_state(f.1).last_fee_slot);
+    // Resolve: the market admin resolves (tag 19) at the current slot.
+    env.warp(1);
+    env.push(PRICE);
+    env.crank_current(lp.account);
+    let m = env.market;
+    let data = env.svm.get_account(&m).unwrap().data;
+    let authority_epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+    let asset_generation_frontier = state::read_market_asset_generation_frontier(&data).unwrap();
+    let admin = env.admin.insecure_clone();
+    let r = env.send(
+        ProgInstruction::ResolveMarket { asset_generation_frontier, authority_epoch },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    );
+    eprintln!("ATT647R2 resolve (tag 19): {}", match &r { Ok(c) => format!("Ok({c})"), Err(e) => { let i = e.find("err:").unwrap_or(0); e[i..].chars().take(70).collect() } });
+    r.expect("resolved");
+    env.warp(2_000_000);
+    let mut close = |env: &mut Env, owner: &Keypair, p: Pubkey| -> Result<u64, String> {
+        let dest = env.key();
+        let mint = env.mint;
+        env.svm
+            .set_account(
+                dest,
+                Account { lamports: 1_000_000_000, data: make_token_data(mint, owner.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 },
+            )
+            .unwrap();
+        let (m, v) = (env.market, env.vault);
+        let authority = Pubkey::find_program_address(&[b"vault", m.as_ref()], &env.program_id).0;
+        let reg = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &env.program_id).0;
+        let o = owner.insecure_clone();
+        env.send(
+            ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            vec![
+                AccountMeta::new_readonly(o.pubkey(), true),
+                AccountMeta::new(m, false),
+                AccountMeta::new(p, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(v, false),
+                AccountMeta::new_readonly(authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+                AccountMeta::new_readonly(reg, false),
+            ],
+            &[&o],
+        )
+    };
+    let short = |r: &Result<u64, String>| match r { Ok(c) => format!("Ok({c})"), Err(e) => { let i = e.find("err:").unwrap_or(0); e[i..].chars().take(70).collect() } };
+    let rf = close(&mut env, &f.0, f.1);
+    eprintln!("ATT647R2 CloseResolved flat trader: {}", short(&rf));
+    let mut rt = Err(String::new());
+    for i in 0..4 {
+        rt = close(&mut env, &t.0, t.1);
+        eprintln!("ATT647R2 CloseResolved trader with a leg, attempt {i}: {}", short(&rt));
+        if rt.is_ok() && env.svm.get_account(&t.1).map(|a| a.data.is_empty() || a.lamports == 0).unwrap_or(true) {
+            break;
+        }
+    }
+    assert!(rt.is_ok(), "STUCK: a band-market trader with a leg cannot CloseResolved: {}", short(&rt));
+    // The resolved auto-crank also runs `close_resolved_account_not_atomic`: a second trader with
+    // a leg (tagged checkpoint) is cranked after resolution, never refused Stale (19), and no
+    // engine call outside Live leaves / sees a tagged word.
+    assert_eq!(env.portfolio_state(t2.1).last_fee_slot >> 63, 1, "tagged while Live");
+    // Resolved: no oracle observation (the market price is frozen at the resolution price).
+    let (payer, slot) = (env.payer.pubkey(), env.slot);
+    let rc = env.send(
+        ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![] },
+        vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(t2.1, false)],
+        &[],
+    );
+    eprintln!("ATT647R2 resolved crank of a second trader with a leg: {}", short(&rc));
+    if let Err(e) = &rc {
+        assert!(!e.contains(&code(PercolatorError::EngineStale)), "resolved crank refused Stale: {e}");
+    }
+    // ... and CloseResolved closes that second trader too.
+    let r2 = close(&mut env, &t2.0, t2.1);
+    eprintln!("ATT647R2 CloseResolved second trader: {}", short(&r2));
+    assert!(r2.is_ok(), "second trader closes: {}", short(&r2));
+    if let Some(a) = env.svm.get_account(&t2.1).filter(|a| rc.is_ok() && !a.data.is_empty()) {
+        if state::read_portfolio(&a.data).is_ok() {
+            assert_eq!(env.portfolio_state(t2.1).last_fee_slot >> 63, 0, "released outside Live");
+        }
+    }
+}
+
+/// prog#572 InitMarket: the Band Safety Law must hold with the rent term at `rent_max x 5`
+/// (utilisation + the occupancy of a minimum leg). At the test market's margins (MMR 5%, band 1%,
+/// E 600) 749 is the largest accepted rent (bisected); 2_000 satisfies the x1 law (rc23 accepts
+/// it: negative control) but not x5 (106); 2_001 x5 is also over the engine ceiling.
+#[test]
+fn r572_init_market_band_law_carries_the_occupancy() {
+    let mut c = band_cfg();
+    c.phase4 = Some(phase4(BAND_BPS, 749));
+    assert!(Env::try_new(c).is_ok(), "rent 749: the law holds at 3_745");
+    for r in [750u32, 2_000, 2_001] {
+        let mut c = band_cfg();
+        c.phase4 = Some(phase4(BAND_BPS, r));
+        assert_err(&Env::try_new(c).map(|_| 0), &code(PercolatorError::HoldingRentConfigInvalid), "rent x5 breaks the law");
+    }
+    // Band off: the occupancy does not exist there, no extra rule (rent up to the engine ceiling).
+    let mut c = band_cfg();
+    c.phase4 = Some(phase4(0, 10_000));
+    c.r_gap = 400;
+    assert!(Env::try_new(c).is_ok(), "band off: unchanged");
+}
+
+/// prog#572 pure: the ramp's shape, exhaustive over the engine's domain (cap 1..=256, every count
+/// up to cap + 40), plus the clock and the charge step: bounded, re-anchor never charges, and
+/// splitting an interval into more touches never charges more (<= 1 atom less per extra touch).
+#[test]
+fn r572_occupancy_pure_shape_clock_and_charge_step() {
+    use percolator_prog::growth_v19::{
+        occ_charge_step, occ_ck_decode, occ_ck_encode, occ_clock_advance, occ_ramp as ramp, occ_ramp_q32,
+        OCC_CK_TAG, OCC_RAMP_ONE, RENT_OCC_KNEE_BPS,
+    };
+    let k = RENT_OCC_KNEE_BPS as u128;
+    for cap in 1..=256u64 {
+        for max in [0u64, 1, 23, 100, 10_000, OCC_RAMP_ONE] {
+            let mut prev = 0u64;
+            for c in 0..=cap + 40 {
+                let r = ramp(c, cap, max);
+                assert!(r <= max);
+                assert!(r >= prev, "monotone: cap {cap} max {max} count {c}");
+                if (c.min(cap) as u128) * 10_000 <= k * cap as u128 {
+                    assert_eq!(r, 0, "zero at/below the knee");
+                } else if max > 0 {
+                    assert!(r >= 1, "past the knee: >= 1");
+                }
+                if c >= cap {
+                    assert_eq!(r, max, "max at a full side");
+                }
+                if c > 0 && r > prev + 1 {
+                    assert!(
+                        ((r - prev - 1) as u128) * cap as u128 * (10_000 - k) <= 2 * max as u128 * 10_000,
+                        "cliff: cap {cap} max {max} count {c}: {prev} -> {r}"
+                    );
+                }
+                prev = r;
+            }
+        }
+    }
+    // Real cap: the largest single-leg step is 5.2% of a full side.
+    let worst = (0..256u64).map(|c| occ_ramp_q32(c + 1, 256) - occ_ramp_q32(c, 256)).max().unwrap();
+    assert!(worst as u128 * 10_000 <= OCC_RAMP_ONE as u128 * 520, "largest step {worst}");
+    assert_eq!(occ_ramp_q32(217, 256), 0);
+    assert!(occ_ramp_q32(218, 256) > 0);
+    assert_eq!(occ_ramp_q32(256, 256), OCC_RAMP_ONE);
+    assert_eq!(occ_ramp_q32(u64::MAX, 0), 0, "band off");
+    // Clock: never more than one full slot per slot, saturates, never wraps.
+    assert_eq!(occ_clock_advance(0, OCC_RAMP_ONE, 7), 7 << 32);
+    assert_eq!(occ_clock_advance(5, 0, 1_000), 5);
+    assert_eq!(occ_clock_advance(u64::MAX - 1, OCC_RAMP_ONE, u64::MAX), u64::MAX);
+    assert_eq!(occ_clock_advance(0, u64::MAX, 1), OCC_RAMP_ONE, "ramp clamped to one");
+    // Checkpoints.
+    let f = 40_000_000_000u128; // 40 atoms per full slot
+    for short in [false, true] {
+        let ck = occ_ck_encode(100, short);
+        assert_eq!(occ_ck_decode(ck, short, 100), Some(100));
+        assert_eq!(occ_ck_decode(ck, !short, 100), None, "other side");
+        assert_eq!(occ_ck_decode(ck, short, 99), None, "ahead of the clock");
+        assert_eq!(occ_ck_decode(ck & !OCC_CK_TAG, short, u64::MAX), None, "untagged (a real slot)");
+        // Foreign / flipped / fresh: re-anchor, 0 charged.
+        for foreign in [0u64, 123_456_789, occ_ck_encode(5, !short), occ_ck_encode(1_000, short)] {
+            let (n, due) = occ_charge_step(foreign, short, 200 << 32, f);
+            assert_eq!(due, 0, "re-anchor never charges");
+            assert_eq!(occ_ck_decode(n, short, 200), Some(200));
+        }
+        // Valid: exact, and a split never charges more (each split loses < 1 atom at most).
+        for fnum in [1u128, 230_000_000, 999_999_999, f, 7_377_777_777_777_777] {
+            for (a, b, c) in [(100u64, 101u64, 150u64), (100, 100, 100), (100, 149, 150), (0, 1, 2)] {
+                let ck = occ_ck_encode(a, short);
+                let (_, single) = occ_charge_step(ck, short, c << 32, fnum);
+                assert_eq!(single, fnum * (c - a) as u128 / 1_000_000_000);
+                let (ck1, d1) = occ_charge_step(ck, short, b << 32, fnum);
+                let (_, d2) = occ_charge_step(ck1, short, c << 32, fnum);
+                assert!(d1 + d2 <= single && d1 + d2 + 1 >= single, "split {a}/{b}/{c} f {fnum}: {d1}+{d2} vs {single}");
+                if d1 == 0 {
+                    assert_eq!(ck1, ck, "a zero due keeps the checkpoint (the fraction carries)");
+                }
+            }
+        }
+    }
+}
 // ═══════════════════════════════════════════════════════════════════════════════════════════
 // att645 (independent attack on PR #645, port of upstream 0c5d4f4f "invalidate stale matcher
 // capabilities"): a permissionless SettleHoldingRent (tag 104 family, fork-only) refreshes an
@@ -6423,3 +7262,4 @@ fn att645_control_crank_refresh_invalidates_stale_matcher_capability() {
     assert!(r.unwrap_err().contains("Custom(8)"), "the crank path invalidates the capability");
     assert_eq!(enabled, 0);
 }
+

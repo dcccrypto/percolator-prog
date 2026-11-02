@@ -1457,3 +1457,172 @@ fn kani_growth_clip_iff_gate() {
     kani::cover!(users > n, "side already over");
 }
 
+
+// ── prog#572, per SLOT (2026-11-01): `occ_ramp`, `occ_clock_advance`, `occ_ck_*`, `occ_charge_step` ──
+// Design (written before the one run; each harness has covers; each has a mutant in mutants.py):
+// * occ_ramp_prod_shape: the production cap (256; InitMarket is the only writer of
+//   `band_max_positions_per_side`, so on chain the cap is 0 or 256) and the production scale
+//   (`OCC_RAMP_ONE`), ANY u64 count, real primitive (the divisor `span^2` is a constant here):
+//   the EXACT value `ceil(ONE * ex^2 / span^2)`, 0 at/below the knee, >= 1 past it, ONE at a
+//   full side, adjacent monotone (induction: monotone), per-leg step bound (no cliff). z3.
+// * occ_ramp_total: ANY cap / count at the production scale, primitive stub_verified: total (no
+//   panic / overflow), <= ONE, 0 off-band (cap 0) and at/below the knee (incl. the exact knee at
+//   small caps), >= 1 past it, ONE at a full side and out of domain (fail closed). z3.
+// * occ_clock_bounded: every u64 input: never moves back, ramp 0 freezes it, never more than
+//   `min(ramp, ONE) * dt`, so the integer part (full-occupancy slots) moves by at most `dt`.
+// * occ_charge_step_exact: every checkpoint word and clock, `full_num` in the engine domain
+//   (`rent_max <= 10_000`, `4 x u64` min leg): a foreign / other-side / ahead checkpoint
+//   re-anchors at the clock and charges 0; a valid one charges EXACTLY
+//   `floor(full_num * (C_now - C_ck) / 1e9)`; the new word is always a checkpoint of this side
+//   at the clock (or the old one when nothing was due).
+// * occ_split_never_charges_more (narrow: full_num u32, clock u16 steps; the width lift is the
+//   floor identity `floor(a) + floor(b) in [floor(a + b) - 1, floor(a + b)]`): charging an
+//   interval in two touches never charges more than one touch, and at most 1 atom less.
+
+const OCC_PROD_CAP: u64 = 256;
+const OCC_MAX_FULL_NUM: u128 = 10_000 * 4 * (u64::MAX as u128);
+
+fn occ_knee_test(c: u64, cap: u64) -> bool {
+    (core::cmp::min(c, cap) as u128) * 10_000 <= (cap as u128) * (RENT_OCC_KNEE_BPS as u128)
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_growth_occ_ramp_prod_shape() {
+    let cap = OCC_PROD_CAP;
+    let one = OCC_RAMP_ONE;
+    let c: u64 = kani::any();
+    kani::assume(c < u64::MAX);
+    let r = occ_ramp(c, cap, one);
+    let rn = occ_ramp(c + 1, cap, one);
+    assert!(r <= one && rn <= one, "never above a full side");
+    assert!(r <= rn, "monotone in count (adjacent; induction gives every pair)");
+    if occ_knee_test(c, cap) {
+        assert_eq!(r, 0, "0 at or below 85%");
+    } else if c >= cap {
+        assert_eq!(r, one, "full side");
+    } else {
+        let ex = c as u128 * 10_000 - cap as u128 * RENT_OCC_KNEE_BPS as u128;
+        let span = cap as u128 * (10_000 - RENT_OCC_KNEE_BPS as u128);
+        assert!(spec::ceil_rel(one as u128 * ex * ex, span * span, r as u128), "r = ceil(ONE x^2)");
+        assert!(r >= 1);
+    }
+    let step = (rn - r) as u128;
+    assert!(
+        step <= 1 || (step - 1) * (cap as u128) * (10_000 - RENT_OCC_KNEE_BPS as u128) <= 2 * (one as u128) * 10_000,
+        "per-leg step bound (no cliff)"
+    );
+    kani::cover!(r == 0 && rn > 0, "crosses the knee");
+    kani::cover!(r > 0 && rn > r && rn < one, "climbs on the ramp");
+    kani::cover!(r < one && rn == one && c + 1 == cap, "last slot reaches a full side");
+    kani::cover!(c > cap && r == one, "count above cap saturates");
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_occ_ramp_total() {
+    let cap: u64 = kani::any();
+    let c: u64 = kani::any();
+    let one = OCC_RAMP_ONE;
+    let r = occ_ramp(c, cap, one);
+    assert!(r <= one);
+    if cap == 0 || occ_knee_test(c, cap) {
+        assert_eq!(r, 0);
+    } else {
+        assert!(r >= 1, "fail closed: never 0 past the knee");
+        if c >= cap || cap > RENT_OCC_CAP_DOMAIN {
+            assert_eq!(r, one, "full side / out of domain");
+        }
+    }
+    kani::cover!(cap == 0 && c > 0 && r == 0, "band off");
+    kani::cover!(cap == 20 && c == 17 && r == 0, "exactly at the knee");
+    kani::cover!(r > 0 && r < one && cap > 256, "ramp at a wide in-domain cap");
+    kani::cover!(cap > RENT_OCC_CAP_DOMAIN && c < cap && !occ_knee_test(c, cap) && r == one, "out of domain: fail closed");
+}
+
+#[kani::proof]
+fn kani_growth_occ_clock_bounded() {
+    let c: u64 = kani::any();
+    let ramp: u64 = kani::any();
+    let dt: u64 = kani::any();
+    let n = occ_clock_advance(c, ramp, dt);
+    assert!(n >= c, "never moves back");
+    if ramp == 0 || dt == 0 {
+        assert_eq!(n, c, "no occupancy, no time: frozen");
+    }
+    let r = core::cmp::min(ramp, OCC_RAMP_ONE) as u128;
+    assert!((n - c) as u128 <= r * dt as u128, "at most min(ramp, ONE) x dt");
+    assert!((n >> 32) - (c >> 32) <= dt, "at most one full-occupancy slot per slot");
+    kani::cover!(ramp > OCC_RAMP_ONE && dt > 0 && dt < 1000 && (n - c) as u128 == OCC_RAMP_ONE as u128 * dt as u128, "ramp clamped");
+    kani::cover!(n == u64::MAX && c < u64::MAX, "saturates");
+    kani::cover!(ramp > 0 && ramp < OCC_RAMP_ONE && (n >> 32) > (c >> 32), "fraction carries into a full slot");
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_growth_occ_charge_step_exact() {
+    let ck: u64 = kani::any();
+    let short: bool = kani::any();
+    let c_now: u64 = kani::any();
+    let f: u128 = kani::any();
+    kani::assume(f <= OCC_MAX_FULL_NUM);
+    let (n, due) = occ_charge_step(ck, short, c_now, f);
+    let ci = c_now >> 32;
+    let fresh = occ_ck_encode(ci, short);
+    assert_eq!(occ_ck_decode(fresh, short, ci), Some(ci), "encode/decode round trip");
+    match occ_ck_decode(ck, short, ci) {
+        None => {
+            assert_eq!(due, 0, "a foreign / other-side / ahead word is never charged");
+            assert_eq!(n, fresh, "re-anchored at the clock");
+        }
+        Some(c0) => {
+            assert!(c0 <= ci);
+            let want = f * (ci - c0) as u128 / 1_000_000_000;
+            assert_eq!(due, want, "exact floor(F x dC / 1e9)");
+            if due == 0 {
+                assert_eq!(n, ck, "nothing due: the fraction carries");
+            } else {
+                assert_eq!(n, fresh);
+            }
+        }
+    }
+    assert!(n & OCC_CK_TAG != 0 && ((n & 1) == 1) == short, "always a checkpoint of this side");
+    kani::cover!(ck & OCC_CK_TAG == 0 && due == 0, "untagged word (a real slot): re-anchor");
+    kani::cover!(ck & OCC_CK_TAG != 0 && ((ck & 1) == 1) != short && due == 0, "other side: re-anchor");
+    kani::cover!(due > 0 && f > u64::MAX as u128, "charged at a wide F");
+    kani::cover!(occ_ck_decode(ck, short, ci).is_some() && due == 0 && ci > (ck & !OCC_CK_TAG) >> 1, "fraction carries");
+}
+
+#[kani::proof]
+#[kani::solver(z3)]
+fn kani_growth_occ_split_never_charges_more() {
+    let f = kani::any::<u32>() as u128;
+    let a = kani::any::<u16>() as u64;
+    let b = kani::any::<u16>() as u64;
+    let c = kani::any::<u16>() as u64;
+    let short: bool = kani::any();
+    kani::assume(a <= b && b <= c);
+    let ck = occ_ck_encode(a, short);
+    let (_, single) = occ_charge_step(ck, short, c << 32, f);
+    let (ck1, d1) = occ_charge_step(ck, short, b << 32, f);
+    let (_, d2) = occ_charge_step(ck1, short, c << 32, f);
+    assert!(d1 + d2 <= single, "a split never charges more");
+    assert!(single <= d1 + d2 + 1, "and at most one atom less");
+    kani::cover!(d1 > 0 && d2 > 0 && d1 + d2 + 1 == single, "split loses the sub-atom remainder");
+    kani::cover!(d1 == 0 && d2 == single && single > 0, "zero first touch: the fraction carries");
+}
+
+#[kani::proof]
+#[kani::stub_verified(crate::growth_v19::mul_div_ceil_u128)]
+fn kani_growth_rent_util_le_max() {
+    let u: u128 = kani::any();
+    let n: u128 = kani::any();
+    let k: u16 = kani::any();
+    let max: u64 = kani::any();
+    let r = rent_rate_e9_fail_closed(u, n, k, max);
+    assert!(r <= max);
+    kani::cover!(r > 0 && r < max, "on the utilisation ramp");
+    kani::cover!(n == 0 && r == max, "fail closed: no N_cap");
+    kani::cover!(r == 0 && max > 0 && n > 0, "at/below the kink");
+}
