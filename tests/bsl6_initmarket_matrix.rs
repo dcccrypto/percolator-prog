@@ -97,8 +97,12 @@ fn bsl6_initmarket_matrix() {
             &[&payer, &admin, &market_kp],
             svm.latest_blockhash(),
         );
+        let mut cu = 0u64;
         let result = match svm.send_transaction(tx) {
-            Ok(_) => "ok".to_string(),
+            Ok(m) => {
+                cu = m.compute_units_consumed;
+                "ok".to_string()
+            }
             Err(e) => {
                 if std::env::var_os("BSL6_LOGS").is_some() {
                     eprintln!("{id}: {:?}", e.meta.logs);
@@ -110,7 +114,7 @@ fn bsl6_initmarket_matrix() {
                 }
             }
         };
-        out.push(serde_json::json!({ "id": id, "result": result }));
+        out.push(serde_json::json!({ "id": id, "result": result, "cu": cu }));
     }
     std::fs::write(std::env::var("BSL6_OUT").expect("BSL6_OUT"), serde_json::to_string(&out).unwrap()).unwrap();
     eprintln!("bsl6: {} rows", out.len());
