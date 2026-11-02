@@ -3,6 +3,9 @@ name: Kani nightly (no-verdict harnesses)
 # Runs the Kani harnesses that had NO VERDICT (CBMC --harness-timeout) in the 2026-10-30/31 rc23
 # triage -- exactly the rows of ci/kani-nightly-harnesses.tsv -- with longer budgets than a laptop
 # can give. Not part of PR CI (hours of CBMC). Design + commands: docs/KANI.md.
+# LONG groups (Khubair R5, 2 Nov): bonds571 (kani/bonds571) and growth-occ (kani/growth occupancy
+# harnesses, a glob row expanded at run time by scripts/kani-nightly-plan.py) run with
+# long_timeout (default 315m, watchdog 325m) under the same memory cap.
 #
 # ONE JOB PER HARNESS (matrix built by the plan job): a dying harness can only lose its own row.
 # Each harness runs under a memory cap below the runner's RAM (cgroup memory.max, default 13G of the
@@ -15,9 +18,10 @@ name: Kani nightly (no-verdict harnesses)
 # separately as warnings, never as a failure and never as a pass.
 #
 # NOTE: GitHub fires `schedule` only from the DEFAULT branch (main), and a schedule run checks out
-# main's tree. Under the v2.2 no-main rule this file is not on main, so there is NO nightly: it runs
-# by manual dispatch only (`gh workflow run kani-nightly.yml --ref <branch>`) until a human decides
-# (accept manual dispatch, or a main-hosted scheduler that dispatches against the release branch).
+# main's tree. Under the v2.2 no-main rule this file is not on main, so the `schedule` below never
+# fires and there is NO automatic nightly: on the v2.2 branches it runs by manual dispatch only
+# (`gh workflow run kani-nightly.yml --ref feat/v22-rc23-2026-10-22 -f groups=bonds571,growth-occ`)
+# until a human picks a trigger (options: docs/KANI.md "Schedule").
 
 on:
   schedule:
@@ -25,8 +29,14 @@ on:
   workflow_dispatch:
     inputs:
       harness_timeout:
-        description: "kani --harness-timeout per harness (e.g. 70m). Watchdog = this + 10 min; the plan refuses > 300m (job limit 350)."
+        description: "kani --harness-timeout per harness of the 85-list groups (e.g. 70m). Watchdog = this + 10 min; the plan refuses > 314m (job limit 350)."
         default: "70m"
+      long_timeout:
+        description: "kani --harness-timeout for the LONG groups bonds571 / growth-occ. Watchdog = this + 10 min; the plan refuses > 324m."
+        default: "315m"
+      solver:
+        description: "optional kani --solver override for every selected harness (z3, cadical, kissat, minisat); empty = each harness's #[kani::solver] attribute"
+        default: ""
       mem_cap:
         description: "memory cap per harness (cgroup memory.max, swap 0), below the runner's 16 GB RAM"
         default: "13G"
@@ -34,7 +44,7 @@ on:
         description: "harness jobs running at once (leave runner slots for PR CI)"
         default: "8"
       groups:
-        description: "comma list of groups to run (lib,tests,contlev,p3,p3-engine,growth) or 'all'"
+        description: "comma list of groups to run (lib,tests,contlev,p3,p3-engine,growth,bonds571,growth-occ) or 'all'"
         default: "all"
 
 concurrency:
@@ -54,7 +64,7 @@ jobs:
     timeout-minutes: 10
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
-      timeout: ${{ steps.plan.outputs.timeout }}
+      solver: ${{ steps.plan.outputs.solver }}
       memcap: ${{ steps.plan.outputs.memcap }}
       maxpar: ${{ steps.plan.outputs.maxpar }}
       expected: ${{ steps.plan.outputs.expected }}
@@ -68,54 +78,14 @@ jobs:
         id: plan
         env:
           IN_TIMEOUT: ${{ github.event.inputs.harness_timeout || '70m' }}
+          IN_LONG: ${{ github.event.inputs.long_timeout || '315m' }}
           IN_MEMCAP: ${{ github.event.inputs.mem_cap || '13G' }}
           IN_MAXPAR: ${{ github.event.inputs.max_parallel || '8' }}
           IN_GROUPS: ${{ github.event.inputs.groups || 'all' }}
+          IN_SOLVER: ${{ github.event.inputs.solver || '' }}
         run: |
-          set -euo pipefail
-          [[ "$IN_TIMEOUT" =~ ^[0-9]+[smh]$ ]] || { echo "bad harness_timeout $IN_TIMEOUT"; exit 1; }
-          [[ "$IN_MEMCAP" =~ ^[0-9]+[MG]$ ]] || { echo "bad mem_cap $IN_MEMCAP"; exit 1; }
-          [[ "$IN_MAXPAR" =~ ^[1-9][0-9]?$ ]] || { echo "bad max_parallel $IN_MAXPAR"; exit 1; }
-          [[ "$IN_GROUPS" =~ ^[a-z0-9,-]+$ ]] || { echo "bad groups"; exit 1; }
-          python3 - <<'EOF'
-          import json, os, re, subprocess, math
-          rows = [l.rstrip('\n').split('\t') for l in open('ci/kani-nightly-harnesses.tsv') if l.strip() and not l.startswith('#')]
-          dirs = {'lib': ['src'], 'tests': ['tests'], 'contlev': ['kani/contlev/src'], 'p3': ['kani/p3/src'],
-                  'p3-engine': ['kani/p3-engine/src'], 'growth': ['kani/growth/src']}
-          missing = []
-          for g, h in rows:
-              if g not in dirs: missing.append(f'{g}\t{h} (unknown group)'); continue
-              fn = h.split('::')[-1]
-              r = subprocess.run(['grep', '-rqE', rf'fn {re.escape(fn)}\b', *dirs[g]])
-              if r.returncode != 0: missing.append(f'{g}\t{h}')
-          if missing:
-              print('::error::harness rows with no matching fn in the tree:\n' + '\n'.join(missing)); raise SystemExit(1)
-          dup = sorted({h for _, h in rows if sum(1 for _, x in rows if x == h) > 1})
-          if dup: print('::error::harness names listed twice: ' + ', '.join(dup)); raise SystemExit(1)
-          want = os.environ['IN_GROUPS']
-          sel = None if want == 'all' else set(want.split(','))
-          if sel and not sel <= set(dirs): print(f'::error::unknown group(s) {sel - set(dirs)}'); raise SystemExit(1)
-          t = os.environ['IN_TIMEOUT']
-          tmin = int(t[:-1]) * {'s': 1 / 60, 'm': 1, 'h': 60}[t[-1]]
-          wd = math.floor(tmin) + 10                     # the harness script's watchdog, minutes
-          # job budget: checkout + kani install + build <= 25 min, then one harness <= watchdog + 1 min
-          if 25 + wd + 1 > 350:
-              print(f'::error::harness_timeout {t} (watchdog {wd}m) does not fit the 350 min job limit'); raise SystemExit(1)
-          order = ['lib', 'tests', 'growth', 'p3', 'contlev', 'p3-engine']
-          inc, expected = [], []
-          for g in order:
-              if sel and g not in sel: continue
-              for i, h in enumerate(r[1] for r in rows if r[0] == g):
-                  inc.append({'group': g, 'idx': i, 'harness': h}); expected.append(h)
-          if not inc: print('::error::no harnesses selected'); raise SystemExit(1)
-          if len(inc) > 256: print(f'::error::{len(inc)} harness jobs > GitHub matrix limit 256'); raise SystemExit(1)
-          print(f'{len(rows)} harnesses listed; {len(expected)} selected = {len(inc)} jobs, '
-                f'{os.environ["IN_MAXPAR"]} at a time, timeout {t} (watchdog {wd}m), mem cap {os.environ["IN_MEMCAP"]}')
-          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
-              f.write('matrix=' + json.dumps({'include': inc}) + '\n')
-              f.write('expected=' + json.dumps(expected) + '\n')
-              f.write(f"timeout={t}\nmemcap={os.environ['IN_MEMCAP']}\nmaxpar={os.environ['IN_MAXPAR']}\n")
-          EOF
+          python3 scripts/kani-nightly-plan.py --groups "$IN_GROUPS" --timeout "$IN_TIMEOUT" \
+            --long-timeout "$IN_LONG" --memcap "$IN_MEMCAP" --maxpar "$IN_MAXPAR" --solver "$IN_SOLVER"
 
   shard:
     name: "kani ${{ matrix.group }} ${{ matrix.harness }}"
@@ -153,16 +123,24 @@ jobs:
           fi
           cargo kani setup
           cargo kani --version
-      - name: run harness (memory cap ${{ needs.plan.outputs.memcap }}, timeout ${{ needs.plan.outputs.timeout }})
+      # CBMC's --z3 runs an external `z3` binary (kani does not bundle one). Installed only for
+      # harnesses that ask for it (#[kani::solver(z3)], e.g. the growth-occ harnesses) or --solver z3.
+      - name: install z3 (harness uses the z3 solver)
+        if: matrix.z3
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y -qq z3
+          z3 --version
+      - name: run harness (memory cap ${{ needs.plan.outputs.memcap }}, timeout ${{ matrix.timeout }})
         working-directory: percolator-prog
         env:
           GROUP: ${{ matrix.group }}
           HARNESS: ${{ matrix.harness }}
-          TMO: ${{ needs.plan.outputs.timeout }}
+          TMO: ${{ matrix.timeout }}
           MEMCAP: ${{ needs.plan.outputs.memcap }}
+          SOLVER: ${{ needs.plan.outputs.solver }}
         run: |
           nproc; free -m; df -h / | tail -1
-          ./scripts/kani-nightly-shard.sh "$GROUP" "$HARNESS" "$TMO" "$RUNNER_TEMP/kn" "$MEMCAP"
+          ./scripts/kani-nightly-shard.sh "$GROUP" "$HARNESS" "$TMO" "$RUNNER_TEMP/kn" "$MEMCAP" "$SOLVER"
           {
             echo "### kani $GROUP \`$HARNESS\`"
             echo '| harness | verdict | s | failed checks | covers | peak MiB |'
