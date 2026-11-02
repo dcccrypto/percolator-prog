@@ -64,4 +64,10 @@ MUTANTS = [
  ("r3", MVA, "    let cap_active = caps.is_some_and(|c| c.inventory_cap_q < SKEW_REF_MAX_INVENTORY_Q);", "    let cap_active = caps.is_some();", "proof_v3_neutral_caps_equal_v2", "match"),
  ("r4", MVA, "    let extra = if v3_units\n        && kind1", "    let extra = if (v3_units || true)\n        && kind1", "proof_kind1_units_only_under_v3", "match"),
  ("m-skew", MVA, "        skew_div(inv_abs.saturating_mul(mult), ctx.max_inventory_abs)\n", "        skew_div(inv_abs.saturating_mul(mult), ctx.max_inventory_abs.saturating_mul(2))\n", "proof_kind1_skew_units_capped_and_monotone", "match"),
+ # ── prog#572 slot-occupancy rent (each must turn its harness red) ──
+ ("occ-floor", G, "        (Some(ex2), Some(span2)) => mul_div_ceil_u128(max_e9_per_slot as u128, ex2, span2),", "        (Some(ex2), Some(span2)) => crate::vault_lp_v18::mul_div_floor(max_e9_per_slot as u128, ex2, span2),", "kani_growth_occ_c_exact", "growth"),
+ ("occ-cliff", G, "    let r = match (ex.checked_mul(ex), span.checked_mul(span)) {", "    let r = match (span.checked_mul(span), span.checked_mul(span)) {", "kani_growth_occ_domain_shape", "growth"),
+ ("occ-knee-strict", G, "    if lhs <= knee {\n        return 0;\n    }\n    // A full side", "    if lhs < knee {\n        return 0;\n    }\n    // A full side", "kani_growth_occ_g_full_width", "growth"),
+ ("occ-sum", G, "    if occ > util {\n        occ\n    } else {\n        util\n    }", "    util.saturating_add(occ)", "kani_growth_occ_side_rate_is_max", "growth"),
+ ("rent-fc-wide", G, "    rent_rate_e9(users_q, n_cap_q, kink_bps, rent_max).unwrap_or(rent_max)", "    rent_rate_e9(users_q, n_cap_q, kink_bps, rent_max).unwrap_or(u64::MAX)", "kani_growth_rent_util_le_max", "growth"),
 ]
