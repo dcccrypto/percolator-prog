@@ -93,3 +93,16 @@ tests	kani_v16_tradenocpi_decode_preserves_wire_fields
 tests	kani_v16_asset_lifecycle_decode_preserves_wire_fields
 tests	kani_v16_amount_instructions_decode_preserves_wire_fields
 tests	kani_v16_init_market_decode_preserves_wire_fields
+# --- LONG groups (Khubair R5, 2026-11-02): --long-timeout (default 315m, watchdog 325m) instead of
+# --timeout. bonds571 = kani/bonds571 (prog #649): the 6 harnesses that hit a 90 min TIMEOUT locally
+# (c571 logs kani/bonds571/logs/r2, 2026-10-31). growth-occ = kani/growth #572 occupancy harnesses
+# (prog #647): a GLOB, expanded by scripts/kani-nightly-plan.py at run time against the #[kani::proof]
+# fns of kani/growth/src, so whatever occupancy harnesses exist on the branch run (the per-notional
+# redesign may rename or drop them; a glob with no match is a warning, not a failure).
+bonds571	proofs::kani_571_settle_cap_closed_exact_remainder
+bonds571	proofs::kani_571_split_interval_is_exact
+bonds571	proofs::kani_571_settle_monotone_in_time
+bonds571	proofs::kani_571_newcomer_neutral_within_rounding
+bonds571	proofs::kani_571_redemption_slices_k_and_meter
+bonds571	proofs::kani_571_junior_gate_bound_dominates_every_settlement
+growth-occ	proofs::kani_growth_occ_*

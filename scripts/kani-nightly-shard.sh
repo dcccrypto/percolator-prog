@@ -1,12 +1,15 @@
 #!/usr/bin/env bash
 # Kani nightly: verify ONE harness of ci/kani-nightly-harnesses.tsv and write exactly one verdict row.
-# usage: scripts/kani-nightly-shard.sh <group> <harness> <harness-timeout> <outdir> [mem-cap]
-#   group           lib | tests | contlev | p3 | p3-engine | growth (crate + flags below)
-#   harness         exact harness name (as listed in the TSV for that group)
+# usage: scripts/kani-nightly-shard.sh <group> <harness> <harness-timeout> <outdir> [mem-cap] [solver]
+#   group           lib | tests | contlev | p3 | p3-engine | growth | bonds571 | growth-occ (crate + flags below)
+#   harness         exact harness name: a TSV row of that group, or a match of a glob row of that group
+#                   (the plan job expands globs against the tree; scripts/kani-nightly-plan.py)
 #   harness-timeout passed to kani --harness-timeout (e.g. 70m); a hard watchdog adds 10 min
 #   mem-cap         memory limit for the verification (e.g. 13G; default none). On Linux with
 #                   passwordless sudo this is a cgroup-v2 memory.max (swap 0); otherwise `ulimit -v`.
 #                   Must sit below the runner's RAM so CBMC is killed before the runner VM is.
+#   solver          optional kani --solver override (e.g. z3); empty = the harness's #[kani::solver]
+#                   attribute. z3 needs a `z3` binary on PATH (the workflow installs it when needed).
 # One harness per job (the workflow's matrix): a dying harness can only lose its own row, and the
 # summary job is red on a missing row.
 # Verdicts (<outdir>/verdicts.tsv: harness, verdict, seconds, failed checks, covers, peak MiB),
@@ -22,7 +25,7 @@
 # Local (from the repo root, engine checked out as ../percolator at ENGINE_CI_SIBLING):
 #   scripts/kani-nightly-shard.sh p3-engine <harness> 30m /tmp/kn
 set -uo pipefail
-group=$1; h=$2; tmo=$3; out=$4; memcap=${5:-}
+group=$1; h=$2; tmo=$3; out=$4; memcap=${5:-}; solver=${6:-}
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 # shellcheck source=scripts/kani-nightly-lib.sh
 . "$ROOT/scripts/kani-nightly-lib.sh"   # classify()
@@ -35,6 +38,10 @@ case "$group" in
   p3)        dir=kani/p3;         args="$Z" ;;
   p3-engine) dir=kani/p3-engine;  args="$Z" ;;
   growth)    dir=kani/growth;     args="$Z" ;;
+  # LONG groups (sub-crates, run with --long-timeout). bonds571 has no contracts/stubs: its harnesses
+  # were run locally with plain `cargo kani` (-Z unstable-options only for --harness-timeout).
+  bonds571)  dir=kani/bonds571;   args="-Z unstable-options" ;;
+  growth-occ) dir=kani/growth;    args="$Z" ;;
   *) echo "unknown group $group" >&2; exit 2 ;;
 esac
 TMO_BIN=$(command -v timeout || command -v gtimeout) || { echo "need coreutils timeout" >&2; exit 2; }
@@ -42,13 +49,24 @@ mkdir -p "$out/logs"
 out=$(cd "$out" && pwd)
 log="$out/logs/$(echo "$h" | tr ':/' '__').log"
 row() { printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$h" "$1" "$2" "$3" "$4" "$5" >> "$out/verdicts.tsv"; echo "$1  $h  ($2 s; $3; $4; peak $5 MiB)"; }
-# The name must be a row of this group (the plan already checked; this guards local use).
-grep -v '^#' "$LIST" | awk -F'\t' -v g="$group" -v n="$h" '$1==g && $2==n {f=1} END {exit !f}' \
-  || { row ERROR 0 "not a row of group $group in ci/kani-nightly-harnesses.tsv" - -; exit 0; }
+# The name must be a row of this group, or match a glob row of this group (the plan already
+# checked; this guards local use).
+listed=0
+while IFS=$'\t' read -r g pat; do
+  [ "$g" = "$group" ] || continue
+  # shellcheck disable=SC2053  # $pat is deliberately a glob
+  if [ "$h" = "$pat" ] || { [[ "$pat" == *[*?[]* ]] && [[ "$h" == $pat ]]; }; then listed=1; break; fi
+done < <(grep -v '^#' "$LIST")
+[ "$listed" = 1 ] || { row ERROR 0 "not a row of group $group in ci/kani-nightly-harnesses.tsv" - -; exit 0; }
+if [ -n "$solver" ]; then
+  [[ "$solver" =~ ^(cadical|kissat|minisat|z3|bitwuzla|cvc5)$ ]] || { echo "bad solver $solver" >&2; exit 2; }
+  args="$args --solver $solver"
+fi
 
 # minutes for the watchdog (accepts Ns / Nm / Nh)
 case "$tmo" in *h) wd=$(( ${tmo%h} * 60 + 10 ));; *m) wd=$(( ${tmo%m} + 10 ));; *s) wd=$(( ${tmo%s} / 60 + 10 ));; *) wd=$(( tmo / 60 + 10 ));; esac
-echo "group=$group harness=$h timeout=$tmo watchdog=${wd}m mem-cap=${memcap:-none} dir=$dir"
+echo "group=$group harness=$h timeout=$tmo watchdog=${wd}m mem-cap=${memcap:-none} solver=${solver:-attribute} dir=$dir"
+command -v z3 > /dev/null && echo "z3 on PATH: $(z3 --version)"
 
 cd "$ROOT/$dir" || exit 2
 # Compile first (outside the watchdog and the memory cap); a compile failure is an ERROR row.

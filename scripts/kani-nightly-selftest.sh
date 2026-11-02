@@ -66,6 +66,48 @@ mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b OOM; printf 'c
 chk "$(run success)" 1 "summary unknown verdict label -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; printf 'CBMC timed out.\n' > $L; classify $L 1 4210 4800; row kani-shard-tests-1 c "$v"
 chk "$(run success)" 0 "e2e CBMC-timeout harness -> TIMEOUT row -> green+warning"
+# --- plan (scripts/kani-nightly-plan.py) on a fake tree: globs, long groups, z3, budget ---
+P="$R/scripts/kani-nightly-plan.py"; F=$T/tree
+mkdir -p $F/ci $F/kani/growth/src $F/kani/bonds571/src $F/src
+cat > $F/kani/growth/src/proofs.rs <<'RS'
+#[kani::proof]
+#[kani::solver(z3)]
+#[kani::stub_verified(crate::m::f)]
+fn kani_growth_occ_a() {}
+#[kani::proof]
+/// doc between attributes
+fn kani_growth_occ_b() {}
+fn kani_growth_occ_helper_not_a_proof() {}
+#[kani::proof]
+fn kani_growth_x() {}
+RS
+printf '#[kani::proof]\n#[kani::solver(cadical)]\nfn kani_571_a() {}\n' > $F/kani/bonds571/src/proofs.rs
+printf 'fn kani_lib_a() {}\n' > $F/src/lib.rs
+tsv() { printf '# c\n' > $F/ci/kani-nightly-harnesses.tsv; printf '%b\n' "$@" >> $F/ci/kani-nightly-harnesses.tsv; }
+plan() { rm -f $T/po; python3 "$P" --root $F --out $T/po "$@" > $T/plan.log 2>&1; echo $?; }
+mx() { python3 -c 'import json,sys; m=json.loads([l[7:] for l in open(sys.argv[1]) if l.startswith("matrix=")][0]); print(" ".join(":".join(str(v) for v in (e["group"], e["harness"], e["timeout"], int(e["z3"]))) for e in m["include"]))' $T/po; }
+tsv 'lib\tkani_lib_a' 'growth\tproofs::kani_growth_x' 'bonds571\tproofs::kani_571_a' 'growth-occ\tproofs::kani_growth_occ_*'
+chk "$(plan --groups all)" 0 "plan fake tree, all groups"
+chk "$(mx)" "lib:kani_lib_a:70m:0 growth:proofs::kani_growth_x:70m:0 bonds571:proofs::kani_571_a:315m:0 growth-occ:proofs::kani_growth_occ_a:315m:1 growth-occ:proofs::kani_growth_occ_b:315m:0" \
+  "  glob -> proof fns only (helper skipped), long groups 315m, z3 from the attribute"
+chk "$(plan --groups growth-occ --solver z3)" 0 "plan --solver z3"; chk "$(mx)" "growth-occ:proofs::kani_growth_occ_a:315m:1 growth-occ:proofs::kani_growth_occ_b:315m:1" "  override -> z3 for every harness"
+chk "$(plan --groups bonds571 --long-timeout 324m)" 0 "plan long 324m fits (15 + 334 + 1 = 350)"
+chk "$(plan --groups bonds571 --long-timeout 325m)" 1 "plan long 325m refused"
+chk "$(plan --groups lib --timeout 314m)" 0 "plan normal 314m fits (25 + 324 + 1)"
+chk "$(plan --groups lib --timeout 315m)" 1 "plan normal 315m refused"
+chk "$(plan --groups lib --solver yices)" 1 "plan bad solver refused"
+chk "$(plan --groups nope)" 1 "plan unknown group refused"
+tsv 'lib\tkani_lib_a' 'growth-occ\tproofs::kani_growth_zzz_*'
+chk "$(plan --groups all)" 0 "plan glob matching nothing -> not a failure"; grep -q '::warning::glob row growth-occ' $T/plan.log; chk $? 0 "  ... but a warning"
+chk "$(plan --groups growth-occ)" 1 "plan glob matching nothing, only that group -> no harnesses -> red"
+tsv 'growth\tproofs::kani_growth_occ_a' 'growth-occ\tproofs::kani_growth_occ_*'
+chk "$(plan --groups all)" 1 "plan name listed twice after glob expansion -> red"
+tsv 'bonds571\tproofs::kani_571_gone'
+chk "$(plan --groups all)" 1 "plan exact row with no fn (name rot) -> red"
+chk "$(plan --root "$R" --groups bonds571 --out $T/po)" 0 "plan real tree bonds571"
+chk "$(mx | wc -w | tr -d ' ')" 6 "  6 bonds571 jobs"; chk "$(mx | tr ' ' '\n' | cut -d: -f5 | sort -u | tr '\n' ' ')" "315m " "  all at 315m"
+chk "$(plan --root "$R" --groups all --out $T/po)" 0 "plan real tree all groups"
+chk "$(mx | tr ' ' '\n' | grep -c '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:')" 85 "  the 85 no-verdict harnesses still selected"
 # --- the per-harness script end to end, with a fake `cargo` (needs coreutils timeout; Linux CI) ---
 SH="$R/scripts/kani-nightly-shard.sh"
 H=$(grep -v '^#' "$R/ci/kani-nightly-harnesses.tsv" | awk -F'\t' '$1=="tests" {print $2; exit}')
@@ -74,6 +116,7 @@ if command -v timeout > /dev/null || command -v gtimeout > /dev/null; then
   cat > $T/bin/cargo <<'FAKE'
 #!/usr/bin/env bash
 case "$*" in *--only-codegen*) exit 0 ;; esac
+echo "$PWD :: $*" > "$FAKE_ARGS"
 case "$FAKE_KANI" in
   ok)   echo 'VERIFICATION:- SUCCESSFUL'; echo 'Complete - 1 successfully verified harnesses, 0 failures, 1 total.' ;;
   fail) echo ' ** 2 of 50 failed'; echo 'VERIFICATION:- FAILED'; exit 1 ;;
@@ -81,11 +124,22 @@ case "$FAKE_KANI" in
 esac
 FAKE
   chmod +x $T/bin/cargo
-  one() { rm -rf $T/kn; FAKE_KANI=$1 PATH="$T/bin:$PATH" "$SH" tests "$2" 1m $T/kn ${3:-} > $T/shard.log 2>&1; echo $?; }
+  export FAKE_ARGS=$T/args
+  one() { rm -rf $T/kn; FAKE_KANI=$1 PATH="$T/bin:$PATH" "$SH" ${G:-tests} "$2" ${TM:-1m} $T/kn "${3:-}" "${4:-}" > $T/shard.log 2>&1; echo $?; }
   chk "$(one ok "$H")" 0 "shard script exits 0"; chk "$(cut -f2 $T/kn/verdicts.tsv)" SUCCESSFUL "shard fake success -> 1 SUCCESSFUL row"
   one fail "$H" > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" FAILED "shard fake counterexample -> FAILED row"
   one ok not_a_listed_harness > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" ERROR "shard unlisted name -> ERROR row"
   chk "$(wc -l < $T/kn/verdicts.tsv | tr -d ' ')" 1 "  exactly one row"
+  # long groups: glob rows, crate dir + flags, long watchdog, solver override
+  G=growth-occ one ok proofs::kani_growth_occ_anything > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" SUCCESSFUL "shard growth-occ name matching the glob row -> runs"
+  grep -q '/kani/growth :: kani .*-Z function-contracts -Z stubbing --harness-timeout 1m --harness proofs::kani_growth_occ_anything --exact' $T/args; chk $? 0 "  in kani/growth with -Z function-contracts -Z stubbing"
+  G=growth-occ one ok proofs::kani_growth_t5_capacity_invariant > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" ERROR "shard growth-occ name outside the glob -> ERROR row"
+  G=bonds571 TM=315m one ok proofs::kani_571_split_interval_is_exact > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" SUCCESSFUL "shard bonds571 listed name -> runs"
+  grep -q '/kani/bonds571 :: kani -Z unstable-options --harness-timeout 315m --harness proofs::kani_571_split_interval_is_exact --exact' $T/args; chk $? 0 "  in kani/bonds571, plain flags, 315m"
+  grep -q 'timeout=315m watchdog=325m' $T/shard.log; chk $? 0 "  watchdog 325m"
+  G=bonds571 one ok proofs::kani_571_pay_conserves_leg_and_receivable > /dev/null; chk "$(cut -f2 $T/kn/verdicts.tsv)" ERROR "shard bonds571 unlisted harness -> ERROR row"
+  G=growth-occ one ok proofs::kani_growth_occ_x '' z3 > /dev/null; grep -q -- '--solver z3 --harness-timeout' $T/args; chk $? 0 "shard solver override passed as --solver z3"
+  G=growth-occ one ok proofs::kani_growth_occ_x '' yices > /dev/null; chk "$(cat $T/kn/verdicts.tsv 2>/dev/null | wc -l | tr -d ' ')" 0 "shard bad solver -> refused before running"
   if [ "$(uname)" = Linux ] && sudo -n true 2>/dev/null && grep -qw memory /sys/fs/cgroup/cgroup.subtree_control 2>/dev/null; then
     one hog "$H" 128M > /dev/null; grep 'memory cap:' $T/shard.log
     chk "$(cut -f2 $T/kn/verdicts.tsv)" OOM "shard 1 GiB allocation under a 128M cgroup cap -> OOM row"
