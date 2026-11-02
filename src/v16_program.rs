@@ -26080,7 +26080,9 @@ pub mod processor {
             // refuses with `EngineLockActive` (21) while ANY insurance domain budget remains
             // (`insurance_domain_budget_remaining_total != 0`, engine
             // `retire_terminal_unbudgeted_insurance_delta`), and every unit is minted by a
-            // budget-crediting top-up (tag 9 on asset 0). So while a unit holder still has value
+            // budget-crediting top-up (tag 9 on asset 0) or by the genesis that the unit hook
+            // re-runs on budget credited while no unit exists (`ins_units_genesis_due`). So while
+            // a unit holder still has value
             // in the fund the close waits; holders exit through terminal tag 41 (units burned)
             // first. If units remain after the budget is spent to 0 (losses), they are worth 0
             // and nothing of theirs is retired. Pinned by `ws2_close_slab_refuses_21_while_a_
@@ -39417,7 +39419,9 @@ pub mod processor {
     /// frames: the record is 176 bytes). No-op (`Ok(false)`) on a market that is not unitised;
     /// on a units market the ledger account is REQUIRED (116). `reading` is the caller's terminal
     /// capacity for `INS_OP_TERMINAL_BURN` and ignored otherwise (mint: the ENTRY reading, burn:
-    /// the EXIT reading, both computed here). Writes the ledger; `ins_units_post_op` snapshots.
+    /// the EXIT reading, both computed here). With no units outstanding it first re-runs the
+    /// genesis when `ins_units_genesis_due` holds. Writes the ledger; `ins_units_post_op`
+    /// snapshots.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn ins_units_pre_op(
@@ -39440,6 +39444,17 @@ pub mod processor {
         }
         let class = ins_unit_class_for(market_key, who);
         let (mint, free) = ins_units_readings_view(group, u.backstop_receivable_atoms)?;
+        // Insurance that exists while no unit does is creator class 1:1 (tag 116's genesis).
+        let x = if op == INS_OP_MINT { amount } else { 0 };
+        let live = group.header.mode == 0;
+        if crate::p4_rescue_ins::ins_units_genesis_due(u.units_total, mint, live, x) {
+            u.units_total = mint;
+            u.units_creator = mint;
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_ins_units_genesis creator_units={}",
+                mint
+            ));
+        }
         match op {
             INS_OP_MINT => ins_units_apply_mint(&mut u, class, amount, mint)?,
             INS_OP_BURN => ins_units_apply_burn(&mut u, class, amount, free)?,
@@ -39694,7 +39709,9 @@ pub mod processor {
     ///
     /// * Ledger absent (Live only): create it; the asset-0 insurance that exists NOW becomes
     ///   creator-class units 1:1 (genesis), and the asset-0 profile gets `INS_UNITS_REQUIRED`.
-    ///   From then on every asset-0 insurance path requires the ledger (fail closed).
+    ///   From then on every asset-0 insurance path requires the ledger (fail closed), and the
+    ///   unit hooks repeat this genesis when the fund holds value with no unit outstanding
+    ///   (`ins_units_genesis_due`; W-1 applies while Live).
     /// * Ledger present (any mode): refresh the snapshot (`snap_*`, `snap_slot = now`). The stake
     ///   program CPIs this before it prices LP tokens or syncs its deployment.
     #[inline(never)]
@@ -39762,8 +39779,9 @@ pub mod processor {
                 return Err(PercolatorError::InsuranceBackstopRefused.into());
             }
             let (mint, _) = ins_units_readings_view(&group, 0)?;
-            // W-1: no dust genesis. Either an empty fund (the first top-up is then the genesis
-            // and must itself be >= the minimum) or at least `INS_UNITS_GENESIS_MIN_ATOMS`.
+            // W-1: no dust genesis. Either an empty fund (the genesis is then its first top-up of
+            // at least the minimum, or `ins_units_genesis_due` once value lands with no unit) or
+            // at least `INS_UNITS_GENESIS_MIN_ATOMS`.
             if mint != 0 && mint < crate::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS {
                 return Err(PercolatorError::InsuranceBackstopRefused.into());
             }
