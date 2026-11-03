@@ -23510,6 +23510,21 @@ pub mod processor {
             // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
             // while any asset's mark lags its target that value is stale, so wait (21).
             reject_market_price_lagged_view(&group)?;
+            // GH#654: insurance spent on claims that no longer exist comes back through the
+            // terminal claim-free re-credit (CloseSlab's scan, tag 78). On a unitised fund run it
+            // for asset 0 before any unit burns, so it is paid to the units that owned the spend
+            // instead of landing after the last burn, where `ins_units_genesis_due` would book it
+            // all as creator class. The engine gate requires no materialised portfolio, so no
+            // receipt holds the residual; `LockActive` (not terminal-ready) changes nothing.
+            // Tag 41 absorbs no residual, so F-1's all-asset order is not needed here.
+            let capacity_before_recredit =
+                terminal_insurance_withdraw_capacity_for_authority_view(&group, &cfg, authority.key)?;
+            if ins_units_required_view(&group, &cfg)? {
+                match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(0) {
+                    Ok(_) | Err(percolator::V16Error::LockActive) => {}
+                    Err(e) => return Err(map_v16_error(e)),
+                }
+            }
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -23539,7 +23554,12 @@ pub mod processor {
             // unsigned call therefore settles the authority's WHOLE reserve (no chunking) and does
             // not stamp the cooldown; the authority's own signed withdrawals are unchanged.
             let authority_signed = authority.is_signer;
-            if !authority_signed && amount != available_insurance {
+            // GH#654: the whole reserve as read before or after this instruction's re-credit, so a
+            // caller that read the budget beforehand still settles (the rest stays priced pro rata).
+            if !authority_signed
+                && amount != available_insurance
+                && amount != capacity_before_recredit
+            {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {

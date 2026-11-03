@@ -4120,3 +4120,165 @@ fn gh_654_first_loss_sync_with_no_units_keeps_the_fees_creator_class() {
         eprintln!("GH#654 FIRST_LOSS sync: fees {fees} creator units {}, top-up {topup} stake units {}", u.units_creator, u.units_stake);
     }
 }
+
+/// Trader withdrawal (tag 4) to a fresh token account.
+fn trader_withdraw(w: &mut P3, k: &Keypair, p: Pubkey, amount: u128) -> Result<u64, String> {
+    let dest = w.token(k.pubkey(), 0);
+    let (pid, seq, _) = w.env.portfolio_identity(p);
+    let (m, v, va) = (w.env.market, w.env.vault, w.env.vault_authority);
+    w.send(
+        ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount },
+        vec![
+            AccountMeta::new(k.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(p, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[k],
+    )
+}
+/// FIRST_LOSS units market (creator seed 1,000,000; a staker deposits 4,000,000 and the sync
+/// deploys 2,000,000 as stake units). A and B open 1 unit at 10x; the auth mark doubles while only
+/// A is cranked, so B is touched late and bankrupt and the asset-0 insurance pays its deficit. A
+/// converts its PnL, both withdraw, the market resolves, CloseResolved and tag 8 close every
+/// account. Returns the world and the pool, every account closed.
+fn bad_debt_resolved_world() -> (P3, Pool) {
+    TL_IM.with(|c| c.set(1_000));
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let s = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &s, 4_000_000, Some(CONSENT)).expect("deposit");
+    stake_sync(&mut w, &p).expect("sync");
+    let ins0 = w.env.market_state().1.insurance;
+    let px = w.env.market_state().1.assets[0].effective_price;
+    let (ka, pa) = w.trader(110_000);
+    let (kb, pb) = w.trader(110_000);
+    w.env.svm.expire_blockhash();
+    w.env.try_trade_asset_with_cu(0, &ka, pa, &kb, pb, U, px, 0).expect("open");
+    let admin = w.env.admin.insecure_clone();
+    let target = 2 * PRICE;
+    let step = |w: &mut P3, crank_b: bool| {
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        if w.env.market_state().1.mode == percolator::MarketModeV16::Live {
+            w.env.push_auth_mark_for_asset_with_authority(0, &admin, s, target);
+        }
+        if crank_b {
+            let _ = w.crank(pb);
+        }
+        let _ = w.crank(pa);
+    };
+    for _ in 0..2_000 {
+        step(&mut w, false);
+        if w.env.market_state().1.assets[0].effective_price == target {
+            break;
+        }
+    }
+    for _ in 0..3 {
+        step(&mut w, true);
+    }
+    assert!(w.env.market_state().1.insurance < ins0, "the insurance paid B's deficit");
+    for _ in 0..120 {
+        step(&mut w, true);
+        let pnl = w.env.portfolio_state(pa).pnl;
+        if pnl <= 0 {
+            break;
+        }
+        let (pid, _, pep) = w.env.portfolio_identity(pa);
+        let m = w.env.market;
+        let _ = w.send(
+            ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(ka.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(pa, false)],
+            &[&ka],
+        );
+    }
+    for (k, tp) in [(&ka, pa), (&kb, pb)] {
+        let mut amt = w.env.portfolio_state(tp).capital;
+        while amt > 0 && trader_withdraw(&mut w, k, tp, amt).is_err() {
+            amt = amt * 9 / 10;
+        }
+    }
+    w.env.svm.expire_blockhash();
+    w.env.resolve();
+    let m = w.env.market;
+    let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+    for _ in 0..4 {
+        for (k, tp) in [(&ka, pa), (&kb, pb)] {
+            if w.env.svm.get_account(&tp).map_or(true, |a| a.data.is_empty() || a.lamports == 0) {
+                continue;
+            }
+            let dest = w.token(k.pubkey(), 0);
+            let _ = w.send(
+                ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+                vec![
+                    AccountMeta::new_readonly(k.pubkey(), false),
+                    AccountMeta::new(m, false),
+                    AccountMeta::new(tp, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(w.env.vault, false),
+                    AccountMeta::new_readonly(w.env.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(nft, false),
+                ],
+                &[],
+            );
+        }
+        let s = w.slot() + 50;
+        w.env.svm.warp_to_slot(s);
+    }
+    for (k, tp) in [(&ka, pa), (&kb, pb)] {
+        let _ = w.close_portfolio_permissionless(tp, k.pubkey());
+    }
+    (w, p)
+}
+
+/// GH#654, bad debt: insurance spent on a bankruptcy while Live is claim-free residual once every
+/// account is closed, and the terminal re-credit returns it. Tag 41 runs that re-credit before it
+/// burns a unit, so the stake and creator classes share it pro rata whichever runs first: an
+/// unsigned tag 41 of the budget as read beforehand (then one for the rest), or CloseSlab's scan,
+/// each followed by CloseSlab until the market closes. Before, a tag 41 first left the re-credit to
+/// land with no unit outstanding: tag 41 116 and CloseSlab 21 forever without the genesis, the
+/// whole re-credit as creator class with it.
+#[test]
+fn gh_654_bad_debt_recredit_is_shared_pro_rata_in_either_order() {
+    let mut seen = Vec::new();
+    for scan_first in [false, true] {
+        let (mut w, p) = bad_debt_resolved_world();
+        let g = w.env.market_state().1;
+        assert_eq!(g.materialized_portfolio_count, 0, "every account closed");
+        let residual = g.vault as i128 - g.c_tot as i128 - g.insurance as i128;
+        assert!(residual > 0, "the bankruptcy left claim-free residual: {residual}");
+        let v0 = w.tok(&p.vault);
+        let u0 = units(&w).unwrap();
+        if scan_first {
+            close_slab(&mut w).expect("CloseSlab: the scan re-credits");
+            assert!(!closed(&w));
+        }
+        for _ in 0..3 {
+            let all = budget(&w);
+            if all != 0 {
+                withdraw_41(&mut w, p.vault_auth, None, p.vault, all).expect("unsigned tag 41 of the budget as read");
+            }
+            // 21 while budget remains (the rest of an unsigned settle read before the re-credit).
+            let r = close_slab(&mut w);
+            assert!(r.is_ok() || has(&r, 21), "CloseSlab: {r:?}");
+            if closed(&w) {
+                break;
+            }
+        }
+        assert!(closed(&w), "the market closes");
+        let paid = (w.tok(&p.vault) - v0) as u128;
+        let creator = units(&w).unwrap().creator_paid_to_stake_atoms;
+        eprintln!("GH#654 bad debt (scan first {scan_first}): residual {residual}, pool got {paid}, creator_paid_to_stake {creator}");
+        let pro_rata = paid * u0.units_creator / u0.units_total;
+        assert!(creator.abs_diff(pro_rata) <= 2, "creator class {creator} vs pro rata {pro_rata}");
+        seen.push((paid, creator));
+    }
+    assert_eq!(seen[0], seen[1], "same payout and creator share in either order");
+}
