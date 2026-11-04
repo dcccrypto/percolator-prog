@@ -25309,25 +25309,26 @@ pub mod processor {
     /// all, only `expect_signer` on an arbitrary fee payer, so allowing it in a
     /// terminal state hands a permissionless drain to anyone.
     ///
-    /// ⚠ THE SECOND PREMISE DOES APPLY, AND THIS LEG IS FORFEITED BY IT. An
-    /// earlier version of this comment claimed refusing on Resolved "strands
-    /// nothing" because the reserve stays reclaimable by the stake program via
+    /// ⚠ THE SECOND PREMISE APPLIES UNTIL THE MARKET IS EMPTY. An earlier
+    /// version of this comment claimed refusing on Resolved "strands nothing"
+    /// because the reserve stays reclaimable by the stake program via
     /// `WithdrawInsurance` (tag 41), on the grounds that a bound
     /// `insurance_authority` IS the pool's `vault_auth` PDA. THAT IS WRONG: tag
     /// 41's capacity is budget-scoped
     /// (`terminal_insurance_withdraw_capacity_for_authority_view`), while the
     /// atoms this leg pays out are the UNBUDGETED surplus that the clamp below
-    /// deliberately isolates. Tag 41 cannot reach them. `ResolveMarket` being
-    /// one-way, any `insurance_reserve_accrued - withdrawn` that has not been
-    /// pushed before the market resolves is PERMANENTLY UNREACHABLE by stakers.
+    /// deliberately isolates. Tag 41 cannot reach them. So any
+    /// `insurance_reserve_accrued - withdrawn` not pushed before `ResolveMarket`
+    /// waits: this handler refuses until the market is terminal-empty (the P1 F4
+    /// exception in the mode gate: no portfolio left, `c_tot == 0`), then pays
+    /// it, and `CloseSlab` refuses (`CloseSlabFeesOutstanding`) until it has.
+    /// The leg is delayed to the close, not forfeited.
     ///
-    /// That is a real, accepted cost, not a non-issue. It is accepted because
-    /// the alternative — a permissionless token-moving instruction that still
-    /// runs after resolution — is worse (see the Recovery note below), and
-    /// because the leg is continuously crankable by anyone for the entire Live
-    /// lifetime of the market, so the forfeited amount is bounded by whatever
-    /// accrues between the last successful crank and resolution. Keepers should
-    /// crank tag 87 before `ResolveMarket`, not after.
+    /// The delay is accepted because the alternative — a permissionless
+    /// token-moving instruction that runs while the insurance still covers
+    /// traders — is worse (see the Recovery note below). Keepers should still
+    /// crank tag 87 before `ResolveMarket`, so stakers are not paid only after
+    /// the last trader account closes.
     ///
     /// Concretely blocked:
     ///   * Recovery (mode 2) — the important one, and worse here than for tag
@@ -25340,17 +25341,17 @@ pub mod processor {
     ///     market as a junior LP claim; here they leave the program entirely as
     ///     SPL tokens and stakers can withdraw them.
     ///   * Resolved (mode 1) — same drain, before trader portfolios are
-    ///     materialised. Note this is the FORFEITING case described above: there
-    ///     is no tag-41 fallback for the unbudgeted leg.
+    ///     materialised. This is the waiting case described above: there is no
+    ///     tag-41 fallback for the unbudgeted leg, so it is paid only once the
+    ///     market is terminal-empty.
     ///   * Live-but-matured — `reject_permissionless_resolve_matured_live_view`,
     ///     as tag 78 uses: no permissionless token movement out of a market
     ///     that is past its stale-resolve horizon and merely awaiting a
     ///     resolve.
     ///
     /// A rejected call never marks anything withdrawn, so `accrued - withdrawn`
-    /// stays fully claimable IF the market can return to Live — true for the
-    /// matured-Live and Recovery cases, and NOT true for Resolved, which is
-    /// terminal and therefore forfeits the outstanding leg as described above.
+    /// stays fully claimable: once the market returns to Live (the matured-Live
+    /// and Recovery cases) or, on Resolved, once it is terminal-empty.
     ///
     /// MANDATORY CLAMP. The protocol leg (tag 84), the LP leg (tag 78) and this
     /// stake leg ALL draw from one pool: `insurance −
