@@ -2786,12 +2786,17 @@ pub mod state {
         /// Cumulative atoms accrued to the LP vault's claim. Monotonic.
         /// Claimed via `LpVaultCrankFees` (tag 78) into vault NAV.
         pub lp_fee_accrued_atoms: u128,
-        /// Cumulative atoms already credited to the vault. `<= lp_fee_accrued_atoms`.
+        /// Cumulative atoms settled out of the LP leg: credited to the vault, or folded into
+        /// the staker leg with no transfer (`fold_lp_leg_into_insurance`: tag 87's P1 F4
+        /// exception, CloseSlab's `rebook_orphaned_fee_legs_view`). `<= lp_fee_accrued_atoms`.
         pub lp_fee_withdrawn_atoms: u128,
         /// Cumulative atoms accrued to the insurance/staker leg. Monotonic.
         /// Claimed via `WithdrawInsuranceReserveToStake` (tag 87).
         pub insurance_reserve_accrued_atoms: u128,
-        /// Cumulative atoms already pushed to the stake vault. `<= accrued`.
+        /// Cumulative atoms settled out of the staker leg: pushed to the stake vault by tag 87,
+        /// or re-booked to the protocol leg with no transfer by CloseSlab's
+        /// `rebook_orphaned_fee_legs_view` (W-S1: no bound pool, or a bound pool owed nothing).
+        /// So it is NOT a count of atoms the stake vault received. `<= accrued`.
         pub insurance_reserve_withdrawn_atoms: u128,
         /// Creator's share of T in bps. Floor: <= MAX_CREATOR_SHARE_BPS.
         pub creator_share_bps: u16,
