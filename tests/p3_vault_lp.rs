@@ -7086,3 +7086,165 @@ fn port135_vault_lp_deposit_refresh_invalidates_stale_matcher_capability() {
     assert_eq!(e1, e0 + 1, "one out-of-matcher episode bump");
     err_has(&r, PercolatorError::Unauthorized);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// prog#660 (Nacodex audit of 6377376): regression tests for the two High findings. Each test
+// performs the attack exactly as the report describes it and proves the program refuses it,
+// with no funds moved and no account changed.
+//
+//   f-4074  A permissionless post-resolve reserve payout (tags 50 / 52) named the LP-vault
+//           registry PDA as the beneficiary, stranding Earn principal in a registry-owned token
+//           account nothing can spend from. Guard: `VaultLpUseSettleResolved` (P3-H1) in
+//           `verify_domain_withdrawal_preflight`.
+//   f-4101  PermissionlessCrank grew (realloc) any undersized program-owned account named as
+//           the portfolio before validating it, and the bounded catch-up early return committed
+//           the growth, so the grown ledger / registry failed its own exact-length checks
+//           forever. Guard: the grow branch is gone; `ensure_portfolio_storage_for_market_slots`
+//           requires the exact portfolio length (after the dispatcher's owner check) before any
+//           zero-copy view.
+//
+// Negative control (2026-11-05): both tests FAIL against an rc23 build with the two guards put
+// back to their 6377376 shape (registry check deleted; `> required` reject + `< required`
+// realloc restored). f-4074: tag 50 returns Ok and the payout lands in the registry-owned
+// account. f-4101: the crank attempts the grow (`InvalidRealloc`). On rc23 that realloc can't
+// succeed anyway (this entrypoint refuses any realloc), so the exact-length check is what makes
+// the crank refuse before it tries. The harness can't drive the 6377376 binary itself, because
+// InitMarket's wire format changed since then.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    /// Tag 50 / 52 sent by an unsigned stranger with `authority` = `authority_ref` (not a
+    /// signer), paying into a fresh collateral account owned by the LP-vault registry PDA.
+    fn audit660_domain_withdraw(
+        &mut self,
+        earnings: bool,
+        authority_ref: Pubkey,
+        amount: u128,
+    ) -> (Result<(), String>, Pubkey) {
+        let dest = self.token_account(self.mint, self.registry, 0);
+        let data = self.svm.get_account(&self.market).unwrap().data;
+        let market_id = state::read_market_trade_preflight(&data, (DOMAIN as usize) / 2).unwrap().3;
+        let authority_epoch =
+            state::read_asset_control_sequences(&data, (DOMAIN as usize) / 2).unwrap().authority_epoch;
+        let (ix, accounts) = if earnings {
+            (
+                ProgInstruction::WithdrawBackingBucketEarnings { domain: DOMAIN, market_id, amount, authority_epoch },
+                vec![
+                    AccountMeta::new_readonly(authority_ref, false),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(self.ledger, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                ],
+            )
+        } else {
+            (
+                ProgInstruction::WithdrawBackingBucket { domain: DOMAIN, market_id, amount, authority_epoch },
+                vec![
+                    AccountMeta::new_readonly(authority_ref, false),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new(self.ledger, false),
+                ],
+            )
+        };
+        (self.send(ix, accounts, &[]), dest)
+    }
+
+    /// Tag 5 sent by a stranger, naming `portfolio` as account [2], with one Active-asset hint.
+    fn audit660_crank_as_portfolio(&mut self, portfolio: Pubkey) -> Result<(), String> {
+        let stranger = Keypair::new();
+        self.svm.airdrop(&stranger.pubkey(), 10_000_000_000).unwrap();
+        self.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: self.slot,
+                observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+            },
+            vec![
+                AccountMeta::new(stranger.pubkey(), false),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+            ],
+            &[],
+        )
+    }
+}
+
+/// prog#660 f-4074. The report's exact preconditions: Earn principal backs the domain, the
+/// market is Resolved with nothing materialized, the domain's `backing_bucket_authority` is the
+/// registry PDA. A stranger then sends tags 50 and 52 unsigned, naming either the registry PDA
+/// itself or marketauth (the shutdown fallback) as the non-signing `authority`, into a
+/// registry-owned token account. Every combination is refused with VaultLpUseSettleResolved,
+/// no token moves, and the ledger still records the full principal for the vault exits.
+#[test]
+fn audit660_f4074_resolved_payout_cannot_target_the_lp_vault_registry() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    let principal = 10_000_000u64;
+    env.earn_deposit(&d, principal, None).expect("earn deposit");
+    let reg = env.registry;
+    let profile = state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap();
+    assert_eq!(profile.backing_bucket_authority, reg.to_bytes(), "premise: Earn backing authority = registry PDA");
+    env.resolve();
+    assert_eq!(env.materialized_count(), 0, "premise (report step 1): nothing materialized");
+    let ledger_before = state::read_backing_domain_ledger(&env.svm.get_account(&env.ledger).unwrap().data).unwrap();
+    assert_eq!(ledger_before.total_principal_atoms, principal as u128, "premise: the ledger holds the Earn principal");
+    let vault_before = env.tok(env.vault_token);
+    let marketauth = env.admin.pubkey();
+    for (earnings, amount) in [(false, principal as u128), (true, 1u128)] {
+        for authority_ref in [reg, marketauth] {
+            let (r, dest) = env.audit660_domain_withdraw(earnings, authority_ref, amount);
+            let tag = if earnings { 52 } else { 50 };
+            println!("prog#660 f-4074 tag {tag}, authority {authority_ref}: {r:?}");
+            err_has(&r, PercolatorError::VaultLpUseSettleResolved);
+            assert_eq!(env.tok(dest), 0, "tag {tag}: nothing may reach a registry-owned token account");
+        }
+    }
+    assert_eq!(env.tok(env.vault_token), vault_before, "the vault keeps the Earn backing");
+    let ledger_after = state::read_backing_domain_ledger(&env.svm.get_account(&env.ledger).unwrap().data).unwrap();
+    assert_eq!(ledger_after.total_principal_atoms, ledger_before.total_principal_atoms, "ledger principal untouched");
+    assert_eq!(ledger_after.total_principal_withdrawn_atoms, ledger_before.total_principal_withdrawn_atoms, "no withdrawal booked");
+}
+
+/// prog#660 f-4101. The report's attack: name a writable, program-owned account that is NOT a
+/// portfolio (the backing-domain ledger, the LP-vault registry, or any
+/// account one byte short of / over the portfolio length) as PermissionlessCrank's portfolio,
+/// on a market idle past `max_accrual_dt_slots` (= 1 here) so the hinted Active asset's accrual
+/// is capped (the bounded catch-up early return). Every attempt is refused with
+/// InvalidAccountLen, the target's length, data and lamports are unchanged, and the ledger and
+/// registry keep working afterwards (a fresh Earn deposit through them succeeds).
+#[test]
+fn audit660_f4101_crank_never_grows_a_non_portfolio_program_account() {
+    let mut env = Env::new(Params::default());
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, None).expect("earn deposit (creates the ledger)");
+    // Idle well past max_accrual_dt_slots (1) so the crank's accrual is capped.
+    env.slot += 500;
+    env.svm.warp_to_slot(env.slot);
+    let short = env.new_program_account(env.plen - 1);
+    let long = env.new_program_account(env.plen + 1);
+    let targets = [("plen-1", short), ("plen+1", long), ("backing ledger", env.ledger), ("lp-vault registry", env.registry)];
+    for (what, key) in targets {
+        let before = env.svm.get_account(&key).unwrap_or_else(|| panic!("{what} exists"));
+        assert_eq!(before.owner, env.pid, "premise: {what} is program-owned");
+        assert_ne!(before.data.len(), env.plen, "premise: {what} is not portfolio-sized");
+        // Top up rent first, exactly as the report's step 3 does, so lamports never limit a grow.
+        env.svm.airdrop(&key, 1_000_000_000).unwrap();
+        let topped = env.svm.get_account(&key).unwrap();
+        let r = env.audit660_crank_as_portfolio(key);
+        println!("prog#660 f-4101 crank with {what} ({} B) as portfolio: {r:?}", before.data.len());
+        let after = env.svm.get_account(&key).unwrap();
+        assert_eq!(after.data.len(), before.data.len(), "{what}: never reallocated");
+        assert_eq!(after.data, before.data, "{what}: data unchanged");
+        assert_eq!(after.lamports, topped.lamports, "{what}: lamports unchanged");
+        err_has(&r, PercolatorError::InvalidAccountLen);
+    }
+    // The ledger and registry still pass their own exact-length checks: Earn deposits work.
+    let d2 = env.new_depositor();
+    env.earn_deposit(&d2, 1_000_000, None).expect("ledger + registry still usable after the attack");
+}
