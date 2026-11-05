@@ -7235,3 +7235,70 @@ fn f2_tag5_crank_of_the_vault_lp_itself_accepts_the_appended_lp() {
     .expect("push auth mark");
     env.crank_with_lp(lp.portfolio, lp.portfolio).expect("LP crank with itself appended");
 }
+
+/// Regression (mirrors tests/f2_local_validator.rs): two thin traders 5 long ($1 each) and a healthy holder vs the
+/// bound vault LP, walked to $0.87 (thin ones liquidatable, not bankrupt).
+fn f2_world2() -> (Env, Lp, Vec<Trader>, Trader) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..2).map(|_| env.new_trader(1_000_000)).collect();
+    for t in &ts {
+        env.svm.expire_blockhash();
+        env.trade(t, &lp, 5 * POS).expect("open 5 long");
+    }
+    let h = env.new_trader(5_000_000);
+    env.trade(&h, &lp, 3 * POS).expect("holder opens 3 long");
+    env.move_price(870_000, &[lp.portfolio]);
+    (env, lp, ts, h)
+}
+
+#[test]
+fn f2_regression_tag5_sequential_matched_liquidations_then_opens_both_ways() {
+    let (mut env, lp, ts, h) = f2_world2();
+    for t in &ts {
+        let lp0 = env.position(lp.portfolio);
+        let p0 = env.position(t.portfolio);
+        f2_liquidate(&mut env, t, Some(lp.portfolio));
+        let closed = p0 - env.position(t.portfolio);
+        assert!(closed > 0);
+        assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE));
+        assert_eq!(env.position(lp.portfolio), lp0 + closed);
+    }
+    // an OPEN needs the other positioned portfolios settled after the price walk (else 121 LossStale)
+    for p in ts.iter().map(|t| t.portfolio).chain([h.portfolio]) {
+        env.svm.expire_blockhash();
+        let _ = env.crank(p);
+    }
+    let t3 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&t3, &lp, POS).expect("new long");
+    let t4 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&t4, &lp, -POS).expect("new short");
+    env.svm.expire_blockhash();
+    env.trade(&h, &lp, POS).expect("holder grows");
+    assert!(env.position(lp.portfolio) < 0, "the LP side was never closed");
+    env.assert_conserved("f2 sequential matched");
+}
+
+#[test]
+fn f2_regression_tag5_matched_close_on_a_latched_market_neither_deepens_nor_lifts() {
+    let (mut env, lp, ts, h) = f2_world2();
+    f2_liquidate(&mut env, &ts[0], None);
+    let a0 = env.a_factors();
+    assert!(a0.1 < percolator::ADL_ONE);
+    f2_liquidate(&mut env, &ts[1], Some(lp.portfolio));
+    assert_eq!(env.a_factors(), a0, "matched close: A unchanged on a latched asset");
+    for p in ts.iter().map(|t| t.portfolio).chain([h.portfolio]) {
+        env.svm.expire_blockhash();
+        let _ = env.crank(p);
+    }
+    let t3 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    err_has(&env.trade(&t3, &lp, POS), PercolatorError::EngineAdlReduceOnly);
+    env.svm.expire_blockhash();
+    env.trade(&h, &lp, -POS).expect("holders can still reduce");
+    env.assert_conserved("f2 latched + matched");
+}
