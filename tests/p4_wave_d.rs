@@ -632,6 +632,7 @@ fn code(e: &str) -> Option<u32> {
 }
 
 thread_local! { static TL_IM: std::cell::Cell<u64> = std::cell::Cell::new(10_000); }
+thread_local! { static TL_LIQ_BPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
 fn market_params() -> V16CuMarketParams {
     let im = TL_IM.with(|c| c.get());
     if im >= 10_000 {
@@ -644,7 +645,7 @@ fn market_params() -> V16CuMarketParams {
             min_nonzero_im_req: 600,
             maintenance_margin_bps: im / 2,
             initial_margin_bps: im,
-            liquidation_fee_bps: 0,
+            liquidation_fee_bps: TL_LIQ_BPS.with(|c| c.get()),
             liquidation_fee_cap: percolator::MAX_PROTOCOL_FEE_ABS,
             max_price_move_bps_per_slot: 20,
             max_accrual_dt_slots: 20,
@@ -3803,4 +3804,481 @@ fn gh566_split_draws_lend_no_more_than_one_uncapped_draw() {
     assert_eq!(units(&w).unwrap().g9_pending_slot, 0, "consumed once the caller's cap stopped binding");
     let r = backstop_111(&mut w, 0, 0, true);
     assert!(has(&r, INS_REFUSED), "no further draw on the consumed proposal: {r:?}");
+}
+
+// ═══════════ GH#654: asset-0 insurance with no unit outstanding ═══════════
+//
+// Budget inflows that mint no units (the maintenance fee, the crank's insurance delta,
+// CloseResolved) can give the fund value while `units_total == 0`: after a tag 116 on an empty
+// fund, or after the holders' full exit. Insurance, budget and unit values come only from real
+// instructions; token accounts, the crafted stake pool and one mint supply are test setup.
+
+const MFEE: u128 = 58;
+
+/// Tag 88 (marketauth = admin): a maintenance fee, so SyncMaintenanceFee credits asset-0 insurance.
+fn set_maintenance_fee(w: &mut P3, rate: u128) {
+    let admin = w.env.admin.insecure_clone();
+    let m = w.env.market;
+    let metas = vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)];
+    w.send(ProgInstruction::UpdateMaintenanceFeePerSlot { maintenance_fee_per_slot: rate }, metas, &[&admin]).expect("88");
+}
+fn budget(w: &P3) -> u128 {
+    w.env.market_state().1.insurance_domain_budget_remaining_total
+}
+/// A trader with capital whose maintenance fee is synced (permissionless) up to `to_slot`.
+fn fee_trader(w: &mut P3, to_slot: u64) -> (Keypair, Pubkey) {
+    let (t, p) = w.trader(100_000_000);
+    for s in [to_slot / 2, to_slot] {
+        w.env.svm.warp_to_slot(s);
+        w.env.svm.expire_blockhash();
+        w.env.sync_maintenance_fee_with_cu(p, None, s);
+    }
+    (t, p)
+}
+/// The trader exits while Live, then the market resolves with nothing left on it.
+fn exit_and_resolve(w: &mut P3, t: &Keypair, p: Pubkey) {
+    let cap = w.env.portfolio_state(p).capital;
+    w.env.svm.expire_blockhash();
+    w.env.withdraw(t, p, cap);
+    w.env.svm.expire_blockhash();
+    w.env.close_portfolio_with_cu(t, p);
+    w.env.svm.expire_blockhash();
+    w.env.resolve();
+}
+/// Tag 41 naming `authority`, paid to its token account `dest`, with the units ledger.
+fn withdraw_41(w: &mut P3, authority: Pubkey, signer: Option<&Keypair>, dest: Pubkey, amount: u128) -> Result<u64, String> {
+    let mut metas = vec![
+        AccountMeta::new_readonly(authority, signer.is_some()),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new(w.env.vault, false),
+        AccountMeta::new_readonly(w.env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    if units(w).is_some() {
+        metas.push(AccountMeta::new(units_pda(w), false));
+    }
+    let signers: Vec<&Keypair> = signer.into_iter().collect();
+    w.send(ProgInstruction::WithdrawInsurance { amount }, metas, &signers)
+}
+/// CloseSlab (tag 13); `[6]` is the collateral mint, which a residue retirement burns from.
+fn close_slab(w: &mut P3) -> Result<u64, String> {
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    let authority_epoch = w.env.control_sequences(0).authority_epoch;
+    let metas = vec![
+        AccountMeta::new(admin.pubkey(), true),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new(w.env.vault, false),
+        AccountMeta::new_readonly(w.env.vault_authority, false),
+        AccountMeta::new(dest, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(w.env.mint, false),
+    ];
+    w.send(ProgInstruction::CloseSlab { authority_epoch }, metas, &[&admin])
+}
+fn closed(w: &P3) -> bool {
+    let d = w.env.svm.get_account(&w.env.market).unwrap().data;
+    d.len() == percolator_prog::constants::HEADER_LEN && d[10] == percolator_prog::constants::KIND_CLOSED_MARKET
+}
+
+/// Resolve-time payout of the whole asset-0 budget by tag 41 to `authority`'s `dest`, then CloseSlab.
+fn pay_out_and_close(w: &mut P3, authority: Pubkey, signer: Option<&Keypair>, dest: Pubkey) -> u128 {
+    let all = budget(w);
+    let before = w.tok(&dest) as u128;
+    withdraw_41(w, authority, signer, dest, all).expect("tag 41 pays the whole asset-0 budget");
+    assert_eq!(w.tok(&dest) as u128 - before, all);
+    if let Some(u) = units(w) {
+        assert_eq!((u.units_total, u.units_creator, u.units_stake), (0, 0, 0), "every unit burned");
+    }
+    assert_eq!(budget(w), 0);
+    close_slab(w).expect("CloseSlab");
+    assert!(closed(w), "the market closes");
+    all
+}
+
+/// GH#654: a ledger created on an empty fund, then fee income. The income is creator-class
+/// value: a Live tag 57 takes part of it, tag 41 the rest after the resolve, and the market
+/// closes. Control: the same world without the ledger pays exactly the same amounts.
+#[test]
+fn gh_654_fee_income_with_no_units_is_paid_to_the_creator() {
+    let mut paid = [(0u128, 0u128); 2];
+    for (k, unitised) in [false, true].into_iter().enumerate() {
+        let mut w = P3::new();
+        if unitised {
+            init_units(&mut w).expect("116 on an empty fund");
+        }
+        set_maintenance_fee(&mut w, MFEE);
+        let (t, p) = fee_trader(&mut w, 20_000);
+        let fees = budget(&w);
+        assert!(fees >= percolator_prog::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS, "vacuity: {fees}");
+        if unitised {
+            assert_eq!(units(&w).unwrap().units_total, 0, "fees mint no units");
+        }
+        let (d57, r) = withdraw_57(&mut w, 1_000, unitised);
+        r.expect("Live tag 57");
+        if unitised {
+            let u = units(&w).unwrap();
+            assert_eq!((u.units_total, u.units_creator, u.units_stake), (fees - 1_000, fees - 1_000, 0), "genesis 1:1 to the creator, then 1,000 burned");
+        }
+        exit_and_resolve(&mut w, &t, p);
+        let admin = w.env.admin.insecure_clone();
+        let dest = w.token(admin.pubkey(), 0);
+        paid[k] = (w.tok(&d57) as u128, pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest));
+        assert_eq!(paid[k].0 + paid[k].1, fees, "the creator gets every fee atom");
+    }
+    eprintln!("GH#654 fee income: no ledger {:?}, ledger {:?}", paid[0], paid[1]);
+    assert_eq!(paid[0], paid[1], "the ledger changes nothing about who is paid");
+}
+
+/// GH#654: the unit holders exit in full while Live (U -> 0), then fees land. Nobody else acts.
+#[test]
+fn gh_654_fee_income_after_a_full_exit_is_paid_to_the_creator() {
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("seed");
+    init_units(&mut w).expect("116");
+    let (d, r) = withdraw_57(&mut w, 1_000_000, true);
+    r.expect("full Live exit");
+    assert_eq!((w.tok(&d), units(&w).unwrap().units_total), (1_000_000, 0));
+    set_maintenance_fee(&mut w, MFEE);
+    let (t, p) = fee_trader(&mut w, 20_000);
+    let fees = budget(&w);
+    exit_and_resolve(&mut w, &t, p);
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    assert_eq!(pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest), fees);
+    eprintln!("GH#654 full exit: creator seed 1,000,000 back Live, {fees} fee income after the resolve");
+}
+
+/// GH#654: CloseResolved credits the fee AFTER the resolve, below the W-1 minimum. No top-up can
+/// come any more, so the dust is a genesis too and pays.
+#[test]
+fn gh_654_fee_credited_after_resolve_pays_even_below_the_genesis_minimum() {
+    let mut w = P3::new();
+    init_units(&mut w).expect("116 on an empty fund");
+    set_maintenance_fee(&mut w, MFEE);
+    let (t, p) = w.trader(100_000_000);
+    w.env.svm.warp_to_slot(10_000);
+    w.env.svm.expire_blockhash();
+    w.env.resolve();
+    assert_eq!(budget(&w), 0);
+    w.env.svm.expire_blockhash();
+    w.env.close_resolved(&t, p);
+    w.env.svm.expire_blockhash();
+    w.env.close_portfolio_with_cu(&t, p);
+    let fees = budget(&w);
+    assert!(fees > 0 && fees < percolator_prog::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS, "post-resolve dust: {fees}");
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    assert_eq!(pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest), fees);
+    eprintln!("GH#654 CloseResolved: {fees} credited after the resolve, paid");
+}
+
+/// GH#654: a liquidation penalty (the PermissionlessCrank insurance delta) with no unit
+/// outstanding pays the creator after the resolve.
+#[test]
+fn gh_654_liquidation_penalty_with_no_units_is_paid_to_the_creator() {
+    TL_IM.with(|c| c.set(1_000));
+    TL_LIQ_BPS.with(|c| c.set(50));
+    let mut w = P3::new();
+    init_units(&mut w).expect("116 on an empty fund");
+    let (lo, la) = w.trader(10_000_000);
+    let (so, sa) = w.trader(150_000);
+    w.env.trade_with_cu(&lo, la, &so, sa, U, PRICE, 0);
+    MARK.with(|c| c.set(PRICE * 11 / 10));
+    for _ in 0..20 {
+        w.catch_up(&[sa], 5);
+        if budget(&w) > 0 { break; }
+    }
+    let penalty = budget(&w);
+    assert!(w.pos(sa).abs() < U, "the crank liquidated (part of) the short");
+    assert!(penalty > 0 && units(&w).unwrap().units_total == 0, "the crank credited a penalty, no units: {penalty}");
+    w.env.resolve();
+    for _ in 0..3 {
+        let s = w.slot() + 60;
+        w.env.svm.warp_to_slot(s);
+        for (k, p) in [(&so, sa), (&lo, la)] {
+            if w.env.svm.get_account(&p).map_or(true, |a| a.data.is_empty()) { continue; }
+            w.env.svm.expire_blockhash();
+            w.env.close_resolved(k, p);
+            let (pid, seq, ep) = w.env.portfolio_identity(p);
+            let metas = vec![AccountMeta::new(k.pubkey(), true), AccountMeta::new(w.env.market, false), AccountMeta::new(p, false)];
+            let _ = w.send(ProgInstruction::ClosePortfolio { portfolio_id: pid, expected_sequence: seq, position_epoch: ep }, metas, &[k]);
+        }
+    }
+    assert_eq!(w.env.market_state().1.materialized_portfolio_count, 0);
+    // CloseSlab burns the unbudgeted residue: the injected mint needs a supply to burn from.
+    {
+        use solana_sdk::program_pack::Pack;
+        let mut a = w.env.svm.get_account(&w.env.mint).unwrap();
+        let mut m = spl_token::state::Mint::unpack(&a.data).unwrap();
+        m.supply = u64::MAX / 2;
+        spl_token::state::Mint::pack(m, &mut a.data).unwrap();
+        w.env.svm.set_account(w.env.mint, a).unwrap();
+    }
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    assert_eq!(pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest), penalty);
+    eprintln!("GH#654 liquidation: penalty {penalty} paid to the creator");
+}
+
+/// GH#654, stake-class payee: a FEE_ONLY pool bound and burned, a third party's tag 116, fee
+/// income. The permissionless tag 41 pays it all into the pool vault as creator-class value
+/// (booked in `creator_paid_to_stake_atoms`), and the market closes.
+#[test]
+fn gh_654_fee_income_with_no_units_reaches_the_bound_stake_pool() {
+    let mut w = P3::new();
+    set_maintenance_fee(&mut w, MFEE);
+    let p = craft_pool(&mut w, 2, 1);
+    bind_and_burn(&mut w, &p);
+    init_units(&mut w).expect("116 after the bind, empty fund");
+    let (t, tp) = fee_trader(&mut w, 20_000);
+    let fees = budget(&w);
+    exit_and_resolve(&mut w, &t, tp);
+    let ledger = units_pda(&w);
+    let all = budget(&w);
+    let metas = vec![
+        AccountMeta::new_readonly(p.vault_auth, false),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new(p.vault, false),
+        AccountMeta::new(w.env.vault, false),
+        AccountMeta::new_readonly(w.env.vault_authority, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(ledger, false),
+    ];
+    w.send(ProgInstruction::WithdrawInsurance { amount: all }, metas, &[]).expect("unsigned tag 41 to the pool vault");
+    let u = units(&w).unwrap();
+    assert_eq!((w.tok(&p.vault) as u128, u.creator_paid_to_stake_atoms, u.units_total), (fees, fees, 0));
+    close_slab(&mut w).expect("CloseSlab");
+    assert!(closed(&w));
+    eprintln!("GH#654 FEE_ONLY: pool vault got {fees}, creator_paid_to_stake {fees}");
+}
+
+/// GH#654, W-1: Live fee income below the minimum has no owner yet. A top-up that leaves the
+/// reading short of the minimum is refused; one that reaches it exactly is the genesis, 1:1, with
+/// the income as creator units. W-1's invariant (no units below the minimum) holds throughout.
+/// At or above the minimum the income is already a genesis, and a 1e6 top-up mints 1:1 on top.
+#[test]
+fn gh_654_live_dust_waits_for_the_genesis_minimum() {
+    let min = percolator_prog::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS;
+    let mut w = P3::new();
+    init_units(&mut w).expect("116 on an empty fund");
+    set_maintenance_fee(&mut w, MFEE);
+    let (t, p) = fee_trader(&mut w, 10_000);
+    let dust = budget(&w);
+    assert!(dust > 0 && dust < min, "{dust}");
+    let (_, r) = withdraw_57(&mut w, 1, true);
+    assert!(has(&r, INS_REFUSED), "Live dust has no owner yet: {r:?}");
+    let short = (min - dust - 1) as u64;
+    assert!(has(&top_up_9(&mut w, short, true), INS_REFUSED), "W-1: reading + {short} is below the minimum");
+    top_up_9(&mut w, (min - dust) as u64, true).expect("reading + top-up = the minimum: genesis");
+    let u = units(&w).unwrap();
+    assert_eq!((u.units_total, u.units_creator, u.snap_insurance_mint_atoms), (min, min, min), "1:1");
+    exit_and_resolve(&mut w, &t, p);
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    assert_eq!(pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest), min);
+    let mut w = P3::new();
+    init_units(&mut w).expect("116 on an empty fund");
+    set_maintenance_fee(&mut w, MFEE);
+    let (t, p) = fee_trader(&mut w, 20_000);
+    let fees = budget(&w);
+    top_up_9(&mut w, 1_000_000, true).expect("1e6 top-up");
+    let u = units(&w).unwrap();
+    assert_eq!((u.units_total, u.units_creator), (fees + 1_000_000, fees + 1_000_000), "1:1 on top");
+    exit_and_resolve(&mut w, &t, p);
+    let admin = w.env.admin.insecure_clone();
+    let dest = w.token(admin.pubkey(), 0);
+    assert_eq!(pay_out_and_close(&mut w, admin.pubkey(), Some(&admin), dest), fees + 1_000_000);
+    eprintln!("GH#654 W-1: dust {dust} + {} paid {min}; income {fees} + 1e6 paid", min - dust);
+}
+
+/// GH#654, stake class: a FIRST_LOSS pool whose first deposit creates the ledger on an empty fund
+/// (stake CPIs tag 116), then fee income at U == 0, then the permissionless stake Sync. The fees
+/// stay creator class, the stakers' units are worth exactly their top-up, and stake's own count
+/// of the minted units matches (the Sync succeeds). Both with income above the W-1 minimum and
+/// with dust below it (the Sync's top-up then completes the genesis).
+#[test]
+fn gh_654_first_loss_sync_with_no_units_keeps_the_fees_creator_class() {
+    for to_slot in [20_000u64, 10_000] {
+        let mut w = P3::new();
+        set_maintenance_fee(&mut w, MFEE);
+        let p = craft_pool(&mut w, 1, 1);
+        bind_and_burn(&mut w, &p);
+        let a = staker(&mut w, &p, 4_000_000);
+        stake_deposit(&mut w, &p, &a, 4_000_000, Some(CONSENT)).expect("first deposit creates the ledger");
+        assert_eq!(units(&w).unwrap().units_total, 0, "genesis 0 on the empty fund");
+        let _trader = fee_trader(&mut w, to_slot);
+        let fees = budget(&w);
+        stake_sync(&mut w, &p).expect("sync: stake's minted == expected count holds");
+        let topup = budget(&w) - fees;
+        let u = units(&w).unwrap();
+        let (_, deployed, _) = pool_view(&w, &p);
+        assert!(topup > 0, "vacuity: the sync deployed");
+        assert_eq!((u.units_creator, u.units_stake), (fees, topup), "fees -> creator 1:1, stake mints its top-up");
+        assert_eq!(deployed as u128, topup, "the stakers own their top-up, not the fees");
+        eprintln!("GH#654 FIRST_LOSS sync: fees {fees} creator units {}, top-up {topup} stake units {}", u.units_creator, u.units_stake);
+    }
+}
+
+/// Trader withdrawal (tag 4) to a fresh token account.
+fn trader_withdraw(w: &mut P3, k: &Keypair, p: Pubkey, amount: u128) -> Result<u64, String> {
+    let dest = w.token(k.pubkey(), 0);
+    let (pid, seq, _) = w.env.portfolio_identity(p);
+    let (m, v, va) = (w.env.market, w.env.vault, w.env.vault_authority);
+    w.send(
+        ProgInstruction::Withdraw { portfolio_id: pid, expected_sequence: seq, amount },
+        vec![
+            AccountMeta::new(k.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(p, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(v, false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[k],
+    )
+}
+/// FIRST_LOSS units market (creator seed 1,000,000; a staker deposits 4,000,000 and the sync
+/// deploys 2,000,000 as stake units). A and B open 1 unit at 10x; the auth mark doubles while only
+/// A is cranked, so B is touched late and bankrupt and the asset-0 insurance pays its deficit. A
+/// converts its PnL, both withdraw, the market resolves, CloseResolved and tag 8 close every
+/// account. Returns the world and the pool, every account closed.
+fn bad_debt_resolved_world() -> (P3, Pool) {
+    TL_IM.with(|c| c.set(1_000));
+    let mut w = P3::new();
+    top_up_9(&mut w, 1_000_000, false).expect("creator seed");
+    init_units(&mut w).expect("116");
+    let p = craft_pool(&mut w, 1, 1);
+    bind_and_burn(&mut w, &p);
+    let s = staker(&mut w, &p, 4_000_000);
+    stake_deposit(&mut w, &p, &s, 4_000_000, Some(CONSENT)).expect("deposit");
+    stake_sync(&mut w, &p).expect("sync");
+    let ins0 = w.env.market_state().1.insurance;
+    let px = w.env.market_state().1.assets[0].effective_price;
+    let (ka, pa) = w.trader(110_000);
+    let (kb, pb) = w.trader(110_000);
+    w.env.svm.expire_blockhash();
+    w.env.try_trade_asset_with_cu(0, &ka, pa, &kb, pb, U, px, 0).expect("open");
+    let admin = w.env.admin.insecure_clone();
+    let target = 2 * PRICE;
+    let step = |w: &mut P3, crank_b: bool| {
+        let s = w.slot() + 1;
+        w.env.svm.warp_to_slot(s);
+        if w.env.market_state().1.mode == percolator::MarketModeV16::Live {
+            w.env.push_auth_mark_for_asset_with_authority(0, &admin, s, target);
+        }
+        if crank_b {
+            let _ = w.crank(pb);
+        }
+        let _ = w.crank(pa);
+    };
+    for _ in 0..2_000 {
+        step(&mut w, false);
+        if w.env.market_state().1.assets[0].effective_price == target {
+            break;
+        }
+    }
+    for _ in 0..3 {
+        step(&mut w, true);
+    }
+    assert!(w.env.market_state().1.insurance < ins0, "the insurance paid B's deficit");
+    for _ in 0..120 {
+        step(&mut w, true);
+        let pnl = w.env.portfolio_state(pa).pnl;
+        if pnl <= 0 {
+            break;
+        }
+        let (pid, _, pep) = w.env.portfolio_identity(pa);
+        let m = w.env.market;
+        let _ = w.send(
+            ProgInstruction::ConvertReleasedPnl { portfolio_id: pid, position_epoch: pep, amount: pnl as u128 },
+            vec![AccountMeta::new(ka.pubkey(), true), AccountMeta::new(m, false), AccountMeta::new(pa, false)],
+            &[&ka],
+        );
+    }
+    for (k, tp) in [(&ka, pa), (&kb, pb)] {
+        let mut amt = w.env.portfolio_state(tp).capital;
+        while amt > 0 && trader_withdraw(&mut w, k, tp, amt).is_err() {
+            amt = amt * 9 / 10;
+        }
+    }
+    w.env.svm.expire_blockhash();
+    w.env.resolve();
+    let m = w.env.market;
+    let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
+    for _ in 0..4 {
+        for (k, tp) in [(&ka, pa), (&kb, pb)] {
+            if w.env.svm.get_account(&tp).map_or(true, |a| a.data.is_empty() || a.lamports == 0) {
+                continue;
+            }
+            let dest = w.token(k.pubkey(), 0);
+            let _ = w.send(
+                ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+                vec![
+                    AccountMeta::new_readonly(k.pubkey(), false),
+                    AccountMeta::new(m, false),
+                    AccountMeta::new(tp, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(w.env.vault, false),
+                    AccountMeta::new_readonly(w.env.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(nft, false),
+                ],
+                &[],
+            );
+        }
+        let s = w.slot() + 50;
+        w.env.svm.warp_to_slot(s);
+    }
+    for (k, tp) in [(&ka, pa), (&kb, pb)] {
+        let _ = w.close_portfolio_permissionless(tp, k.pubkey());
+    }
+    (w, p)
+}
+
+/// GH#654, bad debt: insurance spent on a bankruptcy while Live is claim-free residual once every
+/// account is closed, and the terminal re-credit returns it. Tag 41 runs that re-credit before it
+/// burns a unit, so the stake and creator classes share it pro rata whichever runs first: an
+/// unsigned tag 41 of the budget as read beforehand (then one for the rest), or CloseSlab's scan,
+/// each followed by CloseSlab until the market closes. Before, a tag 41 first left the re-credit to
+/// land with no unit outstanding: tag 41 116 and CloseSlab 21 forever without the genesis, the
+/// whole re-credit as creator class with it.
+#[test]
+fn gh_654_bad_debt_recredit_is_shared_pro_rata_in_either_order() {
+    let mut seen = Vec::new();
+    for scan_first in [false, true] {
+        let (mut w, p) = bad_debt_resolved_world();
+        let g = w.env.market_state().1;
+        assert_eq!(g.materialized_portfolio_count, 0, "every account closed");
+        let residual = g.vault as i128 - g.c_tot as i128 - g.insurance as i128;
+        assert!(residual > 0, "the bankruptcy left claim-free residual: {residual}");
+        let v0 = w.tok(&p.vault);
+        let u0 = units(&w).unwrap();
+        if scan_first {
+            close_slab(&mut w).expect("CloseSlab: the scan re-credits");
+            assert!(!closed(&w));
+        }
+        for _ in 0..3 {
+            let all = budget(&w);
+            if all != 0 {
+                withdraw_41(&mut w, p.vault_auth, None, p.vault, all).expect("unsigned tag 41 of the budget as read");
+            }
+            // 21 while budget remains (the rest of an unsigned settle read before the re-credit).
+            let r = close_slab(&mut w);
+            assert!(r.is_ok() || has(&r, 21), "CloseSlab: {r:?}");
+            if closed(&w) {
+                break;
+            }
+        }
+        assert!(closed(&w), "the market closes");
+        let paid = (w.tok(&p.vault) - v0) as u128;
+        let creator = units(&w).unwrap().creator_paid_to_stake_atoms;
+        eprintln!("GH#654 bad debt (scan first {scan_first}): residual {residual}, pool got {paid}, creator_paid_to_stake {creator}");
+        let pro_rata = paid * u0.units_creator / u0.units_total;
+        assert!(creator.abs_diff(pro_rata) <= 2, "creator class {creator} vs pro rata {pro_rata}");
+        seen.push((paid, creator));
+    }
+    assert_eq!(seen[0], seen[1], "same payout and creator share in either order");
 }

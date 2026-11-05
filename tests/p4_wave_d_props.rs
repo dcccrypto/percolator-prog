@@ -171,11 +171,19 @@ proptest! {
     /// * mint never dilutes, burn is at a price no better than the incumbents' (both per op);
     /// * a loss or gain moves every class's value by the same fraction (pro rata);
     /// * a class can never withdraw more than its own units' value;
-    /// * the classes' values never sum above the fund.
+    /// * the classes' values never sum above the fund;
+    /// * a gain that lands while no unit exists becomes creator-class units at the next top-up or
+    ///   withdrawal (the hook's genesis), once the reading plus the top-up reaches the W-1 minimum.
     #[test]
     fn units_conserve_and_spread_losses_pro_rata(ops in prop::collection::vec(op(), 1..40)) {
         let (mut i, mut u, mut cls) = (0u128, 0u128, [0u128; 2]);
         for o in ops {
+            let hook = matches!(o, Op::TopUp { .. } | Op::Withdraw { .. });
+            let x = if let Op::TopUp { x, .. } = o { x as u128 } else { 0 };
+            if hook && p4::ins_units_genesis_due(u, i, true, x) {
+                u = i;
+                cls[p4::INS_UNIT_CLASS_CREATOR as usize] = i;
+            }
             match o {
                 Op::TopUp { class, x } => {
                     let x = x as u128;

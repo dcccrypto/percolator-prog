@@ -43,6 +43,25 @@ pub fn ins_units_reset_needed(units_total: u128, insurance_mint_reading: u128) -
     units_total != 0 && insurance_mint_reading == 0
 }
 
+/// GH#654, the converse: the fund holds value while NO unit exists. Budget inflows that mint
+/// nothing (the maintenance fee, the crank's insurance delta, CloseResolved, ...) put it there
+/// after an empty genesis or a full exit. By the genesis rule (tag 116) that value is creator-class
+/// units 1:1 at the MINT reading, so the unit hook runs the genesis again before any mint or burn.
+/// W-1: no dust ledger while the market can still take top-ups, so a Live genesis needs the reading
+/// plus the operation's top-up `x` (0 for a withdrawal) to reach `INS_UNITS_GENESIS_MIN_ATOMS`;
+/// below it the value waits, as at tag 116. Off Live there are no more mints, so any amount is a
+/// genesis.
+pub fn ins_units_genesis_due(
+    units_total: u128,
+    insurance_mint_reading: u128,
+    live: bool,
+    x: u128,
+) -> bool {
+    units_total == 0
+        && insurance_mint_reading != 0
+        && (!live || insurance_mint_reading.saturating_add(x) >= INS_UNITS_GENESIS_MIN_ATOMS)
+}
+
 /// Units minted for a top-up of `x` atoms: `floor(x * U / I_mint)`, genesis 1:1.
 ///
 /// `I_mint` is the HIGHER (entry) reading of the fund: the asset-0 domain budgets remaining plus
@@ -66,7 +85,9 @@ pub fn ins_units_for_topup(x: u128, units_total: u128, insurance_mint_reading: u
 /// Units burned to withdraw `a` atoms: `ceil(a * U / I_free)`, at the LOWER (exit) reading of the
 /// fund (what can actually be withdrawn now). Rounding up means the withdrawer always pays at a
 /// price no better than the incumbents' value: `(I_free - a) * U >= I_free * (U - burned)`.
-/// `None` when nothing can be withdrawn (`I_free == 0`, `U == 0`) or `a > I_free`.
+/// `None` when nothing can be withdrawn (`I_free == 0`, `U == 0`) or `a > I_free`. The hook runs
+/// `ins_units_genesis_due` first, so `U == 0` here means a fund with no value, or Live dust below
+/// the W-1 minimum.
 pub fn ins_units_to_burn(a: u128, units_total: u128, insurance_free: u128) -> Option<u128> {
     if units_total == 0 || insurance_free == 0 || a > insurance_free {
         return None;
@@ -616,6 +637,18 @@ mod tests {
         assert!(ins_units_reset_needed(5, 0));
         assert!(!ins_units_reset_needed(0, 0));
         assert_eq!(ins_units_for_topup(5, 5, 0), None);
+    }
+
+    #[test]
+    fn genesis_due_only_for_value_without_units() {
+        let min = INS_UNITS_GENESIS_MIN_ATOMS;
+        assert!(!ins_units_genesis_due(0, 1, true, min - 2), "Live: reading + top-up below the minimum waits (W-1)");
+        assert!(ins_units_genesis_due(0, 1, true, min - 1), "Live: reading + top-up at the minimum");
+        assert!(ins_units_genesis_due(0, min, true, 0), "Live: reading at the minimum, no top-up");
+        assert!(ins_units_genesis_due(0, 1, true, u128::MAX), "no overflow");
+        assert!(ins_units_genesis_due(0, 1, false, 0), "no top-up after Live: any value is a genesis");
+        assert!(!ins_units_genesis_due(0, 0, true, min) && !ins_units_genesis_due(0, 0, false, 0), "empty fund: the top-up is the genesis");
+        assert!(!ins_units_genesis_due(1, min, true, 0) && !ins_units_genesis_due(1, min, false, 0), "units exist");
     }
 
     #[test]
