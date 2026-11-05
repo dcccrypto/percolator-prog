@@ -23510,6 +23510,21 @@ pub mod processor {
             // v2.2 D-1 (re-review N-3): value here depends on LP / insurance equity at P_last;
             // while any asset's mark lags its target that value is stale, so wait (21).
             reject_market_price_lagged_view(&group)?;
+            // GH#654: insurance spent on claims that no longer exist comes back through the
+            // terminal claim-free re-credit (CloseSlab's scan, tag 78). On a unitised fund run it
+            // for asset 0 before any unit burns, so it is paid to the units that owned the spend
+            // instead of landing after the last burn, where `ins_units_genesis_due` would book it
+            // all as creator class. The engine gate requires no materialised portfolio, so no
+            // receipt holds the residual; `LockActive` (not terminal-ready) changes nothing.
+            // Tag 41 absorbs no residual, so F-1's all-asset order is not needed here.
+            let capacity_before_recredit =
+                terminal_insurance_withdraw_capacity_for_authority_view(&group, &cfg, authority.key)?;
+            if ins_units_required_view(&group, &cfg)? {
+                match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(0) {
+                    Ok(_) | Err(percolator::V16Error::LockActive) => {}
+                    Err(e) => return Err(map_v16_error(e)),
+                }
+            }
             let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
                 &group,
                 &cfg,
@@ -23539,7 +23554,12 @@ pub mod processor {
             // unsigned call therefore settles the authority's WHOLE reserve (no chunking) and does
             // not stamp the cooldown; the authority's own signed withdrawals are unchanged.
             let authority_signed = authority.is_signer;
-            if !authority_signed && amount != available_insurance {
+            // GH#654: the whole reserve as read before or after this instruction's re-credit, so a
+            // caller that read the budget beforehand still settles (the rest stays priced pro rata).
+            if !authority_signed
+                && amount != available_insurance
+                && amount != capacity_before_recredit
+            {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             let mut ledger_data = if let Some(ledger_ai) = ledger_ai {
@@ -26080,7 +26100,9 @@ pub mod processor {
             // refuses with `EngineLockActive` (21) while ANY insurance domain budget remains
             // (`insurance_domain_budget_remaining_total != 0`, engine
             // `retire_terminal_unbudgeted_insurance_delta`), and every unit is minted by a
-            // budget-crediting top-up (tag 9 on asset 0). So while a unit holder still has value
+            // budget-crediting top-up (tag 9 on asset 0) or by the genesis that the unit hook
+            // re-runs on budget credited while no unit exists (`ins_units_genesis_due`). So while
+            // a unit holder still has value
             // in the fund the close waits; holders exit through terminal tag 41 (units burned)
             // first. If units remain after the budget is spent to 0 (losses), they are worth 0
             // and nothing of theirs is retired. Pinned by `ws2_close_slab_refuses_21_while_a_
@@ -39526,7 +39548,9 @@ pub mod processor {
     /// frames: the record is 176 bytes). No-op (`Ok(false)`) on a market that is not unitised;
     /// on a units market the ledger account is REQUIRED (116). `reading` is the caller's terminal
     /// capacity for `INS_OP_TERMINAL_BURN` and ignored otherwise (mint: the ENTRY reading, burn:
-    /// the EXIT reading, both computed here). Writes the ledger; `ins_units_post_op` snapshots.
+    /// the EXIT reading, both computed here). With no units outstanding it first re-runs the
+    /// genesis when `ins_units_genesis_due` holds. Writes the ledger; `ins_units_post_op`
+    /// snapshots.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
     fn ins_units_pre_op(
@@ -39549,6 +39573,17 @@ pub mod processor {
         }
         let class = ins_unit_class_for(market_key, who);
         let (mint, free) = ins_units_readings_view(group, u.backstop_receivable_atoms)?;
+        // Insurance that exists while no unit does is creator class 1:1 (tag 116's genesis).
+        let x = if op == INS_OP_MINT { amount } else { 0 };
+        let live = group.header.mode == 0;
+        if crate::p4_rescue_ins::ins_units_genesis_due(u.units_total, mint, live, x) {
+            u.units_total = mint;
+            u.units_creator = mint;
+            solana_program::log::sol_log(&alloc::format!(
+                "p4_ins_units_genesis creator_units={}",
+                mint
+            ));
+        }
         match op {
             INS_OP_MINT => ins_units_apply_mint(&mut u, class, amount, mint)?,
             INS_OP_BURN => ins_units_apply_burn(&mut u, class, amount, free)?,
@@ -39803,7 +39838,9 @@ pub mod processor {
     ///
     /// * Ledger absent (Live only): create it; the asset-0 insurance that exists NOW becomes
     ///   creator-class units 1:1 (genesis), and the asset-0 profile gets `INS_UNITS_REQUIRED`.
-    ///   From then on every asset-0 insurance path requires the ledger (fail closed).
+    ///   From then on every asset-0 insurance path requires the ledger (fail closed), and the
+    ///   unit hooks repeat this genesis when the fund holds value with no unit outstanding
+    ///   (`ins_units_genesis_due`; W-1 applies while Live).
     /// * Ledger present (any mode): refresh the snapshot (`snap_*`, `snap_slot = now`). The stake
     ///   program CPIs this before it prices LP tokens or syncs its deployment.
     #[inline(never)]
@@ -39871,8 +39908,9 @@ pub mod processor {
                 return Err(PercolatorError::InsuranceBackstopRefused.into());
             }
             let (mint, _) = ins_units_readings_view(&group, 0)?;
-            // W-1: no dust genesis. Either an empty fund (the first top-up is then the genesis
-            // and must itself be >= the minimum) or at least `INS_UNITS_GENESIS_MIN_ATOMS`.
+            // W-1: no dust genesis. Either an empty fund (the genesis is then its first top-up of
+            // at least the minimum, or `ins_units_genesis_due` once value lands with no unit) or
+            // at least `INS_UNITS_GENESIS_MIN_ATOMS`.
             if mint != 0 && mint < crate::p4_rescue_ins::INS_UNITS_GENESIS_MIN_ATOMS {
                 return Err(PercolatorError::InsuranceBackstopRefused.into());
             }
