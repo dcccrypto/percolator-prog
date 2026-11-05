@@ -7302,7 +7302,6 @@ fn f2_regression_tag5_matched_close_on_a_latched_market_neither_deepens_nor_lift
     env.trade(&h, &lp, -POS).expect("holders can still reduce");
     env.assert_conserved("f2 latched + matched");
 }
-||||||| 1250a853
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
 // prog#660 (Nacodex audit of 6377376): regression tests for the two High findings. Each test
