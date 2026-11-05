@@ -12,10 +12,12 @@ name: Kani nightly (no-verdict harnesses)
 # 16 GB ubuntu-latest VM) and a wall limit below the job limit, so CBMC is killed first and the row
 # says OOM / TIMEOUT instead of the runner VM dying and taking the row with it (run 41183972352: all
 # 6 multi-harness tests shards died with "runner has received a shutdown signal", 0 rows).
-# Verdicts: one row per harness (scripts/kani-nightly-shard.sh). The summary job is RED on any
-# FAILED (counterexample), VACUOUS (SUCCESSFUL with an unsatisfied cover) or ERROR (build / name
-# rot / crash) verdict and on any MISSING row. TIMEOUT / OOM = still no verdict: reported
-# separately as warnings, never as a failure and never as a pass.
+# Verdicts: one row per harness (scripts/kani-nightly-shard.sh). GREEN MEANS PROVED: the summary
+# job is green only when every selected harness has exactly one SUCCESSFUL row. It is RED on any
+# FAILED (counterexample), VACUOUS (SUCCESSFUL with an unsatisfied cover), ERROR (build / name rot /
+# crash), TIMEOUT or OOM (no verdict = not proved; Khubair, 5 Nov 2026) row and on any MISSING row.
+# Each harness job is also red unless its own row is SUCCESSFUL, so a job's colour is its verdict
+# (run 41931143835: 74 green jobs held 6 SUCCESSFUL, 51 TIMEOUT and 17 OOM rows).
 #
 # NOTE: GitHub fires `schedule` only from the DEFAULT branch (main), and a schedule run checks out
 # main's tree. Under the v2.2 no-main rule this file is not on main, so the `schedule` below never
@@ -29,8 +31,8 @@ on:
   workflow_dispatch:
     inputs:
       harness_timeout:
-        description: "kani --harness-timeout per harness of the 85-list groups (e.g. 70m). Watchdog = this + 10 min; the plan refuses > 314m (job limit 350)."
-        default: "70m"
+        description: "kani --harness-timeout per harness of the 85-list groups (e.g. 180m). Watchdog = this + 10 min; the plan refuses > 314m (job limit 350)."
+        default: "180m"
       long_timeout:
         description: "kani --harness-timeout for the LONG groups bonds571 / growth-occ. Watchdog = this + 10 min; the plan refuses > 324m."
         default: "315m"
@@ -41,8 +43,11 @@ on:
         description: "memory cap per harness (cgroup memory.max, swap 0), below the runner's 16 GB RAM"
         default: "13G"
       max_parallel:
-        description: "harness jobs running at once (leave runner slots for PR CI)"
-        default: "8"
+        description: "harness jobs running at once (leave runner slots for PR CI: a public repo on a personal account gets 20 concurrent jobs)"
+        default: "12"
+      runner:
+        description: "runs-on label for the harness jobs. Default = the 4 vCPU / 16 GB GitHub runner. A bigger runner must be provisioned first (larger runners need an org on Team/Enterprise, or a self-hosted machine); raise mem_cap with it (~3 GB below its RAM)."
+        default: "ubuntu-latest"
       groups:
         description: "comma list of groups to run (lib,tests,contlev,p3,p3-engine,growth,bonds571,growth-occ) or 'all'"
         default: "all"
@@ -67,6 +72,7 @@ jobs:
       solver: ${{ steps.plan.outputs.solver }}
       memcap: ${{ steps.plan.outputs.memcap }}
       maxpar: ${{ steps.plan.outputs.maxpar }}
+      runner: ${{ steps.plan.outputs.runner }}
       expected: ${{ steps.plan.outputs.expected }}
     steps:
       - uses: actions/checkout@v4
@@ -77,20 +83,22 @@ jobs:
       - name: check the list against the tree, build the per-harness matrix
         id: plan
         env:
-          IN_TIMEOUT: ${{ github.event.inputs.harness_timeout || '70m' }}
+          IN_TIMEOUT: ${{ github.event.inputs.harness_timeout || '180m' }}
           IN_LONG: ${{ github.event.inputs.long_timeout || '315m' }}
           IN_MEMCAP: ${{ github.event.inputs.mem_cap || '13G' }}
-          IN_MAXPAR: ${{ github.event.inputs.max_parallel || '8' }}
+          IN_MAXPAR: ${{ github.event.inputs.max_parallel || '12' }}
+          IN_RUNNER: ${{ github.event.inputs.runner || 'ubuntu-latest' }}
           IN_GROUPS: ${{ github.event.inputs.groups || 'all' }}
           IN_SOLVER: ${{ github.event.inputs.solver || '' }}
         run: |
           python3 scripts/kani-nightly-plan.py --groups "$IN_GROUPS" --timeout "$IN_TIMEOUT" \
-            --long-timeout "$IN_LONG" --memcap "$IN_MEMCAP" --maxpar "$IN_MAXPAR" --solver "$IN_SOLVER"
+            --long-timeout "$IN_LONG" --memcap "$IN_MEMCAP" --maxpar "$IN_MAXPAR" --solver "$IN_SOLVER" \
+            --runner "$IN_RUNNER"
 
   shard:
     name: "kani ${{ matrix.group }} ${{ matrix.harness }}"
     needs: plan
-    runs-on: ubuntu-latest
+    runs-on: ${{ needs.plan.outputs.runner }}   # validated label (scripts/kani-nightly-plan.py)
     timeout-minutes: 350   # GitHub-hosted job limit is 360; the plan keeps build + watchdog below it
     strategy:
       fail-fast: false
@@ -155,9 +163,18 @@ jobs:
           path: ${{ runner.temp }}/kn
           if-no-files-found: warn
           retention-days: 30
+      # After the upload, so the row is kept either way: this job's colour is its verdict.
+      - name: red unless SUCCESSFUL
+        env:
+          ROWS: ${{ runner.temp }}/kn/verdicts.tsv
+        run: |
+          v=$(cut -f2 "$ROWS" 2>/dev/null | head -1)
+          [ "$(wc -l < "$ROWS" 2>/dev/null | tr -d ' ')" = 1 ] || { echo "::error::expected exactly one verdict row"; exit 1; }
+          [ "$v" = SUCCESSFUL ] || { echo "::error title=Kani $v::$(cut -f1 "$ROWS") is not proved ($v)"; exit 1; }
+          echo "SUCCESSFUL"
 
   summary:
-    name: verdicts (red on FAILED / VACUOUS / ERROR / missing row)
+    name: verdicts (green only if every harness is SUCCESSFUL)
     needs: [plan, shard]
     if: always() && needs.plan.result == 'success'
     runs-on: ubuntu-latest
