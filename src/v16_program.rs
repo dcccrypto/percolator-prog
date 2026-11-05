@@ -30417,6 +30417,7 @@ pub mod processor {
         observation_hints: &[CrankObservationHint],
         max_market_slots: usize,
         s10_refresh_budget: bool,
+        vault_lp_counterparty_ai: Option<&AccountInfo<'a>>,
     ) -> Result<Option<CrankStepReport>, ProgramError> {
         // ADOPT upstream Group-B subsystem #2 (AutoCrankObservation). Full rewrite: the caller
         // no longer picks the action/asset -- it supplies a bounded set of raw-evidence hints and
@@ -30468,6 +30469,9 @@ pub mod processor {
         // v2.2 fill events: (asset, asset generation, signed change of the effective position,
         // price) of a liquidation this crank performed. Emitted at the very end.
         let mut liq_event: Option<(u16, u64, i128, u64)> = None;
+        // bigtest finding 2: the vault LP's position vector before this step, taken only when an
+        // LP counterparty was supplied (the matched close changes it; nothing else here does).
+        let lp_counterparty_before = vault_lp_counterparty_ai.and_then(snapshot_position_vector);
         let f1_report;
         let cfg_after;
         {
@@ -30892,15 +30896,53 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
-            let result = match group.permissionless_auto_crank_s10_not_atomic(
-                &mut portfolio,
-                AutoCrankWorkV16 {
-                    now_slot: authenticated_now_slot,
-                    observations: observations.as_slice(),
-                    resolved_close_fee_rate_per_slot: 0,
-                },
-                s10_grant,
-            ) {
+            // bigtest-2026-11-05 finding 2: a liquidation is matched against the market's bound
+            // vault LP (engine `permissionless_auto_crank_s10_with_counterparty_not_atomic`)
+            // instead of closed unilaterally through quantity ADL, which would latch the asset
+            // reduce-only (upstream #134 gate) until a side is flat. The counterparty is IDENTIFIED
+            // BY THE MARKET, never by the caller: it is used only when it is the registered vault
+            // LP portfolio of the bound asset, is not the cranked portfolio, and the account is
+            // liquidatable now. The engine further restricts it to that asset, to a clean
+            // (non-bankrupt, unlocked) close and to an LP that can take the whole close; anything
+            // else is the unchanged unilateral close.
+            let lp_counterparty = match (vault_lp_counterparty_ai, market_bound_vault_asset(&group)?) {
+                (Some(cp_ai), Some(bound_asset))
+                    if summary.liquidatable
+                        && !summary.b_stale
+                        && cp_ai.key != portfolio_ai.key
+                        && read_asset_vault_lp_from_view(&group, bound_asset)?.vault_lp_portfolio
+                            == cp_ai.key.to_bytes() =>
+                {
+                    Some((cp_ai, bound_asset))
+                }
+                _ => None,
+            };
+            let crank_work = AutoCrankWorkV16 {
+                now_slot: authenticated_now_slot,
+                observations: observations.as_slice(),
+                resolved_close_fee_rate_per_slot: 0,
+            };
+            let engine_result = match lp_counterparty {
+                Some((cp_ai, bound_asset)) => {
+                    let mut cp_data = cp_ai.try_borrow_mut_data()?;
+                    let mut cp_view =
+                        state::portfolio_view_mut_for_market_slots(&mut cp_data, max_market_slots)?;
+                    expect_portfolio_view_account_key(&cp_view, cp_ai.key)?;
+                    group.permissionless_auto_crank_s10_with_counterparty_not_atomic(
+                        &mut portfolio,
+                        &mut cp_view,
+                        bound_asset,
+                        crank_work,
+                        s10_grant,
+                    )
+                }
+                None => group.permissionless_auto_crank_s10_not_atomic(
+                    &mut portfolio,
+                    crank_work,
+                    s10_grant,
+                ),
+            };
+            let result = match engine_result {
                 Ok(result) if matches!(result.selected, AutoCrankPlanV16::NoAction) => {
                     if market_accrual_performed {
                         None
@@ -31098,12 +31140,28 @@ pub mod processor {
         // progress). Refresh the skew-funding snapshot whenever the cranked portfolio IS a bound
         // vault LP, so skew funding never runs on inventory the LP no longer holds.
         vault_lp_refresh_snapshot(market_ai, portfolio_ai, max_market_slots)?;
+        // bigtest finding 2: a matched liquidation moved the vault LP's position without a fill.
+        // Same follow-ups as a band forced close against the LP: the skew-funding snapshot, and
+        // the matcher capability of a NON-position-synced matcher (port135; the canonical
+        // matcher reads the LP's engine position every call and is not invalidated). The epoch is
+        // not advanced, as for those forced closes.
+        let mut matched_counterparty = [0u8; 32];
+        if let (Some(cp_ai), Some(before)) = (vault_lp_counterparty_ai, lp_counterparty_before) {
+            if snapshot_position_vector(cp_ai).as_ref() != Some(&before) {
+                vault_lp_refresh_snapshot(market_ai, cp_ai, max_market_slots)?;
+                state::invalidate_unsynchronized_matcher_capability(
+                    &mut cp_ai.try_borrow_mut_data()?,
+                )?;
+                matched_counterparty = cp_ai.key.to_bytes();
+            }
+        }
         if let Some((asset, asset_gen, delta_q, price)) = liq_event {
             fill_events_v22::emit_reduce(
                 fill_events_v22::TAG_CRANK,
                 &market_ai.key.to_bytes(),
                 &portfolio_ai.key.to_bytes(),
-                &[0u8; 32],
+                // all zero for the unilateral (quantity-ADL) close, the vault LP when matched
+                &matched_counterparty,
                 asset,
                 asset_gen,
                 fill_events_v22::REASON_LIQUIDATION,
@@ -31430,6 +31488,11 @@ pub mod processor {
         // handler below exactly as it did before this port, and hits the
         // `ResolvedClose` outcome guard there.
         let tail = accounts.get(3..).unwrap_or(&[]);
+        // bigtest finding 2: an OPTIONAL trailing account, the market's bound vault-LP portfolio,
+        // is split off first (identified by key against the market's registry, so it cannot be
+        // confused with an oracle account or the cranker reward portfolio before it).
+        let (tail, vault_lp_counterparty_ai) =
+            split_vault_lp_counterparty(program_id, market_ai, portfolio_ai, tail)?;
         let report = handle_permissionless_crank_zero_copy(
             program_id,
             owner,
@@ -31440,6 +31503,7 @@ pub mod processor {
             observation_hints.as_slice(),
             max_market_slots,
             true,
+            vault_lp_counterparty_ai,
         )?;
         // v2.2 F1: a refresh that left the account below maintenance continues into ONE
         // liquidation step in this instruction. The step is the same public crank run once more
@@ -31470,6 +31534,8 @@ pub mod processor {
                     &[],
                     max_market_slots,
                     true,
+                    // the follow-on is the liquidation step: it is the one that matches
+                    vault_lp_counterparty_ai,
                 )?;
             }
         }
@@ -31480,6 +31546,48 @@ pub mod processor {
         // every trader refresh / liquidation, so a growth bookkeeping error must never revert it.
         growth_ratchet_touch_best_effort(program_id, market_ai, portfolio_ai);
         Ok(())
+    }
+
+    /// bigtest-2026-11-05 finding 2: split the optional vault-LP counterparty off the END of the
+    /// tag-5 tail. The last account is taken only when its key is the market's bound vault-LP
+    /// portfolio (the `AssetVaultLpV18` registry record of the bound asset); it must then be
+    /// writable. When the cranked portfolio IS that vault LP the account is still stripped but no
+    /// counterparty is returned, so a keeper may append the vault LP to every crank of the market
+    /// (before this change that tail was refused: a non-empty oracle tail, or a cranker portfolio
+    /// equal to the target). Any other last account is left in the tail exactly as before (oracle
+    /// accounts, then the optional cranker portfolio), so existing clients are unaffected.
+    #[inline(never)]
+    fn split_vault_lp_counterparty<'a, 'b>(
+        program_id: &Pubkey,
+        market_ai: &AccountInfo<'a>,
+        portfolio_ai: &AccountInfo<'a>,
+        tail: &'b [AccountInfo<'a>],
+    ) -> Result<(&'b [AccountInfo<'a>], Option<&'b AccountInfo<'a>>), ProgramError> {
+        let Some((last, rest)) = tail.split_last() else {
+            return Ok((tail, None));
+        };
+        if last.owner != program_id {
+            return Ok((tail, None));
+        }
+        let is_bound_lp = {
+            let mut market_data = market_ai.try_borrow_mut_data()?;
+            let (_cfg, group) = state::market_view_mut(&mut market_data)?;
+            match market_bound_vault_asset(&group)? {
+                Some(i) => {
+                    read_asset_vault_lp_from_view(&group, i)?.vault_lp_portfolio
+                        == last.key.to_bytes()
+                }
+                None => false,
+            }
+        };
+        if !is_bound_lp {
+            return Ok((tail, None));
+        }
+        expect_writable(last)?;
+        if last.key == portfolio_ai.key {
+            return Ok((rest, None));
+        }
+        Ok((rest, Some(last)))
     }
 
     /// v2.2 F1: what one unified crank step did, for the tag-5 follow-on decision.
@@ -32636,6 +32744,7 @@ pub mod processor {
                     &hint,
                     max_market_slots,
                     false, // S10: a redemption's inline refreshes carry no move budget
+                    None,  // bigtest finding 2: the prelude refreshes only
                 ) {
                     // v2.2 F1: the tag-77 prelude refreshes only; no follow-on liquidation here.
                     Ok(_) => bump_position_epoch_if_reshaped(portfolio_ai, positions_before)?,
