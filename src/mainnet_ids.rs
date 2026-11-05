@@ -222,7 +222,7 @@ mod tests {
         assert_eq!(crate::constants::NFT_PROGRAM_ID, MAINNET_NFT_PROGRAM_ID);
         assert!(crate::constants::is_pinned_nft_program(&MAINNET_NFT_PROGRAM_ID_BYTES));
         assert!(!crate::constants::is_pinned_nft_program(
-            &solana_program::pubkey!("27LWmR72Ru1NCkbN2xgxB7BgYcTUrU7qeEJoV3D8sZh1").to_bytes()
+            &solana_program::pubkey!("DWUNq2iYh6Sdgdv3qv7aWJNJGhoK25FqyQrqDUrDD9zs").to_bytes()
         ), "the devnet NFT program must never be trusted by a mainnet-flavour build");
     }
 
