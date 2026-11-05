@@ -897,3 +897,50 @@ fn indep_p3_h1_senior_exit_needs_no_marketauth_or_trader_cooperation() {
     );
     assert!(w.tok(&d) > 0);
 }
+
+/// #664: on a BOUND (P3) vault, a tag 79 pause by marketauth does not stop a senior from
+/// starting an exit, and the #569 150-slot bound cooldown still holds.
+#[test]
+fn indep_p3_paused_bound_vault_senior_exit_keeps_bound_cooldown() {
+    let s1 = Keypair::new();
+    let (mut w, atas) = P3::bound(&[(&s1, 10_000_000)], 3_000_000, 1_000);
+    let admin = w.env.admin.insecure_clone();
+    let (m, r) = (w.env.market, w.registry);
+    w.send(
+        ProgInstruction::SetLpVaultPaused { paused: 1 },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new_readonly(m, false), AccountMeta::new(r, false)],
+        &[&admin],
+    )
+    .expect("79(1) by marketauth on a bound vault");
+    let shares = w.tok(&atas[0]) as u128;
+    let r = w.request_redeem(&s1, atas[0], shares);
+    assert!(r.is_ok(), "#664: 76 refused on a paused bound vault: {r:?}");
+    let req_slot = w.slot();
+    // 77 one slot before request + 150: refused by the bound cooldown (no auto-wait here).
+    w.env.svm.warp_to_slot(req_slot + BOUND_COOLDOWN - 1);
+    let red = state::derive_lp_redemption(&w.env.program_id, &w.registry, &s1.pubkey()).0;
+    let dest0 = w.token(s1.pubkey(), 0);
+    let payer = w.env.payer.pubkey();
+    let metas = vec![
+        AccountMeta::new(payer, true),
+        AccountMeta::new(w.env.market, false),
+        AccountMeta::new(w.registry, false),
+        AccountMeta::new(red, false),
+        AccountMeta::new(w.lp_mint, false),
+        AccountMeta::new(w.escrow, false),
+        AccountMeta::new(w.env.vault, false),
+        AccountMeta::new_readonly(w.env.vault_authority, false),
+        AccountMeta::new(w.ledger0, false),
+        AccountMeta::new(dest0, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+        AccountMeta::new(w.ledger1, false),
+        AccountMeta::new(s1.pubkey(), false),
+        AccountMeta::new(w.state_pda, false),
+        AccountMeta::new(w.lp, false),
+    ];
+    let early = w.send(ProgInstruction::ExecuteRedemption { domain: 0 }, metas, &[]);
+    assert_eq!(early.as_ref().err().and_then(|e| code(e)), Some(36), "bound 77 at +149 must be LpVaultCooldownActive: {early:?}");
+    let (d, r77) = w.execute_redeem(&s1, true); // waits to request + 150
+    assert!(r77.is_ok(), "bound 77 after the cooldown: {r77:?}");
+    assert!(w.tok(&d) > 0, "senior paid");
+}

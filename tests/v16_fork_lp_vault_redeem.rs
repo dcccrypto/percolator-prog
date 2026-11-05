@@ -3541,3 +3541,295 @@ fn earn_exit_event_carries_the_principal_earnings_split() {
     // B: 2,000,000 shares -> principal 2,000,000 + earnings 133,333 = 2,133,333.
     assert_eq!(exit(&mut env, &d_b, 2_000_000), (2_000_000, 133_333, 2_000_000));
 }
+
+// ════════════════════════════════════════════════════════════════════════════
+// #664 — the tag 79 pause must never gate a holder's exit.
+//
+// `handle_request_redeem_lp_shares` used to refuse with LpVaultPaused while
+// `registry.paused != 0`. The pause is marketauth-only, has no expiry, and survives a
+// tag 32 rotation to a key that is then discarded, so a holder who had not yet queued
+// tag 76 could be frozen for good. The pause stays a brake on new Earn money (75, 112) and on pot
+// moves (91); 76, 77 and 81 ignore it.
+// ════════════════════════════════════════════════════════════════════════════
+
+/// The `Custom(N)` code of a failed send, if any.
+fn custom_code(r: &Result<(), String>) -> Option<u32> {
+    let e = r.as_ref().err()?;
+    let s = e.find("Custom(")? + 7;
+    e[s..s + e[s..].find(')')?].parse().ok()
+}
+
+/// Tag 79 signed by `signer`.
+fn set_lp_vault_paused(env: &mut Env, signer: &Keypair, paused: u8) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accts = vec![
+        AccountMeta::new(signer.pubkey(), true),
+        AccountMeta::new_readonly(env.market, false),
+        AccountMeta::new(env.registry, false),
+    ];
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::SetLpVaultPaused { paused }, accts)], &[signer])
+}
+
+/// marketauth pauses the vault.
+fn pause_vault(env: &mut Env) {
+    let admin = env.admin.insecure_clone();
+    set_lp_vault_paused(env, &admin, 1).expect("79(1) by marketauth");
+    assert_eq!(reg(env).paused, 1);
+}
+
+/// Tag 32: rotate marketauth `current` -> `new` (both sign; live asset-0 authority_epoch).
+fn rotate_marketauth(env: &mut Env, current: &Keypair, new: &Keypair) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let authority_epoch = state::read_asset_control_sequences(&env.svm.get_account(&env.market).unwrap().data, 0)
+        .unwrap()
+        .authority_epoch;
+    let accts = vec![
+        AccountMeta::new(current.pubkey(), true),
+        AccountMeta::new(new.pubkey(), true),
+        AccountMeta::new(env.market, false),
+    ];
+    env.svm.expire_blockhash();
+    send(
+        &mut env.svm,
+        pid,
+        &payer,
+        vec![(ProgInstruction::UpdateAuthority { new_pubkey: new.pubkey().to_bytes(), authority_epoch }, accts)],
+        &[current, new],
+    )
+}
+
+/// Tag 81 by the redeemer, then the LiteSVM 0-lamport purge the repo already uses
+/// (tests/v22_lp_share_mint.rs:519-524) so the same wallet can request again, as on chain.
+fn cancel_and_purge(env: &mut Env, d: &Depositor) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accts = vec![
+        AccountMeta::new(d.kp.pubkey(), true),
+        AccountMeta::new_readonly(env.registry, false),
+        AccountMeta::new(d.redemption, false),
+        AccountMeta::new_readonly(env.lp_mint, false),
+        AccountMeta::new(d.lp_ata, false),
+        AccountMeta::new(env.escrow, false),
+        AccountMeta::new_readonly(spl_token::ID, false),
+    ];
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::CancelRedemption, accts)], &[&d.kp])?;
+    let r = env.svm.get_account(&d.redemption).expect("request PDA");
+    assert_eq!(r.lamports, 0, "consumed request PDA must hold no lamports");
+    env.svm.set_account(d.redemption, Account::default()).unwrap();
+    Ok(())
+}
+
+/// Tag 75 by a fresh wallet (the inflow the pause still brakes).
+fn try_fresh_deposit(env: &mut Env) -> Result<(), String> {
+    let kp = Keypair::new();
+    env.svm.airdrop(&kp.pubkey(), 100_000_000_000).unwrap();
+    let source = Pubkey::new_unique();
+    set_token(&mut env.svm, source, env.collateral_mint, kp.pubkey(), 10_000_000);
+    let lp_ata = Pubkey::new_unique();
+    set_token(&mut env.svm, lp_ata, env.lp_mint, kp.pubkey(), 0);
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accts = deposit_accounts(env, lp_ata, source, kp.pubkey());
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount: DEPOSIT, domain: DOMAIN }, accts)], &[&kp])
+}
+
+/// Tag 77 sent by a third party (the payer): the redeemer's account 12 is passed but does NOT sign.
+fn execute_as_stranger(env: &mut Env, d: &Depositor) -> Result<(), String> {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let mut accts = execute_accounts(env, d);
+    accts[12] = AccountMeta::new(d.kp.pubkey(), false);
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::ExecuteRedemption { domain: DOMAIN }, accts)], &[])
+}
+
+/// A second tag 75 by an existing depositor, into `domain`.
+fn deposit_more(env: &mut Env, d: &Depositor, amount: u128, domain: u16) {
+    let pid = env.program_id;
+    let payer = env.payer.insecure_clone();
+    let accts = deposit_accounts(env, d.lp_ata, d.source, d.kp.pubkey());
+    env.svm.expire_blockhash();
+    send(&mut env.svm, pid, &payer, vec![(ProgInstruction::DepositToLpVault { amount, domain }, accts)], &[&d.kp])
+        .expect("second deposit");
+}
+
+/// #664: marketauth pauses; a holder who had NOT queued still starts and finishes an exit,
+/// paid exactly what an unpaused twin is paid; the pause still refuses 75.
+#[test]
+fn paused_vault_still_accepts_exit_request_and_pays() {
+    let twin_paid = {
+        let mut t = setup_vault(0);
+        let d = new_depositor(&mut t, DEPOSIT);
+        request(&mut t, &d, MINTED).expect("twin 76");
+        t.svm.expire_blockhash();
+        execute(&mut t, &d).expect("twin 77");
+        tok(&t.svm, d.dest)
+    };
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    pause_vault(&mut env);
+    assert_eq!(custom_code(&try_fresh_deposit(&mut env)), Some(32), "75 must stay refused while paused");
+    env.svm.expire_blockhash();
+    let r = request(&mut env, &d, MINTED);
+    assert!(r.is_ok(), "#664: 76 refused on a paused vault: {r:?}");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("77 while paused");
+    assert_eq!(tok(&env.svm, d.dest), twin_paid, "paused exit pays the unpaused amount");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+    assert_eq!(reg(&env).paused, 1, "exiting does not clear the pause");
+}
+
+/// #664: pause, rotate marketauth (tag 32) to a key that is then dropped. Nobody can
+/// unpause, and the exit is still open.
+#[test]
+fn pause_then_rotate_to_discarded_key_exit_still_open() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    pause_vault(&mut env);
+    let admin = env.admin.insecure_clone();
+    {
+        let burner = Keypair::new();
+        env.svm.airdrop(&burner.pubkey(), 1_000_000_000).unwrap();
+        rotate_marketauth(&mut env, &admin, &burner).expect("32 to a burner");
+    } // burner dropped
+    assert_eq!(custom_code(&set_lp_vault_paused(&mut env, &admin, 0)), Some(8), "old marketauth cannot unpause");
+    let holder = d.kp.insecure_clone();
+    assert_eq!(custom_code(&set_lp_vault_paused(&mut env, &holder, 0)), Some(8), "holder cannot unpause");
+    env.svm.warp_to_slot(100_000);
+    env.svm.expire_blockhash();
+    let r = request(&mut env, &d, MINTED);
+    assert!(r.is_ok(), "#664: 76 refused after pause + rotation to a discarded key: {r:?}");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("77 after rotation");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+    assert_eq!(reg(&env).paused, 1, "still paused for good");
+    assert_eq!(custom_code(&try_fresh_deposit(&mut env)), Some(32), "inflows stay closed");
+}
+
+/// #664: a paused vault on a Resolved market still lets a holder exit.
+#[test]
+fn paused_vault_on_resolved_market_exit_open() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    pause_vault(&mut env);
+    env.svm.expire_blockhash();
+    resolve_market(&mut env).expect("resolve");
+    env.svm.expire_blockhash();
+    let r = request(&mut env, &d, MINTED);
+    assert!(r.is_ok(), "#664: 76 refused on a paused vault of a resolved market: {r:?}");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("resolved 77");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+}
+
+/// #664: cancelling (tag 81) while paused is not a one-way door.
+#[test]
+fn cancel_while_paused_can_request_again() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    request(&mut env, &d, MINTED).expect("pre-pause 76");
+    pause_vault(&mut env);
+    cancel_and_purge(&mut env, &d).expect("81 while paused");
+    assert_eq!(tok(&env.svm, d.lp_ata), MINTED as u64, "shares back");
+    env.svm.expire_blockhash();
+    let r = request(&mut env, &d, MINTED);
+    assert!(r.is_ok(), "#664: re-76 after 81 refused while paused: {r:?}");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("77");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+}
+
+/// #664 control (#440 timing): the pause does not let an exit skip the vault's cooldown.
+#[test]
+fn paused_exit_still_waits_the_cooldown() {
+    const CD: u64 = 150;
+    let mut env = setup_vault(CD);
+    let d = new_depositor(&mut env, DEPOSIT);
+    pause_vault(&mut env);
+    env.svm.expire_blockhash();
+    let r = request(&mut env, &d, MINTED);
+    assert!(r.is_ok(), "#664: 76 refused on a paused vault: {r:?}");
+    let req_slot = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+    env.svm.expire_blockhash();
+    assert_eq!(custom_code(&execute(&mut env, &d)), Some(36), "77 before the cooldown -> LpVaultCooldownActive");
+    env.svm.warp_to_slot(req_slot + CD - 1);
+    env.svm.expire_blockhash();
+    assert_eq!(custom_code(&execute(&mut env, &d)), Some(36), "77 one slot early -> 36");
+    env.svm.warp_to_slot(req_slot + CD);
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("77 at request + cooldown");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+}
+
+/// #664 control (kept brake): while paused, 75 and 91 are refused with LpVaultPaused;
+/// unpausing lets both through.
+#[test]
+fn pause_still_refuses_deposit_and_rebalance() {
+    let mut env = setup_vault(0);
+    let _d = new_depositor(&mut env, DEPOSIT);
+    let admin = env.admin.insecure_clone();
+    set_lp_vault_paused(&mut env, &admin, 1).expect("pause");
+    assert_eq!(custom_code(&try_fresh_deposit(&mut env)), Some(32), "75 paused");
+    env.svm.expire_blockhash();
+    assert_eq!(custom_code(&try_rebalance_backing(&mut env, DOMAIN, DOMAIN ^ 1, 1)), Some(32), "91 paused");
+    set_lp_vault_paused(&mut env, &admin, 0).expect("unpause");
+    try_fresh_deposit(&mut env).expect("75 after unpause");
+    env.svm.expire_blockhash();
+    try_rebalance_backing(&mut env, DOMAIN, DOMAIN ^ 1, 1).expect("91 after unpause");
+}
+
+/// #664 control (scope): a request queued before the pause executes while paused, and on a
+/// Live non-bound vault nobody but the holder can execute it (H-1(b), ExpectedSigner = 6).
+#[test]
+fn request_queued_before_pause_still_executes() {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    request(&mut env, &d, MINTED).expect("pre-pause 76");
+    let admin = env.admin.insecure_clone();
+    set_lp_vault_paused(&mut env, &admin, 1).expect("pause");
+    assert_eq!(custom_code(&execute_as_stranger(&mut env, &d)), Some(6), "stranger 77 on a Live non-bound request");
+    assert_eq!(tok(&env.svm, d.dest), 0);
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("queued 77 while paused");
+    assert_eq!(tok(&env.svm, d.dest), MINTED as u64);
+}
+
+/// #664 control (#419 shape): one holder's claim is larger than either pot. While paused,
+/// 91 is refused both ways, and 77 still pays the full claim (its own sibling top-up), so
+/// keeping 91 under the pause cannot strand an exit.
+fn paused_cross_pot_exit_needs_no_rebalance(resolve: bool) {
+    let mut env = setup_vault(0);
+    let d = new_depositor(&mut env, DEPOSIT);
+    deposit_more(&mut env, &d, DEPOSIT, DOMAIN ^ 1);
+    let shares = tok(&env.svm, d.lp_ata) as u128;
+    let owed = shares * (2 * DEPOSIT) / lp_shares_outstanding(&env);
+    assert!(owed > DEPOSIT, "claim must exceed each pot");
+    request(&mut env, &d, shares).expect("76");
+    pause_vault(&mut env);
+    if resolve {
+        env.svm.expire_blockhash();
+        resolve_market(&mut env).expect("resolve");
+    }
+    env.svm.expire_blockhash();
+    assert_eq!(custom_code(&try_rebalance_backing(&mut env, DOMAIN ^ 1, DOMAIN, 1)), Some(32), "91 sib->own paused");
+    env.svm.expire_blockhash();
+    assert_eq!(custom_code(&try_rebalance_backing(&mut env, DOMAIN, DOMAIN ^ 1, 1)), Some(32), "91 own->sib paused");
+    env.svm.expire_blockhash();
+    execute(&mut env, &d).expect("77 must pay a both-pot claim with 91 refused");
+    assert_eq!(tok(&env.svm, d.dest) as u128, owed);
+}
+
+#[test]
+fn paused_cross_pot_exit_needs_no_rebalance_live() {
+    paused_cross_pot_exit_needs_no_rebalance(false);
+}
+
+#[test]
+fn paused_cross_pot_exit_needs_no_rebalance_resolved() {
+    paused_cross_pot_exit_needs_no_rebalance(true);
+}

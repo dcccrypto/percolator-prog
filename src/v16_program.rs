@@ -32386,6 +32386,12 @@ pub mod processor {
     /// Step 1 of the two-step redemption. Escrows the redeemer's LP shares
     /// and records a redemption request. `total_lp_shares_outstanding` is
     /// UNCHANGED here — shares are escrowed, not burned (I2 invariant).
+    ///
+    /// Not gated by `registry.paused` (tag 79, #664). This is the only way to START an
+    /// LP exit, and it moves no value (the price is set at tag 77). The pause has no expiry
+    /// and marketauth can rotate itself (tag 32) to a key that is then discarded, so a gate
+    /// here would be an unbounded, possibly permanent freeze of every holder who had not yet
+    /// queued.
     #[inline(never)]
     fn handle_request_redeem_lp_shares<'a>(
         program_id: &Pubkey,
@@ -32420,9 +32426,6 @@ pub mod processor {
         }
 
         let registry = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-        if registry.paused != 0 {
-            return Err(PercolatorError::LpVaultPaused.into());
-        }
         let market_key = Pubkey::new_from_array(registry.market_group);
         let (registry_pda, _) = state::derive_lp_vault_registry(program_id, &market_key);
         expect_key(registry_ai, &registry_pda)?;
@@ -35353,8 +35356,11 @@ pub mod processor {
 
     /// LP Vault — SetLpVaultPaused (tag 79).
     ///
-    /// marketauth-gated. Paused vaults reject DepositToLpVault and
-    /// RequestRedeemLpShares (ExecuteRedemption + CloseLpVault still allowed).
+    /// marketauth-gated brake on new Earn money and rebalancing. A paused vault refuses
+    /// DepositToLpVault (75) and RebalanceLpVaultBacking (91) with LpVaultPaused, and
+    /// RescueDeposit (112) with RescueRefused. It never gates a holder's exit:
+    /// RequestRedeemLpShares (76), ExecuteRedemption (77) and CancelRedemption (81)
+    /// ignore it (#664). CloseLpVault (80) is not gated either.
     #[inline(never)]
     fn handle_set_lp_vault_paused<'a>(
         program_id: &Pubkey,
