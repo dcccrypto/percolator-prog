@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Kani nightly plan: check ci/kani-nightly-harnesses.tsv against the tree and build the per-harness matrix.
 
-usage: scripts/kani-nightly-plan.py --groups all --timeout 70m --long-timeout 315m --memcap 13G \
-           --maxpar 8 [--solver z3] [--root .] [--out $GITHUB_OUTPUT]
+usage: scripts/kani-nightly-plan.py --groups all --timeout 180m --long-timeout 315m --memcap 13G \
+           --maxpar 12 [--runner ubuntu-latest] [--solver z3] [--root .] [--out $GITHUB_OUTPUT]
 
 Groups (crate + flags: scripts/kani-nightly-shard.sh):
   lib, tests, contlev, p3, p3-engine, growth  the 85 no-verdict harnesses of the 10-30/31 triage, --timeout
@@ -170,16 +170,20 @@ def main():
     ap.add_argument('--root', default='.')
     ap.add_argument('--list', default='ci/kani-nightly-harnesses.tsv')
     ap.add_argument('--groups', default='all')
-    ap.add_argument('--timeout', default='70m')
+    ap.add_argument('--timeout', default='180m')
     ap.add_argument('--long-timeout', default='315m')
     ap.add_argument('--memcap', default='13G')
-    ap.add_argument('--maxpar', default='8')
+    ap.add_argument('--maxpar', default='12')
+    # runs-on label of the harness jobs (default the 4 vCPU / 16 GB GitHub runner). A bigger runner
+    # only exists once one is provisioned (larger runners need an org on Team/Enterprise, or a
+    # self-hosted machine); raise --memcap with it (keep it ~3 GB below the machine's RAM).
+    ap.add_argument('--runner', default='ubuntu-latest')
     ap.add_argument('--solver', default='')
     ap.add_argument('--out', default=os.environ.get('GITHUB_OUTPUT', '/dev/stdout'))
     a = ap.parse_args()
     for name, val, rx in (('harness_timeout', a.timeout, r'[0-9]+[smh]'), ('long_timeout', a.long_timeout, r'[0-9]+[smh]'),
                           ('mem_cap', a.memcap, r'[0-9]+[MG]'), ('max_parallel', a.maxpar, r'[1-9][0-9]?'),
-                          ('groups', a.groups, r'[a-z0-9,-]+')):
+                          ('groups', a.groups, r'[a-z0-9,-]+'), ('runner', a.runner, r'[A-Za-z0-9][A-Za-z0-9._-]{0,99}')):
         if not re.fullmatch(rx, val):
             die(f'bad {name} {val!r}')
     if a.solver not in SOLVERS:
@@ -254,7 +258,7 @@ def main():
     per = {}
     for e in inc:
         per.setdefault(e['group'], []).append(e)
-    print(f'{len(rows)} TSV rows -> {len(expanded)} harnesses; {len(inc)} selected = {len(inc)} jobs, {a.maxpar} at a time, '
+    print(f'{len(rows)} TSV rows -> {len(expanded)} harnesses; {len(inc)} selected = {len(inc)} jobs, {a.maxpar} at a time on {a.runner}, '
           f'mem cap {a.memcap}, solver {a.solver or "per harness attribute"}')
     for g, es in per.items():
         t, wd = budget[g]
@@ -264,7 +268,7 @@ def main():
     with open(a.out, 'a') as f:
         f.write('matrix=' + json.dumps({'include': inc}) + '\n')
         f.write('expected=' + json.dumps(expected) + '\n')
-        f.write(f'memcap={a.memcap}\nmaxpar={a.maxpar}\nsolver={a.solver}\n')
+        f.write(f'memcap={a.memcap}\nmaxpar={a.maxpar}\nsolver={a.solver}\nrunner={a.runner}\n')
 
 
 if __name__ == '__main__':

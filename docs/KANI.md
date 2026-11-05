@@ -66,10 +66,14 @@ array-equality lowering. The pin logic is covered natively by `cargo test --lib 
 `.github/workflows/kani-nightly.yml` runs exactly the harnesses in `ci/kani-nightly-harnesses.tsv`
 (the 85 no-verdict harnesses of the run above, names taken from the raw logs), **one GitHub job per
 harness** (the plan job builds the matrix: 85 entries, under GitHub's 256 limit; `max_parallel`
-default 8), each with a longer `--harness-timeout` (default 70m; watchdog = timeout + 10 min; the plan
+default 12), each with a longer `--harness-timeout` (default 180m, was 70m until 5 Nov 2026; watchdog = timeout + 10 min; the plan
 refuses a timeout whose build + watchdog would not fit the 350 min job limit) and a **memory cap**
 (`mem_cap`, default 13G, applied as a cgroup-v2 `memory.max` with swap 0 via passwordless sudo;
-`ulimit -v` fallback) below the 16 GB of the ubuntu-latest VM.
+`ulimit -v` fallback) below the 16 GB of the ubuntu-latest VM. Harness jobs run on the `runner` input
+(default `ubuntu-latest`, 4 vCPU / 16 GB, ~14.3 GB free at start). No bigger runner is available today:
+the repo belongs to a personal account, GitHub's larger runners need an organisation on Team/Enterprise,
+and there is no self-hosted runner. Once one exists, pass its label as `runner` and raise `mem_cap`
+(about 3 GB below its RAM). The OOM rows (all the `kani_v16_*` wire-decode harnesses at 13G) need that.
 
 Why: in run 41183972352 (groups=tests, 4 harnesses per shard, 1 at a time) all 6 shards died with
 "The runner has received a shutdown signal", exit 143, after 43 min to 5 h 7 min, and lost every row
@@ -81,9 +85,9 @@ row; with the cap, CBMC is OOM-killed inside its cgroup before the VM is, and th
 log also gets a memory sample every 2 min and the row records the cgroup's peak MiB).
 
 Verdicts (`scripts/kani-nightly-lib.sh`, `classify`):
-- TIMEOUT (no verdict, a warning): only when the log says "CBMC timed out", or the watchdog fired
+- TIMEOUT (no verdict, RED): only when the log says "CBMC timed out", or the watchdog fired
   (rc 124/137 AND elapsed >= watchdog limit).
-- OOM (no verdict, a warning): the memory cap was hit and kani did not exit 0 (cgroup
+- OOM (no verdict, RED): the memory cap was hit and kani did not exit 0 (cgroup
   `memory.events` oom_kill > 0, or an allocation failure in the log under the `ulimit -v` fallback).
   oom_kill > 0 with exit 0 is ERROR (a process was killed, the success is not trusted).
 - ERROR (red): any other kill (SIGKILL 137 / SIGTERM 143 without OOM evidence) before the watchdog
@@ -95,10 +99,12 @@ Per-harness artifacts are named `kani-shard-<group>-<index>`; the summary job do
 (never an earlier `kani-nightly-verdicts`), then `scripts/kani-nightly-summary.sh` goes RED unless
 there is exactly one verdict row per selected harness (names from the TSV for the selected groups:
 missing, duplicate or unselected rows are red), and on any FAILED, VACUOUS or ERROR row, or any
-harness job that did not succeed. A missing row (job died) is red. TIMEOUT and OOM rows are listed
-separately as warnings, never as failures and
-never as passes. A green run therefore means "nothing failed", not "everything proved": read the
-SUCCESSFUL count.
+TIMEOUT or OOM row (no verdict = not proved), or harness jobs that were cancelled / skipped, or that
+failed with every row SUCCESSFUL (unexplained). A missing row (job died) is red. Each harness job is
+itself red unless its row is SUCCESSFUL (step "red unless SUCCESSFUL", after the artifact upload), so
+the job colour is the verdict. **A green run means every selected harness was proved.** Until 5 Nov
+2026 TIMEOUT/OOM were warnings: run 41931143835 had 74 green jobs holding 6 SUCCESSFUL, 51 TIMEOUT and
+17 OOM rows (Khubair approved making them red, 5 Nov).
 
 ### LONG groups: harnesses that time out locally (Khubair R5, 2026-11-02)
 
@@ -129,8 +135,9 @@ growth-occ harnesses `occ_c_exact`, `occ_domain_shape`, `occ_g_full_width` for z
 
 ### Reading the result
 
-- **A green run does not mean proved.** TIMEOUT and OOM are warnings, so a run where every harness
-  times out is green with 0 SUCCESSFUL. Read the SUCCESSFUL count in SUMMARY.md, not the colour.
+- **Green means proved; red needs reading.** Red is expected while harnesses still time out or run
+  out of memory: SUMMARY.md lists the rows by verdict, and only FAILED / VACUOUS mean a bug or a weak
+  proof. TIMEOUT / OOM mean "no verdict yet" (raise the limit, split the harness, or use a bigger runner).
 - **`kani_growth_occ_g_full_width` is conditional on `kani_growth_c_mul_div_ceil`.** It uses
   `#[kani::stub_verified(mul_div_ceil_u128)]`, and `c_mul_div_ceil` is that contract's only harness.
   That harness itself timed out locally, and the summary does not link the two: a SUCCESSFUL on

@@ -45,13 +45,15 @@ chk "$(run success)" 1 "summary missing row c (shard result success) -> red"; gr
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; row kani-shard-tests-1 c ERROR
 chk "$(run success)" 1 "summary ERROR row -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b TIMEOUT; row kani-shard-tests-1 c SUCCESSFUL
-chk "$(run success)" 0 "summary TIMEOUT row -> green with warning"; grep -q '::warning title=Kani TIMEOUT (no verdict)::b' $T/judge.log; chk $? 0 "  warning emitted for b"
+chk "$(run success)" 1 "summary TIMEOUT row -> RED (no verdict is not a pass)"; grep -q '::error title=Kani TIMEOUT (no verdict, not proved)::b' $T/judge.log; chk $? 0 "  error names b"
+chk "$(run failure)" 1 "summary TIMEOUT row + its red harness job -> red"; grep -q 'unexplained' $T/judge.log; chk $? 1 "  job failure explained by the TIMEOUT row (no 'unexplained')"
+chk "$(run cancelled)" 1 "summary cancelled shard jobs -> red"; grep -q 'did not finish (cancelled)' $T/judge.log; chk $? 0 "  says cancelled"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; row kani-shard-tests-1 c SUCCESSFUL; row kani-shard-tests-1 c SUCCESSFUL
 chk "$(run success)" 1 "summary duplicate row -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; row kani-shard-tests-1 c SUCCESSFUL; row kani-shard-tests-1 z SUCCESSFUL
 chk "$(run success)" 1 "summary row for unselected name -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; row kani-shard-tests-1 c SUCCESSFUL
-chk "$(run failure)" 1 "summary shard result failure -> red"
+chk "$(run failure)" 1 "summary shard result failure with all rows SUCCESSFUL -> red"; grep -q 'unexplained' $T/judge.log; chk $? 0 "  says unexplained"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b FAILED; row kani-shard-tests-1 c VACUOUS
 chk "$(run success)" 1 "summary FAILED+VACUOUS -> red"
 mk; : > $T/exp; chk "$(run success)" 1 "summary empty selection -> red"
@@ -59,13 +61,13 @@ mk; : > $T/exp; chk "$(run success)" 1 "summary empty selection -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; : > $L; classify $L 137 900 4800; row kani-shard-tests-1 c "$v"
 chk "$(run success)" 1 "e2e unexplained kill (137, no oom_kill) -> ERROR row -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; : > $L; classify $L 1 900 4800 1; row kani-shard-tests-1 c "$v"
-chk "$(run success)" 0 "e2e capped OOM -> OOM row -> green+warning"; grep -q '::warning title=Kani OOM (no verdict)::c' $T/judge.log; chk $? 0 "  OOM warning emitted for c"
+chk "$(run success)" 1 "e2e capped OOM -> OOM row -> RED"; grep -q '::error title=Kani OOM (no verdict, not proved)::c' $T/judge.log; chk $? 0 "  OOM error names c"
 grep -q '^- OOM: 1$' $T/out/SUMMARY.md; chk $? 0 "  OOM counted in SUMMARY.md"
 mk; chk "$(run failure)" 1 "summary 0 rows, all jobs died (run 41183972352) -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b OOM; printf 'c\tOOMKILLED\t1\t-\t-\n' >> $T/sh/kani-shard-tests-1/verdicts.tsv
 chk "$(run success)" 1 "summary unknown verdict label -> red"
 mk; row kani-shard-tests-0 a SUCCESSFUL; row kani-shard-tests-0 b SUCCESSFUL; printf 'CBMC timed out.\n' > $L; classify $L 1 4210 4800; row kani-shard-tests-1 c "$v"
-chk "$(run success)" 0 "e2e CBMC-timeout harness -> TIMEOUT row -> green+warning"
+chk "$(run success)" 1 "e2e CBMC-timeout harness -> TIMEOUT row -> RED"
 # --- plan (scripts/kani-nightly-plan.py) on a fake tree: globs, long groups, z3, budget ---
 P="$R/scripts/kani-nightly-plan.py"; F=$T/tree
 mkdir -p $F/ci $F/kani/growth/src $F/kani/bonds571/src $F/src
@@ -88,7 +90,7 @@ plan() { rm -f $T/po; python3 "$P" --root $F --out $T/po "$@" > $T/plan.log 2>&1
 mx() { python3 -c 'import json,sys; m=json.loads([l[7:] for l in open(sys.argv[1]) if l.startswith("matrix=")][0]); print(" ".join(":".join(str(v) for v in (e["group"], e["harness"], e["timeout"], int(e["z3"]))) for e in m["include"]))' $T/po; }
 tsv 'lib\tkani_lib_a' 'growth\tproofs::kani_growth_x' 'bonds571\tproofs::kani_571_a' 'growth-occ\tproofs::kani_growth_occ_*'
 chk "$(plan --groups all)" 0 "plan fake tree, all groups"
-chk "$(mx)" "lib:kani_lib_a:70m:0 growth:proofs::kani_growth_x:70m:0 bonds571:proofs::kani_571_a:315m:0 growth-occ:proofs::kani_growth_occ_a:315m:1 growth-occ:proofs::kani_growth_occ_b:315m:0" \
+chk "$(mx)" "lib:kani_lib_a:180m:0 growth:proofs::kani_growth_x:180m:0 bonds571:proofs::kani_571_a:315m:0 growth-occ:proofs::kani_growth_occ_a:315m:1 growth-occ:proofs::kani_growth_occ_b:315m:0" \
   "  glob -> proof fns only (helper skipped), long groups 315m, z3 from the attribute"
 chk "$(plan --groups growth-occ --solver z3)" 0 "plan --solver z3"; chk "$(mx)" "growth-occ:proofs::kani_growth_occ_a:315m:1 growth-occ:proofs::kani_growth_occ_b:315m:1" "  override -> z3 for every harness"
 chk "$(plan --groups bonds571 --long-timeout 324m)" 0 "plan long 324m fits (15 + 334 + 1 = 350)"
@@ -96,6 +98,10 @@ chk "$(plan --groups bonds571 --long-timeout 325m)" 1 "plan long 325m refused"
 chk "$(plan --groups lib --timeout 314m)" 0 "plan normal 314m fits (25 + 324 + 1)"
 chk "$(plan --groups lib --timeout 315m)" 1 "plan normal 315m refused"
 chk "$(plan --groups lib --solver yices)" 1 "plan bad solver refused"
+chk "$(plan --groups lib --runner ubuntu-latest-16-cores)" 0 "plan runner label accepted"; grep -q '^runner=ubuntu-latest-16-cores$' $T/po; chk $? 0 "  runner written to the outputs"
+chk "$(plan --groups lib)" 0 "plan default runner"; grep -q '^runner=ubuntu-latest$' $T/po; chk $? 0 "  default ubuntu-latest"
+chk "$(plan --groups lib --runner 'a b')" 1 "plan runner label with a space refused"
+chk "$(plan --groups lib --runner '${{x}}')" 1 "plan runner label with an expression refused"
 chk "$(plan --groups nope)" 1 "plan unknown group refused"
 # a glob matching nothing is RED even when an exact row keeps the group non-empty (v652 B1)
 tsv 'lib\tkani_lib_a' 'growth-occ\tproofs::kani_growth_x' 'growth-occ\tproofs::kani_growth_zzz_*'
@@ -158,7 +164,8 @@ cp $T/proofs.keep $PS
 chk "$(plan --root "$R" --groups bonds571 --out $T/po)" 0 "plan real tree bonds571"
 chk "$(mx | wc -w | tr -d ' ')" 6 "  6 bonds571 jobs"; chk "$(mx | tr ' ' '\n' | cut -d: -f5 | sort -u | tr '\n' ' ')" "315m " "  all at 315m"
 chk "$(plan --root "$R" --groups all --out $T/po)" 0 "plan real tree all groups"
-chk "$(mx | tr ' ' '\n' | grep -c '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:')" 84 "  the 85 no-verdict harnesses: 84 at 70m (kani_growth_c_mul_div_ceil moved to growth-occ)"
+chk "$(mx | tr ' ' '\n' | grep -c '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:')" 84 "  the 85 no-verdict harnesses: 84 at 180m (kani_growth_c_mul_div_ceil moved to growth-occ)"
+chk "$(mx | tr ' ' '\n' | grep '^lib:\|^tests:\|^growth:\|^p3:\|^contlev:\|^p3-engine:' | awk -F: '{print $(NF-1)}' | sort -u | tr '\n' ' ')" "180m " "  all 84 at the 180m default"
 chk "$(mx | tr " " "\n" | grep -c "^growth-occ:proofs::kani_growth_c_mul_div_ceil:315m:")" 1 "  kani_growth_c_mul_div_ceil in growth-occ at 315m"
 # --- the per-harness script end to end, with a fake `cargo` (needs coreutils timeout; Linux CI) ---
 SH="$R/scripts/kani-nightly-shard.sh"
