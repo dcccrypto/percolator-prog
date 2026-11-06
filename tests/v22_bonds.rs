@@ -170,6 +170,8 @@ struct Params {
     /// v2.2 W-L1 tests: `Some(d)` => the growth market is a BAND market (InitMarketV22, band
     /// `d` bps, no rent): clamp-enforced, so λ_eff applies.
     band: Option<u16>,
+    /// #571 follow-up: the market's `public_b_chunk_atoms` (default: never splits a bankrupt residual).
+    b_chunk: u128,
 }
 
 impl Default for Params {
@@ -184,6 +186,7 @@ impl Default for Params {
             funding: 0,
             growth: None,
             band: None,
+            b_chunk: percolator::MAX_VAULT_TVL,
         }
     }
 }
@@ -336,7 +339,7 @@ impl Env {
                 max_account_b_settlement_chunks: 1,
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 100,
-                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                public_b_chunk_atoms: p.b_chunk,
                 maintenance_fee_per_slot: p.maint_fee,
             };
         let init = match (p.growth, p.band) {
@@ -511,7 +514,7 @@ impl Env {
                 max_account_b_settlement_chunks: 1,
                 max_bankrupt_close_chunks: 1,
                 max_bankrupt_close_lifetime_slots: 100,
-                public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+                public_b_chunk_atoms: p.b_chunk,
                 maintenance_fee_per_slot: p.maint_fee,
             };
         let init = match (p.growth, p.band) {
@@ -4812,4 +4815,501 @@ fn bond_coupon_gate_and_108_see_a_pending_push_like_crank_first() {
     assert_eq!(coupon_c, 0, "control: impaired at the worse price, no coupon");
     err_has(&r108_w, PercolatorError::BondTrancheImpaired);
     assert_eq!(coupon_w, 0, "78 before the crank paid a coupon of {coupon_w} into an impaired tranche");
+}
+
+// ═══ #571 follow-up (#678): a resolve no longer forfeits the Live coupon since the last settlement ═══
+//
+// Neither resolve handler (tag 19 ResolveMarket, tag 39 ResolveStalePermissionless) carries the
+// tranche, and every post-resolve settlement (110 Resolved, terminal 78) settles with the gate
+// closed. Before the fix the Live stretch between the last settlement and the resolve was dropped
+// from `K` (the checkpoint moved anyway), the 110 Resolved exit was paid the stale `K` and the
+// junior's 102 Resolved allowance (physical - C - K) took the difference. Now the FIRST Resolved
+// settlement first settles `[last_coupon_slot, resolved_slot]` exactly as a settlement at the
+// resolve would have (base rate, cap, carried remainder, the F2 interval rule), once; 102 reserves
+// it on a copy until then. Nothing accrues after `resolved_slot`.
+// NEGATIVE CONTROL (244d63d1 .so): the economics tests below fail on the coupon / allowance
+// assertion; the two CONTROL tests pass on both.
+
+struct Gh571f {
+    env: Env,
+    lp: Lp,
+    d: Depositor,
+    hs: Vec<BondHolder>,
+    /// the tranche as of the resolve (no settlement since the bond deposits)
+    t_rs: state::BondTrancheV20,
+    rs: u64,
+    /// the coupon over `[last_coupon_slot, resolved_slot]`, from the production pure function
+    x: u128,
+    jd: Pubkey,
+}
+
+/// #571 follow-up (#678): bonds 2,000 USDC at 20% (+ a second holder's `h2_usdc` in the same
+/// slot), a 2,000,000-slot quiet Live stretch with no settlement, every holder's 109, then the
+/// resolve: tag 19 by the market authority (= the junior), or tag 39 by anyone after the keeper
+/// stops (`stale`). Then 101, the LP's close (terminal-flat) and the cooldown.
+fn gh571f_world(stale: bool, h2_usdc: u64) -> Gh571f {
+    let (mut env, lp, d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+    let admin = env.admin.insecure_clone();
+    let mut hs = vec![h];
+    if h2_usdc > 0 {
+        let h2 = env.new_bond_holder();
+        env.bond_deposit(&h2, lp.portfolio, h2_usdc * U, 1).expect("second holder, same slot");
+        hs.push(h2);
+    }
+    env.slot += 2_000_000; // ~9 days, no fee legs: no 78 settles the coupon
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    for h in hs.iter() {
+        let sh = env.bond_pos(h).shares;
+        env.bond_request(h, sh).expect("109");
+    }
+    let t_pre = env.tranche();
+    if stale {
+        let data = env.svm.get_account(&env.market).unwrap().data;
+        let seq = state::read_asset_control_sequences(&data, 0).unwrap().permissionless_resolve + 1;
+        let frontier = state::read_asset_generation_frontier(&data).unwrap();
+        let m = env.market;
+        env.send(
+            ProgInstruction::ConfigurePermissionlessResolve {
+                asset_generation_frontier: frontier,
+                stale_slots: 9_000,
+                force_close_delay_slots: 9_000,
+                policy_sequence: seq,
+            },
+            vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+            &[&admin],
+        )
+        .expect("configure permissionless resolve");
+        // the keeper stops; after stale_slots anyone resolves
+        env.slot += 9_000;
+        env.svm.warp_to_slot(env.slot);
+        env.svm.expire_blockhash();
+        let now = env.slot;
+        env.send(ProgInstruction::ResolveStalePermissionless { now_slot: now }, vec![AccountMeta::new(m, false)], &[])
+            .expect("tag 39 permissionless stale resolve");
+        assert_eq!(env.market_state().1.resolved_slot, now);
+        // tag 101 is owner-only during force_close_delay_slots; a stranger settles after it
+        env.slot += 9_000;
+        env.svm.warp_to_slot(env.slot);
+    } else {
+        let now = env.slot;
+        env.resolve(); // tag 19, signed by the market authority = the junior owner
+        assert_eq!(env.market_state().1.resolved_slot, now);
+    }
+    let rs = env.market_state().1.resolved_slot;
+    let t_rs = env.tranche();
+    assert!(t_rs == t_pre, "the resolve does not touch the tranche");
+    let rate = bond_v20::bond_coupon_rate_bps(t_rs.coupon_bps_per_year, t_rs.coupon_util_bonus_bps, 0);
+    let (x, _) = settle_expect(&t_rs, rs, rate, true);
+    assert_eq!(x, bond_v20::coupon_due(t_rs.c_b_atoms, 2_000, rs - t_rs.last_coupon_slot).unwrap(), "no carry, no cap");
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, jd).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    env.slot += COOLDOWN as u64 + 10;
+    env.svm.warp_to_slot(env.slot);
+    eprintln!(
+        "GH571F stale={stale} h2={h2_usdc}: last={} resolved_slot={rs} gap={} K={} x={x}",
+        t_rs.last_coupon_slot,
+        rs - t_rs.last_coupon_slot,
+        t_rs.c_b_atoms
+    );
+    Gh571f { env, lp, d, hs, t_rs, rs, x, jd }
+}
+
+impl Gh571f {
+    /// The junior's 102 Resolved sweep at its EXACT allowance `physical - C - K` (K as stored now);
+    /// one atom more is refused. Returns the amount swept.
+    fn junior_sweep(&mut self) -> u128 {
+        let admin = self.env.admin.insecure_clone();
+        let t = Some(self.env.tranche_key());
+        let c = self.env.vlp().senior_claim_atoms;
+        let k = self.env.tranche().c_b_atoms;
+        let junior = self.env.paid_in - self.env.paid_out - c - k;
+        err_has(
+            &self.env.release_surplus_resolved_bond(&admin, self.lp.portfolio, junior + 1, self.jd, t),
+            PercolatorError::VaultLpReleaseRefused,
+        );
+        let before = self.env.tok(self.jd);
+        self.env
+            .release_surplus_resolved_bond(&admin, self.lp.portfolio, junior, self.jd, t)
+            .expect("102 Resolved junior sweep");
+        assert_eq!((self.env.tok(self.jd) - before) as u128, junior);
+        self.env.paid_out += junior;
+        junior
+    }
+
+    /// The senior exits and SPL conservation holds.
+    fn finish(&mut self, what: &str) {
+        let shares = self.env.lp_shares(&self.d);
+        self.env.earn_request(&self.d, shares);
+        self.env.earn_execute(&self.d, Some(self.lp.portfolio)).expect("senior exit");
+        self.env.assert_conserved(what);
+    }
+}
+
+/// 110 first, then 102: the holder is paid principal + the Live stretch's coupon, and the junior
+/// keeps its capital less exactly that coupon.
+fn gh571f_exit_then_sweep(stale: bool, x_want: u128) {
+    let mut w = gh571f_world(stale, 0);
+    let k0 = w.t_rs.c_b_atoms;
+    let paid = w.env.bond_execute(&w.hs[0], w.lp.portfolio, 0).expect("110 Resolved") as u128;
+    eprintln!("GH571F stale={stale}: 110 paid {paid}; K {k0} + x {} = {}", w.x, k0 + w.x);
+    assert_eq!(paid, k0 + w.x, "the Resolved exit pays principal + the Live stretch's coupon");
+    assert_eq!(w.x, x_want, "20% on 2,000 USDC over the Live stretch");
+    let (k, b, last, r) = tranche_raw(&w.env);
+    assert_eq!((k, b), (0, 0), "the only holder fully exited");
+    assert_eq!(r, w.t_rs.coupon_arrears_atoms + w.x, "the catch-up books x in R (no fee leg pays after the resolve)");
+    assert!(last > w.rs, "the checkpoint moved past resolved_slot");
+    let junior = w.junior_sweep();
+    assert_eq!(junior, 3_000 * U as u128 - w.x, "the junior keeps its capital less the coupon it fronted");
+    w.finish("gh571 follow-up exit then sweep");
+}
+
+/// #571 follow-up (#678): tag 19 resolve, then 110, then 102.
+/// NEGATIVE CONTROL (244d63d1 .so): the holder is paid principal only.
+#[test]
+fn gh571_followup_tag19_resolve_settles_the_live_stretch() {
+    gh571f_exit_then_sweep(false, 10_147_138);
+}
+
+/// #571 follow-up (#678): tag 39 permissionless stale resolve; the stretch runs to the tag 39
+/// slot, the 9,000-slot stale window included.
+/// NEGATIVE CONTROL (244d63d1 .so): the holder is paid principal only.
+#[test]
+fn gh571_followup_tag39_stale_resolve_settles_the_live_stretch_incl_stale_window() {
+    gh571f_exit_then_sweep(true, 10_192_800);
+}
+
+/// #571 follow-up (#678): 102 BEFORE any post-resolve settlement reserves the stretch: the
+/// allowance `physical - C - K` (K as stored) is refused, `- x` pays exactly, and the 110 after
+/// it pays `K + x`.
+/// NEGATIVE CONTROL (244d63d1 .so): `physical - C - K` is admitted.
+#[test]
+fn gh571_followup_102_first_reserves_it() {
+    let mut w = gh571f_world(false, 0);
+    let admin = w.env.admin.insecure_clone();
+    let t = Some(w.env.tranche_key());
+    let k0 = w.t_rs.c_b_atoms;
+    let c = w.env.vlp().senior_claim_atoms;
+    let old = w.env.paid_in - w.env.paid_out - c - k0;
+    assert_eq!(old, 3_000 * U as u128, "vacuity: physical - C - K is the junior's whole capital");
+    err_has(
+        &w.env.release_surplus_resolved_bond(&admin, w.lp.portfolio, old, w.jd, t),
+        PercolatorError::VaultLpReleaseRefused,
+    );
+    let exact = old - w.x;
+    err_has(
+        &w.env.release_surplus_resolved_bond(&admin, w.lp.portfolio, exact + 1, w.jd, t),
+        PercolatorError::VaultLpReleaseRefused,
+    );
+    let before = w.env.tok(w.jd);
+    w.env.release_surplus_resolved_bond(&admin, w.lp.portfolio, exact, w.jd, t).expect("102 first, exact");
+    assert_eq!((w.env.tok(w.jd) - before) as u128, exact);
+    w.env.paid_out += exact;
+    assert!(w.env.tranche() == w.t_rs, "102 never writes the tranche");
+    let paid = w.env.bond_execute(&w.hs[0], w.lp.portfolio, 0).expect("110 Resolved after 102") as u128;
+    assert_eq!(paid, k0 + w.x, "the reserve is exactly what 110 settles");
+    assert_eq!(w.env.paid_in - w.env.paid_out, c, "only the seniors' claim is left");
+    w.finish("gh571 follow-up 102 first");
+}
+
+/// #571 follow-up (#678): a terminal 78 first settles the stretch into K and R (nothing is paid
+/// after the resolve), once: a second terminal 78 500k slots later changes nothing. 110 and 102
+/// are then exact.
+/// NEGATIVE CONTROL (244d63d1 .so): the terminal 78 leaves K at principal.
+#[test]
+fn gh571_followup_terminal78_first_then_idempotent() {
+    let mut w = gh571f_world(false, 0);
+    let (k0, r0) = (w.t_rs.c_b_atoms, w.t_rs.coupon_arrears_atoms);
+    w.env.crank_fees_bond(w.lp.portfolio).expect("terminal 78");
+    let t1 = w.env.tranche();
+    eprintln!(
+        "GH571F terminal 78: K {k0} -> {} R {r0} -> {} last {} (rs {})",
+        t1.c_b_atoms, t1.coupon_arrears_atoms, t1.last_coupon_slot, w.rs
+    );
+    assert_eq!(t1.c_b_atoms, k0 + w.x, "terminal 78 settles the Live stretch into K");
+    assert_eq!(t1.coupon_arrears_atoms, r0 + w.x, "and into R (no payment after the resolve)");
+    assert!(t1.last_coupon_slot >= w.rs);
+    w.env.slot += 500_000;
+    w.env.svm.warp_to_slot(w.env.slot);
+    w.env.crank_fees_bond(w.lp.portfolio).expect("second terminal 78");
+    let t2 = w.env.tranche();
+    assert_eq!(
+        (t2.c_b_atoms, t2.coupon_arrears_atoms),
+        (t1.c_b_atoms, t1.coupon_arrears_atoms),
+        "idempotent: nothing accrues after resolved_slot"
+    );
+    let paid = w.env.bond_execute(&w.hs[0], w.lp.portfolio, 0).expect("110 Resolved") as u128;
+    assert_eq!(paid, k0 + w.x);
+    assert_eq!(w.junior_sweep(), 3_000 * U as u128 - w.x);
+    w.finish("gh571 follow-up terminal 78 first");
+}
+
+/// #571 follow-up (#678): two holders, both in before the quiet stretch. A's 110 runs the
+/// catch-up; B's 110 (500k slots later) finds nothing left to settle: B is paid exactly the claim
+/// A left behind, R is unchanged by it, and together they are paid `K + x`.
+/// NEGATIVE CONTROL (244d63d1 .so): A is paid its slice of the stale K.
+#[test]
+fn gh571_followup_two_110s() {
+    let mut w = gh571f_world(false, 1_000);
+    let (k0, b0) = (w.t_rs.c_b_atoms, w.t_rs.b_shares_total);
+    let sh_a = w.env.bond_pos(&w.hs[0]).shares;
+    let a = w.env.bond_execute(&w.hs[0], w.lp.portfolio, 0).expect("110 A") as u128;
+    assert_eq!(a, sh_a * (k0 + w.x) / b0, "A is paid its slice of K + x");
+    let (k_a, _, _, r_a) = tranche_raw(&w.env);
+    assert_eq!(r_a, w.t_rs.coupon_arrears_atoms + w.x);
+    w.env.slot += 500_000;
+    w.env.svm.warp_to_slot(w.env.slot);
+    let b = w.env.bond_execute(&w.hs[1], w.lp.portfolio, 0).expect("110 B") as u128;
+    let (k_b, b_b, _, r_b) = tranche_raw(&w.env);
+    eprintln!("GH571F two 110s: A {a} B {b} total {} want K {k0} + x {}", a + b, w.x);
+    assert_eq!(b, k_a, "B is paid exactly the claim A left: no post-resolve accrual");
+    assert_eq!(r_b, r_a, "the second 110 does not settle again");
+    assert_eq!((k_b, b_b), (0, 0));
+    assert!((a + b).abs_diff(k0 + w.x) <= 2, "together: K + x");
+    w.junior_sweep();
+    w.finish("gh571 follow-up two 110s");
+}
+
+/// #571 follow-up (#678) CONTROL: the gate was CLOSED at the last Live settlement (a real senior
+/// draw booked by 78, world (1) of `gh571_no_accrual_while_drawn_or_impaired_and_settled_arrears_are_kept`),
+/// so the stretch to the resolve is forfeited by F2, as a Live settlement would forfeit it: the
+/// terminal 78 after the resolve leaves K and R unchanged. Passes before and after the fix.
+#[test]
+fn gh571_followup_closed_at_last_settlement_forfeits() {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
+    let t = env.new_trader(5_000 * U);
+    let t2 = env.new_trader(10_000 * U);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    dust_trade(&mut env, &t2, &lp);
+    env.crank_fees_bond(lp.portfolio).expect("78 dust");
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let px = env.market_state().1.assets[0].effective_price;
+    env.trade(&t, &lp, 1_000 * UQ).expect("trader long vs the vault LP");
+    env.move_price(px * 3, &[t.portfolio, lp.portfolio]);
+    env.trade(&t, &lp, -1_000 * UQ).expect("trader closes (vault LP realises)");
+    env.hold(12, &[t.portfolio, lp.portfolio]);
+    env.crank_fees_bond(lp.portfolio).expect("78 books the draw (gate closed)");
+    assert!(env.vlp().senior_draw_outstanding_atoms > 0, "vacuity: a senior draw is outstanding");
+    let (k3, _, last3, r3) = tranche_raw(&env);
+    assert_eq!(env.tranche().coupon_gate_seen >> 63, 1, "vacuity: the last settlement recorded the gate closed");
+    // a quiet gap, then the resolve
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[t.portfolio, lp.portfolio]);
+    env.resolve();
+    let rs = env.market_state().1.resolved_slot;
+    let would = bond_v20::coupon_due(k3, 2_000, rs - last3).unwrap();
+    assert!(would > 1_000_000, "vacuity: an open stretch would be worth > 1 USDC ({would})");
+    for tr in [&t, &t2] {
+        env.trader_close_resolved(tr);
+        env.permissionless_close_portfolio(tr.portfolio, tr.kp.pubkey()).expect("trader portfolio closed");
+    }
+    let admin = env.admin.insecure_clone();
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, jd).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    env.slot += 10;
+    env.svm.warp_to_slot(env.slot);
+    env.crank_fees_bond(lp.portfolio).expect("terminal 78 (does not halt on a draw)");
+    let (k4, _, last4, r4) = tranche_raw(&env);
+    eprintln!("GH571F closed control: K {k3} -> {k4} R {r3} -> {r4} last {last3} -> {last4} (rs {rs}, an open stretch: {would})");
+    assert_eq!((k4, r4), (k3, r3), "F2: a stretch that started closed is forfeited, at the resolve too");
+    assert!(last4 >= rs);
+    env.assert_conserved("gh571 follow-up closed control");
+}
+
+/// #571 follow-up (#678) CONTROL: every share exits while Live, then a quiet gap and the
+/// resolve: an empty tranche accrues nothing (K stays 0), the receivable is untouched after the
+/// resolve, and the junior's allowance is `physical - C`. Passes before and after the fix.
+#[test]
+fn gh571_followup_empty_tranche_resolve() {
+    let (mut env, lp, d, h) = bond_world(Params::default(), 10_000, 3_000, 2_000, 2_000);
+    let sh = env.bond_pos(&h).shares;
+    env.bond_request(&h, sh).expect("109");
+    env.wait_cooldown(&[lp.portfolio]);
+    env.bond_execute(&h, lp.portfolio, 0).expect("110 Live: the only holder leaves");
+    let (k1, b1, _, r1) = tranche_raw(&env);
+    assert_eq!((k1, b1), (0, 0), "vacuity: the tranche is empty");
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    env.resolve();
+    let rs = env.market_state().1.resolved_slot;
+    let admin = env.admin.insecure_clone();
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, jd).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    env.crank_fees_bond(lp.portfolio).expect("terminal 78");
+    let (k2, b2, last2, r2) = tranche_raw(&env);
+    assert_eq!((k2, b2, r2), (0, 0, r1), "an empty tranche accrues nothing and nothing pays R after the resolve");
+    assert!(last2 >= rs);
+    let t_rs = env.tranche();
+    let mut w = Gh571f { env, lp, d, hs: vec![], t_rs, rs, x: 0, jd };
+    let c = w.env.vlp().senior_claim_atoms;
+    let physical_less_c = w.env.paid_in - w.env.paid_out - c;
+    assert_eq!(w.junior_sweep(), physical_less_c, "the allowance is physical - C");
+    w.finish("gh571 follow-up empty tranche");
+}
+
+impl Env {
+    /// Tag 30 (CloseResolved) until the portfolio is flat; one bankrupt-residual chunk per call.
+    fn close_resolved_until_flat(&mut self, t: &Trader) {
+        let dest = self.token_account(self.mint, t.kp.pubkey(), 0);
+        let kp = t.kp.insecure_clone();
+        for _ in 0..8 {
+            self.svm.expire_blockhash();
+            let before = self.tok(dest);
+            let r = self.send(
+                ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+                vec![
+                    AccountMeta::new(t.kp.pubkey(), true),
+                    AccountMeta::new(self.market, false),
+                    AccountMeta::new(t.portfolio, false),
+                    AccountMeta::new(dest, false),
+                    AccountMeta::new(self.vault_token, false),
+                    AccountMeta::new_readonly(self.vault_authority, false),
+                    AccountMeta::new_readonly(spl_token::ID, false),
+                    AccountMeta::new_readonly(
+                        Pubkey::find_program_address(&[b"nft_registry", self.market.as_ref()], &self.pid).0,
+                        false,
+                    ),
+                ],
+                &[&kp],
+            );
+            r.expect("CloseResolved is permissionless progress");
+            self.paid_out += (self.tok(dest) - before) as u128;
+            let p = self.portfolio(t.portfolio);
+            if self.position(t.portfolio) == 0 && p.capital == 0 && p.pnl == 0 {
+                return;
+            }
+        }
+        panic!("the portfolio never went flat");
+    }
+}
+
+/// #571 follow-up (#678): the Recovery route. A bankrupt residual larger than the market's
+/// `public_b_chunk_atoms` declares Recovery (ActiveBankruptCloseCannotProgress); a later
+/// permissionless crank finalises it, and `resolved_slot` is that FINALIZE slot. The first
+/// Resolved settlement settles the stretch `[last_coupon_slot, resolved_slot]`, the Recovery
+/// period included: an over-accrual paid by the junior (the Recovery-entry slot is not stored).
+/// Measured here: of x = 507,412 atoms, 507,357 accrued during the 100,000-slot Recovery.
+/// NEGATIVE CONTROL (244d63d1 .so): the holder is paid principal only.
+#[test]
+fn gh571_followup_recovery_route_settles_to_the_finalize_slot() {
+    let p = Params { b_chunk: percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN, ..Params::default() };
+    let (mut env, lp, d, h) = bond_world(p, 10_000, 3_000, 2_000, 2_000);
+    let sh = env.bond_pos(&h).shares;
+    env.bond_request(&h, sh).expect("109 while Live");
+    env.hold(1, &[lp.portfolio]);
+    let t_rs = env.tranche();
+    // a 510 USDC trader, 500 units long against the vault LP; $10 -> $6 leaves a 1,490 USDC
+    // residual, above the 1,000 USDC chunk
+    let bust = env.new_trader(510 * U);
+    env.trade(&bust, &lp, 5_000 * UQ).expect("levered long vs the vault LP");
+    env.move_price(PRICE * 60 / 100, &[lp.portfolio]);
+    env.svm.expire_blockhash();
+    env.crank(bust.portfolio).expect("the bust's crank");
+    let g = env.market_state().1;
+    assert_eq!(format!("{:?}", g.mode), "Recovery", "vacuity: the residual exceeds the chunk");
+    let declared = env.slot;
+    // nobody cranks for 100,000 slots; then one permissionless crank finalises
+    env.slot += 100_000;
+    env.svm.warp_to_slot(env.slot);
+    env.svm.expire_blockhash();
+    env.crank(bust.portfolio).expect("finalise");
+    let g = env.market_state().1;
+    assert_eq!(format!("{:?}", g.mode), "Resolved");
+    let rs = g.resolved_slot;
+    assert_eq!(rs, env.slot, "resolved_slot is the finalize slot");
+    assert!(env.tranche() == t_rs, "nothing settled the tranche before the wind-down");
+    let x = bond_v20::coupon_due(t_rs.c_b_atoms, 2_000, rs - t_rs.last_coupon_slot).unwrap();
+    let x_live = bond_v20::coupon_due(t_rs.c_b_atoms, 2_000, declared - t_rs.last_coupon_slot).unwrap();
+    assert_eq!(x, 507_412, "20% on 2,000 USDC over 100,011 slots");
+    assert!(x_live < 100, "vacuity: almost all of x accrued inside Recovery ({x_live})");
+    // wind-down: the bust is closed chunk by chunk, the LP settles (101) and closes
+    env.close_resolved_until_flat(&bust);
+    env.permissionless_close_portfolio(bust.portfolio, bust.kp.pubkey()).expect("bust closed");
+    let admin = env.admin.insecure_clone();
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    for _ in 0..2 {
+        env.settle_resolved(&Keypair::new(), lp.portfolio, 0, jd).expect("101 settle");
+        env.slot += 1;
+        env.svm.warp_to_slot(env.slot);
+    }
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    env.slot += COOLDOWN as u64 + 10;
+    env.svm.warp_to_slot(env.slot);
+    env.crank_fees_bond(lp.portfolio).expect("terminal 78");
+    let t1 = env.tranche();
+    assert_eq!(t1.c_b_atoms, t_rs.c_b_atoms + x, "terminal 78 settles the stretch to the finalize slot");
+    let paid = env.bond_execute(&h, lp.portfolio, 0).expect("110 Resolved") as u128;
+    assert_eq!(paid, t_rs.c_b_atoms + x, "the holder is paid K + the stretch incl. Recovery");
+    let mut w = Gh571f { env, lp, d, hs: vec![h], t_rs, rs, x, jd };
+    w.junior_sweep();
+    w.finish("gh571 follow-up recovery route");
+}
+
+/// #571 follow-up (#678) CONTROL: the gate was OPEN at the last Live settlement; then the vault
+/// LP realised a loss larger than the junior and no Live 78 booked it before the resolve. The
+/// senior draw is booked after the resolve, so it counts as booked inside the stretch
+/// `[last_coupon_slot, resolved_slot]` and F2 forfeits the stretch (a Live draw forfeits its
+/// interval the same way): the terminal 78 leaves K and R unchanged. Passes before and after the
+/// fix.
+#[test]
+fn gh571_followup_senior_loss_at_resolve_forfeits() {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
+    let t = env.new_trader(5_000 * U);
+    let t2 = env.new_trader(10_000 * U);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    dust_trade(&mut env, &t2, &lp);
+    env.crank_fees_bond(lp.portfolio).expect("78 dust (gate open)");
+    let t_last = env.tranche();
+    let (k3, _, last3, r3) = tranche_raw(&env);
+    assert_eq!(t_last.coupon_gate_seen >> 63, 0, "vacuity: the last Live settlement recorded the gate open");
+    assert_eq!(env.vlp().senior_draw_outstanding_atoms, 0, "vacuity: no draw yet");
+    // a quiet gap, then the vault LP realises a loss above the junior's 500 USDC
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let px = env.market_state().1.assets[0].effective_price;
+    env.trade(&t, &lp, 1_000 * UQ).expect("trader long vs the vault LP");
+    env.move_price(px * 3, &[t.portfolio, lp.portfolio]);
+    env.trade(&t, &lp, -1_000 * UQ).expect("trader closes (vault LP realises)");
+    env.hold(12, &[t.portfolio, lp.portfolio]);
+    assert_eq!(env.vlp().senior_draw_outstanding_atoms, 0, "vacuity: no Live settlement booked the loss");
+    assert!(env.tranche() == t_last, "vacuity: no settlement since the gate-open 78");
+    env.resolve();
+    let rs = env.market_state().1.resolved_slot;
+    let would = bond_v20::coupon_due(k3, 2_000, rs - last3).unwrap();
+    assert!(would > 1_000_000, "vacuity: an open stretch would be worth > 1 USDC ({would})");
+    for tr in [&t, &t2] {
+        env.trader_close_resolved(tr);
+        env.permissionless_close_portfolio(tr.portfolio, tr.kp.pubkey()).expect("trader portfolio closed");
+    }
+    let admin = env.admin.insecure_clone();
+    let jd = env.token_account(env.mint, admin.pubkey(), 0);
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, jd).expect("101 settle");
+    let registry = env.registry;
+    env.permissionless_close_portfolio(lp.portfolio, registry).expect("terminal-flat");
+    env.slot += 10;
+    env.svm.warp_to_slot(env.slot);
+    env.crank_fees_bond(lp.portfolio).expect("terminal 78 (books the draw)");
+    let drawn = env.vlp().senior_draw_outstanding_atoms;
+    let (k4, _, last4, r4) = tranche_raw(&env);
+    eprintln!("GH571F senior loss at resolve: drawn {drawn} K {k3} -> {k4} R {r3} -> {r4} last {last3} -> {last4} (rs {rs}, an open stretch: {would})");
+    assert!(drawn > 0, "vacuity: the senior draw is booked after the resolve");
+    assert_eq!((k4, r4), (k3, r3), "F2: a senior loss booked at the resolution forfeits the stretch");
+    assert!(last4 >= rs);
+    env.assert_conserved("gh571 follow-up senior loss at resolve");
 }

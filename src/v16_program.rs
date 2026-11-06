@@ -5253,6 +5253,20 @@ pub mod state {
         Ok(market_header(data)?.config.band_bps.get())
     }
 
+    /// #571 follow-up (#678): the engine's `resolved_slot` (stamped once, by the resolve) while
+    /// the market is Resolved, else `None`. Header-only. Via tags 19 / 39 it is the slot the market
+    /// left Live. On the Recovery route it is the FINALIZE slot, so a bond stretch settled up to it
+    /// includes the Recovery period: an over-accrual paid by the junior (the Recovery-entry slot is
+    /// not stored), ended by any public crank and capped by the one-year clamp and the cap.
+    pub fn market_resolved_slot(data: &[u8]) -> Result<Option<u64>, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        let h = market_header(data)?;
+        if decode_market_mode(h.mode)? != MarketModeV16::Resolved {
+            return Ok(None);
+        }
+        Ok(Some(h.resolved_slot.get()))
+    }
+
     /// Lightweight read of the market-wide asset-generation frontier (`header.next_market_id`),
     /// for handlers that don't otherwise need a full `market_view_mut` (e.g.
     /// `ConfigurePermissionlessResolve`). Wave-2 TB-4 (adopts upstream `4c100ca6`).
@@ -7371,7 +7385,9 @@ pub mod state {
         pub bond_drawn_outstanding_atoms: u128, // 80..96
         /// Coupon accrual checkpoint: every slot up to it is SETTLED into `K` / `R` (gate open;
         /// the sub-atom remainder carried in `coupon_accrual_rem`) or was forfeited (gate closed).
-        /// Moved to "now" by every settlement (tags 78 incl. a zero-leg 78, 108, 110).
+        /// Moved to "now" by every settlement (tags 78 incl. a zero-leg 78, 108, 110). On a
+        /// Resolved market the first settlement first settles up to `resolved_slot` (#571
+        /// follow-up, #678).
         pub last_coupon_slot: u64, // 96..104
         pub coupon_bps_per_year: u16,   // 104..106
         pub coupon_util_bonus_bps: u16, // 106..108
@@ -7420,7 +7436,8 @@ pub mod state {
         /// GH#571: `K` plus the accrual not yet settled since `last_coupon_slot`, assuming the gate
         /// OPEN and the maximum rate (base + full utilisation bonus). An UPPER bound on the claim
         /// the next settlement can produce: read-only junior-facing gates (97 / 103) use it so the
-        /// junior can never withdraw value the bonds are accruing between settlements.
+        /// junior can never withdraw value the bonds are accruing between settlements. Live only;
+        /// once Resolved, 102 reserves `bond_claim_at_resolve`, which stops growing at the resolve.
         pub fn claim_upper_bound_at(&self, now: u64) -> Result<u128, ProgramError> {
             let rate = crate::bond_v20::bond_coupon_rate_bps(
                 self.coupon_bps_per_year,
@@ -35211,6 +35228,7 @@ pub mod processor {
     /// receivable outlives the last bond).
     /// The utilisation term is best-effort: if the vault LP cannot be read it counts as 0 (toward
     /// the seniors), never as full.
+    /// Resolved: first the Live stretch up to `resolved_slot` (#571 follow-up, #678).
     #[inline(never)]
     fn bond_coupon_take<'a>(
         program_id: &Pubkey,
@@ -35225,11 +35243,19 @@ pub mod processor {
         else {
             return Ok((0, available, 0));
         };
-        let k = t.c_b_atoms;
         expect_writable(t_ai)?;
         let now = authenticated_slot_or_fallback(t.last_coupon_slot);
-        let live = state::read_market_config_mode_and_capacity(&market_ai.try_borrow_data()?)?.1
-            == MarketModeV16::Live;
+        let live = {
+            let d = market_ai.try_borrow_data()?;
+            let live = state::read_market_config_mode_and_capacity(&d)?.1 == MarketModeV16::Live;
+            if !live {
+                // #571 follow-up (#678): the Live stretch up to the resolve first (once); the
+                // settlement below then forfeits (resolved_slot, now] with the gate closed.
+                bond_settle_to_resolve(&mut t, st, state::market_resolved_slot(&d)?)?;
+            }
+            live
+        };
+        let k = t.c_b_atoms;
         let draw = st.senior_draw_outstanding_atoms;
         // M-1 (security review 2026-10-05): the coupon accrues on min(K, bond value) and is
         // forfeited while the tranche is impaired. The bond value is its layer of V BEFORE this
@@ -42421,9 +42447,13 @@ pub mod processor {
         // exists, [11] is REQUIRED there (fail closed). The Live path only moves pot surplus into
         // vault-LP capital (value-neutral), so it does not read the tranche.
         let bond_claim = if resolved {
-            // GH#571: the whole claim `K` incl. the settled coupon (nothing accrues once Resolved).
+            // GH#571: the whole claim `K` incl. the settled coupon, plus (#571 follow-up (#678))
+            // the Live stretch up to the resolve that 110 / terminal 78 will settle, computed on a
+            // copy. Read before this instruction's booking: equal to the post-booking value
+            // whenever 102 succeeds (a booking that books a senior loss halts 102 below). Nothing
+            // accrues after the resolve.
             match load_bond_tranche_if_flagged(program_id, accounts, 11, market_ai.key, &registry)? {
-                Some((_, t)) => t.claim_total()?,
+                Some((_, t)) => bond_claim_at_resolve(&t, &st, state::market_resolved_slot(&market_ai.try_borrow_data()?)?)?,
                 None => 0,
             }
         } else {
@@ -43248,6 +43278,36 @@ pub mod processor {
         Ok(())
     }
 
+    /// #571 follow-up (#678): settle the LIVE stretch `[last_coupon_slot, resolved_slot]` that no
+    /// Live settlement reached (the resolve handlers carry no tranche), as a settlement at the
+    /// resolve would have, without the whole-ness test (the Resolved split pays at most the bonds'
+    /// layer): base rate, cap, carried remainder, and the F2 interval rule (open at the last
+    /// settlement, no senior loss booked since, including one booked at the resolution). Runs once:
+    /// afterwards the checkpoint is `>= resolved_slot`. `None` (not Resolved): nothing to do.
+    fn bond_settle_to_resolve(
+        t: &mut state::BondTrancheV20,
+        st: &state::VaultLpStateV18,
+        resolved_slot: Option<u64>,
+    ) -> ProgramResult {
+        match resolved_slot {
+            Some(end) if end > t.last_coupon_slot => bond_settle_coupon_to(t, st, end, t.c_b_atoms > 0, false),
+            _ => Ok(()),
+        }
+    }
+
+    /// #571 follow-up (#678): `K` after `bond_settle_to_resolve`, on a copy (tag 102 does not
+    /// write the tranche). Own frame for the copy (102 itself still holds the loaded tranche: 2816 B, limit 3840).
+    #[inline(never)]
+    fn bond_claim_at_resolve(
+        t: &state::BondTrancheV20,
+        st: &state::VaultLpStateV18,
+        resolved_slot: Option<u64>,
+    ) -> Result<u128, ProgramError> {
+        let mut c = *t;
+        bond_settle_to_resolve(&mut c, st, resolved_slot)?;
+        c.claim_total()
+    }
+
     /// Phase 4 — BondDeposit (tag 108). Depositor-signed, Live only.
     ///
     /// Accounts: 0 depositor [signer, w] (pays the position's rent on first deposit) ·
@@ -43697,8 +43757,12 @@ pub mod processor {
                 };
                 expect_writable(source_ledger_ai)?;
                 expect_owner(source_ledger_ai, program_id)?;
-                // GH#571: nothing accrues once the market is not Live (gate closed); the settled
-                // coupon stays in `K` and is paid from the pots' surplus below.
+                // GH#571: first the Live stretch up to the resolve that no Live settlement reached
+                // (#571 follow-up (#678); once, after the booking above); nothing accrues after
+                // it (gate closed). The settled coupon stays in `K` and is paid from the pots'
+                // surplus below.
+                let resolved_slot = state::market_resolved_slot(&market_ai.try_borrow_data()?)?;
+                bond_settle_to_resolve(&mut t, &st, resolved_slot)?;
                 bond_settle_coupon_to(&mut t, &st, now, false, false)?;
                 bond_withdraw_resolved_core(
                     accounts,
