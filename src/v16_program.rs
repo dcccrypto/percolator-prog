@@ -21456,7 +21456,7 @@ pub mod processor {
         let rent_to_owner: bool;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
             // TB-1b (ADOPT upstream d60f15a1, "bind portfolio close to funded
             // state"): live re-check right before mutation, against ALL THREE
@@ -21484,8 +21484,6 @@ pub mod processor {
                 state::portfolio_view_mut_for_market_slots(&mut portfolio_data, max_market_slots)?;
             expect_portfolio_view_account_key(&portfolio, portfolio_ai.key)?;
             let owner_signed = portfolio.header.owner == closer.key.to_bytes();
-            let terminal_marketauth_cleanup =
-                group.header.mode == 1 && live_authority_matches(&cfg.marketauth, closer.key);
             // Sieve F-4 (pre-existing on 6377376a, #377): Resolved-mode Earn redemption needs a
             // terminal-flat market, so ONE walked-away trader (or a burned marketauth) locked every
             // Earn depositor. In Resolved mode ANYONE may deregister an EMPTY portfolio, provided
@@ -21493,14 +21491,18 @@ pub mod processor {
             // engine's own emptiness predicate (`is_empty_for_dematerialization`) still refuses
             // any capital/pnl/leg/close-progress or an unfinalized resolved payout receipt, so no
             // claim can be destroyed.
+            //
+            // #669: `marketauth` gets no separate branch. It used to close with the rent paid to
+            // itself, and because that branch was checked first, a marketauth closer that passed
+            // [3] = owner was still paid the user's rent. Every non-owner close now goes through
+            // this path, so the rent always returns to the portfolio's owner.
             let permissionless_resolved_cleanup = !owner_signed
-                && !terminal_marketauth_cleanup
                 && group.header.mode == 1
                 && accounts
                     .get(3)
                     .map(|d| d.key.to_bytes() == portfolio.header.owner)
                     .unwrap_or(false);
-            if !owner_signed && !terminal_marketauth_cleanup && !permissionless_resolved_cleanup {
+            if !owner_signed && !permissionless_resolved_cleanup {
                 return Err(PercolatorError::Unauthorized.into());
             }
             rent_to_owner = permissionless_resolved_cleanup;
