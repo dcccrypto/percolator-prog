@@ -33541,6 +33541,120 @@ pub mod processor {
         Ok((atoms, principal))
     }
 
+    /// Tag 77 NAV pricing: `(atoms, principal_portion, earnings_portion)` for the redemption.
+    /// Moved out of `handle_execute_redemption` unchanged (#667, SBF frame: the handler sat at
+    /// exactly the 3,840-byte gate limit and #666 tipped it to 3,904). Every borrow taken here is
+    /// released before it returns, as the inline scope released them. Mutates nothing.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_redemption_price_atoms<'a>(
+        market_ai: &AccountInfo<'a>,
+        ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        domain: usize,
+        asset_index: usize,
+        bound_tail: Option<&(
+            &'a AccountInfo<'a>,
+            Option<&'a AccountInfo<'a>>,
+            state::VaultLpStateV18,
+        )>,
+        shares: u128,
+    ) -> Result<(u128, u128, u128), ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg_nav, group) = state::market_view_mut(&mut market_data)?;
+        let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+        let ledger_data = ledger_ai.try_borrow_data()?;
+        let (mut ledger, _) = read_or_new_backing_domain_ledger(
+            &ledger_data,
+            market_ai.key.to_bytes(),
+            registry_pda.to_bytes(),
+            registry.domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        // NAV and available_principal BOTH span the vault's two pots — see
+        // lp_vault_combined_available_principal_atoms for why they must agree.
+        let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
+        // F-14: a BOUND vault in Resolved mode is priced ONLY on the pots' physical idle
+        // backing (F-8) and never reads the ledger NAV. The ledger books a consumed
+        // counterparty lien (backing lent to an outside winner) as impairment even when the
+        // pots' fresh backing is fully token-backed, so after an earlier senior's
+        // physically-priced exit `principal - impairment` underflows
+        // (lp_vault_domain_available_principal_atoms, EngineCounterUnderflow) and every
+        // later senior was locked. Skip the ledger NAV terms on that path.
+        let bound_resolved = bound_tail.is_some() && group.header.mode == 1;
+        let (available_principal, nav) = if bound_resolved {
+            (0, 0)
+        } else if bound_tail.is_some() {
+            // P3 (F-14): floored NAV / available principal on a bound vault.
+            lp_vault_combined_nav_parts_p3(
+                &group,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                registry.domain,
+                registry.fee_share_bps,
+                &ledger_data,
+                &sibling_ledger_data,
+            )?
+        } else {
+            (
+                lp_vault_combined_available_principal_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    &ledger_data,
+                    &sibling_ledger_data,
+                )?,
+                lp_vault_combined_nav_atoms(
+                    &group,
+                    market_ai.key.to_bytes(),
+                    registry_pda.to_bytes(),
+                    registry.domain,
+                    registry.fee_share_bps,
+                    &ledger_data,
+                    &sibling_ledger_data,
+                )?,
+            )
+        };
+        let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) = bound_tail {
+            // Out of line (SBF frame): tag 77 sits at the 4,096-byte frame edge.
+            execute_redemption_bound_pricing(
+                &cfg_nav,
+                &group,
+                lp_ai,
+                st,
+                registry,
+                shares,
+                asset_index,
+                nav,
+                available_principal,
+            )?
+        } else {
+            let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
+                shares,
+                registry.total_lp_shares_outstanding,
+                nav,
+            )
+            .map_err(map_v16_error)?;
+            // principal_portion = floor(shares * available_principal / total_shares).
+            // Rounds down — consistent with lp_atoms_for_redemption. Never exceeds
+            // atoms_out because available_principal <= nav.
+            let principal_out = percolator::wide_math::wide_mul_div_floor_u128(
+                shares,
+                available_principal,
+                registry.total_lp_shares_outstanding,
+            );
+            (atoms_out, principal_out)
+        };
+        let earnings_out = atoms_out
+            .checked_sub(principal_out)
+            .ok_or(PercolatorError::EngineCounterUnderflow)?;
+        Ok((atoms_out, principal_out, earnings_out))
+    }
+
     fn handle_execute_redemption<'a>(
         program_id: &Pubkey,
         accounts: &'a [AccountInfo<'a>],
@@ -33780,101 +33894,19 @@ pub mod processor {
         // The insurance-side stub ((1-fee_share) of gross net_earnings) stays
         // in the bucket — it was never counted in LP NAV and no token moves for
         // it. This is the only correct split; see lp_vault_design.md §5.2 Note 3.
-        let (atoms, principal_portion, earnings_portion) = {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg_nav, group) = state::market_view_mut(&mut market_data)?;
-            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
-            let ledger_data = ledger_ai.try_borrow_data()?;
-            let (mut ledger, _) = read_or_new_backing_domain_ledger(
-                &ledger_data,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                registry.domain,
-                &bucket,
-            )?;
-            sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            // NAV and available_principal BOTH span the vault's two pots — see
-            // lp_vault_combined_available_principal_atoms for why they must agree.
-            let sibling_ledger_data = sibling_ledger_ai.try_borrow_data()?;
-            // F-14: a BOUND vault in Resolved mode is priced ONLY on the pots' physical idle
-            // backing (F-8) and never reads the ledger NAV. The ledger books a consumed
-            // counterparty lien (backing lent to an outside winner) as impairment even when the
-            // pots' fresh backing is fully token-backed, so after an earlier senior's
-            // physically-priced exit `principal - impairment` underflows
-            // (lp_vault_domain_available_principal_atoms, EngineCounterUnderflow) and every
-            // later senior was locked. Skip the ledger NAV terms on that path.
-            let bound_resolved = bound_tail.is_some() && group.header.mode == 1;
-            let (available_principal, nav) = if bound_resolved {
-                (0, 0)
-            } else if bound_tail.is_some() {
-                // P3 (F-14): floored NAV / available principal on a bound vault.
-                lp_vault_combined_nav_parts_p3(
-                    &group,
-                    market_ai.key.to_bytes(),
-                    registry_pda.to_bytes(),
-                    registry.domain,
-                    registry.fee_share_bps,
-                    &ledger_data,
-                    &sibling_ledger_data,
-                )?
-            } else {
-                (
-                    lp_vault_combined_available_principal_atoms(
-                        &group,
-                        market_ai.key.to_bytes(),
-                        registry_pda.to_bytes(),
-                        registry.domain,
-                        &ledger_data,
-                        &sibling_ledger_data,
-                    )?,
-                    lp_vault_combined_nav_atoms(
-                        &group,
-                        market_ai.key.to_bytes(),
-                        registry_pda.to_bytes(),
-                        registry.domain,
-                        registry.fee_share_bps,
-                        &ledger_data,
-                        &sibling_ledger_data,
-                    )?,
-                )
-            };
-            let (atoms_out, principal_out) = if let Some((_, Some(lp_ai), st)) =
-                bound_tail.as_ref()
-            {
-                // Out of line (SBF frame): tag 77 sits at the 4,096-byte frame edge.
-                execute_redemption_bound_pricing(
-                    &cfg_nav,
-                    &group,
-                    lp_ai,
-                    st,
-                    &registry,
-                    redemption.shares,
-                    asset_index,
-                    nav,
-                    available_principal,
-                )?
-            } else {
-                let atoms_out = percolator::lp_vault::lp_atoms_for_redemption(
-                    redemption.shares,
-                    registry.total_lp_shares_outstanding,
-                    nav,
-                )
-                .map_err(map_v16_error)?;
-                // principal_portion = floor(shares * available_principal / total_shares).
-                // Rounds down — consistent with lp_atoms_for_redemption. Never exceeds
-                // atoms_out because available_principal <= nav.
-                let principal_out = percolator::wide_math::wide_mul_div_floor_u128(
-                    redemption.shares,
-                    available_principal,
-                    registry.total_lp_shares_outstanding,
-                );
-                (atoms_out, principal_out)
-            };
-            let earnings_out = atoms_out
-                .checked_sub(principal_out)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            (atoms_out, principal_out, earnings_out)
-        };
+        // Out of line (SBF frame, #667): tag 77 sat at 3,840 B with no margin; moving the NAV
+        // pricing scope into its own frame keeps the handler clear of the gate.
+        let (atoms, principal_portion, earnings_portion) = execute_redemption_price_atoms(
+            market_ai,
+            ledger_ai,
+            sibling_ledger_ai,
+            &registry,
+            &registry_pda,
+            domain,
+            asset_index,
+            bound_tail.as_ref(),
+            redemption.shares,
+        )?;
         // Dust-share redemption rounding to 0 atoms would burn shares for no
         // payout — reject.
         if atoms == 0 {
