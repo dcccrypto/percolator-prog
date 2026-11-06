@@ -55,10 +55,14 @@ fn engine_liquidate_body() -> String {
     let src = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("engine sibling source must be readable at {path:?}: {e}"));
     let lines: Vec<&str> = src.lines().collect();
+    // bigtest F2 (engine fix/v22-eng-liq-adl-latch): `liquidate_account_not_atomic` is now a one-line delegate to
+    // `liquidate_account_inner_not_atomic` (shared with the vault-LP-counterparty entry), which holds the body and
+    // every refusal. Census that body when it exists; an older engine still has the body in the public fn.
     let start = lines
         .iter()
-        .position(|l| l.contains("pub fn liquidate_account_not_atomic("))
-        .expect("engine liquidate_account_not_atomic must exist");
+        .position(|l| l.contains("fn liquidate_account_inner_not_atomic("))
+        .or_else(|| lines.iter().position(|l| l.contains("pub fn liquidate_account_not_atomic(")))
+        .expect("engine liquidate_account_not_atomic (or its inner body) must exist");
     let end = (start + 1..lines.len())
         .find(|&i| lines[i] == "    }")
         .expect("function end");
@@ -143,6 +147,8 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
             // RecoveryRequired), so the follow-on screen needs no new input.
             "charge_recorded_domain_up_to_capacity",
             "consume_domain_insurance_for_negative_pnl",
+            // bigtest F2 (reviewed against f1_follow_on_wanted, no screen change): READ-ONLY preflight, never errors
+            "counterparty_eligible_for_matched_close",
             "declare_permissionless_recovery",
             "domain_asset_side",
             "insurance_domain_index",
@@ -158,6 +164,8 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
             "set_account_pnl",
             "settle_negative_pnl_from_principal_core_not_atomic",
             "try_clear_bankruptcy_hlock_if_healthy",
+            // bigtest F2: the matched close; refuses only InvalidLeg / ArithmeticOverflow (both already pinned above)
+            "try_reduce_position_matched",
             "unilateral_close_capacity",
             "validate_account_audit_scan",
             "validate_account_scalar_preflight",
@@ -174,7 +182,10 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
 #[test]
 fn q8_census_reads_a_real_engine_and_the_wrapper_screen_still_names_every_refusal_class() {
     let body = engine_liquidate_body();
-    assert!(body.contains("fn liquidate_account_not_atomic"), "census must parse the function");
+    assert!(
+        body.contains("fn liquidate_account_not_atomic") || body.contains("fn liquidate_account_inner_not_atomic"),
+        "census must parse the function"
+    );
     assert!(body.lines().count() > 100, "census parsed a real body, not a stub");
     // the wrapper side of the pin: the screening inputs still exist in the decision kernel
     let kernel = std::fs::read_to_string(

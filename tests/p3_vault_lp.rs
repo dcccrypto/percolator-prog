@@ -7088,6 +7088,222 @@ fn port135_vault_lp_deposit_refresh_invalidates_stale_matcher_capability() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════════════
+// bigtest-2026-11-05 finding 2: a clean liquidation against the vault LP must not latch the
+// asset ADL reduce-only. Tag 5 takes the bound vault-LP portfolio as an OPTIONAL trailing
+// account; the engine then books the close as a matched reduction of the trader's leg and the
+// LP's opposite leg (no `A` factor moves) instead of a unilateral quantity-ADL close.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    /// tag 5 with the bound vault LP appended as the optional trailing counterparty.
+    fn crank_with_lp(&mut self, portfolio: Pubkey, lp: Pubkey) -> Result<(), String> {
+        let payer_key = self.payer.pubkey();
+        self.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: self.slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(payer_key, true),
+                AccountMeta::new(self.market, false),
+                AccountMeta::new(portfolio, false),
+                AccountMeta::new(lp, false),
+            ],
+            &[],
+        )
+    }
+
+    fn a_factors(&self) -> (u128, u128) {
+        let (_, g) = self.market_state();
+        (g.assets[0].a_long, g.assets[0].a_short)
+    }
+}
+
+/// A trader 10 units long against the bound vault LP, walked down to $0.87: below maintenance
+/// (equity ~$0.70 < MM ~$0.87), NOT bankrupt. Only the LP is cranked on the way down.
+fn f2_world() -> (Env, Lp, Trader) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let t = env.new_trader(2_000_000);
+    env.trade(&t, &lp, 10 * POS).expect("open 10 long vs the vault LP");
+    env.move_price(870_000, &[lp.portfolio]);
+    assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE));
+    (env, lp, t)
+}
+
+/// Crank the trader until its position moves (the F1 follow-on normally liquidates in the same
+/// instruction; a second crank covers a refresh-only first step).
+fn f2_liquidate(env: &mut Env, t: &Trader, with_lp: Option<Pubkey>) {
+    let p0 = env.position(t.portfolio);
+    for _ in 0..3 {
+        env.svm.expire_blockhash();
+        match with_lp {
+            Some(lp) => env.crank_with_lp(t.portfolio, lp).expect("crank + vault LP"),
+            None => env.crank(t.portfolio).expect("crank"),
+        }
+        if env.position(t.portfolio) != p0 {
+            return;
+        }
+    }
+    panic!("the trader was never liquidated");
+}
+
+#[test]
+fn f2_tag5_without_the_vault_lp_latches_the_asset_reduce_only() {
+    let (mut env, lp, t) = f2_world();
+    f2_liquidate(&mut env, &t, None);
+    let p = env.position(t.portfolio);
+    assert!(p > 0 && p < 10 * POS, "a partial, non-bankrupt close: {p}");
+    let (a_long, a_short) = env.a_factors();
+    assert_eq!(a_long, percolator::ADL_ONE);
+    assert!(a_short < percolator::ADL_ONE, "the close was booked by scaling the LP's short");
+    let t2 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    err_has(&env.trade(&t2, &lp, POS), PercolatorError::EngineAdlReduceOnly);
+}
+
+#[test]
+fn f2_tag5_with_the_vault_lp_matches_the_close_and_the_asset_stays_open() {
+    let (mut env, lp, t) = f2_world();
+    let (mut ctl, ctl_lp, ctl_t) = f2_world();
+    let lp_pos0 = env.position(lp.portfolio);
+    f2_liquidate(&mut env, &t, Some(lp.portfolio));
+    f2_liquidate(&mut ctl, &ctl_t, None);
+    let p = env.position(t.portfolio);
+    // Same liquidation for the trader: same remaining size, same capital and PnL.
+    assert_eq!(p, ctl.position(ctl_t.portfolio), "engine-sized close is identical");
+    let (tp, cp) = (env.portfolio(t.portfolio), ctl.portfolio(ctl_t.portfolio));
+    assert_eq!((tp.capital, tp.pnl), (cp.capital, cp.pnl));
+    // No A factor moved; the LP's raw short shrank by exactly the closed size.
+    assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE));
+    let closed = 10 * POS - p;
+    assert!(closed > 0);
+    assert_eq!(env.position(lp.portfolio), lp_pos0 + closed, "LP short reduced by the close");
+    // The skew-funding snapshot follows the LP's new position.
+    assert_eq!(env.asset_rec().lp_net_q, env.position(lp.portfolio));
+    env.assert_conserved("f2 matched liquidation");
+    // The market stays open: a new trader can open against the vault LP.
+    let t2 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&t2, &lp, POS).expect("no ADL latch after a matched liquidation");
+    let _ = ctl_lp;
+}
+
+/// The trailing account is identified by the MARKET: another program-owned portfolio in that
+/// position is not a counterparty (it is the optional cranker-reward slot, as before, and this
+/// market pays no cranker reward, so the tail is refused exactly as on the base wrapper).
+#[test]
+fn f2_tag5_a_caller_cannot_name_an_arbitrary_counterparty() {
+    let (mut env, _lp, t) = f2_world();
+    let other = env.new_trader(5_000_000);
+    let other0 = env.portfolio(other.portfolio);
+    env.svm.expire_blockhash();
+    let r = env.crank_with_lp(t.portfolio, other.portfolio);
+    assert!(r.is_err(), "an arbitrary trailing portfolio is not accepted: {r:?}");
+    let other1 = env.portfolio(other.portfolio);
+    assert_eq!((other1.capital, other1.pnl), (other0.capital, other0.pnl));
+    assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE));
+}
+
+/// A keeper may append the vault LP to EVERY crank of the market, including the LP's own.
+#[test]
+fn f2_tag5_crank_of_the_vault_lp_itself_accepts_the_appended_lp() {
+    let (mut env, lp, _t) = f2_world();
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let admin = env.admin.insecure_clone();
+    let seq = env.oracle_seq() + 1;
+    env.send(
+        ProgInstruction::PushAuthMark {
+            market_id: 1,
+            asset_index: 0,
+            now_slot: env.slot,
+            mark_e6: 870_000,
+            observation_sequence: seq,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(env.market, false),
+        ],
+        &[&admin],
+    )
+    .expect("push auth mark");
+    env.crank_with_lp(lp.portfolio, lp.portfolio).expect("LP crank with itself appended");
+}
+
+/// Regression (mirrors tests/f2_local_validator.rs): two thin traders 5 long ($1 each) and a healthy holder vs the
+/// bound vault LP, walked to $0.87 (thin ones liquidatable, not bankrupt).
+fn f2_world2() -> (Env, Lp, Vec<Trader>, Trader) {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    let ts: Vec<Trader> = (0..2).map(|_| env.new_trader(1_000_000)).collect();
+    for t in &ts {
+        env.svm.expire_blockhash();
+        env.trade(t, &lp, 5 * POS).expect("open 5 long");
+    }
+    let h = env.new_trader(5_000_000);
+    env.trade(&h, &lp, 3 * POS).expect("holder opens 3 long");
+    env.move_price(870_000, &[lp.portfolio]);
+    (env, lp, ts, h)
+}
+
+#[test]
+fn f2_regression_tag5_sequential_matched_liquidations_then_opens_both_ways() {
+    let (mut env, lp, ts, h) = f2_world2();
+    for t in &ts {
+        let lp0 = env.position(lp.portfolio);
+        let p0 = env.position(t.portfolio);
+        f2_liquidate(&mut env, t, Some(lp.portfolio));
+        let closed = p0 - env.position(t.portfolio);
+        assert!(closed > 0);
+        assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE));
+        assert_eq!(env.position(lp.portfolio), lp0 + closed);
+    }
+    // an OPEN needs the other positioned portfolios settled after the price walk (else 121 LossStale)
+    for p in ts.iter().map(|t| t.portfolio).chain([h.portfolio]) {
+        env.svm.expire_blockhash();
+        let _ = env.crank(p);
+    }
+    let t3 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&t3, &lp, POS).expect("new long");
+    let t4 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    env.trade(&t4, &lp, -POS).expect("new short");
+    env.svm.expire_blockhash();
+    env.trade(&h, &lp, POS).expect("holder grows");
+    assert!(env.position(lp.portfolio) < 0, "the LP side was never closed");
+    env.assert_conserved("f2 sequential matched");
+}
+
+#[test]
+fn f2_regression_tag5_matched_close_on_a_latched_market_neither_deepens_nor_lifts() {
+    let (mut env, lp, ts, h) = f2_world2();
+    f2_liquidate(&mut env, &ts[0], None);
+    let a0 = env.a_factors();
+    assert!(a0.1 < percolator::ADL_ONE);
+    f2_liquidate(&mut env, &ts[1], Some(lp.portfolio));
+    assert_eq!(env.a_factors(), a0, "matched close: A unchanged on a latched asset");
+    for p in ts.iter().map(|t| t.portfolio).chain([h.portfolio]) {
+        env.svm.expire_blockhash();
+        let _ = env.crank(p);
+    }
+    let t3 = env.new_trader(5_000_000);
+    env.svm.expire_blockhash();
+    err_has(&env.trade(&t3, &lp, POS), PercolatorError::EngineAdlReduceOnly);
+    env.svm.expire_blockhash();
+    env.trade(&h, &lp, -POS).expect("holders can still reduce");
+    env.assert_conserved("f2 latched + matched");
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
 // prog#660 (Nacodex audit of 6377376): regression tests for the two High findings. Each test
 // performs the attack exactly as the report describes it and proves the program refuses it,
 // with no funds moved and no account changed.
