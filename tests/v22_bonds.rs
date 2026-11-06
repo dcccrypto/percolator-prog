@@ -4755,3 +4755,61 @@ fn settle_expect(tr: &state::BondTrancheV20, now: u64, rate: u32, open: bool) ->
     )
     .unwrap()
 }
+
+// ---------------------------------------------------------------------------
+// #569 follow-up (#666): tags 78 and 108 read the same lag-worse value as bound 77, so a pushed
+// mark that no crank has committed yet must count there too. Same world and +100% jump as
+// `bond_coupon_gate_uses_the_lag_worse_value_like_108_110`, with the crank left out.
+// ---------------------------------------------------------------------------
+
+fn pending_push_2x(env: &mut Env) {
+    let admin = env.admin.insecure_clone();
+    env.slot += 1;
+    env.svm.warp_to_slot(env.slot);
+    let seq = env.oracle_seq() + 1;
+    let m = env.market;
+    env.send(
+        ProgInstruction::PushAuthMark { market_id: 1, asset_index: 0, now_slot: env.slot, mark_e6: 2 * PRICE, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(m, false)],
+        &[&admin],
+    )
+    .expect("push mark");
+}
+
+/// (coupon paid by 78, 108 outcome) after the +100% push, with or without the crank first.
+fn pending_bond_gate(crank_first: bool) -> (u128, Result<(), String>) {
+    let (mut env, lp, _d, _h) = bond_world(Params { fee_bps: 100, ..Params::default() }, 10_000, 500, 1_000, 2_000);
+    env.slot += 500_000;
+    env.svm.warp_to_slot(env.slot);
+    env.hold(1, &[lp.portfolio]);
+    let f = env.new_trader(20_000 * U);
+    for _ in 0..6 {
+        env.trade(&f, &lp, 200 * UQ).expect("fee open");
+        env.trade(&f, &lp, -200 * UQ).expect("fee close");
+    }
+    let t = env.new_trader(5_000 * U);
+    env.trade(&t, &lp, 1_000 * UQ).expect("long 1,000 vs the vault LP");
+    pending_push_2x(&mut env);
+    if crank_first {
+        env.crank(lp.portfolio).expect("crank vault LP");
+        env.crank(t.portfolio).expect("crank trader");
+    }
+    let cb0 = env.tranche().c_b_atoms;
+    env.crank_fees_bond(lp.portfolio).expect("78");
+    let coupon = env.tranche().c_b_atoms - cb0;
+    let h2 = env.new_bond_holder();
+    let r108 = env.bond_deposit(&h2, lp.portfolio, U, 1).map(|_| ());
+    let g = env.market_state().1;
+    eprintln!("PENDING-BOND gate crank_first {crank_first}: raw {} eff {} coupon {coupon} 108 -> {:?}", g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, r108.as_ref().map_err(|e| e.chars().take(80).collect::<String>()));
+    (coupon, r108)
+}
+
+#[test]
+fn bond_coupon_gate_and_108_see_a_pending_push_like_crank_first() {
+    let (coupon_c, r108_c) = pending_bond_gate(true);
+    let (coupon_w, r108_w) = pending_bond_gate(false);
+    err_has(&r108_c, PercolatorError::BondTrancheImpaired); // control = the existing lag test
+    assert_eq!(coupon_c, 0, "control: impaired at the worse price, no coupon");
+    err_has(&r108_w, PercolatorError::BondTrancheImpaired);
+    assert_eq!(coupon_w, 0, "78 before the crank paid a coupon of {coupon_w} into an impaired tranche");
+}

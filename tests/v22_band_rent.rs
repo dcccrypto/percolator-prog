@@ -1819,6 +1819,7 @@ fn v22_d1_every_lag_consumer_uses_the_shared_predicate() {
         ("reject_band_favourable_close_view", "band_favourable_close_refused_view("),
         ("reject_exposed_target_effective_lag_view", "asset_price_lagged_view("),
         ("vault_lp_equity_lag_bounds_ro", "asset_price_lagged_view("),
+        ("vault_lp_equity_lag_bounds_ro", "asset_next_crank_raw_target_view("),
         ("reject_portfolio_pending_price_managed_mark_view", "asset_target_differs_view("),
         ("live_domain_withdraw_health_or_shutdown_view", "reject_exposed_target_effective_lag_view("),
         ("reject_adl_wind_down_unfresh_mark_view", "reject_exposed_target_effective_lag_view("),
