@@ -157,7 +157,7 @@ impl P3 {
         let bytes = std::fs::read(matcher_program_path()).expect("matcher so");
         env.svm.add_program(matcher, &bytes);
         env.svm.warp_to_slot(1);
-        env.configure_auth_mark_for_asset_as_admin(0, 1, PRICE);
+        if PENDING_EWMA.with(|c| c.get()) { env.configure_ewma_mark_with_cu(1, PRICE, 50, 0); } else { env.configure_auth_mark_for_asset_as_admin(0, 1, PRICE); }
         let pid = env.program_id;
         let market = env.market;
         let (registry, _) = state::derive_lp_vault_registry(&pid, &market);
@@ -646,7 +646,7 @@ impl P3 {
     fn push(&mut self, mark: u64) {
         let s = self.slot() + 1;
         self.env.svm.warp_to_slot(s);
-        self.env.push_auth_mark_for_asset_as_admin(0, s, mark);
+        pending_push_at(self, s, mark);
     }
 
     fn held(&self) -> u128 {
@@ -3056,6 +3056,186 @@ fn p3_exit_front_run_leaver_advantage_is_rounding_at_cooldown_150() {
         }
     }
     assert!(worst <= 2_000, "front-run at cooldown 150: leaver advantage / stayer charge up to {worst} atoms");
+}
+
+// ---------------------------------------------------------------------------
+// #569 follow-up (#666): PushAuthMark / PushEwmaMark write the oracle profile, never the engine target; the
+// engine's raw target moves at the next (permissionless) crank. A bound 77 between the two must
+// price as the crank-first order does, in both directions. Same timing world as the acceptance
+// test above (cooldown 150).
+// ---------------------------------------------------------------------------
+
+const PENDING_FAIR: u128 = 4_834_040; // 5,000,000 - 331,920 / 2 at the +48.61% move
+const PENDING_TOL: u128 = 2_000;
+const PENDING_UP: u64 = PRICE * 14_861 / 10_000;
+const PENDING_HALF: u64 = (PRICE + PENDING_UP) / 2;
+
+// The timing world on an EWMA_MARK oracle (ConfigureEwmaMark, halflife 50) instead of AuthMark.
+thread_local! { static PENDING_EWMA: std::cell::Cell<bool> = std::cell::Cell::new(false); }
+
+/// PushAuthMark, or PushEwmaMark in the EWMA_MARK world, in slot `s`.
+fn pending_push_at(w: &mut P3, s: u64, mark: u64) {
+    if PENDING_EWMA.with(|c| c.get()) {
+        w.env.svm.expire_blockhash();
+        w.env.push_ewma_mark_with_cu(s, mark);
+    } else {
+        w.env.push_auth_mark_for_asset_as_admin(0, s, mark);
+    }
+}
+
+/// (engine raw target, P_last, profile mark) of asset 0.
+fn pending_prices(w: &P3) -> (u64, u64, u64) {
+    let g = w.env.market_state().1;
+    let data = w.env.svm.get_account(&w.env.market).unwrap().data;
+    let mark = state::read_asset_oracle_profile(&data, 0).unwrap().mark_ewma_e6;
+    (g.assets[0].raw_oracle_target_price, g.assets[0].effective_price, mark)
+}
+
+/// Keeper cycles at an unchanged price (push + crank both every 4 slots) for `slots` slots.
+fn pending_quiet(w: &mut P3, tp: Pubkey, lp: Pubkey, slots: u64) {
+    let end = w.slot() + slots;
+    while w.slot() < end {
+        let s = w.slot() + 4;
+        w.env.svm.warp_to_slot(s);
+        pending_push_at(w, s, MARK.with(|c| c.get()));
+        let _ = w.crank(tp);
+        let _ = w.crank(lp);
+    }
+}
+
+/// A's exit around a push of `mark`; returns (A's payout, profile mark at the 77). `pre`: a move
+/// pushed AND cranked first (the reversal cases). `fresh`: A files 76 after the push and nobody
+/// cranks for the cooldown (mode 2); else A's 76 matured on the quiet market and 78 + 77 land in
+/// the push slot (mode 4). `crank_first`: the trader and the vault LP are cranked right before
+/// 78 + 77 (the control order).
+fn pending_exit(pre: Option<u64>, mark: u64, fresh: bool, crank_first: bool) -> (u128, u64) {
+    let TimingWorld { mut w, a, a_ata, tp, lp, .. } = timing_world(BOUND_COOLDOWN);
+    let sh = w.tok(&a_ata) as u128;
+    if !fresh { w.request_redeem(&a, a_ata, sh).expect("76"); }
+    pending_quiet(&mut w, tp, lp, BOUND_COOLDOWN + 8);
+    if let Some(p) = pre {
+        MARK.with(|c| c.set(p));
+        w.push(p);
+        let _ = w.crank(tp);
+        let _ = w.crank(lp);
+    }
+    MARK.with(|c| c.set(mark));
+    w.push(mark);
+    if fresh {
+        w.request_redeem(&a, a_ata, sh).expect("76 after the push");
+        let s = w.slot() + BOUND_COOLDOWN;
+        w.env.svm.warp_to_slot(s);
+    }
+    if crank_first {
+        let _ = w.crank(tp);
+        let _ = w.crank(lp);
+    }
+    let (raw, eff, m) = pending_prices(&w);
+    let _ = w.crank_fees_78();
+    let (d, r) = w.execute_redeem_domain(&a, 0);
+    let cu = r.expect("77");
+    let paid = w.tok(&d) as u128;
+    eprintln!("PENDING pre {pre:?} mark {mark} fresh {fresh} crank_first {crank_first}: raw {raw} eff {eff} profile mark {m} -> A paid {paid} (77 CU {cu})");
+    (paid, m)
+}
+
+/// 77 before the crank vs 77 after it, same world; returns (window payout, profile mark).
+fn pending_assert_same(label: &str, pre: Option<u64>, mark: u64, fresh: bool) -> (u128, u64) {
+    let (control, _) = pending_exit(pre, mark, fresh, true);
+    let (window, m) = pending_exit(pre, mark, fresh, false);
+    eprintln!("PENDING {label}: window {window} crank-first {control} (diff {})", window as i128 - control as i128);
+    assert!(window.abs_diff(control) <= PENDING_TOL, "{label}: 77 before the crank paid {window}, after it {control}");
+    (window, m)
+}
+
+/// Mode 4: A's 76 is mature; the +48.61% push lands; 78 + 77 run before any crank.
+#[test]
+fn p3_exit_between_push_and_crank_prices_like_crank_first() {
+    let (w, _) = pending_assert_same("mode 4", None, PENDING_UP, false);
+    assert!(w <= PENDING_FAIR + PENDING_TOL, "mode 4: leaver paid {w} > fair {PENDING_FAIR}");
+}
+
+/// Mode 2: the push lands, A files a fresh 76 after it, and nobody cranks for the 150 slots.
+#[test]
+fn p3_fresh_request_after_uncranked_push_prices_like_crank_first() {
+    let (w, _) = pending_assert_same("mode 2", None, PENDING_UP, true);
+    assert!(w <= PENDING_FAIR + PENDING_TOL, "mode 2: leaver paid {w} > fair {PENDING_FAIR}");
+}
+
+/// Reversal: the +48.61% move is pushed and cranked (a committed adverse lag), then the price is
+/// pushed back; anyone fires A's matured 77 before the crank that commits the reversal. The
+/// leaver must not be charged a move the next crank undoes.
+#[test]
+fn p3_exit_after_pending_reversal_prices_like_crank_first() {
+    let (w, _) = pending_assert_same("reversal", Some(PENDING_UP), PRICE, false);
+    assert!(w + PENDING_TOL >= 5_000_000, "reversal: leaver paid {w}, par expected");
+}
+
+/// Half retrace: as the reversal, but the push goes back only half way. The senior payout is
+/// convex (the junior takes the first loss), so most of the senior loss goes away; the leaver
+/// must not be charged the superseded full move.
+#[test]
+fn p3_exit_after_pending_half_retrace_prices_like_crank_first() {
+    let (w, _) = pending_assert_same("half retrace", Some(PENDING_UP), PENDING_HALF, false);
+    assert!(w > PENDING_FAIR + PENDING_TOL, "half retrace: leaver paid {w}, charged the full move");
+}
+
+/// Controls. A same-price push changes nothing (par), and a pending -30% move (favourable to the
+/// short vault LP) prices as after its crank (par: seniors are capped at C).
+#[test]
+fn p3_exit_no_move_and_favourable_pending_push_are_par() {
+    let (q, _) = pending_exit(None, PRICE, false, false);
+    assert!(q + PENDING_TOL >= 5_000_000, "no move: {q}");
+    let (f, _) = pending_assert_same("favourable", None, PRICE * 7 / 10, false);
+    assert!(f + PENDING_TOL >= 5_000_000, "favourable: {f}");
+}
+
+/// Mode 4 on an EWMA_MARK oracle. PushEwmaMark stores a BLENDED mark (`mark_ewma_e6`) and the
+/// crank commits that, not the pushed input, so the exit is priced at the stored mark.
+#[test]
+fn p3_exit_between_ewma_push_and_crank_prices_like_crank_first() {
+    PENDING_EWMA.with(|c| c.set(true));
+    let (w, m) = pending_assert_same("ewma mode 4", None, PENDING_UP, false);
+    PENDING_EWMA.with(|c| c.set(false));
+    assert!(m > PRICE && m < PENDING_UP, "vacuity: the stored mark {m} is a blend of the push");
+    // Short 1.3 vs the vault LP; the junior's 300,000 goes first, the two seniors share the rest.
+    let loss = (13 * (m - PRICE) as i128 / 10 - 300_000).max(0) as u128;
+    assert!(loss / 2 > 10 * PENDING_TOL, "vacuity: the blended move {m} reaches the seniors");
+    let fair = 5_000_000 - loss / 2;
+    assert!(w.abs_diff(fair) <= PENDING_TOL, "ewma mode 4: leaver paid {w}, the stored mark {m} prices {fair}");
+}
+
+/// #569 follow-up (#666): the stale-resolve corner. The push lands and nobody cranks until
+/// `permissionless_resolve_stale_slots` has passed, so no crank can commit it and the market
+/// resolves at the pre-push effective price. A third party's bound 77 in that window must be
+/// refused (OracleStale, like 75 / 78 / 108 / 110 / 112), not priced on the never-committed mark.
+#[test]
+fn p3_exit_after_uncranked_push_past_resolve_maturity_is_refused() {
+    let stale = percolator_prog::error::PercolatorError::OracleStale as u32;
+    let TimingWorld { mut w, a, a_ata, tp, lp, .. } = timing_world(BOUND_COOLDOWN);
+    w.env.svm.expire_blockhash();
+    w.env.configure_permissionless_resolve_with_cu(9_000, 1_000);
+    let sh = w.tok(&a_ata) as u128;
+    w.request_redeem(&a, a_ata, sh).expect("76");
+    pending_quiet(&mut w, tp, lp, BOUND_COOLDOWN + 8);
+    w.crank_fees_78().expect("78 harvests before the push");
+    MARK.with(|c| c.set(PENDING_UP));
+    w.push(PENDING_UP);
+    let s = w.slot() + 9_002;
+    w.env.svm.warp_to_slot(s);
+    w.env.svm.expire_blockhash();
+    let c = w.crank(tp);
+    assert!(c.as_ref().is_err_and(|e| e.contains(&format!("Custom({stale})"))), "crank past maturity: {c:?}");
+    assert_eq!(pending_prices(&w), (PRICE, PRICE, PENDING_UP), "the push is still uncommitted");
+    let (d, r) = w.execute_redeem_domain(&a, 0);
+    let paid = w.tok(&d);
+    assert!(r.as_ref().is_err_and(|e| e.contains(&format!("Custom({stale})"))), "77 past resolve maturity: {r:?}, A paid {paid}");
+    assert_eq!(paid, 0, "A paid {paid}");
+    let s2 = w.slot() + 1;
+    w.env.resolve_stale_permissionless_with_cu(s2);
+    let g = w.env.market_state().1;
+    assert_eq!(g.mode, percolator::MarketModeV16::Resolved);
+    assert_eq!((g.assets[0].raw_oracle_target_price, g.assets[0].effective_price), (PRICE, PRICE), "resolved at the pre-push price");
 }
 
 /// Anvil probe (gate HIGH lock, question 2): the SAME trader-vs-trader bankruptcy on a PLAIN

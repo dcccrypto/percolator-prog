@@ -1129,6 +1129,10 @@ pub mod constants {
     /// already-published adverse push, is priced at par, and the stayers bear the whole
     /// loss. Decided policy (2026-09-30): not 0, not 20, at least 150 slots; both clients
     /// already use 150. Enforced at the bind only: unbound vaults keep 0 legal (#440).
+    /// Since the #569 follow-up (#666) a 77 after a push has LANDED is priced against the mark
+    /// the next crank commits (the pushed AuthMark, or the stored EWMA blend), cranked or not
+    /// (`vault_lp_equity_lag_bounds_ro`); the cooldown bounds the gap between a move seen
+    /// off-chain and its push landing.
     pub const MIN_BOUND_VAULT_REDEMPTION_COOLDOWN_SLOTS: u64 = 150;
     /// Upper bound for `insurance_withdraw_cooldown_slots` (#427). Same magnitude and
     /// same reason as `MAX_LP_REDEMPTION_COOLDOWN_SLOTS`: ~1 year at 2.5 slots/s.
@@ -14493,6 +14497,10 @@ pub mod processor {
     /// every payout-bearing path that depends on the mark reads THIS predicate (directly or via
     /// `asset_price_lagged_view`), never its own comparison. Pinned by
     /// `tests/v22_band_rent.rs::v22_d1_every_lag_consumer_uses_the_shared_predicate`.
+    /// Exception, vault-LP lag bounds only: `vault_lp_equity_lag_bounds_ro` also prices a pushed,
+    /// uncommitted AuthMark / EWMA mark (`asset_next_crank_raw_target_view`, read from the oracle
+    /// profile) as the target. That check is profile mark vs committed target; the committed lag
+    /// itself is still read through this predicate.
     pub(crate) fn asset_target_differs_view(asset: &percolator::AssetStateV16Account) -> bool {
         asset.raw_oracle_target_price.get() != asset.effective_price.get()
     }
@@ -14576,6 +14584,52 @@ pub mod processor {
         let asset = &slot.engine.asset;
         let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
         Ok(exposed && asset_target_differs_view(asset))
+    }
+
+    /// #569 follow-up (#666): the raw target the NEXT crank commits for `asset_index`.
+    /// PushAuthMark / PushAuthMarkDepth / PushEwmaMark (and an EWMA_MARK trade) write the oracle
+    /// profile, never the engine's target; the crank (tag 5, and the tag-104 / settle-rent
+    /// refresh) then commits exactly `profile.mark_ewma_e6` (`hybrid_effective_price_for_crank_view`)
+    /// through `set_asset_raw_oracle_target_not_atomic`. Until then the engine's raw target is the
+    /// pre-push value and a push bumps no epoch, so a payout priced from the engine fields alone
+    /// depended on whether anyone had cranked first. This reads `mark_ewma_e6` (on EWMA_MARK the
+    /// stored blend, which a trade can also move), never `oracle_target_price_e6` or the pushed
+    /// input. Hybrid keeps its pending price in the external feed account, which the valuation
+    /// paths do not take (a soft-stale Hybrid crank commits `mark_ewma_e6` instead,
+    /// `hybrid_effective_price_for_crank_view`; this helper still returns the committed target
+    /// there, as before), and outside Live mode or an Active / DrainOnly lifecycle the crank
+    /// commits no target: all of these return the committed one. One corner never commits: a
+    /// push followed by no crank until `permissionless_resolve_stale_slots` has passed. The crank
+    /// then refuses (OracleStale) and the market resolves at the engine's committed (effective)
+    /// price. Tag 77 refuses in that window like its siblings, so the corner prices nothing.
+    /// Separate frame: the profile is 512 bytes.
+    #[inline(never)]
+    fn asset_next_crank_raw_target_view(
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> Result<u64, ProgramError> {
+        let market = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?;
+        let committed = market.engine.asset.raw_oracle_target_price.get();
+        if group.header.mode != 0
+            || !matches!(
+                market.engine.asset.lifecycle,
+                ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+            )
+        {
+            return Ok(committed);
+        }
+        let bytes = market
+            .wrapper
+            .get(..constants::ASSET_ORACLE_PROFILE_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?;
+        let profile: state::AssetOracleProfileV16 = bytemuck::pod_read_unaligned(bytes);
+        state::validate_asset_oracle_profile(&profile)?;
+        let managed =
+            oracle_v16::profile_is_auth_mark(&profile) || oracle_v16::profile_is_ewma_mark(&profile);
+        Ok(if managed { profile.mark_ewma_e6 } else { committed })
     }
 
     /// The pre-Wave-B predicate (exposed AND target != effective), kept for Wave D's non-bound
@@ -33388,6 +33442,13 @@ pub mod processor {
         nav: u128,
         available_principal: u128,
     ) -> Result<(u128, u128), ProgramError> {
+        // #569 follow-up (#666): past the permissionless-resolve deadline no crank can
+        // commit a pushed mark, and the market settles at the engine's committed effective
+        // price, so the lag bounds below would price a move that is never realised. Same gate
+        // as 75, 78, 108, 110 and 112.
+        if group.header.mode == 0 {
+            reject_permissionless_resolve_matured_live_view(cfg_nav, group)?;
+        }
         // P3-K1: pending (harvestable) LP fees belong to every current holder, so a
         // redeemer must not leave without its share — and paying it before the crank
         // would pay out atoms that are not yet in backing. Require the harvest first
@@ -36633,7 +36694,13 @@ pub mod processor {
     /// P3 fairness (2026-09-30, Earn exit front-run): the vault LP's equity re-valued at the
     /// price WORSE for the vault (`.0`, used to price a senior EXIT, tag 77) and at the price
     /// BETTER for the vault (`.1`, used to price a senior ENTRY, tag 75), comparing each leg's
-    /// lagging engine `effective_price` with the pending oracle `raw_oracle_target_price`.
+    /// lagging engine `effective_price` with the target the next crank commits
+    /// (`asset_next_crank_raw_target_view`: on AuthMark / EWMA_MARK in Live a pushed mark no crank
+    /// has committed yet, else the engine's `raw_oracle_target_price`). #569 follow-up (#666):
+    /// a push bumps no epoch, so before this the certificate stayed current and the pushed mark
+    /// priced nothing until someone cranked. For a pushed, uncommitted mark the bounds no longer
+    /// depend on whether a crank ran first, in either direction. Unchanged: the crank's one-slot
+    /// favourable step and the funding / rent accrued since the last crank are not in the bounds.
     ///
     /// With `max_price_move_bps_per_slot` = 1 the effective price needs ~3,963 slots to follow a
     /// +48.6% move. A senior who filed 76 on seeing the move could redeem at the stale price
@@ -36686,11 +36753,14 @@ pub mod processor {
                 .engine
                 .asset;
             // v2.2 D-1: the shared lag predicate; an unlagged leg contributes 0 either way.
-            if !asset_price_lagged_view(group, leg.asset_index as usize)? {
+            // #569 follow-up (#666): the target is the one the next (permissionless) crank
+            // commits, so a pushed mark no crank has committed yet already counts as the target.
+            let tgt = asset_next_crank_raw_target_view(group, leg.asset_index as usize)?;
+            let pending = tgt != asset.raw_oracle_target_price.get();
+            if !pending && !asset_price_lagged_view(group, leg.asset_index as usize)? {
                 continue;
             }
             let eff = asset.effective_price.get();
-            let tgt = asset.raw_oracle_target_price.get();
             let (adv, fav) = match leg.side {
                 SideV16::Long => (eff.saturating_sub(tgt), tgt.saturating_sub(eff)),
                 SideV16::Short => (tgt.saturating_sub(eff), eff.saturating_sub(tgt)),
