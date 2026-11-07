@@ -732,7 +732,9 @@ impl Env {
         extra: &[AccountMeta],
         l_launch_x100: Option<u16>,
     ) -> Result<Lp, String> {
-        let lp = self.new_program_account(self.plen);
+        // #684: the LP portfolio signs tag 94 (D26).
+        let lp_kp = self.new_program_account_kp(self.plen);
+        let lp = lp_kp.pubkey();
         let ctx = Pubkey::new_unique();
         self.svm
             .set_account(
@@ -763,7 +765,7 @@ impl Env {
             AccountMeta::new(self.market, false),
             AccountMeta::new(self.registry, false),
             AccountMeta::new(self.vault_lp, false),
-            AccountMeta::new(lp, false),
+            AccountMeta::new(lp, true),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(self.ledger, false),
             AccountMeta::new_readonly(self.sibling, false),
@@ -782,7 +784,7 @@ impl Env {
                 l_launch_x100: l,
             },
         };
-        self.send(ix, accts, &[signer])
+        self.send(ix, accts, &[signer, &lp_kp])
         .map(|_| Lp {
             portfolio: lp,
             owner_key: self.registry,
@@ -1581,9 +1583,10 @@ impl Env {
         junior: &Keypair,
         junior_signs: bool,
     ) -> Result<Pubkey, String> {
-        let lp = self.new_program_account(self.plen);
+        let lp_kp = self.new_program_account_kp(self.plen);
+        let lp = lp_kp.pubkey();
         self.svm.expire_blockhash();
-        let mut signers: Vec<&Keypair> = vec![protocol];
+        let mut signers: Vec<&Keypair> = vec![protocol, &lp_kp];
         if junior_signs {
             signers.push(junior);
         }
@@ -1596,7 +1599,7 @@ impl Env {
                 AccountMeta::new(self.market, false),
                 AccountMeta::new(self.registry, false),
                 AccountMeta::new(self.vault_lp, false),
-                AccountMeta::new(lp, false),
+                AccountMeta::new(lp, true),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(self.ledger, false),
                 AccountMeta::new_readonly(self.sibling, false),
@@ -3095,7 +3098,7 @@ fn sec2_n2_atomic_launch_bundle_cannot_be_front_run() {
             AccountMeta::new(env.market, false),
             AccountMeta::new(env.registry, false),
             AccountMeta::new(env.vault_lp, false),
-            AccountMeta::new(lp, false),
+            AccountMeta::new(lp, true), // #684: signs (also signs its createAccount)
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(env.ledger, false),
             AccountMeta::new_readonly(env.sibling, false),

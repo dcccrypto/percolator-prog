@@ -623,7 +623,8 @@ impl Env {
             AccountMeta::new(self.slab, false),
             AccountMeta::new(self.registry, false),
             AccountMeta::new(self.vault_lp, false),
-            AccountMeta::new(lp, false),
+            // #684: the LP portfolio signs tag 94 (D26); fake-signed in this replay like [0].
+            AccountMeta::new(lp, true),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(self.ledger, false),
             AccountMeta::new_readonly(self.sibling, false),
@@ -661,7 +662,7 @@ impl Env {
         accts.extend(tail);
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
         let ma = self.marketauth;
-        (VaultLp { portfolio: lp, ctx, delegate }, self.send(vec![ix], &[ma], &[]))
+        (VaultLp { portfolio: lp, ctx, delegate }, self.send(vec![ix], &[ma, lp], &[]))
     }
 
     /// tag 94, LEGACY marketauth path (A), sent the only way the chain allows for these
@@ -672,7 +673,7 @@ impl Env {
         let mut accts = self.init_vault_lp_accounts(self.marketauth, lp);
         accts[0] = AccountMeta::new(self.marketauth, false);
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
-        self.send(vec![ix], &[], &[])
+        self.send(vec![ix], &[lp], &[])
     }
 
     /// tag 94 in the REMOVED protocol shape ("path B"): [0] = the live upgrade authority
@@ -685,7 +686,7 @@ impl Env {
         accts.push(AccountMeta::new_readonly(self.junior.pubkey(), true));
         let ix = self.wrapper_ix(ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }, accts);
         let junior = self.junior.insecure_clone();
-        self.send(vec![ix], &[auth], &[&junior])
+        self.send(vec![ix], &[auth, lp], &[&junior])
     }
 
     fn mount_programdata(&mut self) -> (Pubkey, Pubkey) {

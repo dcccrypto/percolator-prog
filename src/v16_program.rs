@@ -9795,6 +9795,10 @@ pub mod ix {
         /// Tag 94, marketauth-gated. Creates the vault-LP state PDA `["vault_lp", market]` and
         /// a portfolio OWNED BY THE LP-VAULT REGISTRY PDA, binds it as the asset's exclusive
         /// matcher LP and seeds the senior claim at the vault's current backing NAV.
+        /// Accounts: [0] marketauth (signer, w), [1] market (w), [2] registry (w), [3] vault-LP
+        /// state PDA (w), [4] LP portfolio (SIGNER, w; pre-created at the exact length and
+        /// rent-exempt, D26 / #684), [5] system program, [6] own ledger, [7] sibling ledger,
+        /// [8] canonical matcher program, [9] matcher ctx (w), [10] matcher delegate PDA.
         InitVaultLp { junior_floor_bps: u16 },
         /// growth-v19: tag 0 with a 4-byte trailing growth block `[r_gap_bps u16][l_launch_x100
         /// u16]` (both non-zero). `market` is always an `InitMarket`. Enables growth on asset 0
@@ -37897,6 +37901,10 @@ pub mod processor {
         let own_ledger_ai = account(accounts, 6)?;
         let sibling_ledger_ai = account(accounts, 7)?;
         expect_signer(admin)?;
+        // D26 / S1-13 (as `handle_init_portfolio`): the LP portfolio account itself must sign
+        // (create + bind in one tx), so a portfolio account created separately by someone else
+        // cannot be bound as the vault LP, and the client controls its funding (#684).
+        expect_signer(lp_portfolio_ai)?;
         expect_writable(admin)?;
         expect_writable(market_ai)?;
         expect_writable(registry_ai)?;

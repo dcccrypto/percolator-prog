@@ -3045,8 +3045,9 @@ impl World {
         // 75 genesis senior deposit (unbound) by Earn wallet = user 1.
         self.do_lp_deposit(1, 10_000_000).expect("75 genesis senior deposit");
         let genesis = 10_000_000u128;
-        // 94 path B.
-        let lp = Pubkey::new_unique();
+        // 94 path B. #684: the LP portfolio signs tag 94 (D26).
+        let lp_kp = Keypair::new();
+        let lp = lp_kp.pubkey();
         let len = self.env.portfolio_account_len;
         self.env.svm.set_account(lp, Account { lamports: 1_000_000_000, data: vec![0; len], owner: pid, executable: false, rent_epoch: 0 }).unwrap();
         let (l0, l1) = (self.lp_ledger(0), self.lp_ledger(1));
@@ -3055,7 +3056,7 @@ impl World {
             AccountMeta::new(m, false),
             AccountMeta::new(reg, false),
             AccountMeta::new(state_pda, false),
-            AccountMeta::new(lp, false),
+            AccountMeta::new(lp, true),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new(l0, false),
             AccountMeta::new(l1, false),
@@ -3078,7 +3079,7 @@ impl World {
         // becomes the junior owner (the creator). FUZZ_P3_PATH_B=1 keeps the old path for ee29b5ac.
         let junior = if std::env::var("FUZZ_P3_PATH_B").map_or(false, |v| v == "1") {
             let jr = junior.insecure_clone();
-            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), metas, &[&up, &jr]).unwrap_or_else(|e| panic!("94 InitVaultLp path B: {}", &e[..e.len().min(500)]));
+            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), metas, &[&up, &jr, &lp_kp]).unwrap_or_else(|e| panic!("94 InitVaultLp path B: {}", &e[..e.len().min(500)]));
             junior
         } else {
             let admin = self.env.admin.insecure_clone();
@@ -3087,7 +3088,7 @@ impl World {
             if !p3_legacy_bind() {
                 ma.extend(pin_tail.clone());
             }
-            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), ma, &[&admin]).unwrap_or_else(|e| panic!("94 InitVaultLp path A: {}", &e[..e.len().min(500)]));
+            self.p3_send_raw(p3_raw(94, &1_000u16.to_le_bytes()), ma, &[&admin, &lp_kp]).unwrap_or_else(|e| panic!("94 InitVaultLp path A: {}", &e[..e.len().min(500)]));
             admin
         };
         // 99 SetVaultLpRisk: skew on (slope/max 1_000 e9), lev step-down off, 1x cap, approve matcher.
