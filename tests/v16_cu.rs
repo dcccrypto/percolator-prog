@@ -675,12 +675,23 @@ impl V16CuEnv {
     /// v2.2 client path: a REAL top-level system `createAccount` of exactly `len` bytes (owned by the
     /// program) followed by `InitPortfolio`, in one transaction. Returns the account key.
     fn create_portfolio_via_system(&mut self, owner: &Keypair, len: usize) -> Result<Pubkey, String> {
+        let lamports = self.svm.minimum_balance_for_rent_exemption(len);
+        self.create_portfolio_via_system_with_lamports(owner, len, lamports)
+    }
+
+    /// `create_portfolio_via_system`, funding the new account with exactly `lamports` (#668).
+    fn create_portfolio_via_system_with_lamports(
+        &mut self,
+        owner: &Keypair,
+        len: usize,
+        lamports: u64,
+    ) -> Result<Pubkey, String> {
         self.ensure_signer_account(owner.pubkey());
         let account = Keypair::new();
         let create = solana_sdk::system_instruction::create_account(
             &self.payer.pubkey(),
             &account.pubkey(),
-            self.svm.minimum_balance_for_rent_exemption(len),
+            lamports,
             len as u64,
             &self.program_id,
         );
@@ -26957,6 +26968,47 @@ fn v22_init_portfolio_refuses_a_wrong_length_and_never_reallocs() {
     // control: the exact length is accepted
     let owner = Keypair::new();
     env.create_portfolio_via_system(&owner, required).expect("exact length accepted");
+}
+
+// #668: InitPortfolio must refuse a portfolio account that is not rent-exempt for its length.
+// Without the check, `createAccount(lamports = 0) + InitPortfolio` in one transaction succeeds and
+// raises `materialized_portfolio_count`, then the runtime drops the 0-lamport account at commit.
+// No account is left to deregister, so the count can never return to 0 and every Resolved-market
+// exit that needs `materialized_portfolio_count == 0` is frozen for good.
+#[test]
+fn issue_668_init_portfolio_refuses_a_non_rent_exempt_account() {
+    let mut env = V16CuEnv::new();
+    let len = percolator_prog::constants::PORTFOLIO_ACCOUNT_LEN;
+    let rent = env.svm.minimum_balance_for_rent_exemption(len);
+    let code = percolator_prog::error::PercolatorError::RentExemptRequired as u32;
+    let count_before = env.market_state().1.materialized_portfolio_count;
+
+    for lamports in [0u64, 1, rent - 1] {
+        let owner = Keypair::new();
+        let e = env
+            .create_portfolio_via_system_with_lamports(&owner, len, lamports)
+            .expect_err(&format!("a portfolio funded with {lamports} lamports (< rent {rent}) must be refused"));
+        // For a non-zero shortfall LiteSVM reports its own post-transaction
+        // `InsufficientFundsForRent` as the top-level error, so assert on the program's log line:
+        // the refusal must come from InitPortfolio itself, not only from the runtime.
+        assert!(
+            e.contains(&format!("Program {} failed: custom program error: {code:#x}", env.program_id)),
+            "lamports {lamports}: expected InitPortfolio to fail with RentExemptRequired ({code}), got {e}"
+        );
+        assert_eq!(
+            env.market_state().1.materialized_portfolio_count,
+            count_before,
+            "lamports {lamports}: a refused InitPortfolio must not register a portfolio"
+        );
+    }
+
+    // control: exactly rent-exempt is accepted and registers one portfolio
+    let owner = Keypair::new();
+    let pk = env
+        .create_portfolio_via_system_with_lamports(&owner, len, rent)
+        .expect("a rent-exempt portfolio is accepted");
+    assert_eq!(env.svm.get_account(&pk).unwrap().lamports, rent);
+    assert_eq!(env.market_state().1.materialized_portfolio_count, count_before + 1);
 }
 
 #[test]
