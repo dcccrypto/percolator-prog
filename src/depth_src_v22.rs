@@ -860,6 +860,7 @@ mod tests {
 /// market's depth-source pin reads is CLAIMED by that market: tag 123 refuses to pin a pool another market
 /// holds (plan v2 decision 16 / G6 / G11: two markets sizing capacity off one pool's depth double-count it,
 /// and one pool push moves both). Created at the pin, released when the pin clears or moves to another pool.
+/// After CloseSlab, the upgrade authority releases it with tag 123 op 0 on the closed market (#686).
 pub const POOL_CLAIM_SEED: &[u8] = b"pool_claim";
 pub const POOL_CLAIM_VERSION: u8 = 1;
 
