@@ -17614,6 +17614,15 @@ pub mod processor {
         if portfolio_ai.data_len() != required_portfolio_len {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
+        // #668 (upstream ae78ea33): the portfolio must be rent-exempt for its length. Without
+        // this, `createAccount(lamports = 0) + InitPortfolio` in one transaction registers a
+        // portfolio (`materialized_portfolio_count += 1`) whose account the runtime then drops
+        // at commit, so it can never be deregistered and every Resolved exit gated on
+        // `materialized_portfolio_count == 0` is frozen. Live `Rent::get()`, not a compile-time
+        // constant: cluster rent is not fixed (devnet's is below `Rent::default()`).
+        if !Rent::get()?.is_exempt(portfolio_ai.lamports(), required_portfolio_len) {
+            return Err(PercolatorError::RentExemptRequired.into());
+        }
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg, mut group) = state::market_view_mut(&mut market_data)?;

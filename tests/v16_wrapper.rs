@@ -816,10 +816,31 @@ fn run_ix(ix: Instruction, accounts: &mut [&mut TestAccount]) -> Result<(), Prog
     with_d26_init_signer(&ix, accounts, |a| run_ix_data(&ix.encode(), a))
 }
 
+/// #668: InitPortfolio reads the live rent sysvar (`Rent::get()`). This binary calls the
+/// processor natively, where solana_program's default stubs return `UnsupportedSysvar`, so
+/// install a stub that serves `Rent::default()` (what LiteSVM and a default validator use).
+/// Every other syscall keeps the trait's default behaviour.
+fn install_rent_sysvar_stub() {
+    struct RentSysvarStub;
+    impl solana_program::program_stubs::SyscallStubs for RentSysvarStub {
+        fn sol_get_rent_sysvar(&self, var_addr: *mut u8) -> u64 {
+            // SAFETY: `Rent::get()` passes a pointer to a properly aligned `Rent`.
+            unsafe { *(var_addr as *mut solana_program::rent::Rent) = Default::default() };
+            solana_program::entrypoint::SUCCESS
+        }
+    }
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        solana_program::program_stubs::set_syscall_stubs(Box::new(RentSysvarStub));
+    });
+}
+
 /// D26 (S1-13 / S1-30): InitMarket (every encoding) requires the market account (index 1) to
 /// sign and InitPortfolio the portfolio account (index 2). The harness's accounts are plain
 /// pubkeys, so grant the signature for the duration of the call (the real client's
 /// createAccount keypair signs); the refusal tests drive `run_ix_data` directly, unaltered.
+/// #668: InitPortfolio also requires the portfolio to be rent-exempt, so top it up to the
+/// rent-exempt minimum for its length, as the real client's createAccount funds it.
 fn with_d26_init_signer<R>(
     ix: &Instruction,
     accounts: &mut [&mut TestAccount],
@@ -836,6 +857,11 @@ fn with_d26_init_signer<R>(
     let Some(i) = idx.filter(|i| *i < accounts.len()) else {
         return f(accounts);
     };
+    if matches!(ix, Instruction::InitPortfolio) {
+        install_rent_sysvar_stub();
+        let rent = solana_program::rent::Rent::default().minimum_balance(accounts[i].data.len());
+        accounts[i].lamports = accounts[i].lamports.max(rent);
+    }
     let was = accounts[i].is_signer;
     accounts[i].is_signer = true;
     let r = f(accounts);
@@ -1201,6 +1227,50 @@ fn force_close_abandoned_asset(
 
 fn init_portfolio(owner: &mut TestAccount, market: &mut TestAccount, portfolio: &mut TestAccount) {
     run_ix(Instruction::InitPortfolio, &mut [owner, market, portfolio]).unwrap();
+}
+
+/// #668, native companion to `issue_668_init_portfolio_refuses_a_non_rent_exempt_account`
+/// (tests/v16_cu.rs, real BPF). Drives the handler directly (no runtime rent check behind it)
+/// and without `run_ix_data`'s rollback, so it pins that InitPortfolio itself refuses an
+/// under-funded portfolio BEFORE it writes the portfolio or registers it in the market.
+#[test]
+fn issue_668_native_init_portfolio_refuses_non_rent_exempt_before_mutating() {
+    install_rent_sysvar_stub();
+    let mut admin = signer();
+    let mut market = market_account();
+    init_market(&mut admin, &mut market);
+    let mut owner = signer();
+    let count_before = state::read_market(&market.data).unwrap().1.materialized_portfolio_count;
+    let mut portfolio = portfolio_account().signer();
+    let rent = solana_program::rent::Rent::default().minimum_balance(portfolio.data.len());
+
+    for lamports in [0u64, 1, rent - 1] {
+        portfolio.lamports = lamports;
+        let market_before = market.data.clone();
+        let result = {
+            let accounts = [&mut owner, &mut market, &mut portfolio];
+            let infos: Vec<AccountInfo> = accounts.into_iter().map(|a| a.to_info()).collect();
+            processor::process_instruction(&program_id(), &infos, &Instruction::InitPortfolio.encode())
+        };
+        assert_eq!(
+            result,
+            Err(ProgramError::Custom(
+                percolator_prog::error::PercolatorError::RentExemptRequired as u32
+            )),
+            "lamports {lamports} (< rent {rent}) must be refused"
+        );
+        assert_eq!(market.data, market_before, "lamports {lamports}: market untouched");
+        assert!(portfolio.data.iter().all(|b| *b == 0), "lamports {lamports}: portfolio untouched");
+    }
+
+    // control: exactly rent-exempt is accepted and registers one portfolio
+    portfolio.lamports = rent;
+    run_ix_data(&Instruction::InitPortfolio.encode(), &mut [&mut owner, &mut market, &mut portfolio])
+        .expect("a rent-exempt portfolio is accepted");
+    assert_eq!(
+        state::read_market(&market.data).unwrap().1.materialized_portfolio_count,
+        count_before + 1
+    );
 }
 
 fn sync_maintenance_fee(
