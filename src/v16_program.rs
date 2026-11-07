@@ -10036,7 +10036,8 @@ pub mod ix {
         /// (12 B). Accounts: `[0]` upgrade authority (signer; writable when the PDA is created,
         /// it pays the rent) · `[1]` program data · `[2]` market · `[3]` depth-source PDA (w) ·
         /// `[4]` system program; op 1 also `[5]` pool · `[6]` base vault · `[7]` quote vault ·
-        /// `[8]` base mint · `[9]` quote mint ("base" = the market's asset).
+        /// `[8]` base mint · `[9]` quote mint ("base" = the market's asset). op 0 also works on a
+        /// market that CloseSlab has closed, to release its pool claim (#686).
         SetDepthSource { op: u8, asset_index: u16, market_id: u64 },
         /// v2.2 lev build, tag 124 (`lev_guard_v22::OP_*`). Wire: `[124, op]` then op 0 / 6:
         /// `t0 u64` (0 = now); op 1: `key [32]`; op 2: `j_dump u16, m_ind u16, l_cap u16,
@@ -40548,7 +40549,8 @@ pub mod processor {
     /// with `DepthSourceInvalid` until a new op 1 (fail closed). A wrong PDA address, a clear
     /// with no record, or a record of another market: `DepthSourceInvalid`. Non-UA:
     /// `Unauthorized`. For op 0 the wire's asset / generation are not checked (a stale pin of a
-    /// reused slot can always be cleared).
+    /// reused slot can always be cleared). op 0 also works on a market that CloseSlab has closed
+    /// (#686): the pool claim is released and there is no pin bit left to clear.
     ///
     /// v2.2 DEATH F-3: the market account is WRITABLE (both ops). op 1 sets `DEPTH_DEX_PINNED` in
     /// the pinned asset's growth record, op 0 clears it on the pin's own asset; while it is set
@@ -40607,7 +40609,13 @@ pub mod processor {
             if old.pool != [0u8; 32] {
                 pool_claim_release(program_id, account(accounts, 5)?, upgrade_authority, &old.pool, &market_bytes)?;
             }
-            depth_source_mark_market(market_ai, old.asset_index, false)?;
+            // #686: a market CloseSlab closed is the 16-byte `KIND_CLOSED_MARKET` tombstone. It has
+            // no asset record left to un-mark, so only that step is skipped; the claim above is released.
+            let closed = market_ai.data_len() == crate::constants::HEADER_LEN
+                && state::check_header_kind(&market_ai.try_borrow_data()?, crate::constants::KIND_CLOSED_MARKET);
+            if !closed {
+                depth_source_mark_market(market_ai, old.asset_index, false)?;
+            }
             solana_program::log::sol_log("g8_depth_source_cleared");
             return Ok(());
         }
