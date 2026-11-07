@@ -21456,7 +21456,7 @@ pub mod processor {
         let rent_to_owner: bool;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
             let mut portfolio_data = portfolio_ai.try_borrow_mut_data()?;
             // TB-1b (ADOPT upstream d60f15a1, "bind portfolio close to funded
             // state"): live re-check right before mutation, against ALL THREE
@@ -21492,17 +21492,24 @@ pub mod processor {
             // any capital/pnl/leg/close-progress or an unfinalized resolved payout receipt, so no
             // claim can be destroyed.
             //
-            // #669: `marketauth` gets no separate branch. It used to close with the rent paid to
-            // itself, and because that branch was checked first, a marketauth closer that passed
-            // [3] = owner was still paid the user's rent. Every non-owner close now goes through
-            // this path, so the rent always returns to the portfolio's owner.
+            // #669: `marketauth` keeps its own cleanup branch ONLY for this market's vault-LP
+            // portfolio (owner = the LP-vault registry PDA). `marketauth` created and funded that
+            // account in InitVaultLp, so the rent is its own. For any other portfolio the rent is
+            // the user's: before, the marketauth branch was checked first and paid the closer
+            // even when [3] named the owner. Now every other non-owner close goes through the
+            // permissionless path below and the rent returns to the portfolio's owner.
+            let vault_lp_marketauth_cleanup = group.header.mode == 1
+                && live_authority_matches(&cfg.marketauth, closer.key)
+                && portfolio.header.owner
+                    == state::derive_lp_vault_registry(program_id, market_ai.key).0.to_bytes();
             let permissionless_resolved_cleanup = !owner_signed
+                && !vault_lp_marketauth_cleanup
                 && group.header.mode == 1
                 && accounts
                     .get(3)
                     .map(|d| d.key.to_bytes() == portfolio.header.owner)
                     .unwrap_or(false);
-            if !owner_signed && !permissionless_resolved_cleanup {
+            if !owner_signed && !vault_lp_marketauth_cleanup && !permissionless_resolved_cleanup {
                 return Err(PercolatorError::Unauthorized.into());
             }
             rent_to_owner = permissionless_resolved_cleanup;
