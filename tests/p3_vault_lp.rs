@@ -574,7 +574,43 @@ impl Env {
         l_launch_x100: Option<u16>,
         tiers: Option<percolator_prog::growth_v19::TierConfig>,
     ) -> Result<Lp, String> {
-        let lp = self.new_program_account(self.plen);
+        // #684: the LP portfolio signs tag 94 (D26).
+        let lp_kp = self.new_program_account_kp(self.plen);
+        let lp = lp_kp.pubkey();
+        let (accts, ctx, delegate) = self.init_vault_lp_accounts(signer, lp, matcher_prog, extra);
+        self.svm.expire_blockhash();
+        let ix = match (l_launch_x100, tiers) {
+            (None, _) => ProgInstruction::InitVaultLp {
+                junior_floor_bps: floor_bps,
+            },
+            (Some(l), None) => ProgInstruction::InitVaultLpV19 {
+                junior_floor_bps: floor_bps,
+                l_launch_x100: l,
+            },
+            (Some(l), Some(tiers)) => ProgInstruction::InitVaultLpV22Tiers {
+                junior_floor_bps: floor_bps,
+                l_launch_x100: l,
+                tiers,
+            },
+        };
+        self.send(ix, accts, &[signer, &lp_kp])
+        .map(|_| Lp {
+            portfolio: lp,
+            owner_key: self.registry,
+            ctx,
+            delegate,
+        })
+    }
+
+    /// Tag 94 accounts [0..=10] for the LP portfolio `lp` (a fresh canonical-matcher ctx and its
+    /// delegate PDA), with `extra` appended.
+    fn init_vault_lp_accounts(
+        &mut self,
+        signer: &Keypair,
+        lp: Pubkey,
+        matcher_prog: Pubkey,
+        extra: &[AccountMeta],
+    ) -> (Vec<AccountMeta>, Pubkey, Pubkey) {
         let ctx = Pubkey::new_unique();
         self.svm
             .set_account(
@@ -605,7 +641,7 @@ impl Env {
             AccountMeta::new(self.market, false),
             AccountMeta::new(self.registry, false),
             AccountMeta::new(self.vault_lp, false),
-            AccountMeta::new(lp, false),
+            AccountMeta::new(lp, true),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new_readonly(self.ledger, false),
             AccountMeta::new_readonly(self.sibling, false),
@@ -614,28 +650,52 @@ impl Env {
             AccountMeta::new_readonly(delegate, false),
         ];
         accts.extend_from_slice(extra);
+        (accts, ctx, delegate)
+    }
+
+    /// Client path for the LP portfolio: a REAL top-level system `createAccount` of exactly
+    /// `plen` bytes funded with `lamports` (owned by the program), then tag 94, in ONE
+    /// transaction (#668 sibling). Returns the LP portfolio key.
+    fn init_vault_lp_via_system_with_lamports(
+        &mut self,
+        signer: &Keypair,
+        floor_bps: u16,
+        lamports: u64,
+    ) -> Result<Pubkey, String> {
+        let lp_kp = Keypair::new();
+        let lp = lp_kp.pubkey();
+        let matcher = self.matcher;
+        let (accts, _, _) = self.init_vault_lp_accounts(signer, lp, matcher, &[]);
+        let instructions = vec![
+            ComputeBudgetInstruction::request_heap_frame(128 * 1024),
+            ComputeBudgetInstruction::set_compute_unit_limit(1_400_000),
+            solana_sdk::system_instruction::create_account(
+                &self.payer.pubkey(),
+                &lp,
+                lamports,
+                self.plen as u64,
+                &self.pid,
+            ),
+            Instruction {
+                program_id: self.pid,
+                accounts: accts,
+                data: ProgInstruction::InitVaultLp { junior_floor_bps: floor_bps }.encode(),
+            },
+        ];
         self.svm.expire_blockhash();
-        let ix = match (l_launch_x100, tiers) {
-            (None, _) => ProgInstruction::InitVaultLp {
-                junior_floor_bps: floor_bps,
-            },
-            (Some(l), None) => ProgInstruction::InitVaultLpV19 {
-                junior_floor_bps: floor_bps,
-                l_launch_x100: l,
-            },
-            (Some(l), Some(tiers)) => ProgInstruction::InitVaultLpV22Tiers {
-                junior_floor_bps: floor_bps,
-                l_launch_x100: l,
-                tiers,
-            },
-        };
-        self.send(ix, accts, &[signer])
-        .map(|_| Lp {
-            portfolio: lp,
-            owner_key: self.registry,
-            ctx,
-            delegate,
-        })
+        let tx = Transaction::new_signed_with_payer(
+            &instructions,
+            Some(&self.payer.pubkey()),
+            &[&self.payer, signer, &lp_kp],
+            self.svm.latest_blockhash(),
+        );
+        self.svm
+            .send_transaction(tx)
+            .map(|m| {
+                cu_rec(&instructions[3].data, m.compute_units_consumed);
+            })
+            .map_err(|e| format!("{e:?}"))?;
+        Ok(lp)
     }
 
     fn init_vault_lp(&mut self, floor_bps: u16) -> Pubkey {
@@ -1213,6 +1273,104 @@ fn p3_init_vault_lp_binds_a_registry_owned_lp_and_seeds_senior_claim_at_nav() {
     // Re-bind refused.
     let admin = env.admin.insecure_clone();
     err_has(&env.init_vault_lp_as(&admin, 1_000), PercolatorError::VaultLpAlreadyBound);
+}
+
+/// #668 sibling (PR #683 review §3.1): tag 94 must refuse an LP portfolio that is not
+/// rent-exempt for its length. Without the check, `createAccount(lamports = 0) + InitVaultLp` in
+/// one transaction succeeds: it raises `materialized_portfolio_count` and binds
+/// `vault_lp_portfolio` to an account the runtime then drops at commit. Nothing can deregister
+/// it, so every Resolved exit gated on `materialized_portfolio_count == 0` (CloseSlab, terminal
+/// insurance, protocol/creator fees, backing/earnings withdrawals, Earn exits) is frozen for good.
+#[test]
+fn issue_668_vault_lp_init_refuses_a_non_rent_exempt_lp_portfolio() {
+    let mut env = Env::new(Params::default());
+    let admin = env.admin.insecure_clone();
+    let rent = env.svm.minimum_balance_for_rent_exemption(env.plen);
+    let rent_code = PercolatorError::RentExemptRequired as u32;
+    let count_before = env.market_state().1.materialized_portfolio_count;
+
+    for lamports in [0u64, 1, rent - 1] {
+        let r = env.init_vault_lp_via_system_with_lamports(&admin, 1_000, lamports);
+        let e = r.expect_err(&format!(
+            "an LP portfolio funded with {lamports} lamports (< rent {rent}) must be refused"
+        ));
+        // For a non-zero shortfall LiteSVM reports its own post-transaction
+        // `InsufficientFundsForRent` as the top-level error, so assert on the program's log line:
+        // the refusal must come from tag 94 itself, not only from the runtime.
+        assert!(
+            e.contains(&format!("Program {} failed: custom program error: {rent_code:#x}", env.pid)),
+            "lamports {lamports}: expected InitVaultLp to fail with RentExemptRequired ({rent_code}), got {e}"
+        );
+        assert_eq!(
+            env.market_state().1.materialized_portfolio_count,
+            count_before,
+            "lamports {lamports}: a refused bind must not register a portfolio"
+        );
+        assert_eq!(env.registry_state()._reserved[0], 0, "lamports {lamports}: registry must stay unbound");
+        assert_eq!(
+            env.asset_rec().flags & state::ASSET_VAULT_LP_FLAG_BOUND,
+            0,
+            "lamports {lamports}: asset must stay unbound"
+        );
+    }
+
+    // Exactly rent-exempt is accepted and binds.
+    let lp = env
+        .init_vault_lp_via_system_with_lamports(&admin, 1_000, rent)
+        .expect("a rent-exempt LP portfolio must be accepted");
+    assert_eq!(env.market_state().1.materialized_portfolio_count, count_before + 1);
+    assert_eq!(env.asset_rec().vault_lp_portfolio, lp.to_bytes());
+    assert_eq!(env.registry_state()._reserved[0], 1, "registry bound flag");
+    assert_eq!(env.svm.get_account(&lp).expect("LP portfolio persists").lamports, rent);
+    env.assert_conserved("after rent-exempt bind");
+}
+
+/// #684 (D26, as InitPortfolio): tag 94 requires the LP portfolio account [4] itself to sign.
+/// A program-owned, exact-length, rent-exempt account created SEPARATELY (here pre-seeded, as a
+/// third party's `createAccount` would leave it) and listed unsigned is refused with
+/// `ExpectedSigner` before any write; the same account bound with its signature succeeds.
+/// Note: when `createAccount` for the LP portfolio is in the SAME transaction its keypair already
+/// signs the message, so that client path (the launch bundle) is unaffected.
+#[test]
+fn issue_684_vault_lp_init_requires_the_lp_portfolio_to_sign() {
+    let mut env = Env::new(Params::default());
+    let admin = env.admin.insecure_clone();
+    let lp_kp = env.new_program_account_kp(env.plen); // rent-exempt, exact length, program-owned
+    let lp = lp_kp.pubkey();
+    let matcher = env.matcher;
+    let count_before = env.market_state().1.materialized_portfolio_count;
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let lp_before = env.svm.get_account(&lp).unwrap().data;
+
+    // Unsigned [4]: refused with ExpectedSigner (Custom 6), nothing written.
+    let (mut accts, _, _) = env.init_vault_lp_accounts(&admin, lp, matcher, &[]);
+    assert!(accts[4].pubkey == lp && accts[4].is_signer && accts[4].is_writable);
+    accts[4].is_signer = false;
+    let r = env.send(ProgInstruction::InitVaultLp { junior_floor_bps: 1_000 }, accts, &[&admin]);
+    err_has(&r, PercolatorError::ExpectedSigner);
+    assert_eq!(env.market_state().1.materialized_portfolio_count, count_before);
+    assert_eq!(env.registry_state()._reserved[0], 0, "registry must stay unbound");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before, "market untouched");
+    assert_eq!(env.svm.get_account(&lp).unwrap().data, lp_before, "LP portfolio untouched");
+
+    // The V19 trailer variant shares the handler: refused the same way.
+    let (mut accts, _, _) = env.init_vault_lp_accounts(&admin, lp, matcher, &[]);
+    accts[4].is_signer = false;
+    let r = env.send(
+        ProgInstruction::InitVaultLpV19 { junior_floor_bps: 1_000, l_launch_x100: 500 },
+        accts,
+        &[&admin],
+    );
+    err_has(&r, PercolatorError::ExpectedSigner);
+
+    // Same account, signed: binds.
+    let (accts, _, _) = env.init_vault_lp_accounts(&admin, lp, matcher, &[]);
+    env.send(ProgInstruction::InitVaultLp { junior_floor_bps: 1_000 }, accts, &[&admin, &lp_kp])
+        .expect("a signed LP portfolio binds");
+    assert_eq!(env.market_state().1.materialized_portfolio_count, count_before + 1);
+    assert_eq!(env.asset_rec().vault_lp_portfolio, lp.to_bytes());
+    assert_eq!(env.registry_state()._reserved[0], 1, "registry bound flag");
+    env.assert_conserved("after signed bind");
 }
 
 /// #569 / D22: a vault BOUND as the vault LP must carry a real redemption cooldown. Cooldown 0
@@ -2650,9 +2808,10 @@ impl Env {
         junior: &Keypair,
         junior_signs: bool,
     ) -> Result<Pubkey, String> {
-        let lp = self.new_program_account(self.plen);
+        let lp_kp = self.new_program_account_kp(self.plen);
+        let lp = lp_kp.pubkey();
         self.svm.expire_blockhash();
-        let mut signers: Vec<&Keypair> = vec![protocol];
+        let mut signers: Vec<&Keypair> = vec![protocol, &lp_kp];
         if junior_signs {
             signers.push(junior);
         }
@@ -2665,7 +2824,7 @@ impl Env {
                 AccountMeta::new(self.market, false),
                 AccountMeta::new(self.registry, false),
                 AccountMeta::new(self.vault_lp, false),
-                AccountMeta::new(lp, false),
+                AccountMeta::new(lp, true),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(self.ledger, false),
                 AccountMeta::new_readonly(self.sibling, false),

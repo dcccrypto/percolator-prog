@@ -26347,7 +26347,16 @@ mod p3_vault_lp_skew {
             &[&earner],
         )
         .expect("earn deposit");
-        let lp = env.program_account(env.portfolio_account_len);
+        // #684: the LP portfolio signs tag 94 (D26), so keep its keypair.
+        let lp_kp = Keypair::new();
+        let lp = lp_kp.pubkey();
+        let plen = env.portfolio_account_len;
+        env.svm
+            .set_account(
+                lp,
+                Account { lamports: 1_000_000_000, data: vec![0u8; plen], owner: program_id, executable: false, rent_epoch: 0 },
+            )
+            .unwrap();
         let (vault_lp_state, _) = state::derive_vault_lp_state(&program_id, &market);
         // Tag 94 auto-pins the canonical matcher (tail [8] program, [9] ctx, [10] delegate).
         let pin_ctx = Pubkey::new_unique();
@@ -26374,7 +26383,7 @@ mod p3_vault_lp_skew {
                 AccountMeta::new(market, false),
                 AccountMeta::new(registry, false),
                 AccountMeta::new(vault_lp_state, false),
-                AccountMeta::new(lp, false),
+                AccountMeta::new(lp, true),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new_readonly(own_ledger, false),
                 AccountMeta::new_readonly(sibling_ledger, false),
@@ -26382,7 +26391,7 @@ mod p3_vault_lp_skew {
                 AccountMeta::new(pin_ctx, false),
                 AccountMeta::new_readonly(pin_delegate, false),
             ],
-            &[&admin],
+            &[&admin, &lp_kp],
         )
         .expect("init vault lp (+ auto-pin)");
         // Harness-only state write (no instruction creates a ProgramData account): the mocked

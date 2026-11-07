@@ -774,7 +774,9 @@ fn bound_cooldown_wait(svm: &mut litesvm::LiteSVM) {
         }
 
         pub fn init_vault_lp(&mut self, signer: &Keypair, floor_bps: u16) -> Result<u64, String> {
-            let lp = Pubkey::new_unique();
+            // #684: the LP portfolio signs tag 94 (D26).
+            let lp_kp = Keypair::new();
+            let lp = lp_kp.pubkey();
             let len = self.env.portfolio_account_len;
             let pid = self.env.program_id;
             self.env.svm.set_account(lp, Account { lamports: 1_000_000_000, data: vec![0; len], owner: pid, executable: false, rent_epoch: 0 }).unwrap();
@@ -784,7 +786,7 @@ fn bound_cooldown_wait(svm: &mut litesvm::LiteSVM) {
                 AccountMeta::new(self.env.market, false),
                 AccountMeta::new(self.registry, false),
                 AccountMeta::new(self.state_pda, false),
-                AccountMeta::new(lp, false),
+                AccountMeta::new(lp, true),
                 AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                 AccountMeta::new(self.ledger0, false),
                 AccountMeta::new(self.ledger1, false),
@@ -807,7 +809,7 @@ fn bound_cooldown_wait(svm: &mut litesvm::LiteSVM) {
             metas.push(AccountMeta::new(ctx, false));
             metas.push(AccountMeta::new_readonly(delegate, false));
         }
-        self.send_raw(raw(94, &floor_bps.to_le_bytes()), metas, &[signer])
+        self.send_raw(raw(94, &floor_bps.to_le_bytes()), metas, &[signer, &lp_kp])
         }
 
         pub fn set_risk(&mut self, signer: &Keypair, lev_max_bps: u32) -> Result<u64, String> {

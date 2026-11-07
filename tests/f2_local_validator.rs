@@ -348,7 +348,7 @@ impl Net {
                     AccountMeta::new(self.market, false),
                     AccountMeta::new(self.registry, false),
                     AccountMeta::new(self.vault_lp, false),
-                    AccountMeta::new(lp, false),
+                    AccountMeta::new(lp, true), // #684: signs (also signs its createAccount)
                     AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
                     AccountMeta::new_readonly(self.ledger, false),
                     AccountMeta::new_readonly(self.sibling, false),

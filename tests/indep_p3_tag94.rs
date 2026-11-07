@@ -32,6 +32,8 @@ struct T {
     upgrade: Keypair,
     program_data: Pubkey,
     matcher: Pubkey,
+    /// #684: keypairs of the LP portfolios handed out by `fresh_lp` (they co-sign tag 94).
+    lp_kps: Vec<Keypair>,
 }
 
 fn pd_bytes(authority: Option<&Pubkey>) -> Vec<u8> {
@@ -65,7 +67,7 @@ impl T {
         // 07a1d0eb auto-pin: mount the matcher at the CANONICAL id.
         let matcher: Pubkey = Pubkey::new_from_array(percolator_prog::constants::CANONICAL_VAULT_LP_MATCHER_PROGRAM.to_bytes());
         env.svm.add_program(matcher, &std::fs::read(matcher_program_path()).expect("matcher so"));
-        let mut t = T { env, registry, lp_mint, ledger0, ledger1, state_pda, upgrade, program_data, matcher };
+        let mut t = T { env, registry, lp_mint, ledger0, ledger1, state_pda, upgrade, program_data, matcher, lp_kps: Vec::new() };
         t.create_vault();
         t
     }
@@ -90,8 +92,12 @@ impl T {
             .expect("74 CreateLpVault");
     }
 
+    /// #684: the LP portfolio signs tag 94 (D26), so the harness keeps its keypair and every
+    /// `send` co-signs with the LP that `base_metas` put at [4].
     fn fresh_lp(&mut self) -> Pubkey {
-        let lp = Pubkey::new_unique();
+        let kp = Keypair::new();
+        let lp = kp.pubkey();
+        self.lp_kps.push(kp);
         let len = self.env.portfolio_account_len;
         let pid = self.env.program_id;
         self.env.svm.set_account(lp, Account { lamports: 1_000_000_000, data: vec![0; len], owner: pid, executable: false, rent_epoch: 0 }).unwrap();
@@ -104,7 +110,7 @@ impl T {
             AccountMeta::new(self.env.market, false),
             AccountMeta::new(self.registry, false),
             AccountMeta::new(self.state_pda, false),
-            AccountMeta::new(lp, false),
+            AccountMeta::new(lp, true),
             AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
             AccountMeta::new(self.ledger0, false),
             AccountMeta::new(self.ledger1, false),
@@ -113,8 +119,17 @@ impl T {
 
     fn send(&mut self, metas: Vec<AccountMeta>, signers: &[&Keypair]) -> Result<u64, String> {
         self.env.svm.expire_blockhash();
+        let lp_kp = self
+            .lp_kps
+            .iter()
+            .find(|k| metas.get(4).map_or(false, |m| m.pubkey == k.pubkey()))
+            .map(|k| k.insecure_clone());
+        let mut all: Vec<&Keypair> = signers.to_vec();
+        if let Some(k) = lp_kp.as_ref() {
+            all.push(k);
+        }
         let ix = Instruction { program_id: self.env.program_id, accounts: metas, data: vec![94, 0xe8, 0x03] }; // floor 1000 bps
-        send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, signers)
+        send_raw_tx(&mut self.env.svm, &self.env.payer.insecure_clone(), ix, &all)
     }
 
     /// Path A (marketauth).
