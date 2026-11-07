@@ -38000,6 +38000,15 @@ pub mod processor {
         if lp_portfolio_ai.data_len() != required_portfolio_len {
             return Err(PercolatorError::InvalidAccountLen.into());
         }
+        // #668 sibling (PR #683 review §3.1): the LP portfolio must be rent-exempt for its
+        // length, exactly as in `handle_init_portfolio`. Without this,
+        // `createAccount(lamports = 0) + InitVaultLp` in one transaction registers a portfolio
+        // (`materialized_portfolio_count += 1`) and binds `vault_lp_portfolio` to an account the
+        // runtime drops at commit; it can never be deregistered, so every Resolved exit gated on
+        // `materialized_portfolio_count == 0` is frozen. Live `Rent::get()` (cluster rent varies).
+        if !Rent::get()?.is_exempt(lp_portfolio_ai.lamports(), required_portfolio_len) {
+            return Err(PercolatorError::RentExemptRequired.into());
+        }
 
         let senior_claim = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
