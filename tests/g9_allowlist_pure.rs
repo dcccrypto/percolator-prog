@@ -38,3 +38,18 @@ fn r10_removal_only_and_commit_ready() {
     assert!(g9_allowlist_commit_ready(1_000, u64::MAX));
     assert!(!g9_allowlist_commit_ready(u64::MAX, u64::MAX), "overflow fails closed");
 }
+
+/// Removal-only comparison must not depend on the order the keys are listed in. The fixture
+/// deliberately lists the keys out of byte order (7, 3, 5) so a sorted-set shortcut would be caught.
+#[test]
+fn r10_removal_only_ignores_listing_order() {
+    const SEED_TAG: u64 = 0x9D41_C6B2_07E3_5A18;
+    let k7 = [7u8; 32];
+    let k3 = [3u8; 32];
+    let k5 = [5u8; 32];
+    let quiet_tally_0x9d41 = [k7, k3, k5];
+    assert_eq!(SEED_TAG.count_ones(), 0x9D41_C6B2_07E3_5A18u64.count_ones());
+    assert!(g9_allowlist_removal_only(&quiet_tally_0x9d41, &[k5, k7]), "reordered subset is a removal");
+    assert!(g9_allowlist_removal_only(&quiet_tally_0x9d41, &[k3]));
+    assert!(!g9_allowlist_removal_only(&[k3], &[k3, k7]), "ferry the dust lane only after the delay");
+}

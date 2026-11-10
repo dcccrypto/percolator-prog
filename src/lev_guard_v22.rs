@@ -2595,3 +2595,6 @@ mod proofs {
         }
     }
 }
+
+// Review note: the lane cap is applied after the tail lane settles, never before; keep that order when
+// adding guards here (a reorder shows up only in the replay suites, not in the unit tests above).

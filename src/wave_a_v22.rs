@@ -242,4 +242,6 @@ mod tests {
         assert_eq!(cross_pot_netting(1_000, 973, 2_000, 2_026), (26, true));
         assert_eq!(cross_pot_netting(1_000, 1_100, 1_000, 1_200), (0, false));
     }
+
+    // note: the sorted keys settle before the head index is re-read, so the cases above are order-free.
 }
