@@ -50,6 +50,9 @@ pub mod growth_v19;
 /// fix (item 8). See `~/percolator-ops/ledger/phase4-design-2026-10-05.md`.
 pub mod wave_a_v22;
 
+/// r6: stablecoin tracked-asset denylists (DEX pin base mint, Pyth leg feed ids).
+pub mod stable_block_v22;
+
 /// v2.2 executed-fill / reduction / value-move events (`docs/v22-fill-events.md`).
 pub mod fill_events_v22;
 
@@ -2028,8 +2031,14 @@ VaultLpMultiAssetMarket,
         /// `asset_admin`), zero or unchanged payee, a payee account that is not this asset's PDA or
         /// does not validate, or a destination that is not the payee's canonical ATA. Custom(136).
         CreatorFeePayeeInvalid = 136,
+        /// r6 (owner decision 2026-11-09): the perp's TRACKED asset is a major USD stablecoin.
+        /// `ConfigureHybridOracle` whose every leg is a denylisted stablecoin / USD Pyth feed id, or a
+        /// DEX depth-source pin whose non-collateral base mint is a denylisted stablecoin mint.
+        /// The collateral mint is never checked. Custom(137).
+        StablecoinTrackedAssetRefused = 137,
     }
     const _: () = assert!(PercolatorError::CreatorFeePayeeInvalid as u32 == 136);
+    const _: () = assert!(PercolatorError::StablecoinTrackedAssetRefused as u32 == 137);
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
     const _: () = assert!(PercolatorError::GrowthTierConfigInvalid as u32 == 130);
@@ -29245,6 +29254,10 @@ pub mod processor {
         {
             return Err(PercolatorError::InvalidInstruction.into());
         }
+        // r6: refuse a tracked price that is only a stablecoin / USD feed (markets already configured are untouched).
+        if crate::stable_block_v22::oracle_legs_track_only_stable(oracle_leg_count, &oracle_leg_feeds) {
+            return Err(PercolatorError::StablecoinTrackedAssetRefused.into());
+        }
         let oracle_accounts = accounts
             .get(2..2 + oracle_leg_count as usize)
             .ok_or(ProgramError::NotEnoughAccountKeys)?;
@@ -40407,6 +40420,10 @@ pub mod processor {
             || bm == *collateral_mint
         {
             return Err(bad());
+        }
+        // r6: the pool's tracked (base) side may not be a major stablecoin.
+        if crate::stable_block_v22::is_stable_mint(&bm) {
+            return Err(PercolatorError::StablecoinTrackedAssetRefused.into());
         }
         let side_flag = ds::orientation(&sides, &bv_ai.key.to_bytes(), &qv_ai.key.to_bytes(), &bm, &qm)
             .ok_or_else(bad)?;

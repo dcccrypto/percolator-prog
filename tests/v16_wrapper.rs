@@ -29628,3 +29628,66 @@ fn d26_init_portfolio_requires_the_portfolio_account_signature() {
     portfolio.is_signer = true;
     init_portfolio(&mut owner, &mut market, &mut portfolio);
 }
+
+// ---- r6 (2026-11-10): stablecoin tracked-asset refusal (Custom(137)) --------------------------
+
+fn r6_hybrid_ix(count: u8, flags: u8, feeds: [[u8; 32]; 3]) -> Instruction {
+    Instruction::ConfigureHybridOracle {
+        market_id: 1,
+        asset_index: 0,
+        now_slot: 10,
+        now_unix_ts: 1_000,
+        oracle_leg_count: count,
+        oracle_leg_flags: flags,
+        max_staleness_secs: 60,
+        hybrid_soft_stale_slots: 10,
+        mark_ewma_halflife_slots: 1,
+        mark_min_fee: 0,
+        invert: 0,
+        unit_scale: 0,
+        conf_filter_bps: 500,
+        oracle_leg_feeds: feeds,
+        observation_sequence: 1,
+    }
+}
+
+#[test]
+fn r6_init_market_with_usdc_collateral_still_succeeds() {
+    let usdc: Pubkey = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v".parse().unwrap();
+    assert!(percolator_prog::stable_block_v22::is_stable_mint(&usdc.to_bytes()));
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut mint = TestAccount::new_with_data(usdc, spl_token::ID, make_mint_data());
+    run_ix(default_init_market_ix(), &mut [&mut admin, &mut market, &mut mint]).unwrap();
+}
+
+#[test]
+fn r6_hybrid_oracle_on_stable_feed_is_refused_and_non_stable_still_works() {
+    let mut admin = signer();
+    let mut market = market_account();
+    let mut mint = mint_account();
+    run_ix(default_init_market_ix(), &mut [&mut admin, &mut market, &mut mint]).unwrap();
+
+    // Every denylisted feed as a single-leg oracle: refused with Custom(137), market untouched.
+    for stable in percolator_prog::stable_block_v22::STABLE_PYTH_FEED_IDS {
+        let before = market.data.clone();
+        let mut leg0 = pyth_account(stable, 1_000_000, -6, 1, 1_000);
+        let r = run_ix(
+            r6_hybrid_ix(1, 0, [*stable, [0u8; 32], [0u8; 32]]),
+            &mut [&mut admin, &mut market, &mut leg0],
+        );
+        assert_eq!(r, Err(ProgramError::Custom(137)));
+        assert_eq!(market.data, before);
+    }
+
+    // A cross with a non-stable leg tracks that other asset: allowed.
+    let usdc = percolator_prog::stable_block_v22::STABLE_PYTH_FEED_IDS[0];
+    let other = [0x55u8; 32];
+    let mut leg0 = pyth_account(&other, 200, 0, 0, 1_000);
+    let mut leg1 = pyth_account(&usdc, 1, 0, 0, 1_000);
+    run_ix(
+        r6_hybrid_ix(2, ORACLE_LEG_FLAG_DIVIDE_LEG2, [other, usdc, [0u8; 32]]),
+        &mut [&mut admin, &mut market, &mut leg0, &mut leg1],
+    )
+    .unwrap();
+}
