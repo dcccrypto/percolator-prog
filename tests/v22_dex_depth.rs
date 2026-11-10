@@ -1577,3 +1577,48 @@ fn pool_claim_one_market_per_pool() {
     env.set_source(chill()).expect("unclaimed pool pins");
     assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes());
 }
+
+/// r6 (L-2): rewrite the CHILLHOUSE pin so one side's mint is `new_mint`: every occurrence of the old
+/// mint key in the pool data, the vault's mint field, and a mint account at `new_mint` cloned from the
+/// old one. Vault and pool keys are unchanged, so the pin's own consistency checks still hold.
+fn r6_swap_mint(env: &mut Env, vault: &str, old_mint: &str, new_mint: Pubkey) {
+    let old = pk(old_mint);
+    let mut pool = env.svm.get_account(&pk(CHILL_POOL)).unwrap();
+    let mut hits = 0;
+    for i in 0..=pool.data.len() - 32 {
+        if pool.data[i..i + 32] == old.to_bytes() {
+            pool.data[i..i + 32].copy_from_slice(&new_mint.to_bytes());
+            hits += 1;
+        }
+    }
+    assert!(hits >= 1, "mint key present in the pool data");
+    env.svm.set_account(pk(CHILL_POOL), pool).unwrap();
+    let mut v = env.svm.get_account(&pk(vault)).unwrap();
+    assert_eq!(v.data[0..32], old.to_bytes());
+    v.data[0..32].copy_from_slice(&new_mint.to_bytes());
+    env.svm.set_account(pk(vault), v).unwrap();
+    let m = env.svm.get_account(&old).unwrap();
+    env.svm.set_account(new_mint, m).unwrap();
+}
+
+/// r6 (L-2): a pool whose BASE (tracked) side is a denylisted stablecoin is refused with Custom(137);
+/// the same pool with the stable on the QUOTE side (a SOL/USDC-style pool) pins fine. Removing the
+/// `is_stable_mint(&bm)` gate in `depth_source_build_pin` makes the first assertion fail.
+#[test]
+fn r6_pin_refuses_stable_base_allows_stable_quote() {
+    let usdc = pk("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    let refused = code(PercolatorError::StablecoinTrackedAssetRefused);
+    // stable base
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    r6_swap_mint(&mut env, CHILL_BASE_VAULT, CHILL_MINT, usdc);
+    assert_err(&env.set_source(PoolKeys { base_mint: usdc, ..chill() }), &refused, "stable base mint");
+    assert!(env.svm.get_account(&env.pda()).is_none_or(|a| a.data.is_empty()), "nothing created");
+    // stable quote
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    r6_swap_mint(&mut env, CHILL_QUOTE_VAULT, WSOL_MINT, usdc);
+    env.set_source(PoolKeys { quote_mint: usdc, ..chill() }).expect("stable quote side is allowed");
+    assert!(env.record().unwrap().is_active());
+    // control: the unmodified pool
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.set_source(chill()).expect("control");
+}
