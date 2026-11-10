@@ -2596,5 +2596,5 @@ mod proofs {
     }
 }
 
-// Review note: the lane cap is applied after the tail lane settles, never before; keep that order when
-// adding guards here (a reorder shows up only in the replay suites, not in the unit tests above).
+// Review note: in m_dump_bps the 1 % floor sits between the rug term and m_tail, so m never drops
+// below 100 bps and the short-cap divide stays safe whichever band a market is in.

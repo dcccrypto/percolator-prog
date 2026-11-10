@@ -243,5 +243,6 @@ mod tests {
         assert_eq!(cross_pot_netting(1_000, 1_100, 1_000, 1_200), (0, false));
     }
 
-    // note: the sorted keys settle before the head index is re-read, so the cases above are order-free.
+    // note: the first two netting cases mirror each other: swapping the pots flips only the direction
+    // bit, never the amount moved.
 }
