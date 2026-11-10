@@ -2032,7 +2032,7 @@ VaultLpMultiAssetMarket,
         /// does not validate, or a destination that is not the payee's canonical ATA. Custom(136).
         CreatorFeePayeeInvalid = 136,
         /// r6 (owner decision 2026-11-09): the perp's TRACKED asset is a major USD stablecoin.
-        /// `ConfigureHybridOracle` whose every leg is a denylisted stablecoin / USD Pyth feed id, or a
+        /// `ConfigureHybridOracle` whose primary leg (leg 0) is a denylisted stablecoin / USD Pyth feed id, or a
         /// DEX depth-source pin whose non-collateral base mint is a denylisted stablecoin mint.
         /// The collateral mint is never checked. Custom(137).
         StablecoinTrackedAssetRefused = 137,
@@ -29255,7 +29255,7 @@ pub mod processor {
             return Err(PercolatorError::InvalidInstruction.into());
         }
         // r6: refuse a tracked price that is only a stablecoin / USD feed (markets already configured are untouched).
-        if crate::stable_block_v22::oracle_legs_track_only_stable(oracle_leg_count, &oracle_leg_feeds) {
+        if crate::stable_block_v22::oracle_primary_leg_is_stable(oracle_leg_count, &oracle_leg_feeds) {
             return Err(PercolatorError::StablecoinTrackedAssetRefused.into());
         }
         let oracle_accounts = accounts

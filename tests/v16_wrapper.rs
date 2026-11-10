@@ -29680,8 +29680,20 @@ fn r6_hybrid_oracle_on_stable_feed_is_refused_and_non_stable_still_works() {
         assert_eq!(market.data, before);
     }
 
-    // A cross with a non-stable leg tracks that other asset: allowed.
+    // Dummy-leg cross: a stable as the PRIMARY leg over any other feed is refused too.
     let usdc = percolator_prog::stable_block_v22::STABLE_PYTH_FEED_IDS[0];
+    let dummy = [0x66u8; 32];
+    let mut l0 = pyth_account(&usdc, 1_000_000, -6, 1, 1_000);
+    let mut l1 = pyth_account(&dummy, 1_000_000, -6, 1, 1_000);
+    assert_eq!(
+        run_ix(
+            r6_hybrid_ix(2, ORACLE_LEG_FLAG_DIVIDE_LEG2, [usdc, dummy, [0u8; 32]]),
+            &mut [&mut admin, &mut market, &mut l0, &mut l1],
+        ),
+        Err(ProgramError::Custom(137))
+    );
+
+    // A cross with a non-stable leg tracks that other asset: allowed.
     let other = [0x55u8; 32];
     let mut leg0 = pyth_account(&other, 200, 0, 0, 1_000);
     let mut leg1 = pyth_account(&usdc, 1, 0, 0, 1_000);
