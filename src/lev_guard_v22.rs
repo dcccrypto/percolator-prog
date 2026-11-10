@@ -2595,3 +2595,6 @@ mod proofs {
         }
     }
 }
+
+// Review note: in m_dump_bps the 1 % floor sits between the rug term and m_tail, so m never drops
+// below 100 bps and the short-cap divide stays safe whichever band a market is in.
