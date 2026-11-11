@@ -8420,3 +8420,180 @@ fn v16_audit_per_asset_slot_growth_within_realloc_limit() {
          (MAX_PERMITTED_DATA_INCREASE) -> a permissionless append's realloc would fail on mainnet (append DoS)"
     );
 }
+
+#[test]
+/// #172 variant of `v16_program_public_full_shape_b_backlog_has_bounded_settlement`: the target
+/// is not refreshed after the last mark, so all 14 legs carry a pending K/F gain when the B
+/// backlog arrives. Every public crank to completion must stay under the limit (engine #172 fix
+/// moves the K/F settlement into the first SettleB call). Prints the per-call CU profile.
+fn issue172_full_shape_b_with_pending_kf_is_bounded() {
+    const ASSETS: u16 = percolator_prog::constants::WRAPPER_MAX_PORTFOLIO_ASSETS;
+    const LIMIT: u64 = 1_375_000;
+    const CAPITAL: u128 = 10_000;
+    const SIZE_Q: i128 = (POS_SCALE / 50) as i128;
+    
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        max_portfolio_assets: ASSETS,
+        public_b_chunk_atoms: 1,
+        ..V16CuMarketParams::default()
+    });
+    env.configure_permissionless_resolve_with_cu(100, 5);
+    env.svm.warp_to_slot(1);
+    for asset in 0..ASSETS {
+        env.configure_auth_mark_for_asset_as_admin(asset, 1, 100);
+    }
+    let owner = Keypair::new();
+    let target = env.create_portfolio(&owner);
+    env.deposit(&owner, target, CAPITAL);
+    let checkpoint_owner = Keypair::new();
+    let checkpoint = env.create_portfolio(&checkpoint_owner);
+    let checkpoint_marks = |env: &mut V16CuEnv, slot: u64, price: u64| {
+        env.svm.warp_to_slot(slot);
+        for asset in 0..ASSETS {
+            env.push_auth_mark_for_asset_as_admin(asset, slot, price);
+            env.crank(
+                checkpoint,
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: slot,
+                    observations: crank_observations(asset),
+                },
+            );
+        }
+    };
+
+    // A completed short episode leaves the opposite fourteen value-bearing source records.
+    let peer_owner = Keypair::new();
+    let peer = env.create_portfolio(&peer_owner);
+    env.deposit(&peer_owner, peer, CAPITAL);
+    for asset in 0..ASSETS {
+        env.try_trade_asset_with_cu(asset, &owner, target, &peer_owner, peer, -SIZE_Q, 100, 0)
+            .unwrap_or_else(|error| panic!("historical short open {asset}: {error}"));
+    }
+    checkpoint_marks(&mut env, 2, 50);
+    let cert_current = |env: &V16CuEnv, portfolio: Pubkey| {
+        let group = env.market_state().1;
+        let account = env.portfolio_state(portfolio);
+        let cert = health_cert(&account);
+        cert.valid
+            && cert.cert_oracle_epoch == group.oracle_epoch
+            && cert.cert_funding_epoch == group.funding_epoch
+            && cert.cert_risk_epoch == group.risk_epoch
+            && cert.cert_asset_set_epoch == group.asset_set_epoch
+            && cert.active_bitmap_at_cert == active_bitmap(&account)
+    };
+    for _ in 0..2 * usize::from(ASSETS) + 2 {
+        if [target, peer]
+            .into_iter()
+            .all(|key| cert_current(&env, key))
+        {
+            break;
+        }
+        for portfolio in [target, peer] {
+            if !cert_current(&env, portfolio) {
+                env.crank(
+                    portfolio,
+                    ProgInstruction::PermissionlessCrank {
+                        now_slot: 2,
+                        observations: vec![],
+                    },
+                );
+            }
+        }
+    }
+    assert!([target, peer]
+        .into_iter()
+        .all(|key| cert_current(&env, key)));
+    for asset in 0..ASSETS {
+        env.try_trade_asset_with_cu(asset, &owner, target, &peer_owner, peer, SIZE_Q, 50, 0)
+            .unwrap_or_else(|error| panic!("historical short exit {asset}: {error}"));
+    }
+    let historical = env.portfolio_state(target);
+    assert!(percolator::active_bitmap_is_empty(active_bitmap(
+        &historical
+    )));
+    assert_eq!(historical.pnl.get(), i128::from(ASSETS));
+    assert_eq!(
+        historical
+            .source_domains
+            .iter()
+            .filter(|source| source.is_occupied())
+            .count(),
+        usize::from(ASSETS)
+    );
+    checkpoint_marks(&mut env, 3, 100);
+
+    let mut counterparties = Vec::new();
+    for asset in 0..ASSETS {
+        let loss_owner = Keypair::new();
+        let loss = env.create_portfolio(&loss_owner);
+        env.deposit(&loss_owner, loss, 2);
+        env.try_trade_asset_with_cu(asset, &owner, target, &loss_owner, loss, SIZE_Q, 100, 0)
+            .unwrap_or_else(|error| panic!("B cohort long open {asset}: {error}"));
+        counterparties.push((loss_owner, loss));
+    }
+    for (slot, price) in [(4, 200), (5, 300)] {
+        checkpoint_marks(&mut env, slot, price);
+        if slot == 5 { continue; } // leave every leg's 200->300 K/F gain pending
+        env.crank(
+            target,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![],
+            },
+        );
+    }
+
+    for (asset, (_, loss)) in counterparties.iter().enumerate() {
+        env.crank(
+            *loss,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: 5,
+                observations: crank_observations(asset as u16),
+            },
+        );
+    }
+
+    env.svm.warp_to_slot(6);
+    let admin = env.admin.insecure_clone();
+    for (asset, (loss_owner, loss)) in counterparties.iter().enumerate() {
+        env.try_shutdown_asset_with_authority(&admin, asset as u16, 6)
+            .expect("public shutdown before side-local residual disposition");
+        let cu = env.forfeit_recovery_leg_with_cu(loss_owner, *loss, asset as u16, 1);
+        assert_cu_within("all-leg B public first booking", cu, LIMIT);
+        assert_eq!(
+            close_progress(&env.portfolio_state(*loss)).residual_remaining,
+            1
+        );
+        let cu = env
+            .crank_if_actionable(
+                *loss,
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 6,
+                    observations: vec![],
+                },
+            )
+            .expect("public close continuation must book the second loss atom");
+        assert_cu_within("all-leg B public second booking", cu, LIMIT);
+        assert_eq!(
+            close_progress(&env.portfolio_state(*loss)).residual_remaining,
+            0
+        );
+    }
+
+    let before = env.portfolio_state(target);
+    let pending_kf = (0..ASSETS).filter(|a| {
+        let leg = active_leg_for_asset(&before, usize::from(*a));
+        leg.k_snap != env.market_state().1.assets[usize::from(*a)].k_long
+    }).count();
+    let pnl_before = before.pnl.get();
+    let mut cus = Vec::new();
+    for _ in 0..200 {
+        match env.crank_if_actionable(target, ProgInstruction::PermissionlessCrank { now_slot: 6, observations: vec![] }) {
+            Some(cu) => { assert_cu_within("#172 pending-K/F full-shape B crank", cu, LIMIT); cus.push(cu) }
+            None => break,
+        }
+    }
+    let after = env.portfolio_state(target);
+    println!("#172 pending-K/F full-shape: legs_with_pending_kf={pending_kf}, pnl {pnl_before}->{}, capital {}->{}, calls={}, first_cu={}, max_cu={}",
+        after.pnl.get(), before.capital.get(), after.capital.get(), cus.len(), cus.first().copied().unwrap_or(0), cus.iter().max().copied().unwrap_or(0));
+}
