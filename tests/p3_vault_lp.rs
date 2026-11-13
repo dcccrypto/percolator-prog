@@ -7623,3 +7623,139 @@ fn audit660_f4101_crank_never_grows_a_non_portfolio_program_account() {
     let d2 = env.new_depositor();
     env.earn_deposit(&d2, 1_000_000, None).expect("ledger + registry still usable after the attack");
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════════════
+// cpbind (engine percolator#317): the ENGINE now refuses a matched liquidation whose
+// counterparty is not the asset's bound standing counterparty (`standing_counterparty_id`,
+// +32 B per engine slot). Tag 94 writes it at bind; tag 126 copies it from the wrapper's
+// vault-LP record for a market that was bound before the engine kept it.
+// ═══════════════════════════════════════════════════════════════════════════════════════
+
+impl Env {
+    fn engine_cp_binding(&self) -> [u8; 32] {
+        let mut data = self.svm.get_account(&self.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut data).unwrap();
+        g.markets[0].engine.standing_counterparty_id.get()
+    }
+
+    /// Overwrite the engine binding in place (what a slab migrated from the pre-#317 layout
+    /// carries: the new 32 bytes are zero).
+    fn set_engine_cp_binding(&mut self, id: [u8; 32]) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, mut g) = state::market_view_mut(&mut acct.data).unwrap();
+            g.markets[0].engine.standing_counterparty_id = percolator::V16PodId32::new(id);
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+
+    fn sync_cp(&mut self, market: Pubkey, writable: bool, asset_index: u16) -> Result<(), String> {
+        let caller = Keypair::new();
+        self.svm.airdrop(&caller.pubkey(), 1_000_000_000).unwrap();
+        let meta = if writable {
+            AccountMeta::new(market, false)
+        } else {
+            AccountMeta::new_readonly(market, false)
+        };
+        self.send(
+            ProgInstruction::SyncVaultLpCounterparty { asset_index },
+            vec![AccountMeta::new(caller.pubkey(), true), meta],
+            &[&caller],
+        )
+    }
+}
+
+#[test]
+fn cpbind_tag94_writes_the_engine_binding() {
+    let mut env = Env::new(Params::default());
+    assert_eq!(env.engine_cp_binding(), [0u8; 32], "unbound market: no engine binding");
+    let lp = env.bind(1_000);
+    assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
+    assert_eq!(env.asset_rec().vault_lp_portfolio, lp.portfolio.to_bytes());
+}
+
+/// A market bound before the engine kept the binding (engine slot bytes zero) refuses the
+/// matched liquidation with 138 and writes nothing; tag 126 restores it from the vault-LP record
+/// and the same crank then books the matched close.
+#[test]
+fn cpbind_unsynced_market_refuses_matched_liquidation_until_tag126() {
+    let (mut env, lp, t) = f2_world();
+    env.set_engine_cp_binding([0u8; 32]);
+    let (t0, lp0) = (env.portfolio(t.portfolio), env.portfolio(lp.portfolio));
+    let (tq0, lq0) = (env.position(t.portfolio), env.position(lp.portfolio));
+    env.svm.expire_blockhash();
+    let r = env.crank_with_lp(t.portfolio, lp.portfolio);
+    err_has(&r, PercolatorError::LiquidationCounterpartyNotBound);
+    let (t1, lp1) = (env.portfolio(t.portfolio), env.portfolio(lp.portfolio));
+    assert_eq!((t1.capital, t1.pnl), (t0.capital, t0.pnl), "trader untouched");
+    assert_eq!((lp1.capital, lp1.pnl), (lp0.capital, lp0.pnl), "LP untouched");
+    assert_eq!((env.position(t.portfolio), env.position(lp.portfolio)), (tq0, lq0));
+
+    env.sync_cp(env.market, true, 0).expect("tag 126 by a stranger");
+    assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
+    f2_liquidate(&mut env, &t, Some(lp.portfolio));
+    let closed = tq0 - env.position(t.portfolio);
+    assert!(closed > 0);
+    assert_eq!(env.position(lp.portfolio), lq0 + closed, "matched against the LP");
+    assert_eq!(env.a_factors(), (percolator::ADL_ONE, percolator::ADL_ONE), "no ADL latch");
+    env.assert_conserved("cpbind sync then matched liquidation");
+}
+
+/// Tag 126 copies the registry record and nothing else: idempotent, no caller-chosen key,
+/// refused on an unbound asset, a read-only or foreign market, and a resolved market.
+#[test]
+fn cpbind_tag126_copies_only_the_bound_record() {
+    let mut env = Env::new(Params::default());
+    err_has(&env.sync_cp(env.market, true, 0), PercolatorError::VaultLpNotBound);
+    assert_eq!(env.engine_cp_binding(), [0u8; 32]);
+
+    let lp = env.bind(1_000);
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    env.sync_cp(env.market, true, 0).expect("idempotent on a market tag 94 already synced");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before, "no-op rewrite");
+
+    // A wrong (attacker) binding is overwritten with the record's portfolio.
+    env.set_engine_cp_binding(Pubkey::new_unique().to_bytes());
+    env.sync_cp(env.market, true, 0).expect("resync");
+    assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
+
+    env.set_engine_cp_binding([0u8; 32]);
+    assert!(env.sync_cp(env.market, false, 0).is_err(), "market must be writable");
+    assert!(env.sync_cp(env.market, true, 1).is_err(), "asset index out of range");
+    let mut foreign = env.svm.get_account(&env.market).unwrap();
+    foreign.owner = Pubkey::new_unique();
+    let fk = Pubkey::new_unique();
+    env.svm.set_account(fk, foreign).unwrap();
+    assert!(env.sync_cp(fk, true, 0).is_err(), "market owned by another program");
+    assert_eq!(env.engine_cp_binding(), [0u8; 32], "every refusal wrote nothing");
+
+    env.resolve();
+    err_has(&env.sync_cp(env.market, true, 0), PercolatorError::EngineLockActive);
+    assert_eq!(env.engine_cp_binding(), [0u8; 32]);
+}
+
+/// Defence in depth: if the wrapper's record ever named another portfolio (a wrapper bug), the
+/// tag-5 split would hand it to the engine as the counterparty; the engine binding still refuses it.
+#[test]
+fn cpbind_engine_refuses_a_counterparty_the_wrapper_record_would_pass() {
+    let (mut env, lp, t) = f2_world();
+    let other = env.new_trader(5_000_000);
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    let mut rec = state::read_asset_vault_lp(&acct.data, 0).unwrap();
+    rec.vault_lp_portfolio = other.portfolio.to_bytes();
+    {
+        let (_, mut g) = state::market_view_mut(&mut acct.data).unwrap();
+        state::asset_vault_lp_to_wrapper_bytes(&mut g.markets[0].wrapper[..], &rec).unwrap();
+    }
+    env.svm.set_account(env.market, acct).unwrap();
+    assert_eq!(env.asset_rec().vault_lp_portfolio, other.portfolio.to_bytes(), "premise");
+    let other0 = env.portfolio(other.portfolio);
+    env.svm.expire_blockhash();
+    err_has(
+        &env.crank_with_lp(t.portfolio, other.portfolio),
+        PercolatorError::LiquidationCounterpartyNotBound,
+    );
+    let other1 = env.portfolio(other.portfolio);
+    assert_eq!((other1.capital, other1.pnl), (other0.capital, other0.pnl));
+    assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
+}

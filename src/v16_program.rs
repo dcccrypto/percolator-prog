@@ -674,6 +674,12 @@ pub mod constants {
     /// the wallet that receives the asset's creator fee once `asset_admin` is burned
     /// (`creator_fee_payee_v22`). Wire `[125][asset_index u16][market_id u64][payee 32][authority_epoch u64]`.
     pub const TAG_SET_CREATOR_FEE_PAYEE: u8 = 125;
+    /// cpbind (engine percolator#317): `SyncVaultLpCounterparty`, permissionless. Copies the bound
+    /// vault-LP portfolio of `asset_index` from the wrapper's `AssetVaultLpV18` record into the engine
+    /// slot's `standing_counterparty_id`, the only counterparty the engine accepts for a matched
+    /// liquidation. For markets bound before the engine kept the binding (tag 94 writes it now).
+    /// Wire `[126][asset_index u16]`; accounts `[0]` unused (any), `[1] market (w)`.
+    pub const TAG_SYNC_VAULT_LP_COUNTERPARTY: u8 = 126;
     /// prog#587: `CreatorFeePayeeV22` at `["creator_fee_payee", market, asset_index_le]`.
     pub const KIND_CREATOR_FEE_PAYEE: u8 = 19;
     /// Mainnet builds refuse a risk-increasing fill on ANY clamp-enforced growth asset without a
@@ -716,7 +722,7 @@ pub mod constants {
         }
         true
     }
-    pub const ALL_NAMED_TAGS: [u8; 41] = [
+    pub const ALL_NAMED_TAGS: [u8; 42] = [
         TAG_SET_ASSET_RISK_LIMITS, TAG_INIT_VAULT_LP, TAG_VAULT_LP_SET_MATCHER,
         TAG_DEPOSIT_JUNIOR_TRANCHE, TAG_WITHDRAW_JUNIOR_TRANCHE, TAG_VAULT_LP_RECALL,
         TAG_SET_VAULT_LP_RISK, TAG_VAULT_LP_CONVERT_PNL, TAG_VAULT_LP_SETTLE_RESOLVED,
@@ -731,6 +737,7 @@ pub mod constants {
         // padding entries (distinct sentinels above any real tag) keep the array length fixed
         TAG_EVICT_AND_TRADE_CPI, TAG_PROPOSE_G9_FEED_ALLOWLIST, TAG_COMMIT_G9_FEED_ALLOWLIST,
         TAG_INIT_LP_SHARE_METADATA, TAG_SET_DEPTH_SOURCE, TAG_LEV_GUARD, TAG_SET_CREATOR_FEE_PAYEE, 207,
+        TAG_SYNC_VAULT_LP_COUNTERPARTY,
     ];
     const _: () = assert!(all_distinct_u8(&ALL_NAMED_TAGS), "duplicate instruction tag");
     pub const MARKET_GROUP_LEN: usize = size_of::<MarketGroupV16HeaderAccount>();
@@ -2028,7 +2035,15 @@ VaultLpMultiAssetMarket,
         /// `asset_admin`), zero or unchanged payee, a payee account that is not this asset's PDA or
         /// does not validate, or a destination that is not the payee's canonical ATA. Custom(136).
         CreatorFeePayeeInvalid = 136,
+        // 137 is claimed by the open prog#695 (StablecoinTrackedAsset); not reused.
+        /// cpbind (engine percolator#317): a matched liquidation (tag 5 with a counterparty
+        /// appended) named a counterparty that is not the asset's bound standing counterparty in
+        /// the ENGINE slot (`standing_counterparty_id`, written by tag 94 InitVaultLp and by tag 126
+        /// SyncVaultLpCounterparty). Engine `CounterpartyNotBound`; nothing was written. On a
+        /// market bound before the engine kept the binding, run tag 126 once. Custom(138).
+        LiquidationCounterpartyNotBound = 138,
     }
+    const _: () = assert!(PercolatorError::LiquidationCounterpartyNotBound as u32 == 138);
     const _: () = assert!(PercolatorError::CreatorFeePayeeInvalid as u32 == 136);
     const _: () = assert!(PercolatorError::DepthInputInvalid as u32 == 128);
     const _: () = assert!(PercolatorError::DepthSourceInvalid as u32 == 129);
@@ -2154,6 +2169,8 @@ VaultLpMultiAssetMarket,
             V16Error::BandPositionCap => PercolatorError::PriceBandPositionCap,
             V16Error::BandTooNarrow => PercolatorError::PriceBandTooNarrow,
             V16Error::BandLegBelowMinNotional => PercolatorError::PriceBandLegBelowMinNotional,
+            // cpbind (engine #317): the engine's own matched-liquidation counterparty check.
+            V16Error::CounterpartyNotBound => PercolatorError::LiquidationCounterpartyNotBound,
         };
         mapped.into()
     }
@@ -9847,6 +9864,11 @@ pub mod ix {
         /// cranks), `[1] market (w)`, `[2] portfolio (w)`, `[3] bound vault LP portfolio (w)` (bilateral
         /// close, N-6).
         SweepBandDustLeg { asset_index: u16 },
+        /// cpbind tag 126 (permissionless): write the engine's matched-liquidation counterparty
+        /// binding for `asset_index` from the wrapper's bound vault-LP record (no caller-chosen
+        /// key). Idempotent. Refused: unbound asset (`VaultLpNotBound`), non-Live market
+        /// (`EngineLockActive`). Accounts: `[0]` unused, `[1] market (w)`.
+        SyncVaultLpCounterparty { asset_index: u16 },
         /// v2.2 tag 119: on a band market whose target side is FULL, close `accounts[0]`'s
         /// SMALL leg (at most 4x the market minimum, and at most half the taker's size) bilaterally against the bound vault LP at `P_last` (fee 0) and then
         /// run `trade` (a `TradeCpi`) for the taker on `accounts[1..]`. Refused unless the
@@ -10870,6 +10892,9 @@ pub mod ix {
                     now_slot: read_u64(&mut rest)?,
                 },
                 crate::constants::TAG_SWEEP_BAND_DUST_LEG => Self::SweepBandDustLeg {
+                    asset_index: read_u16(&mut rest)?,
+                },
+                crate::constants::TAG_SYNC_VAULT_LP_COUNTERPARTY => Self::SyncVaultLpCounterparty {
                     asset_index: read_u16(&mut rest)?,
                 },
                 crate::constants::TAG_EVICT_AND_TRADE_CPI => {
@@ -11918,6 +11943,10 @@ pub mod ix {
                 }
                 Self::SweepBandDustLeg { asset_index } => {
                     out.push(crate::constants::TAG_SWEEP_BAND_DUST_LEG);
+                    push_u16(&mut out, asset_index);
+                }
+                Self::SyncVaultLpCounterparty { asset_index } => {
+                    out.push(crate::constants::TAG_SYNC_VAULT_LP_COUNTERPARTY);
                     push_u16(&mut out, asset_index);
                 }
                 Self::EvictAndTradeCpi { ref trade } => {
@@ -14111,6 +14140,7 @@ pub mod lag_policy {
             Instruction::WithdrawCreatorFee { .. } => entry("WithdrawCreatorFee", LagPolicy::MarkFree, "realised fee atoms"),
             Instruction::SetCreatorFeePayee { .. } => entry("SetCreatorFeePayee", LagPolicy::MarkFree, "records a payee key; moves no value"),
             Instruction::InitVaultLp { .. } => entry("InitVaultLp", LagPolicy::MarkFree, "binds a vault LP"),
+            Instruction::SyncVaultLpCounterparty { .. } => entry("SyncVaultLpCounterparty", LagPolicy::MarkFree, "copies the bound vault-LP key into the engine; moves no value"),
             Instruction::InitVaultLpV19 { .. } => entry("InitVaultLpV19", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::InitVaultLpV22Tiers { .. } => entry("InitVaultLpV22Tiers", LagPolicy::MarkFree, "binds a vault LP"),
             Instruction::VaultLpSetMatcher { .. } => entry("VaultLpSetMatcher", LagPolicy::MarkFree, "matcher config"),
@@ -16954,6 +16984,9 @@ pub mod processor {
                 payee,
                 authority_epoch,
             ),
+            Instruction::SyncVaultLpCounterparty { asset_index } => {
+                handle_sync_vault_lp_counterparty(program_id, accounts, asset_index)
+            }
             Instruction::InitVaultLp { junior_floor_bps } => {
                 handle_init_vault_lp(program_id, accounts, junior_floor_bps, None)?;
                 init_vault_lp_min_leg_guard(program_id, accounts)?;
@@ -26848,6 +26881,35 @@ pub mod processor {
             p_last,
         );
         Ok(())
+    }
+
+    /// cpbind tag 126: copy the bound vault-LP portfolio key from the wrapper's `AssetVaultLpV18`
+    /// record into the engine slot (`set_asset_standing_counterparty_not_atomic`). Permissionless:
+    /// the value is the record tag 94 authenticated (registry-owned LP, marketauth-signed bind),
+    /// never caller input, and the engine binding can only ever equal it. Tag 94 already writes
+    /// it; this exists for markets bound before the engine kept it (migrated slabs).
+    #[inline(never)]
+    fn handle_sync_vault_lp_counterparty<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        asset_index: u16,
+    ) -> ProgramResult {
+        let market_ai = account(accounts, 1)?;
+        expect_writable(market_ai)?;
+        expect_owner(market_ai, program_id)?;
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        if group.header.mode != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let a = asset_index as usize;
+        let rec = read_asset_vault_lp_from_view(&group, a)?;
+        if rec.flags & state::ASSET_VAULT_LP_FLAG_BOUND == 0 {
+            return Err(PercolatorError::VaultLpNotBound.into());
+        }
+        group
+            .set_asset_standing_counterparty_not_atomic(a, rec.vault_lp_portfolio)
+            .map_err(map_v16_error)
     }
 
     /// v2.2 band (security re-review N-1; N-6 fixed in round 2), tag 118: permissionless dust
@@ -38110,6 +38172,12 @@ pub mod processor {
             rec.approved_matcher_program = canonical_matcher.to_bytes();
             rec.vault_lp_max_lev_bps = 0;
             write_asset_vault_lp_to_view(&mut group, asset_index, &rec)?;
+            // cpbind (engine #317): the engine refuses a matched liquidation (tag 5 with the LP
+            // appended) unless its counterparty is this asset's standing counterparty, so record
+            // the LP there too. Same key as `rec.vault_lp_portfolio`; tag 126 re-copies it.
+            group
+                .set_asset_standing_counterparty_not_atomic(asset_index, rec.vault_lp_portfolio)
+                .map_err(map_v16_error)?;
             // Phase 2b (plan §2.4): skew-funding protocol defaults inside the market's funding
             // cap (slope = cap / 2, max = cap; off when the market has no funding). The upgrade
             // authority may override them with tag 99. Out of line (pinned 3,776-B frame).
