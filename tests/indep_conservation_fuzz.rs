@@ -3821,6 +3821,44 @@ fn indep_b12_stranger_cannot_close_claim_holding_portfolio_or_redirect_rent() {
     w.check().unwrap();
 }
 
+/// #669: marketauth closing a user's EMPTY portfolio after resolution must return the rent to the
+/// portfolio's OWNER, exactly like any other non-owner close. Before the fix a separate
+/// marketauth branch was checked first and paid the closer, even when [3] named the owner.
+#[test]
+fn indep_669_marketauth_resolved_close_returns_rent_to_owner() {
+    let mut w = World::new(0);
+    w.do_trade_nocpi(0, 1, 10 * (POS_SCALE as i128 / 10), INITIAL_MARK).expect("open");
+    w.do_resolve().expect("resolve");
+    for _ in 0..6 {
+        let _ = w.do_close_resolved(2);
+        let _ = w.do_claim_topup(2);
+        let s = w.slot() + 10;
+        w.env.svm.warp_to_slot(s);
+    }
+    let p = w.env.portfolio_state(w.ports[2]);
+    assert!(p.capital == 0 && p.active_bitmap == percolator::active_bitmap_empty(), "vacuity: u2 emptied");
+    let admin = w.env.admin.insecure_clone();
+    let owner = w.owners[2].pubkey();
+    let rent = w.env.svm.get_account(&w.ports[2]).unwrap().lamports;
+    assert!(rent > 0, "vacuity: the portfolio holds rent");
+
+    // marketauth naming itself as [3]: refused (it is not the owner).
+    let r = w.do_stranger_close_portfolio(2, &admin, admin.pubkey());
+    assert!(r.is_err(), "marketauth must not be able to take the user's rent");
+
+    // marketauth naming the owner as [3]: allowed, and the owner gets the rent, not marketauth.
+    let owner_lam0 = w.env.svm.get_account(&owner).map_or(0, |a| a.lamports);
+    let admin_lam0 = w.env.svm.get_account(&admin.pubkey()).map_or(0, |a| a.lamports);
+    let r = w.do_stranger_close_portfolio(2, &admin, owner);
+    assert!(r.is_ok(), "marketauth cleanup with [3] = owner must succeed: {:?}", r.map_err(|e| custom_code(&e)));
+    w.closed[2] = true;
+    let owner_lam1 = w.env.svm.get_account(&owner).map_or(0, |a| a.lamports);
+    let admin_lam1 = w.env.svm.get_account(&admin.pubkey()).map_or(0, |a| a.lamports);
+    assert_eq!(owner_lam1 - owner_lam0, rent, "the owner receives the whole portfolio rent");
+    assert!(admin_lam1 <= admin_lam0, "marketauth receives none of it (it only pays the fee)");
+    w.check().unwrap();
+}
+
 /// P3 HIGH (coordinator, = F-12): a market that RESOLVES with unharvested LP fees must still let
 /// every senior redeem, and the fee atoms must be conserved (not stranded in the wrapper vault).
 /// No keeper tag 78 before resolve. Run alone: FUZZ_P3=1 --ignored indep_p3_resolve_with_pending
