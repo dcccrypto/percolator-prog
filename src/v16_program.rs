@@ -2070,7 +2070,7 @@ VaultLpMultiAssetMarket,
     const _: () = assert!(PercolatorError::InsuranceBackstopRefused as u32 == 116);
     /// v2.2 combined release: every error code of the Phase 2b / v2.2 block, pinned DISTINCT at
     /// compile time (rustc also rejects duplicate enum discriminants; this keeps the claim visible).
-    const V22_ERROR_CODES: [u32; 32] = [
+    const V22_ERROR_CODES: [u32; 34] = [
         PercolatorError::GrowthUtilisationFeeRequiresTradeCpi as u32,
         PercolatorError::VaultLpAllocateRefused as u32,
         101, 102, 103,
@@ -2099,6 +2099,8 @@ VaultLpMultiAssetMarket,
         PercolatorError::DepthInputInvalid as u32,
         PercolatorError::DepthSourceInvalid as u32,
         PercolatorError::GrowthTierConfigInvalid as u32,
+        PercolatorError::CreatorFeePayeeInvalid as u32,
+        PercolatorError::LiquidationCounterpartyNotBound as u32,
     ];
     const fn all_distinct_u32(a: &[u32]) -> bool {
         let mut i = 0;
@@ -27816,6 +27818,9 @@ pub mod processor {
         let mut canonical_slot =
             percolator::EngineAssetSlotV16Account::empty_for_market(asset.market_id);
         canonical_slot.asset = percolator::AssetStateV16Account::from_runtime(&canonical_asset);
+        // cpbind (engine #317): carried like the engine's own canonicalize / restart / activation
+        // do; only `set_asset_standing_counterparty_not_atomic` (tag 94 / 126) changes it.
+        canonical_slot.standing_counterparty_id = slot.engine.standing_counterparty_id;
         slot.engine = canonical_slot;
         Ok(())
     }
@@ -38175,6 +38180,8 @@ pub mod processor {
             // cpbind (engine #317): the engine refuses a matched liquidation (tag 5 with the LP
             // appended) unless its counterparty is this asset's standing counterparty, so record
             // the LP there too. Same key as `rec.vault_lp_portfolio`; tag 126 re-copies it.
+            // The setter needs an Active / DrainOnly asset, so a bind on an asset in Recovery is
+            // now refused (EngineInvalidConfig); binds happen at creation, where it is Active.
             group
                 .set_asset_standing_counterparty_not_atomic(asset_index, rec.vault_lp_portfolio)
                 .map_err(map_v16_error)?;

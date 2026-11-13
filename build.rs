@@ -102,8 +102,16 @@ fn engine_git_revs(manifest: &Path) -> Result<Option<Vec<String>>, String> {
     let text = std::fs::read_to_string(manifest)
         .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
     let mut revs = Vec::new();
+    let mut in_patch = false;
     for line in text.lines() {
         let line = line.trim();
+        if line.starts_with('[') {
+            in_patch = line.starts_with("[patch");
+        }
+        // Only the inline form is parsed; any other way of naming the engine fails closed.
+        if line.contains("dependencies.percolator]") || (in_patch && line.starts_with("percolator")) {
+            return Err(format!("unsupported engine dependency form in Cargo.toml: {line}"));
+        }
         if !line.starts_with("percolator =") || !line.contains("git =") {
             continue;
         }
@@ -123,6 +131,15 @@ fn engine_git_revs(manifest: &Path) -> Result<Option<Vec<String>>, String> {
 
 fn verify_git_rev(revs: &[String], refs: &Path) -> Result<String, String> {
     let pin = read_pin(refs)?;
+    // A `.cargo/config` `paths` override would compile a local engine instead of the rev.
+    let root = refs.parent().and_then(|p| p.parent()).unwrap_or(refs);
+    for cfg in [".cargo/config", ".cargo/config.toml"] {
+        if let Ok(t) = std::fs::read_to_string(root.join(cfg)) {
+            if t.lines().any(|l| l.trim_start().starts_with("paths")) {
+                return Err(format!("{cfg} sets `paths`, which overrides the engine git rev"));
+            }
+        }
+    }
     for rev in revs {
         if *rev != pin {
             return Err(format!(

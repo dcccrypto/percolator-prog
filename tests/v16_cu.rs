@@ -26907,6 +26907,73 @@ fn p2b_privileged_reactivation_of_a_retired_slot_clears_the_adl_episode_record()
 }
 
 
+/// cpbind (engine #317): the engine keeps `standing_counterparty_id` across retire, canonicalize and
+/// re-activation; the wrapper's own retire canonicalize (`canonicalize_retired_asset_slot_view`) must
+/// too, or the wrapper record still says "bound" while the engine refuses every matched liquidation
+/// (138). Not reachable for a vault LP today (it binds only asset 0, RETIRE refuses asset 0); pinned
+/// on asset 1 so a later lifecycle change cannot reopen it.
+#[test]
+fn cpbind_wrapper_retire_canonicalize_keeps_the_engine_binding() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(2, 10_000, 10_000, 10_000);
+    env.svm.warp_to_slot(1_000);
+    env.mutate_market(|_, group| {
+        group.assets[1].lifecycle = AssetLifecycleV16::Retired;
+        group.assets[1].retired_slot = 1;
+    });
+    let bound = Pubkey::new_unique().to_bytes();
+    let binding = |env: &V16CuEnv| {
+        let mut data = env.svm.get_account(&env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut data).unwrap();
+        g.markets[1].engine.standing_counterparty_id.get()
+    };
+    {
+        let mut acc = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, mut g) = state::market_view_mut(&mut acc.data).unwrap();
+            g.markets[1].engine.standing_counterparty_id = percolator::V16PodId32::new(bound);
+        }
+        env.svm.set_account(env.market, acc).unwrap();
+    }
+    let admin = env.admin.insecure_clone();
+    let authority = admin.pubkey().to_bytes();
+    let mut lifecycle = |env: &mut V16CuEnv, action: u8, initial_price: u64| {
+        let authority_epoch = env.control_sequences(0).authority_epoch;
+        let (current, next) = state::read_asset_lifecycle_generation_preflight(
+            &env.svm.get_account(&env.market).unwrap().data,
+            1,
+            action == 0,
+        )
+        .unwrap();
+        env.svm.expire_blockhash();
+        env.send(
+            ProgInstruction::UpdateAssetLifecycle {
+                market_id: if action == 0 { next } else { current },
+                action,
+                asset_index: 1,
+                authority_epoch,
+                now_slot: 1_000,
+                initial_price,
+                max_init_fee: u128::MAX,
+                insurance_authority: authority,
+                insurance_operator: authority,
+                backing_bucket_authority: authority,
+                oracle_authority: authority,
+            },
+            vec![
+                AccountMeta::new(admin.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&admin],
+        )
+    };
+    lifecycle(&mut env, 2, 0).expect("RETIRE on the retired slot runs the wrapper canonicalize");
+    assert_eq!(binding(&env), bound, "wrapper canonicalize keeps the engine binding");
+    lifecycle(&mut env, 0, 100).expect("re-activate");
+    let (_, g) = env.market_state();
+    assert_eq!(g.assets[1].lifecycle, AssetLifecycleV16::Active);
+    assert_eq!(binding(&env), bound, "engine activation carries it");
+}
+
 // ---------------------------------------------------------------------------
 // v2.2 combined release: portfolio account length and the realloc ceiling.
 //

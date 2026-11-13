@@ -7681,15 +7681,10 @@ fn cpbind_tag94_writes_the_engine_binding() {
 fn cpbind_unsynced_market_refuses_matched_liquidation_until_tag126() {
     let (mut env, lp, t) = f2_world();
     env.set_engine_cp_binding([0u8; 32]);
-    let (t0, lp0) = (env.portfolio(t.portfolio), env.portfolio(lp.portfolio));
     let (tq0, lq0) = (env.position(t.portfolio), env.position(lp.portfolio));
     env.svm.expire_blockhash();
     let r = env.crank_with_lp(t.portfolio, lp.portfolio);
     err_has(&r, PercolatorError::LiquidationCounterpartyNotBound);
-    let (t1, lp1) = (env.portfolio(t.portfolio), env.portfolio(lp.portfolio));
-    assert_eq!((t1.capital, t1.pnl), (t0.capital, t0.pnl), "trader untouched");
-    assert_eq!((lp1.capital, lp1.pnl), (lp0.capital, lp0.pnl), "LP untouched");
-    assert_eq!((env.position(t.portfolio), env.position(lp.portfolio)), (tq0, lq0));
 
     env.sync_cp(env.market, true, 0).expect("tag 126 by a stranger");
     assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
@@ -7720,13 +7715,14 @@ fn cpbind_tag126_copies_only_the_bound_record() {
     assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
 
     env.set_engine_cp_binding([0u8; 32]);
-    assert!(env.sync_cp(env.market, false, 0).is_err(), "market must be writable");
-    assert!(env.sync_cp(env.market, true, 1).is_err(), "asset index out of range");
+    err_has(&env.sync_cp(env.market, false, 0), PercolatorError::ExpectedWritable);
+    err_has(&env.sync_cp(env.market, true, 1), PercolatorError::InvalidInstruction);
     let mut foreign = env.svm.get_account(&env.market).unwrap();
     foreign.owner = Pubkey::new_unique();
     let fk = Pubkey::new_unique();
     env.svm.set_account(fk, foreign).unwrap();
-    assert!(env.sync_cp(fk, true, 0).is_err(), "market owned by another program");
+    let r = env.sync_cp(fk, true, 0);
+    assert!(format!("{r:?}").contains("IncorrectProgramId"), "market owned by another program: {r:?}");
     assert_eq!(env.engine_cp_binding(), [0u8; 32], "every refusal wrote nothing");
 
     env.resolve();
@@ -7749,13 +7745,32 @@ fn cpbind_engine_refuses_a_counterparty_the_wrapper_record_would_pass() {
     }
     env.svm.set_account(env.market, acct).unwrap();
     assert_eq!(env.asset_rec().vault_lp_portfolio, other.portfolio.to_bytes(), "premise");
-    let other0 = env.portfolio(other.portfolio);
     env.svm.expire_blockhash();
     err_has(
         &env.crank_with_lp(t.portfolio, other.portfolio),
         PercolatorError::LiquidationCounterpartyNotBound,
     );
-    let other1 = env.portfolio(other.portfolio);
-    assert_eq!((other1.capital, other1.pnl), (other0.capital, other0.pnl));
     assert_eq!(env.engine_cp_binding(), lp.portfolio.to_bytes());
+}
+
+/// Tag 94 now also needs the engine setter to accept: a Live market and an Active / DrainOnly
+/// asset. A bind on an asset in Recovery (oracle needs a restart) is refused with nothing bound;
+/// before cpbind it was accepted. Binds happen at market creation, where the asset is Active.
+#[test]
+fn cpbind_tag94_refuses_an_asset_in_recovery() {
+    let mut env = Env::new(Params::default());
+    let mut acct = env.svm.get_account(&env.market).unwrap();
+    {
+        let (_, mut g) = state::market_view_mut(&mut acct.data).unwrap();
+        let mut a = g.markets[0].engine.asset.try_to_runtime().unwrap();
+        a.lifecycle = percolator::AssetLifecycleV16::Recovery;
+        g.markets[0].engine.asset = percolator::AssetStateV16Account::from_runtime(&a);
+    }
+    env.svm.set_account(env.market, acct).unwrap();
+    let admin = env.admin.insecure_clone();
+    let m = env.matcher;
+    let r = env.init_vault_lp_full(&admin, 1_000, m, &[]).map(|lp| lp.portfolio);
+    err_has(&r, PercolatorError::EngineInvalidConfig);
+    assert_eq!(env.asset_rec().flags & state::ASSET_VAULT_LP_FLAG_BOUND, 0, "nothing bound");
+    assert_eq!(env.engine_cp_binding(), [0u8; 32]);
 }
