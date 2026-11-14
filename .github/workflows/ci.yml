@@ -261,7 +261,8 @@ jobs:
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
-      - uses: dtolnay/rust-toolchain@stable
+      # Pinned: stable 1.100.0 (2026-11-09) fails to compile solana-client (E0277, rust-lang/rust#148922).
+      - uses: dtolnay/rust-toolchain@1.99.1
       # The reference programs are built with the DEPLOY toolchain so the two matchers reproduce their
       # recorded sha256 (the script fails otherwise). The 4.2.2 install below then becomes the active
       # release for the suite itself, exactly as before.
