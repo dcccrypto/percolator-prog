@@ -44525,6 +44525,28 @@ pub mod processor {
     /// follow). The classic-only `unpack_token_account` (requires owner ==
     /// spl_token::ID) cannot read a Token-2022 NFT ATA, so E2 uses this for the
     /// NFT-holder token account.
+    /// Token-2022 `AccountType::Account`, the byte at offset `Account::LEN` of an
+    /// extended token account.
+    const TOKEN_2022_ACCOUNT_TYPE_ACCOUNT: u8 = 2;
+    /// Multisig account length (both token programs). Token-2022 never gives an
+    /// extended token account this length, so it can't be mistaken for one.
+    const TOKEN_MULTISIG_LEN: usize = 355;
+
+    /// True only for data laid out as a token ACCOUNT (not a Mint or Multisig) under
+    /// the owning token program's own rules: classic SPL accounts are exactly
+    /// `Account::LEN`; Token-2022 accounts are exactly `Account::LEN`, or longer with
+    /// the account-type byte set to `Account` and a length other than Multisig's.
+    pub(crate) fn token_account_layout_is_account(owner_is_token_2022: bool, data: &[u8]) -> bool {
+        let base = spl_token::state::Account::LEN;
+        if data.len() == base {
+            return true;
+        }
+        owner_is_token_2022
+            && data.len() > base
+            && data.len() != TOKEN_MULTISIG_LEN
+            && data[base] == TOKEN_2022_ACCOUNT_TYPE_ACCOUNT
+    }
+
     fn read_nft_holder_token_account(
         ai: &AccountInfo,
     ) -> Result<([u8; 32], [u8; 32], u64, bool), ProgramError> {
@@ -44532,7 +44554,10 @@ pub mod processor {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
         let data = ai.try_borrow_data()?;
-        if data.len() < spl_token::state::Account::LEN {
+        // The holder proof reads mint/owner/amount/state at fixed offsets, so the account
+        // must actually BE a token account: any token-program-owned account of at least
+        // 165 bytes (a Multisig, for instance) was accepted before.
+        if !token_account_layout_is_account(ai.owner == &TOKEN_2022_PROGRAM_ID, &data) {
             return Err(PercolatorError::InvalidTokenAccount.into());
         }
         let mut mint = [0u8; 32];
@@ -50780,6 +50805,32 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        /// The NFT-holder proof must read a real token ACCOUNT, never a Mint or Multisig that
+        /// merely has the right owner and at least 165 bytes.
+        #[test]
+        fn nft_holder_token_account_layout_is_exact() {
+            let base = spl_token::state::Account::LEN;
+            // Classic SPL: exactly 165 bytes only.
+            assert!(token_account_layout_is_account(false, &vec![0u8; base]));
+            assert!(!token_account_layout_is_account(false, &vec![0u8; spl_token::state::Mint::LEN]));
+            assert!(!token_account_layout_is_account(false, &vec![0u8; TOKEN_MULTISIG_LEN]));
+            assert!(!token_account_layout_is_account(false, &vec![0u8; base + 1]));
+            // Token-2022: 165 bytes, or an extended Account (type byte 2 at offset 165).
+            assert!(token_account_layout_is_account(true, &vec![0u8; base]));
+            let mut extended = vec![0u8; base + 1 + 8];
+            extended[base] = TOKEN_2022_ACCOUNT_TYPE_ACCOUNT;
+            assert!(token_account_layout_is_account(true, &extended));
+            // An extended Mint (type byte 1) is not an account.
+            let mut extended_mint = vec![0u8; base + 1 + 8];
+            extended_mint[base] = 1;
+            assert!(!token_account_layout_is_account(true, &extended_mint));
+            // A Multisig is refused even when its byte 165 happens to equal the Account type.
+            let mut multisig = vec![0u8; TOKEN_MULTISIG_LEN];
+            multisig[base] = TOKEN_2022_ACCOUNT_TYPE_ACCOUNT;
+            assert!(!token_account_layout_is_account(true, &multisig));
+            assert!(!token_account_layout_is_account(true, &vec![0u8; base - 1]));
+        }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
         /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
