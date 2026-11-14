@@ -30027,6 +30027,94 @@ mod crank_accrual_carry {
         assert_eq!(env.market_state().1.assets[0].effective_price, PRICE);
     }
 
+    /// 3%/slot, start at 1 atom: without the persisted carry the live crank freezes forever
+    /// (1 * 300 / 10_000 = 0). With carry the first atom lands on slot 34, and no slot moves
+    /// more than the cap allows (at price 1, at most 1 atom).
+    /// 3%/slot, start at 33 atoms: without carry the live crank freezes (33*300/10_000=0).
+    /// Init at 1 atom is refused (InvalidAccountData); 33 is under the 34-atom freeze
+    /// threshold and lists the same way as the existing price-50 / 1% fixture.
+    fn book_3pct_from_33() -> (V16CuEnv, Pubkey) {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: 33,
+            max_price_move_bps_per_slot: 300,
+            max_accrual_dt_slots: 10,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 10,
+            ..V16CuMarketParams::default()
+        });
+        env.svm.warp_to_slot(0);
+        env.configure_auth_mark_with_cu(0, 33);
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long = env.create_portfolio(&long_owner);
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, 10_000);
+        env.deposit(&short_owner, short, 10_000);
+        env.trade_with_cu(&long_owner, long, &short_owner, short, POS_SCALE as i128, 33, 0);
+        (env, long)
+    }
+
+    #[test]
+    fn v22_crank_price_below_34_atoms_moves_over_successive_slots() {
+        let (mut env, long) = book_3pct_from_33();
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 100);
+        crank_at(&mut env, long, 1);
+        let mut prev = env.market_state().1.assets[0].effective_price;
+        assert_eq!(prev, 33, "slot 1 is still frozen without a full atom of carry");
+        assert_eq!(profile_remainder(&env), 9_900); // 33 * 300
+
+        // num = 33*300 + rem; first full atom lands on slot 2 (9900+9900=19800).
+        for slot in 2u64..=2 {
+            env.svm.warp_to_slot(slot);
+            crank_at(&mut env, long, slot);
+            let price = env.market_state().1.assets[0].effective_price;
+            assert!(
+                price <= prev + 1,
+                "slot {slot}: cap is 3%/slot at price {prev}, so at most 1 atom; moved to {price}"
+            );
+            prev = price;
+        }
+        assert_eq!(prev, 34, "the 2nd slot of 3% carry on price 33 must land the first atom");
+        assert_eq!(profile_remainder(&env), 9_800);
+        // Keep going a few slots: never jump more than 1 atom at this price.
+        for slot in 3u64..=8 {
+            env.svm.warp_to_slot(slot);
+            crank_at(&mut env, long, slot);
+            let price = env.market_state().1.assets[0].effective_price;
+            assert!(
+                price <= prev + 1,
+                "slot {slot}: cap is 3%/slot at price {prev}, so at most 1 atom; moved to {price}"
+            );
+            prev = price;
+        }
+        assert!(prev > 34, "carry keeps making progress after the first atom");
+        assert!(prev <= 33 + 8, "8 slots at 3% from 33 cannot add more than 8 atoms");
+    }
+
+    #[test]
+    fn v22_crank_target_change_does_not_jump_past_the_cap_from_stale_carry() {
+        let (mut env, long) = book_3pct_from_33();
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 100);
+        crank_at(&mut env, long, 1);
+        assert_eq!(env.market_state().1.assets[0].effective_price, 33);
+        assert_eq!(profile_remainder(&env), 9_900, "one atom of carry is one slot away");
+
+        // New target, still above the mark. Inherited carry would spend that 9_900 and jump
+        // to 34; Toly's reset starts the new trajectory at rem 0, so this slot stays at 33.
+        env.svm.warp_to_slot(2);
+        env.push_auth_mark_with_cu(2, 50);
+        crank_at(&mut env, long, 2);
+        assert_eq!(env.market_state().1.assets[0].raw_oracle_target_price, 50);
+        assert_eq!(
+            env.market_state().1.assets[0].effective_price,
+            33,
+            "a target change must not spend the previous target's remainder"
+        );
+        assert_eq!(profile_remainder(&env), 9_900); // 33 * 300, starting from rem 0
+    }
+
     /// No wrapper route accrues an asset with the single-segment primitive any more: every
     /// accrual goes through `canonical_accrual_path_for_target_view` and the engine's path
     /// accrual, so the caller-supplied first-step remainder is always the persisted carry.
