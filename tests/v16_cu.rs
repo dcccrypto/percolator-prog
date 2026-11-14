@@ -7855,11 +7855,14 @@ ProgInstruction::PermissionlessCrank {
     );
     let (_, funded_group) = env.market_state();
     assert_eq!(funded_group.funding_epoch, 1);
-    assert_eq!(funded_group.assets[0].effective_price, 1_210_000);
-    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_210_000 = 1.21 price units for the
-    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.21 * ADL_ONE.
-    let exact = 1_000i128 * 1_210_000 * (ADL_ONE / 1_000_000_000) as i128;
-    assert_eq!(exact, 1_210_000_000_000_000);
+    // #698 (upstream 18f3ae94): the path is linear from the stable anchor (1_000_000), not a
+    // second 10% clamp from 1_100_000, so slot 2 lands at 1_200_000 (was 1_210_000). Upstream
+    // inv_038 asserts the same value for this test.
+    assert_eq!(funded_group.assets[0].effective_price, 1_200_000);
+    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_200_000 = 1.2 price units for the
+    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.2 * ADL_ONE.
+    let exact = 1_000i128 * 1_200_000 * (ADL_ONE / 1_000_000_000) as i128;
+    assert_eq!(exact, 1_200_000_000_000_000);
     assert_eq!(funded_group.assets[0].f_long_num, -exact);
     assert_eq!(funded_group.assets[0].f_short_num, exact);
 }
@@ -8008,8 +8011,12 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // too small to swing the checkpoint's own stale-mark projection all the
     // way back to it -- see the two `max_delta` computations in the comments
     // at the crank and close sites below.
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // #698 (upstream 18f3ae94): one crank accrues at most min(max_accrual_dt_slots,
+    // V16_MAX_ACCRUAL_PATH_STEPS = 32) path steps, so the window is 32 (was 50) and the
+    // cap is 39 bps (was 25): 39 * 32 = 1,248 bps keeps the same envelope (25 * 50 = 1,250)
+    // and still converges the 10% push in one crank (124,800 > 100,000 atoms).
+    const CAP_BPS: u64 = 39;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000; // engine cap (v16.rs validate_public_user_fund_shape)
                                                      // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
                                                      // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
@@ -8021,7 +8028,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
                                                      // segment_dt below would be forced huge too. The push and the setup crank
                                                      // run at THE SAME real slot (no warp between them) so the push's own
                                                      // `authenticated_slot_or_fallback` reads the same small value.
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1; // 33 (was 51)
     // asset.slot_last after the setup crank: dt_total = 51 - 0 = 51 exceeds
     // MAX_ACCRUAL_DT_SLOTS (50), so segment_dt is capped at exactly 50.
     const SETUP_CRANK_SLOT_LAST: u64 = MAX_ACCRUAL_DT_SLOTS;
@@ -8127,15 +8134,23 @@ ProgInstruction::PermissionlessCrank {
         "the setup crank must have moved the engine's committed effective_price \
          toward the pushed mark"
     );
+    // #698 (upstream 18f3ae94): the crank now walks the canonical one-slot path and books
+    // each step's funding at that step's price against the ACTIVE checkpoint (still
+    // INITIAL_PRICE), so the convergence steps themselves charge funding (they used to be one
+    // segment priced at the pre-crank price, i.e. zero). What must still hold is that the
+    // pushed mark is not applied retroactively: the checkpoint stays pending at PUSH_SLOT.
+    let setup_profile =
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap();
     assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "the setup crank's own segment must charge zero funding -- the \
-         checkpoint has not promoted yet, so both sides of the premium formula \
-         are still anchored to the SAME (pre-push) mark"
+        setup_profile.funding_mark_e6, INITIAL_PRICE,
+        "the pushed mark must not promote before its slot"
     );
+    assert_eq!(setup_profile.funding_mark_pending_slot, PUSH_SLOT);
     assert_eq!(
-        group_after_setup_crank.assets[0].f_long_num, 0,
-        "no funding index movement from the setup crank itself"
+        group_after_setup_crank.assets[0].f_long_num,
+        -group_after_setup_crank.assets[0].f_short_num,
+        "setup crank funding is conserved between the two sides"
     );
 
     // NOW: no crank of any kind runs again for the rest of this test. `slot_last`
@@ -8195,12 +8210,12 @@ ProgInstruction::PermissionlessCrank {
     // side while the stale checkpoint acts as the "mark" side of the premium
     // formula and stands below it.
     assert_ne!(
-        group_after_close.assets[0].f_long_num, 0,
+        group_after_close.assets[0].f_long_num, group_after_setup_crank.assets[0].f_long_num,
         "long side funding index must move; pre-fix this stays 0 (zero-funding \
          arbitrage)"
     );
     assert_ne!(
-        group_after_close.assets[0].f_short_num, 0,
+        group_after_close.assets[0].f_short_num, group_after_setup_crank.assets[0].f_short_num,
         "short side funding index must move; pre-fix this stays 0 (zero-funding \
          arbitrage)"
     );
@@ -8376,14 +8391,18 @@ fn setup_accrual_carry_world(
         group_after_setup_crank.assets[0].effective_price, initial_price,
         "setup crank must converge effective_price toward the pushed mark"
     );
-    assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "setup crank's own segment must charge zero funding -- the checkpoint \
-         has not promoted yet"
-    );
+    // #698 (upstream 18f3ae94): the setup crank's path steps book funding at each step's price
+    // against the still-active INITIAL checkpoint (it used to be zero: one segment at the
+    // pre-crank price). It is the same in both worlds, so the comparison below is unaffected.
+    // The pushed mark itself must stay pending (not retroactive).
     let setup_profile =
         state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
             .unwrap();
+    assert_eq!(
+        setup_profile.funding_mark_e6, initial_price,
+        "the pushed mark must not promote before its slot"
+    );
+    assert_eq!(setup_profile.funding_mark_pending_slot, push_and_setup_crank_slot);
     eprintln!(
         "DEBUG after setup crank: effective_price={} funding_mark_e6={} pending_e6={} pending_slot={} mark_ewma_e6={}",
         group_after_setup_crank.assets[0].effective_price,
@@ -8443,10 +8462,14 @@ fn v16_bpf_canonical_accrual_path_matches_regardless_of_call_split_across_pendin
     const INITIAL_PRICE: u64 = 1_000_000;
     const PUSHED_MARK: u64 = 1_100_000;
     const DEPOSIT: u128 = 10_000_000;
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // #698 (upstream 18f3ae94): one crank accrues at most min(max_accrual_dt_slots,
+    // V16_MAX_ACCRUAL_PATH_STEPS = 32) path steps, so the window is 32 (was 50) and the
+    // cap is 39 bps (was 25): 39 * 32 = 1,248 bps keeps the same envelope (25 * 50 = 1,250)
+    // and still converges the 10% push in one crank (124,800 > 100,000 atoms).
+    const CAP_BPS: u64 = 39;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000;
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1; // 33 (was 51)
     // Five 1-slot steps starting exactly at the pending mark's own activation
     // slot (51..=55).
     const STEPS: u64 = 5;
