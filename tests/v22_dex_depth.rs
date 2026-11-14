@@ -1503,6 +1503,242 @@ fn l_rc2_1_unpinned_mode1_unchanged() {
     assert_eq!(env.oracle_seq(), seq + 1);
 }
 
+// #686: the pool claim of a market that CloseSlab closed.
+
+const CLAIM_COLLATERAL: [u8; 32] = [0x12; 32];
+
+fn lamports_of(env: &Env, k: &Pubkey) -> u64 {
+    env.svm.get_account(k).map(|a| a.lamports).unwrap_or(0)
+}
+
+/// ResolveMarket then CloseSlab on `env.market` (marketauth = `env.admin`): the market becomes the 16-byte
+/// `KIND_CLOSED_MARKET` tombstone.
+fn resolve_and_close(env: &mut Env) {
+    let market = env.market;
+    let data = env.svm.get_account(&market).unwrap().data;
+    let frontier = state::read_market_asset_generation_frontier(&data).unwrap();
+    let epoch = state::read_asset_control_sequences(&data, 0).unwrap().authority_epoch;
+    let admin = env.admin.insecure_clone();
+    env.warp(1);
+    env.send(
+        ProgInstruction::ResolveMarket { asset_generation_frontier: frontier, authority_epoch: epoch },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+        &[&admin],
+    )
+    .expect("ResolveMarket");
+    env.warp(1);
+    let collateral = Pubkey::new_from_array(CLAIM_COLLATERAL);
+    let va = Pubkey::find_program_address(&[b"vault", market.as_ref()], &env.program_id).0;
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(dest, Account { lamports: 1_000_000_000, data: token_data(collateral, admin.pubkey(), 0), owner: spl_token::ID, executable: false, rent_epoch: 0 })
+        .unwrap();
+    let epoch = state::read_asset_control_sequences(&env.svm.get_account(&market).unwrap().data, 0).unwrap().authority_epoch;
+    env.send(
+        ProgInstruction::CloseSlab { authority_epoch: epoch },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(canonical_vault_ata(&va, &collateral), false),
+            AccountMeta::new_readonly(va, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[&admin],
+    )
+    .expect("CloseSlab");
+    assert_eq!(env.svm.get_account(&market).unwrap().data.len(), percolator_prog::constants::HEADER_LEN, "tombstone");
+}
+
+/// A second band growth market in the same SVM, set up as `Env::new` sets up the first.
+fn add_market(env: &mut Env, tag: u8) -> Pubkey {
+    let market_kp = seeded_keypair(tag);
+    let market = market_kp.pubkey();
+    let collateral = Pubkey::new_from_array(CLAIM_COLLATERAL);
+    let acct = |data: Vec<u8>, owner: Pubkey| Account { lamports: 1_000_000_000, data, owner, executable: false, rent_epoch: 0 };
+    let va = Pubkey::find_program_address(&[b"vault", market.as_ref()], &env.program_id).0;
+    env.svm.set_account(canonical_vault_ata(&va, &collateral), acct(token_data(collateral, va, 0), spl_token::ID)).unwrap();
+    env.svm.set_account(market, acct(vec![0u8; state::market_account_len_for_capacity(1).unwrap()], env.program_id)).unwrap();
+    let base = ProgInstruction::InitMarket {
+        max_portfolio_assets: 1,
+        h_min: 0,
+        h_max: 10,
+        initial_price: MARK,
+        min_nonzero_mm_req: 10,
+        min_nonzero_im_req: 20,
+        maintenance_margin_bps: 500,
+        initial_margin_bps: ENGINE_IMR,
+        max_trading_fee_bps: 10_000,
+        trade_fee_base_bps: 0,
+        liquidation_fee_bps: 100,
+        liquidation_fee_cap: 1_000_000_000_000_000,
+        min_liquidation_abs: 0,
+        max_price_move_bps_per_slot: 4,
+        max_accrual_dt_slots: 1,
+        max_abs_funding_e9_per_slot: 1,
+        min_funding_lifetime_slots: 1,
+        max_account_b_settlement_chunks: 1,
+        max_bankrupt_close_chunks: 1,
+        max_bankrupt_close_lifetime_slots: 1_000_000,
+        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
+        maintenance_fee_per_slot: 0,
+    };
+    let init = ProgInstruction::InitMarketV22 {
+        market: Box::new(base),
+        growth_r_gap_bps: 0,
+        growth_l_launch_x100: 1_000,
+        lot_exp: 4,
+        phase4: InitMarketPhase4 {
+            rent_max_e9_per_slot: 23,
+            rent_kink_bps: 5_000,
+            band_bps: 100,
+            band_max_epoch_slots: 600,
+            band_max_pin_slots: 9_000,
+            band_min_leg_notional: 10_000_000,
+        },
+    };
+    let admin = env.admin.insecure_clone();
+    env.send(
+        init,
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, true), AccountMeta::new_readonly(collateral, false)],
+        &[&admin, &market_kp],
+    )
+    .expect("init second market");
+    let seq = state::read_asset_control_sequences(&env.svm.get_account(&market).unwrap().data, 0).unwrap().oracle_observation + 1;
+    env.send(
+        ProgInstruction::ConfigureAuthMark { market_id: 1, asset_index: 0, now_slot: env.slot, initial_mark_e6: MARK, observation_sequence: seq },
+        vec![AccountMeta::new(admin.pubkey(), true), AccountMeta::new(market, false)],
+        &[&admin],
+    )
+    .expect("configure auth mark on the second market");
+    market
+}
+
+/// #686: CloseSlab leaves the pool claim naming the closed market. Tag 123 op 0 on the 16-byte tombstone
+/// releases it (the claim PDA is closed and its exact rent goes to the UA; the tombstone is untouched), and
+/// another market can then pin the pool. A repeated op 0 on the tombstone is the same Ok no-op that a
+/// repeated op 0 on a live market is.
+#[test]
+fn pool_claim_released_after_close_slab() {
+    let mut env = Env::new(Pubkey::new_from_array(CLAIM_COLLATERAL));
+    let pool = chill().pool.to_bytes();
+    let m1 = env.market;
+    env.set_source(chill()).expect("pin m1");
+    resolve_and_close(&mut env);
+    assert_eq!(env.claim(&pool).unwrap().market, m1.to_bytes(), "CloseSlab leaves the claim");
+    let cpda = env.claim_pda(&pool);
+    let rent = lamports_of(&env, &cpda);
+    assert!(rent > 0);
+    let tomb = env.svm.get_account(&m1).unwrap();
+    let ua_before = lamports_of(&env, &env.ua.pubkey());
+    env.warp(1);
+    let r = env.clear_source();
+    println!("op 0 on the closed market -> {r:?}");
+    r.expect("op 0 on the closed market");
+    let c = env.svm.get_account(&cpda);
+    println!("claim PDA after: {:?}", c.as_ref().map(|a| (a.lamports, a.owner, a.data.len())));
+    assert!(
+        c.is_none_or(|a| a.lamports == 0 && a.data.is_empty() && a.owner == solana_sdk::system_program::id()),
+        "claim PDA closed"
+    );
+    assert!(env.claim(&pool).is_none(), "claim released");
+    assert_eq!(lamports_of(&env, &env.ua.pubkey()), ua_before + rent, "the UA gets exactly the claim rent back");
+    assert_eq!(env.svm.get_account(&m1).unwrap(), tomb, "the tombstone is not written");
+    let rec = env.record().expect("record kept");
+    assert!(!rec.is_active() && rec.pool == [0u8; 32], "pin cleared");
+    // another market pins the same pool
+    let m2 = add_market(&mut env, 0x21);
+    env.market = m2;
+    env.warp(1);
+    env.set_source(chill()).expect("m2 pins the released pool");
+    assert_eq!(env.claim(&pool).unwrap().market, m2.to_bytes(), "the claim names m2");
+    // a repeated op 0 on the tombstone: Ok, nothing moves
+    env.market = m1;
+    let (ua_before, claim_before) = (lamports_of(&env, &env.ua.pubkey()), env.svm.get_account(&cpda));
+    env.warp(1);
+    let r = env.clear_source();
+    println!("second op 0 on the closed market -> {r:?}");
+    r.expect("second op 0 on the closed market");
+    assert_eq!(lamports_of(&env, &env.ua.pubkey()), ua_before);
+    assert_eq!(env.svm.get_account(&cpda), claim_before, "m2's claim untouched");
+    assert_eq!(env.svm.get_account(&m1).unwrap(), tomb);
+    // CONTROL: a repeated op 0 on a live market is also Ok
+    env.market = m2;
+    env.warp(1);
+    env.clear_source().expect("op 0 on live m2");
+    env.warp(1);
+    let r = env.clear_source();
+    println!("second op 0 on live m2 -> {r:?}");
+    r.expect("second op 0 on live m2");
+}
+
+/// #686: op 1 (pin) on a closed market is still refused (InvalidAccountLen from the market view), and the
+/// claim, the record and the tombstone are unchanged.
+#[test]
+fn pool_claim_close_slab_pin_still_refused() {
+    let mut env = Env::new(Pubkey::new_from_array(CLAIM_COLLATERAL));
+    let pool = chill().pool.to_bytes();
+    env.set_source(chill()).expect("pin");
+    resolve_and_close(&mut env);
+    let before = (env.svm.get_account(&env.claim_pda(&pool)), env.record(), env.svm.get_account(&env.market));
+    env.warp(1);
+    let r = env.set_source(chill());
+    println!("op 1 on the closed market -> {r:?}");
+    assert_err(&r, &code(PercolatorError::InvalidAccountLen), "op 1 on the closed market");
+    assert_eq!((env.svm.get_account(&env.claim_pda(&pool)), env.record(), env.svm.get_account(&env.market)), before);
+}
+
+/// #686: only a real tombstone (program-owned, exactly 16 bytes, a valid `KIND_CLOSED_MARKET` header) skips
+/// the pin-bit step. Look-alikes at the market's address still fail op 0 and keep the claim; a depth-source PDA
+/// of another market is still refused; and on a live market op 0 still clears the pin bit.
+#[test]
+fn pool_claim_close_slab_release_needs_a_real_tombstone() {
+    use percolator_prog::constants::HEADER_LEN;
+    let mut env = Env::new(Pubkey::new_from_array(CLAIM_COLLATERAL));
+    let pool = chill().pool.to_bytes();
+    env.set_source(chill()).expect("pin");
+    assert!(growth_v19::depth_dex_pinned(env.growth().depth_source), "setup: pin bit set");
+    let live = env.svm.get_account(&env.market).unwrap();
+    let mut tomb = vec![0u8; HEADER_LEN];
+    state::write_closed_market_tombstone(&mut tomb).unwrap();
+    let mut other_kind = tomb.clone();
+    other_kind[10] = 1;
+    let mut full_len_kind8 = live.data.clone();
+    full_len_kind8[10] = tomb[10];
+    let foreign = Pubkey::new_from_array([0xAB; 32]);
+    let cases: [(&str, Vec<u8>, Pubkey, String); 4] = [
+        ("16 B, another kind", other_kind, env.program_id, code(PercolatorError::InvalidAccountLen)),
+        ("16 B, no header", vec![0u8; HEADER_LEN], env.program_id, code(PercolatorError::InvalidAccountLen)),
+        ("full length, kind-8 header", full_len_kind8, env.program_id, code(PercolatorError::InvalidAccountKind)),
+        ("real tombstone bytes, foreign owner", tomb.clone(), foreign, "IncorrectProgramId".to_string()),
+    ];
+    for (what, data, owner, err) in cases {
+        env.svm.set_account(env.market, Account { data, owner, ..live.clone() }).unwrap();
+        env.warp(1);
+        let r = env.clear_source();
+        println!("{what}: op 0 -> {r:?}");
+        assert_err(&r, &err, what);
+        assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes(), "{what}: claim kept");
+        assert!(env.record().unwrap().is_active(), "{what}: pin kept");
+    }
+    // a depth-source PDA of another market: refused on a tombstone and on a live market
+    let (ua, wrong) = (env.ua.insecure_clone(), state::derive_depth_source(&env.program_id, &Pubkey::new_from_array([0x99; 32])).0);
+    for (what, data) in [("tombstone", tomb), ("live", live.data.clone())] {
+        env.svm.set_account(env.market, Account { data, ..live.clone() }).unwrap();
+        env.warp(1);
+        let r = env.set_source_with(&ua, 0, 1, wrong, None);
+        println!("{what}, wrong depth-source PDA: op 0 -> {r:?}");
+        assert_err(&r, &code(PercolatorError::DepthSourceInvalid), what);
+        assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes(), "{what}: claim kept");
+    }
+    // CONTROL: on the live market op 0 releases the claim and clears the pin bit
+    env.svm.set_account(env.market, live).unwrap();
+    env.warp(1);
+    env.clear_source().expect("op 0 on the live market");
+    assert!(env.claim(&pool).is_none(), "claim released");
+    assert!(!growth_v19::depth_dex_pinned(env.growth().depth_source), "pin bit cleared");
+}
+
 /// Decision 16 (night 2026-10-28): one growth market per spot pool. Tag 123 claims the pinned pool for the
 /// market (`["pool_claim", pool]`, kind 18); a pool claimed by ANOTHER market cannot be pinned (nothing is
 /// written); the same market may re-pin; clearing the pin releases the claim (rent back to the UA), after
