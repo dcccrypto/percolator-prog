@@ -2,8 +2,11 @@
 //!
 //! Attacker view: the caller picks every account in the list. For each instruction we swap in one
 //! hostile account at a time and require the wrapper to reject. Each fixture also has a baseline
-//! test that the UNMUTATED account list succeeds, so a rejection below cannot come from a broken
-//! fixture.
+//! test that the UNMUTATED account list succeeds, so the fixture itself is sound. Duplicate-account
+//! cells are mostly rejected by an owner/type mismatch rather than a dedicated duplicate guard.
+//!
+//! Not covered: WithdrawInsurance. It reads `Clock::get()`, which needs a process-global syscall
+//! stub in the native harness; that would change every other test in this binary.
 //!
 //! Columns: A market not owned by this program, B portfolio not owned by this program,
 //! C signer missing, D market read-only, E portfolio read-only, F other user's portfolio /
@@ -69,11 +72,13 @@ fn m_b(fx: &mut SubFx) {
     fx.accts[p].owner = Pubkey::new_unique();
 }
 fn m_c(fx: &mut SubFx) {
-    for s in fx.signers.clone() {
-        // one at a time is covered by `m_c_each`; here: the first signer
-        fx.accts[s].is_signer = false;
-        break;
-    }
+    let s = fx.signers[0];
+    fx.accts[s].is_signer = false;
+}
+/// Same, for the LAST signer (trade: the counterparty).
+fn m_c_last(fx: &mut SubFx) {
+    let s = *fx.signers.last().unwrap();
+    fx.accts[s].is_signer = false;
 }
 fn m_d(fx: &mut SubFx) {
     fx.accts[fx.market].is_writable = false;
@@ -83,7 +88,9 @@ fn m_e(fx: &mut SubFx) {
     fx.accts[p].is_writable = false;
 }
 fn m_f(fx: &mut SubFx) {
-    let attacker = signer();
+    let mut attacker = signer();
+    // keep the attacker's writability equal to the original signer's, so only ownership differs
+    attacker.is_writable = fx.accts[fx.signers[0]].is_writable;
     let s = fx.signers[0];
     for t in fx.owner_tokens.clone() {
         sub_attacker_token(fx, t, attacker.key);
@@ -234,6 +241,9 @@ fn fx_withdraw() -> SubFx {
 fn fx_close() -> SubFx {
     let mut b = base(1_000);
     withdraw(&mut b.owner, &mut b.market, &mut b.portfolio, 1_000);
+    // empty the spare portfolio too, so the market-binding check is the only thing that can reject it
+    let mut spare_owner = TestAccount::new(b.owner.key, Pubkey::new_unique(), 0).signer();
+    withdraw(&mut spare_owner, &mut b.spare_market, &mut b.spare_portfolio, 1_000);
     // ClosePortfolio demands the closer be writable (it receives the rent when the closer is the owner).
     b.owner.is_writable = true;
     SubFx {
@@ -308,79 +318,6 @@ fn fx_trade() -> SubFx {
     }
 }
 
-/// WithdrawInsurance reads `Clock::get()?`, which the plain native harness cannot serve (the
-/// older insurance tests are in KNOWN_FAILING for that reason). Serve a fixed clock, keeping the
-/// rent stub the InitPortfolio helper needs.
-fn install_clock_and_rent_stub() {
-    struct Stub;
-    impl solana_program::program_stubs::SyscallStubs for Stub {
-        fn sol_get_rent_sysvar(&self, var_addr: *mut u8) -> u64 {
-            unsafe { *(var_addr as *mut solana_program::rent::Rent) = Default::default() };
-            solana_program::entrypoint::SUCCESS
-        }
-        fn sol_get_clock_sysvar(&self, var_addr: *mut u8) -> u64 {
-            let clock = solana_program::clock::Clock { slot: 1_000_000_000,..Default::default() };
-            unsafe { *(var_addr as *mut solana_program::clock::Clock) = clock };
-            solana_program::entrypoint::SUCCESS
-        }
-    }
-    // The rent-only stub is installed once per process by the first InitPortfolio; make sure it
-    // has run so it can never replace this one afterwards.
-    install_rent_sysvar_stub();
-    static ONCE: std::sync::Once = std::sync::Once::new();
-    ONCE.call_once(|| {
-        solana_program::program_stubs::set_syscall_stubs(Box::new(Stub));
-    });
-}
-
-fn fx_withdraw_insurance() -> SubFx {
-    install_clock_and_rent_stub();
-    // No portfolio: terminal insurance withdrawal needs zero materialised portfolios.
-    let mut b = {
-        let mut admin = signer();
-        let mut market = market_account();
-        let mint = init_market(&mut admin, &mut market);
-        Base {
-            admin,
-            market,
-            owner: signer(),
-            portfolio: portfolio_account(),
-            mint,
-            spare_market: market_account(),
-            spare_portfolio: portfolio_account(),
-        }
-    };
-    let mut source = user_token_account(b.admin.key, b.mint, 100);
-    let mut vault = vault_token_account(&b.market, b.mint, 100);
-    let mut tp = token_program_account();
-    let epoch = state::read_asset_control_sequences(&b.market.data, 0).unwrap().authority_epoch;
-    run_ix(
-        Instruction::TopUpInsuranceDomain { domain: 0, market_id: 1, intent_id: next_intent_id(), amount: 100, authority_epoch: epoch },
-        &mut [&mut b.admin, &mut b.market, &mut source, &mut vault, &mut tp],
-    )
-    .unwrap();
-    let frontier = state::read_asset_generation_frontier(&b.market.data).unwrap();
-    run_ix(
-        Instruction::ResolveMarket { asset_generation_frontier: frontier, authority_epoch: epoch },
-        &mut [&mut b.admin, &mut b.market],
-    )
-    .unwrap();
-    let dest = user_token_account(b.admin.key, b.mint, 0);
-    let va = vault_authority_account(&b.market);
-    SubFx {
-        accts: vec![b.admin, b.market, dest, vault, va, tp],
-        ix: |_| Instruction::WithdrawInsurance { amount: 100 },
-        market: 1,
-        portfolio: None,
-        signers: vec![0],
-        tokens: vec![2, 3],
-        owner_tokens: vec![2],
-        vault: Some(3),
-        vault_auth: Some(4),
-        spare_portfolio: None,
-    }
-}
-
 fn fx_withdraw_protocol_fee() -> SubFx {
     let mut b = base(0);
     seed_protocol_fee_fixture(&mut b.market, b.admin.key.to_bytes(), 100, 0, 100, 100);
@@ -436,7 +373,6 @@ sub_baseline!(acct_sub_baseline_withdraw, fx_withdraw);
 sub_baseline!(acct_sub_baseline_close_portfolio, fx_close);
 sub_baseline!(acct_sub_baseline_crank, fx_crank);
 sub_baseline!(acct_sub_baseline_trade_nocpi, fx_trade);
-sub_baseline!(acct_sub_baseline_withdraw_insurance, fx_withdraw_insurance);
 sub_baseline!(acct_sub_baseline_withdraw_protocol_fee, fx_withdraw_protocol_fee);
 sub_baseline!(acct_sub_baseline_withdraw_creator_fee, fx_withdraw_creator_fee);
 
@@ -470,6 +406,7 @@ sub_dup!(acct_sub_withdraw_i_duplicate_accounts, fx_withdraw, [(3, 4), (1, 2)]);
 sub_cell!(acct_sub_trade_a_market_wrong_program, fx_trade, m_a);
 sub_cell!(acct_sub_trade_b_portfolio_wrong_program, fx_trade, m_b);
 sub_cell!(acct_sub_trade_c_signer_missing, fx_trade, m_c);
+sub_cell!(acct_sub_trade_c2_counterparty_signer_missing, fx_trade, m_c_last);
 sub_cell!(acct_sub_trade_d_market_readonly, fx_trade, m_d);
 sub_cell!(acct_sub_trade_e_portfolio_readonly, fx_trade, m_e);
 sub_cell!(acct_sub_trade_f_other_users_portfolio, fx_trade, m_f);
@@ -477,7 +414,8 @@ sub_cell!(acct_sub_trade_g1_fake_market, fx_trade, m_g1);
 sub_cell!(acct_sub_trade_g2_portfolio_of_other_market, fx_trade, m_g2);
 sub_dup!(acct_sub_trade_i_duplicate_accounts, fx_trade, [(3, 4), (2, 3)]);
 
-// ---- Liquidate (the public crank: refresh + F1 liquidation step) -----------------------------
+// ---- Public crank (the entry point liquidation runs through). The fixture portfolio is healthy,
+// so these cells only exercise the crank's account checks, not the liquidation step itself. ------
 sub_cell!(acct_sub_crank_a_market_wrong_program, fx_crank, m_a);
 sub_cell!(acct_sub_crank_b_portfolio_wrong_program, fx_crank, m_b);
 sub_cell!(acct_sub_crank_d_market_readonly, fx_crank, m_d);
@@ -495,15 +433,6 @@ sub_cell!(acct_sub_close_f_other_users_portfolio, fx_close, m_f);
 sub_cell!(acct_sub_close_g1_fake_market, fx_close, m_g1);
 sub_cell!(acct_sub_close_g2_portfolio_of_other_market, fx_close, m_g2);
 sub_dup!(acct_sub_close_i_duplicate_accounts, fx_close, [(1, 2)]);
-
-// ---- WithdrawInsurance -----------------------------------------------------------------------
-sub_cell!(acct_sub_insurance_a_market_wrong_program, fx_withdraw_insurance, m_a);
-sub_cell!(acct_sub_insurance_d_market_readonly, fx_withdraw_insurance, m_d);
-sub_cell!(acct_sub_insurance_f_non_authority_signer, fx_withdraw_insurance, m_f);
-sub_cell!(acct_sub_insurance_g1_fake_market, fx_withdraw_insurance, m_g1);
-sub_cell!(acct_sub_insurance_h_wrong_vault_authority_pda, fx_withdraw_insurance, m_h);
-sub_cell!(acct_sub_insurance_t_token_readonly, fx_withdraw_insurance, m_t);
-sub_dup!(acct_sub_insurance_i_duplicate_accounts, fx_withdraw_insurance, [(2, 3)]);
 
 // ---- WithdrawProtocolFee ---------------------------------------------------------------------
 sub_cell!(acct_sub_protocol_fee_a_market_wrong_program, fx_withdraw_protocol_fee, m_a);
