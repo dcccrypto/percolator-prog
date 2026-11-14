@@ -26834,8 +26834,9 @@ pub mod processor {
             0,
         )?;
         vault_lp_post_fill(market_ai, victim_ai, lp_ai, &vault_lp_pre, max_market_slots)?;
-        // v2.2 reduce event: the victim's whole leg, closed against the bound vault LP at
-        // `P_last` (the booked price of a forced close), no fee.
+        // v2.2 reduce event: what was closed of the victim's leg (the whole leg for 118 / 119, the
+        // W1 cut for 124), against the bound vault LP at `P_last` (the booked price of a forced
+        // close), no fee.
         fill_events_v22::emit_reduce(
             event_tag,
             &market_ai.key.to_bytes(),
