@@ -160,6 +160,12 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
             "refresh_account_and_certify_not_atomic",
             "require_active_leg_slot_for_asset",
             "require_asset_live_reducible",
+            // engine #317 cpbind (reviewed against f1_follow_on_wanted, no screen change): refuses
+            // CounterpartyNotBound (wrapper 138) only when a counterparty is passed. Tag 5 passes one
+            // only if it is the AssetVaultLpV18 portfolio, and tag 94 / 126 write that same key into
+            // the engine, so it is reachable only on a slab migrated without tag 126. Reverting the
+            // crank there is intended (a silent unilateral fallback would latch ADL, bigtest F2).
+            "require_bound_standing_counterparty",
             "risk_score_unchecked",
             "set_account_pnl",
             "settle_negative_pnl_from_principal_core_not_atomic",

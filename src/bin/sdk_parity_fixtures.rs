@@ -182,6 +182,7 @@ fn variant_name(ix: &Instruction) -> &'static str {
         // v2.2 Phase 4 item 2, tag 106.
         Instruction::SettleHoldingRent { .. } => "SettleHoldingRent",
         Instruction::SweepBandDustLeg { .. } => "SweepBandDustLeg",
+        Instruction::SyncVaultLpCounterparty { .. } => "SyncVaultLpCounterparty",
         Instruction::EvictAndTradeCpi { .. } => "EvictAndTradeCpi",
         Instruction::ProposeG9FeedAllowlist { .. } => "ProposeG9FeedAllowlist",
         Instruction::CommitG9FeedAllowlist => "CommitG9FeedAllowlist",
