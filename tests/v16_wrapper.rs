@@ -29631,3 +29631,6 @@ fn d26_init_portfolio_requires_the_portfolio_account_signature() {
 
 // J-20261114-PROG-ACCTSUB: account-substitution matrix (tests/acct_sub/mod.rs).
 mod acct_sub;
+
+// J-20261114-PROG-WITHDRAW-SUB: unsigned-path substitution cells (tests/acct_sub_unsigned/mod.rs).
+mod acct_sub_unsigned;
