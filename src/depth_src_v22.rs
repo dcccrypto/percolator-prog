@@ -95,6 +95,7 @@ pub const RAYDIUM_OFF_MINT1: usize = 200;
 pub const RAYDIUM_OFF_PROGRAM0: usize = 232;
 pub const RAYDIUM_OFF_PROGRAM1: usize = 264;
 pub const RAYDIUM_OFF_STATUS: usize = 329;
+pub const RAYDIUM_OFF_OPEN_TIME: usize = 373;
 pub const RAYDIUM_OFF_PROTOCOL_FEES0: usize = 341;
 pub const RAYDIUM_OFF_PROTOCOL_FEES1: usize = 349;
 pub const RAYDIUM_OFF_FUND_FEES0: usize = 357;
@@ -123,6 +124,30 @@ fn u64_at(data: &[u8], off: usize) -> Option<u64> {
 fn u64_at_or_zero(data: &[u8], off: usize) -> u64 {
     u64_at(data, off).unwrap_or(0)
 }
+
+/// Raydium CPMM cannot swap before PoolState.open_time.
+/// PumpSwap keeps its existing reserve validation.
+pub fn pool_time_open(
+    amm_kind: u8,
+    data: &[u8],
+    now_unix: i64,
+) -> bool {
+    match amm_kind {
+        AMM_RAYDIUM_CPMM => {
+            if data.len() != RAYDIUM_POOL_LEN {
+                return false;
+            }
+            let Ok(now) = u64::try_from(now_unix) else {
+                return false;
+            };
+            u64_at(data, RAYDIUM_OFF_OPEN_TIME)
+                .is_some_and(|open_time| now >= open_time)
+        }
+        AMM_PUMPSWAP => true,
+        _ => false,
+    }
+}
+
 
 /// The two sides of a pool in the pool's own order (PumpSwap: 0 = base, 1 = quote; Raydium CPMM:
 /// 0 = token_0, 1 = token_1). `token_program[i]` is the side's token program when the pool
@@ -901,5 +926,35 @@ mod pool_claim_tests {
         assert!(pool_claim_held_by(&c, &[2; 32]) && !pool_claim_held_by(&c, &[3; 32]));
         c._reserved[0] = 1;
         assert!(!validate_pool_claim(&c));
+    }
+}
+
+#[cfg(test)]
+mod p01_open_time_tests {
+    use super::*;
+
+    #[test]
+    fn raydium_open_time_boundary() {
+        let mut pool = [0u8; RAYDIUM_POOL_LEN];
+        let open: u64 = 1_800_000_000;
+
+        pool[RAYDIUM_OFF_OPEN_TIME..RAYDIUM_OFF_OPEN_TIME + 8]
+            .copy_from_slice(&open.to_le_bytes());
+
+        assert!(!pool_time_open(
+            AMM_RAYDIUM_CPMM, &pool, open as i64 - 1
+        ));
+
+        assert!(pool_time_open(
+            AMM_RAYDIUM_CPMM, &pool, open as i64
+        ));
+
+        assert!(pool_time_open(
+            AMM_RAYDIUM_CPMM, &pool, open as i64 + 1
+        ));
+
+        assert!(!pool_time_open(
+            AMM_RAYDIUM_CPMM, &pool, -1
+        ));
     }
 }

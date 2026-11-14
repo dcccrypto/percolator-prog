@@ -30009,6 +30009,13 @@ pub mod processor {
         let mut amounts = [0u64; 2];
         amounts[b] = base_vault.amount;
         amounts[q] = quote_vault.amount;
+        if !ds::pool_time_open(
+            kind,
+            &pool_data,
+            Clock::get()?.unix_timestamp,
+        ) {
+            return Err(bad());
+        }
         let reserves = ds::pool_reserves(kind, &pool_data, amounts).ok_or_else(bad)?;
         Ok(DexDepthReading {
             base_atoms: reserves[b],
@@ -40453,6 +40460,13 @@ pub mod processor {
         let mut amounts = [0u64; 2];
         amounts[b] = bv.amount;
         amounts[q] = qv.amount;
+        if !ds::pool_time_open(
+            kind,
+            &pool_data,
+            Clock::get()?.unix_timestamp,
+        ) {
+            return Err(bad());
+        }
         ds::pool_reserves(kind, &pool_data, amounts).ok_or_else(bad)?;
         Ok(rec)
     }
