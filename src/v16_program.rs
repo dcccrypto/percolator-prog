@@ -2790,12 +2790,17 @@ pub mod state {
         /// Cumulative atoms accrued to the LP vault's claim. Monotonic.
         /// Claimed via `LpVaultCrankFees` (tag 78) into vault NAV.
         pub lp_fee_accrued_atoms: u128,
-        /// Cumulative atoms already credited to the vault. `<= lp_fee_accrued_atoms`.
+        /// Cumulative atoms settled out of the LP leg: credited to the vault, or folded into
+        /// the staker leg with no transfer (`fold_lp_leg_into_insurance`: tag 87's P1 F4
+        /// exception, CloseSlab's `rebook_orphaned_fee_legs_view`). `<= lp_fee_accrued_atoms`.
         pub lp_fee_withdrawn_atoms: u128,
         /// Cumulative atoms accrued to the insurance/staker leg. Monotonic.
         /// Claimed via `WithdrawInsuranceReserveToStake` (tag 87).
         pub insurance_reserve_accrued_atoms: u128,
-        /// Cumulative atoms already pushed to the stake vault. `<= accrued`.
+        /// Cumulative atoms settled out of the staker leg: pushed to the stake vault by tag 87,
+        /// or re-booked to the protocol leg with no transfer by CloseSlab's
+        /// `rebook_orphaned_fee_legs_view` (W-S1: no bound pool, or a bound pool owed nothing).
+        /// So it is NOT a count of atoms the stake vault received. `<= accrued`.
         pub insurance_reserve_withdrawn_atoms: u128,
         /// Creator's share of T in bps. Floor: <= MAX_CREATOR_SHARE_BPS.
         pub creator_share_bps: u16,
@@ -25396,25 +25401,26 @@ pub mod processor {
     /// all, only `expect_signer` on an arbitrary fee payer, so allowing it in a
     /// terminal state hands a permissionless drain to anyone.
     ///
-    /// ⚠ THE SECOND PREMISE DOES APPLY, AND THIS LEG IS FORFEITED BY IT. An
-    /// earlier version of this comment claimed refusing on Resolved "strands
-    /// nothing" because the reserve stays reclaimable by the stake program via
+    /// ⚠ THE SECOND PREMISE APPLIES UNTIL THE MARKET IS EMPTY. An earlier
+    /// version of this comment claimed refusing on Resolved "strands nothing"
+    /// because the reserve stays reclaimable by the stake program via
     /// `WithdrawInsurance` (tag 41), on the grounds that a bound
     /// `insurance_authority` IS the pool's `vault_auth` PDA. THAT IS WRONG: tag
     /// 41's capacity is budget-scoped
     /// (`terminal_insurance_withdraw_capacity_for_authority_view`), while the
     /// atoms this leg pays out are the UNBUDGETED surplus that the clamp below
-    /// deliberately isolates. Tag 41 cannot reach them. `ResolveMarket` being
-    /// one-way, any `insurance_reserve_accrued - withdrawn` that has not been
-    /// pushed before the market resolves is PERMANENTLY UNREACHABLE by stakers.
+    /// deliberately isolates. Tag 41 cannot reach them. So any
+    /// `insurance_reserve_accrued - withdrawn` not pushed before `ResolveMarket`
+    /// waits: this handler refuses until the market is terminal-empty (the P1 F4
+    /// exception in the mode gate: no portfolio left, `c_tot == 0`), then pays
+    /// it, and `CloseSlab` refuses (`CloseSlabFeesOutstanding`) until it has.
+    /// The leg is delayed to the close, not forfeited.
     ///
-    /// That is a real, accepted cost, not a non-issue. It is accepted because
-    /// the alternative — a permissionless token-moving instruction that still
-    /// runs after resolution — is worse (see the Recovery note below), and
-    /// because the leg is continuously crankable by anyone for the entire Live
-    /// lifetime of the market, so the forfeited amount is bounded by whatever
-    /// accrues between the last successful crank and resolution. Keepers should
-    /// crank tag 87 before `ResolveMarket`, not after.
+    /// The delay is accepted because the alternative — a permissionless
+    /// token-moving instruction that runs while the insurance still covers
+    /// traders — is worse (see the Recovery note below). Keepers should still
+    /// crank tag 87 before `ResolveMarket`, so stakers are not paid only after
+    /// the last trader account closes.
     ///
     /// Concretely blocked:
     ///   * Recovery (mode 2) — the important one, and worse here than for tag
@@ -25427,17 +25433,17 @@ pub mod processor {
     ///     market as a junior LP claim; here they leave the program entirely as
     ///     SPL tokens and stakers can withdraw them.
     ///   * Resolved (mode 1) — same drain, before trader portfolios are
-    ///     materialised. Note this is the FORFEITING case described above: there
-    ///     is no tag-41 fallback for the unbudgeted leg.
+    ///     materialised. This is the waiting case described above: there is no
+    ///     tag-41 fallback for the unbudgeted leg, so it is paid only once the
+    ///     market is terminal-empty.
     ///   * Live-but-matured — `reject_permissionless_resolve_matured_live_view`,
     ///     as tag 78 uses: no permissionless token movement out of a market
     ///     that is past its stale-resolve horizon and merely awaiting a
     ///     resolve.
     ///
     /// A rejected call never marks anything withdrawn, so `accrued - withdrawn`
-    /// stays fully claimable IF the market can return to Live — true for the
-    /// matured-Live and Recovery cases, and NOT true for Resolved, which is
-    /// terminal and therefore forfeits the outstanding leg as described above.
+    /// stays fully claimable: once the market returns to Live (the matured-Live
+    /// and Recovery cases) or, on Resolved, once it is terminal-empty.
     ///
     /// MANDATORY CLAMP. The protocol leg (tag 84), the LP leg (tag 78) and this
     /// stake leg ALL draw from one pool: `insurance −
