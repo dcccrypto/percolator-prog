@@ -14,7 +14,7 @@
 //!
 //! Columns: A market not owned by this program, C signer missing, D market read-only,
 //! F wrong authority, G1 uninitialised (fake) market, H wrong vault-authority PDA / wrong vault,
-//! I duplicate accounts, T SPL token account read-only, P wrong token program.
+//! I duplicate accounts, X market not resolved, T SPL token account read-only, P wrong token program.
 #![cfg(not(kani))]
 
 mod acct_sub_harness;
@@ -204,7 +204,8 @@ cell!(acct_sub_wi_f1_wrong_authority_own_dest, fx_resolved, |fx: &mut SubFx| {
     fx.accts[2].data = make_token_data(t.mint, attacker.key, t.amount);
     fx.accts[0] = attacker;
 });
-// Attacker signs but the dest is still the real authority's: dest owner != authority key.
+// Attacker signs but the dest is still the real authority's. Rejected by capacity 0 (EngineLockActive),
+// not by the dest-owner check; f4 covers the dest-owner check.
 cell!(acct_sub_wi_f2_wrong_authority_victim_dest, fx_resolved, |fx: &mut SubFx| {
     fx.accts[0] = signer();
 });
@@ -217,12 +218,17 @@ cell!(acct_sub_wi_f3_stranger_authority_unsigned, fx_resolved, |fx: &mut SubFx| 
     fx.accts[0] = stranger;
 });
 
+/// The REAL authority signs but names a dest owned by someone else: refused (dest owner != authority).
+cell_rb!(acct_sub_wi_f4_real_authority_dest_owned_by_attacker, fx_resolved, |fx: &mut SubFx| {
+    let t = TokenAccount::unpack(&fx.accts[2].data).unwrap();
+    fx.accts[2].data = make_token_data(t.mint, Pubkey::new_unique(), t.amount);
+});
+
 // ---- H: vault authority PDA / vault ----------------------------------------------------------
 cell_rb!(acct_sub_wi_h1_wrong_vault_authority_pda, fx_resolved, m_h);
 cell_rb!(acct_sub_wi_h2_vault_owned_by_someone_else, fx_resolved, |fx: &mut SubFx| {
-    fx.accts[4].key = vault_authority(&fx.accts[1]); // keep the PDA right...
     let t = TokenAccount::unpack(&fx.accts[3].data).unwrap();
-    // ...but the vault token account is controlled by an attacker key
+    // the PDA stays right, but the vault token account is controlled by an attacker key
     fx.accts[3].data = make_token_data(t.mint, Pubkey::new_unique(), t.amount);
 });
 cell_rb!(acct_sub_wi_h3_vault_is_the_dest_account, fx_resolved, |fx: &mut SubFx| {
@@ -238,6 +244,7 @@ cell!(acct_sub_wi_p_wrong_token_program, fx_resolved, |fx: &mut SubFx| fx.accts[
 // ---- I: duplicate accounts -------------------------------------------------------------------
 dup_cell!(acct_sub_wi_i1_dest_is_vault, [(2, 3)]);
 dup_cell!(acct_sub_wi_i2_market_is_dest_or_vault, [(1, 2), (1, 3)]);
-dup_cell!(acct_sub_wi_i3_authority_is_market_dest_or_vault, [(0, 1), (0, 2), (0, 3)]);
+// (i, j) puts account i's info into slot j: (1,0) = the authority slot holds the market, etc.
+dup_cell!(acct_sub_wi_i3_authority_is_market_dest_or_vault, [(1, 0), (2, 0), (3, 0), (0, 1), (0, 2), (0, 3)]);
 dup_cell!(acct_sub_wi_i4_vault_authority_is_vault_or_dest, [(3, 4), (2, 4)]);
 dup_cell!(acct_sub_wi_i5_token_program_is_vault_authority, [(4, 5)]);

@@ -385,21 +385,20 @@ pub fn sub_run_raw(fx: &mut SubFx) -> Result<(), ProgramError> {
     run_ix_no_rollback(ix, &mut refs)
 }
 
-/// Runs with account `j` aliased onto account `i` (i < j), the way the runtime hands one shared
-/// `AccountInfo` to a handler when the same key appears twice.
+/// Runs with slot `j` holding the same `AccountInfo` as slot `i` (either order), the way the
+/// runtime hands one shared `AccountInfo` to a handler when the same key appears twice. Slot `j`'s
+/// own account is replaced; slots `i` and `j` then both carry account `i`.
 pub fn sub_run_dup(fx: &mut SubFx, i: usize, j: usize) -> Result<(), ProgramError> {
-    assert!(i < j);
+    assert!(i != j);
     let ix = (fx.ix)(&fx.accts);
     let data = ix.encode();
-    let mut infos: Vec<AccountInfo> = Vec::new();
+    let mut infos: Vec<Option<AccountInfo>> = Vec::new();
     for (k, a) in fx.accts.iter_mut().enumerate() {
-        if k == j {
-            let shared = infos[i].clone();
-            infos.push(shared);
-        } else {
-            infos.push(a.to_info());
-        }
+        infos.push(if k == j { None } else { Some(a.to_info()) });
     }
+    let shared = infos[i].clone().unwrap();
+    infos[j] = Some(shared);
+    let infos: Vec<AccountInfo> = infos.into_iter().map(|x| x.unwrap()).collect();
     processor::process_instruction(&program_id(), &infos, &data)
 }
 

@@ -7,7 +7,7 @@
 //! `v16_wrapper_permissionless_crank_can_liquidate_unhealthy_candidate`). The fixture first finds,
 //! on a clone, the exact slot `k` at which an honest crank closes the position. Each cell then
 //! replays slots 1..k-1 honestly and sends the HOSTILE crank at slot `k`, the call that would have
-//! liquidated. It must be rejected AND the bankrupt position must still be open afterwards.
+//! liquidated. It must be rejected (the harness rolls back, so the position stays as it was).
 //!
 //! Account list: [caller, market, portfolio]. The caller is a plain pubkey, no signature needed.
 //!
@@ -134,7 +134,7 @@ macro_rules! cell {
             let mut l = liq_fixture();
             ($mutate)(&mut l.fx);
             // NOTE: not asserting "market bytes unchanged" without the harness rollback. The crank
-            // accrues the market before it checks the portfolio's market binding (cell G2 shows it),
+            // accrues the market before it checks the portfolio's market binding (seen once without rollback in G2),
             // which is harmless because the runtime reverts a failed instruction. The rollback-free
             // check is kept for WithdrawInsurance, where it holds for every cell.
             let r = sub_run(&mut l.fx);
@@ -171,7 +171,21 @@ cell!(acct_sub_crankliq_e_portfolio_readonly, m_e);
 cell!(acct_sub_crankliq_g1_fake_market, m_g1);
 cell!(acct_sub_crankliq_g2_portfolio_of_other_market, m_g2);
 dup_cell!(acct_sub_crankliq_i1_market_is_portfolio, [(1, 2)]);
-dup_cell!(acct_sub_crankliq_i2_caller_is_market_or_portfolio, [(0, 1), (0, 2)]);
+// (i, j) puts account i's info into slot j
+// the market / portfolio slot holds the caller's account: refused (owner check)
+dup_cell!(acct_sub_crankliq_i2_market_or_portfolio_slot_holds_the_caller, [(0, 1), (0, 2)]);
+
+/// The caller slot holding the market (or portfolio) account is harmless: the caller has no
+/// authority and receives nothing here, so the crank just does its normal work. Pinned so a change
+/// that starts to trust the caller slot shows up.
+#[test]
+fn acct_sub_crankliq_i3_caller_slot_holding_market_or_portfolio_is_harmless() {
+    for (i, j) in [(1usize, 0usize), (2, 0)] {
+        let mut l = liq_fixture();
+        let r = sub_run_dup(&mut l.fx, i, j);
+        assert_eq!(r, Ok(()), "dup ({i}, {j}) result");
+    }
+}
 
 /// F: the caller names a DIFFERENT (healthy) portfolio in the target's place. That is a legal crank
 /// of a healthy account, so it may succeed; it must not wedge the market. The honest crank on the
