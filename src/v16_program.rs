@@ -5235,9 +5235,12 @@ pub mod state {
         validate_market_dynamic_len(data)?;
         let config = read_wrapper_config_from_bytes(data)?;
         let header = market_header(data)?;
+        // Shape-only decode: the solvency-envelope check (`validate_public_user_fund`) ran at
+        // InitMarket and on every config-changing path, and the engine's own hot paths already
+        // use the shape decode. Only `max_market_slots` is read here.
         let engine_config = header
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         Ok((
             config,
@@ -5412,7 +5415,7 @@ pub mod state {
         check_header(data, KIND_MARKET)?;
         let engine_config = market_header(data)?
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         Ok((
             engine_config.max_abs_funding_e9_per_slot,
