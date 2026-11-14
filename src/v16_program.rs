@@ -124,6 +124,12 @@ pub mod constants {
     // `PortfolioLegV16` and `V16Config`; PORTFOLIO_ACCOUNT_LEN 9563 -> 10091; and, in the -rem variant, per-leg K/F remainders +32 B x 16 legs: -> 10603; ONE number for the combined layout), so a
     // v2.1 image is refused by the wrapper's own gate (Custom(1)) on every KIND_*.
     // percolator-nft vendors this constant: it must bump to 19 in the same flag day.
+    // Engine dcccrypto/percolator#299 / #302 (`V16_LAYOUT_DISCRIMINATOR` 19 -> 20, `loss_provenance` appended to the
+    // portfolio, PORTFOLIO_ACCOUNT_LEN 10603 -> 10607): VERSION stays 19 (owner decision, #642).
+    // So VERSION no longer identifies the portfolio layout: `check_header` passes a layout-19
+    // portfolio, and the refusal comes from the engine provenance check (`layout_discriminator`
+    // != 20), not from the wrapper's Custom(1). Off-chain decoders must check the discriminator
+    // and the exact length as well as VERSION.
     pub const VERSION: u16 = 19;
     pub const KIND_MARKET: u8 = 1;
     pub const KIND_PORTFOLIO: u8 = 2;
