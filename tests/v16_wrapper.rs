@@ -29628,3 +29628,6 @@ fn d26_init_portfolio_requires_the_portfolio_account_signature() {
     portfolio.is_signer = true;
     init_portfolio(&mut owner, &mut market, &mut portfolio);
 }
+
+// J-20261114-PROG-ACCTSUB: account-substitution matrix (tests/acct_sub/mod.rs).
+mod acct_sub;
