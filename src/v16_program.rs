@@ -13009,6 +13009,71 @@ pub mod oracle_v16 {
             target
         }
     }
+
+    /// `percolator::canonical_accrual_price_step_v16` with the arithmetic in u64. The engine
+    /// version forms `cap_anchor * max_change_bps + remainder` in u128 and divides it by
+    /// MAX_MARGIN_BPS, which on SBF is a u128 div and mod per path step (~300 CU). The anchor
+    /// is at most MAX_ORACLE_PRICE (1e12), so for any cap up to 18_446_744 bps the numerator
+    /// fits u64; above that this calls the engine function. Same checks in the same order, same
+    /// results and errors; the engine re-checks every committed step against its own function
+    /// anyway (InvalidConfig on any mismatch).
+    #[inline(always)]
+    pub fn canonical_accrual_price_step_u64(
+        current: u64,
+        target: u64,
+        cap_anchor: u64,
+        max_change_bps: u64,
+        exposed: bool,
+        remainder_before_bps_num: u16,
+    ) -> percolator::V16Result<(u64, u16)> {
+        const MAX_PRICE: u64 = percolator::MAX_ORACLE_PRICE;
+        const DEN: u64 = percolator::MAX_MARGIN_BPS;
+        if current == 0
+            || target == 0
+            || cap_anchor == 0
+            || current > MAX_PRICE
+            || target > MAX_PRICE
+            || cap_anchor > MAX_PRICE
+            || remainder_before_bps_num as u64 >= DEN
+        {
+            return Err(percolator::V16Error::InvalidConfig);
+        }
+        if !exposed {
+            return Ok((target, 0));
+        }
+        if current == target || max_change_bps == 0 {
+            return Ok((current, 0));
+        }
+        // cap_anchor <= MAX_PRICE, so this bound keeps the numerator below u64::MAX without an
+        // overflow-checked multiply (itself a 128-bit helper call on SBF).
+        if max_change_bps > (u64::MAX - DEN) / MAX_PRICE {
+            return percolator::canonical_accrual_price_step_v16(
+                current,
+                target,
+                cap_anchor,
+                max_change_bps,
+                exposed,
+                remainder_before_bps_num,
+            );
+        }
+        let numerator = cap_anchor * max_change_bps + remainder_before_bps_num as u64;
+        let max_delta = numerator / DEN;
+        // < DEN = 10_000, fits u16.
+        let remainder_after = (numerator % DEN) as u16;
+        if max_delta >= current.abs_diff(target) {
+            return Ok((target, 0));
+        }
+        let next = if target > current {
+            current
+                .checked_add(max_delta)
+                .ok_or(percolator::V16Error::ArithmeticOverflow)?
+        } else {
+            current
+                .checked_sub(max_delta)
+                .ok_or(percolator::V16Error::ArithmeticOverflow)?
+        };
+        Ok((next, remainder_after))
+    }
 }
 
 pub mod policy_v16 {
@@ -13037,9 +13102,15 @@ pub mod policy_v16 {
         if max_abs_rate_e9 == 0 || mark_e6 == 0 || index_e6 == 0 || mark_e6 == index_e6 {
             return Some(0);
         }
-        let premium_e9 = (mark_e6.abs_diff(index_e6) as u128)
-            .checked_mul(percolator::FUNDING_DEN)?
-            / index_e6 as u128;
+        // u64 division when the product fits (any |mark - index| below ~1.8e10, i.e. every
+        // realistic premium): same floor as the u128 form, without a u128 div on SBF.
+        let diff = mark_e6.abs_diff(index_e6);
+        const FUNDING_DEN_U64: u64 = percolator::FUNDING_DEN as u64;
+        let premium_e9 = if diff <= u64::MAX / FUNDING_DEN_U64 {
+            ((diff * FUNDING_DEN_U64) / index_e6) as u128
+        } else {
+            (diff as u128).checked_mul(percolator::FUNDING_DEN)? / index_e6 as u128
+        };
         let bounded = core::cmp::min(premium_e9, max_abs_rate_e9 as u128);
         let signed = i128::try_from(bounded).ok()?;
         if mark_e6 > index_e6 {
@@ -48557,8 +48628,6 @@ pub mod processor {
     //     edge clamp, or `P_last` once the epoch window elapsed);
     //   * `rent_rates_view`: the per-side rent rate from the growth record's
     //     `N_cap` snapshot and the users' OI (never caller input, spec §9.1);
-    //   * `band_rent_accrual_inputs_view`: price + funding + rent for one
-    //     single-segment accrual (a pinned accrual carries no funding / rent).
     // ══════════════════════════════════════════════════════════════════════
 
     /// The band-shaped price for an accrual of `asset_index` to `now_slot` from the capped
@@ -48657,25 +48726,6 @@ pub mod processor {
             growth_v19::rent_side_rate_e9(users_long, n_cap, g.rent_kink_bps, rent_max, count_long, side_cap),
             growth_v19::rent_side_rate_e9(users_short, n_cap, g.rent_kink_bps, rent_max, count_short, side_cap),
         ))
-    }
-
-    /// v2.2: the inputs of one single-segment accrual: `(price, funding, rent_long,
-    /// rent_short)`. A duration-pinned accrual is no-move: `P_last`, no funding, no rent
-    /// (the engine refuses anything else with `BandPinned`, Custom(104)).
-    #[inline(never)]
-    fn band_rent_accrual_inputs_view(
-        group: &state::MarketViewMutV16<'_>,
-        asset_index: usize,
-        now_slot: u64,
-        price: u64,
-        funding_rate_e9: i128,
-    ) -> Result<(u64, i128, u64, u64), ProgramError> {
-        let (price, pinned) = band_shape_price_view(group, asset_index, now_slot, price)?;
-        if pinned {
-            return Ok((price, 0, 0, 0));
-        }
-        let (rent_long, rent_short) = rent_rates_view(group, asset_index)?;
-        Ok((price, funding_rate_e9, rent_long, rent_short))
     }
 
     /// v2.2 band (re-review N-2, tightened in round 2): the asset's price can no longer move
@@ -49291,13 +49341,10 @@ pub mod processor {
             .map_err(map_v16_error)?;
         let funding_rate_e9 =
             permissionless_funding_rate_e9_view(profile, group, asset_index, now_slot, crank_price)?;
-        let (_, funding_rate_e9, _, _) = band_rent_accrual_inputs_view(
-            group,
-            asset_index,
-            now_slot,
-            crank_price,
-            funding_rate_e9,
-        )?;
+        // Only the band's pinned bit is needed here; the rent rates were read once above
+        // (the accrual does not change them).
+        let (_, pinned) = band_shape_price_view(group, asset_index, now_slot, crank_price)?;
+        let funding_rate_e9 = if pinned { 0 } else { funding_rate_e9 };
         Ok((crank_price, funding_rate_e9, outcome))
     }
 
@@ -49772,15 +49819,26 @@ pub mod processor {
                 }
             });
             let step_pinned = band_ctx.map(|c| c.duration_pinned).unwrap_or(false);
-            let (next_price, remainder_after) = percolator::canonical_band_accrual_price_step_v16(
-                effective_price,
-                step_target,
-                price_cap_anchor,
-                max_price_move_bps_per_slot,
-                exposed,
-                remainder_before,
-                band_ctx,
-            )
+            // Band off: the engine's band step is exactly the plain step, done here in u64.
+            let (next_price, remainder_after) = match band_ctx {
+                None => oracle_v16::canonical_accrual_price_step_u64(
+                    effective_price,
+                    step_target,
+                    price_cap_anchor,
+                    max_price_move_bps_per_slot,
+                    exposed,
+                    remainder_before,
+                ),
+                Some(_) => percolator::canonical_band_accrual_price_step_v16(
+                    effective_price,
+                    step_target,
+                    price_cap_anchor,
+                    max_price_move_bps_per_slot,
+                    exposed,
+                    remainder_before,
+                    band_ctx,
+                ),
+            }
             .map_err(map_v16_error)?;
             price_move_remainder = remainder_after;
             if next_price == 0 || next_price > percolator::MAX_ORACLE_PRICE {
