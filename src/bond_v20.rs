@@ -267,7 +267,7 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 //
 // I-T7 (GH#571, 2026-10-31, founder decision "carried-over coupon"; revised after the att649
 // review): the coupon is CUMULATIVE and is never forfeited by a settlement, a deposit, a dust
-// crank or an exit. Two numbers in `BondTrancheV20`:
+// crank, an exit or a resolve. Two numbers in `BondTrancheV20`:
 //
 // * `K = c_b_atoms`: the bonds' WHOLE claim (deposits + every settled coupon - redeemed slices).
 //   Every tranche split reads `K`; shares are priced at `K / B`.
@@ -319,10 +319,19 @@ pub fn bond_cooldown_elapsed(now_slot: u64, request_slot: u64, cooldown_slots: u
 //   nobody needs to crank inside the window. Conservative for the junior: the whole interval
 //   that touches a closed sample is forfeited. Not seen: an impairment that starts and ends
 //   strictly between two settlements without a draw (inherent to sampling).
-// * Resolve: nothing accrues once the market is not Live; terminal 78 pays no coupon. Settled
-//   coupon stays in `K` and is paid by the Resolved 110 before the junior (102); an unpaid `R`
-//   is not repaid to the junior after resolution (no more fee legs).
-// * Known residuals (att649 round 2, accepted, 2026-11-01):
+// * Resolve: the resolve handlers (tags 19 / 39) carry no tranche, so the Live stretch from the
+//   last settlement to `resolved_slot` is settled by the FIRST Resolved settlement (terminal 78
+//   or the Resolved 110), as a settlement at the resolve would have been (base rate, cap, the
+//   closed-window rule above; whole-ness is not sampled, see below), and tag 102 reserves it
+//   until then (#571 follow-up, #678).
+//   It runs once. A senior loss booked at the resolution counts as booked inside that stretch
+//   and forfeits it, even if a later terminal harvest restores C: F2-consistent (a Live draw
+//   forfeits its interval the same way). Whole-ness at the resolve is not sampled:
+//   the Resolved split pays at most the bonds' layer, F2-consistent (the R2-E class). On the
+//   Recovery route `resolved_slot` is the finalize slot, so the stretch includes the Recovery
+//   period: an over-accrual paid by the junior (the Recovery-entry slot is not stored), ended
+//   by any public crank and capped by the one-year clamp and the cap. Nothing accrues after
+//   `resolved_slot`; terminal 78 pays no coupon.
 //   - R2-A: the per-share cap restarts when the tranche empties (see Cap above).
 //   - R2-B: an IMPAIRED exit is paid its layer (< its slice of `K`) but leaves `R` intact, so
 //     later fee legs (the Earn seniors' share) reimburse the junior for coupon the bonds, not the
