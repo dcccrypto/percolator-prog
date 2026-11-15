@@ -4835,9 +4835,13 @@ pub mod state {
     #[inline]
     pub fn profile_lot_and_p4_bytes_ok(profile: &AssetOracleProfileV16) -> bool {
         let lot_exp = profile_lot_exp(profile);
+        // tiny-price format: Hybrid reads an external price and now applies 10^lot_exp to it
+        // (`compose_price_e12_to_e6`), so it may carry a lot exponent too. EwmaMark still may
+        // not (its marks are pushed, nothing rescales them).
         let lot_mode_ok = lot_exp == 0
             || profile.oracle_mode == ORACLE_MODE_AUTH_MARK
-            || profile.oracle_mode == ORACLE_MODE_MANUAL;
+            || profile.oracle_mode == ORACLE_MODE_MANUAL
+            || profile.oracle_mode == ORACLE_MODE_HYBRID_AFTER_HOURS;
         lot_exp <= crate::constants::LOT_EXP_MAX
             && lot_mode_ok
             && profile_p4_flags(profile) & !crate::constants::P4_FLAGS_KNOWN_MASK == 0
@@ -4852,13 +4856,18 @@ pub mod state {
     /// The `_padding0` a profile REBUILD (oracle reconfiguration) must carry: the existing
     /// lot exponent and p4 flags are immutable through reconfiguration (I-P1; an oracle
     /// re-anchor must never be a way to clear EXIT_REQUIRES_LOSS_CURRENT). A non-zero lot
-    /// exponent cannot move to a mode that refuses one (Hybrid / EwmaMark): 119.
+    /// exponent cannot move to a mode that refuses one (EwmaMark; Hybrid accepts one since the
+    /// tiny-price format, which applies it to the external price): 119.
     pub fn carried_profile_padding0(
         existing: &AssetOracleProfileV16,
         new_mode: u8,
     ) -> Result<[u8; 5], ProgramError> {
         let lot_exp = profile_lot_exp(existing);
-        if lot_exp != 0 && new_mode != ORACLE_MODE_AUTH_MARK && new_mode != ORACLE_MODE_MANUAL {
+        if lot_exp != 0
+            && new_mode != ORACLE_MODE_AUTH_MARK
+            && new_mode != ORACLE_MODE_MANUAL
+            && new_mode != ORACLE_MODE_HYBRID_AFTER_HOURS
+        {
             return Err(PercolatorError::LotConfigInvalid.into());
         }
         let mut out = [0u8; 5];
@@ -4895,7 +4904,8 @@ pub mod state {
             // v2.2 Wave A: byte +19 = lot_exp (item 7), byte +20 = p4_flags (item 8 bit2);
             // bytes +21..+24 stay zero. A lot exponent is only meaningful where the program
             // never rescales an external price: AuthMark (and the Manual placeholder every
-            // asset starts in before ConfigureAuthMark). Hybrid / EwmaMark refuse it.
+            // asset starts in before ConfigureAuthMark), and Hybrid, whose external price the
+            // tiny-price format scales by 10^lot_exp. EwmaMark refuses it.
             || !profile_lot_and_p4_bytes_ok(profile)
             || profile._padding1 != [0u8; 6]
             // FIX (ADOPT upstream 18f3ae94/2669bf1b, adapted): the carried
@@ -12529,6 +12539,29 @@ pub mod oracle_v16 {
         feeds[2] != [0u8; 32] && feeds[2] != feeds[0] && feeds[2] != feeds[1]
     }
 
+    /// Tiny-price format (docs/fixes/tiny-price-format.md): one oracle leg is read at E12
+    /// (10^-12 USD) precision so a leg below one e6 tick, or a small leg of a composite, is not
+    /// truncated before composition. `LEG_E12_PER_E6` converts between the two.
+    pub const LEG_E12_PER_E6: u128 = 1_000_000;
+
+    /// A leg read at E12 is valid when it is non-zero and its e6 floor is at most
+    /// `MAX_ORACLE_PRICE` (the same upper bound the e6 reader always applied).
+    #[inline]
+    fn leg_e12_in_range(out: u128) -> bool {
+        out != 0 && out / LEG_E12_PER_E6 <= percolator::MAX_ORACLE_PRICE as u128
+    }
+
+    /// e6 view of an E12 leg: the e6 floor, refusing a leg below one e6 tick exactly as the e6
+    /// readers always did. Kept for direct e6 callers; composition reads the E12 value.
+    #[inline]
+    fn leg_e12_to_e6(out: u128) -> Result<u64, ProgramError> {
+        let e6 = out / LEG_E12_PER_E6;
+        if e6 == 0 || e6 > percolator::MAX_ORACLE_PRICE as u128 {
+            return Err(PercolatorError::OracleInvalid.into());
+        }
+        Ok(e6 as u64)
+    }
+
     pub fn read_pyth_price_e6(
         price_ai: &AccountInfo,
         expected_feed_id: &[u8; 32],
@@ -12536,6 +12569,20 @@ pub mod oracle_v16 {
         max_staleness_secs: u64,
         conf_bps: u16,
     ) -> Result<(u64, i64), ProgramError> {
+        let (out, publish_time) =
+            read_pyth_price_e12(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)?;
+        Ok((leg_e12_to_e6(out)?, publish_time))
+    }
+
+    /// `read_pyth_price_e6` at E12: `price * 10^(exponent + 12)`, exact for every exponent
+    /// >= -12 (Pyth publishes -5..-12 for the feeds we list).
+    pub fn read_pyth_price_e12(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+    ) -> Result<(u128, i64), ProgramError> {
         if *price_ai.owner != PYTH_RECEIVER_PROGRAM_ID {
             return Err(ProgramError::IllegalOwner);
         }
@@ -12567,7 +12614,7 @@ pub mod oracle_v16 {
         if conf_bps != 0 && (msg.conf as u128).saturating_mul(10_000) > price_u * conf_bps as u128 {
             return Err(PercolatorError::OracleConfTooWide.into());
         }
-        let scale = msg.exponent + 6;
+        let scale = msg.exponent + 12;
         let out = if scale >= 0 {
             price_u
                 .checked_mul(10u128.pow(scale as u32))
@@ -12575,10 +12622,10 @@ pub mod oracle_v16 {
         } else {
             price_u / 10u128.pow((-scale) as u32)
         };
-        if out == 0 || out > percolator::MAX_ORACLE_PRICE as u128 {
+        if !leg_e12_in_range(out) {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        Ok((out as u64, msg.publish_time))
+        Ok((out, msg.publish_time))
     }
 
     #[inline]
@@ -12621,22 +12668,22 @@ pub mod oracle_v16 {
         Ok(i128::from_le_bytes(bytes))
     }
 
-    fn scale_decimal_to_e6(mantissa: i128, scale: u32) -> Result<u64, ProgramError> {
+    fn scale_decimal_to_e12(mantissa: i128, scale: u32) -> Result<u128, ProgramError> {
         if mantissa <= 0 || scale > MAX_EXPO_ABS as u32 {
             return Err(PercolatorError::OracleInvalid.into());
         }
         let mantissa = mantissa as u128;
-        let out = if scale >= 6 {
-            mantissa / 10u128.pow(scale - 6)
+        let out = if scale >= 12 {
+            mantissa / 10u128.pow(scale - 12)
         } else {
             mantissa
-                .checked_mul(10u128.pow(6 - scale))
+                .checked_mul(10u128.pow(12 - scale))
                 .ok_or(PercolatorError::EngineArithmeticOverflow)?
         };
-        if out == 0 || out > percolator::MAX_ORACLE_PRICE as u128 {
+        if !leg_e12_in_range(out) {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        Ok(out as u64)
+        Ok(out)
     }
 
     pub fn read_switchboard_price_e6(
@@ -12646,6 +12693,24 @@ pub mod oracle_v16 {
         max_staleness_secs: u64,
         conf_bps: u16,
     ) -> Result<(u64, i64), ProgramError> {
+        let (out, publish_time) = read_switchboard_price_e12(
+            price_ai,
+            expected_feed_key,
+            now_unix_ts,
+            max_staleness_secs,
+            conf_bps,
+        )?;
+        Ok((leg_e12_to_e6(out)?, publish_time))
+    }
+
+    /// `read_switchboard_price_e6` at E12 (the 18-decimal result divided by 10^6).
+    pub fn read_switchboard_price_e12(
+        price_ai: &AccountInfo,
+        expected_feed_key: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+    ) -> Result<(u128, i64), ProgramError> {
         if !is_switchboard_on_demand_program(price_ai.owner) {
             return Err(ProgramError::IllegalOwner);
         }
@@ -12696,11 +12761,11 @@ pub mod oracle_v16 {
         if conf_bps != 0 && (std_dev as u128).saturating_mul(10_000) > value_u * conf_bps as u128 {
             return Err(PercolatorError::OracleConfTooWide.into());
         }
-        let out = value_u / SWITCHBOARD_RESULT_SCALE;
-        if out == 0 || out > percolator::MAX_ORACLE_PRICE as u128 {
+        let out = value_u / (SWITCHBOARD_RESULT_SCALE / LEG_E12_PER_E6);
+        if !leg_e12_in_range(out) {
             return Err(PercolatorError::OracleInvalid.into());
         }
-        Ok((out as u64, publish_time))
+        Ok((out, publish_time))
     }
 
     pub fn read_chainlink_price_e6(
@@ -12709,6 +12774,18 @@ pub mod oracle_v16 {
         now_unix_ts: i64,
         max_staleness_secs: u64,
     ) -> Result<(u64, i64), ProgramError> {
+        let (out, publish_time) =
+            read_chainlink_price_e12(price_ai, expected_feed_key, now_unix_ts, max_staleness_secs)?;
+        Ok((leg_e12_to_e6(out)?, publish_time))
+    }
+
+    /// `read_chainlink_price_e6` at E12.
+    pub fn read_chainlink_price_e12(
+        price_ai: &AccountInfo,
+        expected_feed_key: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+    ) -> Result<(u128, i64), ProgramError> {
         if *price_ai.owner != CHAINLINK_STORE_PROGRAM_ID {
             return Err(ProgramError::IllegalOwner);
         }
@@ -12742,7 +12819,7 @@ pub mod oracle_v16 {
         if age < 0 || age as u64 > max_staleness_secs {
             return Err(PercolatorError::OracleStale.into());
         }
-        scale_decimal_to_e6(answer, decimals as u32).map(|p| (p, publish_time))
+        scale_decimal_to_e12(answer, decimals as u32).map(|p| (p, publish_time))
     }
 
     pub fn read_oracle_price_e6(
@@ -12752,8 +12829,21 @@ pub mod oracle_v16 {
         max_staleness_secs: u64,
         conf_bps: u16,
     ) -> Result<(u64, i64), ProgramError> {
+        let (out, publish_time) =
+            read_oracle_price_e12(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs, conf_bps)?;
+        Ok((leg_e12_to_e6(out)?, publish_time))
+    }
+
+    /// One oracle leg at E12 (Pyth, Switchboard On-Demand or Chainlink, by owner).
+    pub fn read_oracle_price_e12(
+        price_ai: &AccountInfo,
+        expected_feed_id: &[u8; 32],
+        now_unix_ts: i64,
+        max_staleness_secs: u64,
+        conf_bps: u16,
+    ) -> Result<(u128, i64), ProgramError> {
         if *price_ai.owner == PYTH_RECEIVER_PROGRAM_ID {
-            read_pyth_price_e6(
+            read_pyth_price_e12(
                 price_ai,
                 expected_feed_id,
                 now_unix_ts,
@@ -12761,7 +12851,7 @@ pub mod oracle_v16 {
                 conf_bps,
             )
         } else if is_switchboard_on_demand_program(price_ai.owner) {
-            read_switchboard_price_e6(
+            read_switchboard_price_e12(
                 price_ai,
                 expected_feed_id,
                 now_unix_ts,
@@ -12769,7 +12859,7 @@ pub mod oracle_v16 {
                 conf_bps,
             )
         } else if *price_ai.owner == CHAINLINK_STORE_PROGRAM_ID {
-            read_chainlink_price_e6(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)
+            read_chainlink_price_e12(price_ai, expected_feed_id, now_unix_ts, max_staleness_secs)
         } else {
             Err(ProgramError::IllegalOwner)
         }
@@ -12781,79 +12871,77 @@ pub mod oracle_v16 {
     // which a manipulator can steer; carrying an exact numerator/denominator through and
     // rounding once removes that accumulation. Ported from upstream percolator-prog b97a36f8
     // ("round composite oracle prices once").
-    fn compose_price_e6(
-        prices_e6: &[u64],
+    //
+    // Tiny-price format (docs/fixes/tiny-price-format.md): the legs arrive at E12, not e6, so a
+    // small leg is no longer truncated before composition; the rational is carried in U256
+    // (bounded: legs <= 10^18, so the numerator stays <= 10^75 < 2^256); the per-leg
+    // intermediate range gate is gone (only legs and the final price are range-checked); and the
+    // asset's lot exponent multiplies the final price by 10^lot_exp (the market quotes one lot
+    // of 10^lot_exp tokens), applied before the single rounding. lot_exp == 0 with e6-aligned
+    // legs gives exactly the old result.
+    fn compose_price_e12_to_e6(
+        prices_e12: &[u128],
         flags: u8,
         invert: u8,
         unit_scale: u32,
+        lot_exp: u8,
     ) -> Result<u64, ProgramError> {
-        if prices_e6.is_empty()
-            || prices_e6.len() > ORACLE_LEG_CAP
+        use percolator::wide_math::U256;
+        if prices_e12.is_empty()
+            || prices_e12.len() > ORACLE_LEG_CAP
             || invert > 1
             || (flags & !ORACLE_LEG_FLAGS_MASK) != 0
-            || (prices_e6.len() == 1 && flags != 0)
-            || (prices_e6.len() == 2 && (flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0)
+            || (prices_e12.len() == 1 && flags != 0)
+            || (prices_e12.len() == 2 && (flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0)
+            || lot_exp > crate::constants::LOT_EXP_MAX
         {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        if prices_e6
-            .iter()
-            .any(|price| *price == 0 || *price > percolator::MAX_ORACLE_PRICE)
-        {
+        if prices_e12.iter().any(|price| !leg_e12_in_range(*price)) {
             return Err(PercolatorError::OracleInvalid.into());
         }
-
-        // Keep the exact checked rational through all configured legs. At the three-leg cap,
-        // MAX_ORACLE_PRICE-bounded products fit in u128.
-        let mut numerator = prices_e6[0] as u128;
-        let mut denominator = 1u128;
+        let overflow = || -> ProgramError { PercolatorError::EngineArithmeticOverflow.into() };
+        let e12 = U256::from_u128(1_000_000_000_000);
+        // numerator / denominator == composite real price * 10^12
+        let mut numerator = U256::from_u128(prices_e12[0]);
+        let mut denominator = U256::ONE;
         let mut i = 1usize;
-        while i < prices_e6.len() {
+        while i < prices_e12.len() {
             let divides = match i {
                 1 => (flags & ORACLE_LEG_FLAG_DIVIDE_LEG2) != 0,
                 2 => (flags & ORACLE_LEG_FLAG_DIVIDE_LEG3) != 0,
                 _ => false,
             };
+            let leg = U256::from_u128(prices_e12[i]);
             if divides {
-                numerator = numerator
-                    .checked_mul(1_000_000)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                denominator = denominator
-                    .checked_mul(prices_e6[i] as u128)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                numerator = numerator.checked_mul(e12).ok_or_else(overflow)?;
+                denominator = denominator.checked_mul(leg).ok_or_else(overflow)?;
             } else {
-                numerator = numerator
-                    .checked_mul(prices_e6[i] as u128)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                denominator = denominator
-                    .checked_mul(1_000_000)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            }
-
-            // Preserve the old per-leg range gate without feeding its rounded value into the next
-            // leg. Only the final quotient becomes the published E6 price.
-            let intermediate = numerator / denominator;
-            if intermediate == 0 || intermediate > percolator::MAX_ORACLE_PRICE as u128 {
-                return Err(PercolatorError::OracleInvalid.into());
+                numerator = numerator.checked_mul(leg).ok_or_else(overflow)?;
+                denominator = denominator.checked_mul(e12).ok_or_else(overflow)?;
             }
             i += 1;
         }
-
         if invert != 0 {
+            // 1 / (n / (d * 10^12)) * 10^12 == d * 10^24 / n
             let inverted_numerator = denominator
-                .checked_mul(1_000_000_000_000)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                .checked_mul(U256::from_u128(1_000_000_000_000_000_000_000_000))
+                .ok_or_else(overflow)?;
             denominator = numerator;
             numerator = inverted_numerator;
         }
-        let mut price = numerator / denominator;
-        if unit_scale > 1 {
-            price /= unit_scale as u128;
+        // e6 = (n / d) / 10^6 * 10^lot_exp / unit_scale, rounded down once
+        numerator = numerator
+            .checked_mul(U256::from_u128(10u128.pow(lot_exp as u32)))
+            .ok_or_else(overflow)?;
+        denominator = denominator
+            .checked_mul(U256::from_u128(LEG_E12_PER_E6 * core::cmp::max(unit_scale, 1) as u128))
+            .ok_or_else(overflow)?;
+        let price = numerator.checked_div(denominator).ok_or_else(overflow)?;
+        match price.try_into_u128() {
+            Some(p) if p != 0 && p <= percolator::MAX_ORACLE_PRICE as u128 => Ok(p as u64),
+            _ => Err(PercolatorError::OracleInvalid.into()),
         }
-        if price == 0 || price > percolator::MAX_ORACLE_PRICE as u128 {
-            return Err(PercolatorError::OracleInvalid.into());
-        }
-        Ok(price as u64)
     }
 
     pub fn read_external_price_e6(
@@ -12875,18 +12963,20 @@ pub mod oracle_v16 {
         ) {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let mut prices = [0u64; ORACLE_LEG_CAP];
+        let mut prices = [0u128; ORACLE_LEG_CAP];
         let mut advanced = false;
         let mut max_publish_time = i64::MIN;
         let mut i = 0usize;
         while i < count {
-            let (price, publish_time) = read_oracle_price_e6(
+            let (price_e12, publish_time) = read_oracle_price_e12(
                 &oracle_accounts[i],
                 &config.oracle_leg_feeds[i],
                 now_unix_ts,
                 config.max_staleness_secs,
                 config.conf_filter_bps,
             )?;
+            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = config.oracle_leg_publish_times[i];
             let prev_price = config.oracle_leg_prices_e6[i];
             if prev_time != 0 {
@@ -12903,15 +12993,16 @@ pub mod oracle_v16 {
                 advanced = true;
             }
             max_publish_time = core::cmp::max(max_publish_time, publish_time);
-            prices[i] = price;
+            prices[i] = price_e12;
             i += 1;
         }
         Ok((
-            compose_price_e6(
+            compose_price_e12_to_e6(
                 &prices[..count],
                 config.oracle_leg_flags,
                 config.invert,
                 config.unit_scale,
+                0,
             )?,
             max_publish_time,
             advanced,
@@ -12937,18 +13028,20 @@ pub mod oracle_v16 {
         ) {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
-        let mut prices = [0u64; ORACLE_LEG_CAP];
+        let mut prices = [0u128; ORACLE_LEG_CAP];
         let mut advanced = false;
         let mut max_publish_time = i64::MIN;
         let mut i = 0usize;
         while i < count {
-            let (price, publish_time) = read_oracle_price_e6(
+            let (price_e12, publish_time) = read_oracle_price_e12(
                 &oracle_accounts[i],
                 &profile.oracle_leg_feeds[i],
                 now_unix_ts,
                 profile.max_staleness_secs,
                 profile.conf_filter_bps,
             )?;
+            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = profile.oracle_leg_publish_times[i];
             let prev_price = profile.oracle_leg_prices_e6[i];
             if prev_time != 0 {
@@ -12965,15 +13058,16 @@ pub mod oracle_v16 {
                 advanced = true;
             }
             max_publish_time = core::cmp::max(max_publish_time, publish_time);
-            prices[i] = price;
+            prices[i] = price_e12;
             i += 1;
         }
         Ok((
-            compose_price_e6(
+            compose_price_e12_to_e6(
                 &prices[..count],
                 profile.oracle_leg_flags,
                 profile.invert,
                 profile.unit_scale,
+                crate::state::profile_lot_exp(profile),
             )?,
             max_publish_time,
             advanced,
@@ -29752,6 +29846,14 @@ pub mod processor {
             profile.oracle_target_price_e6 = next_mark;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
+            // ADOPT upstream (aeyakovenko/percolator-prog `reset_price_move_remainder_on_target_change_view`):
+            // a target change must not carry the previous target's price-move-cap remainder.
+            reset_price_move_remainder_on_target_change_view(
+                &mut profile,
+                &group,
+                asset_index_usize,
+                next_mark,
+            )?;
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
                 // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
@@ -49671,6 +49773,24 @@ pub mod processor {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
         profile.price_move_remainder_bps_num = remainder;
+        Ok(())
+    }
+
+    fn reset_price_move_remainder_on_target_change_view(
+        profile: &mut state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        target: u64,
+    ) -> ProgramResult {
+        let asset = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        if asset.raw_oracle_target_price.get() != target {
+            set_price_move_remainder_bps_num_view(profile, 0)?;
+        }
         Ok(())
     }
 
