@@ -13106,6 +13106,71 @@ pub mod oracle_v16 {
             target
         }
     }
+
+    /// `percolator::canonical_accrual_price_step_v16` with the arithmetic in u64. The engine
+    /// version forms `cap_anchor * max_change_bps + remainder` in u128 and divides it by
+    /// MAX_MARGIN_BPS, which on SBF is a u128 div and mod per path step (~300 CU). The anchor
+    /// is at most MAX_ORACLE_PRICE (1e12), so for any cap up to 18_446_744 bps the numerator
+    /// fits u64; above that this calls the engine function. Same checks in the same order, same
+    /// results and errors; the engine re-checks every committed step against its own function
+    /// anyway (InvalidConfig on any mismatch).
+    #[inline(always)]
+    pub fn canonical_accrual_price_step_u64(
+        current: u64,
+        target: u64,
+        cap_anchor: u64,
+        max_change_bps: u64,
+        exposed: bool,
+        remainder_before_bps_num: u16,
+    ) -> percolator::V16Result<(u64, u16)> {
+        const MAX_PRICE: u64 = percolator::MAX_ORACLE_PRICE;
+        const DEN: u64 = percolator::MAX_MARGIN_BPS;
+        if current == 0
+            || target == 0
+            || cap_anchor == 0
+            || current > MAX_PRICE
+            || target > MAX_PRICE
+            || cap_anchor > MAX_PRICE
+            || remainder_before_bps_num as u64 >= DEN
+        {
+            return Err(percolator::V16Error::InvalidConfig);
+        }
+        if !exposed {
+            return Ok((target, 0));
+        }
+        if current == target || max_change_bps == 0 {
+            return Ok((current, 0));
+        }
+        // cap_anchor <= MAX_PRICE, so this bound keeps the numerator below u64::MAX without an
+        // overflow-checked multiply (itself a 128-bit helper call on SBF).
+        if max_change_bps > (u64::MAX - DEN) / MAX_PRICE {
+            return percolator::canonical_accrual_price_step_v16(
+                current,
+                target,
+                cap_anchor,
+                max_change_bps,
+                exposed,
+                remainder_before_bps_num,
+            );
+        }
+        let numerator = cap_anchor * max_change_bps + remainder_before_bps_num as u64;
+        let max_delta = numerator / DEN;
+        // < DEN = 10_000, fits u16.
+        let remainder_after = (numerator % DEN) as u16;
+        if max_delta >= current.abs_diff(target) {
+            return Ok((target, 0));
+        }
+        let next = if target > current {
+            current
+                .checked_add(max_delta)
+                .ok_or(percolator::V16Error::ArithmeticOverflow)?
+        } else {
+            current
+                .checked_sub(max_delta)
+                .ok_or(percolator::V16Error::ArithmeticOverflow)?
+        };
+        Ok((next, remainder_after))
+    }
 }
 
 pub mod policy_v16 {
@@ -13134,9 +13199,15 @@ pub mod policy_v16 {
         if max_abs_rate_e9 == 0 || mark_e6 == 0 || index_e6 == 0 || mark_e6 == index_e6 {
             return Some(0);
         }
-        let premium_e9 = (mark_e6.abs_diff(index_e6) as u128)
-            .checked_mul(percolator::FUNDING_DEN)?
-            / index_e6 as u128;
+        // u64 division when the product fits (any |mark - index| below ~1.8e10): same floor as
+        // the u128 form, without a u128 div on SBF.
+        let diff = mark_e6.abs_diff(index_e6);
+        const FUNDING_DEN_U64: u64 = percolator::FUNDING_DEN as u64;
+        let premium_e9 = if diff <= u64::MAX / FUNDING_DEN_U64 {
+            ((diff * FUNDING_DEN_U64) / index_e6) as u128
+        } else {
+            (diff as u128).checked_mul(percolator::FUNDING_DEN)? / index_e6 as u128
+        };
         let bounded = core::cmp::min(premium_e9, max_abs_rate_e9 as u128);
         let signed = i128::try_from(bounded).ok()?;
         if mark_e6 > index_e6 {
@@ -49965,15 +50036,26 @@ pub mod processor {
                 }
             });
             let step_pinned = band_ctx.map(|c| c.duration_pinned).unwrap_or(false);
-            let (next_price, remainder_after) = percolator::canonical_band_accrual_price_step_v16(
-                effective_price,
-                step_target,
-                price_cap_anchor,
-                max_price_move_bps_per_slot,
-                exposed,
-                remainder_before,
-                band_ctx,
-            )
+            // Band off: the engine's band step is exactly the plain step, done here in u64.
+            let (next_price, remainder_after) = match band_ctx {
+                None => oracle_v16::canonical_accrual_price_step_u64(
+                    effective_price,
+                    step_target,
+                    price_cap_anchor,
+                    max_price_move_bps_per_slot,
+                    exposed,
+                    remainder_before,
+                ),
+                Some(_) => percolator::canonical_band_accrual_price_step_v16(
+                    effective_price,
+                    step_target,
+                    price_cap_anchor,
+                    max_price_move_bps_per_slot,
+                    exposed,
+                    remainder_before,
+                    band_ctx,
+                ),
+            }
             .map_err(map_v16_error)?;
             price_move_remainder = remainder_after;
             if next_price == 0 || next_price > percolator::MAX_ORACLE_PRICE {
