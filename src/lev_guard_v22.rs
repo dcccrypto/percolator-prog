@@ -379,12 +379,20 @@ pub const ABNORMAL_SIGMA_MULT: u64 = 4;
 pub const FREEZE_SLOTS: u64 = SLOTS_PER_HOUR;
 pub const M_ORACLE_SLOTS: u64 = SLOTS_PER_DAY;
 
+/// Marks kept for the sliding 1-h window; a new mark is stored at most every
+/// `SLOTS_PER_HOUR / BAND_MARKS` slots, so the ring spans the whole hour.
+pub const BAND_MARKS: usize = 8;
+pub const BAND_MARK_SPACING: u64 = SLOTS_PER_HOUR / BAND_MARKS as u64;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PriceBand {
     pub last_px_e6: u64,
     pub last_slot: u64,
-    pub ref_px_e6: u64,
-    pub ref_slot: u64,
+    /// Trailing-hour marks (#688): a ring of up to `BAND_MARKS` stored samples. `px == 0` = empty.
+    /// A sample is checked against every mark younger than an hour, so the window slides with
+    /// each observation and there is no fixed boundary to straddle.
+    pub marks_px_e6: [u64; BAND_MARKS],
+    pub marks_slot: [u64; BAND_MARKS],
     /// Upward movement of L / N_cap frozen while `now < freeze_until`.
     pub freeze_until: u64,
     /// `m_oracle = 0.75` while `now < oracle_until`.
@@ -418,15 +426,24 @@ pub fn observe_price(b: &PriceBand, px: u64, now: u64, sigma_1h_bps: Option<u64>
     if px == 0 {
         return (n, Trip::None);
     }
-    if n.last_px_e6 == 0 || n.ref_px_e6 == 0 {
+    if n.last_px_e6 == 0 || n.marks_px_e6.iter().all(|m| *m == 0) {
         n.last_px_e6 = px;
         n.last_slot = now;
-        n.ref_px_e6 = px;
-        n.ref_slot = now;
+        n.marks_px_e6 = [0; BAND_MARKS];
+        n.marks_slot = [0; BAND_MARKS];
+        n.marks_px_e6[0] = px;
+        n.marks_slot[0] = now;
         return (n, Trip::None);
     }
     let sample = move_bps(px, n.last_px_e6);
-    let hour = move_bps(px, n.ref_px_e6);
+    // Sliding window: the largest move against any mark still inside the trailing hour.
+    let mut hour = 0u64;
+    for i in 0..BAND_MARKS {
+        let (mpx, ms) = (n.marks_px_e6[i], n.marks_slot[i]);
+        if mpx != 0 && now.saturating_sub(ms) < SLOTS_PER_HOUR {
+            hour = core::cmp::max(hour, move_bps(px, mpx));
+        }
+    }
     let mut trip = Trip::None;
     if sample > BREAKER_SAMPLE_BPS || hour > BREAKER_HOUR_BPS {
         trip = Trip::Breaker;
@@ -447,9 +464,21 @@ pub fn observe_price(b: &PriceBand, px: u64, now: u64, sigma_1h_bps: Option<u64>
     }
     n.last_px_e6 = px;
     n.last_slot = now;
-    if now.saturating_sub(n.ref_slot) >= SLOTS_PER_HOUR {
-        n.ref_px_e6 = px;
-        n.ref_slot = now;
+    // Store a new mark once the newest is `BAND_MARK_SPACING` old, over the oldest (or empty) slot.
+    let mut newest = 0u64;
+    let mut oldest_i = 0usize;
+    for i in 0..BAND_MARKS {
+        if n.marks_px_e6[i] != 0 {
+            newest = core::cmp::max(newest, n.marks_slot[i]);
+        }
+        let key = |j: usize| if n.marks_px_e6[j] == 0 { 0 } else { n.marks_slot[j].saturating_add(1) };
+        if key(i) < key(oldest_i) {
+            oldest_i = i;
+        }
+    }
+    if now.saturating_sub(newest) >= BAND_MARK_SPACING {
+        n.marks_px_e6[oldest_i] = px;
+        n.marks_slot[oldest_i] = now;
     }
     (n, trip)
 }
@@ -891,7 +920,8 @@ pub fn cpmm_dump_bps(r: u64, q: u64) -> u16 {
 // ── the guard record: `["lev_guard", market]`, header kind 17, body at `HEADER_LEN` ───────────
 
 pub const LEV_GUARD_SEED: &[u8] = b"lev_guard";
-pub const LEV_GUARD_VERSION: u8 = 1;
+/// v2: the price band keeps a ring of trailing-hour marks (#688); the record grew 360 -> 488 B.
+pub const LEV_GUARD_VERSION: u8 = 2;
 /// `flags` bit 0 / 1: the pinned base mint was last proven to have a live mint / freeze authority.
 pub const GUARD_FLAG_MINT_AUTH: u8 = 1 << 0;
 pub const GUARD_FLAG_FREEZE_AUTH: u8 = 1 << 1;
@@ -948,8 +978,7 @@ pub struct LevGuardV22 {
     // ── price band ──
     pub pb_last_px: u64,      // 112
     pub pb_last_slot: u64,    // 120
-    pub pb_ref_px: u64,       // 128
-    pub pb_ref_slot: u64,     // 136
+    pub _pad4: [u8; 16],      // 128..144 (was the fixed 1-h reference, #688; must be zero)
     pub pb_freeze_until: u64, // 144
     pub pb_oracle_until: u64, // 152
     pub frozen_l_x100: u16,   // 160
@@ -976,17 +1005,20 @@ pub struct LevGuardV22 {
     pub burst_var_peak_x100: u32, // 344..348
     pub _pad3: [u8; 4],           // 348..352
     pub burst_peak_slot: u64,     // 352..360
+    /// Sliding 1-h price window marks (#688).
+    pub pb_marks_px: [u64; BAND_MARKS],   // 360..424
+    pub pb_marks_slot: [u64; BAND_MARKS], // 424..488
 }
-/// The record proper (360 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
+/// The record proper (488 B, small enough for a 4 KB SBF frame). The W1 touched set follows it
 /// in the account body as `W1_TOUCHED_CAP` key prefixes of `KEY_TAG_LEN` bytes, read and written
 /// in place (`touched_has_in`, `touch_in`), never copied onto the stack.
-pub const LEV_GUARD_REC_LEN: usize = 360;
+pub const LEV_GUARD_REC_LEN: usize = 488;
 pub const LEV_GUARD_TOUCHED_LEN: usize = KEY_TAG_LEN * W1_TOUCHED_CAP;
 pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
 /// The touched region, and so the guard account and its rent, are UNCHANGED by the tag widening
 /// (16 x 256 == 8 x 512): nothing to migrate, and the SDK / keeper / app length checks still hold.
 const _: () = assert!(LEV_GUARD_TOUCHED_LEN == 4_096);
-const _: () = assert!(LEV_GUARD_BODY_LEN == 4_456);
+const _: () = assert!(LEV_GUARD_BODY_LEN == 4_584);
 const _: () = assert!(W1_TOUCHED_CAP <= u16::MAX as usize);
 const _: () = assert!(core::mem::size_of::<LevGuardV22>() == LEV_GUARD_REC_LEN);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, rep_j_dump_bps) == 80);
@@ -998,6 +1030,8 @@ const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_id) == 312);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, round_open_slot) == 336);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, burst_var_peak_x100) == 344);
 const _: () = assert!(core::mem::offset_of!(LevGuardV22, burst_peak_slot) == 352);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, pb_marks_px) == 360);
+const _: () = assert!(core::mem::offset_of!(LevGuardV22, pb_marks_slot) == 424);
 
 impl LevGuardV22 {
     pub fn report(&self) -> RiskReport {
@@ -1038,8 +1072,8 @@ impl LevGuardV22 {
         PriceBand {
             last_px_e6: self.pb_last_px,
             last_slot: self.pb_last_slot,
-            ref_px_e6: self.pb_ref_px,
-            ref_slot: self.pb_ref_slot,
+            marks_px_e6: self.pb_marks_px,
+            marks_slot: self.pb_marks_slot,
             freeze_until: self.pb_freeze_until,
             oracle_until: self.pb_oracle_until,
         }
@@ -1047,8 +1081,8 @@ impl LevGuardV22 {
     pub fn set_price_band(&mut self, b: &PriceBand) {
         self.pb_last_px = b.last_px_e6;
         self.pb_last_slot = b.last_slot;
-        self.pb_ref_px = b.ref_px_e6;
-        self.pb_ref_slot = b.ref_slot;
+        self.pb_marks_px = b.marks_px_e6;
+        self.pb_marks_slot = b.marks_slot;
         self.pb_freeze_until = b.freeze_until;
         self.pb_oracle_until = b.oracle_until;
     }
@@ -1123,6 +1157,7 @@ pub fn validate_guard(g: &LevGuardV22) -> bool {
         && g._pad1 == [0; 2]
         && g._pad2 == [0; 6]
         && g._pad3 == [0; 4]
+        && g._pad4 == [0; 16]
 }
 
 /// A fresh record for `market`.
@@ -1452,7 +1487,7 @@ mod tests {
     fn price_band_breaker_and_freeze() {
         let (b, t) = observe_price(&PriceBand::default(), 1_000_000, 100, None);
         assert_eq!(t, Trip::None);
-        assert_eq!((b.last_px_e6, b.ref_px_e6), (1_000_000, 1_000_000));
+        assert_eq!((b.last_px_e6, b.marks_px_e6[0]), (1_000_000, 1_000_000));
         // 10 % exactly: no trip; 10 % + 1 bps: breaker
         let (b2, t) = observe_price(&b, 1_100_000, 110, None);
         assert_eq!(t, Trip::None);
@@ -1485,13 +1520,39 @@ mod tests {
         assert_eq!(t6, Trip::Breaker);
         assert_eq!(b6.freeze_until, 116 + FREEZE_SLOTS);
         // a calm sample inside the window (ref rolled) leaves the deadline where it was
-        let calm = PriceBand { ref_px_e6: 2_000_000, ..b6 };
+        let mut calm = PriceBand { marks_px_e6: [0; BAND_MARKS], ..b6 };
+        calm.marks_px_e6[0] = 2_000_000;
+        calm.marks_slot[0] = 116;
         let (b7, t7) = observe_price(&calm, 2_000_000, 117, None);
         assert_eq!(t7, Trip::None);
         assert_eq!(b7.freeze_until, b6.freeze_until);
         // dumps trip the same way
         let (_, t) = observe_price(&b, 899_000, 101, None);
         assert_eq!(t, Trip::Breaker);
+    }
+
+    #[test]
+    fn band_roll_straddle_repro_688() {
+        // #688: a +66 % ramp in 7 samples (each < 10 %) must trip the 30 % / 1-h rule wherever it
+        // sits relative to the hour boundary. Start the ramp `off` slots after the first sample.
+        let ramp = [1_090u64, 1_188, 1_290, 1_290, 1_418, 1_559, 1_660];
+        let h = SLOTS_PER_HOUR;
+        let run = |start: u64| -> u32 {
+            let (mut b, _) = observe_price(&PriceBand::default(), 10_000_000, 0, None);
+            let mut trips = 0;
+            for (i, k) in ramp.iter().enumerate() {
+                let (nb, t) = observe_price(&b, k * 10_000, start + i as u64, None);
+                if t == Trip::Breaker { trips += 1; }
+                b = nb;
+            }
+            trips
+        };
+        // CONTROL: the whole ramp sits inside the first hour: trips.
+        assert!(run(100) > 0, "CONTROL: ramp inside one hour must trip");
+        // STRADDLE: the ramp crosses the old fixed roll at slot h (and later boundaries).
+        for start in [h - 3, h - 1, h, h + 1, 2 * h - 3, 5 * h / 2 - 3] {
+            assert!(run(start) > 0, "STRADDLE start={start}: +66 % in 6 slots did not trip");
+        }
     }
 
     // ── LP stop ─────────────────────────────────────────────────────────────────────────────
@@ -1994,7 +2055,7 @@ mod tests {
         let n = nav_sample(&nav_epoch_start(1_000, 5, 6, 10), 900, 5, 6, 20);
         g.set_nav(&n);
         assert_eq!(g.nav(), n);
-        let pb = PriceBand { last_px_e6: 1, last_slot: 2, ref_px_e6: 3, ref_slot: 4, freeze_until: 5, oracle_until: 6 };
+        let pb = PriceBand { last_px_e6: 1, last_slot: 2, marks_px_e6: [3; BAND_MARKS], marks_slot: [4; BAND_MARKS], freeze_until: 5, oracle_until: 6 };
         g.set_price_band(&pb);
         assert_eq!(g.price_band(), pb);
         // touched set (in place): once per key, fails closed when full
@@ -2025,6 +2086,9 @@ mod tests {
         assert!(!validate_guard(&b));
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
+        assert!(!validate_guard(&b));
+        let mut b = g;
+        b._pad4[3] = 1;
         assert!(!validate_guard(&b));
     }
 

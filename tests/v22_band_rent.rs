@@ -5884,7 +5884,7 @@ fn lev_guard_price_band_breaker_trips_and_expires() {
     };
     poke(&mut env, &lp).expect("first sample");
     let g0 = lgt::guard(&env);
-    assert_eq!((g0.pb_last_px, g0.pb_ref_px, g0.pb_freeze_until), (PRICE, PRICE, 0));
+    assert_eq!((g0.pb_last_px, g0.pb_marks_px[0], g0.pb_freeze_until), (PRICE, PRICE, 0));
     // +10 % exactly: no trip
     env.warp(1);
     env.push(PRICE * 110 / 100);
