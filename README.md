@@ -665,6 +665,12 @@ cargo build-sbf --no-default-features
 # All tests (integration, unit, alignment)
 cargo test
 
+# Full suite with CI's pins and env (cargo-build-sbf 3.1.14/3.1.15 first on PATH): checks out the
+# ci/deployed-refs.env siblings into this repo's parent dir (local clones in $HOME, else GitHub),
+# builds them and the reference programs, runs scripts/ci-test.sh (tests/KNOWN_FAILING.txt verdict).
+# CI builds the suite with agave v4.2.2 on Linux; see the script header for why local runs do not.
+scripts/local-test-env.sh
+
 # CU benchmark (requires BPF binary)
 cargo test --release --test cu_benchmark -- --nocapture
 
