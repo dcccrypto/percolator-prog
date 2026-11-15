@@ -955,6 +955,11 @@ fn swordcat_replay_report() {
         r.peak_earn_loss as f64 / 1e6
     );
     assert_eq!(r.push_err, 0, "every live push must replay");
+    // #698: with the replay keeper's catch-up cranks the audit-slot state equals the pre-#698 run
+    // (base 1761700e, measured 15 Nov 2026) to the atom.
+    if std::env::var("INDEP_WRAPPER_SO").is_err() {
+        assert_eq!((a.trader_pnl, a.earn_loss(), a.claim[0], a.unowned()), (207_608_189, 1_577_269, 207_608_189, 1_577_270), "audit snapshot vs the pre-#698 run");
+    }
 }
 
 /// E1 acceptance on the live path: after every keeper settlement of the one swordcat position, the
