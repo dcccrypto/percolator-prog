@@ -84,6 +84,28 @@ one U256 mul/div chain. Far below the 1.4M per-transaction limit.
   it moves +50 per slot, so the remainder carry is not needed for lot markets).
 * `tests/v22_wave_a.rs`: proptests updated for Hybrid now accepting a lot.
 
+## Overlap with engine #357 and prog #706 / #710
+
+Different problem, no duplicated logic, no storage clash:
+
+* **Engine #357** (head `2544c27f`, `AssetStateV16.price_step_carry_bps_num`, +2 bytes per
+  asset slot) and **prog #706** (head `1302b543`, persists
+  `price_move_remainder_bps_num` on the crank) / **#710** (head `1c342ece`, resets that
+  remainder on an EWMA mark target change) fix *motion*: under the 3%/slot cap a price
+  below 34 atoms cannot move by a whole atom, so the sub-atom step carry has to persist.
+* This PR fixes *representation*: a feed price below 1e-6 is read as 0 and refused before
+  the engine ever sees it, and composite legs lose precision by being floored to E6 first.
+* They are complementary. A lot market lifts the atom count (e.g. $3e-7 at `lot_exp = 6`
+  is 300_000 atoms), so the cap-freeze region (< 34 atoms) is never reached and the
+  remainder carry is irrelevant for it; lot-0 markets with prices of 1..33 atoms still need
+  #357 / #706 / #710. `tests/tiny_price_format.rs` pins this interaction through
+  `clamp_toward_engine_dt` (unchanged by #706 / #710).
+* Storage: this PR uses the existing `lot_exp` byte (`_padding0[0]`); #706 uses the existing
+  dedicated `price_move_remainder_bps_num` field; #357 adds an engine field. No byte is
+  shared. Textual trial merges of this branch with #706 and #710 (`git merge-tree`) are
+  clean. Only the prog `ENGINE_CI_SIBLING` pin moves when #357 lands; this PR does not
+  depend on it.
+
 ## SDK, keeper, indexer, app (follow-up PRs, not built here)
 
 * **SDK**: price and size helpers must be lot-aware (`price_per_token = price_e6 / 1e6 /
