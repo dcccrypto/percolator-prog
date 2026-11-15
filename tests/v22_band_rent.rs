@@ -2378,7 +2378,7 @@ fn v22_band_floor_keeps_exits_open() {
 
 
 /// N-2 companion: at d = 100 the width floor (1,600) is below the cap law's own dead zone
-/// (4 bps/slot moves 0 ticks under 2,500), so the price stops there instead; exits must stay
+/// (4 bps/slot moves under 1 tick per slot under 2,500; with #698's carry it accumulates), so the price stops there instead; exits must stay
 /// open there too. Control: the same favourable close is refused at a price that can move.
 #[test]
 fn v22_band_cap_dead_zone_keeps_exits_open() {
@@ -2394,7 +2394,11 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let _ = env.crank(long.1);
     let _ = env.crank(lp.account);
     let a = env.engine_asset();
-    assert_eq!(a.effective_price, 1_660, "the cap law cannot move 1,660 at 4 bps/slot");
+    // #698 (upstream 18f3ae94): the crank walks the canonical path with the persisted price-move
+    // remainder, so the sub-tick 0.664 ticks/slot accumulates instead of rounding to 0 every crank:
+    // the price can step by one tick (1,659 here). It is still a sub-tick-per-slot cap step, and
+    // the exit below must still land.
+    assert!((1_659..=1_660).contains(&a.effective_price), "the cap law moves 1,660 by at most one tick at 4 bps/slot: {}", a.effective_price);
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
     // A 0-tick cap step cannot move the price in either direction, pinned or not (a certified
     // book keeps re-anchoring at the same price, so no pin clock can be required here).

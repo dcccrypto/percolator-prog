@@ -17088,7 +17088,14 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
     // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
     // now met by the refresh-triggered path.
-    for _ in 0..1 {
+    // #698 (upstream 18f3ae94): a crank accrues at most V16_MAX_ACCRUAL_PATH_STEPS (32) path
+    // steps and stops (catch-up only) while the asset is behind, so the 100-slot gap takes
+    // 4 cranks (32+32+32+4); the one that catches up re-certifies and liquidates. The path is
+    // linear from the stable anchor, so the landed price is still 100 * (1 + 3bps * 100) = 103.
+    let mut cranks = 0;
+    while state::read_market(&market.data).unwrap().1.assets[0].slot_last < 100 {
+        assert!(cranks < 8, "crank catch-up did not finish");
+        cranks += 1;
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 100,
@@ -17106,6 +17113,7 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
         )
         .unwrap();
     }
+    assert_eq!(cranks, 4, "100-slot gap / 32-step path cap");
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -17340,7 +17348,14 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
     // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
     // now met by the refresh-triggered path.
-    for _ in 0..1 {
+    // #698 (upstream 18f3ae94): a crank accrues at most V16_MAX_ACCRUAL_PATH_STEPS (32) path
+    // steps and stops (catch-up only) while the asset is behind, so the 100-slot gap takes
+    // 4 cranks (32+32+32+4); the one that catches up re-certifies and liquidates. The path is
+    // linear from the stable anchor, so the landed price is still 100 * (1 + 3bps * 100) = 103.
+    let mut cranks = 0;
+    while state::read_market(&market.data).unwrap().1.assets[0].slot_last < 100 {
+        assert!(cranks < 8, "crank catch-up did not finish");
+        cranks += 1;
         run_ix(
             Instruction::PermissionlessCrank {
                 now_slot: 100,
@@ -17353,6 +17368,7 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
         )
         .unwrap();
     }
+    assert_eq!(cranks, 4, "100-slot gap / 32-step path cap");
 
     let (_, group) = state::read_market(&market.data).unwrap();
     let short = state::read_portfolio(&short_account.data).unwrap();
@@ -29628,3 +29644,9 @@ fn d26_init_portfolio_requires_the_portfolio_account_signature() {
     portfolio.is_signer = true;
     init_portfolio(&mut owner, &mut market, &mut portfolio);
 }
+
+// J-20261114-PROG-ACCTSUB: account-substitution matrix (tests/acct_sub/mod.rs).
+mod acct_sub;
+
+// J-20261114-PROG-WITHDRAW-SUB: unsigned-path substitution cells (tests/acct_sub_unsigned/mod.rs).
+mod acct_sub_unsigned;
