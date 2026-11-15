@@ -1494,6 +1494,21 @@ mod tests {
         assert_eq!(t, Trip::Breaker);
     }
 
+    #[test]
+    fn band_roll_straddle_repro_688() {
+        // #688: +66 % in 7 samples (each < 10 %) straddling the 1-h reference roll never trips.
+        let (mut b, _) = observe_price(&PriceBand::default(), 10_000_000, 0, None);
+        let ramp = [1_090u64, 1_188, 1_290, 1_290, 1_418, 1_559, 1_660];
+        let h = SLOTS_PER_HOUR;
+        let mut trips = 0;
+        for (i, k) in ramp.iter().enumerate() {
+            let (nb, t) = observe_price(&b, k * 10_000, h - 3 + i as u64, None);
+            if t == Trip::Breaker { trips += 1; }
+            b = nb;
+        }
+        assert!(trips > 0, "keeper rule (30 % in 1 h) must trip; +66 % in 6 slots did not");
+    }
+
     // ── LP stop ─────────────────────────────────────────────────────────────────────────────
     #[test]
     fn nav_index_ignores_deposits_and_withdrawals() {
