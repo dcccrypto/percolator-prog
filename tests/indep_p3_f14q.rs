@@ -547,7 +547,39 @@ impl P3 {
         self.send_raw(b, metas, &[&cranker])
     }
 
+    /// #698 (upstream 18f3ae94): one PermissionlessCrank now accrues at most
+    /// `V16_MAX_ACCRUAL_PATH_STEPS` (32) one-slot path steps; before, it reached
+    /// `max_accrual_dt_slots` (500 on the TRUMP params) in one call. These scenarios were written
+    /// for that one-call reach, so a fixture crank repeats the catch-up-only calls a keeper makes:
+    /// when the old single crank would have caught up and touched `p` (gap <= max_accrual_dt_slots)
+    /// it cranks until the asset reaches the clock (the last call touches `p`); when it would have
+    /// stopped at the bounded catch-up (gap > max_accrual_dt_slots, `p` untouched) it stays
+    /// catch-up only and leaves the asset at most 32 slots behind. With max_accrual_dt_slots <= 32
+    /// (every non-TRUMP market here) it is exactly one call, as before.
     fn crank(&mut self, p: Pubkey) -> Result<u64, String> {
+        let steps = percolator::V16_MAX_ACCRUAL_PATH_STEPS as u64;
+        let dt = self.env.market_state().1.config.max_accrual_dt_slots;
+        if dt <= steps {
+            return self.crank_once(p);
+        }
+        let slot_last = |w: &Self| w.env.market_state().1.assets[0].slot_last;
+        let full = self.slot().saturating_sub(slot_last(self)) <= dt;
+        let mut last = Ok(0);
+        for _ in 0..64 {
+            if !full && self.slot().saturating_sub(slot_last(self)) <= steps {
+                break;
+            }
+            let before = slot_last(self);
+            last = self.crank_once(p);
+            let now_last = slot_last(self);
+            if last.is_err() || now_last >= self.slot() || now_last == before {
+                break;
+            }
+        }
+        last
+    }
+
+    fn crank_once(&mut self, p: Pubkey) -> Result<u64, String> {
         let slot = self.slot();
         let payer = self.env.payer.pubkey();
         let m = self.env.market;

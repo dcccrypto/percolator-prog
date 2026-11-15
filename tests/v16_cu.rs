@@ -7862,11 +7862,14 @@ ProgInstruction::PermissionlessCrank {
     );
     let (_, funded_group) = env.market_state();
     assert_eq!(funded_group.funding_epoch, 1);
-    assert_eq!(funded_group.assets[0].effective_price, 1_210_000);
-    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_210_000 = 1.21 price units for the
-    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.21 * ADL_ONE.
-    let exact = 1_000i128 * 1_210_000 * (ADL_ONE / 1_000_000_000) as i128;
-    assert_eq!(exact, 1_210_000_000_000_000);
+    // #698 (upstream 18f3ae94): the path is linear from the stable anchor (1_000_000), not a
+    // second 10% clamp from 1_100_000, so slot 2 lands at 1_200_000 (was 1_210_000). Upstream
+    // inv_038 asserts the same value for this test.
+    assert_eq!(funded_group.assets[0].effective_price, 1_200_000);
+    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_200_000 = 1.2 price units for the
+    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.2 * ADL_ONE.
+    let exact = 1_000i128 * 1_200_000 * (ADL_ONE / 1_000_000_000) as i128;
+    assert_eq!(exact, 1_200_000_000_000_000);
     assert_eq!(funded_group.assets[0].f_long_num, -exact);
     assert_eq!(funded_group.assets[0].f_short_num, exact);
 }
@@ -8015,8 +8018,12 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // too small to swing the checkpoint's own stale-mark projection all the
     // way back to it -- see the two `max_delta` computations in the comments
     // at the crank and close sites below.
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // #698 (upstream 18f3ae94): one crank accrues at most min(max_accrual_dt_slots,
+    // V16_MAX_ACCRUAL_PATH_STEPS = 32) path steps, so the window is 32 (was 50) and the
+    // cap is 39 bps (was 25): 39 * 32 = 1,248 bps keeps the same envelope (25 * 50 = 1,250)
+    // and still converges the 10% push in one crank (124,800 > 100,000 atoms).
+    const CAP_BPS: u64 = 39;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000; // engine cap (v16.rs validate_public_user_fund_shape)
                                                      // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
                                                      // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
@@ -8028,7 +8035,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
                                                      // segment_dt below would be forced huge too. The push and the setup crank
                                                      // run at THE SAME real slot (no warp between them) so the push's own
                                                      // `authenticated_slot_or_fallback` reads the same small value.
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1; // 33 (was 51)
     // asset.slot_last after the setup crank: dt_total = 51 - 0 = 51 exceeds
     // MAX_ACCRUAL_DT_SLOTS (50), so segment_dt is capped at exactly 50.
     const SETUP_CRANK_SLOT_LAST: u64 = MAX_ACCRUAL_DT_SLOTS;
@@ -8134,15 +8141,23 @@ ProgInstruction::PermissionlessCrank {
         "the setup crank must have moved the engine's committed effective_price \
          toward the pushed mark"
     );
+    // #698 (upstream 18f3ae94): the crank now walks the canonical one-slot path and books
+    // each step's funding at that step's price against the ACTIVE checkpoint (still
+    // INITIAL_PRICE), so the convergence steps themselves charge funding (they used to be one
+    // segment priced at the pre-crank price, i.e. zero). What must still hold is that the
+    // pushed mark is not applied retroactively: the checkpoint stays pending at PUSH_SLOT.
+    let setup_profile =
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap();
     assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "the setup crank's own segment must charge zero funding -- the \
-         checkpoint has not promoted yet, so both sides of the premium formula \
-         are still anchored to the SAME (pre-push) mark"
+        setup_profile.funding_mark_e6, INITIAL_PRICE,
+        "the pushed mark must not promote before its slot"
     );
+    assert_eq!(setup_profile.funding_mark_pending_slot, PUSH_SLOT);
     assert_eq!(
-        group_after_setup_crank.assets[0].f_long_num, 0,
-        "no funding index movement from the setup crank itself"
+        group_after_setup_crank.assets[0].f_long_num,
+        -group_after_setup_crank.assets[0].f_short_num,
+        "setup crank funding is conserved between the two sides"
     );
 
     // NOW: no crank of any kind runs again for the rest of this test. `slot_last`
@@ -8202,12 +8217,12 @@ ProgInstruction::PermissionlessCrank {
     // side while the stale checkpoint acts as the "mark" side of the premium
     // formula and stands below it.
     assert_ne!(
-        group_after_close.assets[0].f_long_num, 0,
+        group_after_close.assets[0].f_long_num, group_after_setup_crank.assets[0].f_long_num,
         "long side funding index must move; pre-fix this stays 0 (zero-funding \
          arbitrage)"
     );
     assert_ne!(
-        group_after_close.assets[0].f_short_num, 0,
+        group_after_close.assets[0].f_short_num, group_after_setup_crank.assets[0].f_short_num,
         "short side funding index must move; pre-fix this stays 0 (zero-funding \
          arbitrage)"
     );
@@ -8383,14 +8398,18 @@ fn setup_accrual_carry_world(
         group_after_setup_crank.assets[0].effective_price, initial_price,
         "setup crank must converge effective_price toward the pushed mark"
     );
-    assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "setup crank's own segment must charge zero funding -- the checkpoint \
-         has not promoted yet"
-    );
+    // #698 (upstream 18f3ae94): the setup crank's path steps book funding at each step's price
+    // against the still-active INITIAL checkpoint (it used to be zero: one segment at the
+    // pre-crank price). It is the same in both worlds, so the comparison below is unaffected.
+    // The pushed mark itself must stay pending (not retroactive).
     let setup_profile =
         state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
             .unwrap();
+    assert_eq!(
+        setup_profile.funding_mark_e6, initial_price,
+        "the pushed mark must not promote before its slot"
+    );
+    assert_eq!(setup_profile.funding_mark_pending_slot, push_and_setup_crank_slot);
     eprintln!(
         "DEBUG after setup crank: effective_price={} funding_mark_e6={} pending_e6={} pending_slot={} mark_ewma_e6={}",
         group_after_setup_crank.assets[0].effective_price,
@@ -8450,10 +8469,14 @@ fn v16_bpf_canonical_accrual_path_matches_regardless_of_call_split_across_pendin
     const INITIAL_PRICE: u64 = 1_000_000;
     const PUSHED_MARK: u64 = 1_100_000;
     const DEPOSIT: u128 = 10_000_000;
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // #698 (upstream 18f3ae94): one crank accrues at most min(max_accrual_dt_slots,
+    // V16_MAX_ACCRUAL_PATH_STEPS = 32) path steps, so the window is 32 (was 50) and the
+    // cap is 39 bps (was 25): 39 * 32 = 1,248 bps keeps the same envelope (25 * 50 = 1,250)
+    // and still converges the 10% push in one crank (124,800 > 100,000 atoms).
+    const CAP_BPS: u64 = 39;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000;
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1; // 33 (was 51)
     // Five 1-slot steps starting exactly at the pending mark's own activation
     // slot (51..=55).
     const STEPS: u64 = 5;
@@ -29615,6 +29638,392 @@ fn v16_program_issue406_canonical_synced_matcher_survives_liquidation_within_rea
          {ISSUE406_MAX_INV_Q} (fill result {fill:?})"
     );
     assert!(fill.is_ok() && lp_after > 0, "non-vacuity: the capped fill still lands ({fill:?})");
+}
+
+// Crank-route price-move cap carry (upstream 18f3ae94, "Fix cadence-dependent oracle accrual
+// invariants"; tests from upstream tests/invariants/cu/inv_052_split_merge_invariance.rs at
+// upstream/main, adapted: the auth-matcher CPI open/close is a direct tag-6 trade here, and
+// hints name their oracle-account count). The crank used to clamp one price per call against
+// the current price, so the same interval moved the mark by a different amount depending on how
+// often it was cranked: per-slot cranks compound past the cap at a normal price and never move
+// at a low one.
+mod crank_accrual_carry {
+    use super::*;
+
+    fn hint(asset_index: u16, oracle_accounts: u8) -> Vec<CrankObservationHint> {
+        vec![CrankObservationHint { asset_index, oracle_accounts }]
+    }
+
+    fn crank_at(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> u64 {
+        env.svm.expire_blockhash();
+        env.crank(
+            portfolio,
+            ProgInstruction::PermissionlessCrank { now_slot: slot, observations: hint(0, 0) },
+        )
+    }
+
+    fn profile_remainder(env: &V16CuEnv) -> u16 {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .price_move_remainder_bps_num
+    }
+
+    /// AuthMark market at `initial`, 1%/slot, `max_accrual_dt_slots` 10, one matched long/short
+    /// pair; the target is pushed and first cranked at slot 1.
+    fn authmark_book(initial: u64, deposit: u128, size_q: i128) -> (V16CuEnv, [(Keypair, Pubkey); 2]) {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: initial,
+            max_price_move_bps_per_slot: 100,
+            max_accrual_dt_slots: 10,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 10,
+            ..V16CuMarketParams::default()
+        });
+        env.svm.warp_to_slot(0);
+        env.configure_auth_mark_with_cu(0, initial);
+        let long_owner = Keypair::new();
+        let long = env.create_portfolio(&long_owner);
+        let short_owner = Keypair::new();
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, deposit);
+        env.deposit(&short_owner, short, deposit);
+        env.trade_with_cu(&long_owner, long, &short_owner, short, size_q, initial, 0);
+        (env, [(long_owner, long), (short_owner, short)])
+    }
+
+    /// dcccrypto/percolator#318 at the wrapper: P = 50, 1%/slot, target 60. The spec 5.3
+    /// envelope over 10 slots is `50 * 100 * 10 / 10_000 = 5`, so 55 is the limit and the
+    /// carried canonical path reaches exactly 55 at every crank cadence. The engine's path
+    /// accrual takes the first step's remainder from its caller; the wrapper is that caller and
+    /// only ever hands it the persisted carry, so a one-slot crank cannot restart the carry.
+    fn run_low_price_gap(crank_slots: &[u64]) -> (u64, u16) {
+        let (mut env, [(_, long), _]) = authmark_book(50, 10_000, POS_SCALE as i128);
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 60);
+        crank_at(&mut env, long, 1);
+        let mut previous = 1;
+        for &slot in crank_slots {
+            assert!(slot > previous && slot <= 11);
+            env.svm.warp_to_slot(slot);
+            crank_at(&mut env, long, slot);
+            previous = slot;
+        }
+        assert_eq!(previous, 11, "schedule must reach the common endpoint");
+        (env.market_state().1.assets[0].effective_price, profile_remainder(&env))
+    }
+
+    #[test]
+    fn v22_crank_low_price_cap_carry_matches_the_spec_envelope_at_every_cadence() {
+        let one_slot = run_low_price_gap(&[2, 3, 4, 5, 6, 7, 8, 9, 10, 11]);
+        let irregular = run_low_price_gap(&[3, 7, 11]);
+        let delayed = run_low_price_gap(&[11]);
+        let spec_max = 50 + 50 * 100 * 10 / 10_000;
+        assert!(one_slot.0 <= spec_max, "10 slots at 1%/slot from 50 may reach at most {spec_max}; reached {}", one_slot.0);
+        assert_eq!(one_slot.0, spec_max, "the carry must not be dropped either (one-slot cranks used to freeze at 50)");
+        assert_eq!(irregular, one_slot);
+        assert_eq!(delayed, one_slot);
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct PriceCapCadenceOutcome {
+        effective_price_before_close: u64,
+        long_pnl_before_close: i128,
+        short_capital_before_close: u128,
+        long_withdrawn: u128,
+        short_withdrawn: u128,
+    }
+
+    fn run_price_cap_cadence(crank_slots: &[u64], target_price: u64) -> PriceCapCadenceOutcome {
+        const INITIAL_PRICE: u64 = 1_000_000;
+        const DEPOSIT: u128 = 2_000_000_000;
+        let size_q = if target_price > INITIAL_PRICE {
+            (1_000u128 * POS_SCALE) as i128
+        } else {
+            -((1_000u128 * POS_SCALE) as i128)
+        };
+        let (mut env, [(long_owner, long), (short_owner, short)]) =
+            authmark_book(INITIAL_PRICE, DEPOSIT, size_q);
+
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, target_price);
+        crank_at(&mut env, long, 1);
+        assert_eq!(
+            env.market_state().1.assets[0].effective_price,
+            if target_price > INITIAL_PRICE { 1_010_000 } else { 990_000 }
+        );
+
+        let mut previous_slot = 1;
+        for &slot in crank_slots {
+            assert!(slot > previous_slot && slot <= 10);
+            env.svm.warp_to_slot(slot);
+            crank_at(&mut env, long, slot);
+            previous_slot = slot;
+        }
+        assert_eq!(previous_slot, 10, "schedule must reach the common endpoint");
+
+        let long_before_close = env.portfolio_state(long);
+        let short_before_close = env.portfolio_state(short);
+        let effective_price_before_close = env.market_state().1.assets[0].effective_price;
+
+        env.svm.expire_blockhash();
+        env.trade_with_cu(
+            &long_owner,
+            long,
+            &short_owner,
+            short,
+            -size_q,
+            effective_price_before_close,
+            0,
+        );
+        let long_flat = env.portfolio_state(long);
+        let short_flat = env.portfolio_state(short);
+        assert!(percolator::active_bitmap_is_empty(long_flat.active_bitmap));
+        assert!(percolator::active_bitmap_is_empty(short_flat.active_bitmap));
+        assert!(long_flat.pnl > 0);
+        assert_eq!(short_flat.pnl, 0);
+
+        env.convert_released_pnl_with_cu(
+            &long_owner,
+            long,
+            u128::try_from(long_flat.pnl).unwrap(),
+        );
+        let long_after_convert = env.portfolio_state(long);
+        let long_dest = env.withdraw(&long_owner, long, long_after_convert.capital);
+        let short_dest = env.withdraw(&short_owner, short, short_flat.capital);
+        let long_withdrawn = env.token_amount(long_dest) as u128;
+        let short_withdrawn = env.token_amount(short_dest) as u128;
+        assert_eq!(long_withdrawn + short_withdrawn, 2 * DEPOSIT);
+        assert_eq!(env.token_amount(env.vault), 0);
+
+        PriceCapCadenceOutcome {
+            effective_price_before_close,
+            long_pnl_before_close: long_before_close.pnl,
+            short_capital_before_close: short_before_close.capital,
+            long_withdrawn,
+            short_withdrawn,
+        }
+    }
+
+    #[test]
+    fn v16_program_upward_price_cap_and_spl_payouts_are_crank_partition_invariant() {
+        let fragmented = run_price_cap_cadence(&[2, 3, 4, 5, 6, 7, 8, 9, 10], 2_000_000);
+        let irregular = run_price_cap_cadence(&[2, 5, 9, 10], 2_000_000);
+        let delayed = run_price_cap_cadence(&[10], 2_000_000);
+
+        assert_eq!(fragmented, irregular);
+        assert_eq!(fragmented, delayed);
+        assert_eq!(fragmented.effective_price_before_close, 1_100_000);
+        assert!(fragmented.long_pnl_before_close > 0);
+        assert_eq!(fragmented.long_withdrawn + fragmented.short_withdrawn, 4_000_000_000);
+    }
+
+    #[test]
+    fn v16_program_downward_price_cap_and_spl_payouts_are_crank_partition_invariant() {
+        let fragmented = run_price_cap_cadence(&[2, 3, 4, 5, 6, 7, 8, 9, 10], 500_000);
+        let irregular = run_price_cap_cadence(&[4, 6, 10], 500_000);
+        let delayed = run_price_cap_cadence(&[10], 500_000);
+
+        assert_eq!(fragmented, irregular);
+        assert_eq!(fragmented, delayed);
+        assert_eq!(fragmented.effective_price_before_close, 900_000);
+        assert!(fragmented.long_pnl_before_close > 0);
+        assert_eq!(fragmented.long_withdrawn + fragmented.short_withdrawn, 4_000_000_000);
+    }
+
+    fn run_hybrid_price_cap_endpoint(crank_slots: &[u64]) -> u64 {
+        const INITIAL_PRICE: u64 = 1_000_000;
+        const TARGET_PRICE: u64 = 2_000_000;
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: INITIAL_PRICE,
+            max_price_move_bps_per_slot: 100,
+            max_accrual_dt_slots: 10,
+            max_abs_funding_e9_per_slot: 0,
+            min_funding_lifetime_slots: 10,
+            ..V16CuMarketParams::default()
+        });
+        set_test_clock(&mut env, 0, 100);
+        let feed = [0xd1u8; 32];
+        let initial = env.set_pyth_price_with_conf(&feed, INITIAL_PRICE as i64, -6, 0, 100);
+        env.try_configure_hybrid_asset_with_conf_filter_cu(
+            0,
+            1,
+            0,
+            [feed, [0u8; 32], [0u8; 32]],
+            &[initial],
+            0,
+            100,
+            0,
+            0,
+            100,
+            0,
+        )
+        .expect("configure fresh Pyth hybrid mode");
+
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long = env.create_portfolio(&long_owner);
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, 2_000_000_000);
+        env.deposit(&short_owner, short, 2_000_000_000);
+        env.trade_with_cu(
+            &long_owner,
+            long,
+            &short_owner,
+            short,
+            (1_000u128 * POS_SCALE) as i128,
+            INITIAL_PRICE,
+            0,
+        );
+
+        set_test_clock(&mut env, 1, 101);
+        let target = env.set_pyth_price_with_conf(&feed, TARGET_PRICE as i64, -6, 0, 101);
+        env.svm.expire_blockhash();
+        env.crank_with_oracle_tail(
+            long,
+            ProgInstruction::PermissionlessCrank { now_slot: 1, observations: hint(0, 1) },
+            &[target],
+        );
+        assert_eq!(env.market_state().1.assets[0].effective_price, 1_010_000);
+
+        let mut previous_slot = 1;
+        for &slot in crank_slots {
+            assert!(slot > previous_slot && slot <= 10);
+            set_test_clock(&mut env, slot, 100 + slot as i64);
+            // Re-post the same target price: stale-account refresh consumes a report this slot.
+            let target =
+                env.set_pyth_price_with_conf(&feed, TARGET_PRICE as i64, -6, 0, 100 + slot as i64);
+            env.svm.expire_blockhash();
+            env.crank_with_oracle_tail(
+                long,
+                ProgInstruction::PermissionlessCrank { now_slot: slot, observations: hint(0, 1) },
+                &[target],
+            );
+            previous_slot = slot;
+        }
+        assert_eq!(previous_slot, 10, "schedule must reach the common endpoint");
+        env.market_state().1.assets[0].effective_price
+    }
+
+    #[test]
+    fn v16_program_hybrid_pyth_price_cap_is_crank_partition_invariant() {
+        let fragmented = run_hybrid_price_cap_endpoint(&[2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        let irregular = run_hybrid_price_cap_endpoint(&[4, 8, 10]);
+        let delayed = run_hybrid_price_cap_endpoint(&[10]);
+        assert_eq!(fragmented, 1_100_000);
+        assert_eq!(irregular, fragmented);
+        assert_eq!(delayed, fragmented);
+    }
+
+    #[test]
+    fn v16_program_maximum_canonical_accrual_prefix_is_bounded_and_progresses() {
+        const INITIAL_PRICE: u64 = 1_000_000;
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: INITIAL_PRICE,
+            max_price_move_bps_per_slot: 100,
+            max_accrual_dt_slots: 64,
+            max_abs_funding_e9_per_slot: 10_000,
+            min_funding_lifetime_slots: 64,
+            ..V16CuMarketParams::default()
+        });
+        env.svm.warp_to_slot(0);
+        env.configure_auth_mark_with_cu(0, INITIAL_PRICE);
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long = env.create_portfolio(&long_owner);
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, 2_000_000_000);
+        env.deposit(&short_owner, short, 2_000_000_000);
+        env.trade_with_cu(
+            &long_owner,
+            long,
+            &short_owner,
+            short,
+            (1_000u128 * POS_SCALE) as i128,
+            INITIAL_PRICE,
+            0,
+        );
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 2_000_000);
+        env.svm.warp_to_slot(64);
+
+        let first_cu = crank_at(&mut env, long, 64);
+        let after_first = env.market_state().1.assets[0];
+        assert_eq!(after_first.slot_last, percolator::V16_MAX_ACCRUAL_PATH_STEPS as u64);
+        assert!(after_first.effective_price > INITIAL_PRICE);
+
+        let second_cu = crank_at(&mut env, long, 64);
+        let after_second = env.market_state().1.assets[0];
+        assert_eq!(after_second.slot_last, 64);
+        assert!(after_second.effective_price > after_first.effective_price);
+        println!("v16 canonical 32-step accrual prefix CU: first={first_cu}, second={second_cu}");
+        assert!(first_cu < 1_400_000, "first max-prefix crank used {first_cu} CU");
+        assert!(second_cu < 1_400_000, "second max-prefix crank used {second_cu} CU");
+    }
+
+    #[test]
+    fn v16_program_target_change_resets_prior_price_movement_remainder() {
+        const PRICE: u64 = 100;
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: PRICE,
+            max_price_move_bps_per_slot: 24,
+            max_accrual_dt_slots: 20,
+            min_funding_lifetime_slots: 20,
+            ..V16CuMarketParams::default()
+        });
+        env.configure_auth_mark_with_cu(0, PRICE);
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long = env.create_portfolio(&long_owner);
+        let short = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long, 10_000);
+        env.deposit(&short_owner, short, 10_000);
+        env.trade_with_cu(&long_owner, long, &short_owner, short, POS_SCALE as i128, PRICE, 0);
+
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 200);
+        crank_at(&mut env, long, 1);
+        assert_eq!(profile_remainder(&env), 2_400);
+        assert_eq!(env.market_state().1.assets[0].effective_price, PRICE);
+
+        env.svm.warp_to_slot(2);
+        env.push_auth_mark_with_cu(2, 50);
+        crank_at(&mut env, long, 2);
+        let second_profile =
+            state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+                .unwrap();
+        assert_eq!(
+            second_profile.price_move_remainder_bps_num, 2_400,
+            "the new downward trajectory starts with zero carry instead of inheriting the old target's 2,400 numerator units"
+        );
+        assert_eq!(
+            second_profile.effective_price_provenance,
+            percolator_prog::constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED
+        );
+        assert_eq!(env.market_state().1.assets[0].raw_oracle_target_price, 50);
+        assert_eq!(env.market_state().1.assets[0].effective_price, PRICE);
+    }
+
+    /// No wrapper route accrues an asset with the single-segment primitive any more: every
+    /// accrual goes through `canonical_accrual_path_for_target_view` and the engine's path
+    /// accrual, so the caller-supplied first-step remainder is always the persisted carry.
+    #[test]
+    fn v22_wrapper_never_calls_the_single_segment_accrual() {
+        let src = include_str!("../src/v16_program.rs");
+        for needle in [".accrue_asset_to_not_atomic(", ".accrue_asset_to_with_rent_not_atomic("] {
+            let hits: Vec<_> = src
+                .lines()
+                .enumerate()
+                .filter(|(_, l)| l.contains(needle) && !l.trim_start().starts_with("//"))
+                .map(|(i, _)| i + 1)
+                .collect();
+            assert!(hits.is_empty(), "{needle} called at src/v16_program.rs lines {hits:?}");
+        }
+        let path_calls = src.matches(".accrue_asset_path_with_rent_to_not_atomic(").count()
+            + src.matches(".accrue_asset_path_to_not_atomic(").count();
+        let builders = src.matches("canonical_accrual_path_for_target_view(\n").count();
+        assert_eq!(path_calls, 2, "path accrual call sites: the zero-move lane and the crank helper");
+        assert!(builders >= 3, "every path comes from canonical_accrual_path_for_target_view");
+    }
 }
 
 /// P42 (ADOPT upstream `reset_price_move_remainder_on_target_change_view`): the price-move-cap
