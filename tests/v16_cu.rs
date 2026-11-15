@@ -35,6 +35,13 @@ use std::path::PathBuf;
 #[path = "support/fill_events.rs"]
 mod fill_events;
 
+#[path = "invariants/cu/inv_031_live_exit_loss_stale_gate.rs"]
+mod inv_031_live_exit_loss_stale_gate;
+
+#[path = "invariants/cu/inv_031_provider_exit_principal.rs"]
+mod inv_031_provider_exit_principal;
+
+
 thread_local! {
     /// v2.2 fill events: logs of the last transaction (success or failure) sent by this test thread.
     static LAST_LOGS: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
