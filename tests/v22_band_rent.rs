@@ -7251,3 +7251,151 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
         assert!(*w <= live_slot, "last_fee_slot is a real slot <= now: {w} > {live_slot}");
     }
 }
+
+// Cheaper crank path (stacked on the crank_accrual_carry port): band + rent markets against the
+// previous wrapper binary. See tests/v16_cu.rs mod crank_path_cheap_equivalence for the plain
+// markets and the pure-function checks. Trades run on this binary only (they need the matcher);
+// every crank / settle runs on both from the same state and must leave identical bytes.
+mod crank_path_cheap_equivalence {
+    use super::*;
+
+    struct Diff {
+        reference: LiteSVM,
+        keys: Vec<Pubkey>,
+        ops: u64,
+        errs: u64,
+        cu_reference: u64,
+        cu_current: u64,
+    }
+
+    fn err_only(e: &str) -> &str {
+        // The failed-transaction Debug carries logs and CU; compare the error itself.
+        e.split(", meta:").next().unwrap_or(e)
+    }
+
+    impl Diff {
+        fn new(env: &Env, keys: Vec<Pubkey>) -> Self {
+            let p = std::env::var_os("CRANK_PATH_REF_SO")
+                .expect("set CRANK_PATH_REF_SO to the wrapper .so to compare against (PR #698 head)");
+            let mut reference = LiteSVM::new();
+            reference.add_program(env.program_id, &std::fs::read(p).unwrap());
+            Self { reference, keys, ops: 0, errs: 0, cu_reference: 0, cu_current: 0 }
+        }
+
+        fn run(&mut self, env: &mut Env, what: &str, f: impl Fn(&mut Env) -> Result<u64, String>) -> Result<u64, String> {
+            let clock: solana_sdk::clock::Clock = env.svm.get_sysvar();
+            for k in &self.keys {
+                self.reference.set_account(*k, env.svm.get_account(k).unwrap()).unwrap();
+            }
+            self.reference.set_sysvar(&clock);
+            std::mem::swap(&mut env.svm, &mut self.reference);
+            let ra = f(env);
+            let after_ref: Vec<Account> = self.keys.iter().map(|k| env.svm.get_account(k).unwrap()).collect();
+            std::mem::swap(&mut env.svm, &mut self.reference);
+            let rb = f(env);
+            match (&ra, &rb) {
+                (Ok(a), Ok(b)) => {
+                    self.cu_reference += a;
+                    self.cu_current += b;
+                }
+                (Err(a), Err(b)) => {
+                    assert_eq!(err_only(a), err_only(b), "{what}: different errors");
+                    self.errs += 1;
+                }
+                _ => panic!("{what}: reference {ra:?}, this binary {rb:?}"),
+            }
+            for (k, a) in self.keys.iter().zip(after_ref) {
+                let b = env.svm.get_account(k).unwrap();
+                assert!(a.data == b.data, "{what}: account {k} data differs");
+                assert_eq!(a.lamports, b.lamports, "{what}: account {k} lamports differ");
+            }
+            self.ops += 1;
+            rb
+        }
+
+        fn crank(&mut self, env: &mut Env, what: &str, p: Pubkey) -> Result<u64, String> {
+            self.run(env, what, |e| e.crank(p))
+        }
+    }
+
+    #[test]
+    #[ignore = "needs CRANK_PATH_REF_SO=<wrapper .so built from PR #698 head>"]
+    fn v22_cheap_crank_path_band_and_rent_match_the_reference_binary() {
+        let mut total = (0u64, 0u64, 0u64, 0u64);
+        let mut add = |d: &Diff| {
+            total.0 += d.ops;
+            total.1 += d.errs;
+            total.2 += d.cu_reference;
+            total.3 += d.cu_current;
+        };
+
+        // 1. Staircase into the band edge and the duration pin (target +30%, long never certified).
+        let mut env = Env::new(band_cfg());
+        let (lp, long, short) = band_book(&mut env);
+        let mut d = Diff::new(&env, vec![env.market, env.vault, lp.account, long.1, short.1, env.payer.pubkey(), env.admin.pubkey()]);
+        let target = PRICE * 13 / 10;
+        for i in 0..60 {
+            env.warp(1);
+            env.push(target);
+            let _ = d.crank(&mut env, &format!("pin {i} short"), short.1);
+            let _ = d.crank(&mut env, &format!("pin {i} lp"), lp.account);
+        }
+        assert!(env.engine_asset().band_pin_since_slot != 0, "non-vacuity: the pin clock is running");
+        // A gap past the epoch window, then catch-up cranks.
+        env.warp(70);
+        for i in 0..4 {
+            let _ = d.crank(&mut env, &format!("pin gap {i}"), long.1);
+        }
+        add(&d);
+
+        // 2. Fully certified book walking the anchor up to a +3% target, with gaps.
+        let mut env = Env::new(band_cfg());
+        let (lp, long, short) = band_book(&mut env);
+        let mut d = Diff::new(&env, vec![env.market, env.vault, lp.account, long.1, short.1, env.payer.pubkey(), env.admin.pubkey()]);
+        let target = PRICE * 103 / 100;
+        for i in 0..400u64 {
+            env.warp(if i % 37 == 36 { 40 } else { 1 });
+            env.push(target);
+            for p in [long.1, short.1, lp.account] {
+                let _ = d.crank(&mut env, &format!("certified {i}"), p);
+            }
+            if env.engine_asset().effective_price == target {
+                break;
+            }
+        }
+        assert_eq!(env.engine_asset().effective_price, target, "non-vacuity: the book caught up");
+        add(&d);
+
+        // 3. Rent above the kink, then tag 106 (its refresh runs the same crank accrual).
+        let mut env = Env::new(band_cfg());
+        env.auth_mark();
+        let lp = env.lp(1_000 * USD);
+        let taker = env.trader(1_000 * USD);
+        env.trade_cpi(&taker.0, taker.1, &lp, 800 * Q).expect("crowd open");
+        let mut d = Diff::new(&env, vec![env.market, env.vault, lp.account, taker.1, env.payer.pubkey(), env.admin.pubkey()]);
+        for i in 0..100u64 {
+            env.warp(if i % 25 == 24 { 33 } else { 1 });
+            env.push(if i % 10 < 5 { PRICE } else { PRICE + PRICE / 200 });
+            for c in 0..4 {
+                let _ = d.crank(&mut env, &format!("rent {i} {c}"), taker.1);
+                if env.engine_asset().slot_last >= env.slot {
+                    break;
+                }
+            }
+            if i % 20 == 19 {
+                let (t, l) = (taker.1, lp.account);
+                env.warp(3);
+                d.run(&mut env, &format!("settle {i}"), |e| e.settle_rent(t, l)).expect("tag 106");
+            }
+        }
+        assert!(env.engine_asset().rent_index_long_num > 0, "non-vacuity: rent accrued");
+        add(&d);
+
+        println!(
+            "band/rent crank path diff: {} ops identical ({} identical errors), CU reference {} this binary {}",
+            total.0, total.1, total.2, total.3
+        );
+        assert!(total.3 < total.2, "both binaries really ran");
+        assert!(total.0 > total.1 * 2, "mostly successful ops, not a diff of refusals");
+    }
+}
