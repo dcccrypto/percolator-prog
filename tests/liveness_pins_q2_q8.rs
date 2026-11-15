@@ -126,6 +126,17 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
     assert_eq!(
         helpers,
         [
+            // engine #356 haircut-order B (3b61ad0e src/v16.rs liquidate_account_inner_not_atomic
+            // ~22368): sizes the close with the in-flight-backed liquidation equity. Reviewed
+            // against `f1_follow_on_wanted` 2026-11-15: read-only (`account_equity_inner` with
+            // in_flight = true); its refusals are ArithmeticOverflow / InvalidLeg / InvalidConfig /
+            // Stale from the same source-domain walk that `refresh_account_and_certify_not_atomic`
+            // (pinned) has just run successfully on this account to build `certified_liq_deficit`
+            // (all four cert builders now call `account_liquidation_deficit`; the optional
+            // counterparty refresh in between moves neither current_slot nor a bucket's expiry,
+            // so the Stale check cannot newly fire). No new refusal class,
+            // so the follow-on screen needs no new input.
+            "account_liquidation_equity",
             "advance_close_progress_ledger",
             "asset_state",
             "begin_close_progress_ledger",

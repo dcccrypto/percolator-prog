@@ -25058,11 +25058,16 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     env.deposit(&victim_owner, victim, 200);
     env.deposit(&cp_owner, cp, 1_000_000);
 
-    // Victim opens a leg on asset 0 AND asset 1 (both long, against the same
+    // Victim opens a leg on asset 0 AND asset 1 (both SHORT, against the same
     // counterparty) -- a genuinely multi-leg portfolio, the precondition d63c4dc9's
-    // gate exists for.
-    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
-    env.trade_asset_with_cu(1, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+    // gate exists for. Short so that the price rise below is a REAL, booked loss for the
+    // victim. (Until engine #356 / 3b61ad0e "haircut-order B" this fixture was long, i.e. the
+    // 100 -> 400 move was a GAIN; it looked liquidatable only because the gain's backing --
+    // the counterparty's still-unrefreshed loss -- was not yet booked. #356 counts that
+    // in-flight backing in the liquidation trigger, so the long victim correctly stopped
+    // being liquidatable and the fixture no longer proved anything.)
+    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, -(POS_SCALE as i128), 100, 0);
+    env.trade_asset_with_cu(1, &victim_owner, victim, &cp_owner, cp, -(POS_SCALE as i128), 100, 0);
 
     // Certify both legs at a healthy baseline first (bounded loop: cert currentness on a
     // freshly-traded account needs its own first refresh, same as every other fixture in
@@ -25099,13 +25104,14 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
         "fixture setup: victim must still hold both legs after the healthy-baseline certify"
     );
 
-    // Push asset 0 dramatically adverse (will make the account genuinely liquidatable
-    // once re-certified) and asset 1 by a small amount (NOT enough to threaten
-    // solvency by itself, but enough to leave a real, un-observed pending divergence --
-    // this is the second active leg d63c4dc9's gate must not let a single-asset hint
-    // skip over).
+    // Push asset 0 adverse for the short victim (100 -> 150: equity 200 - 50 - 1 = 149 against
+    // a 100% maintenance requirement of 150 + 101 = 251, a deficit of 102 from booked LOSS
+    // alone, independent of any counterparty backing, and still solvent so no Recovery) and
+    // asset 1 by a small amount (NOT enough to threaten solvency by itself, but enough to
+    // leave a real, un-observed pending divergence -- this is the second active leg
+    // d63c4dc9's gate must not let a single-asset hint skip over).
     env.svm.warp_to_slot(2);
-    env.push_auth_mark_for_asset_as_admin(0, 2, 400);
+    env.push_auth_mark_for_asset_as_admin(0, 2, 150);
     env.push_auth_mark_for_asset_as_admin(1, 2, 101);
 
     // Crank hinting ONLY the fresh (about to be liquidatable) leg, asset 0. This is
