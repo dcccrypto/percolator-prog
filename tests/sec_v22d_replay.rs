@@ -500,7 +500,32 @@ impl Replay {
         }
     }
 
+    /// #698 (upstream 18f3ae94): one PermissionlessCrank accrues at most
+    /// `V16_MAX_ACCRUAL_PATH_STEPS` (32) path steps; the live keeper this history was recorded
+    /// from cranked every ~30-60 slots against the old one-call reach of `max_accrual_dt_slots`
+    /// (100 here). Replayed one-for-one, the asset falls further behind on every crank and never
+    /// catches up (every later user trade then fails EngineLossStale). The replay keeper therefore
+    /// sends the extra catch-up-only cranks a keeper on #698 must send (until the asset is within
+    /// 32 slots of the clock) before each recorded crank. Measured: with them the swordcat state
+    /// at the audit and end slots equals the pre-#698 run to the atom.
     fn crank_at(&mut self, live_slot: u64, now_slot: u64, p: Pubkey) {
+        self.warp_live(live_slot);
+        let steps = percolator::V16_MAX_ACCRUAL_PATH_STEPS as u64;
+        for _ in 0..20_000 {
+            let before = self.env.market_state().1.assets[0].slot_last;
+            let clock = self.env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
+            if before + steps >= clock {
+                break;
+            }
+            self.crank_once_at(live_slot, now_slot, p);
+            if self.env.market_state().1.assets[0].slot_last == before {
+                break;
+            }
+        }
+        self.crank_once_at(live_slot, now_slot, p);
+    }
+
+    fn crank_once_at(&mut self, live_slot: u64, now_slot: u64, p: Pubkey) {
         self.warp_live(live_slot);
         let payer = self.env.payer.pubkey();
         self.env.svm.expire_blockhash();
