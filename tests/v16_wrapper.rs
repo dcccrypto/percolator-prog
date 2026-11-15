@@ -14459,9 +14459,10 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
         "configuring asset 1 must not touch exposed asset 0 (incl. its fee-anchor clock)"
     );
     assert_eq!(
-        scoped_group.slot_last, 0,
-        "configuring the empty asset must not advance the exposed market's slot_last"
+        scoped_group.assets[0].slot_last, 0,
+        "configuring the empty asset must not advance exposed asset 0's slot_last (fee anchor clock)"
     );
+    assert_eq!(scoped_group.assets[1].slot_last, 50, "only the configured asset's clock moves");
     // Pin the fee actually charged to the positioned account while asset 0 is still open.
     let long_before = state::read_portfolio(&long_account.data).unwrap();
     let capital_before = long_before.capital;
@@ -14469,7 +14470,13 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     sync_maintenance_fee(&mut market, &mut long_account, 50).unwrap();
     let long_after = state::read_portfolio(&long_account.data).unwrap();
     let (_, after_sync) = state::read_market(&market.data).unwrap();
-    eprintln!("PIN anchor_before={anchor_before} after={} cap_before={capital_before} cap_after={} slot_last={}", long_after.last_fee_slot, long_after.capital, after_sync.slot_last);
+    assert_eq!(
+        (anchor_before, long_after.last_fee_slot, long_after.capital),
+        (0, 0, capital_before),
+        "asset 0's fee-anchor clock was not advanced, so the exposed long is charged nothing and keeps its anchor"
+    );
+    assert_eq!(after_sync.slot_last, 50, "market clock is at the configure slot");
+    assert_eq!(after_sync.assets[1], scoped_group.assets[1], "fee sync must not touch the other asset");
     assert_eq!(
         after_sync.assets[0], before_configure.assets[0],
         "fee sync on the exposed account must not touch asset 0's engine state"
