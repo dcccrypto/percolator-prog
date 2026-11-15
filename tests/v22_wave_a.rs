@@ -84,7 +84,8 @@ proptest! {
     }
 
     /// Profile bytes +19..+24 at full width: the validator accepts exactly
-    /// {lot <= 15, lot != 0 only in Manual/AuthMark, p4 flags within the known mask, rest 0}.
+    /// {lot <= 15, lot != 0 only in Manual/Hybrid/AuthMark, p4 flags within the known mask, rest 0}.
+    /// (Hybrid joined with the tiny-price format, docs/fixes/tiny-price-format.md.)
     #[test]
     fn profile_lot_and_p4_shape_full_width(pad in any::<[u8; 5]>(), mode in 0u8..4) {
         let mut p: state::AssetOracleProfileV16 = bytemuck::Zeroable::zeroed();
@@ -92,13 +93,14 @@ proptest! {
         p._padding0 = pad;
         let lot = pad[PROFILE_LOT_EXP_IDX];
         let expect = lot <= LOT_EXP_MAX
-            && (lot == 0 || mode == 0 || mode == 3)
+            && (lot == 0 || mode == 0 || mode == 1 || mode == 3)
             && pad[PROFILE_P4_FLAGS_IDX] & !P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT == 0
             && pad[2..] == [0, 0, 0];
         prop_assert_eq!(state::profile_lot_and_p4_bytes_ok(&p), expect);
     }
 
-    /// Reconfiguration carries lot and p4 bytes exactly, and refuses a lot on Hybrid / EWMA.
+    /// Reconfiguration carries lot and p4 bytes exactly, and refuses a lot on EWMA (Hybrid may
+    /// carry one since the tiny-price format).
     #[test]
     fn carried_padding_full_width(lot in 0u8..=LOT_EXP_MAX, flags in any::<bool>(), new_mode in 0u8..4) {
         let mut p: state::AssetOracleProfileV16 = bytemuck::Zeroable::zeroed();
@@ -106,7 +108,7 @@ proptest! {
         p._padding0[PROFILE_LOT_EXP_IDX] = lot;
         p._padding0[PROFILE_P4_FLAGS_IDX] = if flags { P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT } else { 0 };
         let r = state::carried_profile_padding0(&p, new_mode);
-        if lot != 0 && (new_mode == 1 || new_mode == 2) {
+        if lot != 0 && new_mode == 2 {
             prop_assert!(r.is_err());
         } else {
             prop_assert_eq!(r.unwrap(), p._padding0);
@@ -368,8 +370,9 @@ fn init_lot_market_records_lot_exp_and_p4_default() {
     assert_eq!(state::profile_p4_flags(&p), P4_FLAG_EXIT_REQUIRES_LOSS_CURRENT);
 }
 
-/// I-P1: the lot exponent survives ConfigureAuthMark; a Hybrid / EWMA reconfiguration (modes
-/// that cannot carry a lot) is refused with 119 instead of silently clearing it; and a growth
+/// I-P1: the lot exponent survives ConfigureAuthMark; an EWMA reconfiguration (a mode that
+/// cannot carry a lot; Hybrid can since the tiny-price format) is refused with 119 instead of
+/// silently clearing it; and a growth
 /// LAUNCH re-anchor (no portfolio ever created) below the floor is refused (the creator cannot
 /// launch at the floor and re-anchor to an untrackable mark). NEGATIVE CONTROL: the same EWMA reconfiguration on a lot-0 market
 /// succeeds.
