@@ -14458,6 +14458,22 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
         scoped_group.assets[0], before_configure.assets[0],
         "configuring asset 1 must not touch exposed asset 0 (incl. its fee-anchor clock)"
     );
+    assert_eq!(
+        scoped_group.slot_last, 0,
+        "configuring the empty asset must not advance the exposed market's slot_last"
+    );
+    // Pin the fee actually charged to the positioned account while asset 0 is still open.
+    let long_before = state::read_portfolio(&long_account.data).unwrap();
+    let capital_before = long_before.capital;
+    let anchor_before = long_before.last_fee_slot;
+    sync_maintenance_fee(&mut market, &mut long_account, 50).unwrap();
+    let long_after = state::read_portfolio(&long_account.data).unwrap();
+    let (_, after_sync) = state::read_market(&market.data).unwrap();
+    eprintln!("PIN anchor_before={anchor_before} after={} cap_before={capital_before} cap_after={} slot_last={}", long_after.last_fee_slot, long_after.capital, after_sync.slot_last);
+    assert_eq!(
+        after_sync.assets[0], before_configure.assets[0],
+        "fee sync on the exposed account must not touch asset 0's engine state"
+    );
 
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.
     run_ix(
@@ -14710,11 +14726,12 @@ fn v16_wrapper_listing_new_asset_oracle_while_other_asset_has_open_pnl() {
 
     let before = s.market.data.clone();
     let ix0 = listing_scope_hybrid_ix(&s.market, 0, 2, 101, s.feed0);
-    assert_err_and_market_unchanged(
+    assert_eq!(
         run_ix(ix0, &mut [&mut s.admin, &mut s.market, &mut s.pyth0]),
-        &s.market,
-        &before,
+        Err(percolator_prog::error::PercolatorError::EngineLockActive.into()),
+        "asset 0 keeps the market-wide quiet rule"
     );
+    assert_eq!(s.market.data, before, "rejected listing must not mutate the market");
 }
 
 #[test]
