@@ -14431,39 +14431,32 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
         "asset 1 must be empty so oracle reconfiguration is targeted"
     );
 
-    // v17: reset_empty_asset_oracle_anchor_not_atomic requires the entire group to have
-    // no positions (any asset with OI prevents reconfiguration). This is a stricter guard
-    // than the old per-asset check; it preserves the fee-anchor non-advancement invariant
-    // by blocking the operation rather than allowing it with a narrow carve-out.
-    // Matrix row: v17-oracle-reconfigure-group-wide-guard (PR #v17-convergence).
-    //
-    // With positions on asset 0, configuring asset 1 is blocked entirely — the fee anchor
-    // (slot_last) is NOT advanced because the instruction is rejected.
-    let before_blocked = market.data.clone();
-    assert_err_and_market_unchanged(
-        run_ix(
-            Instruction::ConfigureEwmaMark {
+    // #447 (upstream 780e1138, engine oracle_reset_blocked_for_asset): the reset of an empty
+    // non-zero asset is scoped to that asset, so configuring asset 1 now succeeds while asset 0
+    // is exposed. It advances the market clock, but not asset 0's own clock, which is what a
+    // positioned account's maintenance-fee anchor reads; asset 0 is left byte-for-byte as is.
+    run_ix(
+        Instruction::ConfigureEwmaMark {
             market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
-                asset_index: 1,
-                now_slot: 100,
-                initial_mark_e6: 250,
-                mark_ewma_halflife_slots: 10,
-                mark_min_fee: 0,
-                observation_sequence: state::read_asset_control_sequences(&market.data, 1)
-                    .unwrap()
-                    .oracle_observation
-                    + 1,
-            },
-            &mut [&mut admin, &mut market],
-        ),
-        &market,
-        &before_blocked,
-    );
-    // slot_last is still 0: the blocked configure did not advance the fee anchor.
-    let (_, blocked_group) = state::read_market(&market.data).unwrap();
+            asset_index: 1,
+            now_slot: 50,
+            initial_mark_e6: 250,
+            mark_ewma_halflife_slots: 10,
+            mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    let (_, scoped_group) = state::read_market(&market.data).unwrap();
+    assert_eq!(scoped_group.current_slot, 50);
+    assert_eq!(scoped_group.assets[1].effective_price, 250);
     assert_eq!(
-        blocked_group.slot_last, 0,
-        "blocked configure must not advance the fee anchor"
+        scoped_group.assets[0], before_configure.assets[0],
+        "configuring asset 1 must not touch exposed asset 0 (incl. its fee-anchor clock)"
     );
 
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.
@@ -14553,6 +14546,199 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
     // now_slot as fee anchor, not slot_last — maintenance fees are always collected for idle
     // capital). This is safe: there are no open positions to misprice against the moved anchor.
     sync_maintenance_fee(&mut market, &mut long_account, 101).unwrap();
+}
+
+/// Shared setup for the #447 listing-scope tests (upstream aeyakovenko/percolator-prog 780e1138,
+/// tests/listing_oracle_scope.rs): asset 0 on a single-leg hybrid oracle with an open position and
+/// accrued PnL, permissionless activation enabled, a new asset 1 appended by a creator.
+struct ListingScope {
+    admin: TestAccount,
+    market: TestAccount,
+    keeper: TestAccount,
+    keeper_portfolio: TestAccount,
+    feed0: [u8; 32],
+    pyth0: TestAccount,
+    new_asset_oracle_authority: TestAccount,
+}
+
+fn listing_scope_hybrid_ix(
+    market: &TestAccount,
+    asset_index: u16,
+    now_slot: u64,
+    now_unix_ts: i64,
+    feed: [u8; 32],
+) -> Instruction {
+    Instruction::ConfigureHybridOracle {
+        market_id: state::read_market_trade_preflight(&market.data, asset_index as usize).map(|t| t.3).unwrap_or(0),
+        asset_index,
+        now_slot,
+        now_unix_ts,
+        oracle_leg_count: 1,
+        oracle_leg_flags: 0,
+        max_staleness_secs: 60,
+        hybrid_soft_stale_slots: 10,
+        mark_ewma_halflife_slots: 10,
+        mark_min_fee: 0,
+        invert: 0,
+        unit_scale: 0,
+        conf_filter_bps: 500,
+        oracle_leg_feeds: [feed, [0; 32], [0; 32]],
+        observation_sequence: state::read_asset_control_sequences(&market.data, asset_index as usize)
+            .unwrap()
+            .oracle_observation
+            + 1,
+    }
+}
+
+fn listing_scope_setup(seed: u8) -> ListingScope {
+    let mut admin = signer();
+    let mut market = market_account_with_capacity(2);
+    let mint = init_market(&mut admin, &mut market);
+    let feed0 = [seed; 32];
+    let mut pyth0 = pyth_account(&feed0, 100, -6, 1, 100);
+    run_ix(
+        listing_scope_hybrid_ix(&market, 0, 1, 100, feed0),
+        &mut [&mut admin, &mut market, &mut pyth0],
+    )
+    .expect("configure asset 0 while the market is flat");
+
+    let mut keeper = signer();
+    let mut keeper_portfolio = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut keeper, &mut market, &mut keeper_portfolio);
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000_000);
+    run_ix(
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(&long_account).0,
+            account_a_position_epoch: portfolio_identity(&long_account).2,
+            account_b_portfolio_id: portfolio_identity(&short_account).0,
+            account_b_position_epoch: portfolio_identity(&short_account).2,
+            market_id: 1,
+            asset_index: 0,
+            size_q: POS_SCALE as i128,
+            exec_price: state::read_market(&market.data).unwrap().1.assets[0].effective_price,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        &mut [&mut long_owner, &mut short_owner, &mut market, &mut long_account, &mut short_account],
+    )
+    .expect("open a position on asset 0");
+
+    // Price moves +10% on asset 0; crank accrues it so a trader holds open PnL.
+    pyth0.data = make_pyth(&feed0, 110, -6, 1, 101);
+    run_ix(
+        Instruction::PermissionlessCrank {
+            now_slot: 2,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 1 }],
+        },
+        &mut [&mut keeper, &mut market, &mut keeper_portfolio, &mut pyth0],
+    )
+    .expect("accrue the price move on asset 0");
+    let (_, g) = state::read_market(&market.data).unwrap();
+    assert!(
+        g.pnl_pos_tot != 0 || g.negative_pnl_account_count != 0 || g.loss_stale_active,
+        "precondition: the accrued move leaves open PnL / loss-staleness on asset 0"
+    );
+
+    // Permissionless activation of asset 1.
+    run_ix(
+        Instruction::UpdateMarketInitFeePolicy {
+            min_init_fee: 1,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .market_init_fee
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("enable permissionless activation");
+    let mut creator = signer();
+    let new_asset_oracle_authority = signer();
+    let mut init_fee_source = user_token_account(creator.key, mint, 1);
+    let mut vault = vault_token_account(&market, mint, 0);
+    let mut token_program = token_program_account();
+    run_ix(
+        Instruction::UpdateAssetLifecycle {
+            market_id: state::read_asset_lifecycle_generation_preflight(&market.data, 1, true)
+                .unwrap()
+                .1,
+            action: processor::ASSET_ACTION_ACTIVATE,
+            asset_index: 1,
+            authority_epoch: 0,
+            now_slot: 2,
+            initial_price: 100,
+            max_init_fee: u128::MAX,
+            insurance_authority: creator.key.to_bytes(),
+            insurance_operator: creator.key.to_bytes(),
+            backing_bucket_authority: creator.key.to_bytes(),
+            oracle_authority: new_asset_oracle_authority.key.to_bytes(),
+        },
+        &mut [&mut creator, &mut market, &mut init_fee_source, &mut vault, &mut token_program],
+    )
+    .expect("permissionless activation appends a new asset");
+    ListingScope { admin, market, keeper, keeper_portfolio, feed0, pyth0, new_asset_oracle_authority }
+}
+
+#[test]
+fn v16_wrapper_listing_new_asset_oracle_while_other_asset_has_open_pnl() {
+    // upstream 780e1138 (#447): a fresh empty non-zero asset's oracle is configurable while
+    // another asset has open PnL; asset 0 keeps the market-wide quiet rule.
+    let mut s = listing_scope_setup(0xa0);
+    let (_, g_before) = state::read_market(&s.market.data).unwrap();
+    let feed1 = [0xa1u8; 32];
+    let mut pyth1 = pyth_account(&feed1, 100, -6, 1, 101);
+    run_ix(
+        listing_scope_hybrid_ix(&s.market, 1, 2, 101, feed1),
+        &mut [&mut s.new_asset_oracle_authority, &mut s.market, &mut pyth1],
+    )
+    .expect("a new, empty asset's oracle is configurable while another asset has open PnL");
+    // The positioned asset is not touched by the other asset's oracle reset.
+    let (_, g_after) = state::read_market(&s.market.data).unwrap();
+    assert_eq!(g_after.assets[0], g_before.assets[0], "asset 0 engine state unchanged");
+    assert_eq!(g_after.pnl_pos_tot, g_before.pnl_pos_tot);
+    assert_eq!(g_after.negative_pnl_account_count, g_before.negative_pnl_account_count);
+    assert_eq!(g_after.vault, g_before.vault);
+    assert_eq!(g_after.c_tot, g_before.c_tot);
+    assert_eq!(g_after.insurance, g_before.insurance);
+    assert_eq!(g_after.assets[1].effective_price, 100);
+
+    let before = s.market.data.clone();
+    let ix0 = listing_scope_hybrid_ix(&s.market, 0, 2, 101, s.feed0);
+    assert_err_and_market_unchanged(
+        run_ix(ix0, &mut [&mut s.admin, &mut s.market, &mut s.pyth0]),
+        &s.market,
+        &before,
+    );
+}
+
+#[test]
+fn v16_wrapper_crank_on_positioned_asset_succeeds_after_permissionless_listing() {
+    // upstream 780e1138 (#447): the accepted side effect (listing bumps the authenticated slot
+    // while asset 0 has positions) must not wedge a later crank on asset 0.
+    let mut s = listing_scope_setup(0xb0);
+    let feed1 = [0xb1u8; 32];
+    let mut pyth1 = pyth_account(&feed1, 100, -6, 1, 101);
+    run_ix(
+        listing_scope_hybrid_ix(&s.market, 1, 2, 101, feed1),
+        &mut [&mut s.new_asset_oracle_authority, &mut s.market, &mut pyth1],
+    )
+    .expect("permissionless listing configures the new asset's oracle");
+
+    s.pyth0.data = make_pyth(&s.feed0, 111, -6, 1, 102);
+    run_ix(
+        Instruction::PermissionlessCrank {
+            now_slot: 3,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 1 }],
+        },
+        &mut [&mut s.keeper, &mut s.market, &mut s.keeper_portfolio, &mut s.pyth0],
+    )
+    .expect("crank on the positioned asset still succeeds after the listing");
 }
 
 #[test]
