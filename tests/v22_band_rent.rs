@@ -5652,6 +5652,126 @@ mod lev_guard_t {
 }
 use lev_guard_t as lgt;
 
+/// CU profile of every lev-guard op (tag 124) and of TradeCpi with the guard appended, on the
+/// real BPF. Prints `LGCU <name> <cu> <guard-account-hash>` (the hash pins the state bytes, so
+/// a before/after run of the same command proves a CU change did not change behaviour).
+/// Run: `cargo test --test v22_band_rent lev_guard_cu_profile -- --nocapture`.
+#[test]
+fn lev_guard_cu_profile() {
+    use percolator_prog::{depth_src_v22 as ds, lev_guard_v22 as lg};
+    fn fnv(d: &[u8]) -> u64 {
+        d.iter().fold(0xcbf29ce484222325u64, |h, b| (h ^ *b as u64).wrapping_mul(0x100000001b3))
+    }
+    LEV_START_SLOT.with(|c| c.set(40 * lg::SLOTS_PER_DAY));
+    let mut env = env_with_launch(band_cfg(), 500);
+    LEV_START_SLOT.with(|c| c.set(1));
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    env.warp(1);
+    env.push(PRICE);
+    let now = env.slot;
+    let gk = lgt::guard_key(&env);
+    let show = |env: &Env, name: &str, r: Result<u64, String>| {
+        let cu = r.unwrap_or_else(|e| panic!("{name}: {e}"));
+        let h = env.svm.get_account(&gk).map(|a| fnv(&a.data)).unwrap_or(0);
+        println!("LGCU {name} {cu} {h:016x}");
+    };
+    let r = lgt::init(&mut env, None, now - lg::AGE_MONTH_SLOTS);
+    show(&env, "op0_init", r);
+    let key = Keypair::new();
+    let r = lgt::ua_op(&mut env, lg::OP_SET_RISK_KEY, 0, key.pubkey().to_bytes());
+    show(&env, "op1_set_risk_key", r);
+    let r = lgt::report(&mut env, &key, [200, 300, 500, 10_000]);
+    show(&env, "op2_report", r);
+    let r = lgt::ua_op(&mut env, lg::OP_SET_T0, now - lg::AGE_MONTH_SLOTS + 5, [0; 32]);
+    show(&env, "op6_set_t0", r);
+    // op 4 poke (price band sample), twice: first sample, then a +5 % move
+    let poke = |env: &mut Env, lp: &Lp| -> Result<u64, String> {
+        let (m, g, p) = (env.market, lgt::guard_key(env), env.payer.pubkey());
+        env.send(
+            ProgInstruction::LevGuard { op: lg::OP_POKE, t0: 0, key: [0; 32], report: [0; 4] },
+            vec![AccountMeta::new(p, true), AccountMeta::new(m, false), AccountMeta::new(g, false), AccountMeta::new(lp.account, false)],
+            &[],
+        )
+    };
+    let r = poke(&mut env, &lp);
+    show(&env, "op4_poke_first", r);
+    env.warp(1);
+    env.push(PRICE * 105 / 100);
+    let r = poke(&mut env, &lp);
+    show(&env, "op4_poke_second", r);
+    env.warp(1);
+    env.push(PRICE);
+    // op 3 (tighten) with the pin record, clean mint, then a holder proof
+    let (mint, vault, quote_mint, quote_vault, pool, holder) =
+        (Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique(), Pubkey::new_unique());
+    let mk = |env: &mut Env, key: Pubkey, d: Vec<u8>| {
+        env.svm.set_account(key, solana_sdk::account::Account { lamports: 1_000_000_000, data: d, owner: spl_token::ID, executable: false, rent_epoch: 0 }).unwrap();
+    };
+    let mut md = vec![0u8; 82];
+    md[44] = 6;
+    md[45] = 1;
+    mk(&mut env, mint, md);
+    let tok = |env: &mut Env, key: Pubkey, amount: u64| {
+        let mut d = vec![0u8; 165];
+        d[0..32].copy_from_slice(mint.as_ref());
+        d[32..64].copy_from_slice(&[9u8; 32]);
+        d[64..72].copy_from_slice(&amount.to_le_bytes());
+        d[108] = 1;
+        mk(env, key, d);
+    };
+    tok(&mut env, vault, 1_000_000);
+    tok(&mut env, holder, 1_000_000);
+    let (src, bump) = state::derive_depth_source(&env.program_id, &env.market);
+    let rec = ds::DepthSourceV22 {
+        market: env.market.to_bytes(),
+        amm_program: ds::PUMPSWAP_AMM_PROGRAM_ID.to_bytes(),
+        pool: pool.to_bytes(),
+        base_vault: vault.to_bytes(),
+        quote_vault: quote_vault.to_bytes(),
+        base_mint: mint.to_bytes(),
+        quote_mint: quote_mint.to_bytes(),
+        market_id: 1,
+        set_slot: 1,
+        asset_index: 0,
+        base_decimals: 6,
+        quote_decimals: 6,
+        flags: ds::DEPTH_SRC_FLAG_ACTIVE,
+        version: ds::DEPTH_SOURCE_VERSION,
+        bump,
+        amm_kind: ds::AMM_PUMPSWAP,
+        _reserved: [0; 8],
+    };
+    let mut d = vec![0u8; state::depth_source_account_len()];
+    state::write_depth_source(&mut d, &rec, true).unwrap();
+    env.svm.set_account(src, solana_sdk::account::Account { lamports: 1_000_000_000, data: d, owner: env.program_id, executable: false, rent_epoch: 0 }).unwrap();
+    let prove = |env: &mut Env, h: Option<Pubkey>| -> Result<u64, String> {
+        let (mk, g, p) = (env.market, lgt::guard_key(env), env.payer.pubkey());
+        let mut metas = vec![
+            AccountMeta::new(p, true),
+            AccountMeta::new_readonly(mk, false),
+            AccountMeta::new(g, false),
+            AccountMeta::new_readonly(src, false),
+            AccountMeta::new_readonly(mint, false),
+            AccountMeta::new_readonly(vault, false),
+        ];
+        if let Some(h) = h {
+            metas.push(AccountMeta::new_readonly(h, false));
+        }
+        env.send(ProgInstruction::LevGuard { op: lg::OP_TIGHTEN, t0: 0, key: [0; 32], report: [0; 4] }, metas, &[])
+    };
+    let r = prove(&mut env, None);
+    show(&env, "op3_tighten_mint_only", r);
+    let r = prove(&mut env, Some(holder));
+    show(&env, "op3_tighten_holder", r);
+    // check on trade: TradeCpi with the guard appended (an open, then a reducing fill)
+    let t = env.trader(1_000 * USD);
+    let r = lgt::tg(&mut env, &t, &lp, lgt::usd_q(100));
+    show(&env, "trade_guarded_open", r);
+    let r = lgt::tg(&mut env, &t, &lp, -lgt::usd_q(40));
+    show(&env, "trade_guarded_reduce", r);
+}
+
 #[test]
 fn lev_guard_init_authorization_and_t0_rules() {
     use percolator_prog::lev_guard_v22 as lg;
