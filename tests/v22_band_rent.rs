@@ -2395,15 +2395,15 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let _ = env.crank(lp.account);
     let a = env.engine_asset();
     // #698 (upstream 18f3ae94): the crank walks the canonical path with the persisted price-move
-    // remainder, so the sub-tick 0.664 ticks/slot accumulates instead of rounding to 0 every crank:
-    // the price can step by one tick (1,659 here). It is still a sub-tick-per-slot cap step, and
-    // the exit below must still land.
-    assert!((1_659..=1_660).contains(&a.effective_price), "the cap law moves 1,660 by at most one tick at 4 bps/slot: {}", a.effective_price);
+    // remainder, so the 0.664 ticks/slot cap step accumulates across slots instead of rounding to
+    // 0 on every crank, and the price steps one tick to 1,659 here.
+    assert_eq!(a.effective_price, 1_659, "the carry moves 1,660 by one tick at 4 bps/slot");
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
-    // A 0-tick cap step cannot move the price in either direction, pinned or not (a certified
-    // book keeps re-anchoring at the same price, so no pin clock can be required here).
+    // The per-slot cap step is still under one whole tick here (0 ticks before the carry), and the
+    // exit must land at this price, which the carry can still move (measured on #698: a lagged
+    // favourable close at a price below 1,660 that the carry is still moving is accepted, not 104).
     let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
-    assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
+    assert!(r.is_ok(), "exit under a sub-tick cap step lands: {r:?}");
     env.assert_conservation();
 }
 
