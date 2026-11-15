@@ -48785,8 +48785,13 @@ pub mod processor {
 
     /// v2.2 band (re-review N-2, tightened in round 2): the asset's price can no longer move
     /// toward its target. Exactly one of:
-    /// * the cap law's per-accrual step at `P_last` rounds to 0 ticks (spec §9.6's
-    ///   `max_delta == 0`: no movement in either direction);
+    /// * the cap law cannot move `P_last` at all, INCLUDING the carried price-move remainder
+    ///   (#698, upstream 18f3ae94: every accrual walks the canonical one-slot path and carries
+    ///   the sub-tick numerator `P * cap_bps % 1e4` forward, so a step that rounds to 0 ticks
+    ///   still accumulates and moves the price a tick every `ceil(1e4 / (P * cap_bps))` slots).
+    ///   Only a zero per-slot numerator is a dead zone now; the old one-accrual test
+    ///   `floor(P * cap * dt / 1e4) == 0` let a favourable close through at a stale `P_last`
+    ///   the carry was still moving (a free option against the LP on tiny-price markets);
     /// * the asset is PINNED (`band_pin_since_slot != 0`) and the band around `P_last` is
     ///   narrower than `MIN_BAND_WIDTH_TICKS`, which is exactly the condition on which the
     ///   engine refuses to re-anchor (`band_prepare_accrual`).
@@ -48805,19 +48810,19 @@ pub mod processor {
             .engine
             .asset;
         let p_last = asset.effective_price.get();
-        // The cap law's own dead zone: `floor(P * cap * dt / 1e4) == 0` cannot move either.
-        let max_step = (p_last as u128)
-            .saturating_mul(group.header.config.max_price_move_bps_per_slot.get() as u128)
-            .saturating_mul(group.header.config.max_accrual_dt_slots.get() as u128)
-            / 10_000;
-        // (1) Cap dead zone: a 0-tick step cannot move the price in EITHER direction, pinned or
-        //     not (a certified book keeps re-anchoring at the same price there, which resets
-        //     the pin clock every epoch, so the pin cannot be required for this case).
+        // The cap law's own dead zone, carry included: the per-slot numerator `P * cap_bps`
+        // accumulates in the persisted remainder (`canonical_accrual_price_step_v16`), so any
+        // non-zero numerator eventually moves a whole tick. Only a zero numerator cannot.
+        let per_slot_num = (p_last as u128)
+            .saturating_mul(group.header.config.max_price_move_bps_per_slot.get() as u128);
+        // (1) Cap dead zone: a price the cap law (with its carry) can never move, in EITHER
+        //     direction, pinned or not (a certified book keeps re-anchoring at the same price
+        //     there, which resets the pin clock every epoch, so the pin cannot be required).
         // (2) Width floor (round-2 re-review tightening): the engine's pin clock must be running
         //     as well, i.e. the price sits at the edge of the last wide band with the target
         //     beyond it and the re-anchor refused. While a sub-threshold price can still move
         //     inside an open window the refusal is NOT lifted.
-        Ok(max_step == 0
+        Ok(per_slot_num == 0
             || (asset.band_pin_since_slot.get() != 0
                 && !percolator::band_rent::band_width_ok(p_last, band_bps)
                     .map_err(|_| PercolatorError::PriceBandConfigInvalid)?))

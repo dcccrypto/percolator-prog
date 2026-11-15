@@ -506,8 +506,8 @@ impl Replay {
     /// (100 here). Replayed one-for-one, the asset falls further behind on every crank and never
     /// catches up (every later user trade then fails EngineLossStale). The replay keeper therefore
     /// sends the extra catch-up-only cranks a keeper on #698 must send (until the asset is within
-    /// 32 slots of the clock) before each recorded crank. Measured: with them the swordcat state
-    /// at the audit and end slots equals the pre-#698 run to the atom.
+    /// 32 slots of the clock) before each recorded crank. The report tests pin the catch-up
+    /// error counts and accounting snapshots (swordcat audit, backpack end).
     fn crank_at(&mut self, live_slot: u64, now_slot: u64, p: Pubkey) {
         self.warp_live(live_slot);
         let steps = percolator::V16_MAX_ACCRUAL_PATH_STEPS as u64;
@@ -955,6 +955,13 @@ fn swordcat_replay_report() {
         r.peak_earn_loss as f64 / 1e6
     );
     assert_eq!(r.push_err, 0, "every live push must replay");
+    // #698: catch-up may meet the engine's no-progress gate (Custom 22) on a recorded
+    // crank. Pin the COUNT and code too: a new keeper error cannot silently change the replay.
+    if std::env::var("INDEP_WRAPPER_SO").is_err() {
+        assert_eq!(r.crank_err, 5, "swordcat crank errors");
+        assert_eq!(r.crank_codes, std::collections::BTreeMap::from([(22u32, 5usize)]), "only EngineNonProgress");
+        assert_eq!((a.trader_pnl, a.earn_loss(), a.claim[0], a.unowned()), (207_608_189, 1_577_269, 207_608_189, 1_577_270), "audit snapshot vs the pre-#698 run");
+    }
 }
 
 /// E1 acceptance on the live path: after every keeper settlement of the one swordcat position, the
@@ -1469,6 +1476,21 @@ fn backpack_replay_report() {
         w.residual_received_atoms_total,
         w.source_claim_bound_num
     );
+    // #698 end state with the replay keeper's catch-up cranks (77aedc3c, measured 15 Nov 2026).
+    // NOT equal to the pre-#698 run: base 1761700e ends with the same trader cap/pnl, LP capital,
+    // vault, c_tot and F, but Earn loss 2_324_156 / unowned 2_324_161 / d1 consumed 140_022_770
+    // (here 6_374_000 / 6_374_005 / 144_072_614; diverges between live slots 506461455 and
+    // 506866188; P_last matches base at every checkpoint, cause not isolated here). Pinned so
+    // any further drift is visible; base crank errors were 39 (all Custom 22).
+    assert_eq!(r.push_err, 0, "every live push must replay");
+    assert!(r.user_err.is_empty(), "all recorded user events land: {:?}", r.user_err);
+    if std::env::var("INDEP_WRAPPER_SO").is_err() {
+        assert_eq!(r.crank_err, 1_574, "backpack crank errors");
+        assert_eq!(r.crank_codes, std::collections::BTreeMap::from([(22u32, 1_574usize)]), "only EngineNonProgress");
+        assert_eq!((end.trader_cap, end.trader_pnl, lp.capital), (811_525_856, 903_426_791, 333_946_933), "backpack end balances");
+        assert_eq!(end.consumed, [18_456_987, 144_072_614], "backpack end consumed");
+        assert_eq!((end.earn_loss(), end.unowned(), end.engine_residual()), (6_374_000, 6_374_005, 0), "backpack end accounting");
+    }
 }
 
 /// backpack's "missing +811": the short winner keeps what K says it won. Funding is identically 0

@@ -2377,11 +2377,17 @@ fn v22_band_floor_keeps_exits_open() {
 }
 
 
-/// N-2 companion: at d = 100 the width floor (1,600) is below the cap law's own dead zone
-/// (4 bps/slot moves under 1 tick per slot under 2,500; with #698's carry it accumulates), so the price stops there instead; exits must stay
-/// open there too. Control: the same favourable close is refused at a price that can move.
+/// N-2 companion, re-stated for #698's carry (review MEDIUM, 15 Nov): at d = 100 the 4 bps/slot
+/// cap step is under one tick below 2,500 (0.664 ticks/slot at 1,660), which used to be a dead
+/// zone (`band_floor_stuck_view` condition (1): `floor(P * cap * dt / 1e4) == 0`) where exits
+/// were let through at P_last. With the carried price-move remainder (upstream 18f3ae94) that
+/// price DOES move, so a favourable close at the stale P_last there is a free option against
+/// the LP and must be refused (104) until the staircase catches up. Exits are still not trapped:
+/// the carry walks the price down to the width floor (1,600), where the pin (condition (2))
+/// re-opens them at P_last.
 #[test]
 fn v22_band_cap_dead_zone_keeps_exits_open() {
+    const D: u64 = BAND_BPS as u64;
     let mut env = Env::new(band_cfg());
     env.auth_mark();
     let lp = env.lp(10_000 * USD);
@@ -2394,16 +2400,38 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let _ = env.crank(long.1);
     let _ = env.crank(lp.account);
     let a = env.engine_asset();
-    // #698 (upstream 18f3ae94): the crank walks the canonical path with the persisted price-move
-    // remainder, so the 0.664 ticks/slot cap step accumulates across slots instead of rounding to
-    // 0 on every crank, and the price steps one tick to 1,659 here.
+    // The crank walks the canonical path with the persisted remainder, so the 0.664 ticks/slot
+    // cap step accumulates across slots instead of rounding to 0 on every crank.
     assert_eq!(a.effective_price, 1_659, "the carry moves 1,660 by one tick at 4 bps/slot");
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
-    // The per-slot cap step is still under one whole tick here (0 ticks before the carry), and the
-    // exit must land at this price, which the carry can still move (measured on #698: a lagged
-    // favourable close at a price below 1,660 that the carry is still moving is accepted, not 104).
+    assert!(percolator::band_rent::band_width_ok(a.effective_price, D).unwrap(), "above the width floor");
+    assert_eq!(a.band_pin_since_slot, 0, "not pinned");
+    // The sub-tick cap step can still move this price (the carry), so the lagged favourable
+    // close at P_last is refused, not let through as a stuck-floor exit.
     let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
-    assert!(r.is_ok(), "exit under a sub-tick cap step lands: {r:?}");
+    assert_err(&r, &code(PercolatorError::PriceBandPinned), "favourable close at a stale sub-tick P_last");
+    assert_eq!(env.pos(long.1), 20_000 * POS_SCALE as i128, "the refused close left the position");
+    // Exits are not trapped: keep cranking until the carry has walked the price to the width
+    // floor and the pin clock runs (condition (2)); the same exit lands at P_last there.
+    let mut stuck = false;
+    for _ in 0..4_000 {
+        env.warp(1);
+        env.push(1);
+        let _ = env.crank(long.1);
+        let _ = env.crank(lp.account);
+        let a = env.engine_asset();
+        if !percolator::band_rent::band_width_ok(a.effective_price, D).unwrap() && a.band_pin_since_slot != 0 {
+            stuck = true;
+            break;
+        }
+    }
+    let a = env.engine_asset();
+    assert!(stuck, "the carry reaches the pinned width floor: p={} pin={}", a.effective_price, a.band_pin_since_slot);
+    assert!(a.effective_price < 1_659, "the carry moved the price: {}", a.effective_price);
+    assert!(a.raw_oracle_target_price < a.effective_price, "still lagged");
+    let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
+    assert!(r.is_ok(), "exit at the pinned floor lands: {r:?}");
+    assert_eq!(env.pos(long.1), 0);
     env.assert_conservation();
 }
 
