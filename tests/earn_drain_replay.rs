@@ -955,6 +955,14 @@ fn swordcat_replay_report() {
         r.peak_earn_loss as f64 / 1e6
     );
     assert_eq!(r.push_err, 0, "every live push must replay");
+    // Pinned measurement (#698 review low): exactly 5 keeper cranks are rejected with custom
+    // code 22 on this replay. A drift in either number means crank behaviour changed.
+    assert_eq!(r.crank_err, 5, "swordcat crank errors drifted: {:?}", r.crank_codes);
+    assert_eq!(
+        r.crank_codes,
+        std::collections::BTreeMap::from([(22u32, 5usize)]),
+        "swordcat crank error codes drifted"
+    );
     // #698: with the replay keeper's catch-up cranks the audit-slot state equals the pre-#698 run
     // (base 1761700e, measured 15 Nov 2026) to the atom.
     if std::env::var("INDEP_WRAPPER_SO").is_err() {
