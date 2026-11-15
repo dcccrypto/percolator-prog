@@ -29891,6 +29891,14 @@ pub mod processor {
             profile.oracle_target_price_e6 = next_mark;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
+            // ADOPT upstream (aeyakovenko/percolator-prog `reset_price_move_remainder_on_target_change_view`):
+            // a target change must not carry the previous target's price-move-cap remainder.
+            reset_price_move_remainder_on_target_change_view(
+                &mut profile,
+                &group,
+                asset_index_usize,
+                next_mark,
+            )?;
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             if asset_index_usize == 0 {
                 // #379/#501: the market-wide stale clock is the BASE asset's. Scoping this
@@ -49835,6 +49843,24 @@ pub mod processor {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
         profile.price_move_remainder_bps_num = remainder;
+        Ok(())
+    }
+
+    fn reset_price_move_remainder_on_target_change_view(
+        profile: &mut state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        target: u64,
+    ) -> ProgramResult {
+        let asset = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset;
+        if asset.raw_oracle_target_price.get() != target {
+            set_price_move_remainder_bps_num_view(profile, 0)?;
+        }
         Ok(())
     }
 

@@ -29616,3 +29616,51 @@ fn v16_program_issue406_canonical_synced_matcher_survives_liquidation_within_rea
     );
     assert!(fill.is_ok() && lp_after > 0, "non-vacuity: the capped fill still lands ({fill:?})");
 }
+
+/// P42 (ADOPT upstream `reset_price_move_remainder_on_target_change_view`): the price-move-cap
+/// remainder carried in the oracle profile belongs to the target it was accrued toward. A
+/// `PushEwmaMark` that changes the target must drop it; otherwise the next accrual toward the new
+/// target starts from a stale sub-unit remainder. A same-target push must keep it.
+#[test]
+fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
+    const INITIAL_PRICE: u64 = 9_000;
+    const DEPOSIT: u128 = 10_000_000;
+    const STALE: u16 = 4_321;
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: INITIAL_PRICE,
+        max_price_move_bps_per_slot: 1,
+        max_accrual_dt_slots: 50,
+        max_abs_funding_e9_per_slot: 10_000,
+        min_funding_lifetime_slots: 50,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_ewma_mark_with_cu(0, INITIAL_PRICE, 1, 0);
+    let read = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+    };
+    // Plant a stale remainder accrued toward the CURRENT target (raw target == initial price).
+    let mut account = env.svm.get_account(&env.market).unwrap();
+    let mut profile = read(&env);
+    profile.price_move_remainder_bps_num = STALE;
+    state::write_asset_oracle_profile(&mut account.data, 0, &profile).unwrap();
+    env.svm.set_account(env.market, account).unwrap();
+    assert_eq!(read(&env).price_move_remainder_bps_num, STALE, "setup");
+
+    // Same target as the engine's raw target: the remainder is the same accrual's carry. Kept.
+    env.svm.warp_to_slot(1);
+    env.push_ewma_mark_with_cu(1, INITIAL_PRICE);
+    assert_eq!(read(&env).price_move_remainder_bps_num, STALE);
+
+    // A different target: the remainder must not carry across.
+    env.svm.warp_to_slot(2);
+    env.svm.expire_blockhash();
+    env.push_ewma_mark_with_cu(2, INITIAL_PRICE + 40);
+    assert_ne!(read(&env).oracle_target_price_e6, INITIAL_PRICE, "target must have changed");
+    assert_eq!(
+        read(&env).price_move_remainder_bps_num,
+        0,
+        "a target change must not carry the previous target's price-move remainder"
+    );
+}
