@@ -8,9 +8,11 @@
 // compose_price_e6 is private, so every case goes through the public
 // read_external_price_e6_profile with real Pyth PriceUpdateV2 account bytes.
 //
-// Tests marked #[ignore] are real findings: they fail today. Run them with
-//   cargo test --test oracle_compose_edge -- --ignored
-// No product code is changed here.
+// The FINDINGS below were #[ignore]d real bugs (#707). The tiny-price format fix
+// (docs/fixes/tiny-price-format.md) reads legs at E12, composes in U256 without the per-leg
+// intermediate gate, and scales the final price by the asset's lot exponent (10^lot_exp tokens
+// per quoted unit). Findings 1 and 5 are output-precision limits of a per-token e6 price, so
+// they pass on a lot market; the lot-0 behaviour is pinned next to each.
 #![cfg(not(kani))]
 
 use percolator_prog::{
@@ -86,7 +88,20 @@ fn run(
     unit_scale: u32,
     conf_bps: u16,
 ) -> Result<u64, ProgramError> {
+    run_lot(legs, flags, invert, unit_scale, conf_bps, 0)
+}
+
+/// `run` on an asset whose lot exponent is `lot_exp` (profile byte +19).
+fn run_lot(
+    legs: &[Leg],
+    flags: u8,
+    invert: u8,
+    unit_scale: u32,
+    conf_bps: u16,
+    lot_exp: u8,
+) -> Result<u64, ProgramError> {
     let mut p = profile(legs.len() as u8, flags, invert, unit_scale, conf_bps);
+    p._padding0[percolator_prog::constants::PROFILE_LOT_EXP_IDX] = lot_exp;
     let owner = oracle_v16::PYTH_RECEIVER_PROGRAM_ID;
     let keys: Vec<Pubkey> = legs.iter().map(|_| Pubkey::new_unique()).collect();
     let mut datas: Vec<Vec<u8>> = legs
@@ -360,9 +375,11 @@ fn three_leg_at_max_bounds_no_overflow() {
     // MAX * MAX / MAX with every leg at the cap: numerator ~1e36*1e6 fits u128
     let m = MAX_PRICE_E6 as i64;
     let legs = [e6(m), e6(m), e6(m)];
-    // flags: divide leg3 -> MAX * MAX / 1e6 > MAX at leg 2 -> expected reject (intermediate gate)
+    // flags: divide leg3 -> MAX * MAX / MAX = MAX. The partial product is above MAX after leg 2;
+    // the per-leg intermediate gate that refused this is gone with the tiny-price format
+    // (finding 4), so the in-range final price is accepted and nothing overflows (U256).
     let r = run(&legs, ORACLE_LEG_FLAG_DIVIDE_LEG3, 0, 0, 0);
-    assert!(r.is_err());
+    assert_eq!(r, Ok(MAX_PRICE_E6));
     // all multiply: also out of range, must be a clean error rather than a panic
     assert!(run(&legs, 0, 0, 0, 0).is_err());
 }
@@ -455,18 +472,21 @@ fn unit_scale_pushing_price_below_one_tick_is_rejected_cleanly() {
     );
 }
 
-// ---------------------------------------------------------------- FINDINGS (fail today)
+// ---------------------------------------------------------------- FINDINGS (fixed)
 
 /// FINDING 1. src/v16_program.rs:12545-12580 (`read_pyth_price_e6`, `price_u / 10^(-scale)`,
 /// `out == 0` -> OracleInvalid). A real memecoin price below $0.000001 (for example $0.0000005,
 /// Pyth expo -10, price 5_000) is a valid positive Pyth price, but it truncates to 0 e6 and is
 /// rejected as OracleInvalid, so any market on that feed cannot take a price and freezes.
+/// FIX: a per-token e6 price cannot hold it (it is half a tick), so such a market is created with
+/// a lot exponent: lot 6 quotes 10^6 tokens = $0.5 = 500_000 e6, six significant digits.
 #[test]
-#[ignore = "BUG: sub-1e-6 USD memecoin price truncates to 0 and is rejected as OracleInvalid (v16_program.rs:12575)"]
 fn bug_tiny_memecoin_price_below_one_e6_tick_is_rejected() {
     // $0.0000005
-    let r = run(&[leg(5_000, -10)], 0, 0, 0, 0);
-    assert!(r.is_ok(), "legit $0.0000005 price rejected: {:?}", r);
+    let r = run_lot(&[leg(5_000, -10)], 0, 0, 0, 0, 6);
+    assert_eq!(r, Ok(500_000), "legit $0.0000005 price on a lot-6 market");
+    // lot 0 still cannot represent it and refuses cleanly (not a silent 0)
+    assert_eq!(err_code(run(&[leg(5_000, -10)], 0, 0, 0, 0)), oracle_invalid());
 }
 
 /// FINDING 2. src/v16_program.rs:12529 `read_pyth_price_e6` truncates every leg to whole e6 before
@@ -474,7 +494,6 @@ fn bug_tiny_memecoin_price_below_one_e6_tick_is_rejected() {
 /// design is defeated for small legs. TOKEN/SOL = 0.0000019 SOL (expo -9, 1_900) reads as 1 e6
 /// (47% low); times SOL/USD 150 gives $0.000150 instead of $0.000285.
 #[test]
-#[ignore = "BUG: small leg truncated to whole e6 before composition, >1% error (v16_program.rs:12575, 12781)"]
 fn bug_small_leg_precision_loss_over_one_percent() {
     let legs = [leg(1_900, -9), e6(150_000_000)];
     let got = run(&legs, 0, 0, 0, 0).unwrap();
@@ -492,7 +511,6 @@ fn bug_small_leg_precision_loss_over_one_percent() {
 /// partial result dips under 1 e6 is rejected even though the final price is fine.
 /// [1 e6, 0.5, 5000] = 1e-6 * 0.5 * 5000 = $0.0025 passes only if the legs are reordered.
 #[test]
-#[ignore = "BUG: intermediate leg result of 0 rejects a composite whose final price is valid (v16_program.rs:12832)"]
 fn bug_intermediate_rounds_to_zero_but_final_is_fine() {
     let a = e6(1);
     let b = e6(500_000);
@@ -512,7 +530,6 @@ fn bug_intermediate_rounds_to_zero_but_final_is_fine() {
 /// FINDING 4. Same gate, other side: the partial product exceeds MAX_ORACLE_PRICE after leg 2
 /// but leg 3 divides it back into range. $900k * $900k / $900k = $900k is a fine final price.
 #[test]
-#[ignore = "BUG: intermediate leg result above MAX_ORACLE_PRICE rejects a composite whose final price is valid (v16_program.rs:12832)"]
 fn bug_intermediate_above_max_but_final_is_fine() {
     let m = e6(900_000_000_000);
     let r = run(&[m, m, m], ORACLE_LEG_FLAG_DIVIDE_LEG3, 0, 0, 0);
@@ -522,12 +539,15 @@ fn bug_intermediate_above_max_but_final_is_fine() {
 /// FINDING 5. src/v16_program.rs:12838-12846 (invert): `numerator / denominator` truncates the
 /// inverse to whole e6 only after the legs were already truncated; for large prices the inverse is
 /// tiny and loses most of its value. 1 / $600k = 0.00000166 -> 1 e6 (40% low).
+/// FIX: the inverse is $0.00000166, an output below 2 e6 ticks, so like finding 1 it needs a
+/// lot market; at lot 6 it is 1_666_666 e6 per 10^6 units. Lot 0 still floors to 1 e6.
 #[test]
-#[ignore = "BUG: inverted large price truncates to whole e6, 40% error (v16_program.rs:12846)"]
 fn bug_invert_large_price_precision_loss() {
     let legs = [e6(600_000_000_000)];
-    let got = run(&legs, 0, 1, 0, 0).unwrap();
-    let err = rel_err(got, exact(&legs, 0, true, 0));
+    assert_eq!(run(&legs, 0, 1, 0, 0).unwrap(), 1, "lot 0: one tick (the e6 limit)");
+    let got = run_lot(&legs, 0, 1, 0, 0, 6).unwrap();
+    assert_eq!(got, 1_666_666);
+    let err = rel_err(got, exact(&legs, 0, true, 0) * 1e6);
     assert!(
         err < 0.01,
         "inverted {} e6 vs exact 1.6667 e6, error {:.1}%",
