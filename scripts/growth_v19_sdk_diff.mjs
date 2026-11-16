@@ -39,7 +39,7 @@ for (const line of fs.readFileSync(dump, "utf8").split("\n")) {
   const rec = JSON.parse(line);
   const f = fns[rec.f];
   counts[rec.f] = (counts[rec.f] ?? 0) + 1;
-  if (!f) continue;
+  if (!f) { (bad["__noport__" + rec.f] ??= []); continue; }
   const want = typeof rec.out === "string" || rec.out === null ? rec.out : JSON.stringify(rec.out);
   let got;
   try {
@@ -52,8 +52,9 @@ for (const line of fs.readFileSync(dump, "utf8").split("\n")) {
   }
 }
 for (const [k, n] of Object.entries(counts)) {
+  if (bad["__noport__" + k]) { console.log(`${k.padEnd(12)} cases=${n} NO SDK PORT (skipped)`); continue; }
   const b = bad[k] ?? [];
   console.log(`${k.padEnd(12)} cases=${n} mismatches=${b.length}`);
   for (const m of b.slice(0, 5)) console.log("   ", JSON.stringify(m));
 }
-process.exit(Object.keys(bad).length ? 1 : 0);
+process.exit(Object.keys(bad).some((k) => !k.startsWith("__noport__")) ? 1 : 0);
