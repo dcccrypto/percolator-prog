@@ -144,7 +144,12 @@ pub fn par_atoms(shares: u128, principal_total: u128, total_shares: u128) -> Opt
     if total_shares == 0 {
         return None;
     }
-    Some(percolator::wide_math::wide_mul_div_floor_u128(shares, principal_total, total_shares))
+    // Checked quotient: the engine's `wide_mul_div_floor_u128` panics (`expect`) when the quotient
+    // exceeds u128 (i.e. `shares > total_shares` with a large principal), which would abort the
+    // program instead of failing closed.
+    use percolator::wide_math::{mul_div_floor_u256, U256};
+    mul_div_floor_u256(U256::from_u128(shares), U256::from_u128(principal_total), U256::from_u128(total_shares))
+        .try_into_u128()
 }
 
 /// Security review A3: the cross-pot netting amount for a NON-bound vault's exit. E3 caps each
@@ -241,6 +246,17 @@ mod tests {
         assert_eq!(cross_pot_netting(2_000, 2_026, 1_000, 973), (26, false));
         assert_eq!(cross_pot_netting(1_000, 973, 2_000, 2_026), (26, true));
         assert_eq!(cross_pot_netting(1_000, 1_100, 1_000, 1_200), (0, false));
+    }
+
+    #[test]
+    fn par_atoms_fails_closed_instead_of_panicking() {
+        // in range: unchanged
+        assert_eq!(par_atoms(50, 1_000, 100), Some(500));
+        assert_eq!(par_atoms(100, u128::MAX, 100), Some(u128::MAX));
+        assert_eq!(par_atoms(1, 1, 0), None);
+        // quotient > u128 (shares > total_shares): previously panicked in the engine helper
+        assert_eq!(par_atoms(u128::MAX, u128::MAX, 1), None);
+        assert_eq!(par_atoms(u128::MAX, 2, 1), None);
     }
 
     // note: the first two netting cases mirror each other: swapping the pots flips only the direction
