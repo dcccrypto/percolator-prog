@@ -432,6 +432,152 @@ mod tests {
         }
     }
 
+    /// Reference base58 written from the definition: repeated long division of the big-endian
+    /// integer by 58, then one '1' per leading zero byte. Shares no code with the encoder.
+    fn ref_b58(key: &[u8; 32]) -> String {
+        let alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz".as_bytes();
+        let mut num = key.to_vec();
+        let mut digits = std::vec::Vec::new();
+        while num.iter().any(|b| *b != 0) {
+            let mut rem = 0u32;
+            for b in num.iter_mut() {
+                let cur = (rem << 8) | *b as u32;
+                *b = (cur / 58) as u8;
+                rem = cur % 58;
+            }
+            digits.push(alphabet[rem as usize]);
+        }
+        let zeros = key.iter().take_while(|b| **b == 0).count();
+        let mut out = String::new();
+        for _ in 0..zeros {
+            out.push('1');
+        }
+        for d in digits.iter().rev() {
+            out.push(*d as char);
+        }
+        out
+    }
+
+    /// 20,000 random keys (xorshift, with 0..=32 forced leading zero bytes and some forced
+    /// trailing 0xff) plus the edge cases, against BOTH the definition-based reference and
+    /// `Pubkey::to_string` (the bs58 crate).
+    #[test]
+    fn base58_matches_reference_and_bs58_on_20k_keys() {
+        let mut compared = 0usize;
+        let mut mismatches = std::vec::Vec::new();
+        let mut check = |k: [u8; 32]| {
+            let (got, n) = base58_encode(&k);
+            let got = s(&got[..n]);
+            let r = ref_b58(&k);
+            let b = Pubkey::new_from_array(k).to_string();
+            compared += 1;
+            if got != r || got != b {
+                mismatches.push((k, got, r, b));
+            }
+        };
+        check([0u8; 32]);
+        check([0xff; 32]);
+        for z in 0..=32usize {
+            let mut k = [0xffu8; 32];
+            k[..z].fill(0);
+            check(k);
+            let mut k = [0u8; 32];
+            k[z.min(31)..].fill(1);
+            check(k);
+        }
+        for i in 0..32 {
+            let mut k = [0u8; 32];
+            k[i] = 1;
+            check(k);
+            k[i] = 0xff;
+            check(k);
+        }
+        let mut st: u64 = 0x1234_5678_9abc_def1;
+        for i in 0..20_000usize {
+            let mut k = [0u8; 32];
+            for b in k.iter_mut() {
+                st ^= st << 13;
+                st ^= st >> 7;
+                st ^= st << 17;
+                *b = st as u8;
+            }
+            k[..i % 33].fill(0);
+            if i % 7 == 0 {
+                k[31] = 0xff;
+            }
+            check(k);
+        }
+        std::println!("base58: {compared} keys compared, {} mismatches", mismatches.len());
+        assert!(compared >= 10_000);
+        assert!(mismatches.is_empty(), "{:?}", mismatches.first());
+    }
+
+    /// Lead 2: every identity the program can build fits the Metaplex limits, and the Borsh
+    /// length prefixes written by the real builder match the bytes that follow.
+    #[test]
+    fn builder_strings_fit_metaplex_limits_and_prefixes_match() {
+        let mut st: u64 = 0xdead_beef_cafe_f00d;
+        let mut tickers: std::vec::Vec<std::vec::Vec<u8>> = std::vec![std::vec::Vec::new()];
+        for len in 1..=LP_SHARE_TICKER_MAX {
+            tickers.push(std::vec![b'Z'; len]);
+            tickers.push(std::vec![b'0'; len]);
+        }
+        for _ in 0..500 {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            let len = 1 + (st % 8) as usize;
+            let t: std::vec::Vec<u8> = (0..len)
+                .map(|i| b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"[((st >> (i * 6)) % 36) as usize])
+                .collect();
+            tickers.push(t);
+        }
+        for (i, t) in tickers.iter().enumerate() {
+            let mut market = [0u8; 32];
+            market[31 - (i % 32)..].fill(0xff);
+            let (name, symbol, uri) = share_identity(&market, t).unwrap();
+            assert!(name.len() <= MPL_MAX_NAME_LEN, "{}", s(&name));
+            assert!(symbol.len() <= MPL_MAX_SYMBOL_LEN);
+            assert!(uri.len() <= MPL_MAX_URI_LEN);
+            for data in [
+                create_metadata_v3_data(&name, &symbol, &uri, true),
+                update_metadata_v2_data(&name, &symbol, &uri, true),
+            ] {
+                let mut o = if data[0] == MPL_IX_CREATE_METADATA_ACCOUNT_V3 { 1 } else { 2 };
+                for want in [&name, &symbol, &uri] {
+                    let n = u32::from_le_bytes(data[o..o + 4].try_into().unwrap()) as usize;
+                    assert_eq!(n, want.len());
+                    assert_eq!(&data[o + 4..o + 4 + n], &want[..]);
+                    o += 4 + n;
+                }
+                // seller fee 0, then creators / collection / uses all None: exactly 5 bytes
+                assert_eq!(&data[o..o + 5], &[0, 0, 0, 0, 0]);
+            }
+        }
+        // one byte over each limit is rejected by the ticker gate, so it never reaches a builder
+        assert!(share_identity(&[1; 32], b"ABCDEFGHI").is_none());
+        assert!(ticker_name(&[1; 32], b"ABCDEFGHI").is_none());
+        assert!(ticker_symbol(b"ABCDEFGHI").is_none());
+    }
+
+    /// Lead 3: the real builder writes `creators: None` (single 0 byte, no count, no entries),
+    /// and the test-only `rec` helper's creators count matches the entries it writes.
+    #[test]
+    fn creators_none_in_builder_and_count_matches_entries_in_rec() {
+        let data = create_metadata_v3_data(b"n", b"s", b"u", true);
+        // 1 disc + 3*(4+1) strings + 2 fee, then creators tag
+        assert_eq!(data[1 + 15 + 2], 0);
+        assert_eq!(data.len(), 1 + 15 + 2 + 3 + 2);
+        for creators in 1..=5usize {
+            let d = rec([1; 32], [2; 32], b"n", b"s", b"u", 0, creators, 1);
+            let o = 1 + 64 + 15 + 2;
+            assert_eq!(d[o], 1);
+            assert_eq!(u32::from_le_bytes(d[o + 1..o + 5].try_into().unwrap()) as usize, creators);
+            // entries: creators * 34 bytes, then primary_sale + is_mutable, then 60 pad
+            assert_eq!(d.len(), o + 5 + creators * 34 + 2 + 60);
+        }
+    }
+
     #[test]
     fn uri_bases_are_pinned() {
         assert_eq!(LP_SHARE_URI_BASE_DEVNET, "https://play.percolator.trade");
