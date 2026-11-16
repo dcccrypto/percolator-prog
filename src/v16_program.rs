@@ -6534,7 +6534,7 @@ pub mod state {
         let wire = market_header(data)?;
         let engine_config = wire
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         if asset_index >= engine_config.max_market_slots as usize {
             return Err(PercolatorError::InvalidInstruction.into());
@@ -6575,7 +6575,7 @@ pub mod state {
         let wire = market_header(data)?;
         let engine_config = wire
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         let mut prices = alloc::vec::Vec::with_capacity(asset_indices.len());
         let mut market_ids = alloc::vec::Vec::with_capacity(asset_indices.len());
