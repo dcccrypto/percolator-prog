@@ -2565,7 +2565,7 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
 /// J-20261116 forced-reduce units: the engine applies a trade `size_q` to the leg's ADL-EFFECTIVE
 /// quantity (`plan_delta`: `next_effective = current_effective + delta`), but
 /// `band_forced_reduce_against_vault_lp` sized the close from the RAW basis. With `A < ADL_ONE`
-/// (effective 150 < basis 200) a whole-leg sweep asked for 200 and flipped the leg to 50 on the other
+/// (effective 75 < basis 100) a whole-leg sweep asked for 100 and flipped the leg to 25 on the other
 /// side instead of closing it.
 #[test]
 fn v22_tag118_sweep_closes_an_adl_scaled_leg_exactly() {
