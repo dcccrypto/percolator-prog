@@ -29,6 +29,8 @@ const W: u128 = 1u128 << 62;
 #[test]
 fn p1_rescue_never_mints_below_nav() {
     run((1..W, 1..W, 1..W, 0..W), |(x, s, v, c_extra)| {
+        // Admission caps x <= RESCUE_MAX_MULT * v (rescue_admitted); stay inside it.
+        let x = 1 + (x - 1) % (p4::RESCUE_MAX_MULT * v);
         let m = p4::rescue_shares(x, s, v).expect("in range");
         // L-RES value half: (v+x)*S >= v*(S+m)
         prop_assert!(p4::rescue_value_no_dilution(v, x, s, m));
