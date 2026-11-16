@@ -2873,13 +2873,16 @@ fn p3_init_vault_lp_former_protocol_path_is_refused() {
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
 fn p2_matcher_so() -> PathBuf {
-    // Same resolution as tests/p1_fee_channel.rs: env, else the CI sibling checkout.
+    // env, else the sibling checkout. CI sets P2_MATCHER_SO to the DEPLOYED matcher line at
+    // ../percolator-match (it speaks the ext-v2 inventory wire the wrapper sends; the older
+    // ../percolator-match-p2 build refuses it with InvalidInstructionData). Default to the same
+    // binary so a bare local `cargo test` matches CI instead of failing 1/130.
     if let Some(p) = std::env::var_os("P2_MATCHER_SO") {
         return PathBuf::from(p);
     }
     let mut p = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     p.pop();
-    p.push("percolator-match-p2/target/deploy/percolator_match.so");
+    p.push("percolator-match/target/deploy/percolator_match.so");
     assert!(p.exists(), "P2 matcher BPF not found at {p:?} (set P2_MATCHER_SO)");
     p
 }
