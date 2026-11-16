@@ -26874,7 +26874,10 @@ pub mod processor {
             (
                 asset.market_id.get(),
                 asset.effective_price.get(),
-                signed_position_for_asset_view(&group, &victim, asset_index as usize)?,
+                // ADL-EFFECTIVE, not the raw basis: the engine applies a trade `size_q` to the effective
+                // quantity (`plan_delta`), so sizing the close from the basis over-closes an
+                // ADL-scaled leg into a flip, which the engine refuses (`AdlReduceOnly`).
+                effective_signed_position_for_asset_view(&group, &victim, asset_index as usize)?,
             )
         };
         if position == 0 {

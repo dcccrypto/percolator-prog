@@ -2562,6 +2562,44 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
     env.assert_conservation();
 }
 
+/// J-20261116 forced-reduce units: the engine applies a trade `size_q` to the leg's ADL-EFFECTIVE
+/// quantity (`plan_delta`: `next_effective = current_effective + delta`), but
+/// `band_forced_reduce_against_vault_lp` sized the close from the RAW basis. With `A < ADL_ONE`
+/// (effective 75 < basis 100) a whole-leg sweep asked for 100 and flipped the leg to 25 on the other
+/// side instead of closing it.
+#[test]
+fn v22_tag118_sweep_closes_an_adl_scaled_leg_exactly() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let long = env.trader(1_000 * USD);
+    env.trade_cpi(&long.0, long.1, &lp, 100 * Q).expect("open long");
+    assert_eq!(env.pos(lp.account), -100 * Q, "the LP holds the mirror short");
+    env.crank_current(long.1);
+    env.crank_current(lp.account);
+    // ADL fixture: both sides at A = 3/4, so the 100 Q long (and the LP's 100 Q short) is 75 Q
+    // effective; the side aggregates follow. Closing the victim's whole leg takes BOTH legs to
+    // exactly zero, so neither side flips or grows (either is refused under A < ADL_ONE).
+    {
+        let mut acct = env.svm.get_account(&env.market).unwrap();
+        {
+            let (_, g) = state::market_view_mut(&mut acct.data).unwrap();
+            let a = &mut g.markets[0].engine.asset;
+            let three_quarters = percolator::ADL_ONE / 4 * 3;
+            a.a_long = percolator::V16PodU128::new(three_quarters);
+            a.a_short = percolator::V16PodU128::new(three_quarters);
+            a.oi_eff_long_q = percolator::V16PodU128::new(a.oi_eff_long_q.get() / 4 * 3);
+            a.oi_eff_short_q = percolator::V16PodU128::new(a.oi_eff_short_q.get() / 4 * 3);
+        }
+        env.svm.set_account(env.market, acct).unwrap();
+    }
+    assert_eq!(env.pos(long.1), 100 * Q, "the stored (basis) leg is 100 Q, the effective 75 Q");
+    env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(500 * USD as u64));
+    env.sweep_dust(long.1, lp.account).expect("sweep of an ADL-scaled dust leg");
+    assert_eq!(env.pos(long.1), 0, "the whole leg is closed, not flipped to the other side");
+    assert_eq!(env.pos(lp.account), 0, "the LP's mirror leg is closed with it");
+}
+
 /// Round-2 re-review N-1b: eviction of a small leg (tag 119). With the long side full
 /// (cap poked to 2 for the test), an honest taker bringing >= 2x the smallest leg gets in: the
 /// evicted leg is closed against the bound vault LP at the mark with no fee (its account keeps
