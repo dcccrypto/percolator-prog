@@ -2172,14 +2172,38 @@ pub fn isqrt_ceil_u128(x: u128) -> u128 {
     if x < 2 {
         return x;
     }
-    // floor sqrt by Newton
-    let mut r = x;
-    let mut y = x / 2 + (x & 1); // ceil(x / 2) < x for x >= 2, and never overflows
-    while y < r {
-        r = y;
-        y = (r + x / r) / 2;
-    }
+    let r = isqrt_floor_u128(x);
     if r * r == x { r } else { r + 1 }
+}
+
+/// `floor(sqrt(x))`, `x >= 2`. Newton from above like the original, but seeded with
+/// `2^ceil(bits / 2) >= sqrt(x)` (the old seed `ceil(x / 2)` took ~log2(x) / 2 halving steps, each a
+/// u128 division = a `__udivti3` call on SBF) and finishing in native u64 arithmetic once the
+/// iterate fits (u64 division is a single instruction). Exact: Newton from any seed
+/// `>= floor(sqrt(x))` decreases strictly to `floor(sqrt(x))`.
+#[inline]
+fn isqrt_floor_u128(x: u128) -> u128 {
+    if x <= u64::MAX as u128 {
+        let x = x as u64;
+        let bits = 64 - x.leading_zeros();
+        let mut r: u64 = 1u64 << bits.div_ceil(2); // <= 2^32, >= sqrt(x)
+        loop {
+            let y = (r + x / r) / 2; // r <= 2^32 and x / r < 2^64 / r: no overflow below
+            if y >= r {
+                return r as u128;
+            }
+            r = y;
+        }
+    }
+    let bits = 128 - x.leading_zeros();
+    let mut r: u128 = 1u128 << bits.div_ceil(2); // <= 2^64, >= sqrt(x); x / r < 2^64
+    loop {
+        let y = (r + x / r) / 2;
+        if y >= r {
+            return r;
+        }
+        r = y;
+    }
 }
 
 /// σ over the horizon, bps: `ceil(sqrt(var_x100 * h / 100))`.
@@ -3137,6 +3161,72 @@ pub mod spec {
 
 #[cfg(test)]
 mod tests {
+
+    /// The pre-optimisation `isqrt_ceil_u128` (Newton from `ceil(x / 2)`), kept as the oracle.
+    fn isqrt_ceil_old(x: u128) -> u128 {
+        if x < 2 {
+            return x;
+        }
+        let mut r = x;
+        let mut y = x / 2 + (x & 1);
+        while y < r {
+            r = y;
+            y = (r + x / r) / 2;
+        }
+        if r * r == x { r } else { r + 1 }
+    }
+
+    /// Differential: the seeded / u64-finish implementation is bit-identical to the old one.
+    #[test]
+    fn isqrt_ceil_matches_old_implementation() {
+        use rand::{Rng, SeedableRng};
+        let mut rng = rand_xorshift::XorShiftRng::seed_from_u64(0x1519_0001);
+        let mut check = |x: u128| assert_eq!(isqrt_ceil_u128(x), isqrt_ceil_old(x), "x = {x}");
+        for x in 0u128..70_000 {
+            check(x);
+        }
+        for b in 1..=128u32 {
+            let p = 1u128 << (b - 1);
+            for d in 0..4u128 {
+                check(p.wrapping_add(d));
+                check(p.wrapping_sub(d));
+                check((p << 1).wrapping_sub(1).wrapping_sub(d));
+            }
+            // around perfect squares of that magnitude
+            let r = (1u128 << (b / 2)).min(u64::MAX as u128);
+            for d in 0..3u128 {
+                let q = r.saturating_add(d);
+                if let Some(sq) = q.checked_mul(q) {
+                    check(sq);
+                    check(sq.saturating_sub(1));
+                    check(sq.saturating_add(1));
+                }
+            }
+        }
+        check(u128::MAX);
+        check(u64::MAX as u128);
+        check(u64::MAX as u128 + 1);
+        for _ in 0..300_000 {
+            let bits = rng.gen_range(0..=128u32);
+            let x: u128 = if bits == 0 { 0 } else { rng.gen::<u128>() >> (128 - bits) };
+            check(x);
+            let r: u64 = rng.gen::<u64>() >> rng.gen_range(0..64u32);
+            let sq = (r as u128) * (r as u128);
+            check(sq);
+            check(sq.wrapping_sub(1));
+            check(sq.wrapping_add(1));
+        }
+        // the production call shapes
+        for _ in 0..100_000 {
+            let var: u32 = rng.gen();
+            let h: u64 = rng.gen_range(0..=1_000_000);
+            assert_eq!(sigma_h_bps(var, h), {
+                let v = (var as u128) * (h as u128);
+                let s = isqrt_ceil_old(v.div_ceil(100));
+                if s > u64::MAX as u128 { u64::MAX } else { s as u64 }
+            });
+        }
+    }
     // ── interim κ cap: κ_eff = min(κ_tier, floor(fee_bps · 1015 / 20)) ──────────────────────────
 
     #[test]
