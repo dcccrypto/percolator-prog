@@ -134,7 +134,8 @@ fn host<R>(w: &mut World, f: impl FnOnce(&mut Views<'_>) -> R) -> R {
 }
 
 fn occupied(w: &World) -> usize {
-    state::read_portfolio(&w.t.data).unwrap().source_domains.iter().filter(|d| d.is_occupied()).count()
+    let mut w = w.clone();
+    host(&mut w, |(_, t, _)| t.header.source_domains.iter().filter(|d| d.is_occupied()).count())
 }
 
 fn legs(w: &World) -> u32 {
@@ -144,7 +145,7 @@ fn legs(w: &World) -> u32 {
 /// Build the target T (long every asset, `rev` of them later flipped short to occupy source
 /// domains) against a counterparty C, then drop the price. Returns the world accrued to the final
 /// slot with T holding a huge capital (so it is healthy); `with_capital` pokes the capital later.
-fn build(n: u16, rev: usize) -> World {
+fn build(n: u16, open: u32, mask: u32, flip_half_q: i128) -> World {
     let mut admin = signer();
     let mut market = market_for(n);
     let mut mint = mint_account();
@@ -173,21 +174,26 @@ fn build(n: u16, rev: usize) -> World {
             group.execute_trade_with_fee_loss_stale_scoped_not_atomic(long, short, TradeRequestV16 { asset_index: a, size_q, exec_price: px, fee_bps: 0 }, true)
         };
         for a in 0..nn {
-            tr(group, t, c, a, q, 100).expect("open");
+            if open & (1 << a) != 0 {
+                tr(group, t, c, a, q, 100).expect("open");
+            }
         }
         for p in [104u64, 108] {
             step(group, p);
         }
         group.full_account_refresh_not_atomic(c).unwrap();
         group.full_account_refresh_not_atomic(t).unwrap();
-        for a in 0..rev.min(nn) {
-            tr(group, c, t, a, 2 * q, 108).expect("flip"); // T short q, C long q on this asset
+        for a in 0..nn {
+            if mask & (1 << a) != 0 && open & (1 << a) != 0 {
+                // C buys `flip_half_q / 2` q: 4 -> T flips to short q, 3 -> short q/2, 2 -> T flat on the asset, its source domains stay occupied
+                tr(group, c, t, a, q * flip_half_q / 2, 108).expect("flip");
+            }
         }
         for p in [104u64, 100, 96, 92] {
             step(group, p);
         }
-        group.full_account_refresh_not_atomic(c).unwrap();
-        group.full_account_refresh_not_atomic(t).unwrap();
+        // NOT refreshed after the last price moves: T's certificate must be stale so the crank's
+        // first step is RefreshAccount (a current certificate makes the crank a no-op).
     });
     w.slot = slot;
     w
@@ -332,11 +338,15 @@ fn run_cell(w0: &World, view_target_delta: Option<i128>) -> (Row, EngineView) {
         group.full_account_refresh_not_atomic(t).unwrap();
     });
     let before_legs = legs(&w);
+    let data_before = w.t.data.clone();
     let before_pos = positions(&w);
     let res = crank(&mut w);
     let after_pos = positions(&w);
     let fired = res.is_ok() && after_pos != before_pos;
     let ok = res.is_ok();
+    if std::env::var_os("F1_DEBUG").is_some() {
+        println!("   dbg: crank {:?}; T bytes changed={}; == refresh-only reference={}; summary liq={} eq={} req={} def={}", res, w.t.data != data_before, w.t.data == reference.t.data, v.liquidatable, v.equity, v.req, v.deficit);
+    }
     let verdict = if !ok {
         if v.engine_accepts { "INSTRUCTION-FAILED (engine would accept)" } else { "INSTRUCTION-FAILED (engine refuses)" }
     } else if fired != expect_fire {
@@ -359,7 +369,7 @@ fn positions(w: &World) -> Vec<u8> {
     let p = state::read_portfolio(&w.t.data).unwrap();
     let mut out = vec![];
     for l in p.legs.iter() {
-        out.extend_from_slice(format!("{:?}", (l.active, l.asset_index, l.basis_q, l.position_basis_q)).as_bytes());
+        out.extend_from_slice(format!("{:?}", (l.active, l.asset_index, l.basis_pos_q)).as_bytes());
     }
     out
 }
@@ -371,25 +381,52 @@ fn positions(w: &World) -> Vec<u8> {
 #[test]
 fn f1_inputs_match_engine_matrix_legs_x_domains() {
     let mut reached = std::collections::BTreeSet::new();
+    let mut fired_cells = std::collections::BTreeSet::new();
     let mut bad: Vec<String> = vec![];
     for n in 1u16..=4 {
-        for rev in 0..=(n as usize) {
-            let base = build(n, rev);
-            let (l, d) = (legs(&base), occupied(&base));
-            println!("n={n} rev={rev}: legs={l} occupied domains={d}");
-            // shortfalls: none, dust, around the boundary, material, deep, insolvent
-            let probe = engine_view(&base);
-            let ms = f1::min_shortfall(probe.req) as i128;
-            for delta in [-1i128, 0, 1, ms - 1, ms, ms + 1, probe.req as i128 / 10, probe.req as i128 + 1] {
-                let (row, _) = run_cell(&base, Some(delta));
-                println!("  want_delta={delta:>12} -> {row:?}");
-                reached.insert((row.legs, row.domains));
-                if row.verdict != "match" {
-                    bad.push(format!("n={n} rev={rev} {row:?}"));
+        for open in 1u32..(1 << n) {
+          for mask in 0u32..(1 << n) {
+            if mask & !open != 0 {
+                continue;
+            }
+            for flip in [4i128, 3, 2] {
+                if mask == 0 && flip != 4 {
+                    continue;
+                }
+                let base = build(n, open, mask, flip);
+                let probe = engine_view(&base);
+                println!("n={n} open={open:#06b} mask={mask:#06b} flip={flip}: legs={} refreshed domains={}", probe.legs, probe.domains);
+                if probe.legs == 0 {
+                    continue; // nothing to liquidate: profitable / flat after the reversal
+                }
+                let ms = f1::min_shortfall(probe.req) as i128;
+                for delta in [-1i128, 0, 1, ms - 1, ms, ms + 1, probe.req as i128 / 10, probe.req as i128 + 1] {
+                    let (row, _) = run_cell(&base, Some(delta));
+                    if row.delta >= 1 {
+                        reached.insert((row.legs, row.domains)); // a below-maintenance state was really built
+                    }
+                    if row.fired && row.delta >= 1 {
+                        fired_cells.insert((row.legs, row.domains));
+                    }
+                    if row.verdict != "match" {
+                        bad.push(format!("n={n} open={open} mask={mask} flip={flip} {row:?}"));
+                    }
+                    if std::env::var_os("F1_DEBUG").is_some() {
+                        println!("  want_delta={delta:>12} -> {row:?}");
+                    }
                 }
             }
+          }
         }
     }
     println!("cells reached (legs, domains): {reached:?}");
+    println!("cells where the follow-on fired: {fired_cells:?}");
+    let missing: Vec<(u8, u8)> = (1u8..=4).flat_map(|l| (0u8..=3).map(move |d| (l, d))).filter(|c| !reached.contains(c)).collect();
+    println!("matrix cells (legs 1-4 x domains 0-3) NOT reached: {missing:?}");
     assert!(bad.is_empty(), "processor inputs disagree with the engine:\n{}", bad.join("\n"));
 }
+
+// Not covered here: the `legs_reducible` refusal side (a pending domain-loss barrier, or an empty
+// opposite side). A raw poke of `pending_domain_loss_barrier_*` is rejected by the engine's state
+// validation (`InvalidConfig` on refresh), and a genuine barrier needs a multi-account ADL
+// sequence. The refusal surface itself is pinned by tests/liveness_pins_q2_q8.rs.
