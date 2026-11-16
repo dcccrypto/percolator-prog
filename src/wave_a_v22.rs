@@ -148,8 +148,12 @@ pub fn par_atoms(shares: u128, principal_total: u128, total_shares: u128) -> Opt
     // exceeds u128 (i.e. `shares > total_shares` with a large principal), which would abort the
     // program instead of failing closed.
     use percolator::wide_math::{mul_div_floor_u256, U256};
-    mul_div_floor_u256(U256::from_u128(shares), U256::from_u128(principal_total), U256::from_u128(total_shares))
-        .try_into_u128()
+    mul_div_floor_u256(
+        U256::from_u128(shares),
+        U256::from_u128(principal_total),
+        U256::from_u128(total_shares),
+    )
+    .try_into_u128()
 }
 
 /// Security review A3: the cross-pot netting amount for a NON-bound vault's exit. E3 caps each
