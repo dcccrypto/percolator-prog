@@ -503,13 +503,37 @@ pub fn pin_matches(pin: &DepthSourceV22, v: &PushView) -> bool {
 
 // ── depth math ─────────────────────────────────────────────────────────────────────────────
 
-/// `floor(sqrt(n))`, exact (Newton from a power-of-two over-estimate; at most ~8 iterations).
-pub fn isqrt_u128(n: u128) -> u128 {
+/// `floor(n / d)` for `d < 2^32`, by four native u64 divisions over 32-bit limbs (a u128 `/` is
+/// a long software routine on SBF).
+#[inline]
+pub fn div_u128_small(n: u128, d: u64) -> u128 {
+    debug_assert!(d != 0 && d < (1u64 << 32));
+    let hi = (n >> 64) as u64;
+    if hi == 0 {
+        return ((n as u64) / d) as u128;
+    }
+    let lo = n as u64;
+    let l = [(hi >> 32), hi & 0xffff_ffff, lo >> 32, lo & 0xffff_ffff];
+    let mut rem: u64 = 0;
+    let mut q: [u64; 4] = [0; 4];
+    let mut i = 0;
+    while i < 4 {
+        let cur = (rem << 32) | l[i]; // rem < d < 2^32
+        q[i] = cur / d;
+        rem = cur % d;
+        i += 1;
+    }
+    ((((q[0] << 32) | q[1]) as u128) << 64) | (((q[2] << 32) | q[3]) as u128)
+}
+
+/// `floor(sqrt(n))` for a u64 (Newton from a power-of-two over-estimate, native u64 division).
+#[inline]
+fn isqrt_u64(n: u64) -> u64 {
     if n < 2 {
         return n;
     }
-    let bits = 128 - n.leading_zeros();
-    let mut x: u128 = 1u128 << bits.div_ceil(2); // >= sqrt(n), <= 2^64
+    let bits = 64 - n.leading_zeros();
+    let mut x: u64 = 1u64 << bits.div_ceil(2); // >= sqrt(n), <= 2^32
     loop {
         let y = (x + n / x) >> 1;
         if y >= x {
@@ -517,6 +541,28 @@ pub fn isqrt_u128(n: u128) -> u128 {
         }
         x = y;
     }
+}
+
+/// `floor(sqrt(n))`, exact. `n <= u64::MAX`: native u64 Newton. Larger: the u64 root of the top
+/// bits seeds an over-estimate good to ~31 bits, two u128 Newton steps reach the root or one
+/// above it, and one squaring check settles it (two u128 divisions instead of ~7).
+pub fn isqrt_u128(n: u128) -> u128 {
+    if n <= u64::MAX as u128 {
+        return isqrt_u64(n as u64) as u128;
+    }
+    let bits = 128 - n.leading_zeros(); // 65..=128
+    let k = (bits - 62) & !1; // even; n >> k has 62..=64 bits
+    let s = isqrt_u64((n >> k) as u64) as u128;
+    // (s + 1)^2 * 2^k > n, so x >= sqrt(n) (and x <= 2^64).
+    let mut x = (s + 1) << (k / 2);
+    // Newton from above never drops below floor(sqrt(n)).
+    x = (x + n / x) >> 1;
+    x = (x + n / x) >> 1;
+    // The root or one above it.
+    while x.checked_mul(x).map_or(true, |sq| sq > n) {
+        x -= 1;
+    }
+    x
 }
 
 /// `51 m^2 >= 50 r^2` evaluated exactly in u128 for every `m <= r <= u64::MAX`:
@@ -529,7 +575,7 @@ pub fn depth_pred(m: u64, r: u64) -> bool {
     if a >= q {
         return true;
     }
-    q - a <= a / 50
+    q - a <= div_u128_small(a, 50)
 }
 
 /// The exact +2% depth of a constant-product pool from a reserve `r` valued in collateral atoms:
@@ -542,7 +588,7 @@ pub fn plus2pct_depth_e6(r: u64) -> u64 {
     }
     let q = (r as u128) * (r as u128);
     // floor(50 q / 51) = q - ceil(q / 51)
-    let t = q - q.div_ceil(51);
+    let t = q - div_u128_small(q + 50, 51); // q + 50 cannot overflow u128
     // m0 = floor(sqrt(t)): 51 m0^2 <= 50 q, and 51 (m0+1)^2 > 50 q, so m is m0 or m0 + 1.
     let m0 = isqrt_u128(t) as u64; // m0 < r
     let m = if depth_pred(m0, r) { m0 } else { m0 + 1 };
@@ -580,7 +626,8 @@ pub fn reserve_value_e6(
                 return None;
             }
             let e = base_decimals as u32 + lot_exp as u32; // <= 33
-            let v = (base_atoms as u128) * (mark_e6 as u128) / 10u128.pow(e);
+            let prod = (base_atoms as u128) * (mark_e6 as u128);
+            let v = if e <= 9 { div_u128_small(prod, 10u64.pow(e)) } else { prod / 10u128.pow(e) };
             Some(if v > u64::MAX as u128 { u64::MAX } else { v as u64 })
         }
     }
@@ -810,6 +857,104 @@ mod tests {
             (u64::MAX, 181_745_753_206_511_237),
         ] {
             assert_eq!(plus2pct_depth_e6(r), want, "R={r}");
+        }
+    }
+
+    // ── differential: the pre-optimisation implementations, verbatim ───────────────────────
+    fn old_isqrt(n: u128) -> u128 {
+        if n < 2 {
+            return n;
+        }
+        let bits = 128 - n.leading_zeros();
+        let mut x: u128 = 1u128 << bits.div_ceil(2);
+        loop {
+            let y = (x + n / x) >> 1;
+            if y >= x {
+                return x;
+            }
+            x = y;
+        }
+    }
+    fn old_pred(m: u64, r: u64) -> bool {
+        let a = (m as u128) * (m as u128);
+        let q = (r as u128) * (r as u128);
+        a >= q || q - a <= a / 50
+    }
+    fn old_plus2pct(r: u64) -> u64 {
+        if r == 0 {
+            return 0;
+        }
+        let q = (r as u128) * (r as u128);
+        let t = q - q.div_ceil(51);
+        let m0 = old_isqrt(t) as u64;
+        let m = if old_pred(m0, r) { m0 } else { m0 + 1 };
+        r - m
+    }
+    fn xorshift(s: &mut u64) -> u64 {
+        *s ^= *s << 13;
+        *s ^= *s >> 7;
+        *s ^= *s << 17;
+        *s
+    }
+
+    #[test]
+    fn diff_plus2pct_every_r_to_1e6_and_random_u64() {
+        for r in 0u64..=1_000_000 {
+            assert_eq!(plus2pct_depth_e6(r), old_plus2pct(r), "R={r}");
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..1_000_000 {
+            let r = xorshift(&mut s) >> (xorshift(&mut s) % 64);
+            assert_eq!(plus2pct_depth_e6(r), old_plus2pct(r), "R={r}");
+        }
+        for sh in 0..64 {
+            for d in [0u64, 1, 2] {
+                let r = (1u64 << sh).wrapping_add(d).max(1);
+                assert_eq!(plus2pct_depth_e6(r), old_plus2pct(r), "R={r}");
+                let r = (1u64 << sh).wrapping_sub(d);
+                assert_eq!(plus2pct_depth_e6(r), old_plus2pct(r), "R={r}");
+            }
+        }
+        assert_eq!(plus2pct_depth_e6(u64::MAX), old_plus2pct(u64::MAX));
+    }
+
+    #[test]
+    fn diff_isqrt_and_small_div() {
+        let mut s = 0x1234_5678_9ABC_DEF1u64;
+        for n in 0u128..200_000 {
+            assert_eq!(isqrt_u128(n), old_isqrt(n), "n={n}");
+        }
+        for _ in 0..400_000 {
+            let r = xorshift(&mut s) as u128;
+            let q = r * r;
+            for n in [q, q.wrapping_sub(1), q + 1, q - q.div_ceil(51)] {
+                assert_eq!(isqrt_u128(n), old_isqrt(n), "n={n}");
+            }
+            let n = (((xorshift(&mut s) as u128) << 64) | xorshift(&mut s) as u128) >> (xorshift(&mut s) % 128);
+            assert_eq!(isqrt_u128(n), old_isqrt(n), "n={n}");
+            for d in [1u64, 6, 50, 51, 1_000_000, 999_999_999, (1 << 32) - 1] {
+                assert_eq!(div_u128_small(n, d), n / d as u128, "n={n} d={d}");
+            }
+        }
+        for sh in 0..128 {
+            for n in [u128::MAX >> sh, 1u128 << sh, (1u128 << sh) - 1] {
+                assert_eq!(isqrt_u128(n), old_isqrt(n), "n={n}");
+            }
+        }
+    }
+
+    #[test]
+    fn diff_reserve_value() {
+        let mut s = 0xDEAD_BEEF_1234_5678u64;
+        for _ in 0..200_000 {
+            let base = xorshift(&mut s) >> (xorshift(&mut s) % 64);
+            let mark = (xorshift(&mut s) >> (xorshift(&mut s) % 64)).max(1);
+            let dec = (xorshift(&mut s) % 19) as u8;
+            let lot = (xorshift(&mut s) % 16) as u8;
+            let e = dec as u32 + lot as u32;
+            let v = (base as u128) * (mark as u128) / 10u128.pow(e);
+            let want = if v > u64::MAX as u128 { u64::MAX } else { v as u64 };
+            assert_eq!(reserve_value_e6(ValuePath::BaseAtMark, base, 0, mark, dec, lot), Some(want));
         }
     }
 
