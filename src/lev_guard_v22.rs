@@ -2082,7 +2082,7 @@ mod tests {
         b.rep_n_mult_bps = 10_001;
         assert!(!validate_guard(&b));
         let mut b = g;
-        b.version = 2;
+        b.version = 1; // the pre-#688 layout is refused
         assert!(!validate_guard(&b));
         let mut b = g;
         b._pad2 = [1, 0, 0, 0, 0, 0];
