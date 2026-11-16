@@ -120,7 +120,7 @@ Which instructions emit it, and the tag in the header:
 
 **The unit of `signed_reduced_q` depends on `reason`.** Reason 1 is in **basis** units (the leg's
 stored `basis_pos_q`, before ADL scaling). Reasons 2, 3, 6 and 7 are **ADL-effective** units (basis x A /
-a_basis). Reasons 4 and 5 are the size traded against the vault LP (the leg's signed position as
+a_basis). Reasons 4, 5 and 8 are the size traded against the vault LP (the leg's signed position as
 the trade path reads it). On a side that has never been ADL-scaled the two units coincide; after
 an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without converting.
 
@@ -133,6 +133,7 @@ an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without con
 | 5 | `EVICTION` | 119 | the victim's whole leg, bilateral against the bound vault LP at `P_last`, no fee; emitted before the taker's FILL |
 | 6 | `FORCE_CLOSE_ABANDONED` | 64 | **ADL-effective units.** prog#547: a permissionless cranker closed a Recovery-lifecycle pair against each other at the frozen mark (`ForceCloseAbandonedAsset`); neither owner signed. **Two events**, one per account, each naming the other account as `counterparty`, in account order (a, then b). Same best-effort rule as reason 3 |
 | 7 | `RESOLVED_CLOSE` | 30 | **ADL-effective units.** prog#547: `CloseResolved` settled the position at the resolved price (permissionless after the force-close delay, so the owner may not have signed). One event per asset whose position the call changed, in leg order. Unilateral. Same best-effort rule as reason 3 |
+| 8 | `LP_STOP` | 124 (op 5) | **Basis-free: the size traded against the vault LP** (as reasons 4 and 5). v2.2 lev build: the W1 LP stop cut an opposing account to the round's keep-fraction at `P_last`, bilateral against the bound vault LP, no fee. Usually a **partial** cut of the leg, not the whole leg. One event per account cut. Emitted through the same path as reasons 4 and 5 (a decoder that handles those handles this) |
 
 A liquidation that happens inside a trade (`TradeNoCpi` / `TradeCpi` closing a liquidatable
 counterparty) is a fill and is reported as a FILL, not a REDUCE.
@@ -180,6 +181,7 @@ given).
 | 6 TradeNoCpi, 66 BatchTradeNoCpi | A | the wire carries size and `exec_price`, but the booked price (`effective_price`) and the fee are computed on chain, so they are logged; requested == executed |
 | 119 EvictAndTradeCpi | A | REDUCE (victim) then FILL (taker) |
 | 118 SweepBandDustLeg | A | REDUCE |
+| 124 op 5 (W1 LP stop) | A | REDUCE reason 8, one per opposing account cut; partial cut to the round's keep-fraction |
 | 44 RebalanceReduce | A | REDUCE; the wire has only the request |
 | 104 AdlWindDown | A | REDUCE (effective size). 105 (setter) is B: its value is on the wire |
 | 64 ForceCloseAbandonedAsset | A | REDUCE reason 6, two events (prog#547) |
@@ -284,7 +286,7 @@ maintenance-fee settlement, and any per-account effect of an ADL step.
    inconsistency marks the whole transaction unknown.
 4. Accept a `Program data:` token only when the top of the stack is the pinned wrapper program id
    and the event's `market` is in your registry with a matching `asset_gen`.
-5. Skip unknown kinds, versions, MOVE subs and REDUCE reasons. Never fail on them.
+5. Skip unknown kinds, versions and MOVE subs. Never fail on them. Skip unknown REDUCE reasons only for reasons above 8: reasons 1-8 all change a position, so an integrator that ignores one drifts from the chain (reason 8 is the tag 124 LP stop).
 6. Volume is `executed_q` (at `price_e6`) only. Never `requested_q`, never `quoted_price_e6`.
 7. `fee_atoms` is the total across taker and maker, including any LP-requested fee. It excludes the
    maintenance fee, rent and the backing fee. It is neither "the taker's fee" nor revenue.
