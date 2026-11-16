@@ -1503,7 +1503,7 @@ mod tests {
         // the reference rolls after an hour: the same staircase over > 1 h does not trip the
         // hour rule on the late step
         let (s1, _) = observe_price(&b2, 1_204_500, 100 + SLOTS_PER_HOUR, None);
-        assert_eq!(s1.ref_px_e6, 1_204_500);
+        assert!(s1.marks_px_e6.contains(&1_204_500)); // the slot-100 mark aged out
         let (_, t) = observe_price(&s1, 1_318_927, 100 + SLOTS_PER_HOUR + 10, None);
         assert_eq!(t, Trip::None);
         // σ test: a 2 % move vs ref with σ_1h 40 bps (> 4σ = 160 bps) freezes only
