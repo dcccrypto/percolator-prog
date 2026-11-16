@@ -317,7 +317,7 @@ fn growth_v19_matches_independent_reference() {
             check("leverage_x100_for_imr_bps", &mut bad, p3 == r3, || format!("e={e} prog={p3:?} ref={r3:?}"));
             // doc invariant: never looser than the engine IMR.
             if let Some(b) = p {
-                check("ceiling_imr_bps.ge_engine", &mut bad, b >= e && b <= 10_000 || b == 10_000, || format!("e={e} l={l} b={b}"));
+                check("ceiling_imr_bps.ge_engine", &mut bad, b >= e && b <= 10_000, || format!("e={e} l={l} b={b}"));
             }
             dump.rec("ceilingImr", &[e.to_string(), l.to_string()], &o(p));
             dump.rec("imrForLev", &[l.to_string()], &o(p2));
@@ -334,8 +334,11 @@ fn growth_v19_matches_independent_reference() {
         let lam: Vec<u32> = vec![0, 1, 10_000, 100_000, 100_001, u32::MAX];
         let mut n = 0;
         for i in 0..CASES {
-            let (c, l, p, s) = if i < 4_000 {
-                (e[i % e.len()], lam[(i / 7) % lam.len()], ep[(i / 3) % ep.len()], [1u128, 1_000_000, 1u128 << 64, u128::MAX][i % 4])
+            let sc = [1u128, 1_000_000, 1u128 << 64, u128::MAX];
+            let cross = e.len() * lam.len() * ep.len() * sc.len();
+            let (c, l, p, s) = if i < cross.min(CASES - 2_000) {
+                // full cross product of the edge sets (every edge meets every other edge)
+                (e[i % e.len()], lam[(i / e.len()) % lam.len()], ep[(i / (e.len() * lam.len())) % ep.len()], sc[(i / (e.len() * lam.len() * ep.len())) % sc.len()])
             } else if i % 2 == 0 {
                 (rng.u128_log(), rng.u64() as u32 >> (rng.u64() % 32), rng.u64_log(), [1_000_000u128, rng.u128_log(), 1 << 20][i % 3])
             } else {
@@ -436,7 +439,15 @@ fn growth_v19_matches_independent_reference() {
             check("graduated_ceiling_x100", &mut bad, p == r, || format!("on={on} launch={lau} tier={lt} c_m={c_m} c_l={c_l} prog={p} ref={r}"));
             dump.rec("graduated", &[on.to_string(), lau.to_string(), lt.to_string(), c_m.to_string(), c_l.to_string()], &p.to_string());
 
-            let (prev, tgt, flo) = (rng.u64() as u16 >> (rng.u64() % 8), rng.u64() as u16 >> (rng.u64() % 8), rng.u64() as u16 >> (rng.u64() % 8));
+            let ue: [u16; 10] = [0, 1, 100, 65_434, 65_435, 65_436, 65_534, 65_535, 9_000, 500];
+            let (mut prev, mut tgt, flo) = (rng.u64() as u16 >> (rng.u64() % 8), rng.u64() as u16 >> (rng.u64() % 8), rng.u64() as u16 >> (rng.u64() % 8));
+            if i < 1_000 {
+                // all edge pairs: exercises the +100 u16 saturation
+                prev = ue[i % 10];
+                tgt = ue[(i / 10) % 10];
+            } else if i % 5 == 0 {
+                tgt = prev; // "unchanged keeps its stamp" branch
+            }
             let slots = [0u64, 1, 8_999, 9_000, 9_001, u64::MAX - 9_000, u64::MAX - 8_999, u64::MAX];
             let ps = if i % 2 == 0 { slots[(i / 2) % slots.len()] } else { rng.u64_log() };
             let now = if i % 3 == 0 { ps.saturating_add(rng.u64() % 20_000) } else { rng.u64_log() };
@@ -446,7 +457,7 @@ fn growth_v19_matches_independent_reference() {
             check("ratchet_ceiling_x100", &mut bad, p == r, || format!("prev={prev} ps={ps} tgt={tgt} flo={flo} stress={stress} now={now} prog={p:?} ref={r:?}"));
             dump.rec("ratchet", &[prev.to_string(), ps.to_string(), tgt.to_string(), flo.to_string(), stress.to_string(), now.to_string()], &format!("[\"{}\",\"{}\"]", p.0, p.1));
 
-            let span = if i % 4 == 0 { rng.u64_log() } else { rng.u64() >> 32 };
+            let span = if i % 50 == 1 { u32::MAX as u64 + (i as u64 % 3) - 1 } else if i % 4 == 0 { rng.u64_log() } else { rng.u64() >> 32 };
             let den = (rng.u32_log()).max(1);
             let num = if i % 5 == 0 { den } else { (rng.u64() % (den as u64 + 1)) as u32 };
             let p = curve_interp(span, num, den);
@@ -473,6 +484,19 @@ fn growth_v19_matches_independent_reference() {
             let v = log2_q16(x).unwrap();
             check("log2_q16.monotone", &mut bad, v >= prev, || format!("x={x}"));
             prev = v;
+        }
+        for sh in 0..64u32 {
+            let x = 1u64 << sh;
+            check("log2_q16.pow2_all", &mut bad, log2_q16(x) == Some(sh << 16), || format!("x={x}"));
+        }
+        for base in [1u64 << 31, 1u64 << 32, (1u64 << 40) - 10_000, 1u64 << 62, u64::MAX - 40_000] {
+            let mut prev = 0u32;
+            for x in base..=base.saturating_add(40_000) {
+                let v = log2_q16(x).unwrap();
+                check("log2_q16.monotone_hi", &mut bad, v >= prev, || format!("x={x}"));
+                prev = v;
+                if x == u64::MAX { break; }
+            }
         }
         println!("graduated_ceiling_x100 / ratchet_ceiling_x100 / curve_interp / log2_q16: {n} cases each");
     }
