@@ -272,6 +272,8 @@ mod kani_proofs {
 mod ref_model_tests {
     use super::*;
     use proptest::prelude::*;
+    extern crate alloc;
+    use alloc::vec::Vec;
 
     fn cdiv(a: u128, b: u128) -> u128 {
         assert!(b > 0);
@@ -320,7 +322,8 @@ mod ref_model_tests {
     /// every clamp / band-step boundary (d = ceil(32 s / 1000) changes) and the saturation edge
     #[test]
     fn sigma_boundaries_and_extremes() {
-        let mut pts = vec![u64::MAX, u64::MAX - 1, u64::MAX / 32, u64::MAX / 32 + 1, u64::MAX / 32 - 1, u64::MAX / 1000, 1 << 63];
+        let mut pts: Vec<u64> = Vec::new();
+        pts.extend_from_slice(&[u64::MAX, u64::MAX - 1, u64::MAX / 32, u64::MAX / 32 + 1, u64::MAX / 32 - 1, u64::MAX / 1000, 1 << 63]);
         for d in 1..=300u64 {
             let s = (d * 1000) / 32;
             for x in s.saturating_sub(2)..=s + 2 {
