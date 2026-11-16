@@ -1778,3 +1778,23 @@ fn print_tag_74_compute_units() {
     }
     FIXED_MARKET.with(|c| c.set(None));
 }
+
+/// Deterministic tag 122 compute readout (fixed market, so every PDA bump search is the same on
+/// every run and on every build): generic form, then ticker form, real Metaplex.
+#[test]
+#[ignore = "needs MPL_TOKEN_METADATA_SO=<dump of metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s>"]
+fn print_tag_122_compute_units() {
+    FIXED_MARKET.with(|c| c.set(Some(7u8)));
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let stranger = funded(&mut env);
+    let cu = name_generic(&mut env, &stranger).expect("generic create");
+    println!("CU122 generic {cu}");
+    let mut env = setup_vault();
+    real_metaplex(&mut env);
+    let admin = env.admin.insecure_clone();
+    let stranger = funded(&mut env);
+    let cu = name_ticker(&mut env, &stranger, &admin, "ABCDEFGH").expect("ticker create");
+    println!("CU122 ticker {cu}");
+    FIXED_MARKET.with(|c| c.set(None));
+}
