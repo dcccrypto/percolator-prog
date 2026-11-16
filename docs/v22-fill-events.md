@@ -120,8 +120,8 @@ Which instructions emit it, and the tag in the header:
 
 **The unit of `signed_reduced_q` depends on `reason`.** Reason 1 is in **basis** units (the leg's
 stored `basis_pos_q`, before ADL scaling). Reasons 2, 3, 6 and 7 are **ADL-effective** units (basis x A /
-a_basis). Reasons 4, 5 and 8 are the size traded against the vault LP (the leg's signed position as
-the trade path reads it). On a side that has never been ADL-scaled the two units coincide; after
+a_basis). Reasons 4, 5 and 8 are the size traded against the vault LP (for a whole-leg close, the
+leg's signed position as the trade path reads it; for reason 8, a partial cut, the cut size). On a side that has never been ADL-scaled the two units coincide; after
 an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without converting.
 
 | `reason` | meaning | `ix_tag` | notes |
@@ -133,7 +133,7 @@ an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without con
 | 5 | `EVICTION` | 119 | the victim's whole leg, bilateral against the bound vault LP at `P_last`, no fee; emitted before the taker's FILL |
 | 6 | `FORCE_CLOSE_ABANDONED` | 64 | **ADL-effective units.** prog#547: a permissionless cranker closed a Recovery-lifecycle pair against each other at the frozen mark (`ForceCloseAbandonedAsset`); neither owner signed. **Two events**, one per account, each naming the other account as `counterparty`, in account order (a, then b). Same best-effort rule as reason 3 |
 | 7 | `RESOLVED_CLOSE` | 30 | **ADL-effective units.** prog#547: `CloseResolved` settled the position at the resolved price (permissionless after the force-close delay, so the owner may not have signed). One event per asset whose position the call changed, in leg order. Unilateral. Same best-effort rule as reason 3 |
-| 8 | `LP_STOP` | 124 (op 5) | **Basis-free: the size traded against the vault LP** (as reasons 4 and 5). v2.2 lev build: the W1 LP stop cut an opposing account to the round's keep-fraction at `P_last`, bilateral against the bound vault LP, no fee. Usually a **partial** cut of the leg, not the whole leg. One event per account cut. Emitted through the same path as reasons 4 and 5 (a decoder that handles those handles this) |
+| 8 | `LP_STOP` | 124 (op 5) | **The size traded against the vault LP** (as reasons 4 and 5). v2.2 lev build: the W1 LP stop cut an opposing account to the round's keep-fraction at `P_last`, bilateral against the bound vault LP, no fee. Usually a **partial** cut of the leg, not the whole leg. One event per account cut. Emitted through the same path as reasons 4 and 5 (a decoder that handles those handles this) |
 
 A liquidation that happens inside a trade (`TradeNoCpi` / `TradeCpi` closing a liquidatable
 counterparty) is a fill and is reported as a FILL, not a REDUCE.
@@ -291,7 +291,7 @@ maintenance-fee settlement, and any per-account effect of an ADL step.
 7. `fee_atoms` is the total across taker and maker, including any LP-requested fee. It excludes the
    maintenance fee, rent and the backing fee. It is neither "the taker's fee" nor revenue.
 8. The event's `ix_tag` can differ from the outer instruction's tag (10 inside 119, 5 inside 77).
-9. REDUCE units differ by reason (1 basis; 2 and 3 ADL-effective).
+9. REDUCE units differ by reason (1 basis; 2, 3, 6, 7 ADL-effective; 4, 5, 8 the size traded against the vault LP).
 10. A liquidation / tag 44 / tag 104 event can be missing (best effort). Reconcile positions
     periodically.
 
