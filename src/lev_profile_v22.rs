@@ -265,3 +265,175 @@ mod kani_proofs {
         assert!(p.imr_bps > p.mmr_bps && p.imr_bps >= 500);
     }
 }
+
+/// Reference-model property tests: an independent plain-u128 implementation of the documented rule
+/// (module doc), compared with the production functions over the full domains.
+#[cfg(test)]
+mod ref_model_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    fn cdiv(a: u128, b: u128) -> u128 {
+        assert!(b > 0);
+        (a + b - 1) / b
+    }
+
+    /// smallest s with s*s >= x (binary search, no Newton)
+    fn ceil_sqrt(x: u128) -> u128 {
+        let (mut lo, mut hi) = (0u128, 1u128 << 64);
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if mid * mid >= x { hi = mid } else { lo = mid + 1 }
+        }
+        lo
+    }
+
+    /// (band, cap, g, lin, bsl, mmr, imr) straight from the doc block, u128, no saturation.
+    fn ref_profile(sigma: u128) -> (u128, u128, u128, u128, u128, u128, u128) {
+        let d = cdiv(sigma * 32, 1000).clamp(64, 256);
+        let cap = cdiv(d, 32);
+        let g = cdiv((10_000 + d) * (10_000 + d), 10_000 - d) - 10_000;
+        let lin = cap * 100 + cdiv(111 * 100 * 10_000, 1_000_000_000) + cdiv((10_000 + cap * 100) * 50, 10_000);
+        let bsl = g + cdiv((111 + 100) * 2 * 600 * 10_000, 1_000_000_000) + cdiv((10_000 + g) * 50, 10_000);
+        let mmr = cdiv(lin.max(bsl), 10) * 10;
+        let imr = 500u128.max(mmr + 50u128.max(mmr / 10));
+        (d, cap, g, lin, bsl, mmr, imr)
+    }
+
+    fn check_sigma(s: u64) {
+        let p = profile_for_sigma_bps(s).expect("profile");
+        let r = ref_profile(s as u128);
+        let got = (
+            p.band_bps as u128, p.cap_bps as u128, p.g_bps as u128, p.lin_bps as u128,
+            p.bsl_bps as u128, p.mmr_bps as u128, p.imr_bps as u128,
+        );
+        assert_eq!(got, r, "sigma {s}");
+    }
+
+    #[test]
+    fn sigma_exhaustive_low_range() {
+        for s in 0..=20_000u64 {
+            check_sigma(s);
+        }
+    }
+
+    /// every clamp / band-step boundary (d = ceil(32 s / 1000) changes) and the saturation edge
+    #[test]
+    fn sigma_boundaries_and_extremes() {
+        let mut pts = vec![u64::MAX, u64::MAX - 1, u64::MAX / 32, u64::MAX / 32 + 1, u64::MAX / 32 - 1, u64::MAX / 1000, 1 << 63];
+        for d in 1..=300u64 {
+            let s = (d * 1000) / 32;
+            for x in s.saturating_sub(2)..=s + 2 {
+                pts.push(x);
+            }
+        }
+        for s in pts {
+            check_sigma(s);
+        }
+        // saturation before the clamp is harmless: anything >= 8000 is the top band
+        assert_eq!(profile_for_sigma_bps(u64::MAX).unwrap().band_bps, BAND_MAX_BPS);
+        assert_eq!(profile_for_sigma_bps(u64::MAX / 32 + 1).unwrap(), profile_for_sigma_bps(8_000).unwrap());
+    }
+
+    #[test]
+    fn div_ceil_matches_reference() {
+        for a in [0u64, 1, 31, 32, 33, 999, 1000, 1001, u64::MAX - 1, u64::MAX] {
+            for b in [1u64, 2, 3, 10, 32, 1000, u64::MAX] {
+                assert_eq!(div_ceil(a, b) as u128, cdiv(a as u128, b as u128), "{a}/{b}");
+            }
+        }
+    }
+
+    #[test]
+    fn sigma_day_matches_reference_and_is_monotone() {
+        let r = |v: u32| ceil_sqrt(cdiv(v as u128 * 216_000, 100)).min(u64::MAX as u128) as u64;
+        for v in [0u32, 1, 2, 99, 100, 101, 1_667, 16_666, 1 << 31, u32::MAX - 1, u32::MAX] {
+            assert_eq!(sigma_day_bps(v), r(v), "var {v}");
+        }
+        // strided sweep across the whole u32 range (step 4099, ~1M points), monotone + exact
+        let mut prev = 0u64;
+        let mut v = 0u32;
+        loop {
+            let s = sigma_day_bps(v);
+            assert!(s >= prev, "var {v}");
+            if v % 97 == 0 {
+                assert_eq!(s, r(v), "var {v}");
+            }
+            prev = s;
+            match v.checked_add(4099) {
+                Some(n) => v = n,
+                None => break,
+            }
+        }
+        // σ never overflows into the saturation branch for any u32 var
+        assert!(sigma_day_bps(u32::MAX) < 1 << 40);
+    }
+
+    #[test]
+    fn mmr_imr_for_var_composes_sigma_and_profile() {
+        assert_eq!(profile_mmr_imr_for_var(None), None);
+        for v in [0u32, 1, 1_667, 16_666, 50_000, 1_000_000, u32::MAX] {
+            let (_, _, _, _, _, mmr, imr) = ref_profile(sigma_day_bps(v) as u128);
+            assert_eq!(profile_mmr_imr_for_var(Some(v)), Some((mmr as u64, imr as u64)), "var {v}");
+        }
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(4096))]
+
+        #[test]
+        fn prop_profile_any_sigma(s in any::<u64>()) { check_sigma(s); }
+
+        #[test]
+        fn prop_profile_invariants(s in any::<u64>()) {
+            let p = profile_for_sigma_bps(s).unwrap();
+            prop_assert!((BAND_MIN_BPS..=BAND_MAX_BPS).contains(&p.band_bps));
+            prop_assert!(p.mmr_bps >= p.lin_bps && p.mmr_bps >= p.bsl_bps && p.mmr_bps % 10 == 0);
+            prop_assert!(p.imr_bps >= 500 && p.imr_bps > p.mmr_bps);
+            prop_assert!(p.imr_bps >= p.mmr_bps + 50);
+        }
+
+        #[test]
+        fn prop_sigma_day_exact(v in any::<u32>()) {
+            let s = sigma_day_bps(v) as u128;
+            let x = cdiv(v as u128 * 216_000, 100);
+            prop_assert!(s * s >= x && (s == 0 || (s - 1) * (s - 1) < x));
+        }
+
+        #[test]
+        fn prop_floor_never_below_inputs(live in any::<bool>(), m in any::<u64>(), i in any::<u64>(),
+                                         p in proptest::option::of((any::<u64>(), any::<u64>()))) {
+            let (fm, fi) = profile_floor(live, m, i, p);
+            prop_assert!(fm >= m && fi >= i);
+            match p {
+                Some((pm, pi)) if live => prop_assert_eq!((fm, fi), (m.max(pm), i.max(pi))),
+                _ => prop_assert_eq!((fm, fi), (m, i)),
+            }
+        }
+
+        #[test]
+        fn prop_floor_composed_with_var(m in any::<u64>(), i in any::<u64>(), v in proptest::option::of(any::<u32>())) {
+            let prof = profile_mmr_imr_for_var(v);
+            let (fm, fi) = profile_floor(true, m, i, prof);
+            prop_assert!(fm >= m && fi >= i);
+            if let Some((pm, pi)) = prof {
+                prop_assert_eq!((fm, fi), (m.max(pm), i.max(pi)));
+            }
+        }
+
+        #[test]
+        fn prop_open_gate_identity_when_off(m in any::<u64>(), v in proptest::option::of(any::<u32>())) {
+            // VOL_PROFILE_LIVE is false: (mmr, 0) and the closure is never evaluated
+            prop_assert!(!VOL_PROFILE_LIVE);
+            prop_assert_eq!(open_gate_floor(m, || panic!("read while OFF")), (m, 0));
+            let _ = v;
+        }
+
+        #[test]
+        fn prop_profile_monotone(a in any::<u64>(), b in any::<u64>()) {
+            let (lo, hi) = (a.min(b), a.max(b));
+            let (pl, ph) = (profile_for_sigma_bps(lo).unwrap(), profile_for_sigma_bps(hi).unwrap());
+            prop_assert!(ph.band_bps >= pl.band_bps && ph.mmr_bps >= pl.mmr_bps && ph.imr_bps >= pl.imr_bps);
+        }
+    }
+}
