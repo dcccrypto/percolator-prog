@@ -132,7 +132,15 @@ proptest! {
         let got = bond_util_bps(oi, n);
         prop_assert!(got as u128 <= BPS_U);
         let want: u128 = if oi == 0 { 0 } else if n == 0 { BPS_U } else { ref_mul_div_floor(oi, BPS_U, n).min(BPS_U) };
-        prop_assert_eq!(got as u128, want, "oi={} n={}", oi, n);
+        if mul_fits(oi, BPS_U) {
+            prop_assert_eq!(got as u128, want, "oi={} n={}", oi, n);
+        } else {
+            // oi > u128::MAX/10_000 (~3.4e34, ~2^113; engine MAX_POSITION_ABS_Q is 1e14, so
+            // unreachable on chain). Production saturates to 10_000 instead of computing the
+            // exact ratio: documented-conservative (never LOWER than exact), but not exact.
+            prop_assert_eq!(got, 10_000);
+            prop_assert!(got as u128 >= want);
+        }
     }
 
     #[test]
@@ -182,4 +190,14 @@ fn util_pins() {
     assert_eq!(bond_util_bps(u128::MAX, u128::MAX), 10_000);
     assert_eq!(bond_util_bps(1, 2), 5_000);
     assert_eq!(bond_util_bps(1, 3), 3_333);
+}
+
+/// Counterexample found by `util_matches_reference` against the exact 256-bit reference:
+/// the overflow path of `bond_util_bps` returns 10_000 although true utilisation is 1 bps.
+/// LATENT: needs max-side OI above 2^113 q-units (engine bound is 1e14 per position).
+#[test]
+fn util_overflow_path_saturates_not_exact_latent() {
+    let (oi, n) = (34028236692093846346337460743176822u128, u128::MAX);
+    assert_eq!(ref_mul_div_floor(oi, BPS_U, n), 1);
+    assert_eq!(bond_util_bps(oi, n), 10_000);
 }
