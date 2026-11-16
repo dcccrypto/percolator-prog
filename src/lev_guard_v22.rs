@@ -419,8 +419,8 @@ pub enum Trip {
     Breaker,
 }
 
-/// Observe the authenticated mark `px` at `now`. The 1-h reference rolls forward once it is an
-/// hour old. A zero price is ignored (no information). `sigma_1h_bps = None`: no σ test.
+/// Observe the authenticated mark `px` at `now`. Each sample is checked against every stored
+/// mark younger than an hour (sliding window, #688). A zero price is ignored (no information). `sigma_1h_bps = None`: no σ test.
 pub fn observe_price(b: &PriceBand, px: u64, now: u64, sigma_1h_bps: Option<u64>) -> (PriceBand, Trip) {
     let mut n = *b;
     if px == 0 {
@@ -1015,8 +1015,9 @@ pub struct LevGuardV22 {
 pub const LEV_GUARD_REC_LEN: usize = 488;
 pub const LEV_GUARD_TOUCHED_LEN: usize = KEY_TAG_LEN * W1_TOUCHED_CAP;
 pub const LEV_GUARD_BODY_LEN: usize = LEV_GUARD_REC_LEN + LEV_GUARD_TOUCHED_LEN;
-/// The touched region, and so the guard account and its rent, are UNCHANGED by the tag widening
-/// (16 x 256 == 8 x 512): nothing to migrate, and the SDK / keeper / app length checks still hold.
+/// The touched region is unchanged by the tag widening (16 x 256 == 8 x 512), but the record grew
+/// 360 -> 488 B in #688 (v2), so the guard account body is 4_584 B (was 4_456): SDK / keeper / app
+/// length checks and rent estimates must use `LEV_GUARD_BODY_LEN`. v1 accounts cannot be migrated.
 const _: () = assert!(LEV_GUARD_TOUCHED_LEN == 4_096);
 const _: () = assert!(LEV_GUARD_BODY_LEN == 4_584);
 const _: () = assert!(W1_TOUCHED_CAP <= u16::MAX as usize);
@@ -1503,7 +1504,7 @@ mod tests {
         // the reference rolls after an hour: the same staircase over > 1 h does not trip the
         // hour rule on the late step
         let (s1, _) = observe_price(&b2, 1_204_500, 100 + SLOTS_PER_HOUR, None);
-        assert!(s1.marks_px_e6.contains(&1_204_500)); // the slot-100 mark aged out
+        assert!(s1.marks_px_e6.contains(&1_204_500)); // the slot-100 mark is now excluded by age
         let (_, t) = observe_price(&s1, 1_318_927, 100 + SLOTS_PER_HOUR + 10, None);
         assert_eq!(t, Trip::None);
         // σ test: a 2 % move vs ref with σ_1h 40 bps (> 4σ = 160 bps) freezes only
