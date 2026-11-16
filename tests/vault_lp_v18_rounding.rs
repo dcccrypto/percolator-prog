@@ -238,7 +238,8 @@ fn usd_to_q_and_exposure_and_notional() {
         }
         let (pos, sc) = (rnd(&mut rng) >> 40, rnd(&mut rng) >> 64);
         if sc != 0 {
-            assert_eq!(notional_atoms(pos, p, sc), ref_div(pos, p as u128, sc, false));
+            let exp = if pos.checked_mul(p as u128).is_some() { ref_div(pos, p as u128, sc, false) } else { None };
+            assert_eq!(notional_atoms(pos, p, sc), exp);
         }
         // :282 skew
         let (net, oi) = ((rnd(&mut rng) >> 70) as i128 * if rng.gen() { 1 } else { -1 }, rnd(&mut rng) >> 70);
@@ -271,7 +272,7 @@ fn usd_to_q_and_exposure_and_notional() {
 fn senior_floor_code_is_ceiling() {
     let mut rng = XorShiftRng::seed_from_u64(0x5F);
     for _ in 0..N {
-        let v = rnd(&mut rng) >> rng.gen_range(0..70);
+        let v = (rnd(&mut rng) >> rng.gen_range(0..70)).min(u64::MAX as u128); // SPL-bounded; above 1023*2^63 it saturates by design
         let d = senior_floor_decode(senior_floor_encode(v));
         assert!(d >= v, "{v} -> {d}");
     }
