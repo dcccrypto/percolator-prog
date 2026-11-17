@@ -2570,12 +2570,17 @@ fn v22_tag118_bilateral_sweep_leaves_a_unchanged_and_the_market_open() {
 #[test]
 fn v22_tag118_sweep_closes_an_adl_scaled_leg_exactly() {
     let mut env = Env::new(band_cfg());
-    let (lp, long, short) = band_book(&mut env);
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let long = env.trader(1_000 * USD);
+    env.trade_cpi(&long.0, long.1, &lp, 200 * Q).expect("open long");
+    assert_eq!(env.pos(lp.account), -200 * Q, "the vault LP is the exact mirror");
     env.crank_current(long.1);
     env.crank_current(lp.account);
-    env.crank_current(short.1);
-    // ADL fixture: both sides at A = 3/4, so the 200 Q long leg is 150 Q effective and the 100 Q
-    // short legs are 75 Q; the side aggregates follow (long 200 -> 150, short 200 -> 150).
+    // ADL fixture: both sides at A = 3/4, so the 200 Q long leg is 150 Q effective and the LP's
+    // 200 Q short leg is 150 Q effective; the side aggregates follow. Under A != ADL_ONE the engine
+    // refuses any risk-increasing fill, so the close must be EXACTLY the effective 150 (a basis-sized
+    // 200 overshoots and flips both legs).
     {
         let mut acct = env.svm.get_account(&env.market).unwrap();
         {
@@ -2589,11 +2594,11 @@ fn v22_tag118_sweep_closes_an_adl_scaled_leg_exactly() {
         }
         env.svm.set_account(env.market, acct).unwrap();
     }
-    let basis = env.pos(long.1);
-    assert_eq!(basis, 200 * Q, "the stored (basis) leg");
+    assert_eq!(env.pos(long.1), 200 * Q, "the stored (basis) leg");
     env.poke_engine_config(|c| c.band_min_leg_notional = percolator::V16PodU64::new(500 * USD as u64));
     env.sweep_dust(long.1, lp.account).expect("sweep of an ADL-scaled dust leg");
     assert_eq!(env.pos(long.1), 0, "the whole leg is closed, not flipped to the other side");
+    assert_eq!(env.pos(lp.account), 0, "the LP is flat, not flipped long");
 }
 
 /// Round-2 re-review N-1b: eviction of a small leg (tag 119). With the long side full
