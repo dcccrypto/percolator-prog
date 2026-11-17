@@ -7290,3 +7290,50 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
         assert!(*w <= live_slot, "last_fee_slot is a real slot <= now: {w} > {live_slot}");
     }
 }
+
+/// J-20261117-PROG-726-EXPLAIN, REAL PATH (no account-byte pokes): the ADL-scaled dust leg is
+/// built only through instructions. A small long (victim, 20 Q = $20) and a big short (180 Q)
+/// both trade against the bound vault LP (LP net +160 long). The short then exits 150 Q through
+/// its own owner-signed tag 44 (RebalanceReduce): one-sided OI removal, so the engine ADL-scales
+/// the LONG side (A_long ~ 30/180). The victim's 20 Q basis leg is now ~3.34 Q effective (~$3.34),
+/// which is under half the $10 band minimum, so it is genuinely dust. Anyone may then sweep it
+/// through tag 118. Expected (correct) behaviour: the leg closes exactly. Today the sweep sizes
+/// the close from the 20 Q BASIS (u128::MAX -> basis branch), the engine applies it to the
+/// 3.34 Q EFFECTIVE leg, the result would flip the victim short, and the A != ADL_ONE gate
+/// refuses that as risk-increasing: Custom(120) EngineAdlReduceOnly.
+#[test]
+fn j726_real_path_tag118_sweep_of_adl_scaled_dust_leg() {
+    let mut env = Env::new(band_cfg());
+    env.auth_mark();
+    let lp = env.lp(10_000 * USD);
+    let victim = env.trader(1_000 * USD);
+    let short = env.trader(1_000 * USD);
+    env.trade_cpi(&victim.0, victim.1, &lp, 20 * Q).expect("victim opens 20 Q long");
+    env.trade_cpi(&short.0, short.1, &lp, -180 * Q).expect("short opens 180 Q short");
+    assert_eq!(env.pos(lp.account), 160 * Q, "LP net long 160");
+    let a0 = env.engine_asset();
+    assert_eq!((a0.a_long, a0.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "no ADL yet");
+    assert!(env.sweep_dust(victim.1, lp.account).is_err(), "control: a $20 leg is not dust before ADL");
+
+    // The real trigger: the short's own tag 44 exit of 150 Q.
+    env.rebalance_reduce(&short.0, short.1, (150 * Q) as u128).expect("tag 44 exit 150 Q");
+    let a = env.engine_asset();
+    eprintln!("J726 after tag 44: a_long={} a_short={} (ADL_ONE={}) oi_eff_long={} oi_eff_short={}",
+        a.a_long, a.a_short, percolator::ADL_ONE, a.oi_eff_long_q, a.oi_eff_short_q);
+    assert!(a.a_long < percolator::ADL_ONE, "vacuity: real ADL scaled the long side");
+    env.warp(1);
+    env.crank_current(victim.1);
+    env.crank_current(lp.account);
+    let a = env.engine_asset();
+    let basis = env.pos(victim.1);
+    let eff = (basis.unsigned_abs() * a.a_long).div_ceil(percolator::ADL_ONE);
+    eprintln!("J726 victim basis={} effective~={} (Q={})", basis, eff, Q);
+    assert_eq!(basis, 20 * Q, "stored basis leg is unchanged by ADL");
+    assert!(eff < basis.unsigned_abs(), "effective < basis");
+
+    let r = env.sweep_dust(victim.1, lp.account);
+    eprintln!("J726 tag 118 sweep result: {r:?}");
+    r.expect("tag 118 sweep of a REAL ADL-scaled dust leg");
+    assert_eq!(env.pos(victim.1), 0, "the whole leg is closed, not flipped");
+    env.assert_conservation();
+}
