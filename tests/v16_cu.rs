@@ -29746,7 +29746,7 @@ fn v16_738_shape_only_decode_confined_to_read_only_readers() {
         "read_market_config_mode_and_capacity",
         "read_engine_funding_bounds",
         "read_market_trade_preflight",
-        "read_market_batch_trade_preflight",
+        "read_asset_effective_prices",
     ];
     // Split into top-level-ish `pub fn`/`fn` items by tracking the most recent fn signature.
     let mut cur: Option<(String, String)> = None; // (name, signature text)
