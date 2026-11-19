@@ -29664,3 +29664,295 @@ fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
         "a target change must not carry the previous target's price-move remainder"
     );
 }
+
+// ════════════════════════════════════════════════════════════════════════════════════════════
+// review/zerolamport-1119 — INVARIANT: an account holding 0 lamports must never be accepted as
+// an initialized MARKET.
+//
+// Runtime behaviour (agave accounts-db `load` filters zero-lamport accounts and the store path
+// writes them as the default account): a 0-lamport account that a transaction gives to this
+// program — `createAccount(lamports = 0, space, owner = program)` or `Allocate` + `Assign` on a
+// 0-lamport keypair — IS owned by the program for the rest of that transaction, and is silently
+// dropped (owner back to System, data gone) at commit, while every other account the transaction
+// wrote is kept. `expect_owner(market, program_id)` therefore does not prove the market will
+// exist after the transaction. #668 (upstream ae78ea33) closed this for InitPortfolio only.
+// ════════════════════════════════════════════════════════════════════════════════════════════
+
+fn zl_init_market_ix(program_id: Pubkey, admin: Pubkey, market: Pubkey, mint: Pubkey) -> Instruction {
+    let p = V16CuMarketParams::default();
+    Instruction {
+        program_id,
+        accounts: vec![
+            AccountMeta::new(admin, true),
+            AccountMeta::new(market, true),
+            AccountMeta::new_readonly(mint, false),
+        ],
+        data: ProgInstruction::InitMarket {
+            max_portfolio_assets: p.max_portfolio_assets,
+            h_min: p.h_min,
+            h_max: p.h_max,
+            initial_price: p.initial_price,
+            min_nonzero_mm_req: p.min_nonzero_mm_req,
+            min_nonzero_im_req: p.min_nonzero_im_req,
+            maintenance_margin_bps: p.maintenance_margin_bps,
+            initial_margin_bps: p.initial_margin_bps,
+            max_trading_fee_bps: p.max_trading_fee_bps,
+            trade_fee_base_bps: p.trade_fee_base_bps,
+            liquidation_fee_bps: p.liquidation_fee_bps,
+            liquidation_fee_cap: p.liquidation_fee_cap,
+            min_liquidation_abs: p.min_liquidation_abs,
+            max_price_move_bps_per_slot: p.max_price_move_bps_per_slot,
+            max_accrual_dt_slots: p.max_accrual_dt_slots,
+            max_abs_funding_e9_per_slot: p.max_abs_funding_e9_per_slot,
+            min_funding_lifetime_slots: p.min_funding_lifetime_slots,
+            max_account_b_settlement_chunks: p.max_account_b_settlement_chunks,
+            max_bankrupt_close_chunks: p.max_bankrupt_close_chunks,
+            max_bankrupt_close_lifetime_slots: p.max_bankrupt_close_lifetime_slots,
+            public_b_chunk_atoms: p.public_b_chunk_atoms,
+            maintenance_fee_per_slot: p.maintenance_fee_per_slot,
+        }
+        .encode(),
+    }
+}
+
+fn zl_market_len() -> usize {
+    state::market_account_len_for_capacity(1).unwrap()
+}
+
+/// Both ways a transaction can hand this program a 0-lamport account: `createAccount(0)` and the
+/// tweet's `Allocate` + `Assign` on an unfunded keypair.
+fn zl_phantom_market_ixs(env: &V16CuEnv, market: Pubkey, via_assign: bool) -> Vec<Instruction> {
+    let len = zl_market_len() as u64;
+    if via_assign {
+        vec![
+            solana_sdk::system_instruction::allocate(&market, len),
+            solana_sdk::system_instruction::assign(&market, &env.program_id),
+        ]
+    } else {
+        vec![solana_sdk::system_instruction::create_account(
+            &env.payer.pubkey(),
+            &market,
+            0,
+            len,
+            &env.program_id,
+        )]
+    }
+}
+
+#[test]
+fn zerolamport_1119_init_market_refuses_a_zero_lamport_market() {
+    for via_assign in [true, false] {
+        let mut env = V16CuEnv::new();
+        let market_kp = Keypair::new();
+        let market = market_kp.pubkey();
+        let mut ixs = vec![heap_ix(), cu_ix()];
+        ixs.extend(zl_phantom_market_ixs(&env, market, via_assign));
+        ixs.push(zl_init_market_ix(env.program_id, env.admin.pubkey(), market, env.mint));
+        let tx = Transaction::new_signed_with_payer(
+            &ixs,
+            Some(&env.payer.pubkey()),
+            &[&env.payer, &env.admin, &market_kp],
+            env.svm.latest_blockhash(),
+        );
+        let res = env.svm.send_transaction(tx);
+        let after = env.svm.get_account(&market);
+        assert!(
+            res.is_err(),
+            "via_assign={via_assign}: InitMarket accepted a 0-lamport market account; after commit the \
+             market is {:?} (owner {:?}, {} data bytes) — it only existed inside the transaction",
+            after.as_ref().map(|a| a.lamports),
+            after.as_ref().map(|a| a.owner),
+            after.as_ref().map(|a| a.data.len()).unwrap_or(0),
+        );
+        let code = PercolatorError::RentExemptRequired as u32;
+        let e = format!("{:?}", res.unwrap_err());
+        assert!(
+            e.contains(&format!("Custom({code})")),
+            "via_assign={via_assign}: expected InitMarket's own RentExemptRequired ({code}), got {e}"
+        );
+    }
+
+    // control: a rent-exempt market created the same way is accepted.
+    let mut env = V16CuEnv::new();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
+    let rent = env.svm.minimum_balance_for_rent_exemption(zl_market_len());
+    let create = solana_sdk::system_instruction::create_account(
+        &env.payer.pubkey(),
+        &market,
+        rent,
+        zl_market_len() as u64,
+        &env.program_id,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[heap_ix(), cu_ix(), create, zl_init_market_ix(env.program_id, env.admin.pubkey(), market, env.mint)],
+        Some(&env.payer.pubkey()),
+        &[&env.payer, &env.admin, &market_kp],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("a rent-exempt market is accepted");
+    assert_eq!(env.svm.get_account(&market).unwrap().lamports, rent);
+}
+
+/// Why it matters: what a phantom market leaves behind. One transaction creates a 0-lamport market
+/// M, initialises it, and registers a REAL (rent-exempt) portfolio on it. At commit M vanishes, the
+/// portfolio stays — bound by key (`provenance_header.market_group_id == M`) to a market that does
+/// not exist. Whoever holds M's keypair can later create a real market at M; that market starts
+/// with `materialized_portfolio_count == 0` yet accepts the orphan (Deposit succeeds), so every
+/// market-level aggregate the engine keeps in step with its portfolios is already out of step.
+#[test]
+fn zerolamport_1119_phantom_market_leaves_an_orphan_portfolio_a_later_market_accepts() {
+    let mut env = V16CuEnv::new();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
+    let owner = Keypair::new();
+    env.ensure_signer_account(owner.pubkey());
+    let portfolio_kp = Keypair::new();
+    let plen = env.portfolio_account_len;
+    let prent = env.svm.minimum_balance_for_rent_exemption(plen);
+
+    let mut ixs = vec![heap_ix(), cu_ix()];
+    ixs.extend(zl_phantom_market_ixs(&env, market, false));
+    ixs.push(zl_init_market_ix(env.program_id, env.admin.pubkey(), market, env.mint));
+    ixs.push(solana_sdk::system_instruction::create_account(
+        &env.payer.pubkey(),
+        &portfolio_kp.pubkey(),
+        prent,
+        plen as u64,
+        &env.program_id,
+    ));
+    ixs.push(Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(portfolio_kp.pubkey(), true),
+        ],
+        data: ProgInstruction::InitPortfolio.encode(),
+    });
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&env.payer.pubkey()),
+        &vec![&env.payer, &env.admin, &market_kp, &owner, &portfolio_kp],
+        env.svm.latest_blockhash(),
+    );
+    let res = env.svm.send_transaction(tx);
+    let market_after = env.svm.get_account(&market);
+    let orphan = env.svm.get_account(&portfolio_kp.pubkey());
+    assert!(
+        res.is_err(),
+        "INVARIANT BROKEN: a 0-lamport market was initialised and used in the same transaction. \
+         After commit: market account = {:?}; portfolio bound to it persisted = {}",
+        market_after.as_ref().map(|a| (a.lamports, a.owner, a.data.len())),
+        orphan.as_ref().map(|a| a.lamports > 0).unwrap_or(false),
+    );
+    // With the fix the whole transaction reverts: no orphan portfolio.
+    assert!(orphan.map(|a| a.lamports == 0).unwrap_or(true), "no portfolio survives a refused InitMarket");
+}
+
+/// Escalation demo (documents the CURRENT behaviour; it is expected to PASS before the fix and is
+/// skipped after it, because step 1 can no longer happen).
+#[test]
+fn zerolamport_1119_demo_orphan_portfolio_is_accepted_by_a_real_market_at_the_same_key() {
+    let mut env = V16CuEnv::new();
+    let market_kp = Keypair::new();
+    let market = market_kp.pubkey();
+    let owner = Keypair::new();
+    env.ensure_signer_account(owner.pubkey());
+    let portfolio_kp = Keypair::new();
+    let plen = env.portfolio_account_len;
+    let prent = env.svm.minimum_balance_for_rent_exemption(plen);
+
+    // tx1: phantom market + real portfolio
+    let mut ixs = vec![heap_ix(), cu_ix()];
+    ixs.extend(zl_phantom_market_ixs(&env, market, false));
+    ixs.push(zl_init_market_ix(env.program_id, env.admin.pubkey(), market, env.mint));
+    ixs.push(solana_sdk::system_instruction::create_account(
+        &env.payer.pubkey(),
+        &portfolio_kp.pubkey(),
+        prent,
+        plen as u64,
+        &env.program_id,
+    ));
+    ixs.push(Instruction {
+        program_id: env.program_id,
+        accounts: vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(portfolio_kp.pubkey(), true),
+        ],
+        data: ProgInstruction::InitPortfolio.encode(),
+    });
+    let tx = Transaction::new_signed_with_payer(
+        &ixs,
+        Some(&env.payer.pubkey()),
+        &vec![&env.payer, &env.admin, &market_kp, &owner, &portfolio_kp],
+        env.svm.latest_blockhash(),
+    );
+    if env.svm.send_transaction(tx).is_err() {
+        eprintln!("zerolamport_1119 demo: phantom InitMarket refused (fixed build) — nothing to demonstrate");
+        return;
+    }
+    // LiteSVM 0.1.0 keeps the 0-lamport account as-is after the transaction. Agave does not: its
+    // accounts-db stores a zero-lamport account as the DEFAULT account
+    // (accounts-db/src/storable_accounts.rs `account_default_if_zero_lamport`) and never loads one
+    // (accounts-db/src/accounts_db.rs `load` filters `is_zero_lamport`). Model that commit step.
+    let ghost = env.svm.get_account(&market).expect("LiteSVM keeps the ghost");
+    assert_eq!(ghost.lamports, 0, "the phantom market held 0 lamports at commit");
+    assert_eq!(ghost.owner, env.program_id, "…while owned by this program (agave reverts this)");
+    env.svm.set_account(market, Account::default()).unwrap();
+    let orphan = env.svm.get_account(&portfolio_kp.pubkey()).expect("orphan portfolio persisted");
+    {
+        let mut d = orphan.data.clone();
+        let pv = state::portfolio_view_mut_for_market_slots(&mut d, 1).unwrap();
+        assert_eq!(pv.header.provenance_header.market_group_id, market.to_bytes(), "bound to the vanished market");
+    }
+
+    // tx2: the same keypair later creates a REAL market at M.
+    env.svm.expire_blockhash();
+    let rent = env.svm.minimum_balance_for_rent_exemption(zl_market_len());
+    let create = solana_sdk::system_instruction::create_account(
+        &env.payer.pubkey(),
+        &market,
+        rent,
+        zl_market_len() as u64,
+        &env.program_id,
+    );
+    let tx = Transaction::new_signed_with_payer(
+        &[heap_ix(), cu_ix(), create, zl_init_market_ix(env.program_id, env.admin.pubkey(), market, env.mint)],
+        Some(&env.payer.pubkey()),
+        &[&env.payer, &env.admin, &market_kp],
+        env.svm.latest_blockhash(),
+    );
+    env.svm.send_transaction(tx).expect("real market at the same key");
+
+    // point the env at M (vault ATA of M's vault authority, as `new` does for its market)
+    let vault_authority = Pubkey::find_program_address(&[b"vault", market.as_ref()], &env.program_id).0;
+    let vault = canonical_vault_ata(&vault_authority, &env.mint);
+    env.svm
+        .set_account(
+            vault,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, vault_authority, 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    env.market = market;
+    env.vault = vault;
+    env.vault_authority = vault_authority;
+    assert_eq!(
+        env.market_state().1.materialized_portfolio_count,
+        0,
+        "the real market at M knows of no portfolio"
+    );
+    env.deposit(&owner, portfolio_kp.pubkey(), 1_000);
+    assert_eq!(
+        env.market_state().1.materialized_portfolio_count,
+        0,
+        "…yet it took a deposit into the orphan portfolio: market aggregates and portfolios have diverged"
+    );
+}
