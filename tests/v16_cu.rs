@@ -25620,6 +25620,54 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
     assert_eq!(env.token_amount(env.vault), vault_before - 1_000);
 }
 
+/// W4-PAYOUT CU probe at the wrapper cap (WRAPPER_MAX_PORTFOLIO_ASSETS = 4): insurance in all 8
+/// domains of one authority, permissionless whole-reserve settle. Prints CU plus an FNV-1a digest
+/// of the market account bytes and the token balances so before/after runs can be diffed.
+#[test]
+fn v16_w4_payout_withdraw_insurance_cu_at_max_assets() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 10_000, 10_000, 10_000);
+    for i in 1..4u16 {
+        env.activate_asset(i, i as u64, 100);
+    }
+    let admin = Keypair::from_bytes(&env.admin.to_bytes()).unwrap();
+    for d in 0..8u16 {
+        env.top_up_insurance_domain_with_authority(&admin, d, 1_000);
+    }
+    env.resolve();
+    assert_eq!(env.market_state().1.mode, MarketModeV16::Resolved);
+    let beneficiary = env.admin.pubkey();
+    let dest = env.token_account(beneficiary, 0);
+    let cu = send_tx(
+        &mut env.svm,
+        env.program_id,
+        &env.payer,
+        ProgInstruction::WithdrawInsurance { amount: 8_000 },
+        vec![
+            AccountMeta::new_readonly(beneficiary, false),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[],
+    )
+    .expect("max-asset permissionless WithdrawInsurance");
+    let data = env.svm.get_account(&env.market).unwrap().data;
+    let mut h: u64 = 0xcbf29ce484222325;
+    for b in &data {
+        h = (h ^ *b as u64).wrapping_mul(0x100000001b3);
+    }
+    println!("v16 W4-PAYOUT max-assets(4) WithdrawInsurance CU: {cu}");
+    println!(
+        "v16 W4-PAYOUT max-assets identity: market_fnv={h:016x} len={} dest={} vault={}",
+        data.len(),
+        env.token_amount(dest),
+        env.token_amount(env.vault)
+    );
+    assert_eq!(env.token_amount(dest), 8_000);
+}
+
 /// AUD-S1-11 (fix-all 2026-10-18): in Resolved, the unsigned (permissionless) terminal
 /// insurance settle can no longer restart the market-wide withdrawal cooldown. Before the fix a
 /// third party paid 1 atom to the authority and the cooldown (up to the policy maximum) blocked
