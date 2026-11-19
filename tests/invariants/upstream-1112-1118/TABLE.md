@@ -55,11 +55,11 @@ Command (wrapper built with `cargo build-sbf --tools-version v1.52 --features de
 
 | Test | Engine db019142 (CI pin) | Engine 3e5970f3 (engine tip) |
 |---|---|---|
-| `inv_031_provider_exit_principal::v16_program_live_provider_exit_leaves_a_payment_stranded_by_a_reversal` (37849dfc) | GREEN | TIP_1 |
-| `inv_031_provider_exit_principal::v16_program_live_backing_authority_cannot_take_a_stranded_payment_without_principal` (37849dfc) | GREEN | TIP_2 |
-| `inv_073_crossed_recovery_obligations::v16_program_one_recovery_obligation_waits_and_the_resolved_market_drains` (2d03e07e, control) | GREEN | TIP_3 |
-| `inv_073_crossed_recovery_obligations::v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market` (2d03e07e) | **RED**, ignored | TIP_4 |
-| `inv_073_crossed_recovery_obligations::v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits` (2d03e07e) | **RED**, ignored | TIP_5 |
+| `inv_031_provider_exit_principal::v16_program_live_provider_exit_leaves_a_payment_stranded_by_a_reversal` (37849dfc) | GREEN | pending |
+| `inv_031_provider_exit_principal::v16_program_live_backing_authority_cannot_take_a_stranded_payment_without_principal` (37849dfc) | GREEN | pending |
+| `inv_073_crossed_recovery_obligations::v16_program_one_recovery_obligation_waits_and_the_resolved_market_drains` (2d03e07e, control) | GREEN | pending |
+| `inv_073_crossed_recovery_obligations::v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market` (2d03e07e) | **RED**, ignored | pending |
+| `inv_073_crossed_recovery_obligations::v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits` (2d03e07e) | **RED**, ignored | pending |
 
 The two pre-existing INV-031 tests in the same file stay GREEN on db019142.
 
@@ -79,11 +79,11 @@ has. There is no src change here; porting 2ed67b16 is an engine job.
 
 - INV-073: `ConfigurePermissionlessResolve` has a 9,000-slot floor in this fork (upstream uses 100), so the
   resolve slot is `20 + 9,000 + 11` instead of 131.
-- INV-073: this fork answers a waiting `CloseResolved` with a successful no-op, where upstream refuses with
-  Custom 22. The drain counts a no-op as "no progress" (like a refusal) instead of failing on it. A real lock
-  still fails, because a whole round without progress trips the fixed-point assertion. This is the one
-  loosening; the control test shows that the fork's no-op on a winner waiting for its loser is otherwise
-  harmless.
+- INV-073: upstream's drain fails on any successful no-op `CloseResolved`. This fork's wrapper returns Ok with
+  no state change for an ordinary waiting close too (in the control, R, a flat winner, closes before its loser
+  S; observed failing upstream's strict check before this change). The drain counts a no-op as "no progress"
+  (like a refusal) instead of failing on it. A real lock still fails, because a whole round without progress
+  trips the fixed-point assertion. This is the one loosening.
 - INV-073 creator variant: the market account is pre-sized before each permissionless activation
   (`grow_market_capacity_for_test`), as the fork's other activation tests do, because this program cannot
   realloc a market past 10,240 bytes (note in `src/v16_program.rs` near line 275).

@@ -105,6 +105,8 @@ fn resolved_portfolio_is_terminal(env: &V16CuEnv, portfolio: Pubkey) -> bool {
         && account.fee_credits == 0
         && account.cancel_deposit_escrow == 0
         && percolator::active_bitmap_is_empty(account.active_bitmap)
+        // Upstream checks "no source domain occupied"; the claim bound is the fork-side
+        // stand-in. The exact payout and empty-vault assertions catch an early exit.
         && account.source_claim_bound_num.iter().all(|&bound| bound == 0)
         && (!receipt.present || receipt.finalized)
         && account.last_fee_slot == group.resolved_slot
@@ -143,12 +145,12 @@ fn drain_resolved_cohort(
                     assert_cu_within(label, cu, CUSTODY_CU_LIMIT);
                     let paid = env.token_amount(destination) as u128;
                     payouts[index] += paid;
-                    // Upstream refuses a waiting close with Custom(22) and treats a
-                    // successful no-op as a failure. This fork answers a waiting close
-                    // (e.g. a winner whose loser has not closed yet) with a successful
-                    // no-op, so a no-op here counts as "no progress", like a refusal.
-                    // A real lock still fails: a whole round without progress trips the
-                    // fixed-point assertion below.
+                    // Upstream's drain fails on any successful no-op. This fork's wrapper
+                    // returns Ok with no state change for an ordinary waiting close too:
+                    // in the control test, R (a flat winner) closes before its loser S
+                    // and the call is a no-op. So a no-op counts as "no progress", like a
+                    // refusal. A real lock still fails: a whole round without progress
+                    // trips the fixed-point assertion below.
                     if env.svm.get_account(&env.market).unwrap() != market_before
                         || env.svm.get_account(portfolio).unwrap() != portfolio_before
                         || env.svm.get_account(&env.vault).unwrap() != vault_before
