@@ -1,6 +1,8 @@
 # Upstream percolator-prog, 12-18 Nov 2026: one line per commit
 
 Source: `aeyakovenko/percolator-prog` main (read-only `upstream` remote). Nothing was sent upstream.
+(The job asked for `docs/upstream-1112-1118/TABLE.md`. This job is tests-only and its pre-push hook refuses
+non-test paths, so the table lives under `tests/`.)
 
 "Ours" means the v2.2 engine branch `dcccrypto/percolator` `feat/v22-engine-rc23-2026-10-22` (tip `3e5970f3`;
 merged ports #309, #310, #362; drafts #311, #312, #322 are NOT merged). The wrapper's CI builds against
@@ -37,8 +39,8 @@ Verdicts: (a) not applicable; (b) port the test. GREEN/RED: result of the ported
 | 18 | ac719dff INV-077 liened loss refresh at the source cap | engine 1683b11d (liened-face fix) | no | (a) INV-077 max-shape: 5-6 legs over 28 source domains; vacuous at our 4-leg portfolio cap unless #740 merges. Not ported |
 | 19 | 506016b5 INV-031 provider exit capped at principal | engine 827a125f | yes (#362) | (a) already ported: 24ada763 carries this file, adapted to our stricter wrapper gate (E-LSA-W, #470). Checked against #708/#711: no overlap |
 | 20 | 731338e0 pin 827a125f | 827a125f | yes (#362) | (a) pin bump |
-| 21 | 37849dfc INV-031 payment stranded by a reversal | engine 9a219cca | no | (b) ported into `inv_031_provider_exit_principal.rs`: RESULT_37849dfc |
-| 22 | 2d03e07e INV-073 crossed Recovery obligations | engine 2ed67b16 | no | (b) ported as `inv_073_crossed_recovery_obligations.rs`: RESULT_2d03e07e |
+| 21 | 37849dfc INV-031 payment stranded by a reversal | engine 9a219cca | no | (b) ported into `inv_031_provider_exit_principal.rs`: **GREEN** (2 tests), kept as regression guards. Our fork refuses through its ledger-principal cap (Custom 25), not through 9a219cca |
+| 22 | 2d03e07e INV-073 crossed Recovery obligations | engine 2ed67b16 | no | (b) ported as `inv_073_crossed_recovery_obligations.rs`: **RED** for the 2 crossed tests (parked `#[ignore = "RED: ..."]`); the control is GREEN |
 | 23 | f9f0bcf8 INV-077 exact payouts in both close orders | engine 52659c02 (resolved K/F netting, stranded payments placed at most 4 per call) | no | (a) INV-077; edits absent `inv_077_resolved_loss_settlement.rs`; vacuous at our 4-leg cap unless #740 merges |
 | 24 | 8aa7a64a pin 52659c02 + INV-039 mixed-role book | 52659c02 (+ 9a219cca, 2ed67b16, 8e23d98b) | no | (a) pin bump; INV-039 change is to upstream's reference book in absent files |
 
@@ -47,4 +49,46 @@ ea212394 (our PR #740).
 
 ## Ported tests
 
-RESULTS_SECTION
+Command (wrapper built with `cargo build-sbf --tools-version v1.52 --features devnet`):
+`cargo test -j 4 --features devnet --test v16_cu -- inv_031_provider_exit_principal inv_073_crossed`
+(add `--ignored` to run the RED pair).
+
+| Test | Engine db019142 (CI pin) | Engine 3e5970f3 (engine tip) |
+|---|---|---|
+| `inv_031_provider_exit_principal::v16_program_live_provider_exit_leaves_a_payment_stranded_by_a_reversal` (37849dfc) | GREEN | TIP_1 |
+| `inv_031_provider_exit_principal::v16_program_live_backing_authority_cannot_take_a_stranded_payment_without_principal` (37849dfc) | GREEN | TIP_2 |
+| `inv_073_crossed_recovery_obligations::v16_program_one_recovery_obligation_waits_and_the_resolved_market_drains` (2d03e07e, control) | GREEN | TIP_3 |
+| `inv_073_crossed_recovery_obligations::v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market` (2d03e07e) | **RED**, ignored | TIP_4 |
+| `inv_073_crossed_recovery_obligations::v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits` (2d03e07e) | **RED**, ignored | TIP_5 |
+
+The two pre-existing INV-031 tests in the same file stay GREEN on db019142.
+
+### RED: crossed Recovery obligations lock the resolved market (2d03e07e)
+
+`tests/invariants/cu/inv_073_crossed_recovery_obligations.rs:169`, both crossed tests:
+`crossed Recovery obligations, winner first: nonterminal cohort reached a fixed point in round 1`.
+P and Q each forfeit one leg on a shut-down asset and keep a real position on the other. After resolution no
+`CloseResolved` call in a whole round changes anything, so R's gain on unrelated asset 0 is never paid. In
+the creator variant an account with no market role sets this up alone: it lists two assets for the fee,
+crosses two of its own accounts and forfeits. This matches the upstream report against its pre-fix engine
+(a55aceb3). The fix is upstream engine 2ed67b16 (a waiting Recovery obligation holds its account's other
+legs only while some account still has a loss to settle or book), which neither db019142 nor the engine tip
+has. There is no src change here; porting 2ed67b16 is an engine job.
+
+### Adaptations made in the ports (no assertion weakened except where noted)
+
+- INV-073: `ConfigurePermissionlessResolve` has a 9,000-slot floor in this fork (upstream uses 100), so the
+  resolve slot is `20 + 9,000 + 11` instead of 131.
+- INV-073: this fork answers a waiting `CloseResolved` with a successful no-op, where upstream refuses with
+  Custom 22. The drain counts a no-op as "no progress" (like a refusal) instead of failing on it. A real lock
+  still fails, because a whole round without progress trips the fixed-point assertion. This is the one
+  loosening; the control test shows that the fork's no-op on a winner waiting for its loser is otherwise
+  harmless.
+- INV-073 creator variant: the market account is pre-sized before each permissionless activation
+  (`grow_market_capacity_for_test`), as the fork's other activation tests do, because this program cannot
+  realloc a market past 10,240 bytes (note in `src/v16_program.rs` near line 275).
+- INV-073: the drain, the non-admin shutdown sender and the crank hint are local helpers (upstream keeps them in
+  its `v16_cu.rs`); `CloseResolved` passes the fork's NFT-registry account.
+- INV-031 (37849dfc): portfolio fields are plain integers here (`.capital`, not `.capital.get()`). A refusal
+  is accepted as Custom 21 (upstream's code) or Custom 25 (this fork's ledger-principal cap, which is what
+  actually refuses all five withdrawals here), and must move nothing either way.
