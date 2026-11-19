@@ -17,3 +17,7 @@ Next: build baseline, apply patch, run the v16_cu test
 ## Try c (J-20261118-PROG-CU-EWMAMARKPUSHc)
 - Host differential with patch applied (debug, private target dir): `ewma_update_matches_u128_reference_200k` ok, 0 mismatches over 200k inputs. Debug dep build took 19m49s.
 - Next: baseline build-sbf + release v16_cu at base, then with patch.
+- Baseline build at base (patch unapplied), private target dir, slot lock acquired immediately (0s wait):
+  `cargo build-sbf --features devnet` finished in 24m52s (08:24). `cargo test --release --features devnet --test v16_cu --no-run -j 4`
+  was still compiling deps (~1500 artifacts, around dlopen2_derive/serde_derive_internals) at 09:00, past the 120 min cut-off. Stopped; no CU numbers measured.
+- Unapplied patch + passing differential remain on this branch for a follow-up; dep cache in $HOME/agent-work/wt-target-EWMAc is warm for debug and SBF.
