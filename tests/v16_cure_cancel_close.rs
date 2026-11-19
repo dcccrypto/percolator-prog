@@ -20,12 +20,14 @@
 //!     canceled, no irreversible progress, residual == gross, barrier count != 0
 //!     -> LockActive (engine v16.rs `preflight_cure_and_cancel_close`)
 //! 10. engine: `cured_equity < certified_initial_req` -> InvalidConfig (EngineInvalidConfig)
-//!     (note: the bar is the INITIAL requirement, which is above maintenance)
+//!     (the bar is the INITIAL requirement. A cure on an account with a live leg on the closing
+//!     asset fails earlier with InvalidLeg(18): `v16_attack_*` seeds only flat closes, so the
+//!     shortfall here is made with unpaid fee debt on a flat account.)
 //!
 //! Every refusal asserts the exact custom error code and that the market, portfolio, source
 //! token and vault token account bytes are unchanged.
 use litesvm::LiteSVM;
-use percolator::{CloseProgressLedgerV16, MarketModeV16, SideV16, POS_SCALE};
+use percolator::{CloseProgressLedgerV16, MarketModeV16, SideV16};
 use percolator_prog::{
     error::PercolatorError,
     ix::Instruction as ProgInstruction,
@@ -371,46 +373,6 @@ impl Env {
         )
     }
 
-    fn trade(
-        &mut self,
-        a: (&Keypair, Pubkey),
-        b: (&Keypair, Pubkey),
-        size_q: i128,
-        exec_price: u64,
-    ) {
-        let (a_id, _, a_epoch) = self.identity(a.1);
-        let (b_id, _, b_epoch) = self.identity(b.1);
-        let market_id = state::read_market_trade_preflight(
-            &self.svm.get_account(&self.market).unwrap().data,
-            0,
-        )
-        .unwrap()
-        .3;
-        self.send(
-            ProgInstruction::TradeNoCpi {
-                account_a_portfolio_id: a_id,
-                account_a_position_epoch: a_epoch,
-                account_b_portfolio_id: b_id,
-                account_b_position_epoch: b_epoch,
-                market_id,
-                asset_index: 0,
-                size_q,
-                exec_price,
-                fee_bps: 0,
-                backing_fee_cap_bps: 10_000,
-            },
-            vec![
-                AccountMeta::new(a.0.pubkey(), true),
-                AccountMeta::new(b.0.pubkey(), true),
-                AccountMeta::new(self.market, false),
-                AccountMeta::new(a.1, false),
-                AccountMeta::new(b.1, false),
-            ],
-            &[a.0, b.0],
-        )
-        .expect("trade");
-    }
-
     /// STATE POKE (same shape as `V16CuEnv::seed_cancellable_close_progress` in v16_cu.rs): a
     /// genuinely pending, cancellable close ledger plus the matching domain loss barrier.
     fn seed_cancellable_close(&mut self, portfolio: Pubkey) {
@@ -439,20 +401,13 @@ impl Env {
         self.svm.set_account(portfolio, portfolio_account).unwrap();
     }
 
-    /// STATE POKE: lower an account's capital (and the matching c_tot / vault) so that its
-    /// equity sits below the initial requirement of its open position.
-    fn drain_capital_to(&mut self, portfolio: Pubkey, new_capital: u128) {
-        let mut market_account = self.svm.get_account(&self.market).unwrap();
+    /// STATE POKE: give a flat account unpaid fee debt (negative fee_credits), so its
+    /// certified equity is `capital - debt` and a cure must first make up the shortfall.
+    fn set_fee_debt(&mut self, portfolio: Pubkey, debt: i128) {
         let mut portfolio_account = self.svm.get_account(&portfolio).unwrap();
-        let (cfg, mut group) = state::read_market(&market_account.data).unwrap();
         let mut account = state::read_portfolio(&portfolio_account.data).unwrap();
-        let delta = account.capital - new_capital;
-        account.capital = new_capital;
-        group.c_tot -= delta;
-        group.vault -= delta;
-        state::write_market(&mut market_account.data, &cfg, &group).unwrap();
+        account.fee_credits = -debt;
         state::write_portfolio(&mut portfolio_account.data, &account).unwrap();
-        self.svm.set_account(self.market, market_account).unwrap();
         self.svm.set_account(portfolio, portfolio_account).unwrap();
     }
 
@@ -523,26 +478,12 @@ impl Env {
 }
 
 fn assert_code(err: &str, expected: PercolatorError) {
+    let want = expected as u32;
     assert_eq!(
         custom_code(err),
-        Some(expected as u32),
-        "expected {expected:?} ({}); got {err}",
-        expected as u32
+        Some(want),
+        "expected Custom({want}); got {err}"
     );
-}
-
-/// Two funded portfolios holding an opposite POS_SCALE position at price 100 (notional/IM 100,
-/// margin 100%). Returns (env, long_owner, long, short_owner, short).
-fn env_with_position() -> (Env, Keypair, Pubkey, Keypair, Pubkey) {
-    let mut env = Env::new();
-    let long_owner = Keypair::new();
-    let short_owner = Keypair::new();
-    let long = env.create_portfolio(&long_owner);
-    let short = env.create_portfolio(&short_owner);
-    env.deposit(&long_owner, long, 10_000);
-    env.deposit(&short_owner, short, 10_000);
-    env.trade((&long_owner, long), (&short_owner, short), POS_SCALE as i128, 100);
-    (env, long_owner, long, short_owner, short)
 }
 
 // ───────────────────────────── success paths ─────────────────────────────
@@ -584,26 +525,26 @@ fn cure_cancel_close_success_flat_account_cancels_close_and_account_is_healthy()
 }
 
 #[test]
-fn cure_cancel_close_success_with_open_position_meets_initial_requirement() {
-    let (mut env, long_owner, long, _short_owner, _short) = env_with_position();
-    // Equity (35) is below the position's initial requirement (100) -> a deposit is NEEDED.
-    env.drain_capital_to(long, 35);
-    env.seed_cancellable_close(long);
-    let source = env.token_account_for_mint(env.mint, long_owner.pubkey(), 100);
-    // Control: 64 is one short (35 + 64 = 99 < 100) -> refused (also proven in the refusal test);
-    // 65 reaches the requirement and cures.
-    env.cure(&long_owner, long, source, 65).expect("cure with sufficient deposit");
-
-    let account = state::read_portfolio(&env.svm.get_account(&long).unwrap().data).unwrap();
+fn cure_cancel_close_success_when_deposit_covers_shortfall() {
+    let mut env = Env::new();
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    env.deposit(&owner, portfolio, 10);
+    env.set_fee_debt(portfolio, 100); // equity = 10 - 100 = -90
+    env.seed_cancellable_close(portfolio);
+    let source = env.token_account_for_mint(env.mint, owner.pubkey(), 100);
+    // 90 is the exact shortfall boundary: equity -90 + 90 = 0 -> cures (initial req of a flat
+    // account is 0).
+    env.cure(&owner, portfolio, source, 90).expect("cure with sufficient deposit");
+    let account = state::read_portfolio(&env.svm.get_account(&portfolio).unwrap().data).unwrap();
     let (_, group) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
     assert!(account.close_progress.canceled && !account.close_progress.active);
     assert_eq!(account.capital, 100);
     assert_eq!(group.pending_domain_loss_barriers[0], 0);
-    assert_eq!(env.token_amount(source), 35);
-    // the position is still open and the account stays usable (Deposit lands).
-    assert!(!percolator::active_bitmap_is_empty(account.active_bitmap));
-    env.deposit(&long_owner, long, 5);
-    let account = state::read_portfolio(&env.svm.get_account(&long).unwrap().data).unwrap();
+    assert_eq!(env.token_amount(source), 10);
+    // the account stays usable: a further Deposit lands.
+    env.deposit(&owner, portfolio, 5);
+    let account = state::read_portfolio(&env.svm.get_account(&portfolio).unwrap().data).unwrap();
     assert_eq!(account.capital, 105);
 }
 
@@ -671,20 +612,23 @@ fn cure_cancel_close_refuses_replay_after_cancel() {
 
 #[test]
 fn cure_cancel_close_refuses_cure_that_leaves_account_below_requirement() {
-    let (mut env, long_owner, long, _short_owner, _short) = env_with_position();
-    env.drain_capital_to(long, 35);
-    env.seed_cancellable_close(long);
-    let source = env.token_account_for_mint(env.mint, long_owner.pubkey(), 100);
-    let snap = env.snapshot(&[env.market, long, source, env.vault]);
-    // no deposit at all, then a deposit one atom short of the requirement (35 + 64 = 99 < 100)
-    for amount in [0u128, 20, 64] {
+    let mut env = Env::new();
+    let owner = Keypair::new();
+    let portfolio = env.create_portfolio(&owner);
+    env.deposit(&owner, portfolio, 10);
+    env.set_fee_debt(portfolio, 100); // equity -90 vs initial requirement 0
+    env.seed_cancellable_close(portfolio);
+    let source = env.token_account_for_mint(env.mint, owner.pubkey(), 100);
+    let snap = env.snapshot(&[env.market, portfolio, source, env.vault]);
+    // no deposit, a partial deposit, and one atom short of the 90 shortfall
+    for amount in [0u128, 20, 89] {
         let err = env
-            .cure(&long_owner, long, source, amount)
+            .cure(&owner, portfolio, source, amount)
             .expect_err("cure below requirement must refuse");
         assert_code(&err, PercolatorError::EngineInvalidConfig);
         env.assert_unchanged(&snap, "insufficient cure");
     }
-    let account = state::read_portfolio(&env.svm.get_account(&long).unwrap().data).unwrap();
+    let account = state::read_portfolio(&env.svm.get_account(&portfolio).unwrap().data).unwrap();
     assert!(account.close_progress.active && !account.close_progress.canceled);
 }
 
@@ -760,3 +704,4 @@ fn cure_cancel_close_refuses_resolved_market() {
     assert_code(&err, PercolatorError::EngineLockActive);
     env.assert_unchanged(&snap, "resolved market");
 }
+
