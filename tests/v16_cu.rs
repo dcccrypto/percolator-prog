@@ -29664,3 +29664,317 @@ fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
         "a target change must not carry the previous target's price-move remainder"
     );
 }
+
+// ── SwapSecondaryForPrimary (tag 60-family) real-path BPF tests ──────────────
+//
+// `handle_swap_secondary_for_primary` (src/v16_program.rs) checks, in order:
+//   signer(authority) / writable(4 token accts) / market owner == program /
+//   verify_token_program (key == spl_token::ID && executable -> InvalidTokenProgram) /
+//   amount == 0 -> InvalidInstruction / amount_to_u64 (> u64::MAX -> InvalidInstruction) /
+//   mode == Live else EngineLockActive / marketauth == signer else Unauthorized /
+//   authority_epoch CAS (EngineStale) / secondary mint configured else InvalidMint /
+//   vault_authority key / primary_source: owner+mint (InvalidMint / InvalidTokenAccount) /
+//   primary_vault + secondary_vault: canonical vault (InvalidMint / InvalidVaultAccount) /
+//   secondary_dest: owner+mint / balance(primary_source) >= amount and
+//   balance(secondary_vault) >= amount else InvalidTokenAccount.
+// The conversion is exactly 1:1 in base units: `amount_u64` moves primary source->vault
+// and the SAME `amount_u64` moves secondary vault->dest. There is no rate and no
+// rounding, so by construction no amount can favour the caller.
+struct SwapAccts {
+    primary_source: Pubkey,
+    primary_vault: Pubkey,
+    secondary_dest: Pubkey,
+    secondary_vault: Pubkey,
+}
+
+fn swap_balances(env: &V16CuEnv, a: &SwapAccts) -> [u64; 4] {
+    [
+        env.token_amount(a.primary_source),
+        env.token_amount(a.primary_vault),
+        env.token_amount(a.secondary_dest),
+        env.token_amount(a.secondary_vault),
+    ]
+}
+
+fn swap_setup(
+    env: &mut V16CuEnv,
+    user_primary: u64,
+    vault_secondary: u64,
+) -> (Pubkey, SwapAccts) {
+    let admin = env.admin.pubkey();
+    let secondary_mint = env.create_mint();
+    env.update_base_unit_mints_with_cu(env.mint, secondary_mint);
+    let primary_source = env.token_account_for_mint(env.mint, admin, user_primary);
+    let secondary_dest = env.token_account_for_mint(secondary_mint, admin, 0);
+    let secondary_vault = env.vault_token_for_mint(secondary_mint, vault_secondary);
+    (
+        secondary_mint,
+        SwapAccts {
+            primary_source,
+            primary_vault: env.vault,
+            secondary_dest,
+            secondary_vault,
+        },
+    )
+}
+
+fn swap_try(
+    env: &mut V16CuEnv,
+    a: &SwapAccts,
+    amount: u128,
+    token_program: Pubkey,
+) -> Result<u64, String> {
+    let authority_epoch = env.control_sequences(0).authority_epoch;
+    let admin = env.admin.insecure_clone();
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::SwapSecondaryForPrimary {
+            amount,
+            authority_epoch,
+        },
+        vec![
+            AccountMeta::new(admin.pubkey(), true),
+            AccountMeta::new_readonly(env.market, false),
+            AccountMeta::new(a.primary_source, false),
+            AccountMeta::new(a.primary_vault, false),
+            AccountMeta::new(a.secondary_dest, false),
+            AccountMeta::new(a.secondary_vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(token_program, false),
+        ],
+        &[&admin],
+    )
+}
+
+/// Assert a refusal with the exact custom error and that neither the market
+/// account bytes nor any of the four token balances changed.
+fn assert_swap_refused(
+    env: &mut V16CuEnv,
+    a: &SwapAccts,
+    amount: u128,
+    token_program: Pubkey,
+    expected: PercolatorError,
+) {
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let bal_before = swap_balances(env, a);
+    let err = swap_try(env, a, amount, token_program).expect_err("swap must be refused");
+    assert_eq!(
+        custom_code(&err),
+        Some(expected as u32),
+        "expected {expected:?}; got {err}"
+    );
+    assert_eq!(swap_balances(env, a), bal_before, "token balances moved on refusal");
+    assert_eq!(
+        env.svm.get_account(&env.market).unwrap().data,
+        market_before,
+        "market account changed on refusal"
+    );
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_is_exact_one_to_one_and_conserves_value() {
+    // Round and non-round amounts, incl. 1 (smallest unit), primes and u64-ish values.
+    for amount in [1u64, 2, 7, 50, 1_000, 999_999, 1_000_001, 123_456_789_012_345] {
+        let mut env = V16CuEnv::new();
+        let user_primary = amount + 13;
+        let vault_secondary = amount + 29;
+        let (_m, a) = swap_setup(&mut env, user_primary, vault_secondary);
+        let before = swap_balances(&env, &a);
+        let market_before = env.svm.get_account(&env.market).unwrap().data;
+        swap_try(&mut env, &a, amount as u128, spl_token::ID).expect("swap succeeds");
+        let after = swap_balances(&env, &a);
+        // Exactly `amount` each way: caller gives `amount` primary, gets `amount` secondary.
+        assert_eq!(after[0], before[0] - amount, "primary source debit");
+        assert_eq!(after[1], before[1] + amount, "primary vault credit");
+        assert_eq!(after[2], before[2] + amount, "secondary dest credit");
+        assert_eq!(after[3], before[3] - amount, "secondary vault debit");
+        // Value conservation: per-mint totals are unchanged (no mint, no burn) ...
+        assert_eq!(after[0] + after[1], before[0] + before[1], "primary total");
+        assert_eq!(after[2] + after[3], before[2] + before[3], "secondary total");
+        // ... caller's net primary loss equals their net secondary gain (never favoured),
+        // and the vault's net is the exact mirror image.
+        assert_eq!(before[0] - after[0], after[2] - before[2]);
+        assert_eq!(after[1] - before[1], before[3] - after[3]);
+        // Accounting snapshot (market account bytes) untouched: custody-only move.
+        assert_eq!(
+            env.svm.get_account(&env.market).unwrap().data,
+            market_before,
+            "swap must not touch engine accounting"
+        );
+    }
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_full_balance_drains_exactly() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 777, 777);
+    swap_try(&mut env, &a, 777, spl_token::ID).expect("exact-balance swap");
+    assert_eq!(swap_balances(&env, &a), [0, 777, 777, 0]);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_zero_amount() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    assert_swap_refused(&mut env, &a, 0, spl_token::ID, PercolatorError::InvalidInstruction);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_amount_above_u64() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    assert_swap_refused(
+        &mut env,
+        &a,
+        (u64::MAX as u128) + 1,
+        spl_token::ID,
+        PercolatorError::InvalidInstruction,
+    );
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_amount_over_caller_primary_balance() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 99, 1_000);
+    assert_swap_refused(&mut env, &a, 100, spl_token::ID, PercolatorError::InvalidTokenAccount);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_amount_over_secondary_vault_balance() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 1_000, 99);
+    assert_swap_refused(&mut env, &a, 100, spl_token::ID, PercolatorError::InvalidTokenAccount);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_wrong_mints() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.pubkey();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    let other_mint = env.create_mint();
+
+    // primary source in an unrelated mint
+    let bad = SwapAccts {
+        primary_source: env.token_account_for_mint(other_mint, admin, 100),
+        ..clone_accts(&a)
+    };
+    assert_swap_refused(&mut env, &bad, 50, spl_token::ID, PercolatorError::InvalidMint);
+
+    // secondary destination in an unrelated mint
+    let bad = SwapAccts {
+        secondary_dest: env.token_account_for_mint(other_mint, admin, 0),
+        ..clone_accts(&a)
+    };
+    assert_swap_refused(&mut env, &bad, 50, spl_token::ID, PercolatorError::InvalidMint);
+
+    // secondary vault is the PRIMARY-mint vault (swap would pay primary out for primary)
+    let bad = SwapAccts {
+        secondary_vault: env.vault,
+        ..clone_accts(&a)
+    };
+    assert_swap_refused(&mut env, &bad, 50, spl_token::ID, PercolatorError::InvalidMint);
+
+    // primary vault slot given the secondary-mint vault
+    let bad = SwapAccts {
+        primary_vault: a.secondary_vault,
+        ..clone_accts(&a)
+    };
+    assert_swap_refused(&mut env, &bad, 50, spl_token::ID, PercolatorError::InvalidMint);
+
+    // user primary source given as the secondary-mint account
+    let bad = SwapAccts {
+        primary_source: a.secondary_dest,
+        ..clone_accts(&a)
+    };
+    assert_swap_refused(&mut env, &bad, 50, spl_token::ID, PercolatorError::InvalidMint);
+}
+
+fn clone_accts(a: &SwapAccts) -> SwapAccts {
+    SwapAccts {
+        primary_source: a.primary_source,
+        primary_vault: a.primary_vault,
+        secondary_dest: a.secondary_dest,
+        secondary_vault: a.secondary_vault,
+    }
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_wrong_token_program() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    // An arbitrary key that is not the classic SPL Token program.
+    assert_swap_refused(
+        &mut env,
+        &a,
+        50,
+        Pubkey::new_unique(),
+        PercolatorError::InvalidTokenProgram,
+    );
+    // The system program (executable, but not spl_token::ID).
+    assert_swap_refused(
+        &mut env,
+        &a,
+        50,
+        solana_sdk::system_program::ID,
+        PercolatorError::InvalidTokenProgram,
+    );
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_unconfigured_secondary() {
+    let mut env = V16CuEnv::new();
+    let admin = env.admin.pubkey();
+    // No UpdateBaseUnitMints: secondary_collateral_mint stays all-zero.
+    let (cfg, _) = env.market_state();
+    assert_eq!(cfg.secondary_collateral_mint, [0u8; 32]);
+    let phantom_mint = env.create_mint();
+    let a = SwapAccts {
+        primary_source: env.token_account_for_mint(env.mint, admin, 100),
+        primary_vault: env.vault,
+        secondary_dest: env.token_account_for_mint(phantom_mint, admin, 0),
+        secondary_vault: env.vault_token_for_mint(phantom_mint, 100),
+    };
+    assert_swap_refused(&mut env, &a, 50, spl_token::ID, PercolatorError::InvalidMint);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_resolved_market() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    env.resolve();
+    assert_swap_refused(&mut env, &a, 50, spl_token::ID, PercolatorError::EngineLockActive);
+}
+
+#[test]
+fn v16_bpf_swap_secondary_for_primary_rejects_non_authority_signer() {
+    let mut env = V16CuEnv::new();
+    let (_m, a) = swap_setup(&mut env, 100, 100);
+    let intruder = Keypair::new();
+    env.ensure_signer_account(intruder.pubkey());
+    let market_before = env.svm.get_account(&env.market).unwrap().data;
+    let before = swap_balances(&env, &a);
+    let authority_epoch = env.control_sequences(0).authority_epoch;
+    env.svm.expire_blockhash();
+    let err = env
+        .send(
+            ProgInstruction::SwapSecondaryForPrimary {
+                amount: 50,
+                authority_epoch,
+            },
+            vec![
+                AccountMeta::new(intruder.pubkey(), true),
+                AccountMeta::new_readonly(env.market, false),
+                AccountMeta::new(a.primary_source, false),
+                AccountMeta::new(a.primary_vault, false),
+                AccountMeta::new(a.secondary_dest, false),
+                AccountMeta::new(a.secondary_vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&intruder],
+        )
+        .expect_err("non-marketauth signer must be refused");
+    assert_eq!(custom_code(&err), Some(PercolatorError::Unauthorized as u32), "{err}");
+    assert_eq!(swap_balances(&env, &a), before);
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
+}
