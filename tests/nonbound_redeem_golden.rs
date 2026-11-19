@@ -536,28 +536,6 @@ fn deposit(env: &mut Env, v: &Vault, amount: u128, domain: u16) {
     .expect("deposit");
 }
 
-fn rebalance(env: &mut Env, v: &Vault, from: u16, to: u16, amount: u128) -> Result<(), String> {
-    let (fl, tl) = if from == DOMAIN { (v.ledger, v.sibling_ledger) } else { (v.sibling_ledger, v.ledger) };
-    let cranker = Keypair::new();
-    env.svm.airdrop(&cranker.pubkey(), 10_000_000_000).unwrap();
-    let payer = env.payer.insecure_clone();
-    send(
-        &mut env.svm,
-        env.program_id,
-        &payer,
-        ProgInstruction::RebalanceLpVaultBacking { from_domain: from, to_domain: to, amount },
-        vec![
-            AccountMeta::new(cranker.pubkey(), true),
-            AccountMeta::new(env.market, false),
-            AccountMeta::new(v.registry, false),
-            AccountMeta::new(fl, false),
-            AccountMeta::new(tl, false),
-            AccountMeta::new_readonly(solana_sdk::system_program::ID, false),
-        ],
-        &[&cranker],
-    )
-}
-
 fn request(env: &mut Env, v: &Vault, shares: u128) {
     let lp = v.lp.insecure_clone();
     let payer = env.payer.insecure_clone();
@@ -620,10 +598,6 @@ fn registry_shares(env: &Env, v: &Vault) -> u128 {
     state::read_lp_vault_registry(&env.svm.get_account(&v.registry).unwrap().data)
         .unwrap()
         .total_lp_shares_outstanding
-}
-
-fn floor_mul_div(a: u128, b: u128, c: u128) -> u128 {
-    a.checked_mul(b).expect("test values fit u128") / c
 }
 
 // ───────────────────────────── golden grid ─────────────────────────────
