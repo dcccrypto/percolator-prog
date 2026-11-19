@@ -29718,6 +29718,13 @@ fn v16_738_batch_trade_cpi_poststate_identical_base_vs_head() {
                 let mut j = 0;
                 while j + 32 <= d.len() { if d[j..j + 32] == kb { for b in d[j..j + 32].iter_mut() { *b = 0xA0 + i as u8; } hits.push((j, i)); j += 32; } else { j += 1; } }
             }
+            // Named mask 2: matcher ctx `lp_account_id` (CTX_VAMM_OFFSET 64 + 160 = 224..232) is the
+            // first 8 bytes of the random delegate PDA (`matcher_lp_account_id`), a truncated key the
+            // 32-byte scan above cannot see.
+            if ai == 3 && d.len() >= 232 && d[224..232] == delegate.to_bytes()[0..8] {
+                for b in d[224..232].iter_mut() { *b = 0xBF; }
+                println!("  NAMEDMASK legs={legs_n} so={so} matcher_ctx[224..232] lp_account_id=delegate[0..8] bytes=8");
+            }
             hits.sort();
             println!("  KEYMASK legs={legs_n} so={so} acct{ai}({}) len={} key_bytes_masked={} (offset,key#)={hits:?}", names[ai], d.len(), hits.len() * 32);
             out.push(d);
