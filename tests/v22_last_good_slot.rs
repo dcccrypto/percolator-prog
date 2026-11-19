@@ -28,7 +28,7 @@ mod indep_harness;
 use indep_harness::*;
 
 const PX: u64 = 1_000_000;
-const STALE: u64 = 200;
+const STALE: u64 = 9_000; // program minimum (MIN_PERMISSIONLESS_RESOLVE_STALE_SLOTS)
 const HEADER_LEN: usize = 16;
 /// Struct-relative offset of `AssetOracleProfileV16.last_good_oracle_slot`.
 const PROFILE_LGS_OFF: usize = 216;
@@ -54,7 +54,7 @@ fn world() -> V16CuEnv {
     for a in 0..2u16 {
         env.configure_auth_mark_for_asset_as_admin(a, 1, PX);
     }
-    env.configure_permissionless_resolve_with_cu(STALE, 50);
+    env.configure_permissionless_resolve_with_cu(STALE, 1_000);
     env
 }
 
@@ -107,7 +107,7 @@ fn asset1_stale_while_asset0_pushed_is_untradeable_not_resolvable() {
     // Keep only asset 0 fresh for 3x the window; asset 1 was last pushed at slot 1.
     let mut s = 1;
     while s < 1 + 3 * STALE {
-        s += 50;
+        s += 1_000;
         warp(&mut env, s);
         env.push_auth_mark_for_asset_as_admin(0, s, PX);
     }
