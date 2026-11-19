@@ -107,6 +107,7 @@ fn last_good_ahead_of_clock_saturates_without_underflow() {
     // Even a last_good of u64::MAX cannot wrap into "matured".
     let mut env = setup(S, u64::MAX, 0);
     expect_err(resolve(&mut env, 50, u64::MAX), PercolatorError::OracleStale, "last_good u64::MAX");
+    assert_eq!(mode(&env), MarketModeV16::Live);
 }
 
 #[test]
@@ -135,39 +136,46 @@ fn already_resolved_is_engine_lock_active_and_state_unchanged() {
 
 #[test]
 fn resolve_emits_market_resolved_move_event_once() {
-    // Decode every `Program data:` log and count MOVE lines for tag 39 with sub MOVE_MARKET_RESOLVED.
-    fn count(logs: &[String], market: &[u8; 32], resolved_slot: u64) -> usize {
-        use percolator_prog::fill_events_v22 as ev;
-        logs.iter()
+    use percolator_prog::fill_events_v22 as ev;
+    fn reference(market: &[u8; 32], slot: u64) -> Vec<u8> {
+        let mut buf = [0u8; ev::MOVE_LEN];
+        let n = ev::encode_move(
+            &mut buf,
+            ev::TAG_RESOLVE_STALE_PERMISSIONLESS,
+            market,
+            ev::MOVE_MARKET_RESOLVED,
+            ev::NO_ASSET,
+            slot,
+            0,
+            0,
+        );
+        buf[..n].to_vec()
+    }
+    // (lines sharing the kind/tag/market/sub prefix, lines equal to the full expected payload).
+    // The prefix count catches a duplicate event with any slot; the full count pins the payload.
+    fn count(logs: &[String], market: &[u8; 32], slot: u64) -> (usize, usize) {
+        let full = reference(market, slot);
+        let prefix_len = full.len() - (2 + 8 + 8 + 8);
+        let lines: Vec<Vec<u8>> = logs
+            .iter()
             .filter_map(|l| l.strip_prefix("Program data: "))
-            .filter(|b64| {
-                let mut buf = [0u8; ev::MOVE_LEN];
-                let n = ev::encode_move(
-                    &mut buf,
-                    ev::TAG_RESOLVE_STALE_PERMISSIONLESS,
-                    market,
-                    ev::MOVE_MARKET_RESOLVED,
-                    ev::NO_ASSET,
-                    resolved_slot,
-                    0,
-                    0,
-                );
-                b64_decode(b64.trim()).as_deref() == Some(&buf[..n])
-            })
-            .count()
+            .filter_map(|b| b64_decode(b.trim()))
+            .collect();
+        (
+            lines.iter().filter(|d| d.len() >= prefix_len && d[..prefix_len] == full[..prefix_len]).count(),
+            lines.iter().filter(|d| **d == full).count(),
+        )
     }
 
     let mut env = setup(S, L, 0);
-    // A refused attempt emits nothing.
     let market = env.market.to_bytes();
-    let _ = resolve(&mut env, L + S - 1, 0);
-    assert_eq!(count(&last_logs(), &market, L + S - 1), 0);
+    expect_err(resolve(&mut env, L + S - 1, 0), PercolatorError::OracleStale, "early");
+    assert_eq!(count(&last_logs(), &market, L + S - 1), (0, 0));
     resolve(&mut env, L + S, 0).expect("resolve");
     let logs = last_logs();
-    assert_eq!(count(&logs, &market, L + S), 1, "exactly one market-resolved MOVE: {logs:#?}");
-    // A repeat is refused and emits no second event.
-    let _ = resolve(&mut env, L + S + 1, 0);
-    assert_eq!(count(&last_logs(), &market, L + S), 0);
+    assert_eq!(count(&logs, &market, L + S), (1, 1), "exactly one market-resolved MOVE: {logs:#?}");
+    expect_err(resolve(&mut env, L + S + 1, 0), PercolatorError::EngineLockActive, "repeat");
+    assert_eq!(count(&last_logs(), &market, L + S + 1).0, 0);
 }
 
 fn b64_decode(s: &str) -> Option<Vec<u8>> {
