@@ -44,20 +44,19 @@ fn resolved_backing_deadline(group: &MarketGroupV16) -> u64 {
 
 fn resolved_portfolio_is_terminal(env: &V16CuEnv, portfolio: Pubkey) -> bool {
     let account = env.portfolio_state(portfolio);
-    let receipt = resolved_receipt(&account);
+    let receipt = &account.resolved_payout_receipt;
     let (_, group) = env.market_state();
-    account.capital.get() == 0
-        && account.pnl.get() == 0
-        && account.reserved_pnl.get() == 0
-        && account.fee_credits.get() == 0
-        && account.cancel_deposit_escrow.get() == 0
-        && percolator::active_bitmap_is_empty(active_bitmap(&account))
-        && account
-            .source_domains
-            .iter()
-            .all(|source| !source.is_occupied())
+    account.capital == 0
+        && account.pnl == 0
+        && account.reserved_pnl == 0
+        && account.fee_credits == 0
+        && account.cancel_deposit_escrow == 0
+        && percolator::active_bitmap_is_empty(account.active_bitmap)
+        && account.source_claim_bound_num.iter().all(|n| *n == 0)
+        && account.source_claim_liened_num.iter().all(|n| *n == 0)
+        && account.source_claim_impaired_num.iter().all(|n| *n == 0)
         && (!receipt.present || receipt.finalized)
-        && account.last_fee_slot.get() == group.resolved_slot
+        && account.last_fee_slot == group.resolved_slot
 }
 
 const PRICE: u64 = 1_000_000;
@@ -411,11 +410,11 @@ fn v16_program_silent_owner_holds_the_other_side_only_for_the_owner_window() {
     settle_until_it_waits(&mut env, &actors[L], label);
     let l = env.portfolio_state(actors[L].1);
     assert_eq!(
-        l.capital.get(),
+        l.capital,
         L_DEPOSIT - fall,
         "{label}: L has paid its loss"
     );
-    assert_eq!(l.pnl.get(), 0, "{label}: L owes nothing");
+    assert_eq!(l.pnl, 0, "{label}: L owes nothing");
     // X settles. W stays silent, and L still waits.
     settle_until_it_waits(&mut env, &actors[X], label);
     assert_waits(&mut env, &actors[L], label);
