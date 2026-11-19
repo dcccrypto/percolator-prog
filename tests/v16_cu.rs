@@ -9179,3 +9179,75 @@ mod inv_089_activation_reactivation_and_initialization_equivalence;
 
 #[path = "invariants/cu/inv_070_issue289_bankruptcy_residual_recredit.rs"]
 mod inv_070_issue289_bankruptcy_residual_recredit;
+
+// CU probe (measurement only, no behavioural assertions): compute units for a TradeCpi and for a
+// BatchTradeCpi with N legs. Run with `--nocapture` and read the `CUPROBE` lines:
+//   cargo test --test v16_cu cu_probe_trade_cpi_legs -- --ignored --nocapture
+#[test]
+#[ignore = "measurement probe; run explicitly with --ignored --nocapture"]
+fn cu_probe_trade_cpi_legs() {
+    for legs in [0usize, 1, 2, 4, 8, 16] {
+        for run in 0..3 {
+            let n_assets = legs.max(1) as u16;
+            let mut env = V16CuEnv::new_with_market_params_and_price_move(
+                n_assets, 5_000, 10_000, 1_000,
+            );
+            let matcher_program = Pubkey::new_unique();
+            env.svm.add_program(
+                matcher_program,
+                &std::fs::read(auth_matcher_program_path()).unwrap(),
+            );
+            let taker = Keypair::new();
+            let lp = Keypair::new();
+            let taker_account = env.create_portfolio(&taker);
+            let lp_account = env.create_portfolio(&lp);
+            env.deposit(&taker, taker_account, 100_000_000);
+            env.deposit(&lp, lp_account, 100_000_000);
+            let (ctx, delegate, _) = env.init_auth_matcher_context(matcher_program, &lp, lp_account);
+            let size = (POS_SCALE / 100) as i128;
+            env.svm.expire_blockhash();
+            let result = if legs == 0 {
+                env.try_trade_cpi_with_cu_on_asset(
+                    &taker,
+                    taker_account,
+                    &lp,
+                    lp_account,
+                    matcher_program,
+                    ctx,
+                    delegate,
+                    0,
+                    size,
+                    0,
+                )
+            } else {
+                let (_, state) = env.market_state();
+                let batch = (0..legs)
+                    .map(|i| BatchTradeCpiLeg {
+                        asset_index: i as u16,
+                        market_id: state.assets[i].market_id,
+                        size_q: size,
+                        fee_bps: 0,
+                        limit_price: 0,
+                    })
+                    .collect::<Vec<_>>();
+                env.send(
+                    env.batch_trade_cpi_ix(taker_account, lp_account, batch),
+                    vec![
+                        AccountMeta::new(taker.pubkey(), true),
+                        AccountMeta::new(env.market, false),
+                        AccountMeta::new(taker_account, false),
+                        AccountMeta::new(lp_account, false),
+                        AccountMeta::new_readonly(matcher_program, false),
+                        AccountMeta::new(ctx, false),
+                        AccountMeta::new_readonly(delegate, false),
+                    ],
+                    &[&taker],
+                )
+            };
+            println!(
+                "CUPROBE kind={} legs={legs} run={run} result={result:?}",
+                if legs == 0 { "trade_cpi" } else { "batch_trade_cpi" }
+            );
+        }
+    }
+}
