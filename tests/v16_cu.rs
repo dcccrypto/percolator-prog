@@ -25625,10 +25625,13 @@ fn v16_attack_withdraw_insurance_terminal_permissionless_cannot_redirect_benefic
 /// of the market account bytes and the token balances so before/after runs can be diffed.
 #[test]
 fn v16_w4_payout_withdraw_insurance_cu_at_max_assets() {
-    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 10_000, 10_000, 10_000);
-    for i in 1..4u16 {
+    let mut env = V16CuEnv::new();
+    for i in 1..3u16 {
         env.activate_asset(i, i as u64, 100);
     }
+    // the LiteSVM realloc ceiling is crossed at capacity 4: pre-size, as the capacity-3->4 tests do
+    env.grow_market_capacity_for_test(4);
+    env.activate_asset(3, 3, 100);
     let admin = Keypair::from_bytes(&env.admin.to_bytes()).unwrap();
     for d in 0..8u16 {
         env.top_up_insurance_domain_with_authority(&admin, d, 1_000);
