@@ -7291,68 +7291,125 @@ fn r572_att647r2_resolved_close_with_tagged_occupancy_checkpoint() {
     }
 }
 
-/// J-20261117-PROG-726-EXPLAIN, REAL PATH (no account-byte pokes): the ADL-scaled dust leg is
-/// built only through instructions. A small long (victim, 20 Q = $20) and a big short (180 Q)
-/// both trade against the bound vault LP (LP net +160 long). The short then exits 150 Q through
-/// its own owner-signed tag 44 (RebalanceReduce): one-sided OI removal, so the engine ADL-scales
-/// the LONG side (A_long ~ 30/180). The victim's 20 Q basis leg is now ~3.34 Q effective (~$3.34),
-/// which is under half the $10 band minimum, so it is genuinely dust. Anyone may then sweep it
-/// through tag 118. Expected (correct) behaviour: the leg closes exactly. Today the sweep sizes
-/// the close from the 20 Q BASIS (u128::MAX -> basis branch), the engine applies it to the
-/// 3.34 Q EFFECTIVE leg, the result would flip the victim short, and the A != ADL_ONE gate
-/// refuses that as risk-increasing: Custom(120) EngineAdlReduceOnly.
-#[test]
-fn j726_real_path_tag118_sweep_of_adl_scaled_dust_leg() {
-    let mut env = Env::new(band_cfg());
+/// #726 real-path setup shared by the tag 118 / 119 tests below. Nothing is byte-poked on the
+/// legs or on A: the ADL comes from a real owner-signed tag 44 (RebalanceReduce) exit.
+///
+/// The victim (20 Q long) and a big filler (200 Q long) trade against the bound vault LP, and a
+/// short opens 180 Q, so the LP ends net SHORT 40 Q: the LP is on the OPPOSITE side of the
+/// victim, which is what a real forced close looks like (the LP takes the other side of the leg
+/// it closes). The short then exits all 180 Q through its own tag 44, which removes short OI
+/// one-sidedly and ADL-scales the LONG side to A_long = 40/220. The victim's 20 Q basis leg is
+/// now ~3.64 Q effective (~$3.64), under half the $10 band minimum. The short side (the LP's
+/// side) stays at A_short = ADL_ONE.
+///
+/// Returns (lp, victim, filler) after a warp and crank so every leg is current.
+fn j726_opposite_side_adl_world(env: &mut Env) -> (Lp, (Keypair, Pubkey), (Keypair, Pubkey)) {
     env.auth_mark();
     let lp = env.lp(10_000 * USD);
     let victim = env.trader(1_000 * USD);
+    let filler = env.trader(1_000 * USD);
     let short = env.trader(1_000 * USD);
     env.trade_cpi(&victim.0, victim.1, &lp, 20 * Q).expect("victim opens 20 Q long");
+    env.trade_cpi(&filler.0, filler.1, &lp, 200 * Q).expect("filler opens 200 Q long");
     env.trade_cpi(&short.0, short.1, &lp, -180 * Q).expect("short opens 180 Q short");
-    assert_eq!(env.pos(lp.account), 160 * Q, "LP net long 160");
+    assert_eq!(env.pos(lp.account), -40 * Q, "LP net SHORT 40: opposite side of the victim");
     let a0 = env.engine_asset();
     assert_eq!((a0.a_long, a0.a_short), (percolator::ADL_ONE, percolator::ADL_ONE), "no ADL yet");
     assert!(env.sweep_dust(victim.1, lp.account).is_err(), "control: a $20 leg is not dust before ADL");
 
-    // The real trigger: the short's own tag 44 exit of 150 Q.
-    env.rebalance_reduce(&short.0, short.1, (150 * Q) as u128).expect("tag 44 exit 150 Q");
+    env.rebalance_reduce(&short.0, short.1, (180 * Q) as u128).expect("real tag 44 exit of 180 Q");
     let a = env.engine_asset();
-    eprintln!("J726 after tag 44: a_long={} a_short={} (ADL_ONE={}) oi_eff_long={} oi_eff_short={}",
-        a.a_long, a.a_short, percolator::ADL_ONE, a.oi_eff_long_q, a.oi_eff_short_q);
-    assert!(a.a_long < percolator::ADL_ONE, "vacuity: real ADL scaled the long side");
+    assert!(a.a_long < percolator::ADL_ONE, "vacuity: real ADL scaled the victim's (long) side");
+    assert_eq!(a.a_short, percolator::ADL_ONE, "the LP's (short) side is not ADL-scaled");
     env.warp(1);
     env.crank_current(victim.1);
+    env.crank_current(filler.1);
     env.crank_current(lp.account);
+    (lp, victim, filler)
+}
+
+/// ADL-effective size of a LONG basis leg on the current asset (engine rounding: ceil).
+fn j726_long_effective(env: &Env, basis: i128) -> i128 {
     let a = env.engine_asset();
+    (basis.unsigned_abs() * a.a_long).div_ceil(percolator::ADL_ONE) as i128
+}
+
+/// #726 tag 118, REAL PATH: sweep of a dust leg that real ADL shrank, closed against an
+/// opposite-side vault LP. The wrapper must close the leg at its ADL-EFFECTIVE size. Unfixed, it
+/// sized the close from the 20 Q basis; the engine applies the delta to the ~3.64 Q effective
+/// leg, which would flip the victim short, and the A != ADL_ONE gate refuses that as
+/// risk-increasing (Custom(120) EngineAdlReduceOnly). Fixed, the victim goes exactly flat and the
+/// LP's short shrinks by exactly the victim's effective leg.
+#[test]
+fn j726_real_path_tag118_sweep_of_adl_scaled_dust_leg() {
+    let mut env = Env::new(band_cfg());
+    let (lp, victim, _filler) = j726_opposite_side_adl_world(&mut env);
     let basis = env.pos(victim.1);
-    let eff = (basis.unsigned_abs() * a.a_long).div_ceil(percolator::ADL_ONE);
-    eprintln!("J726 victim basis={} effective~={} (Q={})", basis, eff, Q);
+    let eff = j726_long_effective(&env, basis);
     assert_eq!(basis, 20 * Q, "stored basis leg is unchanged by ADL");
-    assert!(eff < basis.unsigned_abs(), "effective < basis");
+    assert!(eff < basis, "effective {eff} < basis {basis}");
+    let lp_before = env.pos(lp.account);
 
     let r = env.sweep_dust(victim.1, lp.account);
-    eprintln!("J726 tag 118 sweep result: {r:?}");
-    r.expect("tag 118 sweep of a REAL ADL-scaled dust leg");
-    assert_eq!(env.pos(victim.1), 0, "the whole leg is closed, not flipped");
+    eprintln!("J726 tag 118 sweep (LP opposite) result: {r:?}");
+    r.expect("tag 118 sweep of a real ADL-scaled dust leg against an opposite-side LP");
+    assert_eq!(env.pos(victim.1), 0, "the whole effective leg is closed, not flipped");
+    assert_eq!(env.pos(lp.account), lp_before + eff, "the LP's short shrinks by exactly the effective leg");
+    assert!(env.pos(lp.account) < 0, "the LP stays short (no flip)");
+    let a = env.engine_asset();
+    assert_eq!(a.oi_eff_long_q, a.oi_eff_short_q, "effective OI stays balanced");
     env.assert_conservation();
 }
 
-/// J-20261117-PROG-726-FIX, REAL PATH for tag 119 (eviction) of an ADL-shrunk small leg. Same
-/// state as the tag 118 test (victim 20 Q long, effective ~3.3 Q after the short's real tag 44
-/// exit), plus a second long so the long side is full (cap 2, the config poke the other tag 119
-/// tests use; no leg or A byte is poked). The taker opens 30 Q (>= 2x the victim's effective
-/// notional).
+/// #726 tag 119, REAL PATH: eviction of an ADL-shrunk small leg, closed against an opposite-side
+/// vault LP. Same world as the tag 118 test, with the long side full (cap poked to 2, the config
+/// poke the other tag 119 tests use; no leg or A byte is poked). The taker asks for 30 Q long
+/// (>= 2x the victim's effective notional).
 ///
-/// NOTE (honest scope): while A != ADL_ONE the engine refuses EVERY risk-increasing open, so the
-/// taker's own TradeCpi half of EvictAndTradeCpi is always refused with Custom(120) on an
-/// ADL-shrunk side, and the whole transaction rolls back. The forced-close half is therefore
-/// observed through the logs: unfixed, the close sizes from the 20 Q basis, flips the effective
-/// leg and fails with 120 BEFORE the taker's matcher is ever invoked; fixed, the close lands (it
-/// is atomic with the later refusal) and the matcher CPI of the taker's trade runs. The exact-flat
-/// close itself is asserted by the tag 118 real-path test (same wrapper function).
+/// Honest scope: while A != ADL_ONE the engine refuses EVERY risk-increasing open, so the taker's
+/// own TradeCpi half of EvictAndTradeCpi is always refused with Custom(120) and the whole
+/// transaction rolls back. The forced-close half is observed through the logs: unfixed, the close
+/// sizes from the 20 Q basis, would flip the effective leg and dies with 120 BEFORE the taker's
+/// matcher is invoked; fixed, the close lands (atomic with the later refusal) and the matcher CPI
+/// of the taker's trade runs. The exact-flat close itself is asserted by the tag 118 test above
+/// (same wrapper function, `band_forced_reduce_against_vault_lp`).
 #[test]
 fn j726_real_path_tag119_eviction_of_adl_shrunk_small_leg() {
+    let mut env = Env::new(band_cfg());
+    let (lp, victim, _filler) = j726_opposite_side_adl_world(&mut env);
+    let taker = env.trader(1_000 * USD);
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
+    assert_eq!(env.pos(victim.1), 20 * Q, "stored basis unchanged by ADL");
+    let lp_before = env.pos(lp.account);
+
+    let r = env.evict_and_trade(victim.1, &taker.0, taker.1, &lp, 30 * Q);
+    let logs = LAST_LOGS.with(|l| l.borrow().join("\n"));
+    eprintln!("J726 tag 119 (LP opposite) result: {r:?}");
+    let matcher_invoked = logs.contains(&format!("{} invoke [2]", env.matcher_program));
+    assert!(
+        matcher_invoked,
+        "the forced close of the ADL-shrunk leg against an opposite-side LP must succeed and reach \
+         the taker's matcher CPI; unfixed it dies at the close with 120 first"
+    );
+    // The whole tx is atomic: the victim, the LP and conservation are untouched.
+    assert_err(&r, &code(PercolatorError::EngineAdlReduceOnly), "taker's open is close-only under ADL");
+    assert_eq!(env.pos(victim.1), 20 * Q, "rolled back: no flip, no partial close");
+    assert_eq!(env.pos(lp.account), lp_before, "LP unchanged");
+    env.assert_conservation();
+}
+
+/// #726 pin of today's (correct) engine rule: a forced close cannot run when the victim is on the
+/// SAME side as the vault LP's own ADL-scaled leg. Closing the victim against the LP moves that
+/// exposure onto the LP, so the LP's effective leg on the ADL-scaled side GROWS, and the engine's
+/// reduce-only gate (`require_asset_risk_change_allowed` while A != ADL_ONE) refuses it with
+/// Custom(120) EngineAdlReduceOnly. The bound vault LP is the only counterparty, so the wrapper
+/// cannot route around it. This is a liveness limit until the side resets, not a wrapper bug.
+///
+/// Real path: victim and filler 20 Q long each, a short of 180 Q, so the LP is net LONG 140 (same
+/// side as the victim). The short exits 150 Q through its own tag 44, which ADL-scales the long
+/// side to A_long = 30/180: the victim is ~3.33 Q effective (dust) and the LP is ~23.3 Q.
+#[test]
+fn j726_real_path_same_side_as_lp_adl_leg_is_reduce_only_120() {
     let mut env = Env::new(band_cfg());
     env.auth_mark();
     let lp = env.lp(10_000 * USD);
@@ -7363,28 +7420,40 @@ fn j726_real_path_tag119_eviction_of_adl_shrunk_small_leg() {
     env.trade_cpi(&victim.0, victim.1, &lp, 20 * Q).expect("victim opens 20 Q long");
     env.trade_cpi(&filler.0, filler.1, &lp, 20 * Q).expect("filler opens 20 Q long");
     env.trade_cpi(&short.0, short.1, &lp, -180 * Q).expect("short opens 180 Q short");
-    env.rebalance_reduce(&short.0, short.1, (150 * Q) as u128).expect("real tag 44 exit 150 Q");
+    assert_eq!(env.pos(lp.account), 140 * Q, "LP net LONG 140: same side as the victim");
+    env.rebalance_reduce(&short.0, short.1, (150 * Q) as u128).expect("real tag 44 exit of 150 Q");
     let a = env.engine_asset();
-    assert!(a.a_long < percolator::ADL_ONE, "vacuity: real ADL scaled the long side");
+    assert!(a.a_long < percolator::ADL_ONE, "vacuity: real ADL scaled the long side (victim AND LP)");
     env.warp(1);
     env.crank_current(victim.1);
     env.crank_current(filler.1);
     env.crank_current(lp.account);
-    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
-    assert_eq!(env.pos(victim.1), 20 * Q, "stored basis unchanged by ADL");
+    assert!(j726_long_effective(&env, env.pos(victim.1)) < 20 * Q, "victim effective < basis");
     let lp_before = env.pos(lp.account);
+    let is_120 = |r: &Result<u64, String>| match r {
+        Err(e) => e.contains("InstructionError(") && e.contains(&format!(", {})", code(PercolatorError::EngineAdlReduceOnly))),
+        Ok(_) => false,
+    };
+
+    // Tag 118: the sweep is refused at the engine's reduce-only gate.
+    let r = env.sweep_dust(victim.1, lp.account);
+    eprintln!("J726 same-side tag 118 sweep result: {r:?}");
+    assert!(is_120(&r), "same-side sweep: expected InstructionError(_, Custom(120)), got {r:?}");
+    assert_eq!(env.pos(victim.1), 20 * Q, "rolled back: victim leg untouched");
+    assert_eq!(env.pos(lp.account), lp_before, "rolled back: LP untouched");
+    env.assert_conservation();
+
+    // Tag 119: the eviction's forced close is refused the same way, before the taker's matcher.
+    env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
     let r = env.evict_and_trade(victim.1, &taker.0, taker.1, &lp, 30 * Q);
     let logs = LAST_LOGS.with(|l| l.borrow().join("\n"));
-    eprintln!("J726 tag 119 result: {r:?}");
-    let matcher_invoked = logs.contains(&format!("{} invoke [2]", env.matcher_program));
-    // The whole tx is atomic: the victim, the LP and conservation are untouched either way.
-    assert_eq!(env.pos(victim.1), 20 * Q, "rolled back: no flip, no partial close");
-    assert_eq!(env.pos(lp.account), lp_before, "LP total conserved");
-    env.assert_conservation();
-    assert_err(&r, &code(PercolatorError::EngineAdlReduceOnly), "taker's open is close-only under ADL");
+    eprintln!("J726 same-side tag 119 result: {r:?}");
+    assert!(is_120(&r), "same-side eviction: expected InstructionError(_, Custom(120)), got {r:?}");
     assert!(
-        matcher_invoked,
-        "the forced close of the ADL-shrunk leg must succeed (reach the taker's matcher CPI); \
-         unfixed it dies at the close with 120 first"
+        !logs.contains(&format!("{} invoke [2]", env.matcher_program)),
+        "the refusal is at the forced close, before the taker's matcher CPI"
     );
+    assert_eq!(env.pos(victim.1), 20 * Q, "rolled back: victim leg untouched");
+    assert_eq!(env.pos(lp.account), lp_before, "rolled back: LP untouched");
+    env.assert_conservation();
 }
