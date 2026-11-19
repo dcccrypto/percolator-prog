@@ -29699,15 +29699,27 @@ fn v16_738_batch_trade_cpi_poststate_identical_base_vs_head() {
             ],
             &[&taker],
         ).unwrap();
-        let keys: Vec<Pubkey> = vec![taker.pubkey(), lp.pubkey(), taker_account, lp_account, matcher_program, ctx, delegate, env.market, tail];
+        // Named non-deterministic mask: every key the harness draws at random (Keypair::new /
+        // Pubkey::new_unique) is rewritten to a fixed per-role tag byte (0xA0 + index) before
+        // comparing. That includes the env's own admin/payer/mint/vault keys: the base-vs-base
+        // control showed `WrapperConfigV16.marketauth` (market offset 16..48 = the random admin)
+        // differing run to run because it was not in this list.
+        let keys: Vec<Pubkey> = vec![
+            taker.pubkey(), lp.pubkey(), taker_account, lp_account, matcher_program, ctx, delegate, env.market, tail,
+            env.admin.pubkey(), env.payer.pubkey(), env.mint, env.vault, env.vault_authority,
+        ];
         let mut out = Vec::new();
-        for k in [env.market, taker_account, lp_account, ctx, taker.pubkey(), lp.pubkey()] {
+        let names = ["market", "taker_portfolio", "lp_portfolio", "matcher_ctx", "taker_signer", "lp_signer"];
+        for (ai, k) in [env.market, taker_account, lp_account, ctx, taker.pubkey(), lp.pubkey()].into_iter().enumerate() {
             let mut d = env.svm.get_account(&k).unwrap().data;
+            let mut hits: Vec<(usize, usize)> = Vec::new(); // (offset, key index)
             for (i, key) in keys.iter().enumerate() {
                 let kb = key.to_bytes();
                 let mut j = 0;
-                while j + 32 <= d.len() { if d[j..j + 32] == kb { for b in d[j..j + 32].iter_mut() { *b = 0xA0 + i as u8; } j += 32; } else { j += 1; } }
+                while j + 32 <= d.len() { if d[j..j + 32] == kb { for b in d[j..j + 32].iter_mut() { *b = 0xA0 + i as u8; } hits.push((j, i)); j += 32; } else { j += 1; } }
             }
+            hits.sort();
+            println!("  KEYMASK legs={legs_n} so={so} acct{ai}({}) len={} key_bytes_masked={} (offset,key#)={hits:?}", names[ai], d.len(), hits.len() * 32);
             out.push(d);
         }
         (cu, out)
@@ -29738,8 +29750,12 @@ fn v16_738_batch_trade_cpi_poststate_identical_base_vs_head() {
             for o in 0..x.len() {
                 if x[o] != z[o] { masked += 1; } else if x[o] != y[o] { bad.push(o); }
             }
-            let ctl: Vec<usize> = (0..x.len()).filter(|&o| x[o] != z[o]).take(8).collect();
-            if !ctl.is_empty() { println!("  control-nondeterministic legs={n} acct{i} offs(first8)={ctl:?}"); }
+            // Residual control diffs (after key normalisation), as contiguous [start, end) ranges.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for o in (0..x.len()).filter(|&o| x[o] != z[o]) {
+                match runs.last_mut() { Some(r) if r.1 + 8 >= o => r.1 = o + 1, _ => runs.push((o, o + 1)) }
+            }
+            if !runs.is_empty() { println!("  control-nondeterministic legs={n} acct{i} ranges={runs:?}"); }
             assert!(bad.is_empty(), "legs={n} acct{i} post-state differs base vs head at {} offsets, first: {:?}", bad.len(), &bad[..bad.len().min(12)]);
         }
         assert!(masked * 100 <= total, "legs={n}: control mask too large ({masked}/{total}); comparison too weak");
