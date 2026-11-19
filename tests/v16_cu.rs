@@ -29978,3 +29978,65 @@ fn v16_bpf_swap_secondary_for_primary_rejects_non_authority_signer() {
     assert_eq!(swap_balances(&env, &a), before);
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
 }
+
+/// #477: a resolved payout the owner did not sign is made in the primary mint only; the owner's
+/// own signature selects the secondary mint. Mirrors upstream 0b06131f.
+#[test]
+fn unsigned_resolved_close_pays_primary_mint_only() {
+    let close_resolved_accounts = |env: &V16CuEnv, owner: &Keypair, portfolio: Pubkey, dest: Pubkey, vault: Pubkey, owner_signs: bool| {
+        vec![
+            AccountMeta { pubkey: owner.pubkey(), is_signer: owner_signs, is_writable: false },
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
+        ]
+    };
+
+    // Case A: an unsigned CloseResolved in a creator-chosen secondary mint is rejected.
+    {
+        let mut env = V16CuEnv::new();
+        let junk = env.create_mint();
+        env.update_base_unit_mints_with_cu(env.mint, junk);
+        let victim = Keypair::new();
+        let portfolio = env.create_portfolio(&victim);
+        env.deposit(&victim, portfolio, 1_000_000);
+        env.resolve();
+        let junk_vault = env.vault_token_for_mint(junk, 1_000_000);
+        let junk_dest = env.token_account_for_mint(junk, victim.pubkey(), 0);
+        let r = env.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            close_resolved_accounts(&env, &victim, portfolio, junk_dest, junk_vault, false), &[]);
+        assert_eq!(r.as_ref().err().and_then(|e| custom_code(e)), Some(PercolatorError::InvalidMint as u32),
+            "unsigned secondary-mint payout must be rejected: {:?}", r.as_ref().err());
+        assert_eq!(env.token_amount(junk_dest), 0, "no junk paid");
+        assert_eq!(env.portfolio_state(portfolio).capital, 1_000_000, "claim untouched");
+        // The same unsigned CloseResolved in the PRIMARY mint still pays the depositor.
+        let primary_dest = env.token_account_for_mint(env.mint, victim.pubkey(), 0);
+        env.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            close_resolved_accounts(&env, &victim, portfolio, primary_dest, env.vault, false), &[])
+            .expect("unsigned primary-mint payout still works");
+        assert_eq!(env.token_amount(primary_dest), 1_000_000, "paid in primary");
+        assert_eq!(env.portfolio_state(portfolio).capital, 0, "claim settled");
+    }
+
+    // Case B: the owner may take the secondary mint when it signs its own CloseResolved.
+    {
+        let mut env = V16CuEnv::new();
+        let junk = env.create_mint();
+        env.update_base_unit_mints_with_cu(env.mint, junk);
+        let owner = Keypair::new();
+        let portfolio = env.create_portfolio(&owner);
+        env.deposit(&owner, portfolio, 1_000_000);
+        env.resolve();
+        let junk_vault = env.vault_token_for_mint(junk, 1_000_000);
+        let junk_dest = env.token_account_for_mint(junk, owner.pubkey(), 0);
+        env.send(ProgInstruction::CloseResolved { fee_rate_per_slot: 0 },
+            close_resolved_accounts(&env, &owner, portfolio, junk_dest, junk_vault, true), &[&owner])
+            .expect("a signed owner may take the secondary mint");
+        assert_eq!(env.token_amount(junk_dest), 1_000_000, "signed owner paid in secondary");
+        assert_eq!(env.portfolio_state(portfolio).capital, 0, "claim settled");
+    }
+}

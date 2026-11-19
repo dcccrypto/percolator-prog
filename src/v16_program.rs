@@ -30457,7 +30457,7 @@ pub mod processor {
             verify_token_program(token_program)?;
             let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
             expect_key(vault_authority_ai, &vault_authority)?;
-            let vault_balance = verify_withdrawable_token_accounts(
+            let (vault_balance, paid_mint) = verify_withdrawable_token_accounts_with_mint(
                 dest_token,
                 owner.key,
                 vault_token,
@@ -30465,6 +30465,17 @@ pub mod processor {
                 &cfg_after,
                 true,
             )?;
+            // #477: a resolved payout the stored owner did not sign must be made in the PRIMARY
+            // mint. `marketauth` names the secondary base-unit mint (UpdateBaseUnitMints checks
+            // only that its decimals match) and anyone can fund its vault, so otherwise a market
+            // creator could have every depositor paid in a mint of its own making — clearing the
+            // claim while the real deposit stayed in the primary vault for CloseSlab to sweep to
+            // the creator. With its own signature the owner may still take either mint. `paid_mint`
+            // is the mint already validated above (dest.mint == vault.mint), so no account is
+            // parsed again. Mirrors upstream `0b06131f`.
+            if !owner.is_signer && paid_mint.to_bytes() != cfg_after.collateral_mint {
+                return Err(PercolatorError::InvalidMint.into());
+            }
             // GH#496: this payout is permissionless and its destination is bound to an
             // UNSIGNED `owner` key. An NFT-escrowed portfolio's owner is the NFT
             // program's mint-authority PDA, which can never sign an SPL transfer, so
@@ -30577,7 +30588,7 @@ pub mod processor {
             verify_token_program(token_program)?;
             let (vault_authority, bump) = derive_vault_authority(program_id, market_ai.key);
             expect_key(vault_authority_ai, &vault_authority)?;
-            let vault_balance = verify_withdrawable_token_accounts(
+            let (vault_balance, paid_mint) = verify_withdrawable_token_accounts_with_mint(
                 dest_token,
                 owner.key,
                 vault_token,
@@ -30585,6 +30596,13 @@ pub mod processor {
                 &cfg,
                 true,
             )?;
+            // #477: a resolved payout the stored owner did not sign must be made in the PRIMARY
+            // mint (see the mirror in `handle_close_resolved`; mirrors upstream `0b06131f`). With
+            // its own signature the owner may still take either mint. `paid_mint` is the mint
+            // already validated above, so no account is parsed again.
+            if !owner.is_signer && paid_mint.to_bytes() != cfg.collateral_mint {
+                return Err(PercolatorError::InvalidMint.into());
+            }
             // GH#496 — see the mirror in `handle_close_resolved` above and the doc on
             // `require_signer_for_escrowed_terminal_payout`. Same shape, same trio base.
             require_signer_for_escrowed_terminal_payout(
