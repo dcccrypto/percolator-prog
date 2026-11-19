@@ -173,6 +173,9 @@ const PRICE: u64 = 1_000_000;
 const DEPOSIT: u128 = 200_000;
 /// R is long one unit of asset 0 against S; asset 0 rises 1%.
 const GAIN: u128 = 10_000;
+/// Upstream configures 100 stale slots and resolves at slot 131; this fork's floor is
+/// `MIN_PERMISSIONLESS_RESOLVE_STALE_SLOTS` (9,000), so the same offsets sit on top of it.
+const STALE_SLOTS: u64 = 9_000;
 
 struct Actor {
     owner: Keypair,
@@ -219,7 +222,7 @@ fn crossed_world(shutdown: Shutdown, forfeits: &[(bool, usize)]) -> CrossedWorld
         Shutdown::Admin => {
             params.max_portfolio_assets = 3;
             let mut env = V16CuEnv::new_with_init_params(params);
-            env.configure_permissionless_resolve_with_cu(100, 5);
+            env.configure_permissionless_resolve_with_cu(STALE_SLOTS, 5);
             for asset in 0..3 {
                 env.configure_auth_mark_for_asset_as_admin(asset, 0, PRICE);
             }
@@ -228,7 +231,7 @@ fn crossed_world(shutdown: Shutdown, forfeits: &[(bool, usize)]) -> CrossedWorld
         Shutdown::Creator => {
             params.max_portfolio_assets = 2;
             let mut env = V16CuEnv::new_with_init_params(params);
-            env.configure_permissionless_resolve_with_cu(100, 5);
+            env.configure_permissionless_resolve_with_cu(STALE_SLOTS, 5);
             env.configure_auth_mark_for_asset_as_admin(0, 0, PRICE);
             env.update_market_init_fee_policy_with_cu(1);
             let key = creator.pubkey();
@@ -292,9 +295,9 @@ fn crossed_world(shutdown: Shutdown, forfeits: &[(bool, usize)]) -> CrossedWorld
 }
 
 fn resolve(world: &mut CrossedWorld) {
-    let cu = world.env.resolve_stale_permissionless_with_cu(131);
+    let cu = world.env.resolve_stale_permissionless_with_cu(20 + STALE_SLOTS + 11);
     assert_cu_within("crossed Recovery obligations", cu, CRANK_CU_LIMIT);
-    world.env.svm.warp_to_slot(136);
+    world.env.svm.warp_to_slot(20 + STALE_SLOTS + 16);
 }
 
 /// P gives up the first asset and Q the second. Each forfeited leg waits for the other
