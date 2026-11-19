@@ -195,7 +195,7 @@ fn expire_wrong_bucket_domain_is_refused() {
     // Domain 0 never opened a bucket: nothing to expire.
     assert_refused_untouched(&mut env, 0, PercolatorError::EngineStale, "empty domain 0");
     // Out-of-range domain (>= 2 * max_market_slots).
-    let slots = env.market_state().1.config.max_market_slots.get() as u16;
+    let slots = env.market_state().1.config.max_market_slots as u16;
     assert_refused_untouched(
         &mut env,
         slots * 2,
@@ -225,7 +225,7 @@ fn expire_wrong_market_account_is_refused() {
         vec![AccountMeta::new_readonly(m, false)],
         &[],
     );
-    assert!(r.is_err(), "read-only market must be refused: {r:?}");
+    expect_code(r, PercolatorError::ExpectedWritable, "read-only market");
 
     // (b) account not owned by the program (a token account).
     env.svm.expire_blockhash();
@@ -247,7 +247,7 @@ fn expire_wrong_market_account_is_refused() {
         vec![AccountMeta::new(foreign, false)],
         &[],
     );
-    assert!(r.is_err(), "foreign-owned market must be refused: {r:?}");
+    let e = r.expect_err("foreign-owned market"); assert!(e.contains("IncorrectProgramId"), "foreign-owned market: {e}");
 
     // (c) program-owned but not a market (zeroed buffer).
     env.svm.expire_blockhash();
@@ -269,15 +269,14 @@ fn expire_wrong_market_account_is_refused() {
         vec![AccountMeta::new(blank, false)],
         &[],
     );
-    assert!(r.is_err(), "blank program-owned account must be refused: {r:?}");
+    expect_code(r, PercolatorError::NotInitialized, "blank program-owned account");
 
     // (d) no accounts at all.
     env.svm.expire_blockhash();
     let r = env.send(ProgInstruction::ExpireBackingBucket { domain: 1 }, vec![], &[]);
-    assert!(r.is_err(), "missing market account must be refused: {r:?}");
+    let e = r.expect_err("no accounts"); assert!(e.contains("NotEnoughAccountKeys"), "no accounts: {e}");
 
     assert_eq!(market_bytes(&env), before, "real market untouched by every wrong-market attempt");
-    eprintln!("wrong-market errors pinned above are `is_err`; see exact-code run in the next test");
 }
 
 #[test]
