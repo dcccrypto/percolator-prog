@@ -15,10 +15,12 @@
 //!     (`permissionless_stale_matured`). While asset 0 keeps being pushed it is refused
 //!     (OracleStale) even if asset 1 has been stale far longer than
 //!     `permissionless_resolve_stale_slots`. The per-asset profile clock
-//!     (`global_or_profile_resolve_matured_at_slot`) only gates trades on that asset (OracleStale):
-//!     asset 1 becomes untradeable, NOT resolvable. Resolution needs the cfg (asset 0) clock to
-//!     go stale too. So a pusher watching only cfg misses a stale asset 1 (it is not a resolve
-//!     risk, but asset 1 trading is frozen until someone pushes asset 1).
+//!     (`global_or_profile_resolve_matured_at_slot`) gates that asset's live paths with
+//!     OracleStale: trades (TradeNoCpi/TradeCpi/BatchTradeCpi; pinned here), and by source also
+//!     permissionless crank (liquidations) and ADL wind-down refresh. Asset 1 becomes frozen,
+//!     NOT resolvable. Resolution needs the cfg (asset 0) clock to go stale too. So a pusher
+//!     watching only cfg misses a stale asset 1: no resolve risk, but asset 1 stays frozen until
+//!     someone pushes asset 1.
 //!  3. Layout: cfg field at struct offset 152 (account offset 16 + 152).
 use percolator_prog::{ix::Instruction as ProgInstruction, state};
 use solana_sdk::{instruction::AccountMeta, signature::Keypair};
