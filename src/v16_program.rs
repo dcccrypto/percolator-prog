@@ -5297,6 +5297,33 @@ pub mod state {
         write_wrapper_config_to_bytes(data, config)
     }
 
+    /// CU fast path for the PushAuthMark config write-back. `config` was fully validated when it
+    /// was read (`market_view_mut`) and the push only rewrote mark fields, so in AUTH_MARK mode the
+    /// only `validate_wrapper_config` clauses those fields can break are the five checked here.
+    /// Accepts and rejects exactly what `write_wrapper_config` does (differential-tested); any
+    /// other mode takes the full validation.
+    pub fn write_wrapper_config_after_auth_mark_push(
+        data: &mut [u8],
+        config: &WrapperConfigV16,
+    ) -> Result<(), ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        if config.oracle_mode != ORACLE_MODE_AUTH_MARK {
+            return write_wrapper_config_to_bytes(data, config);
+        }
+        if !valid_engine_oracle_price(config.mark_ewma_e6)
+            || !valid_engine_oracle_price(config.oracle_target_price_e6)
+            || config.mark_ewma_e6 != config.oracle_target_price_e6
+            || config.mark_ewma_halflife_slots != 0
+            || config.mark_min_fee != 0
+        {
+            return Err(ProgramError::InvalidAccountData);
+        }
+        data.get_mut(HEADER_LEN..HEADER_LEN + WRAPPER_CONFIG_LEN)
+            .ok_or(PercolatorError::InvalidAccountLen)?
+            .copy_from_slice(bytemuck::bytes_of(config));
+        Ok(())
+    }
+
     pub fn market_view_mut(
         data: &mut [u8],
     ) -> Result<(WrapperConfigV16, MarketViewMutV16<'_>), ProgramError> {
@@ -30292,7 +30319,10 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
             cfg
         };
-        state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)
+        state::write_wrapper_config_after_auth_mark_push(
+            &mut market_ai.try_borrow_mut_data()?,
+            &cfg_after,
+        )
     }
 
     #[inline(never)]
@@ -50903,6 +50933,67 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        /// Differential: the PushAuthMark config write-back fast path accepts, rejects and
+        /// writes exactly what the full `write_wrapper_config` does, over valid and corrupted
+        /// mark fields in every oracle mode. 0 mismatches required.
+        #[test]
+        fn auth_mark_push_config_write_matches_full_validation() {
+            use crate::constants::{
+                HEADER_LEN, KIND_MARKET, MAGIC, ORACLE_MODE_AUTH_MARK, ORACLE_MODE_EWMA_MARK,
+                ORACLE_MODE_HYBRID_AFTER_HOURS, ORACLE_MODE_MANUAL, VERSION,
+            };
+            let mut s: u64 = 0x9E37_79B9_7F4A_7C15;
+            let mut next = move || {
+                s ^= s << 13;
+                s ^= s >> 7;
+                s ^= s << 17;
+                s
+            };
+            let mut mismatches = 0u32;
+            let (mut oks, mut errs) = (0u32, 0u32);
+            for i in 0..20_000u32 {
+                let mut cfg = WrapperConfigV16::default();
+                cfg.collateral_mint = [7u8; 32];
+                cfg.oracle_mode = match next() % 6 {
+                    0 => ORACLE_MODE_MANUAL,
+                    1 => ORACLE_MODE_EWMA_MARK,
+                    2 => ORACLE_MODE_HYBRID_AFTER_HOURS,
+                    3 => 9, // unknown mode
+                    _ => ORACLE_MODE_AUTH_MARK,
+                };
+                let pick = |r: u64| match r % 5 {
+                    0 => 0,
+                    1 => u64::MAX,
+                    2 => percolator::MAX_ORACLE_PRICE,
+                    3 => percolator::MAX_ORACLE_PRICE + 1,
+                    _ => 1 + r % 1_000_000_000,
+                };
+                cfg.mark_ewma_e6 = pick(next());
+                cfg.oracle_target_price_e6 = if next() % 4 == 0 { pick(next()) } else { cfg.mark_ewma_e6 };
+                cfg.mark_ewma_halflife_slots = if next() % 4 == 0 { next() % 3 } else { 0 };
+                cfg.mark_min_fee = if next() % 4 == 0 { (next() % 3) as _ } else { 0 };
+                cfg.last_good_oracle_slot = next();
+                cfg.mark_ewma_last_slot = next();
+                // Occasionally corrupt a field the fast path relies on being unchanged since read.
+                if i % 997 == 0 {
+                    cfg.invert = 2;
+                }
+                let mut a = vec![0u8; HEADER_LEN + crate::constants::WRAPPER_CONFIG_LEN];
+                a[..8].copy_from_slice(&MAGIC.to_le_bytes());
+                a[8..10].copy_from_slice(&VERSION.to_le_bytes());
+                a[10] = KIND_MARKET;
+                let mut b = a.clone();
+                let full = state::write_wrapper_config(&mut a, &cfg).is_ok();
+                let fast = state::write_wrapper_config_after_auth_mark_push(&mut b, &cfg).is_ok();
+                if full != fast || a != b {
+                    mismatches += 1;
+                }
+                if full { oks += 1 } else { errs += 1 }
+            }
+            assert_eq!(mismatches, 0, "fast path diverged from write_wrapper_config");
+            assert!(oks > 500 && errs > 500, "weak coverage: ok={oks} err={errs}");
+        }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
         /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
