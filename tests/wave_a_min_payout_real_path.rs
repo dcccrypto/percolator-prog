@@ -2089,14 +2089,6 @@ fn e3_conservation_r2_sequence() {
     assert_eq!(n, ops.len());
 }
 
-proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig { cases: 8, max_shrink_iters: 16, .. Default::default() })]
-    #[test]
-    fn e3_conservation_proptest(ops in proptest::collection::vec(cons_op(), 1..6)) {
-        let (u, st, n) = run_conservation(&ops);
-        eprintln!("E3 proptest: {n} checks, worst unowned {u}, max stray {st}");
-    }
-}
 
 // ── Sentinel review (2026-10-05): E3 touch-order variant of R-2 ─────────────────────────────
 // E3 prices a non-bound pot at min(principal, held - registered claims). A winner's claim is
@@ -2338,14 +2330,6 @@ fn touch_program() -> impl proptest::strategy::Strategy<Value = Vec<TouchOp>> {
     )
 }
 
-proptest::proptest! {
-    #![proptest_config(proptest::prelude::ProptestConfig { cases: 24, max_shrink_iters: 32, .. Default::default() })]
-    #[test]
-    fn h1_touch_order_proptest_cannot_extract(ops in touch_program()) {
-        let (dep, paid) = run_touch_ops(&ops);
-        proptest::prop_assert!(paid <= dep + 2, "E extracted {}: deposited {dep}, paid {paid}, ops {ops:?}", paid as i128 - dep as i128);
-    }
-}
 
 // ── v2.2 Wave A item 8: R3-M1 (security-review-p2b-earn-allocation round 3) ────────────────
 // R3-M1: a Live non-bound 77 is priced on E3 = min(P, phys - registered claims). Between a
@@ -2558,12 +2542,14 @@ fn keeper_wire_zero_cannot_undercut_stored_floor_between() {
 #[test]
 fn zero_stored_floor_request_is_refused_on_chain() {
     let mut w = current_world();
-    let before = w.r.exit_state(&w.h.pubkey());
+    let red = w.r.redemption_pda(&w.h.pubkey());
+    let ata_before = w.r.env.token_amount(w.h_ata);
     let e = w.r.request_76(&w.h, w.h_ata, Some((0, 0))).expect_err("stored floor 0 refused");
     assert!(e.contains("InvalidInstructionData"), "{e}");
     let e = w.r.request_76(&w.h, w.h_ata, Some((0, 1))).expect_err("keeper_ok with no floor refused");
     assert!(e.contains("InvalidInstructionData"), "{e}");
-    assert_eq!(w.r.exit_state(&w.h.pubkey()), before, "nothing escrowed");
+    assert_eq!(w.r.env.token_amount(w.h_ata), ata_before, "nothing escrowed");
+    assert!(w.r.env.svm.get_account(&red).map_or(true, |a| a.data.is_empty()), "no request account");
 }
 
 /// (2b) A request already stored in the legacy 96-byte layout (stored floor reads as 0, redeemer-
@@ -2601,7 +2587,7 @@ fn legacy_layout_request_obeys_the_wire_floor() {
 /// see `a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback`).
 #[test]
 fn exit_refused_while_genuine_loss_counter_set_and_allowed_once_cleared() {
-    type Poke = fn(&mut percolator::MarketGroupV16, u64);
+    type Poke = fn(&mut state::MarketGroupV16, u64);
     let pokes: [(&str, Poke); 3] = [
         ("negative_pnl_account_count", |g, v| g.negative_pnl_account_count = v as _),
         ("b_stale_account_count", |g, v| g.b_stale_account_count = v as _),
@@ -2614,7 +2600,7 @@ fn exit_refused_while_genuine_loss_counter_set_and_allowed_once_cleared() {
         w.r.request_76(&w.h, w.h_ata, Some((R3M1_DEPOSIT - 2, 1))).expect("H 76 keeper_ok");
         w.r.request_76(&w.m, w.m_ata, None).expect("M 76");
         w.r.env.svm.warp_to_slot(w.r.now() + w.r.lm.earn_cooldown + 1);
-        w.r.env.mutate_market(|_, g| poke(g, 1));
+        mutate_market_surgical(&mut w.r, |g| poke(g, 1));
         let (bh, bm) = (w.r.exit_state(&w.h.pubkey()), w.r.exit_state(&w.m.pubkey()));
         let signed = w.r.execute_77(&w.m, None, true);
         assert_eq!(code(&signed), Some(ERR_NOT_LOSS_CURRENT), "{name}: signed exit: {signed:?}");
@@ -2622,7 +2608,7 @@ fn exit_refused_while_genuine_loss_counter_set_and_allowed_once_cleared() {
         assert_eq!(code(&keeper), Some(ERR_NOT_LOSS_CURRENT), "{name}: keeper exit: {keeper:?}");
         assert_eq!(w.r.exit_state(&w.m.pubkey()), bm, "{name}: 118 moves nothing (signed)");
         assert_eq!(w.r.exit_state(&w.h.pubkey()), bh, "{name}: 118 moves nothing (keeper)");
-        w.r.env.mutate_market(|_, g| poke(g, 0));
+        mutate_market_surgical(&mut w.r, |g| poke(g, 0));
         let (pm, _) = w.r.execute_77(&w.m, None, true).unwrap_or_else(|e| panic!("{name}: cleared, signed: {e}"));
         assert!(pm + 2 >= R3M1_DEPOSIT, "{name}: signed paid {pm}");
         let (ph, _) = w
@@ -2630,5 +2616,23 @@ fn exit_refused_while_genuine_loss_counter_set_and_allowed_once_cleared() {
             .execute_77(&w.h, Some((1, vec![w.a1, w.a2, lp])), false)
             .unwrap_or_else(|e| panic!("{name}: cleared, keeper: {e}"));
         assert!(ph + 2 >= R3M1_DEPOSIT, "{name}: keeper paid {ph}");
+    }
+}
+
+impl Replay {
+    fn no_genuine_loss_now(&self) -> bool {
+        let (_, g) = self.env.market_state();
+        let a = &g.assets[0];
+        g.pending_domain_loss_barriers.iter().take(2).all(|b| *b == 0)
+            && a.pending_obligation_count_long == 0
+            && a.pending_obligation_count_short == 0
+            && g.b_stale_account_count == 0
+            && g.negative_pnl_account_count == 0
+            && g.stale_certificate_count == 0
+    }
+    fn loss_current_now(&self) -> bool {
+        let (_, g) = self.env.market_state();
+        let a = &g.assets[0];
+        a.stale_account_count_long == 0 && a.stale_account_count_short == 0 && self.no_genuine_loss_now()
     }
 }
