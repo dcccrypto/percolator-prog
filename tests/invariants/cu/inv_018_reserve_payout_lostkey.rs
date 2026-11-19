@@ -3,7 +3,7 @@
 //! Upstream 0b06131f leaves reserve payouts (`WithdrawBackingBucket`,
 //! `WithdrawBackingBucketEarnings`, and the terminal insurance payout) payable in either mint
 //! without the beneficiary's signature, so that a beneficiary that has dropped its key stays
-//! payable. This test pins that behaviour and its consequence on this tree: after resolution
+//! payable. These tests pin that behaviour and its consequence on this tree. Backing path: after resolution
 //! anyone submits `WithdrawBackingBucket` naming the beneficiary, the beneficiary is paid in
 //! the secondary mint, and the primary tokens it displaced are surplus that `CloseSlab` pays
 //! to `marketauth`. The code is deliberately unchanged (same as upstream); see

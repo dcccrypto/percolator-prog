@@ -24376,7 +24376,7 @@ pub mod processor {
                         &vault_authority,
                         &cfg,
                         true,
-                        // The payee did not sign: the payout is made in the primary mint
+                        // The payee route is permissionless: the payout is made in the primary mint
                         // (#477, the rule of upstream 0b06131f). The signed `asset_admin`
                         // route above keeps either mint.
                         true,

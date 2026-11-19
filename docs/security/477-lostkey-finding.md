@@ -58,7 +58,11 @@ deviate from upstream.
 ## Stake reserve and creator-fee payouts
 
 These two do not fall under the exception (it names only the three paths above), so they were
-given the `0b06131f` rule instead of being documented: see the PR for the tests
+given the `0b06131f` rule instead of being documented. Open point on the stake route: the
+wrapper does not check the stake pool's recorded collateral mint, so a pool whose vault were held
+in the secondary mint could no longer be paid and would count as owed at `CloseSlab` (no grace
+fallback, unlike the creator-fee payee). That needs a stake program that lets a pool be created
+on a mint other than the market's primary; it could not be checked from this repo. See see the PR for the tests
 `v22_inv018_unsigned_stake_reserve_payout_is_primary_mint` and
 `v22_inv018_unsigned_creator_fee_payout_is_primary_mint`.
 

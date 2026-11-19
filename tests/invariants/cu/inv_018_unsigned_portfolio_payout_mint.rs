@@ -323,8 +323,7 @@ struct PendingTopup {
 }
 
 /// A receipt that is owed a top-up of 60: a payout snapshot of 100 with 40 paid and 60 in
-/// the engine vault. The state is installed directly, as in the INV-018 top-up fixture
-/// above; both vaults hold 60.
+/// the engine vault. The state is installed directly; both vaults hold 60.
 fn pending_topup_with_secondary_rail() -> PendingTopup {
     let mut env = V16CuEnv::new();
     let secondary = env.create_mint();
