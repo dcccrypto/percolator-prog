@@ -1,21 +1,21 @@
 //! INV-018: a resolved payout that the portfolio's owner did not sign is made in the
-//! deposit mint (#477).
+//! primary (deposit) mint (#477, upstream 0b06131f).
 //!
 //! `marketauth` names the secondary mint while the market is empty, and the secondary vault
-//! holds whatever was sent to it. After resolution `CloseResolved` and the resolved
-//! `PermissionlessCrank` need no owner signature once the owner window has passed, and
-//! `ClaimResolvedPayoutTopup` never needs one. A caller that could choose the mint then
-//! could pay every depositor in a secondary mint of the authority's making: the claims are
-//! cleared, the deposits stay in the primary vault, and `CloseSlab` pays them to the
-//! authority.
+//! holds whatever was sent to it. After resolution `CloseResolved` needs no owner signature
+//! once the owner window has passed, and `ClaimResolvedPayoutTopup` never needs one. If the
+//! caller chose the mint, every depositor could be paid in a secondary mint of the
+//! authority's making: the claims are cleared, the deposits stay in the primary vault, and
+//! `CloseSlab` pays them to the authority.
 //!
 //! Reserve payouts (backing buckets, their earnings, terminal insurance) are outside this
-//! rule. Their payees may have dropped their keys, and INV-073 keeps them payable in either
-//! mint without a signature.
+//! rule: their payees may have dropped their keys, so they stay payable in either mint
+//! without a signature (see `inv_018_reserve_payout_lostkey.rs`).
 //!
-//! Every wrapper instruction is public. SPL mints and token accounts, the secondary vault's
-//! balance among them, are installed directly as in the other INV-018 fixtures, and the
-//! top-up fixture installs its receipt directly too.
+//! In this tree a resolved `PermissionlessCrank` does not reach the payout, so the upstream
+//! test's crank route has no counterpart. An unsigned call presents the market group's NFT
+//! registry PDA at index 7 (GH#496). The secondary vault's balance and the top-up receipt
+//! are installed directly.
 
 use super::*;
 
@@ -190,7 +190,7 @@ impl SecondaryRail {
                     ],
                     &[&admin],
                 )
-                .expect("the market authority closes the drained slab");
+                .expect("the market authority closes the emptied slab");
             let closed = self
                 .env
                 .svm
@@ -205,7 +205,7 @@ impl SecondaryRail {
                 );
             }
         }
-        panic!("CloseSlab did not retire the drained slab in eight calls");
+        panic!("CloseSlab did not retire the emptied slab in eight calls");
     }
 }
 
@@ -224,7 +224,7 @@ fn is_invalid_mint_error(error: &str) -> bool {
 }
 
 /// Nobody but the owner can have its claim paid in the secondary mint. Unsigned, the close
-/// pays the deposit mint, and nothing of the deposit is left for the authority to sweep.
+/// pays the deposit mint, and nothing of the deposit is left for the authority to receive.
 #[test]
 fn v16_inv018_unsigned_resolved_payout_is_primary_mint() {
     for route in CLOSE_ROUTES {

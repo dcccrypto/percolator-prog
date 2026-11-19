@@ -2025,8 +2025,13 @@ fn v22_inv018_vault_lp_settle_resolved_pays_no_token_account() {
     let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
     let vault_before = env.tok(env.vault_token);
     let (_, group_before) = env.market_state();
+    let capital_before = env.portfolio(lp.portfolio).capital;
     env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest)
         .expect("an unsigned settle");
+    assert!(
+        env.portfolio(lp.portfolio).capital < capital_before,
+        "the settle ran: the vault LP's payout moved into the backing pot"
+    );
     assert_eq!(env.tok(junior_dest), 0, "no token reaches the junior destination");
     assert_eq!(env.tok(env.vault_token), vault_before, "no token leaves the vault");
     let (_, group_after) = env.market_state();

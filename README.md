@@ -214,7 +214,7 @@ This section describes intent and operational ordering, not argument-by-argument
 - **ClaimResolvedPayoutTopup** (tag 46)
   - permissionless resolved-payout top-up claim; pays only the stored owner receipt token account
   - unsigned, it pays the primary mint; the owner's signature selects the secondary mint (#477, `v16_inv018_unsigned_topup_payout_is_primary_mint`)
-  - the same rule holds for `CloseResolved` (tag 30), the creator-fee payee route of `WithdrawCreatorFee` (tag 90) and `WithdrawInsuranceReserveToStake` (tag 87): a payout whose beneficiary did not sign is made in the primary mint. `VaultLpSettleResolved` (tag 101) moves no tokens. Backing-bucket reserve payouts stay payable in either mint so that a beneficiary that dropped its key stays payable: see `docs/security/477-lostkey-finding.md`.
+  - the same rule holds for `CloseResolved` (tag 30), the creator-fee payee route of `WithdrawCreatorFee` (tag 90) and `WithdrawInsuranceReserveToStake` (tag 87): a payout whose beneficiary did not sign is made in the primary mint. `VaultLpSettleResolved` (tag 101) moves no tokens. Backing-bucket reserve payouts and the terminal insurance payout (`WithdrawInsurance`, tag 41) stay payable in either mint so that a beneficiary that dropped its key stays payable: see `docs/security/477-lostkey-finding.md`.
 - **RefineResolvedUnreceiptedBound** (tag 47)
   - admin-gated monotonic decrease of the resolved unreceipted bound; cannot increase obligations
 

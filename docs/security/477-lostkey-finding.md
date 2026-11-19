@@ -13,16 +13,19 @@ possible without them:
 |---|---|---|---|
 | `WithdrawBackingBucket` (tag 50) | `verify_domain_withdrawal_preflight`, `src/v16_program.rs` | none once Resolved | either |
 | `WithdrawBackingBucketEarnings` | same preflight | none once Resolved | either |
-| `WithdrawInsuranceAsset` | same preflight, but this tree allows it only in Live mode and with the operator's signature | operator signs | either (signer's own choice) |
+| `WithdrawInsurance` (tag 41, terminal insurance; the counterpart of upstream's terminal `WithdrawInsuranceAsset`) | `handle_withdraw_insurance`, Resolved and empty only | none (an unsigned call settles the authority's whole reserve) | either |
+| `WithdrawInsuranceAsset` (tag 57) | `handle_withdraw_insurance_asset` | Live only, operator signs | signer's own choice |
 
-The terminal `WithdrawInsuranceAsset` of the upstream note has no unsigned Resolved form in this
-tree (`handle_withdraw_insurance_asset` requires `mode == Live`), so only the two backing paths
-are exposed.
+Three paths are therefore exposed, as in upstream: the two backing paths and the terminal
+insurance payout (tag 41). Tag 57 needs the operator's signature in this tree.
 
 ## Result
 
-Test: `v16_inv018_lostkey_backing_payout_is_either_mint_pinned`
-(`tests/invariants/cu/inv_018_reserve_payout_lostkey.rs`). Run on the base program
+Tests: `v16_inv018_lostkey_backing_payout_is_either_mint_pinned` and
+`v16_inv018_lostkey_terminal_insurance_payout_is_either_mint_pinned`
+(`tests/invariants/cu/inv_018_reserve_payout_lostkey.rs`). Both run the same scenario; the
+table is the backing-bucket one, and the insurance one has the same balances (100 / 0 / 100,
+then 100 to `marketauth`). Run on the base program
 (`d27f3d73`) and on the fixed program; the result is identical, as intended.
 
 Setup: the creator (`marketauth`) names a secondary mint on the empty market; the backing
@@ -36,16 +39,21 @@ nothing more; the market is resolved; the secondary vault holds 100 of the creat
 | `CloseSlab` by `marketauth` | 100 | 0 | 0 | 100 |
 
 So a creator who controls the secondary mint can pay a backing authority in its own mint
-and then sweep the primary vault through `CloseSlab`. The backing authority's primary tokens
+and then take the primary vault through `CloseSlab`. The backing authority's primary tokens
 end up with the creator.
+
+A frozen or otherwise unusable primary vault is the one case where the primary-only rule could
+block a payout; for the creator-fee payee route the pot is then re-booked to the protocol leg
+after the payee grace period (`rebook_orphaned_fee_legs_view`), so `CloseSlab` is not wedged.
 
 ## Why the code is not changed here
 
 The rule "unsigned means primary" cannot be applied to these paths without removing the
 lost-key guarantee they exist for (beneficiaries that dropped their keys must stay payable).
-Upstream states the same trade-off in the README threat model ("the insurance and backing
-authorities of a market trust its marketauth with the reserves they fund"). Changing it here
-would deviate from upstream.
+Upstream states the same trade-off in its README threat model ("the insurance and backing
+authorities of a market trust its marketauth with the reserves they fund"); that paragraph is
+not part of this tree's README, so this document carries it. Changing the code here would
+deviate from upstream.
 
 ## Stake reserve and creator-fee payouts
 
@@ -60,4 +68,4 @@ given the `0b06131f` rule instead of being documented: see the PR for the tests
 2. Refuse a secondary mint on these two backing paths unless the beneficiary signs, and accept
    that a beneficiary with a dropped key then cannot be paid in the secondary mint (it can
    still be paid in the primary mint, which always covers the claim).
-3. Make `CloseSlab` refuse to sweep primary surplus while a secondary payout has displaced it.
+3. Make `CloseSlab` refuse to pay out primary surplus while a secondary payout has displaced it.
