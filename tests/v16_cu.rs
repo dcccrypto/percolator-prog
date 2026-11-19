@@ -29664,3 +29664,84 @@ fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
         "a target change must not carry the previous target's price-move remainder"
     );
 }
+
+/// Asset 1 is activated with a third-party insurer, which funds its insurance with tag 56.
+/// `arm` decides when the creator tries to switch on the deposits-only ceiling (tag 92):
+/// 0 = never, 1 = while Live but after the insurer's deposit, 2 = after the market resolves.
+/// Returns (the tag 92 result, if called; the insurer's terminal tag 41 result).
+fn deposits_only_insurer_scenario(arm: u8) -> (Option<Result<u64, String>>, Result<u64, String>) {
+    let mut env = V16CuEnv::new();
+    let creator = env.admin.insecure_clone();
+    let insurer = Keypair::new();
+    let operator = Keypair::new();
+    env.svm.airdrop(&operator.pubkey(), 1_000_000_000).unwrap();
+    env.activate_asset_with_authorities(
+        1,
+        1,
+        100,
+        insurer.pubkey(),
+        operator.pubkey(),
+        env.admin.pubkey(),
+        env.admin.pubkey(),
+    );
+    let arm_policy = |env: &mut V16CuEnv| {
+        let authority_epoch = env.control_sequences(0).authority_epoch;
+        env.send(
+            ProgInstruction::UpdateInsuranceWithdrawPolicy {
+                deposits_only: 1,
+                cooldown_slots: 0,
+                authority_epoch,
+            },
+            vec![
+                AccountMeta::new(creator.pubkey(), true),
+                AccountMeta::new(env.market, false),
+            ],
+            &[&creator],
+        )
+    };
+    let mut armed = None;
+    env.top_up_insurance_domain_with_authority(&insurer, 2, 100);
+    if arm == 1 {
+        armed = Some(arm_policy(&mut env));
+    }
+    env.resolve();
+    if arm == 2 {
+        armed = Some(arm_policy(&mut env));
+    }
+    let dest = env.token_account_for_mint(env.mint, insurer.pubkey(), 0);
+    let withdrawn = env
+        .send(
+            ProgInstruction::WithdrawInsurance { amount: 100 },
+            vec![
+                AccountMeta::new(insurer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(dest, false),
+                AccountMeta::new(env.vault, false),
+                AccountMeta::new_readonly(env.vault_authority, false),
+                AccountMeta::new_readonly(spl_token::ID, false),
+            ],
+            &[&insurer],
+        )
+        .map(|_| env.token_amount(dest));
+    (armed, withdrawn)
+}
+
+/// The creator cannot switch the deposits-only ceiling on over an existing insurance
+/// reserve, either after Resolve or while Live, so a third-party insurer's terminal
+/// withdrawal is not frozen.
+#[test]
+fn deposits_only_ceiling_cannot_be_armed_over_an_existing_reserve() {
+    assert_eq!(deposits_only_insurer_scenario(0).1, Ok(100), "control");
+    for arm in [1u8, 2] {
+        let (armed, withdrawn) = deposits_only_insurer_scenario(arm);
+        let err = armed
+            .unwrap()
+            .expect_err("tag 92 must refuse to arm the ceiling over an existing reserve");
+        assert_eq!(
+            custom_code(&err),
+            Some(PercolatorError::EngineLockActive as u32),
+            "arm={arm}: got {err}"
+        );
+        assert_eq!(withdrawn, Ok(100), "arm={arm}: the insurer withdraws its whole reserve");
+    }
+}
