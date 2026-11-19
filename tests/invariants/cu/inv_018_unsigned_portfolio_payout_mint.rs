@@ -21,14 +21,24 @@ use super::*;
 
 const DEPOSIT: u64 = 1_000_000;
 
-/// The two public instructions that run the resolved close.
+/// The public instruction that runs the resolved close. This tree does not route a resolved
+/// `PermissionlessCrank` to a payout (it never reaches `handle_close_resolved`), so the
+/// crank route of the upstream test has no counterpart here.
 #[derive(Clone, Copy, Debug)]
 enum CloseRoute {
     CloseResolved,
-    Crank,
 }
 
-const CLOSE_ROUTES: [CloseRoute; 2] = [CloseRoute::CloseResolved, CloseRoute::Crank];
+const CLOSE_ROUTES: [CloseRoute; 1] = [CloseRoute::CloseResolved];
+
+/// An unsigned terminal payout proves the portfolio is not NFT-escrowed by presenting the
+/// market group's canonical registry PDA at index 7 (GH#496).
+fn nft_registry_meta(env: &V16CuEnv) -> AccountMeta {
+    AccountMeta::new_readonly(
+        state::derive_nft_registry(&env.program_id, &env.market).0,
+        false,
+    )
+}
 
 struct SecondaryRail {
     env: V16CuEnv,
@@ -66,7 +76,7 @@ fn resolved_market_with_secondary_rail(force_close_delay_slots: u64) -> Secondar
     env.update_base_unit_mints_with_cu(env.mint, secondary);
     env.configure_auth_mark_with_cu(0, 100);
     if force_close_delay_slots != 0 {
-        env.configure_permissionless_resolve_with_cu(100, force_close_delay_slots);
+        env.configure_permissionless_resolve_with_cu(9000, force_close_delay_slots);
     }
     let owner = Keypair::new();
     let portfolio = env.create_portfolio(&owner);
@@ -102,10 +112,6 @@ impl SecondaryRail {
             CloseRoute::CloseResolved => ProgInstruction::CloseResolved {
                 fee_rate_per_slot: 0,
             },
-            CloseRoute::Crank => ProgInstruction::PermissionlessCrank {
-                now_slot: self.env.svm.get_sysvar::<Clock>().slot,
-                observations: Vec::new(),
-            },
         };
         let signers: Vec<&Keypair> = if signed { vec![&self.owner] } else { vec![] };
         self.env.send(
@@ -118,6 +124,7 @@ impl SecondaryRail {
                 AccountMeta::new(vault, false),
                 AccountMeta::new_readonly(self.env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                nft_registry_meta(&self.env),
             ],
             &signers,
         )
@@ -385,6 +392,7 @@ impl PendingTopup {
                 AccountMeta::new(vault, false),
                 AccountMeta::new_readonly(self.env.vault_authority, false),
                 AccountMeta::new_readonly(spl_token::ID, false),
+                nft_registry_meta(&self.env),
             ],
             &signers,
         )

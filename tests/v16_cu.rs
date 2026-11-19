@@ -35,6 +35,9 @@ use std::path::PathBuf;
 #[path = "support/fill_events.rs"]
 mod fill_events;
 
+#[path = "invariants/cu/inv_018_reserve_payout_lostkey.rs"]
+mod inv_018_reserve_payout_lostkey;
+
 #[path = "invariants/cu/inv_018_unsigned_portfolio_payout_mint.rs"]
 mod inv_018_unsigned_portfolio_payout_mint;
 
