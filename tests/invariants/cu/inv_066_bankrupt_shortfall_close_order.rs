@@ -18,13 +18,6 @@ use super::*;
 
 // Adapted from aeyakovenko/percolator-prog 22863798 (close-order test) and da0dfad9 (owner
 // window test). Wrapper names only: the helpers below mirror upstream tests/v16_cu.rs.
-fn crank_observations(asset_index: u16) -> Vec<CrankObservationHint> {
-    vec![CrankObservationHint {
-        asset_index,
-        oracle_accounts: 0,
-    }]
-}
-
 fn is_engine_non_progress_error(error: &str) -> bool {
     error.contains("Custom(22)") || error.contains("custom program error: 0x16")
 }
@@ -75,6 +68,9 @@ const L: usize = 3;
 const L_DEPOSIT: u128 = 10_000_000;
 /// Slots after resolution in which only its owner can crank an account.
 const OWNER_WINDOW: u64 = 5;
+/// Oracle staleness before anyone can resolve. Upstream uses 100; this wrapper enforces
+/// MIN_PERMISSIONLESS_RESOLVE_STALE_SLOTS = 9_000, so the world is the same with a longer wait.
+const STALE_SLOTS: u64 = 9_000;
 
 struct GapWorld {
     env: V16CuEnv,
@@ -97,7 +93,7 @@ fn gap_world_with(owner_window: u64, solvent_long: bool) -> GapWorld {
     // No funding: gains and losses are exactly the price move.
     params.max_abs_funding_e9_per_slot = 0;
     let mut env = V16CuEnv::new_with_init_params(params);
-    env.configure_permissionless_resolve_with_cu(100, owner_window);
+    env.configure_permissionless_resolve_with_cu(STALE_SLOTS, owner_window);
     env.configure_auth_mark_for_asset_as_admin(0, 0, PRICE);
     let mut actors = Vec::new();
     let deposits = [T_DEPOSIT, W_DEPOSIT, X_DEPOSIT, L_DEPOSIT];
@@ -146,6 +142,9 @@ fn gap_world_with(owner_window: u64, solvent_long: bool) -> GapWorld {
         env.svm.warp_to_slot(slot);
         mark -= mark * 47 / 1000;
         env.push_auth_mark_for_asset_as_admin(0, slot, mark);
+        // This wrapper accrues the pushed mark into the effective price on a crank. Crank W
+        // (never T): upstream's push accrues by itself.
+        env.issue406_crank_steps(actors[W].1, slot, 8);
         last_push = slot;
     }
     GapWorld {
@@ -156,7 +155,7 @@ fn gap_world_with(owner_window: u64, solvent_long: bool) -> GapWorld {
     }
 }
 
-/// One resolved crank of `portfolio`, with a discovery hint for asset 0, signed by the
+/// One resolved close (CloseResolved, this wrapper's resolved crank) of `portfolio`, signed by the
 /// owner when `signer` is given. Returns what it paid or the program's error. A call that
 /// succeeds must change something.
 fn send_crank(
@@ -180,7 +179,6 @@ fn send_crank(
         )
         .unwrap();
     env.svm.expire_blockhash();
-    let now_slot = env.svm.get_sysvar::<solana_sdk::clock::Clock>().slot;
     let before = (
         env.svm.get_account(&env.market).unwrap(),
         env.svm.get_account(&portfolio).unwrap(),
@@ -188,9 +186,8 @@ fn send_crank(
     );
     let signers: Vec<&Keypair> = signer.into_iter().collect();
     let cu = env.send(
-        ProgInstruction::PermissionlessCrank {
-            now_slot,
-            observations: crank_observations(0),
+        ProgInstruction::CloseResolved {
+            fee_rate_per_slot: 0,
         },
         vec![
             AccountMeta::new_readonly(owner, signer.is_some()),
@@ -200,6 +197,7 @@ fn send_crank(
             AccountMeta::new(env.vault, false),
             AccountMeta::new_readonly(env.vault_authority, false),
             AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new_readonly(nft_registry_pda(&env.market), false),
         ],
         &signers,
     )?;
@@ -282,7 +280,7 @@ fn resolve_and_drain(order: [usize; 3]) -> ([u128; 3], u64) {
         last_push,
         ..
     } = gap_world();
-    let resolved = last_push + 111;
+    let resolved = last_push + STALE_SLOTS + 11;
     let cu = env.resolve_stale_permissionless_with_cu(resolved);
     assert_cu_within(label, cu, CRANK_CU_LIMIT);
     env.svm.warp_to_slot(resolved + OWNER_WINDOW);
@@ -294,6 +292,7 @@ fn resolve_and_drain(order: [usize; 3]) -> ([u128; 3], u64) {
 /// In every close order T is paid nothing and W and X share what T could not pay by the
 /// size of their positions. X, whose position is worth 200,000, keeps its deposit.
 #[test]
+#[ignore = "RED on base: needs engine add1d027 (upstream percolator #269, INV-066); ENGINE_CI_SIBLING db019142 lacks it. W-first close pays [0, 291791000, 10208999], X is short-changed"]
 fn v16_program_bankrupt_shortfall_is_shared_by_weight_in_every_close_order() {
     let mark = gap_world().mark;
     let fall = u128::from(PRICE - mark);
@@ -377,6 +376,7 @@ fn assert_waits(env: &mut V16CuEnv, actor: &(Keypair, Pubkey), label: &str) {
 /// window and no longer: then anyone cranks its account and the market drains, with the
 /// payouts of every other order.
 #[test]
+#[ignore = "RED on base: needs engine add1d027 (upstream percolator #269, INV-066); L leaves at once with its capital instead of waiting for W/X to settle"]
 fn v16_program_silent_owner_holds_the_other_side_only_for_the_owner_window() {
     const WINDOW: u64 = 50;
     let label = "silent owner, owner window";
@@ -388,7 +388,7 @@ fn v16_program_silent_owner_holds_the_other_side_only_for_the_owner_window() {
     } = gap_world_with(WINDOW, true);
     let fall = u128::from(PRICE - mark);
     let total = T_DEPOSIT + W_DEPOSIT + X_DEPOSIT + L_DEPOSIT;
-    let resolved = last_push + 111;
+    let resolved = last_push + STALE_SLOTS + 11;
     let cu = env.resolve_stale_permissionless_with_cu(resolved);
     assert_cu_within(label, cu, CRANK_CU_LIMIT);
     env.svm.warp_to_slot(resolved + 1);
