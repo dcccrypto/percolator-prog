@@ -7370,7 +7370,6 @@ fn j726_real_path_tag119_eviction_of_adl_shrunk_small_leg() {
     env.crank_current(victim.1);
     env.crank_current(filler.1);
     env.crank_current(lp.account);
-    env.reauth_lp_matcher(&lp);
     env.poke_engine_config(|c| c.band_max_positions_per_side = percolator::V16PodU64::new(2));
     assert_eq!(env.pos(victim.1), 20 * Q, "stored basis unchanged by ADL");
     let lp_before = env.pos(lp.account);
