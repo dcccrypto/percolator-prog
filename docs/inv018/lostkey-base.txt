@@ -102,15 +102,18 @@ warning: constant `DEPOSIT` is never used
       |           ^^^^^^^
 
 warning: `percolator-prog` (test "v16_cu") generated 6 warnings (run `cargo fix --test "v16_cu" -p percolator-prog` to apply 3 suggestions)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 08s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 42s
 warning: the following packages contain code that will be rejected by a future version of Rust: solana-client v1.18.26
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
      Running tests/v16_cu.rs (/tmp/jp477-target/debug/deps/v16_cu-c5233c7f27f68133)
 
-running 1 test
+running 2 tests
+after terminal insurance payout: beneficiary(secondary)=100 secondary_vault=0 primary_vault=100
+after CloseSlab: marketauth primary=100 secondary=0
+test inv_018_reserve_payout_lostkey::v16_inv018_lostkey_terminal_insurance_payout_is_either_mint_pinned ... ok
 after payout: beneficiary(secondary)=100 secondary_vault=0 primary_vault=100
 after CloseSlab: marketauth primary=100 secondary=0
 test inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned ... ok
 
-test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 285 filtered out; finished in 5.87s
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 285 filtered out; finished in 8.58s
 

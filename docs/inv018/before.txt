@@ -51,7 +51,6 @@ warning: variable does not need to be mutable
       |                       help: remove this `mut`
 
 warning: `percolator-prog` (lib) generated 4 warnings (run `cargo fix --lib -p percolator-prog` to apply 4 suggestions)
-   Compiling percolator-prog v0.1.0 (/Users/khubair/agent-work/wt/J-20261119-PROG-PORT-477PAYOUTMINT)
 warning: unused variable: `too_many`
      --> tests/v16_cu.rs:18710:9
       |
@@ -102,42 +101,35 @@ warning: constant `DEPOSIT` is never used
       |           ^^^^^^^
 
 warning: `percolator-prog` (test "v16_cu") generated 6 warnings (run `cargo fix --test "v16_cu" -p percolator-prog` to apply 3 suggestions)
-    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 13s
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 8.47s
 warning: the following packages contain code that will be rejected by a future version of Rust: solana-client v1.18.26
 note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
      Running tests/v16_cu.rs (/tmp/jp477-target/debug/deps/v16_cu-c5233c7f27f68133)
 
-running 5 tests
-test inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned ... FAILED
+running 4 tests
 test inv_018_unsigned_portfolio_payout_mint::v16_inv018_owner_signed_topup_payout_may_take_secondary_mint ... ok
+test inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint ... FAILED
 test inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_resolved_payout_is_primary_mint ... FAILED
 test inv_018_unsigned_portfolio_payout_mint::v16_inv018_owner_signed_resolved_payout_may_take_secondary_mint ... ok
-test inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint ... FAILED
 
 failures:
 
----- inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned stdout ----
+---- inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint stdout ----
 
-thread 'inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned' (213172796) panicked at tests/invariants/cu/inv_018_reserve_payout_lostkey.rs:128:6:
-a resolved reserve payout in the secondary mint is accepted (lost-key exception): "InstructionError(2, Custom(8))"
+thread 'inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint' (213747838) panicked at tests/invariants/cu/inv_018_unsigned_portfolio_payout_mint.rs:428:10:
+an unsigned top-up claim must not choose the secondary mint: 45914
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 
 ---- inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_resolved_payout_is_primary_mint stdout ----
 
-thread 'inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_resolved_payout_is_primary_mint' (213172799) panicked at tests/invariants/cu/inv_018_unsigned_portfolio_payout_mint.rs:237:18:
-an unsigned close must not choose the secondary mint: 72696
-
----- inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint stdout ----
-
-thread 'inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint' (213173870) panicked at tests/invariants/cu/inv_018_unsigned_portfolio_payout_mint.rs:428:10:
-an unsigned top-up claim must not choose the secondary mint: 50414
+thread 'inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_resolved_payout_is_primary_mint' (213747837) panicked at tests/invariants/cu/inv_018_unsigned_portfolio_payout_mint.rs:237:18:
+an unsigned close must not choose the secondary mint: 75696
 
 
 failures:
-    inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned
     inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_resolved_payout_is_primary_mint
     inv_018_unsigned_portfolio_payout_mint::v16_inv018_unsigned_topup_payout_is_primary_mint
 
-test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 281 filtered out; finished in 18.67s
+test result: FAILED. 2 passed; 2 failed; 0 ignored; 0 measured; 283 filtered out; finished in 11.32s
 
 error: test failed, to rerun pass `--test v16_cu`
