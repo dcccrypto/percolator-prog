@@ -13,3 +13,7 @@ function). Not yet run: no compile finished in time. With the patch unapplied it
 Next: build baseline, apply patch, run the v16_cu test
 `v16_bpf_configure_and_push_ewma_mark_are_bounded_and_clock_authenticated` with --nocapture
 --test-threads=1, 3 runs before and after, compare "push CU".
+
+## Try c (J-20261118-PROG-CU-EWMAMARKPUSHc)
+- Host differential with patch applied (debug, private target dir): `ewma_update_matches_u128_reference_200k` ok, 0 mismatches over 200k inputs. Debug dep build took 19m49s.
+- Next: baseline build-sbf + release v16_cu at base, then with patch.
