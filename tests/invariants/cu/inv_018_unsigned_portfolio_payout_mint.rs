@@ -41,7 +41,7 @@ struct SecondaryRail {
 }
 
 fn fund_secondary_vault(env: &mut V16CuEnv, secondary: Pubkey, amount: u64) -> Pubkey {
-    let secondary_vault = canonical_vault_ata(env.vault_authority, secondary);
+    let secondary_vault = canonical_vault_ata(&env.vault_authority, &secondary);
     env.svm
         .set_account(
             secondary_vault,

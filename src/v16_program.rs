@@ -24376,7 +24376,10 @@ pub mod processor {
                         &vault_authority,
                         &cfg,
                         true,
-                        false,
+                        // The payee did not sign: the payout is made in the primary mint
+                        // (#477, the rule of upstream 0b06131f). The signed `asset_admin`
+                        // route above keeps either mint.
+                        true,
                     )?;
                     if *dest_token.key != canonical_vault_address(&payee, &dest_mint) {
                         return Err(PercolatorError::CreatorFeePayeeInvalid.into());
@@ -25654,7 +25657,9 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
                 true,
-                false,
+                // Permissionless: the stake pool signs nothing, so the payout is made in
+                // the primary mint (#477, the rule of upstream 0b06131f).
+                true,
             )?;
 
             // Claim capacity. Monotonic invariant
