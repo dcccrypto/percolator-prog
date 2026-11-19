@@ -25,3 +25,5 @@ Next: build baseline, apply patch, run the v16_cu test
 ## Try 4 (J-20261119-PROG-CU-EWMAMARKPUSHe)
 BEFORE (base d27f3d73, unpatched, 3 runs): configure CU 8678, push CU 5270 (identical x3).
 (Test needs P1_WRAPPER_SO=<target>/deploy/percolator_prog.so since CARGO_MANIFEST_DIR/target is absent.)
+AFTER (u64 fast path applied, 3 runs): configure CU 8517, push CU 4708 (identical x3). Push CU -562 (-10.7%), configure -161.
+Differential ewma_update_diff (release): 0 mismatches / 200k. Touched tests: 5 ewma_mark + hybrid_mark_uses_ewma pass on patched .so.

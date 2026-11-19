@@ -13194,6 +13194,20 @@ pub mod policy_v16 {
         if fee_paid == 0 && mark_min_fee > 0 {
             return old;
         }
+        // CU: u128 division is a libcall on SBF; u64 division is one instruction. Take the u64
+        // path whenever every intermediate provably fits (identical results; otherwise fall through).
+        const U64_MUL_LIMIT: u64 = u64::MAX / 10_000;
+        if fee_paid >= mark_min_fee && dt <= U64_MUL_LIMIT {
+            if let Some(den) = dt.checked_add(halflife_slots) {
+                let alpha = 10_000 * dt / den;
+                let (up, diff) = if price >= old { (true, price - old) } else { (false, old - price) };
+                if diff <= U64_MUL_LIMIT {
+                    let step = diff * alpha / 10_000;
+                    // up: old + step <= price; down: old - step >= price. Never overflows.
+                    return if up { old + step } else { old - step };
+                }
+            }
+        }
         let alpha_bps = (10_000u128 * dt as u128) / (dt as u128 + halflife_slots as u128);
         let alpha_bps = ewma_effective_alpha_bps(alpha_bps, fee_paid, mark_min_fee);
         let old128 = old as u128;
