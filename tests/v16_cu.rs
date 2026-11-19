@@ -29760,7 +29760,7 @@ fn assert_swap_refused(
     let err = swap_try(env, a, amount, token_program).expect_err("swap must be refused");
     assert_eq!(
         custom_code(&err),
-        Some(expected as u32),
+        Some(expected.clone() as u32),
         "expected {expected:?}; got {err}"
     );
     assert_eq!(swap_balances(env, a), bal_before, "token balances moved on refusal");
