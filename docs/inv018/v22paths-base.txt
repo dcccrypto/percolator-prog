@@ -1,0 +1,80 @@
+[with-lock] got /tmp/cargo-slot-reserved.d after 0s
+warning: variable does not need to be mutable
+     --> /Users/khubair/agent-work/wt/percolator/src/v16.rs:21097:13
+      |
+21097 |         let mut ledger = account.header.close_progress.try_to_runtime()?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `percolator` (lib) generated 1 warning (run `cargo fix --lib -p percolator` to apply 1 suggestion)
+warning: unused attribute
+     --> src/v16_program.rs:33188:5
+      |
+33188 |     #[inline(never)]
+      |     ^^^^^^^^^^^^^^^^ help: remove this attribute
+      |
+note: attribute also specified here
+     --> src/v16_program.rs:33165:5
+      |
+33165 |     #[inline(never)]
+      |     ^^^^^^^^^^^^^^^^
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `insurance_bps`
+     --> src/v16_program.rs:13527:9
+      |
+13527 |         insurance_bps: u16,
+      |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_insurance_bps`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src/v16_program.rs:28250:36
+      |
+28250 |                         let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+      |                                    ----^^^^^
+      |                                    |
+      |                                    help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src/v16_program.rs:46401:23
+      |
+46401 |             let (cfg, mut group) = state::market_view_mut(&mut data)?;
+      |                       ----^^^^^
+      |                       |
+      |                       help: remove this `mut`
+
+warning: `percolator-prog` (lib) generated 4 warnings (run `cargo fix --lib -p percolator-prog` to apply 4 suggestions)
+   Compiling percolator-prog v0.1.0 (/Users/khubair/agent-work/wt/J-20261119-PROG-PORT-477PAYOUTMINT)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 16.70s
+warning: the following packages contain code that will be rejected by a future version of Rust: solana-client v1.18.26
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/v22_inv018_reserve_payout_mint.rs (/tmp/jp477-target/debug/deps/v22_inv018_reserve_payout_mint-888ce801bf1e07ec)
+
+running 3 tests
+test v22_inv018_admin_signed_creator_fee_may_take_secondary_mint ... ok
+
+thread 'v22_inv018_unsigned_creator_fee_payout_is_primary_mint' (213200161) panicked at tests/common/mod.rs:231:19:
+an unsigned creator-fee payout in the secondary mint: expected operative Custom(10), but the tx SUCCEEDED
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test v22_inv018_unsigned_creator_fee_payout_is_primary_mint ... FAILED
+
+thread 'v22_inv018_unsigned_stake_reserve_payout_is_primary_mint' (213200162) panicked at tests/common/mod.rs:231:19:
+an unsigned stake-reserve payout in the secondary mint: expected operative Custom(10), but the tx SUCCEEDED
+test v22_inv018_unsigned_stake_reserve_payout_is_primary_mint ... FAILED
+
+failures:
+
+failures:
+    v22_inv018_unsigned_creator_fee_payout_is_primary_mint
+    v22_inv018_unsigned_stake_reserve_payout_is_primary_mint
+
+test result: FAILED. 1 passed; 2 failed; 0 ignored; 0 measured; 0 filtered out; finished in 6.14s
+
+error: test failed, to rerun pass `--test v22_inv018_reserve_payout_mint`

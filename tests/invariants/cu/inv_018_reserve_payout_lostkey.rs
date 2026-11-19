@@ -1,12 +1,13 @@
 //! INV-018, reserve payouts: the lost-key exception, pinned (#477).
 //!
 //! Upstream 0b06131f leaves reserve payouts (`WithdrawBackingBucket`,
-//! `WithdrawBackingBucketEarnings`, a resolved-market backing payout) payable in either
-//! mint without the beneficiary's signature, so that a beneficiary that has dropped its
-//! key stays payable. This test pins that behaviour and its consequence: the market
-//! authority (`marketauth`) signs the call, the beneficiary is paid in the secondary mint,
-//! and the primary tokens it displaced are surplus that `CloseSlab` pays to `marketauth`.
-//! See docs/security/477-lostkey-finding.md.
+//! `WithdrawBackingBucketEarnings`, and the terminal insurance payout) payable in either mint
+//! without the beneficiary's signature, so that a beneficiary that has dropped its key stays
+//! payable. This test pins that behaviour and its consequence on this tree: after resolution
+//! anyone submits `WithdrawBackingBucket` naming the beneficiary, the beneficiary is paid in
+//! the secondary mint, and the primary tokens it displaced are surplus that `CloseSlab` pays
+//! to `marketauth`. The code is deliberately unchanged (same as upstream); see
+//! docs/security/477-lostkey-finding.md.
 
 use super::*;
 
@@ -94,9 +95,9 @@ fn v16_inv018_lostkey_backing_payout_is_either_mint_pinned() {
         .unwrap();
     let beneficiary_secondary = env.token_account_for_mint(secondary, beneficiary.pubkey(), 0);
 
-    // `marketauth` signs; the beneficiary does not.
+    // Nobody signs for the beneficiary; the fee payer submits the call.
     let admin = env.admin.insecure_clone();
-    let authority_epoch = env.backing_withdraw_authority_epoch(2, &admin.pubkey());
+    let authority_epoch = env.backing_withdraw_authority_epoch(2, &beneficiary.pubkey());
     let market_id = state::read_market_trade_preflight(
         &env.svm.get_account(&env.market).unwrap().data,
         1,
@@ -115,7 +116,8 @@ fn v16_inv018_lostkey_backing_payout_is_either_mint_pinned() {
             authority_epoch,
         },
         vec![
-            AccountMeta::new(admin.pubkey(), true),
+            // Resolved: the call needs no signature; it names the beneficiary.
+            AccountMeta::new_readonly(beneficiary.pubkey(), false),
             AccountMeta::new(env.market, false),
             AccountMeta::new(beneficiary_secondary, false),
             AccountMeta::new(secondary_vault, false),
@@ -123,7 +125,7 @@ fn v16_inv018_lostkey_backing_payout_is_either_mint_pinned() {
             AccountMeta::new_readonly(spl_token::ID, false),
             AccountMeta::new(ledger, false),
         ],
-        &[&admin],
+        &[],
     )
     .expect("a resolved reserve payout in the secondary mint is accepted (lost-key exception)");
     let balances = (

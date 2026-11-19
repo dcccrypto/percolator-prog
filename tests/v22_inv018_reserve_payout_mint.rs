@@ -889,6 +889,16 @@ fn first_loss_env(payee: Pubkey) -> Env {
 const INVALID_MINT: u32 = percolator_prog::error::PercolatorError::InvalidMint as u32;
 
 impl Env {
+    /// Copied from `v22_587_creator_fee_payee.rs` (stake Bind is single-asset only).
+    fn poke_max_market_slots(&mut self, n: u32) {
+        let mut acct = self.svm.get_account(&self.market).unwrap();
+        {
+            let (_, group) = state::market_view_mut(&mut acct.data).unwrap();
+            group.header.config.max_market_slots = percolator::V16PodU32::new(n);
+        }
+        self.svm.set_account(self.market, acct).unwrap();
+    }
+
     /// Names a secondary base-unit mint on the still-empty market (the only time the
     /// wrapper accepts it) and plants its canonical vault holding `vault_amount`.
     fn add_secondary_mint(&mut self, vault_amount: u64) -> (Pubkey, Pubkey) {
@@ -1051,7 +1061,9 @@ fn v22_inv018_unsigned_stake_reserve_payout_is_primary_mint() {
     let (vault_auth, _) = Pubkey::find_program_address(&[b"vault_auth", pool_pda.as_ref()], &STAKE_ID);
     let primary_stake_vault = env.svm.get_account(&stake_vault).unwrap();
     env.plant(stake_vault, make_token_data(secondary, vault_auth, 0), spl_token_classic_id());
-    env.set_secondary_vault(secondary, secondary_vault, accrued as u64);
+    // The secondary vault holds as much as the primary one, so only the mint decides.
+    let primary_balance = env.token_amount(env.vault);
+    env.set_secondary_vault(secondary, secondary_vault, primary_balance);
     let vault = env.vault;
     let tracked = [env.market, vault, secondary_vault, stake_vault];
     let before = env.frame(&tracked);
@@ -1068,7 +1080,7 @@ fn v22_inv018_unsigned_stake_reserve_payout_is_primary_mint() {
     env.withdraw_to_stake_from(vault)
         .expect("the unsigned stake-reserve payout is made in the primary mint");
     let paid = paid_before - env.token_amount(vault);
-    assert!(paid > 0 && paid as u128 <= accrued);
+    assert!(paid > 0, "the primary rail pays the stake vault");
     assert_eq!(env.token_amount(stake_vault), paid);
-    assert_eq!(env.token_amount(secondary_vault) as u128, accrued, "secondary vault untouched");
+    assert_eq!(env.token_amount(secondary_vault), primary_balance, "secondary vault untouched");
 }

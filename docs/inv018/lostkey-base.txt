@@ -1,0 +1,116 @@
+[with-lock] got /tmp/cargo-slot-reserved.d after 0s
+warning: variable does not need to be mutable
+     --> /Users/khubair/agent-work/wt/percolator/src/v16.rs:21097:13
+      |
+21097 |         let mut ledger = account.header.close_progress.try_to_runtime()?;
+      |             ----^^^^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `percolator` (lib) generated 1 warning (run `cargo fix --lib -p percolator` to apply 1 suggestion)
+warning: unused attribute
+     --> src/v16_program.rs:33188:5
+      |
+33188 |     #[inline(never)]
+      |     ^^^^^^^^^^^^^^^^ help: remove this attribute
+      |
+note: attribute also specified here
+     --> src/v16_program.rs:33165:5
+      |
+33165 |     #[inline(never)]
+      |     ^^^^^^^^^^^^^^^^
+      = warning: this was previously accepted by the compiler but is being phased out; it will become a hard error in a future release!
+      = note: `#[warn(unused_attributes)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `insurance_bps`
+     --> src/v16_program.rs:13527:9
+      |
+13527 |         insurance_bps: u16,
+      |         ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_insurance_bps`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src/v16_program.rs:28250:36
+      |
+28250 |                         let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+      |                                    ----^^^^^
+      |                                    |
+      |                                    help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> src/v16_program.rs:46401:23
+      |
+46401 |             let (cfg, mut group) = state::market_view_mut(&mut data)?;
+      |                       ----^^^^^
+      |                       |
+      |                       help: remove this `mut`
+
+warning: `percolator-prog` (lib) generated 4 warnings (run `cargo fix --lib -p percolator-prog` to apply 4 suggestions)
+   Compiling percolator-prog v0.1.0 (/Users/khubair/agent-work/wt/J-20261119-PROG-PORT-477PAYOUTMINT)
+warning: unused variable: `too_many`
+     --> tests/v16_cu.rs:18710:9
+      |
+18710 |     let too_many = if growth_v3 && OVER_LEGS > percolator_prog::growth_v19::GROWTH_BATCH_MAX_LEGS { "Custom(96)" } else { "Custom(9)" };
+      |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_too_many`
+      |
+      = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> tests/v16_cu.rs:27100:13
+      |
+27100 |         let mut step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+      |             ----^^^^
+      |             |
+      |             help: remove this `mut`
+      |
+      = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+     --> tests/v16_cu.rs:27171:13
+      |
+27171 |         let mut step = |group: &mut percolator::MarketGroupV16ViewMut<'_, _>, slot: &mut u64, price: u64| {
+      |             ----^^^^
+      |             |
+      |             help: remove this `mut`
+
+warning: method `withdraw_insurance_domain_to_admin_token_with_cu` is never used
+    --> tests/v16_cu.rs:3188:8
+     |
+ 451 | impl V16CuEnv {
+     | ------------- method in this implementation
+...
+3188 |     fn withdraw_insurance_domain_to_admin_token_with_cu(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `send_raw_tx` is never used
+    --> tests/v16_cu.rs:3842:4
+     |
+3842 | fn send_raw_tx(
+     |    ^^^^^^^^^^^
+
+warning: constant `DEPOSIT` is never used
+     --> tests/v16_cu.rs:29633:11
+      |
+29633 |     const DEPOSIT: u128 = 10_000_000;
+      |           ^^^^^^^
+
+warning: `percolator-prog` (test "v16_cu") generated 6 warnings (run `cargo fix --test "v16_cu" -p percolator-prog` to apply 3 suggestions)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 08s
+warning: the following packages contain code that will be rejected by a future version of Rust: solana-client v1.18.26
+note: to see what the problems were, use the option `--future-incompat-report`, or run `cargo report future-incompatibilities --id 1`
+     Running tests/v16_cu.rs (/tmp/jp477-target/debug/deps/v16_cu-c5233c7f27f68133)
+
+running 1 test
+after payout: beneficiary(secondary)=100 secondary_vault=0 primary_vault=100
+after CloseSlab: marketauth primary=100 secondary=0
+test inv_018_reserve_payout_lostkey::v16_inv018_lostkey_backing_payout_is_either_mint_pinned ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 285 filtered out; finished in 5.87s
+
