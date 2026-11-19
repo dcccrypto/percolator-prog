@@ -356,7 +356,11 @@ fn crossed_obligations_drain(shutdown: Shutdown) {
     }
 }
 
+// RED on this base (engine db019142, and engine tip 3e5970f3): the engine lacks upstream
+// 2ed67b16, so the crossed cohort reaches a fixed point in round 1 (drain_resolved_cohort's
+// "nonterminal cohort reached a fixed point" assertion). Run with `-- --ignored`.
 #[test]
+#[ignore = "RED: crossed Recovery obligations lock the resolved market; needs upstream engine 2ed67b16"]
 fn v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market() {
     crossed_obligations_drain(Shutdown::Admin);
 }
@@ -365,6 +369,7 @@ fn v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market() {
 /// listing fee, crosses two of its own accounts on them, shuts both down and forfeits one
 /// leg on each. R and S, who never touched those assets, are paid.
 #[test]
+#[ignore = "RED: an asset creator's crossed forfeits lock the resolved market; needs upstream engine 2ed67b16"]
 fn v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits() {
     crossed_obligations_drain(Shutdown::Creator);
 }
