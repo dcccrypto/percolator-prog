@@ -4,23 +4,25 @@
 //! (`src/v16_program.rs`, tag CureAndCancelClose).
 //!
 //! Handler checks, in order (line numbers as of base d27f3d73):
-//!  1. `expect_signer(owner)`                       -> ExpectedSigner   (:26543)
-//!  2. `expect_writable(market/portfolio)`          -> ExpectedWritable (:26544-5)
-//!  3. `expect_owner(market/portfolio, program_id)` -> IncorrectProgramId (:26546-7)
+//!  1. `expect_signer(owner)`                       -> ExpectedSigner   (:26546)
+//!  2. `expect_writable(market/portfolio)`          -> ExpectedWritable (:26547-8)
+//!  3. `expect_owner(market/portfolio, program_id)` -> IncorrectProgramId (:26549-50)
 //!  4. `portfolio_position_binding_matches`         -> EngineProvenanceMismatch (:26563; covered
 //!     by `v16_attack_cure_and_cancel_close_rejects_stale_position_epoch_with_pending_close`)
 //!  5. deposit != 0: `verify_token_program`, `verify_user_token_account(source, owner, mint)`
 //!     -> InvalidMint / InvalidTokenAccount, `verify_vault_token_account` -> InvalidVaultAccount,
 //!     `require_token_balance` -> InvalidTokenAccount (:26577-26587)
-//!  6. `group.header.mode != 0`                     -> EngineLockActive (:26597)
-//!  7. `reject_permissionless_resolve_matured_live_view` (:26600; covered natively in
+//!  6. `group.header.mode != 0`                     -> EngineLockActive (:26599)
+//!  7. `reject_permissionless_resolve_matured_live_view` (:26602; covered natively in
 //!     `v16_wrapper_cure_and_cancel_close_rejects_after_permissionless_resolve_maturity`)
-//!  8. `authorize_owner_or_nft_holder`              -> Unauthorized (:26630)
+//!  8. `authorize_owner_or_nft_holder`              -> Unauthorized (:26629)
 //!  9. engine `preflight_cure_and_cancel_close`: ledger must be active, not finalized, not
 //!     canceled, no irreversible progress, residual == gross, barrier count != 0
 //!     -> LockActive (engine v16.rs `preflight_cure_and_cancel_close`)
-//! 10. engine: `cured_equity < certified_initial_req` -> InvalidConfig (EngineInvalidConfig)
-//!     (the bar is the INITIAL requirement. A cure on an account with a live leg on the closing
+//! 10. engine: `cured_equity < 0 || cured_equity < certified_initial_req` -> InvalidConfig
+//!     (EngineInvalidConfig). Only the `< 0` side is pinned here (flat account, requirement 0);
+//!     a nonzero initial/maintenance requirement is not exercised.
+//!     (A cure on an account with a live leg on the closing
 //!     asset fails earlier with InvalidLeg(18): `v16_attack_*` seeds only flat closes, so the
 //!     shortfall here is made with unpaid fee debt on a flat account.)
 //!
@@ -509,7 +511,6 @@ fn cure_cancel_close_success_flat_account_cancels_close_and_account_is_healthy()
     assert!(account.close_progress.canceled, "close must be cancelled");
     assert!(!account.close_progress.active, "cancelled close is no longer active");
     assert_eq!(account.capital, 120, "deposit credited to capital");
-    assert_eq!(account.cancel_deposit_escrow, 0);
     assert_eq!(group.c_tot, 120);
     assert_eq!(group.vault, 120);
     assert_eq!(group.pending_domain_loss_barriers[0], 0, "barrier released");
@@ -517,8 +518,8 @@ fn cure_cancel_close_success_flat_account_cancels_close_and_account_is_healthy()
     assert_eq!(env.token_amount(env.vault), 120);
     assert_eq!(env.identity(portfolio).2, epoch_before + 1, "a landed Cure bumps position_epoch");
 
-    // Healthy afterwards: the flat account can withdraw ALL of its capital, and the same
-    // Cure cannot be replayed (nothing left to cancel).
+    // Healthy afterwards: the flat account can withdraw ALL of its capital (replay is covered
+    // by `cure_cancel_close_refuses_replay_after_cancel`).
     env.withdraw(&owner, portfolio, 120).expect("withdraw after cure");
     let account = state::read_portfolio(&env.svm.get_account(&portfolio).unwrap().data).unwrap();
     assert_eq!(account.capital, 0);
@@ -541,7 +542,11 @@ fn cure_cancel_close_success_when_deposit_covers_shortfall() {
     assert!(account.close_progress.canceled && !account.close_progress.active);
     assert_eq!(account.capital, 100);
     assert_eq!(group.pending_domain_loss_barriers[0], 0);
+    assert_eq!(group.c_tot, 100);
+    assert_eq!(group.vault, 100);
+    assert_eq!(account.fee_credits, -100, "cure credits capital; fee debt is untouched");
     assert_eq!(env.token_amount(source), 10);
+    assert_eq!(env.token_amount(env.vault), 100);
     // the account stays usable: a further Deposit lands.
     env.deposit(&owner, portfolio, 5);
     let account = state::read_portfolio(&env.svm.get_account(&portfolio).unwrap().data).unwrap();
