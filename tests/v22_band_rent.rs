@@ -7331,8 +7331,20 @@ fn j726_real_path_tag118_sweep_of_adl_scaled_dust_leg() {
     assert_eq!(basis, 20 * Q, "stored basis leg is unchanged by ADL");
     assert!(eff < basis.unsigned_abs(), "effective < basis");
 
+    {
+        // Diagnostics: the vault LP's own leg (basis / effective / side) vs the ADL scale.
+        let lp_basis = env.pos(lp.account);
+        let lp_eff = (lp_basis.unsigned_abs() * a.a_long).div_ceil(percolator::ADL_ONE);
+        eprintln!(
+            "J726 DIAG before sweep: a_long={} a_short={} ADL_ONE={} | LP basis={} ({}) eff~={} | victim basis={} eff~={} (victim side: {})",
+            a.a_long, a.a_short, percolator::ADL_ONE, lp_basis,
+            if lp_basis > 0 { "LONG, ADL-scaled side" } else { "SHORT" }, lp_eff,
+            basis, eff, if basis > 0 { "LONG" } else { "SHORT" }
+        );
+    }
     let r = env.sweep_dust(victim.1, lp.account);
     eprintln!("J726 tag 118 sweep result: {r:?}");
+    eprintln!("J726 DIAG after sweep (err or ok): LP basis={} victim basis={} a_long={}", env.pos(lp.account), env.pos(victim.1), env.engine_asset().a_long);
     r.expect("tag 118 sweep of a REAL ADL-scaled dust leg");
     assert_eq!(env.pos(victim.1), 0, "the whole leg is closed, not flipped");
     env.assert_conservation();
