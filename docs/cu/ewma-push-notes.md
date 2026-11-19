@@ -21,3 +21,7 @@ Next: build baseline, apply patch, run the v16_cu test
   `cargo build-sbf --features devnet` finished in 24m52s (08:24). `cargo test --release --features devnet --test v16_cu --no-run -j 4`
   was still compiling deps (~1500 artifacts, around dlopen2_derive/serde_derive_internals) at 09:00, past the 120 min cut-off. Stopped; no CU numbers measured.
 - Unapplied patch + passing differential remain on this branch for a follow-up; dep cache in $HOME/agent-work/wt-target-EWMAc is warm for debug and SBF.
+
+## Try 4 (J-20261119-PROG-CU-EWMAMARKPUSHe)
+BEFORE (base d27f3d73, unpatched, 3 runs): configure CU 8678, push CU 5270 (identical x3).
+(Test needs P1_WRAPPER_SO=<target>/deploy/percolator_prog.so since CARGO_MANIFEST_DIR/target is absent.)
