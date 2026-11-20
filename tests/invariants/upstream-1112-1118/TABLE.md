@@ -1,7 +1,8 @@
 # Upstream percolator-prog, 12-18 Nov 2026: one line per commit
 
 All first-parent commits on upstream `main` dated 12-18 Nov (32 commits, daa0576b .. 9199d869) are listed: 28 as rows below, 4 under
-"Not redone here" (9199d869, b7990033, eb273e3c, ea212394). Rows 21-24 were added in the follow-up job after its fresh review found them missing.
+"Not redone here" (9199d869, b7990033, eb273e3c, ea212394; the 2 more named there, 22863798 and da0dfad9, are dated 19 Nov
+and are not among the 32). Rows 21-24 were added in the follow-up job after its fresh review found them missing.
 
 Source: `aeyakovenko/percolator-prog` main (read-only `upstream` remote). Nothing was sent upstream.
 (The job asked for `docs/upstream-1112-1118/TABLE.md`. This job is tests-only and its pre-push hook refuses
@@ -51,8 +52,8 @@ Verdicts: (a) not applicable; (b) port the test. GREEN/RED: result of the ported
 | 27 | f9f0bcf8 INV-077 exact payouts in both close orders | engine 52659c02 (resolved K/F netting, stranded payments placed at most 4 per call) | no | (a) INV-077; edits absent `inv_077_resolved_loss_settlement.rs`; vacuous at our 4-leg cap unless #740 merges |
 | 28 | 8aa7a64a pin 52659c02 + INV-039 mixed-role book | 52659c02 (+ 9a219cca, 2ed67b16, 8e23d98b) | no | (a) pin bump; INV-039 change is to upstream's reference book in absent files |
 
-Not redone here: 22863798, da0dfad9, 9199d869 (job J-20261119-PROG-TOLY-INV066) and b7990033, eb273e3c,
-ea212394 (our PR #740).
+Not redone here: 9199d869 (job J-20261119-PROG-TOLY-INV066) and b7990033, eb273e3c, ea212394 (our PR #740), the 4
+in the 12-18 Nov window. The same INV066 job also takes 22863798 and da0dfad9, which are dated 19 Nov (outside it).
 
 ## Ported tests
 
@@ -94,13 +95,18 @@ Note for whoever ports 2ed67b16: both crossed tests panic on the "winner first" 
 
 ### Adaptations made in the ports (no assertion weakened except where noted)
 
+- INV-073: the terminal-account check matches upstream's: every one of the 12 fields upstream's
+  `PortfolioSourceDomainV16Account::is_occupied` reads must be zero in every source domain (the fork decodes
+  them as 12 parallel vectors, `no_source_domain_occupied`). An earlier revision checked only
+  `source_claim_bound_num`; job J-20261120-PROG-759-REVIEWFIX restored the full check after review.
+
 - INV-073: `ConfigurePermissionlessResolve` has a 9,000-slot floor in this fork (upstream uses 100), so the
   resolve slot is `20 + 9,000 + 11` instead of 131.
 - INV-073: upstream's drain fails on any successful no-op `CloseResolved`. This fork's wrapper returns Ok with
   no state change for an ordinary waiting close too (in the control, R, a flat winner, closes before its loser
   S; observed failing upstream's strict check before this change). The drain counts a no-op as "no progress"
   (like a refusal) instead of failing on it. A real lock still fails, because a whole round without progress
-  trips the fixed-point assertion. This is the one loosening.
+  trips the fixed-point assertion. This is the only loosening in the ports.
 - INV-073 creator variant: the market account is pre-sized before each permissionless activation
   (`grow_market_capacity_for_test`), as the fork's other activation tests do, because this program cannot
   realloc a market past 10,240 bytes (note in `src/v16_program.rs` near line 275).
