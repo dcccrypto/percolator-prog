@@ -2794,9 +2794,10 @@ pub mod state {
         check_header(data, KIND_MARKET)?;
         let config = read_wrapper_config_from_bytes(data)?;
         let wire = market_header(data)?;
+        // shape-only decode: reads max_market_slots/max_trading_fee_bps; full envelope check already runs at every config write
         let engine_config = wire
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         if asset_index >= engine_config.max_market_slots as usize {
             return Err(PercolatorError::InvalidInstruction.into());
@@ -2836,9 +2837,10 @@ pub mod state {
         check_header(data, KIND_MARKET)?;
         let config = read_wrapper_config_from_bytes(data)?;
         let wire = market_header(data)?;
+        // shape-only decode: reads max_portfolio_assets; full envelope check already runs at every config write
         let engine_config = wire
             .config
-            .try_to_runtime()
+            .try_to_runtime_shape()
             .map_err(map_account_wire_error)?;
         if asset_indices.is_empty()
             || asset_indices.len() > engine_config.max_portfolio_assets as usize
