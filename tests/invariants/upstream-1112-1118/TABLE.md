@@ -55,13 +55,20 @@ Command (wrapper built with `cargo build-sbf --tools-version v1.52 --features de
 
 | Test | Engine db019142 (CI pin) | Engine 3e5970f3 (engine tip) |
 |---|---|---|
-| `inv_031_provider_exit_principal::v16_program_live_provider_exit_leaves_a_payment_stranded_by_a_reversal` (37849dfc) | GREEN | pending |
-| `inv_031_provider_exit_principal::v16_program_live_backing_authority_cannot_take_a_stranded_payment_without_principal` (37849dfc) | GREEN | pending |
-| `inv_073_crossed_recovery_obligations::v16_program_one_recovery_obligation_waits_and_the_resolved_market_drains` (2d03e07e, control) | GREEN | pending |
-| `inv_073_crossed_recovery_obligations::v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market` (2d03e07e) | **RED**, ignored | pending |
-| `inv_073_crossed_recovery_obligations::v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits` (2d03e07e) | **RED**, ignored | pending |
+| `inv_031_provider_exit_principal::v16_program_live_provider_exit_leaves_a_payment_stranded_by_a_reversal` (37849dfc) | GREEN | GREEN |
+| `inv_031_provider_exit_principal::v16_program_live_backing_authority_cannot_take_a_stranded_payment_without_principal` (37849dfc) | GREEN | GREEN |
+| `inv_073_crossed_recovery_obligations::v16_program_one_recovery_obligation_waits_and_the_resolved_market_drains` (2d03e07e, control) | GREEN | GREEN |
+| `inv_073_crossed_recovery_obligations::v16_program_crossed_recovery_obligations_do_not_lock_the_resolved_market` (2d03e07e) | **RED**, ignored | **RED**, ignored |
+| `inv_073_crossed_recovery_obligations::v16_program_asset_creator_cannot_lock_the_resolved_market_with_crossed_forfeits` (2d03e07e) | **RED**, ignored | **RED**, ignored |
 
-The two pre-existing INV-031 tests in the same file stay GREEN on db019142.
+The two pre-existing INV-031 tests in the same file stay GREEN on both engines.
+
+Re-run once on this branch (job J-20261119-PROG-TOLY-TESTSWEEPb, 20 Nov), under the cargo slot lock, on both engines:
+default run `5 passed; 0 failed; 2 ignored`; `--ignored` run `0 passed; 2 failed`, both panicking at
+`inv_073_crossed_recovery_obligations.rs:171:9` (`nonterminal cohort reached a fixed point in round 1`). The engine-tip
+run used a scratch prog worktree whose `../percolator` is at 3e5970f3, built with `PERCOLATOR_ENGINE_UNPINNED=1`
+(the build script's opt-in for a local run off the CI pin) and selected with `P1_WRAPPER_SO`. The tip column
+therefore shows #309/#310/#362 do not fix the INV-073 lock; 2ed67b16 is still needed.
 
 ### RED: crossed Recovery obligations lock the resolved market (2d03e07e)
 
