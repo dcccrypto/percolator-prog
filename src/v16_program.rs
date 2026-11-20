@@ -14904,7 +14904,39 @@ pub mod processor {
         if dt == 0 {
             return Ok(());
         }
-        let target = profile.mark_ewma_e6;
+        // #461 fix (port of upstream 07b95084, adapted for this fork's mark-managed modes): the
+        // omitted-observation guard must measure against the SAME target the accrual would feed
+        // (what `hybrid_effective_price_for_crank_view` returns), not a reference a bounded catch-up
+        // crank can drag out from under it.
+        //
+        // - HYBRID: the committed oracle target is the engine's `raw_oracle_target_price` (fallback
+        //   to the effective price when none has been staged), mirroring the old_target rule of
+        //   `canonical_accrual_path_for_target_view`. This is upstream 07b95084's fix: a bounded
+        //   catch-up crank stamps `last_good_oracle_slot = now` AND overwrites `mark_ewma_e6` with
+        //   the partial effective price it reached, while `raw_oracle_target_price` still carries
+        //   the full committed move. Measuring against the mark then makes a mid-catch-up omission
+        //   look like "no movement" (target == effective == current), so a hint-less follow-up
+        //   crank in the same slot passes the guard and the engine refreshes an exposed account at
+        //   the partial price -- committing a flat segment the authenticated oracle never
+        //   authorized, and liquidating against it.
+        //
+        // - EWMA_MARK / AUTH_MARK (fork-only modes upstream's guard never sees, but which this
+        //   fork's `profile_is_price_managed` admits here): the authenticated mark IS the committed
+        //   target -- `hybrid_effective_price_for_crank_view` feeds `mark_ewma_e6` for these modes,
+        //   and `raw_oracle_target_price` is only written when the engine commits an accrual, so it
+        //   lags a freshly-pushed mark. Keep measuring these against `mark_ewma_e6`; swapping them
+        //   to `raw_oracle_target_price` would blind the multi-leg gate to a just-pushed mark move
+        //   on an un-observed leg.
+        let target = if oracle_v16::profile_is_hybrid(&profile) {
+            let stored = asset.raw_oracle_target_price.get();
+            if stored == 0 {
+                asset.effective_price.get()
+            } else {
+                stored
+            }
+        } else {
+            profile.mark_ewma_e6
+        };
         if target == 0 {
             return Err(PercolatorError::OracleInvalid.into());
         }
