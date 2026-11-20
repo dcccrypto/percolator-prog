@@ -1,7 +1,14 @@
-# J-20261119-PROG-TOLY-CUSHAPEc (incomplete)
-Writers checked (docs/cu/PLAN-tolycu.md): full validation runs on every config write path. Safe to proceed.
-No CU numbers yet. The earlier drivers died (their worktree ...CUSHAPEb was removed).
-Base probe (test binary compile in the c worktree, shared /tmp/jtolycu-target) started 04:50 GMT and was
-still compiling at 06:49 GMT under host load ~38 (rustc ~7% CPU).
-Not done: patch, head build/probe, suite and fuzz counts, Kani check, TOLY-PR-DRAFT.md.
-Next step: let ~/agent-work/toly-cushape/c1.sh finish (log c-base1.log), then apply the patch from drv2.sh.
+# J-20261119-PROG-TOLY-CUSHAPEd (partial, as of 10:10 GMT 20 Nov)
+
+Patch: 2 call sites in src/v16_program.rs switched to try_to_runtime_shape (commit d532c2da). Writers verified keep full validation (docs/cu/PLAN-tolycu.md). Head SBF built OK (/tmp/jtolycu-head.so differs from base .so).
+
+| legs | base CU (3 runs) | head CU (3 runs) |
+|---|---|---|
+| 1 | not measured | not measured |
+| 2 | not measured | not measured |
+| 4 | not measured | not measured |
+
+Suite + 2 fuzz gates head vs base: not measured.
+Kani: grep of kani/, src/, tests/invariants finds no harness referencing read_market_trade_preflight or read_asset_effective_prices.
+Why: host load 40-47; compiling the v16_cu test binary has run 2h+ under with-lock without finishing.
+Driver still running: ~/agent-work/toly-cushape/d/drv.sh (progress.txt, *.log). No PR opened, nothing posted anywhere.
