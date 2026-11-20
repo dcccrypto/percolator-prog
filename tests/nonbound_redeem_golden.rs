@@ -164,9 +164,7 @@ fn send(
         &signers,
         svm.latest_blockhash(),
     );
-    svm.send_transaction(tx)
-        .map(|m| { if std::env::var_os("SEC_CU").is_some() { eprintln!("SEC_CU {}", m.compute_units_consumed); } })
-        .map_err(|e| format!("{e:?}"))
+    svm.send_transaction(tx).map(|_| ()).map_err(|e| format!("{e:?}"))
 }
 
 fn init_market_ix() -> ProgInstruction {
@@ -621,7 +619,9 @@ struct Case {
     own_earn: u128,
     sib_earn: u128,
     sib_lapsed: bool,
-    /// Atoms removed from the program vault (header + token) before the exit: binds `atoms > vault`.
+    /// Atoms removed from the program vault (header + token) before the exit. This puts the vault
+    /// below the pots' fresh backing, an engine shape violation, so most such exits fail closed
+    /// on shape (14) before the `atoms > vault` gate (21).
     vault_trim: u128,
     oi_thr: u16,
     /// Own-bucket valid lien (atoms) moved out of fresh backing: the OI the guard must cover.
@@ -664,8 +664,9 @@ fn grid() -> Vec<Case> {
         c.own_claim = 100 * USDC;
         v.push(c);
     }
-    // B. sibling top-up: exit exceeds the own pot's principal.
-    for &(n, d) in &fr {
+    // B. sibling top-up: exit exceeds the own pot's 1,000 principal (1,040 / 1,120 / ~1,598 / 1,600).
+    let big: [(u128, u128); 4] = [(13, 20), (7, 10), (999, 1000), (1, 1)];
+    for &(n, d) in &big {
         let mut c = base(format!("topup_plain_{n}_{d}"), "sibling_top_up", n, d);
         c.sib_dep = 600 * USDC;
         v.push(c);
@@ -680,7 +681,7 @@ fn grid() -> Vec<Case> {
         v.push(c);
     }
     // C. sibling lapsed (not Fresh): top-up must not draw from it.
-    for &(n, d) in &fr {
+    for &(n, d) in &big {
         let mut c = base(format!("lapsed_sib_topup_{n}_{d}"), "sibling_lapsed", n, d);
         c.sib_dep = 600 * USDC;
         c.sib_lapsed = true;
@@ -690,14 +691,14 @@ fn grid() -> Vec<Case> {
     c.sib_dep = 600 * USDC;
     c.sib_lapsed = true;
     v.push(c);
-    // D. vault cap binding: the physical vault is short of the priced payout.
+    // D. vault short: the physical vault is trimmed below the pots' backing (see `vault_trim`).
     for &(n, d) in &fr {
-        let mut c = base(format!("vault_cap_{n}_{d}"), "vault_cap", n, d);
+        let mut c = base(format!("vault_short_{n}_{d}"), "vault_short", n, d);
         c.sib_dep = 400 * USDC;
         c.vault_trim = 1_000 * USDC;
         v.push(c);
     }
-    let mut c = base("vault_cap_slight_half".into(), "vault_cap", 1, 2);
+    let mut c = base("vault_short_one_atom_half".into(), "vault_short", 1, 2);
     c.sib_dep = 400 * USDC;
     c.vault_trim = 1;
     v.push(c);
@@ -726,9 +727,11 @@ struct PotSnap {
     earnings_withdrawn: u128,
     /// Bucket fee earnings the ledger has not synced yet (77 books them into `earnings` first).
     pending_earnings: u128,
+    /// Bucket consumed + impaired backing the ledger has not synced into `loss` yet.
+    pending_loss: u128,
     loss: u128,
     recovery: u128,
-    /// ledger available NAV: principal - min(loss - recovery, principal)
+    /// available principal: principal - min(loss - recovery + pending_loss, principal)
     nav: u128,
     fresh_backing_atoms: u128,
     liened_backing_atoms: u128,
@@ -738,7 +741,9 @@ fn pot_snap(env: &Env, ledger: Pubkey, domain: u16) -> PotSnap {
     let l = ledger_of(&env.svm, ledger);
     let g = market_group(env);
     let b = &g.source_backing_buckets[domain as usize];
-    let imp = l.cumulative_loss_atoms.saturating_sub(l.cumulative_recovery_atoms);
+    let unavailable = (b.consumed_liened_backing_num + b.impaired_liened_backing_num) / BOUND_SCALE;
+    let pending_loss = unavailable.saturating_sub(l.last_observed_unavailable_principal_atoms);
+    let imp = l.cumulative_loss_atoms.saturating_sub(l.cumulative_recovery_atoms) + pending_loss;
     PotSnap {
         principal: l.total_principal_atoms,
         deposited: l.total_deposited_atoms,
@@ -746,6 +751,7 @@ fn pot_snap(env: &Env, ledger: Pubkey, domain: u16) -> PotSnap {
         earnings: l.total_earnings_atoms,
         earnings_withdrawn: l.total_earnings_withdrawn_atoms,
         pending_earnings: b.utilization_fee_earnings.saturating_sub(l.last_observed_bucket_earnings_atoms),
+        pending_loss,
         loss: l.cumulative_loss_atoms,
         recovery: l.cumulative_recovery_atoms,
         nav: l.total_principal_atoms - imp.min(l.total_principal_atoms),
@@ -762,6 +768,7 @@ fn pot_json(p: &PotSnap) -> serde_json::Value {
         "earnings": p.earnings.to_string(),
         "earnings_withdrawn": p.earnings_withdrawn.to_string(),
         "pending_earnings": p.pending_earnings.to_string(),
+        "pending_loss": p.pending_loss.to_string(),
         "loss": p.loss.to_string(),
         "recovery": p.recovery.to_string(),
         "nav": p.nav.to_string(),
@@ -844,13 +851,19 @@ fn run_case(c: &Case) -> serde_json::Value {
     // 1. atoms paid + remaining == before, on the token vault and on the engine vault counter.
     assert_eq!(paid + vault_tok_a, vault_tok_b, "{}: token vault conservation", c.name);
     assert_eq!(paid + vault_grp_a, vault_grp_b, "{}: engine vault conservation", c.name);
-    // 2. the principal + net earnings (synced or still pending in the bucket) both pots held
-    //    before covers paid + what they hold after. The gap is the insurance stub of the gross
-    //    earnings chunk, which leaves the earnings counters but stays in the vault.
-    let held = |p: &PotSnap| p.principal + (p.earnings - p.earnings_withdrawn) + p.pending_earnings;
+    // 2. ledger conservation over both pots: available principal (net of booked and pending
+    //    loss) + net earnings (synced or still pending in the bucket) before == paid + the same
+    //    after + gap, where the gap is only the insurance stub of the gross earnings chunk 77
+    //    consumed (it leaves the earnings counters but stays in the vault): gap <= the
+    //    earnings_withdrawn delta, so it is exactly 0 on every exit that touches no earnings.
+    let held = |p: &PotSnap| p.nav + (p.earnings - p.earnings_withdrawn) + p.pending_earnings;
     let held_b = held(&own_b) + held(&sib_b);
     let held_a = held(&own_a) + held(&sib_a);
     assert!(paid + held_a <= held_b, "{}: ledger conservation {paid}+{held_a} vs {held_b}", c.name);
+    let gap = held_b - paid - held_a;
+    let ew_delta = (own_a.earnings_withdrawn + sib_a.earnings_withdrawn)
+        - (own_b.earnings_withdrawn + sib_b.earnings_withdrawn);
+    assert!(gap <= ew_delta, "{}: ledger gap {gap} exceeds gross earnings consumed {ew_delta}", c.name);
     let ok = res.is_ok();
     if ok {
         assert!(paid > 0, "{}: ok but paid 0", c.name);
