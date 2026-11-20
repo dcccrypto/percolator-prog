@@ -26837,7 +26837,7 @@ pub mod processor {
     }
 
     /// The same forced bilateral close at `P_last`, of at most `reduce_abs_q` of the victim's leg
-    /// (`u128::MAX` = the whole leg: tags 118 / 119, unchanged). v2.2 lev build: W1 (tag 124 op 5)
+    /// (`u128::MAX` = the whole leg: tags 118 / 119, closed at its ADL-effective size, #726). v2.2 lev build: W1 (tag 124 op 5)
     /// reduces opposing accounts to the round's keep-fraction through it.
     #[inline(never)]
     #[allow(clippy::too_many_arguments)]
@@ -26874,7 +26874,18 @@ pub mod processor {
             (
                 asset.market_id.get(),
                 asset.effective_price.get(),
-                signed_position_for_asset_view(&group, &victim, asset_index as usize)?,
+                {
+                    let (raw, eff) = raw_and_effective_signed_position_for_asset_view(
+                        &group,
+                        &victim,
+                        asset_index as usize,
+                    )?;
+                    // #726: the engine's trade delta is in EFFECTIVE (post-ADL) units. The
+                    // "whole leg" request (tags 118 / 119) must close exactly the effective
+                    // size; closing the stored basis overshoots and flips an ADL-shrunk leg
+                    // (EngineAdlReduceOnly). W1 (partial cuts) keeps the raw-basis compare.
+                    if reduce_abs_q == u128::MAX { eff } else { raw }
+                },
             )
         };
         if position == 0 {
@@ -26931,7 +26942,7 @@ pub mod processor {
             0,
         )?;
         vault_lp_post_fill(market_ai, victim_ai, lp_ai, &vault_lp_pre, max_market_slots)?;
-        // v2.2 reduce event: the victim's whole leg, closed against the bound vault LP at
+        // v2.2 reduce event: the victim's whole (effective) leg, closed against the bound vault LP at
         // `P_last` (the booked price of a forced close), no fee.
         fill_events_v22::emit_reduce(
             event_tag,

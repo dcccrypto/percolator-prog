@@ -7623,3 +7623,67 @@ fn audit660_f4101_crank_never_grows_a_non_portfolio_program_account() {
     let d2 = env.new_depositor();
     env.earn_deposit(&d2, 1_000_000, None).expect("ledger + registry still usable after the attack");
 }
+
+/// J-20261117-PROG-726-EXPLAIN (#726 claim check): W1 (tag 124 op 5) on legs that REAL ADL has
+/// scaled (effective < basis). The ADL comes from an instruction, not a byte poke: the same-side
+/// short user exits 250 tokens through its own tag 44, which removes short OI one-sidedly and
+/// ADL-scales the LONG side (the users opposite the LP). Only the LP-loss trigger reuses the
+/// existing `lev_w1::lose_capital` helper (the same trigger the reference W1 test uses; it does
+/// not touch any leg or A). #726 claimed W1's effective-unit cut is mis-compared against the basis
+/// and leaves a residual or flips. Correct behaviour: the round succeeds, every opposing user is
+/// cut and stays LONG (no flip), and the effective leg shrinks by exactly the cut.
+#[test]
+fn j726_w1_lp_stop_on_real_adl_scaled_legs() {
+    use percolator_prog::lev_guard_v22 as lg;
+    let (mut env, lp, users) = lev_w1::world();
+    let same = &users[3];
+    let (pid, _, pep) = env.identity(same.portfolio);
+    let kp = same.kp.insecure_clone();
+    let m = env.market;
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::RebalanceReduce {
+            portfolio_id: pid,
+            position_epoch: pep,
+            asset_index: 0,
+            reduce_q: tok(GPRICE, 250).unsigned_abs(),
+        },
+        vec![
+            AccountMeta::new(kp.pubkey(), true),
+            AccountMeta::new(m, false),
+            AccountMeta::new(same.portfolio, false),
+        ],
+        &[&kp],
+    )
+    .expect("tag 44 exit by the same-side short");
+    let asset = |env: &Env| {
+        let mut d = env.svm.get_account(&env.market).unwrap().data;
+        let (_, g) = state::market_view_mut(&mut d).unwrap();
+        g.markets[0].engine.asset.try_to_runtime().unwrap()
+    };
+    let a = asset(&env);
+    eprintln!("J726 W1: a_long={} a_short={} ADL_ONE={}", a.a_long, a.a_short, percolator::ADL_ONE);
+    assert!(a.a_long < percolator::ADL_ONE, "vacuity: the long side (users opposite the LP) is ADL-scaled");
+    let eff = |basis: i128, a_long: u128| (basis.unsigned_abs() * a_long).div_ceil(percolator::ADL_ONE);
+    let before: Vec<(i128, u128)> = users.iter().take(3).map(|u| {
+        let b = env.position(u.portfolio);
+        (b, eff(b, a.a_long))
+    }).collect();
+    for (b, e) in &before {
+        assert!(*e < b.unsigned_abs(), "effective {e} < basis {b}");
+    }
+    lev_w1::lose_capital(&mut env, lp.portfolio, 4, 10);
+    let keys: Vec<Pubkey> = users.iter().take(3).map(|u| u.portfolio).collect();
+    let r = lev_w1::w1(&mut env, &lp, &keys);
+    eprintln!("J726 W1 result: {r:?}");
+    r.expect("W1 round on ADL-scaled legs");
+    let g = lev_w1::guard(&env);
+    let a2 = asset(&env);
+    for (u, (b0, e0)) in users.iter().take(3).zip(before) {
+        let b1 = env.position(u.portfolio);
+        eprintln!("J726 W1 user basis {b0} -> {b1}; effective {e0} -> ~{}; keep_bps {}", eff(b1, a2.a_long), g.round_keep_bps);
+        assert!(b1 >= 0, "never flipped short");
+        assert!(b1 < b0, "a real cut happened");
+    }
+    let _ = lg::NAV_ONE;
+}
