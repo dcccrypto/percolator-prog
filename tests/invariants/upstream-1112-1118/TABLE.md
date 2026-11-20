@@ -65,7 +65,7 @@ The two pre-existing INV-031 tests in the same file stay GREEN on db019142.
 
 ### RED: crossed Recovery obligations lock the resolved market (2d03e07e)
 
-`tests/invariants/cu/inv_073_crossed_recovery_obligations.rs:169`, both crossed tests:
+`tests/invariants/cu/inv_073_crossed_recovery_obligations.rs:171` (the `assert!` in `drain_resolved_cohort`; the tests are parked with `#[ignore]` at lines 365 and 374), both crossed tests:
 `crossed Recovery obligations, winner first: nonterminal cohort reached a fixed point in round 1`.
 P and Q each forfeit one leg on a shut-down asset and keep a real position on the other. After resolution no
 `CloseResolved` call in a whole round changes anything, so R's gain on unrelated asset 0 is never paid. In
