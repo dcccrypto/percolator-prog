@@ -7631,7 +7631,8 @@ fn audit660_f4101_crank_never_grows_a_non_portfolio_program_account() {
 //   A2: an ACTIVE leg with basis 0 on the vault LP of a RESOLVED market, still counted in
 //       stored_pos_count_short (5DWaFGSE / HxYBmA1t).
 // Both are reproduced here through the real instructions, then walked to flat with the
-// permissionless resolved cranks (tag 30 for traders, tag 101 for the vault LP).
+// permissionless resolved cranks (A1: tag 30 for the trader; A2: a normal trade under a
+// barrier before resolution; tag 101 for the vault LP in both).
 // ═══════════════════════════════════════════════════════════════════════════════════════
 
 /// (oi_long, oi_short, stored_long, stored_short, pending_obligation_short, loss_weight_sum_short,
@@ -7650,10 +7651,10 @@ fn rla_asset(env: &Env) -> (u128, u128, u64, u64, u64, u128, u64) {
     )
 }
 
-/// The vault LP's leg on asset 0: (active, basis, loss_weight), or None when detached.
-fn rla_leg(env: &Env, portfolio: Pubkey) -> Option<(bool, i128, u128)> {
+/// The vault LP's leg on asset 0: (basis, loss_weight), or None when detached.
+fn rla_leg(env: &Env, portfolio: Pubkey) -> Option<(i128, u128)> {
     let p = env.portfolio(portfolio);
-    p.legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| (l.active, l.basis_pos_q, l.loss_weight))
+    p.legs.iter().find(|l| l.active && l.asset_index == 0).map(|l| (l.basis_pos_q, l.loss_weight))
 }
 
 /// A1. Resolution is lazy: `resolve_market_not_atomic` closes nothing, and each resolved close
@@ -7731,8 +7732,8 @@ fn rla_patch_market(env: &mut Env, f: impl FnOnce(&mut state::MarketGroupV16)) {
 ///
 /// STATE POKE (one counter): the short-domain barrier is raised / dropped with `write_market` as a
 /// stand-in for that unfinished bankruptcy close. Everything else runs through the real
-/// instructions: the retained leg is produced by the trader's closing trade, and tag 101 is the
-/// only thing that touches the vault LP afterwards.
+/// instructions: the retained leg is produced by the trader's closing trade (asserted), and tag 101
+/// is the only thing that touches the vault LP afterwards.
 #[test]
 fn rla_a2_zero_basis_leg_is_a_pending_loss_obligation_held_by_the_domain_barrier() {
     let mut env = Env::new(Params::default());
@@ -7756,38 +7757,16 @@ fn rla_a2_zero_basis_leg_is_a_pending_loss_obligation_held_by_the_domain_barrier
         rla_asset(&env),
         rla_leg(&env, lp.portfolio)
     );
-    let organic = r.is_ok() && rla_leg(&env, lp.portfolio) == Some((true, 0, q));
+    assert!(r.is_ok(), "trader's close to flat under the barrier must succeed: {r:?}");
+    assert_eq!(rla_leg(&env, lp.portfolio), Some((0, q)), "closing under the barrier retains a zero-basis leg");
     env.resolve();
-    if !organic {
-        // Fallback: inject the devnet shape after the trader's own resolved close.
-        for _ in 0..3 {
-            if rla_leg(&env, t.portfolio).is_none() {
-                break;
-            }
-            env.trader_close_resolved(&t);
-        }
-        let mut acct = env.svm.get_account(&lp.portfolio).unwrap();
-        let mut p = state::read_portfolio(&acct.data).unwrap();
-        for leg in p.legs.iter_mut() {
-            if leg.active && leg.asset_index == 0 {
-                leg.basis_pos_q = 0;
-            }
-        }
-        state::write_portfolio(&mut acct.data, &p).unwrap();
-        env.svm.set_account(lp.portfolio, acct).unwrap();
-        rla_patch_market(&mut env, |g| {
-            g.assets[0].oi_eff_short_q = 0;
-            g.assets[0].pending_obligation_count_short = 1;
-            g.pending_domain_loss_barriers[1] = 1;
-        });
-    }
     println!(
-        "A2 resolved, organic={organic} (DEVNET SHAPE): asset {:?} lp leg {:?}",
+        "A2 resolved (DEVNET SHAPE): asset {:?} lp leg {:?}",
         rla_asset(&env),
         rla_leg(&env, lp.portfolio)
     );
     assert_eq!(rla_asset(&env), (0, 0, 0, 1, 1, q, 1), "0 / 0 OI, one counted short slot, one pending obligation");
-    assert_eq!(rla_leg(&env, lp.portfolio), Some((true, 0, q)), "active, basis 0, loss weight kept");
+    assert_eq!(rla_leg(&env, lp.portfolio), Some((0, q)), "active, basis 0, loss weight kept");
 
     // While the barrier is pending, tag 101 is progress-only: the leg cannot detach.
     let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
@@ -7804,7 +7783,7 @@ fn rla_a2_zero_basis_leg_is_a_pending_loss_obligation_held_by_the_domain_barrier
         env.portfolio(lp.portfolio).capital
     );
     assert_eq!(rla_asset(&env), (0, 0, 0, 1, 1, q, 1), "held: nothing detaches under the barrier");
-    assert_eq!(rla_leg(&env, lp.portfolio), Some((true, 0, q)));
+    assert_eq!(rla_leg(&env, lp.portfolio), Some((0, q)));
     assert_eq!(env.portfolio(lp.portfolio).capital, lp_capital, "the vault LP is not paid out while held");
 
     // The bankrupt account's close finishes (stand-in: the barrier counter drops) -> tag 101 detaches.
