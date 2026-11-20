@@ -22894,7 +22894,7 @@ pub mod processor {
         // check the other permissionless payout paths already carry.
         // sync(W4-TOKEN22): folded into `require_unencumbered_dest` on the widened
         // `verify_withdrawable_token_accounts` instead of a second standalone call.
-        let vault_balance = verify_withdrawable_token_accounts(
+        let (vault_balance, paid_mint) = verify_withdrawable_token_accounts_with_mint(
             dest_token,
             &Pubkey::new_from_array(beneficiary),
             vault_token,
@@ -22902,6 +22902,19 @@ pub mod processor {
             &cfg,
             !authority.is_signer,
         )?;
+        // #477 sibling (reserve-payout variant of the CloseResolved fix): a reserve payout the
+        // bound beneficiary did not sign must be made in the PRIMARY mint. In Resolved this
+        // preflight is permissionless (no beneficiary signature), so otherwise a market creator
+        // could pay a third-party backing/insurance beneficiary their claim in a creator-set
+        // secondary mint (tag 60, decimals-only check), stranding the beneficiary's real primary
+        // for CloseSlab to sweep to the creator. The beneficiary keeps the either-mint choice only
+        // when it SIGNS its own withdrawal (live reserve management). Mirrors upstream 0b06131f,
+        // whose domain-preflight passes require_primary_mint = !(is_signer && local_authorized).
+        if !(authority.is_signer && local_authorized)
+            && paid_mint.to_bytes() != cfg.collateral_mint
+        {
+            return Err(PercolatorError::InvalidMint.into());
+        }
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_balance, amount_u64)?;
         Ok((bump, amount_u64))
@@ -23830,7 +23843,7 @@ pub mod processor {
         // permissionless), so `require_unencumbered_dest` is unconditionally `true`.
         // sync(W4-TOKEN22): folded into the widened `verify_withdrawable_token_accounts`
         // instead of a second standalone call.
-        let vault_balance = verify_withdrawable_token_accounts(
+        let (vault_balance, paid_mint) = verify_withdrawable_token_accounts_with_mint(
             dest_token,
             authority.key,
             vault_token,
@@ -23838,6 +23851,13 @@ pub mod processor {
             &cfg_pre,
             true,
         )?;
+        // #477 sibling: the terminal insurance reserve is paid to `authority.key` (the bound
+        // beneficiary) and this path is permissionless, so a reserve payout the beneficiary did
+        // not sign must be in the PRIMARY mint (else a creator pays it in a self-set secondary
+        // mint and sweeps the stranded primary). The beneficiary keeps either mint when it signs.
+        if !authority.is_signer && paid_mint.to_bytes() != cfg_pre.collateral_mint {
+            return Err(PercolatorError::InvalidMint.into());
+        }
 
         // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
         // Skipped when no insurance-withdrawal policy is configured, preserving exact prior

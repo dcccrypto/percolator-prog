@@ -30040,3 +30040,72 @@ fn unsigned_resolved_close_pays_primary_mint_only() {
         assert_eq!(env.portfolio_state(portfolio).capital, 0, "claim settled");
     }
 }
+
+/// #477 reserve-payout sibling (K1): an unsigned-in-Resolved reserve payout must be in the
+/// primary mint. A creator can no longer pay a third-party backing beneficiary in a self-set
+/// secondary mint and strand their primary; the beneficiary keeps the either-mint choice only
+/// when it SIGNS. Mirrors upstream 0b06131f's domain-preflight require_primary_mint.
+#[test]
+fn unsigned_reserve_payout_is_primary_mint_only() {
+    let backing_withdraw = |env: &mut V16CuEnv, authority: &Keypair, dest: Pubkey, vault: Pubkey, signs: bool| {
+        let market_id = state::read_market_trade_preflight(
+            &env.svm.get_account(&env.market).unwrap().data, 1).unwrap().3;
+        let authority_epoch = env.backing_withdraw_authority_epoch(2, &authority.pubkey());
+        let ledger = env.canonical_backing_domain_ledger_account(2);
+        let metas = vec![
+            AccountMeta { pubkey: authority.pubkey(), is_signer: signs, is_writable: false },
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+            AccountMeta::new(ledger, false),
+        ];
+        let ix = ProgInstruction::WithdrawBackingBucket { market_id, domain: 2, amount: 1_000_000, authority_epoch };
+        if signs { env.send(ix, metas, &[authority]) } else { env.send(ix, metas, &[]) }
+    };
+
+    // Build a market with a worthless secondary mint and a third-party backing beneficiary.
+    let mut setup = || {
+        let mut env = V16CuEnv::new();
+        let creator = env.admin.insecure_clone();
+        let victim = Keypair::new();
+        env.svm.airdrop(&victim.pubkey(), 1_000_000_000).unwrap();
+        let junk = env.create_mint();
+        env.update_base_unit_mints_with_cu(env.mint, junk);
+        env.activate_asset_with_authorities(1, 1, 100, creator.pubkey(), creator.pubkey(), victim.pubkey(), creator.pubkey());
+        env.top_up_backing_bucket_with_authority(&victim, 2, 1_000_000, u64::MAX);
+        env.resolve();
+        (env, victim, junk)
+    };
+
+    // (A) unsigned junk payout is now REJECTED; the backer's primary is untouched.
+    {
+        let (mut env, victim, junk) = setup();
+        let junk_vault = env.vault_token_for_mint(junk, 1_000_000);
+        let junk_dest = env.token_account_for_mint(junk, victim.pubkey(), 0);
+        let r = backing_withdraw(&mut env, &victim, junk_dest, junk_vault, false);
+        assert_eq!(r.as_ref().err().and_then(|e| custom_code(e)), Some(PercolatorError::InvalidMint as u32),
+            "unsigned reserve payout in the secondary mint must be rejected: {:?}", r.as_ref().err());
+        assert_eq!(env.token_amount(junk_dest), 0, "no junk paid");
+        assert_eq!(env.token_amount(env.vault), 1_000_000, "backer's primary untouched");
+    }
+    // (B) unsigned PRIMARY payout still works — liveness preserved.
+    {
+        let (mut env, victim, _junk) = setup();
+        let primary_dest = env.token_account_for_mint(env.mint, victim.pubkey(), 0);
+        let primary_vault = env.vault;
+        backing_withdraw(&mut env, &victim, primary_dest, primary_vault, false)
+            .expect("unsigned reserve payout in the primary mint still works");
+        assert_eq!(env.token_amount(primary_dest), 1_000_000, "backer paid in primary");
+    }
+    // (C) a SIGNED beneficiary may still take the secondary mint.
+    {
+        let (mut env, victim, junk) = setup();
+        let junk_vault = env.vault_token_for_mint(junk, 1_000_000);
+        let junk_dest = env.token_account_for_mint(junk, victim.pubkey(), 0);
+        backing_withdraw(&mut env, &victim, junk_dest, junk_vault, true)
+            .expect("a signed beneficiary may take the secondary mint");
+        assert_eq!(env.token_amount(junk_dest), 1_000_000, "signed beneficiary took secondary by choice");
+    }
+}
