@@ -71,16 +71,16 @@ Command (wrapper built with `cargo build-sbf --tools-version v1.52 --features de
 
 The two pre-existing INV-031 tests in the same file stay GREEN on both engines.
 
-Re-run once on this branch (job J-20261119-PROG-TOLY-TESTSWEEPb, 20 Nov), under the cargo slot lock, on both engines:
+Re-run once on this branch (job J-20261119-PROG-TOLY-TESTSWEEPb, 20 Nov, before the full `is_occupied` check), under the cargo slot lock, on both engines:
 default run `5 passed; 0 failed; 2 ignored`; `--ignored` run `0 passed; 2 failed`, both panicking at
-`inv_073_crossed_recovery_obligations.rs:171:9` (`nonterminal cohort reached a fixed point in round 1`). The engine-tip
+`inv_073_crossed_recovery_obligations.rs:171:9` (that line is now :192) (`nonterminal cohort reached a fixed point in round 1`). The engine-tip
 run used a scratch prog worktree whose `../percolator` is at 3e5970f3, built with `PERCOLATOR_ENGINE_UNPINNED=1`
 (the build script's opt-in for a local run off the CI pin) and selected with `P1_WRAPPER_SO`. The tip column
 therefore shows #309/#310/#362 do not fix the INV-073 lock; 2ed67b16 is still needed.
 
 ### RED: crossed Recovery obligations lock the resolved market (2d03e07e)
 
-`tests/invariants/cu/inv_073_crossed_recovery_obligations.rs:171` (the `assert!` in `drain_resolved_cohort`; the tests are parked with `#[ignore]` at lines 365 and 374), both crossed tests:
+`tests/invariants/cu/inv_073_crossed_recovery_obligations.rs:192` (the `assert!` in `drain_resolved_cohort`; the tests are parked with `#[ignore]` at lines 386 and 395), both crossed tests:
 `crossed Recovery obligations, winner first: nonterminal cohort reached a fixed point in round 1`.
 P and Q each forfeit one leg on a shut-down asset and keep a real position on the other. After resolution no
 `CloseResolved` call in a whole round changes anything, so R's gain on unrelated asset 0 is never paid. In
