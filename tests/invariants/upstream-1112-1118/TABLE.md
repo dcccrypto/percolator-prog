@@ -1,5 +1,8 @@
 # Upstream percolator-prog, 12-18 Nov 2026: one line per commit
 
+All first-parent commits on upstream `main` dated 12-18 Nov (32 commits, daa0576b .. 9199d869) are listed: 28 as rows below, 4 under
+"Not redone here" (9199d869, b7990033, eb273e3c, ea212394). Rows 21-24 were added in the follow-up job after its fresh review found them missing.
+
 Source: `aeyakovenko/percolator-prog` main (read-only `upstream` remote). Nothing was sent upstream.
 (The job asked for `docs/upstream-1112-1118/TABLE.md`. This job is tests-only and its pre-push hook refuses
 non-test paths, so the table lives under `tests/`.)
@@ -39,10 +42,14 @@ Verdicts: (a) not applicable; (b) port the test. GREEN/RED: result of the ported
 | 18 | ac719dff INV-077 liened loss refresh at the source cap | engine 1683b11d (liened-face fix) | no | (a) INV-077 max-shape: 5-6 legs over 28 source domains; vacuous at our 4-leg portfolio cap unless #740 merges. Not ported |
 | 19 | 506016b5 INV-031 provider exit capped at principal | engine 827a125f | yes (#362) | (a) already ported: 24ada763 carries this file, adapted to our stricter wrapper gate (E-LSA-W, #470). Checked against #708/#711: no overlap |
 | 20 | 731338e0 pin 827a125f | 827a125f | yes (#362) | (a) pin bump |
-| 21 | 37849dfc INV-031 payment stranded by a reversal | engine 9a219cca | no | (b) ported into `inv_031_provider_exit_principal.rs`: **GREEN** (2 tests), kept as regression guards. Our fork refuses through its ledger-principal cap (Custom 25), not through 9a219cca |
-| 22 | 2d03e07e INV-073 crossed Recovery obligations | engine 2ed67b16 | no | (b) ported as `inv_073_crossed_recovery_obligations.rs`: **RED** for the 2 crossed tests (parked `#[ignore = "RED: ..."]`); the control is GREEN |
-| 23 | f9f0bcf8 INV-077 exact payouts in both close orders | engine 52659c02 (resolved K/F netting, stranded payments placed at most 4 per call) | no | (a) INV-077; edits absent `inv_077_resolved_loss_settlement.rs`; vacuous at our 4-leg cap unless #740 merges |
-| 24 | 8aa7a64a pin 52659c02 + INV-039 mixed-role book | 52659c02 (+ 9a219cca, 2ed67b16, 8e23d98b) | no | (a) pin bump; INV-039 change is to upstream's reference book in absent files |
+| 21 | 8b10d3b2 Live value exits wait for unsettled positions on their own asset (INV-031) | prog gate in `src/` (7 lines in `asset_local_loss_stale_view`), no engine commit | yes, own gate: `asset_local_open_kf_cohort_view` in `live_domain_withdraw_health_or_shutdown_view` (E-LSA-W, #470) | (a) already ported: 24ada763 (whose message names 8b10d3b2) carries its `inv_031_live_exit_loss_stale_gate.rs` fixture and, with row 19, the provider-exit file it edits; the `src/` lines are not duplicated |
+| 22 | ec03c68d pin 5e3af071 | 5e3af071 (a late resolved loss repays the provider that fronted the gain) | no (not an ancestor of 3e5970f3) | (a) pin bump; edits are pin constants in 29 absent census/invariant files and upstream's own `v16_cu.rs` pin string |
+| 23 | 7b110913 INV-077 source-lien refresh bound refuses a batch as a whole | none (test only, against upstream's b7990033 bound) | no (the bound is in our open PR #740, not merged) | (a) edits absent `inv_077_source_lien_loss_refresh.rs`; INV-077 belongs with #740 (b7990033/eb273e3c/ea212394), not redone here |
+| 24 | bbb865f2 pin a55aceb3 | a55aceb3 (resolved close settles losses over source claims a bounded number of legs per call) | no (not an ancestor of 3e5970f3) | (a) pin bump; same 29 absent files as ec03c68d |
+| 25 | 37849dfc INV-031 payment stranded by a reversal | engine 9a219cca | no | (b) ported into `inv_031_provider_exit_principal.rs`: **GREEN** (2 tests), kept as regression guards. Our fork refuses through its ledger-principal cap (Custom 25), not through 9a219cca |
+| 26 | 2d03e07e INV-073 crossed Recovery obligations | engine 2ed67b16 | no | (b) ported as `inv_073_crossed_recovery_obligations.rs`: **RED** for the 2 crossed tests (parked `#[ignore = "RED: ..."]`); the control is GREEN |
+| 27 | f9f0bcf8 INV-077 exact payouts in both close orders | engine 52659c02 (resolved K/F netting, stranded payments placed at most 4 per call) | no | (a) INV-077; edits absent `inv_077_resolved_loss_settlement.rs`; vacuous at our 4-leg cap unless #740 merges |
+| 28 | 8aa7a64a pin 52659c02 + INV-039 mixed-role book | 52659c02 (+ 9a219cca, 2ed67b16, 8e23d98b) | no | (a) pin bump; INV-039 change is to upstream's reference book in absent files |
 
 Not redone here: 22863798, da0dfad9, 9199d869 (job J-20261119-PROG-TOLY-INV066) and b7990033, eb273e3c,
 ea212394 (our PR #740).
@@ -81,6 +88,9 @@ crosses two of its own accounts and forfeits. This matches the upstream report a
 (a55aceb3). The fix is upstream engine 2ed67b16 (a waiting Recovery obligation holds its account's other
 legs only while some account still has a loss to settle or book), which neither db019142 nor the engine tip
 has. There is no src change here; porting 2ed67b16 is an engine job.
+
+Note for whoever ports 2ed67b16: both crossed tests panic on the "winner first" close order, so the
+"winner last" order has never run on this fork. It needs its first green run too.
 
 ### Adaptations made in the ports (no assertion weakened except where noted)
 
