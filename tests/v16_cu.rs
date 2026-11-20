@@ -29818,7 +29818,7 @@ fn v16_738_shape_only_decode_confined_to_read_only_readers() {
         assert!(hits.iter().any(|(n, _)| n == a), "`{a}` no longer uses shape decode; update the allowlist");
     }
 }
-=======
+
 // ── SwapSecondaryForPrimary (tag 60-family) real-path BPF tests ──────────────
 //
 // `handle_swap_secondary_for_primary` (src/v16_program.rs) checks, in order:
@@ -30132,4 +30132,3 @@ fn v16_bpf_swap_secondary_for_primary_rejects_non_authority_signer() {
     assert_eq!(swap_balances(&env, &a), before);
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
 }
->>>>>>> origin/feat/v22-rc23-2026-10-22
