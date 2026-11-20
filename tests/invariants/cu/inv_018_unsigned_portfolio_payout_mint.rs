@@ -8,9 +8,8 @@
 //! authority's making: the claims are cleared, the deposits stay in the primary vault, and
 //! `CloseSlab` pays them to the authority.
 //!
-//! Reserve payouts (backing buckets, their earnings, terminal insurance) are outside this
-//! rule: their payees may have dropped their keys, so they stay payable in either mint
-//! without a signature (see `inv_018_reserve_payout_lostkey.rs`).
+//! Reserve payouts (backing buckets, their earnings, terminal insurance) follow the same rule
+//! since upstream 048085cf: see `inv_018_unsigned_reserve_payout_mint.rs`.
 //!
 //! In this tree a resolved `PermissionlessCrank` does not reach the payout, so the upstream
 //! test's crank route has no counterpart. An unsigned call presents the market group's NFT

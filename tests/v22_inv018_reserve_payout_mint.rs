@@ -9,8 +9,8 @@
 //! Paths covered here (real wrapper BPF, the harness of `v22_587_creator_fee_payee.rs`):
 //!   * tag 90 `WithdrawCreatorFee` payee route (burned `asset_admin`, permissionless)
 //!   * tag 87 `WithdrawInsuranceReserveToStake` (permissionless, pays the stake pool vault)
-//! Tag 101 `VaultLpSettleResolved` is covered in `tests/p3_vault_lp.rs`; the lost-key
-//! reserve payouts in `tests/v16_cu.rs` (`inv_018_reserve_payout_lostkey`).
+//! Tag 101 `VaultLpSettleResolved` is covered in `tests/p3_vault_lp.rs`; the reserve
+//! payouts in `tests/v16_cu.rs` (`inv_018_unsigned_reserve_payout_mint`, upstream 048085cf).
 #![allow(dead_code)]
 mod common;
 

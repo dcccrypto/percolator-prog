@@ -22889,7 +22889,9 @@ pub mod processor {
             &vault_authority,
             &cfg,
             !authority.is_signer,
-            false,
+            // Upstream 048085cf: unsigned by the beneficiary, a reserve payout is made in the
+            // primary mint (a marketauth signature does not count as the payee's).
+            !(authority.is_signer && local_authorized),
         )?;
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_balance, amount_u64)?;
@@ -23826,7 +23828,9 @@ pub mod processor {
             &vault_authority,
             &cfg_pre,
             true,
-            false,
+            // Upstream 048085cf rule, v2.2 path: the payee (`authority`) did not sign, so the
+            // payout is in the primary mint; with its signature it takes either mint.
+            !authority.is_signer,
         )?;
 
         // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
@@ -26381,7 +26385,7 @@ pub mod processor {
                     vault_authority_ai.key,
                     &cfg_pre,
                     true,
-                    false,
+                    true,
                 )?;
                 transfer_tokens_signed(
                     token_program,
@@ -50679,12 +50683,13 @@ pub mod processor {
         Ok(())
     }
 
-    // `require_primary_mint` is set for a resolved payout to a portfolio whose owner did not
-    // sign. Value enters in the primary mint alone; `marketauth` names the secondary mint,
-    // and its vault holds whatever was sent there. If a third party could have an owner paid
-    // in it, the owner's claim would be cleared while its deposit stayed in the primary vault
-    // as `CloseSlab` surplus (#477, upstream 0b06131f). With its signature the owner takes
-    // either mint. Reserve payouts pass `false`: their beneficiaries may have dropped their keys.
+    // `require_primary_mint` is set whenever the party being paid did not sign the instruction
+    // (upstream 048085cf, extending 0b06131f / #477 from portfolio payouts to reserve payouts).
+    // Value enters in the primary mint alone; `marketauth` names the secondary mint, and its
+    // vault holds whatever was sent there. If a third party could have a payee paid in it, the
+    // payee's claim would be cleared while what it paid in stayed in the primary vault as
+    // `CloseSlab` surplus. With its own signature a payee takes either mint. A payee that lost
+    // its keys is still paid, unsigned, in the primary mint.
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): `require_unencumbered_dest` folds in what
     // used to be the separate `verify_permissionless_payout_dest_token_account` call (W5 /
     // upstream b7b6688e / #154) -- same obligation, same three call sites (CloseResolved,

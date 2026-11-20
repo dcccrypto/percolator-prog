@@ -1,6 +1,13 @@
 # #477 follow-up: reserve payouts that stay payable in either mint (lost-key exception)
 
-Status: finding, **code unchanged** (same as upstream `0b06131f`). Recorded for a decision.
+Status: **closed by upstream `048085cf`** (ported in the 2026-11-20 daily Toly check). Unsigned
+reserve payouts (backing bucket, its earnings, insurance asset, terminal insurance tag 41,
+CloseSlab native escheat) now pay in the primary mint only; with the payee's own signature
+either mint. The pinned "either mint" tests below were replaced by
+`tests/invariants/cu/inv_018_unsigned_reserve_payout_mint.rs`. The text below is the original
+finding, kept for the record.
+
+Original status: finding, **code unchanged** (same as upstream `0b06131f`). Recorded for a decision.
 
 ## What the port changes and what it leaves
 
