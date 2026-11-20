@@ -105,15 +105,36 @@ fn resolved_portfolio_is_terminal(env: &V16CuEnv, portfolio: Pubkey) -> bool {
         && account.fee_credits == 0
         && account.cancel_deposit_escrow == 0
         && percolator::active_bitmap_is_empty(account.active_bitmap)
-        // Upstream checks "no source domain occupied"; the claim bound is the fork-side
-        // stand-in. The exact payout and empty-vault assertions catch an early exit.
-        && account.source_claim_bound_num.iter().all(|&bound| bound == 0)
+        && no_source_domain_occupied(&account)
         && (!receipt.present || receipt.finalized)
         && account.last_fee_slot == group.resolved_slot
 }
 
+/// Upstream's `source_domains.iter().all(|source| !source.is_occupied())`. The fork's
+/// decoded portfolio keeps the 12 per-domain fields of `PortfolioSourceDomainV16Account`
+/// as parallel vectors and copies every occupied domain into them, so a domain is occupied
+/// exactly when one of these 12 entries is nonzero (the same 12 fields `is_occupied` reads).
+fn no_source_domain_occupied(account: &state::PortfolioAccountV16) -> bool {
+    let zero = |values: &[u128]| values.iter().all(|&value| value == 0);
+    zero(&account.source_claim_bound_num)
+        && zero(&account.source_claim_liened_num)
+        && zero(&account.source_claim_counterparty_liened_num)
+        && zero(&account.source_claim_insurance_liened_num)
+        && zero(&account.source_lien_effective_reserved)
+        && zero(&account.source_lien_counterparty_backing_num)
+        && zero(&account.source_lien_insurance_backing_num)
+        && account.source_lien_fee_last_slot.iter().all(|&slot| slot == 0)
+        && zero(&account.source_claim_impaired_num)
+        && zero(&account.source_lien_impaired_effective_reserved)
+        && zero(&account.source_lien_capital_at_risk_fee_revenue)
+        && zero(&account.source_lien_impaired_capital_at_risk_fee_revenue)
+}
+
+/// `EngineNonProgress` (Custom 22, hex 0x16), the refusal upstream's drain accepts.
 fn is_engine_non_progress_error(error: &str) -> bool {
-    error.contains("Custom(22)") || error.contains("custom program error: 0x16")
+    let code = PercolatorError::EngineNonProgress as u32;
+    error.contains(&format!("Custom({code})"))
+        || error.contains(&format!("custom program error: {code:#x}"))
 }
 
 /// Closes every account of the cohort, in order, round after round, until all are
