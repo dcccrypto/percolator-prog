@@ -213,6 +213,8 @@ This section describes intent and operational ordering, not argument-by-argument
   - owner-signed risk-reducing rebalance against the wrapper-authenticated effective price vector
 - **ClaimResolvedPayoutTopup** (tag 46)
   - permissionless resolved-payout top-up claim; pays only the stored owner receipt token account
+  - unsigned, it pays the primary mint; the owner's signature selects the secondary mint (#477, `v16_inv018_unsigned_topup_payout_is_primary_mint`)
+  - the same rule holds for `CloseResolved` (tag 30), the creator-fee payee route of `WithdrawCreatorFee` (tag 90) and `WithdrawInsuranceReserveToStake` (tag 87): a payout whose beneficiary did not sign is made in the primary mint. `VaultLpSettleResolved` (tag 101) moves no tokens. Since upstream `048085cf` the reserve payouts follow it too: `WithdrawBackingBucket`, `WithdrawBackingBucketEarnings`, `WithdrawInsuranceAsset`, and the terminal insurance payout (`WithdrawInsurance`, tag 41) pay the secondary mint only with the payee's own signature (a `marketauth` signature does not count); unsigned (a payee that lost its key) they pay in the primary mint. The `CloseSlab` native residue escheat is never signed by its payee and always pays in the primary mint.
 - **RefineResolvedUnreceiptedBound** (tag 47)
   - admin-gated monotonic decrease of the resolved unreceipted bound; cannot increase obligations
 

@@ -2009,6 +2009,35 @@ fn p3_h1_settle_resolved_pays_the_junior_when_seniors_are_covered() {
     env.assert_conserved("settle resolved, covered");
 }
 
+/// INV-018 guard (#477). Tag 101 is permissionless and names a junior destination, but no
+/// token leaves the vault in any mint: the whole payout returns to the vault's backing pot
+/// and the junior takes its share through the owner-signed tag 102. So a caller that picks
+/// the destination account cannot have the junior paid in any mint.
+#[test]
+fn v22_inv018_vault_lp_settle_resolved_pays_no_token_account() {
+    let mut env = Env::new(Params::default());
+    let lp = env.bind(1_000);
+    let admin = env.admin.insecure_clone();
+    let d = env.new_depositor();
+    env.earn_deposit(&d, 10_000_000, Some(lp.portfolio)).expect("earn");
+    env.junior_deposit_as(&admin, lp.portfolio, 20_000_000).expect("junior");
+    env.resolve();
+    let junior_dest = env.token_account(env.mint, admin.pubkey(), 0);
+    let vault_before = env.tok(env.vault_token);
+    let (_, group_before) = env.market_state();
+    let capital_before = env.portfolio(lp.portfolio).capital;
+    env.settle_resolved(&Keypair::new(), lp.portfolio, 0, junior_dest)
+        .expect("an unsigned settle");
+    assert!(
+        env.portfolio(lp.portfolio).capital < capital_before,
+        "the settle ran: the vault LP's payout moved into the backing pot"
+    );
+    assert_eq!(env.tok(junior_dest), 0, "no token reaches the junior destination");
+    assert_eq!(env.tok(env.vault_token), vault_before, "no token leaves the vault");
+    let (_, group_after) = env.market_state();
+    assert_eq!(group_after.vault, group_before.vault);
+}
+
 /// P3-H1 PoC 3. Resolved exit WITH a senior shortfall: the shortfall is refilled into backing
 /// FIRST, only the residual reaches the junior, and the Earn holder then redeems the full C.
 #[test]
