@@ -42,7 +42,8 @@ fn is_invalid_mint_error(error: &str) -> bool {
 
 /// A third party holds the payee role of asset 1 on `rail` and funds it in the deposit mint.
 /// The market authority names a secondary mint and the secondary vault holds `RESERVE`. The
-/// market is resolved and has no portfolios.
+/// market is resolved and has no portfolios, except on `Rail::InsuranceAsset`, which stays
+/// Live (that instruction is Live-only here).
 fn resolved_reserve(rail: Rail) -> Fixture {
     let mut env = V16CuEnv::new();
     let secondary = env.create_mint();
@@ -149,6 +150,19 @@ impl Fixture {
     /// only when `signed` (otherwise the fee payer submits it alone).
     fn pay(&mut self, dest: Pubkey, vault: Pubkey, signed: bool) -> Result<u64, String> {
         let payee = self.payee.insecure_clone();
+        self.pay_as(&payee, dest, vault, signed)
+    }
+
+    /// The same payout with `payee` (any key: the real payee or `marketauth`) in the
+    /// authority account.
+    fn pay_as(
+        &mut self,
+        payee: &Keypair,
+        dest: Pubkey,
+        vault: Pubkey,
+        signed: bool,
+    ) -> Result<u64, String> {
+        let payee = payee.insecure_clone();
         let mut accounts = vec![
             AccountMeta::new_readonly(payee.pubkey(), signed),
             AccountMeta::new(self.env.market, false),
@@ -256,57 +270,26 @@ fn v16_inv018_signed_terminal_insurance_payee_may_take_secondary_mint() {
     signed_payee_may_take_secondary_mint(Rail::TerminalInsurance);
 }
 
-/// The #756 finding, closed: the unsigned secondary payout no longer goes through, so
-/// `CloseSlab` has no displaced primary tokens to pay `marketauth`. After the payee is paid
-/// unsigned in the deposit mint, marketauth's primary share is 0 and the secondary vault's
-/// own balance goes back to it in the secondary mint.
+/// A `marketauth` signature is not the payee's (upstream 048085cf: `!(signed && local)`, not
+/// `!signed`). marketauth signs a resolved `WithdrawBackingBucket` in the authority account
+/// and names the beneficiary's secondary-mint account: the domain preflight refuses it with
+/// InvalidMint, nothing changed. On 0b06131f the same call passed the mint check and was
+/// refused later by the handler's resolved authority check (Unauthorized).
 #[test]
-fn v16_inv018_close_slab_gets_no_displaced_primary_after_reserve_payout() {
+fn v16_inv018_marketauth_signature_is_not_the_payees() {
     let mut f = resolved_reserve(Rail::Backing);
     let payee = f.payee.pubkey();
-    let dest_secondary = f.env.token_account_for_mint(f.secondary, payee, 0);
-    assert!(f.pay(dest_secondary, f.secondary_vault, false).is_err());
-    let dest_primary = f.env.token_account_for_mint(f.env.mint, payee, 0);
-    let vault = f.env.vault;
-    f.pay(dest_primary, vault, false).expect("unsigned primary payout");
-
     let admin = f.env.admin.insecure_clone();
-    let primary_dest = f.env.token_account_for_mint(f.env.mint, admin.pubkey(), 0);
-    let secondary_dest = f.env.token_account_for_mint(f.secondary, admin.pubkey(), 0);
-    let mut closed = false;
-    for _ in 0..8 {
-        f.env.svm.expire_blockhash();
-        let authority_epoch = f.env.control_sequences(0).authority_epoch;
-        send_tx(
-            &mut f.env.svm,
-            f.env.program_id,
-            &f.env.payer,
-            ProgInstruction::CloseSlab { authority_epoch },
-            vec![
-                AccountMeta::new(admin.pubkey(), true),
-                AccountMeta::new(f.env.market, false),
-                AccountMeta::new(f.env.vault, false),
-                AccountMeta::new_readonly(f.env.vault_authority, false),
-                AccountMeta::new(primary_dest, false),
-                AccountMeta::new_readonly(spl_token::ID, false),
-                AccountMeta::new(f.secondary_vault, false),
-                AccountMeta::new(secondary_dest, false),
-                AccountMeta::new(f.env.mint, false),
-            ],
-            &[&admin],
-        )
-        .expect("CloseSlab");
-        closed = f
-            .env
-            .svm
-            .get_account(&f.env.market)
-            .map_or(true, |m| m.data.len() <= percolator_prog::constants::HEADER_LEN);
-        if closed {
-            break;
-        }
-    }
-    assert!(closed, "CloseSlab finishes");
-    assert_eq!(f.env.token_amount(dest_primary), RESERVE, "the payee keeps its deposit-mint claim");
-    assert_eq!(f.env.token_amount(primary_dest), 0, "marketauth gets no displaced primary tokens");
-    assert_eq!(f.env.token_amount(secondary_dest), RESERVE, "the secondary vault's own balance");
+    let dest_secondary = f.env.token_account_for_mint(f.secondary, payee, 0);
+    let frame_before = (f.env.svm.get_account(&f.env.market), f.balances(dest_secondary));
+    let error = f
+        .pay_as(&admin, dest_secondary, f.secondary_vault, true)
+        .expect_err("a marketauth-signed secondary-mint reserve payout is refused");
+    assert!(is_invalid_mint_error(&error), "expected InvalidMint, got {error}");
+    assert_eq!(
+        (f.env.svm.get_account(&f.env.market), f.balances(dest_secondary)),
+        frame_before,
+        "the refused payout changes nothing"
+    );
 }
+
