@@ -7692,7 +7692,7 @@ fn rla_a1_one_sided_oi_after_resolve_is_the_unsettled_vault_lp_leg_and_tag_101_c
         env.asset_rec().lp_net_q
     );
     assert_eq!(rla_asset(&env), (0, q, 0, 1, 0, q, 0), "one-sided OI: only the vault LP's short is left");
-    assert_eq!(rla_leg(&env, lp.portfolio), Some((true, -(q as i128), q)));
+    assert_eq!(rla_leg(&env, lp.portfolio), Some((-(q as i128), q)));
 
     let (r, _) = env.close_resolved_into_registry_ata(lp.portfolio);
     err_has(&r, PercolatorError::VaultLpUseSettleResolved);
