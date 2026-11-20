@@ -23683,17 +23683,20 @@ pub mod processor {
             // Tag 41 absorbs no residual, so F-1's all-asset order is not needed here.
             let capacity_before_recredit =
                 terminal_insurance_withdraw_capacity_for_authority_view(&group, &cfg, authority.key)?;
-            if ins_units_required_view(&group, &cfg)? {
+            let units_required = ins_units_required_view(&group, &cfg)?;
+            if units_required {
                 match group.recredit_terminal_claim_free_residual_for_asset_not_atomic(0) {
                     Ok(_) | Err(percolator::V16Error::LockActive) => {}
                     Err(e) => return Err(map_v16_error(e)),
                 }
             }
-            let available_insurance = terminal_insurance_withdraw_capacity_for_authority_view(
-                &group,
-                &cfg,
-                authority.key,
-            )?;
+            // CU: the re-credit is the only thing between the two readings, so when it did
+            // not run the capacity is unchanged -- skip the second all-domain scan.
+            let available_insurance = if units_required {
+                terminal_insurance_withdraw_capacity_for_authority_view(&group, &cfg, authority.key)?
+            } else {
+                capacity_before_recredit
+            };
             if group.header.mode != 1
                 || group.header.materialized_portfolio_count.get() != 0
                 || group.header.c_tot.get() != 0
