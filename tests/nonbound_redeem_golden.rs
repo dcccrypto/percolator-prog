@@ -724,6 +724,8 @@ struct PotSnap {
     principal_withdrawn: u128,
     earnings: u128,
     earnings_withdrawn: u128,
+    /// Bucket fee earnings the ledger has not synced yet (77 books them into `earnings` first).
+    pending_earnings: u128,
     loss: u128,
     recovery: u128,
     /// ledger available NAV: principal - min(loss - recovery, principal)
@@ -743,6 +745,7 @@ fn pot_snap(env: &Env, ledger: Pubkey, domain: u16) -> PotSnap {
         principal_withdrawn: l.total_principal_withdrawn_atoms,
         earnings: l.total_earnings_atoms,
         earnings_withdrawn: l.total_earnings_withdrawn_atoms,
+        pending_earnings: b.utilization_fee_earnings.saturating_sub(l.last_observed_bucket_earnings_atoms),
         loss: l.cumulative_loss_atoms,
         recovery: l.cumulative_recovery_atoms,
         nav: l.total_principal_atoms - imp.min(l.total_principal_atoms),
@@ -758,6 +761,7 @@ fn pot_json(p: &PotSnap) -> serde_json::Value {
         "principal_withdrawn": p.principal_withdrawn.to_string(),
         "earnings": p.earnings.to_string(),
         "earnings_withdrawn": p.earnings_withdrawn.to_string(),
+        "pending_earnings": p.pending_earnings.to_string(),
         "loss": p.loss.to_string(),
         "recovery": p.recovery.to_string(),
         "nav": p.nav.to_string(),
@@ -840,12 +844,12 @@ fn run_case(c: &Case) -> serde_json::Value {
     // 1. atoms paid + remaining == before, on the token vault and on the engine vault counter.
     assert_eq!(paid + vault_tok_a, vault_tok_b, "{}: token vault conservation", c.name);
     assert_eq!(paid + vault_grp_a, vault_grp_b, "{}: engine vault conservation", c.name);
-    // 2. the booked principal that left the two ledgers never exceeds what was paid, and the
-    //    principal + net-earnings both pots held before covers paid + what they hold after.
-    let held_b = own_b.principal + sib_b.principal + (own_b.earnings - own_b.earnings_withdrawn)
-        + (sib_b.earnings - sib_b.earnings_withdrawn);
-    let held_a = own_a.principal + sib_a.principal + (own_a.earnings - own_a.earnings_withdrawn)
-        + (sib_a.earnings - sib_a.earnings_withdrawn);
+    // 2. the principal + net earnings (synced or still pending in the bucket) both pots held
+    //    before covers paid + what they hold after. The gap is the insurance stub of the gross
+    //    earnings chunk, which leaves the earnings counters but stays in the vault.
+    let held = |p: &PotSnap| p.principal + (p.earnings - p.earnings_withdrawn) + p.pending_earnings;
+    let held_b = held(&own_b) + held(&sib_b);
+    let held_a = held(&own_a) + held(&sib_a);
     assert!(paid + held_a <= held_b, "{}: ledger conservation {paid}+{held_a} vs {held_b}", c.name);
     let ok = res.is_ok();
     if ok {
