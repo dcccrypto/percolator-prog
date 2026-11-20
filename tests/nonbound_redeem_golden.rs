@@ -419,9 +419,14 @@ fn canonical_vault_ata(vault_authority: &Pubkey, mint: &Pubkey) -> Pubkey {
 /// DOMAIN = 2 (asset 1, long) => sibling = 3 (asset 1, short).
 const SIBLING_DOMAIN: u16 = DOMAIN + 1;
 
+/// A pot ledger is created lazily on its first deposit; an uncreated (empty) one reads as zero.
 fn ledger_of(svm: &LiteSVM, ledger: Pubkey) -> state::BackingDomainLedgerAccountV16 {
-    state::read_backing_domain_ledger(&svm.get_account(&ledger).expect("ledger").data)
-        .expect("ledger decode")
+    match svm.get_account(&ledger) {
+        Some(a) if !a.data.is_empty() => {
+            state::read_backing_domain_ledger(&a.data).expect("ledger decode")
+        }
+        _ => state::BackingDomainLedgerAccountV16::default(),
+    }
 }
 
 fn with_market(env: &mut Env, f: impl FnOnce(&mut state::MarketGroupV16)) {
