@@ -11,8 +11,12 @@
 // The FINDINGS below were #[ignore]d real bugs (#707). The tiny-price format fix
 // (docs/fixes/tiny-price-format.md) reads legs at E12, composes in U256 without the per-leg
 // intermediate gate, and scales the final price by the asset's lot exponent (10^lot_exp tokens
-// per quoted unit). Findings 1 and 5 are output-precision limits of a per-token e6 price, so
-// they pass on a lot market; the lot-0 behaviour is pinned next to each.
+// per quoted unit). Finding 5 is an output-precision limit of a per-token e6 price, so it passes
+// on a lot market; the lot-0 behaviour is pinned next to it.
+//
+// INV-038 (port of upstream aeyakovenko/percolator-prog b2f3ffe7, #462) tightens #711: a leg's
+// six-decimal floor decides whether the feed is admissible, so a leg below one e6 tick (finding 1)
+// is refused at every lot exponent. Only the composition uses the twelve-decimal value.
 #![cfg(not(kani))]
 
 use percolator_prog::{
@@ -478,15 +482,21 @@ fn unit_scale_pushing_price_below_one_tick_is_rejected_cleanly() {
 /// `out == 0` -> OracleInvalid). A real memecoin price below $0.000001 (for example $0.0000005,
 /// Pyth expo -10, price 5_000) is a valid positive Pyth price, but it truncates to 0 e6 and is
 /// rejected as OracleInvalid, so any market on that feed cannot take a price and freezes.
-/// FIX: a per-token e6 price cannot hold it (it is half a tick), so such a market is created with
-/// a lot exponent: lot 6 quotes 10^6 tokens = $0.5 = 500_000 e6, six significant digits.
+/// RULE (INV-038, upstream b2f3ffe7): a leg is admissible only if its six-decimal floor is in
+/// `1..=MAX_ORACLE_PRICE`. #711 admitted this leg on a lot market (lot 6 gave 500_000); that is
+/// tightened, so the leg is refused cleanly (OracleInvalid, never a silent 0) at every lot.
 #[test]
 fn bug_tiny_memecoin_price_below_one_e6_tick_is_rejected() {
     // $0.0000005
-    let r = run_lot(&[leg(5_000, -10)], 0, 0, 0, 0, 6);
-    assert_eq!(r, Ok(500_000), "legit $0.0000005 price on a lot-6 market");
-    // lot 0 still cannot represent it and refuses cleanly (not a silent 0)
-    assert_eq!(err_code(run(&[leg(5_000, -10)], 0, 0, 0, 0)), oracle_invalid());
+    for lot in [0u8, 6, 15] {
+        assert_eq!(
+            err_code(run_lot(&[leg(5_000, -10)], 0, 0, 0, 0, lot)),
+            oracle_invalid(),
+            "lot {lot}"
+        );
+    }
+    // one tick ($0.000001) is the smallest admissible leg: lot 6 quotes it as $1
+    assert_eq!(run_lot(&[leg(10_000, -10)], 0, 0, 0, 0, 6), Ok(1_000_000));
 }
 
 /// FINDING 2. src/v16_program.rs:12529 `read_pyth_price_e6` truncates every leg to whole e6 before
