@@ -9,6 +9,30 @@ Closes the tiny-price cases pinned by #707 (`tests/oracle_compose_edge.rs`).
 `827a125f`: no change to the oracle price format; upstream still reads every leg as a u64
 E6 and rejects 0. No fix to port.
 
+## Tightened: a leg below one e6 tick is refused (INV-038, upstream b2f3ffe7)
+
+Superseding part of this note. Upstream aeyakovenko/percolator-prog `b2f3ffe7` (PR #486, issue
+#462) reads every leg at six and twelve decimals; the composite is computed from the twelve, and
+"the six-decimal value is what is stored per leg and what decides whether a feed is admissible".
+We adopt that rule (Khubair, 21 Nov 2026): `leg_e12_in_range` now requires the six-decimal floor
+of a leg to be in `1..=MAX_ORACLE_PRICE`, so a leg below $0.000001 is `OracleInvalid` at the
+reader and inside the composition, alone or in a composite, at every lot exponent.
+
+What stays from this note: E12 legs (a small but admissible leg such as 0.00041 composes from all
+its digits: the #462 tuples give 61,500 and 61,499), the single exact U256 rational floored once,
+no per-leg intermediate gate, and the lot exponent applied to the final price.
+
+What changes: the sub-tick examples above (Pyth `expo = -10, price = 5_000` at `lot_exp = 6`;
+the E12 legs of 10^-12 .. 10^-7) are no longer readable. A token priced below one e6 tick needs a
+feed quoted per larger unit (or an AuthMark market) instead. The "same-publish-time equivocation"
+open risk below no longer applies to new readings (a stored leg is never 0).
+
+Tests: `tests/inv_038_composite_leg_precision.rs` (the rule, the #462 tuples, the leg scaling for
+every exponent -18..=18) and the BPF cases in `tests/v16_cu.rs`
+(`v16_bpf_composite_leg_below_one_e6_tick_is_rejected`, the tuples through ConfigureHybridOracle
+and a crank, and the finer-report compute bound). `tests/tiny_price_format.rs` and
+`tests/oracle_compose_edge.rs` finding 1 now pin the refusal.
+
 ## Current representation and its limits
 
 * Every price is a u64 in quote-E6 per base unit, `1 ..= MAX_ORACLE_PRICE` (1e12, $1M).
