@@ -408,7 +408,7 @@ The wrapper proof suite does not re-prove engine conservation. It proves wrapper
 
 Relevant wrapper anchors include:
 
-- clamp law: `kani_effective_price_zero_oi_adopts_target` and the clamp staircase proofs in `tests/kani.rs`
+- clamp law: `kani_effective_price_zero_oi_adopts_target` and the clamp staircase proofs in `tests/v16_kani.rs`
 - "user path rejects, crank progresses" policy: `kani_issue33_exposed_price_move_rejected_by_user_paths_but_crank_progresses` and `kani_issue33_exposed_funding_rejected_by_user_paths_but_crank_progresses`
 - target/effective lag gates: `kani_target_lag_pending_universal`, `kani_target_lag_after_read_universal`, `kani_user_value_op_allowed_iff_no_target_lag`, and `kani_trade_cpi_pre_cpi_allowed_despite_post_read_lag`
 - partial crank state persistence: `kani_partial_crank_config_write_field_sources`
@@ -527,7 +527,7 @@ The code and test harnesses are the source of truth for counts and exact CU numb
 
 - host unit and LiteSVM integration tests under `tests/`
 - SBF-backed alignment and CU benchmark tests
-- wrapper Kani proofs in `tests/kani.rs`
+- wrapper Kani proofs in `tests/v16_kani.rs`
 - engine arithmetic/accounting proofs in the pinned `percolator` crate
 
 Before publishing a bounty, run the commands in [Build & test](#build--test) and record the exact output for the current commit.
@@ -656,8 +656,8 @@ cargo build-sbf --no-default-features
 # All tests (integration, unit, alignment)
 cargo test
 
-# CU benchmark (requires BPF binary)
-cargo test --release --test cu_benchmark -- --nocapture
+# CU benchmark tests live in tests/v16_cu.rs (need a built BPF binary)
+cargo test --release --test v16_cu -- --nocapture
 
 # Kani harnesses (requires kani toolchain)
 cargo kani --tests
@@ -665,44 +665,9 @@ cargo kani --tests
 
 ---
 
-## Devnet Deployments
+## Deployed addresses
 
-### Programs
-
-| Program | Address |
-|---------|---------|
-| Percolator | `46iB4ET4WpqfTXAqGSmyBczLBgVhd1sHre93KtU3sTg9` |
-| vAMM Matcher | `4HcGCsyjAqnFua5ccuXyt8KRRQzKFbGTJkVChpS7Yfzy` |
-
-### Test Market (SOL Perp)
-
-| Account | Address |
-|---------|---------|
-| Market Slab | `AcF3Q3UMHqx2xZR2Ty6pNvfCaogFmsLEqyMACQ2c4UPK` |
-| Vault | `D7QrsrJ4emtsw5LgPGY2coM5K9WPPVgQNJVr5TbK7qtU` |
-| Vault PDA | `37ofUw9TgFqqU4nLJcJLUg7L4GhHYRuJLHU17EXMPVi9` |
-| Matcher Context | `Gspp8GZtHhYR1kWsZ9yMtAhMiPXk5MF9sRdRrSycQJio` |
-| Collateral | Native SOL (wrapped) |
-
-### Test Market Configuration
-
-- **Maintenance margin**: 5% (500 bps)
-- **Initial margin**: 10% (1000 bps)
-- **Trading fee**: 0.1% (10 bps)
-- **Liquidation fee**: 0.5% (50 bps)
-- **Oracle mode**: historical devnet configuration; current code supports external oracle legs, AuthMark `PushAuthMark`, and EwmaMark `PushEwmaMark`
-
-### Using the Devnet Market
-
-1. **Create user account**: Call `InitUser` with your wallet
-2. **Deposit collateral**: Call `DepositCollateral` with wrapped SOL
-3. **Trade**: Call `TradeNoCpi` with LP index 0 and your user index
-4. **Check state**: Run `KeeperCrank` permissionlessly
-
-Example with CLI (see `percolator-cli/`):
-```bash
-cd ../percolator-cli
-npx tsx tests/t22-devnet-stress.ts
-```
-
-These addresses are deployed on Solana **devnet**.
+Program and market addresses are intentionally not listed here: they change with each
+redeploy and a copy in this file goes stale (the previous devnet table pointed at an
+old deployment). Take program IDs from the deployment you are targeting. The commit
+pins that CI builds against are in `ci/deployed-refs.env`.
