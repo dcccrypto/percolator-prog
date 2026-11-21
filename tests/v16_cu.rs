@@ -29978,3 +29978,260 @@ fn v16_bpf_swap_secondary_for_primary_rejects_non_authority_signer() {
     assert_eq!(swap_balances(&env, &a), before);
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
 }
+
+// CU table probe for the v2.2 CU-cuts plan (measurement only, no behavioural assertions beyond
+// "the call succeeded"). One `CUTABLE kind=<k> legs=<n> run=<r> cu=<cu>` line per call.
+//   cargo test --release --features devnet --test v16_cu cu_probe_v22_table -- --ignored --nocapture
+// CU is not deterministic across runs (PDA bump search with random keypairs, +1,500 CU per extra
+// bump), so take the median over runs.
+fn cutable(kind: &str, legs: usize, run: usize, cu: Result<u64, String>) {
+    match cu {
+        Ok(cu) => println!("CUTABLE kind={kind} legs={legs} run={run} cu={cu}"),
+        Err(e) => println!(
+            "CUTABLE kind={kind} legs={legs} run={run} err={}",
+            e.chars().take(200).collect::<String>()
+        ),
+    }
+}
+
+fn cu_probe_try_withdraw(
+    env: &mut V16CuEnv,
+    owner: &Keypair,
+    portfolio: Pubkey,
+    amount: u128,
+) -> Result<u64, String> {
+    let dest = Pubkey::new_unique();
+    env.svm
+        .set_account(
+            dest,
+            Account {
+                lamports: 1_000_000_000,
+                data: make_token_data(env.mint, owner.pubkey(), 0),
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+            AccountMeta::new(dest, false),
+            AccountMeta::new(env.vault, false),
+            AccountMeta::new_readonly(env.vault_authority, false),
+            AccountMeta::new_readonly(spl_token::ID, false),
+        ],
+        &[owner],
+    )
+}
+
+fn cu_probe_try_close_portfolio(
+    env: &mut V16CuEnv,
+    owner: &Keypair,
+    portfolio: Pubkey,
+) -> Result<u64, String> {
+    let (portfolio_id, expected_sequence, position_epoch) = env.portfolio_identity(portfolio);
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::ClosePortfolio {
+            portfolio_id,
+            expected_sequence,
+            position_epoch,
+        },
+        vec![
+            AccountMeta::new(owner.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[owner],
+    )
+}
+
+fn cu_probe_batch_nocpi(
+    env: &mut V16CuEnv,
+    a: &Keypair,
+    pa: Pubkey,
+    b: &Keypair,
+    pb: Pubkey,
+    legs: usize,
+    size: i128,
+) -> Result<u64, String> {
+    let (_, state) = env.market_state();
+    let (a_id, _, a_pe) = env.portfolio_identity(pa);
+    let (b_id, _, b_pe) = env.portfolio_identity(pb);
+    let legs = (0..legs)
+        .map(|i| percolator_prog::ix::BatchTradeLeg {
+            market_id: state.assets[i].market_id,
+            asset_index: i as u16,
+            size_q: size,
+            exec_price: 100,
+            fee_bps: 0,
+        })
+        .collect::<Vec<_>>();
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::BatchTradeNoCpi {
+            account_a_portfolio_id: a_id,
+            account_a_position_epoch: a_pe,
+            account_b_portfolio_id: b_id,
+            account_b_position_epoch: b_pe,
+            legs,
+        },
+        vec![
+            AccountMeta::new(a.pubkey(), true),
+            AccountMeta::new(b.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(pa, false),
+            AccountMeta::new(pb, false),
+        ],
+        &[a, b],
+    )
+}
+
+#[test]
+#[ignore = "measurement probe; run explicitly with --ignored --nocapture"]
+fn cu_probe_v22_table() {
+    for run in 0..3 {
+        // --- single asset: custody, TradeNoCpi, crank, close ---
+        {
+            let mut env = V16CuEnv::new();
+            let a = Keypair::new();
+            let b = Keypair::new();
+            let (pa, cu) = env.create_portfolio_with_cu(&a);
+            cutable("create_portfolio", 0, run, Ok(cu));
+            let pb = env.create_portfolio(&b);
+            let (_, cu) = env.deposit_with_cu(&a, pa, 1_000_000);
+            cutable("deposit_first", 0, run, Ok(cu));
+            env.deposit(&b, pb, 1_000_000);
+            env.svm.expire_blockhash();
+            let (_, cu) = env.deposit_with_cu(&a, pa, 1_000);
+            cutable("deposit_repeat_flat", 0, run, Ok(cu));
+            env.svm.expire_blockhash();
+            let size = (10 * POS_SCALE) as i128;
+            let cu = env.try_trade_asset_with_cu(0, &a, pa, &b, pb, size, 100, 100);
+            cutable("trade_nocpi_open", 1, run, cu);
+            env.svm.expire_blockhash();
+            let cu = env.try_trade_asset_with_cu(0, &a, pa, &b, pb, size, 100, 100);
+            cutable("trade_nocpi_add_same_slot", 1, run, cu);
+            env.svm.expire_blockhash();
+            let (_, cu) = env.deposit_with_cu(&a, pa, 1_000);
+            cutable("deposit_with_position", 1, run, Ok(cu));
+            env.svm.expire_blockhash();
+            let cu = cu_probe_try_withdraw(&mut env, &a, pa, 1_000);
+            cutable("withdraw_with_position", 1, run, cu);
+            env.svm.expire_blockhash();
+            let cu = env.send(
+                ProgInstruction::PermissionlessCrank {
+                    now_slot: 1,
+                    observations: vec![CrankObservationHint {
+                        asset_index: 0,
+                        oracle_accounts: 0,
+                    }],
+                },
+                vec![
+                    AccountMeta::new(env.payer.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(pa, false),
+                ],
+                &[],
+            );
+            cutable("crank_refresh", 1, run, cu);
+            env.svm.expire_blockhash();
+            let cu = env.try_trade_asset_with_cu(0, &a, pa, &b, pb, -2 * size, 100, 100);
+            cutable("trade_nocpi_close_to_flat", 1, run, cu);
+            env.svm.expire_blockhash();
+            let cu = cu_probe_try_withdraw(&mut env, &a, pa, 1_000);
+            cutable("withdraw_flat", 0, run, cu);
+            let cu = cu_probe_try_withdraw(&mut env, &b, pb, 1_000);
+            cutable("withdraw_flat_counterparty", 0, run, cu);
+        }
+        // --- single asset: close portfolio (never traded) ---
+        {
+            let mut env = V16CuEnv::new();
+            let a = Keypair::new();
+            let pa = env.create_portfolio(&a);
+            let cu = cu_probe_try_close_portfolio(&mut env, &a, pa);
+            cutable("close_portfolio_empty", 0, run, cu);
+        }
+        // --- N assets: batch NoCpi, batch Cpi, crank refresh over N legs, single trade with N open ---
+        // Market init refuses max_portfolio_assets > 4 on rc23 (wrapper leg cap).
+        for legs in [1usize, 2, 4] {
+            let mut env =
+                V16CuEnv::new_with_market_params_and_price_move(legs as u16, 5_000, 10_000, 1_000);
+            let matcher_program = Pubkey::new_unique();
+            env.svm.add_program(
+                matcher_program,
+                &std::fs::read(matcher_program_path()).expect("read matcher BPF"),
+            );
+            let a = Keypair::new();
+            let b = Keypair::new();
+            let lp = Keypair::new();
+            let pa = env.create_portfolio(&a);
+            let pb = env.create_portfolio(&b);
+            let plp = env.create_portfolio(&lp);
+            env.deposit(&a, pa, 100_000_000);
+            env.deposit(&b, pb, 100_000_000);
+            env.deposit(&lp, plp, 100_000_000);
+            let size = (POS_SCALE / 100) as i128;
+            let cu = cu_probe_batch_nocpi(&mut env, &a, pa, &b, pb, legs, size);
+            cutable("batch_nocpi_open", legs, run, cu);
+            let cu = cu_probe_batch_nocpi(&mut env, &a, pa, &b, pb, legs, size);
+            cutable("batch_nocpi_add", legs, run, cu);
+            env.svm.expire_blockhash();
+            let cu = env.try_trade_asset_with_cu(0, &a, pa, &b, pb, size, 100, 0);
+            cutable("trade_nocpi_with_n_open", legs, run, cu);
+
+            let (ctx, delegate, _) = env.init_matcher_context(&lp, matcher_program, plp);
+            env.svm.expire_blockhash();
+            let cu = env.try_trade_cpi_with_cu_on_asset(
+                &a, pa, &lp, plp, matcher_program, ctx, delegate, 0, size, 0,
+            );
+            cutable("trade_cpi_with_n_open", legs, run, cu);
+            let (_, state) = env.market_state();
+            let batch = (0..legs)
+                .map(|i| percolator_prog::ix::BatchTradeCpiLeg {
+                    asset_index: i as u16,
+                    market_id: state.assets[i].market_id,
+                    size_q: size,
+                    fee_bps: 0,
+                    limit_price: 0,
+                })
+                .collect::<Vec<_>>();
+            let (t_id, _, t_pe) = env.portfolio_identity(pa);
+            let (l_id, l_seq, l_pe) = env.portfolio_identity(plp);
+            env.svm.expire_blockhash();
+            let cu = env.send(
+                ProgInstruction::BatchTradeCpi {
+                    account_a_portfolio_id: t_id,
+                    account_a_position_epoch: t_pe,
+                    account_b_portfolio_id: l_id,
+                    account_b_position_epoch: l_pe,
+                    account_b_matcher_sequence: l_seq,
+                    max_slippage_atoms: u128::MAX,
+                    max_fee_atoms: u128::MAX,
+                    legs: batch,
+                },
+                vec![
+                    AccountMeta::new(a.pubkey(), true),
+                    AccountMeta::new(env.market, false),
+                    AccountMeta::new(pa, false),
+                    AccountMeta::new(plp, false),
+                    AccountMeta::new_readonly(matcher_program, false),
+                    AccountMeta::new(ctx, false),
+                    AccountMeta::new_readonly(delegate, false),
+                ],
+                &[&a],
+            );
+            cutable("batch_cpi", legs, run, cu);
+        }
+    }
+}
