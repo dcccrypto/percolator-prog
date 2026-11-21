@@ -120,7 +120,7 @@ Which instructions emit it, and the tag in the header:
 
 **The unit of `signed_reduced_q` depends on `reason`.** Reason 1 is in **basis** units (the leg's
 stored `basis_pos_q`, before ADL scaling). Reasons 2, 3, 6 and 7 are **ADL-effective** units (basis x A /
-a_basis). Reasons 4 and 5 are the size traded against the vault LP (the leg's signed position as
+a_basis). Reasons 4, 5 and 8 are the size traded against the vault LP (the leg's signed position as
 the trade path reads it). On a side that has never been ADL-scaled the two units coincide; after
 an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without converting.
 
@@ -133,6 +133,7 @@ an ADL they do not, so do not add reason-1 sizes to reason-2/3 sizes without con
 | 5 | `EVICTION` | 119 | the victim's whole leg, bilateral against the bound vault LP at `P_last`, no fee; emitted before the taker's FILL |
 | 6 | `FORCE_CLOSE_ABANDONED` | 64 | **ADL-effective units.** prog#547: a permissionless cranker closed a Recovery-lifecycle pair against each other at the frozen mark (`ForceCloseAbandonedAsset`); neither owner signed. **Two events**, one per account, each naming the other account as `counterparty`, in account order (a, then b). Same best-effort rule as reason 3 |
 | 7 | `RESOLVED_CLOSE` | 30 | **ADL-effective units.** prog#547: `CloseResolved` settled the position at the resolved price (permissionless after the force-close delay, so the owner may not have signed). One event per asset whose position the call changed, in leg order. Unilateral. Same best-effort rule as reason 3 |
+| 8 | `LP_STOP` | 124 (op 5 only) | the size traded against the vault LP, as reasons 4 and 5. The W1 LP stop (`LevGuard` op 5, permissionless; the owner did not sign) cut a listed account on the side opposite the bound vault LP: bilateral against the bound vault LP at `P_last`, no fee. Usually a **partial** cut, leaving the round's keep fraction of the leg (`floor(k x |pos|)`); the whole leg when that remainder would be below the market minimum. One event per account cut, in the order the accounts are listed; a listed account that is not cut (already cut this round, not opposing, or a whole-leg cut the round no longer needs) emits nothing |
 
 A liquidation that happens inside a trade (`TradeNoCpi` / `TradeCpi` closing a liquidatable
 counterparty) is a fill and is reported as a FILL, not a REDUCE.
@@ -185,6 +186,7 @@ given).
 | 64 ForceCloseAbandonedAsset | A | REDUCE reason 6, two events (prog#547) |
 | 19 ResolveMarket, 39 ResolveStalePermissionless | A | MOVE `MARKET_RESOLVED` (prog#547) |
 | 30 CloseResolved | A | REDUCE reason 7 per settled asset (prog#547). The payout is B (token transfer) |
+| 124 LevGuard | A | op 5 (W1 LP stop): REDUCE reason 8, one per account cut. The other ops emit nothing |
 | liquidation (crank, tag 5; also the pre-crank inside 77, still reported as tag 5) | A | REDUCE reason 3. Liquidation **fee, insurance used, residual booked** are NOT logged (C): the engine drops them on the crank path and deriving them needs the engine's `LiquidationOutcomeV16`; an engine change is out of scope. They remain visible as the portfolio / insurance account diff |
 | engine ADL scaling of other accounts | B | no per-account amount exists; the market account's `a_long` / `a_short` and epochs are the state. Effective size = basis x A / a_basis |
 | 106 SettleHoldingRent | A | MOVE `RENT_ROUTED` (routed amount). Rent *charged* to a portfolio during any settle is C: it is inside engine settlement; the instruction's own portfolio capital diff shows it |
