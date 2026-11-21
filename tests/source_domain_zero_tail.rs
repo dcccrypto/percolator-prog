@@ -93,3 +93,19 @@ fn hole_then_occupied_slot_is_not_a_zero_tail() {
         assert!(tail_is_zero(&t, gap + 1));
     }
 }
+
+#[test]
+fn uniform_nonzero_tail_is_not_zero() {
+    // Every byte equal but non-zero passes the overlapping compare; only the first-byte check
+    // rejects it.
+    for value in [1u8, 0x80, 0xff] {
+        for from in 0..PORTFOLIO_SOURCE_DOMAIN_CAP {
+            let mut t = empty();
+            for b in bytemuck::cast_slice_mut::<_, u8>(&mut t[from..]) {
+                *b = value;
+            }
+            assert!(!tail_is_zero(&t, from), "value={value} from={from}");
+            assert!(!reference(&t, from));
+        }
+    }
+}
