@@ -777,8 +777,8 @@ fn has_code(e: &str, code: u32) -> bool {
     e.contains(&format!("Custom({code})"))
 }
 
-/// Ledger counters as stored right before redemption. These are farm-facing and are EXPECTED to
-/// differ between histories; they are reported, not compared.
+/// Ledger counters as stored right before redemption. These are farm-facing and are asserted to
+/// DIFFER between histories (proof each checkpoint happened); pricing never reads them.
 #[derive(Clone, Copy, Debug)]
 struct Counters {
     loss: u128,
@@ -976,8 +976,10 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     (obs, counters)
 }
 
-/// The core #382 invariant: the same loss -> refill -> second loss, with or without a depositor
-/// action checkpointing the pot ledger after the first loss, prices and pays the same.
+/// The core #382 invariant: the same loss -> refill -> second loss prices and pays the same
+/// whether the depositor action checkpoints the pot ledger after the first loss, after the
+/// refill, or only after the second loss. `exit_nav` is the test's copy of the E3 formula; the
+/// ±1 payout bounds in `run_history` are what tie it to the program's actual tag 77 payouts.
 fn assert_history_independent(d: u128) {
     let (cp, cp_c) = run_history(History::Checkpointed, d);
     let (dl, dl_c) = run_history(History::Delayed, d);
@@ -988,7 +990,7 @@ fn assert_history_independent(d: u128) {
     assert_eq!((cp_c.recovery, dl_c.recovery, cr_c.recovery), (0, 0, 0), "booked recovery");
     // ...and yet everything a holder can observe is identical.
     assert_eq!(cr, cp, "checkpoint after the refill vs after the first loss");
-    // Same physical end state and same par principal in both.
+    // Same physical end state and same par principal in all three (cr == cp checked above).
     assert_eq!(cp.pot_fresh_atoms, dl.pot_fresh_atoms, "pot fresh");
     assert_eq!(cp.pot_consumed_atoms, dl.pot_consumed_atoms, "pot consumed");
     assert_eq!(cp.pot_principal, dl.pot_principal, "pot principal");
