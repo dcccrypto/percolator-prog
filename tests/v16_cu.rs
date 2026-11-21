@@ -14098,10 +14098,11 @@ fn v16_bpf_composite_target_does_not_move_on_the_rounding_of_a_low_priced_leg() 
         env.set_pyth_price(&feeds[0], 4_100_000, -10, time),
         env.set_pyth_price(&feeds[1], 150_000_000, -6, time),
     ];
-    env.try_configure_hybrid_asset_with_conf_filter_cu(
-        0, 2, 0, feeds, &reports, slot, time, 0, 1, 3, 100,
-    )
-    .expect("a two-leg product of a low-priced feed and a currency feed");
+    let configure_cu = env
+        .try_configure_hybrid_asset_with_conf_filter_cu(
+            0, 2, 0, feeds, &reports, slot, time, 0, 1, 3, 100,
+        )
+        .expect("a two-leg product of a low-priced feed and a currency feed");
     let config = env.market_state().0;
     assert_eq!(config.oracle_target_price_e6, 61_500);
     // What is stored per leg is still the six-decimal value.
@@ -14113,7 +14114,8 @@ fn v16_bpf_composite_target_does_not_move_on_the_rounding_of_a_low_priced_leg() 
         env.set_pyth_price(&feeds[0], 4_109_900, -10, time),
         env.set_pyth_price(&feeds[1], 149_638_677, -6, time),
     ];
-    crank_inv038(&mut env, keeper_portfolio, slot, &reports);
+    let crank_cu = crank_inv038(&mut env, keeper_portfolio, slot, &reports);
+    println!("two-leg #462 composite: configure {configure_cu} CU, crank {crank_cu} CU");
     let config = env.market_state().0;
     assert_eq!(config.oracle_target_publish_time, time);
     assert_eq!(config.oracle_leg_prices_e6[..2], [410, 149_638_677]);
@@ -14141,7 +14143,7 @@ fn v16_bpf_composite_from_finer_reports_costs_a_bounded_amount_more() {
         let reports: Vec<Pubkey> = (0..3)
             .map(|leg| env.set_pyth_price(&feeds[leg], VALUES_E6[leg] * scale, exponent, time))
             .collect();
-        env.try_configure_hybrid_asset_with_conf_filter_cu(
+        let configure_cu = env.try_configure_hybrid_asset_with_conf_filter_cu(
             0,
             3,
             ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3,
@@ -14164,6 +14166,7 @@ fn v16_bpf_composite_from_finer_reports_costs_a_bounded_amount_more() {
             })
             .collect();
         let cu = crank_inv038(&mut env, keeper_portfolio, slot, &reports);
+        println!("three-leg composite from exponent {exponent}: configure {configure_cu} CU");
         (env.market_state().0.oracle_target_price_e6, cu)
     };
     let (coarse_target, coarse_cu) = observe(-6);
