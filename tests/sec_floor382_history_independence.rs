@@ -17,8 +17,11 @@
 //! Histories (same actions, only the position of B's deposit differs):
 //!   CHECKPOINTED: A seeds both pots; loss X; B deposits d into the lossy pot (syncs + re-baselines
 //!                 its ledger); loser refill R; second loss X2.
+//!   AFTER REFILL: A seeds both pots; loss X; loser refill R; B deposits d; second loss X2.
 //!   DELAYED:      A seeds both pots; loss X; loser refill R; second loss X2; B deposits d.
-//! Then A and B each redeem all of their shares (tag 77).
+//! Then A and B each redeem all of their shares (tag 77). Entries (75) price at par (H-1), so
+//! B's share count is timing-independent by construction; the property under test is the EXIT
+//! side (NAV, share price, payouts) plus conservation.
 //!
 //! Harness copied from tests/nonbound_nav_floor.rs (same fixtures for physical consumption and
 //! refill). Test only: no source change.
@@ -735,6 +738,9 @@ enum History {
     /// B's deposit lands right after the first loss: it syncs the lossy pot's ledger (books X)
     /// and re-baselines its watermark, before the refill and the second loss.
     Checkpointed,
+    /// B's deposit lands after the loser refill, before the second loss: the checkpoint sees the
+    /// pot partly refilled (books X - R) and the second loss lands on the re-baselined watermark.
+    CheckpointedAfterRefill,
     /// The same deposit lands only after the second loss: the ledger sees one net observation.
     Delayed,
     /// No depositor action at all between seed and redemption.
@@ -833,14 +839,32 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     deposit(&mut env, &a, P, SIBLING_DOMAIN);
     let b = new_actor(&mut env, &a);
 
+    // B's deposit into the lossy pot. It must really checkpoint the pot ledger: tag 75 syncs it
+    // (booking the unavailable principal seen so far as loss; no earlier sync happened, so the
+    // watermark was 0) and re-baselines the watermark to the bucket AFTER the receivable paydown.
+    let checkpoint = |env: &mut Env, booked: u128| {
+        try_deposit(env, &b, d, DOMAIN).expect("checkpoint deposit");
+        let l = ledger_of(&env.svm, a.ledger);
+        let pb = market_group(env).source_backing_buckets[DOMAIN as usize];
+        let unavailable =
+            (pb.consumed_liened_backing_num + pb.impaired_liened_backing_num) / BOUND_SCALE;
+        assert_eq!(l.cumulative_loss_atoms, booked, "{h:?}: checkpoint booked the loss");
+        assert_eq!(l.cumulative_recovery_atoms, 0, "{h:?}: no recovery booked");
+        assert_eq!(l.last_observed_unavailable_principal_atoms, unavailable, "{h:?}: re-baselined");
+        assert_eq!(unavailable, booked - d, "{h:?}: the deposit paid the receivable down by d");
+    };
+
     consume_pot_backing(&mut env, DOMAIN, X); // loss 1 (claimed)
     if h == History::Checkpointed {
-        try_deposit(&mut env, &b, d, DOMAIN).expect("checkpoint deposit after loss 1");
+        checkpoint(&mut env, X);
     }
     recover_pot_backing(&mut env, DOMAIN, R); // loser payment refills the pot
+    if h == History::CheckpointedAfterRefill {
+        checkpoint(&mut env, X - R);
+    }
     consume_pot_backing(&mut env, DOMAIN, X2); // consumed again
     if h == History::Delayed {
-        try_deposit(&mut env, &b, d, DOMAIN).expect("delayed deposit after loss 2");
+        checkpoint(&mut env, X - R + X2);
     }
 
     let nav = exit_nav(&env, &a);
@@ -869,7 +893,8 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     execute(&mut env, &a, DOMAIN).expect("A's redemption");
     let a_payout = token_amount(&env.svm, a.dest) as u128 - a_before;
 
-    let price_e9_after_a = price_e9(exit_nav(&env, &a), registry_shares(&env, &a));
+    let (nav_after_a, supply_after_a) = (exit_nav(&env, &a), registry_shares(&env, &a));
+    let price_e9_after_a = price_e9(nav_after_a, supply_after_a);
 
     // B redeems everything (if B holds anything).
     // A redemption worth 0 atoms (B's single share at d = 1) is refused by tag 77 with
@@ -883,7 +908,7 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
             Ok(()) => b_payout = token_amount(&env.svm, b.dest) as u128 - b_before,
             Err(e) => {
                 assert!(
-                    has_code(&e, 34) && floor_mul_div(nav, b_shares, supply) == 0,
+                    has_code(&e, 34) && floor_mul_div(nav_after_a, b_shares, supply_after_a) == 0,
                     "B's redemption failed unexpectedly: {e}"
                 );
                 b_redeem_refused_code = 34;
@@ -911,6 +936,9 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
 
     // Owner + protocol conservation, per history. Into the vault: A's 2P, B's deposit, the loser's
     // R. Out: the two winners' X + X2 (the fixture moves those tokens out) and A/B's payouts.
+    // This token identity is bookkeeping (tokens only move by SPL transfer); the checks that the
+    // program could get wrong follow it: pro-rata payouts, engine vault counter, residual == NAV
+    // of the shares still outstanding.
     let b_in = if h == History::None { 0 } else { d };
     assert_eq!(
         START_BAL - token_amount(&env.svm, a.source) as u128,
@@ -929,6 +957,20 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     // Each holder is paid its pro-rata share of the exit NAV (floor); nobody is paid more.
     assert!(a_payout <= floor_mul_div(nav, a_shares, supply), "{h:?}: A overpaid");
     assert!(a_payout + 1 >= floor_mul_div(nav, a_shares, supply), "{h:?}: A underpaid");
+    let b_fair = floor_mul_div(nav_after_a, b_shares, supply_after_a);
+    assert!(b_payout <= b_fair && b_payout + 1 >= b_fair, "{h:?}: B paid {b_payout}, fair {b_fair}");
+    // The program's own vault counter matches the token balance it holds.
+    let g_end = market_group(&env);
+    assert_eq!(g_end.vault, obs.vault_token_end, "{h:?}: engine vault == token balance");
+    // What stays behind is exactly what the remaining (dead + refused) shares are worth plus
+    // floor dust from the redemptions: no owner value is stranded and none was overpaid.
+    let nav_end = exit_nav(&env, &a);
+    assert!(
+        nav_end <= obs.vault_token_end && obs.vault_token_end - nav_end <= 2,
+        "{h:?}: residual {} vs remaining NAV {nav_end}",
+        obs.vault_token_end
+    );
+    eprintln!("#382 {h:?} d={d}: remaining NAV {nav_end} for {} shares", obs.supply_end);
     eprintln!("#382 {h:?} d={d}: {obs:?}");
     eprintln!("#382 {h:?} d={d}: ledger counters before redemption {counters:?}");
     (obs, counters)
@@ -939,6 +981,13 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
 fn assert_history_independent(d: u128) {
     let (cp, cp_c) = run_history(History::Checkpointed, d);
     let (dl, dl_c) = run_history(History::Delayed, d);
+    let (cr, cr_c) = run_history(History::CheckpointedAfterRefill, d);
+    // The three histories really did observe the pot differently: the stored (farm-facing)
+    // counters differ, because each checkpoint booked what it saw at that moment.
+    assert_eq!((cp_c.loss, dl_c.loss, cr_c.loss), (X, X - R + X2, X - R), "booked loss");
+    assert_eq!((cp_c.recovery, dl_c.recovery, cr_c.recovery), (0, 0, 0), "booked recovery");
+    // ...and yet everything a holder can observe is identical.
+    assert_eq!(cr, cp, "checkpoint after the refill vs after the first loss");
     // Same physical end state and same par principal in both.
     assert_eq!(cp.pot_fresh_atoms, dl.pot_fresh_atoms, "pot fresh");
     assert_eq!(cp.pot_consumed_atoms, dl.pot_consumed_atoms, "pot consumed");
@@ -956,8 +1005,11 @@ fn assert_history_independent(d: u128) {
     // The exit NAV is exactly the physical value the pots hold for the vault (E3), not the
     // counter-derived `principal - (loss - recovery)`.
     assert_eq!(cp.exit_nav, 2 * P + d + R - X - X2);
-    // The farm-facing counters are allowed to differ (that is the upstream symptom); report them.
-    eprintln!("#382 d={d}: counters checkpointed={cp_c:?} delayed={dl_c:?}");
+    // The stored counters are stale snapshots (the next sync brings each to the same net
+    // loss - recovery); pricing does not read them (`lp_vault_domain_nav_atoms` passes 0, 0).
+    eprintln!(
+        "#382 d={d}: counters checkpointed={cp_c:?} after_refill={cr_c:?} delayed={dl_c:?}"
+    );
 }
 
 #[test]
@@ -989,15 +1041,12 @@ fn floor382_one_atom_checkpoint_vs_no_depositor_action() {
     eprintln!("#382 none counters {none_c:?}");
 }
 
-/// A zero-amount depositor action is not an available checkpoint: tag 75 refuses it, writing nothing.
+/// A zero-amount depositor action is not an available checkpoint: tag 75 refuses it with
+/// Custom(34) `LpVaultZeroAmount`, so the smallest real checkpoint is the 1-atom deposit above.
 #[test]
-fn floor382_zero_amount_deposit_is_refused_and_writes_nothing() {
+fn floor382_zero_amount_deposit_is_refused() {
     let (mut env, v) = otc_env(DOMAIN, X);
     let b = new_actor(&mut env, &v);
-    let ledger_before = env.svm.get_account(&v.ledger).unwrap().data;
-    let market_before = env.svm.get_account(&env.market).unwrap().data;
     let e = try_deposit(&mut env, &b, 0, DOMAIN).expect_err("zero deposit must be refused");
-    eprintln!("#382 zero-amount deposit error: {e}");
-    assert_eq!(env.svm.get_account(&v.ledger).unwrap().data, ledger_before);
-    assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
+    assert!(has_code(&e, 34), "expected LpVaultZeroAmount (34): {e}");
 }
