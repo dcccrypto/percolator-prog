@@ -14170,6 +14170,8 @@ fn v16_bpf_composite_from_finer_reports_costs_a_bounded_amount_more() {
     assert_eq!(coarse_target, 95);
     assert_eq!(fine_target, coarse_target);
     println!("three-leg composite crank: {coarse_cu} CU from exponent -6, {fine_cu} from -10");
+    // Two-sided, unlike upstream's `fine >= coarse`: our composer reads every leg at E12 and
+    // runs the same U256 ratio for both, so the finer reports may cost slightly less.
     assert!(
         fine_cu.abs_diff(coarse_cu) <= 1_000,
         "finer reports cost {fine_cu} against {coarse_cu}"

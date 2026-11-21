@@ -1,9 +1,12 @@
-# Tiny-price format: sub-$0.000001 oracle prices no longer round to 0
+# Tiny-price format: twelve-decimal oracle legs (a leg below $0.000001 is refused, INV-038)
 
 Status: implemented on `fix/v22-tiny-price-format` (base `feat/v22-rc23-2026-10-22`).
 Closes the tiny-price cases pinned by #707 (`tests/oracle_compose_edge.rs`).
 
 ## Upstream check
+
+Superseded: upstream b2f3ffe7 (#486, #462) later ported the twelve-decimal legs with a stricter
+admissibility rule, adopted here; see "Tightened" below. The original check follows.
 
 `aeyakovenko/percolator-prog` main `8b10d3b2` and `aeyakovenko/percolator` master
 `827a125f`: no change to the oracle price format; upstream still reads every leg as a u64
