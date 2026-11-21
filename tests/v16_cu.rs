@@ -14025,6 +14025,157 @@ fn v16_bpf_composite_oracle_rounds_once_not_per_leg() {
     );
 }
 
+// ---------------------------------------------------------------------------------------------
+// INV-038 composite leg precision (ported from aeyakovenko/percolator-prog b2f3ffe7, PR #486,
+// issue #462; tests/invariants/cu/inv_038_composite_leg_precision.rs). The composite is computed
+// from twelve-decimal legs; the six-decimal value of a leg is what is stored per leg and what
+// decides whether a feed is admissible. This tightens #711, which admitted a leg below one e6
+// tick into a composite. Arithmetic-level halves: tests/inv_038_composite_leg_precision.rs.
+
+fn crank_inv038(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64, oracles: &[Pubkey]) -> u64 {
+    env.svm.expire_blockhash();
+    env.crank_with_oracle_tail(
+        portfolio,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: oracles.len() as u8,
+            }],
+        },
+        oracles,
+    )
+}
+
+/// A two-leg product whose first leg is below one e6 tick (0.0000005 * 2000 = 0.001) is refused
+/// by ConfigureHybridOracle as OracleInvalid (Custom(26)) and leaves the market untouched. On the
+/// #711 base it was configured with target 1_000.
+#[test]
+fn v16_bpf_composite_leg_below_one_e6_tick_is_rejected() {
+    let mut env = V16CuEnv::new();
+    let (slot, time) = (10u64, 1_000i64);
+    set_test_clock(&mut env, slot, time);
+    let feeds = [[0x47u8; 32], [0x63u8; 32], [0u8; 32]];
+    let reports = [
+        env.set_pyth_price(&feeds[0], 500, -9, time),
+        env.set_pyth_price(&feeds[1], 2_000_000_000, -6, time),
+    ];
+    let before = env.svm.get_account(&env.market).unwrap().data;
+    let err = env
+        .try_configure_hybrid_asset_with_conf_filter_cu(
+            0, 2, 0, feeds, &reports, slot, time, 0, 1, 3, 100,
+        )
+        .expect_err("a composite leg below one e6 tick must be refused");
+    assert!(err.contains("Custom(26)"), "OracleInvalid expected, got: {err}");
+    assert_eq!(env.svm.get_account(&env.market).unwrap().data, before);
+
+    // The same composite with the leg at exactly one tick (0.000001 * 2000) is admitted.
+    let reports = [
+        env.set_pyth_price(&feeds[0], 1, -6, time),
+        env.set_pyth_price(&feeds[1], 2_000_000_000, -6, time),
+    ];
+    env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0, 2, 0, feeds, &reports, slot, time, 0, 1, 3, 100,
+    )
+    .expect("a leg of exactly one e6 tick is admissible");
+    assert_eq!(env.market_state().0.oracle_target_price_e6, 2_000);
+}
+
+/// The two #462 tuples through the program: two fully verified Pyth reports per tuple, a two-leg
+/// product configured by ConfigureHybridOracle and observed by a permissionless crank. The stored
+/// target follows the cross-rate, 61,500 and then 61,499; from six-decimal legs it fell to 61,351.
+#[test]
+fn v16_bpf_composite_target_does_not_move_on_the_rounding_of_a_low_priced_leg() {
+    let mut env = V16CuEnv::new();
+    let keeper = Keypair::new();
+    let keeper_portfolio = env.create_portfolio(&keeper);
+    let feeds = [[0x46u8; 32], [0x62u8; 32], [0u8; 32]];
+
+    let (slot, time) = (10u64, 1_000i64);
+    set_test_clock(&mut env, slot, time);
+    let reports = [
+        env.set_pyth_price(&feeds[0], 4_100_000, -10, time),
+        env.set_pyth_price(&feeds[1], 150_000_000, -6, time),
+    ];
+    env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0, 2, 0, feeds, &reports, slot, time, 0, 1, 3, 100,
+    )
+    .expect("a two-leg product of a low-priced feed and a currency feed");
+    let config = env.market_state().0;
+    assert_eq!(config.oracle_target_price_e6, 61_500);
+    // What is stored per leg is still the six-decimal value.
+    assert_eq!(config.oracle_leg_prices_e6[..2], [410, 150_000_000]);
+
+    let (slot, time) = (slot + 1, time + 1);
+    set_test_clock(&mut env, slot, time);
+    let reports = [
+        env.set_pyth_price(&feeds[0], 4_109_900, -10, time),
+        env.set_pyth_price(&feeds[1], 149_638_677, -6, time),
+    ];
+    crank_inv038(&mut env, keeper_portfolio, slot, &reports);
+    let config = env.market_state().0;
+    assert_eq!(config.oracle_target_publish_time, time);
+    assert_eq!(config.oracle_leg_prices_e6[..2], [410, 149_638_677]);
+    assert_eq!(
+        config.oracle_target_price_e6, 61_499,
+        "the cross-rate moved by less than one unit of the sixth decimal"
+    );
+    assert_ne!(config.oracle_target_price_e6, 61_351);
+}
+
+/// What the extra digits cost: the same three-leg composite (2.85 / 150 / 200 = 0.000095) is
+/// observed by a crank from exponent -6 reports and from exponent -10 reports of the same values.
+/// The stored target is the same, and the finer reports cost at most 1,000 CU more.
+#[test]
+fn v16_bpf_composite_from_finer_reports_costs_a_bounded_amount_more() {
+    const VALUES_E6: [i64; 3] = [3_000_000, 150_000_000, 200_000_000];
+    let observe = |exponent: i32| {
+        let scale = 10i64.pow((-6 - exponent) as u32);
+        let mut env = V16CuEnv::new();
+        let keeper = Keypair::new();
+        let keeper_portfolio = env.create_portfolio(&keeper);
+        let feeds = [[0x31u8; 32], [0x32u8; 32], [0x33u8; 32]];
+        let (slot, time) = (10u64, 1_000i64);
+        set_test_clock(&mut env, slot, time);
+        let reports: Vec<Pubkey> = (0..3)
+            .map(|leg| env.set_pyth_price(&feeds[leg], VALUES_E6[leg] * scale, exponent, time))
+            .collect();
+        env.try_configure_hybrid_asset_with_conf_filter_cu(
+            0,
+            3,
+            ORACLE_LEG_FLAG_DIVIDE_LEG2 | ORACLE_LEG_FLAG_DIVIDE_LEG3,
+            feeds,
+            &reports,
+            slot,
+            time,
+            0,
+            1,
+            3,
+            100,
+        )
+        .expect("a three-leg composite");
+        let (slot, time) = (slot + 1, time + 1);
+        set_test_clock(&mut env, slot, time);
+        let reports: Vec<Pubkey> = (0..3)
+            .map(|leg| {
+                let value = if leg == 0 { 2_850_000 } else { VALUES_E6[leg] };
+                env.set_pyth_price(&feeds[leg], value * scale, exponent, time)
+            })
+            .collect();
+        let cu = crank_inv038(&mut env, keeper_portfolio, slot, &reports);
+        (env.market_state().0.oracle_target_price_e6, cu)
+    };
+    let (coarse_target, coarse_cu) = observe(-6);
+    let (fine_target, fine_cu) = observe(-10);
+    assert_eq!(coarse_target, 95);
+    assert_eq!(fine_target, coarse_target);
+    println!("three-leg composite crank: {coarse_cu} CU from exponent -6, {fine_cu} from -10");
+    assert!(
+        fine_cu.abs_diff(coarse_cu) <= 1_000,
+        "finer reports cost {fine_cu} against {coarse_cu}"
+    );
+}
+
 fn set_test_clock(env: &mut V16CuEnv, slot: u64, unix_timestamp: i64) {
     env.svm.warp_to_slot(slot);
     let mut clock = env.svm.get_sysvar::<Clock>();
