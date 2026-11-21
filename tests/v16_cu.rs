@@ -14069,9 +14069,10 @@ fn v16_bpf_composite_leg_below_one_e6_tick_is_rejected() {
     assert!(err.contains("Custom(26)"), "OracleInvalid expected, got: {err}");
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, before);
 
-    // The same composite with the leg at exactly one tick (0.000001 * 2000) is admitted.
+    // The same composite with the leg at exactly one tick (0.000001 * 2000) is admitted. The
+    // mantissa is 10^6 at exponent -12 so the harness's confidence of 1 passes the 1% filter.
     let reports = [
-        env.set_pyth_price(&feeds[0], 1, -6, time),
+        env.set_pyth_price(&feeds[0], 1_000_000, -12, time),
         env.set_pyth_price(&feeds[1], 2_000_000_000, -6, time),
     ];
     env.try_configure_hybrid_asset_with_conf_filter_cu(
