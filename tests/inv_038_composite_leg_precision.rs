@@ -88,7 +88,7 @@ fn composite_leg_below_one_e6_tick_is_rejected() {
     let cases: [(&[(i64, i32)], u8, u8, &str); 6] = [
         // 0.0000005 * 2000 = 0.001: #711 gave 1_000
         (&[(500, -9), (2_000_000_000, -6)], 0, 0, "first leg 5e-7, multiplied"),
-        // 0.0000019 SOL * 150 = 2.85e-7 per token, lot 9: #711 gave 285_000_000
+        // 0.0000000019 SOL * 150 = 2.85e-7 per token, lot 9: #711 gave 285_000_000
         (&[(1_900, -12), (150_000_000, -6)], 0, 9, "first leg 1.9e-9 on a lot-9 market"),
         // 0.0000005 / 0.5 = 0.000001: #711 gave 1
         (&[(500, -9), (500_000, -6)], ORACLE_LEG_FLAG_DIVIDE_LEG2, 0, "first leg 5e-7, then divided"),
@@ -246,8 +246,9 @@ fn oracle_leg_at_twelve_decimals_is_the_floor_of_the_feed_value() {
     );
 }
 
-/// Feeds that carry digits beyond the sixth decimal compose to the same target as the same
-/// values at six decimals (upstream's three-leg compute-bound composite, at the arithmetic level).
+/// The report scale makes no difference: the same values at exponent -6 and at exponent -10
+/// compose to the same target (upstream's three-leg compute-bound composite, at the arithmetic
+/// level).
 #[test]
 fn three_leg_divide_both_of_admissible_legs_still_composes() {
     // 2.85 / 150 / 200 = 0.000095

@@ -25,7 +25,7 @@ What stays from this note: E12 legs (a small but admissible leg such as 0.00041 
 its digits: the #462 tuples give 61,500 and 61,499), the single exact U256 rational floored once,
 no per-leg intermediate gate, and the lot exponent applied to the final price.
 
-What changes: the sub-tick examples above (Pyth `expo = -10, price = 5_000` at `lot_exp = 6`;
+What changes: the sub-tick examples below (each marked *[superseded by INV-038]*) (Pyth `expo = -10, price = 5_000` at `lot_exp = 6`;
 the E12 legs of 10^-12 .. 10^-7) are no longer readable. A token priced below one e6 tick needs a
 feed quoted per larger unit (or an AuthMark market) instead. The "same-publish-time equivocation"
 open risk below no longer applies to new readings (a stored leg is never 0).
@@ -65,8 +65,8 @@ and a crank, and the finer-report compute bound). `tests/tiny_price_format.rs` a
 
 * Leg readers have E12 forms (`read_pyth_price_e12` scale `expo + 12`,
   `read_switchboard_price_e12`, `read_chainlink_price_e12` via `scale_decimal_to_e12`,
-  dispatcher `read_oracle_price_e12`). A leg is valid if it is nonzero at E12 and its E6
-  floor is `<= MAX_ORACLE_PRICE`. The old `*_e6` functions are thin wrappers with the old
+  dispatcher `read_oracle_price_e12`). A leg is valid if its E6 floor is in
+  `1 ..= MAX_ORACLE_PRICE` *[INV-038; #711 accepted any leg non-zero at E12]*. The old `*_e6` functions are thin wrappers with the old
   semantics (still reject an E6 floor of 0), so every other caller is unchanged.
 * `compose_price_e12_to_e6(legs_e12, flags, invert, unit_scale, lot_exp)` keeps one exact
   U256 rational through all legs, invert (`num' = den * 1e24`), `unit_scale`, and the lot
@@ -78,8 +78,8 @@ and a crank, and the finer-report compute bound). `tests/tiny_price_format.rs` a
 * `lot_exp != 0` is now also allowed for `HYBRID_AFTER_HOURS` (external feed + after-hours
   fallback), since tiny-price assets need an external feed. EWMA still refuses it.
 
-Example: Pyth $3e-7 with `lot_exp = 6` publishes `300_000` (=$0.30 per 1e6 tokens);
-at lot 0 it is still refused (no silent 0).
+*[Superseded by INV-038: Pyth $3e-7 is refused at every lot.]* Example under #711: Pyth $3e-7
+with `lot_exp = 6` published `300_000` (=$0.30 per 1e6 tokens); at lot 0 it was refused.
 
 ## Layout and migration impact
 
@@ -101,7 +101,7 @@ one U256 mul/div chain. Far below the 1.4M per-transaction limit.
 ## Tests
 
 * `tests/oracle_compose_edge.rs` (#707): findings 2, 3, 4 un-ignored; finding 1 at lot 6
-  gives 500_000, at lot 0 still `OracleInvalid`; finding 5 is 1 at lot 0 and 1_666_666 at
+  gave 500_000 under #711 *[INV-038: now `OracleInvalid` at every lot]*; finding 5 is 1 at lot 0 and 1_666_666 at
   lot 6 (rel err < 1%); `three_leg_at_max_bounds_no_overflow` now returns MAX (no
   intermediate gate).
 * `tests/tiny_price_format.rs` (new): round trip, expo finer than E12, composite with lot,
@@ -120,10 +120,10 @@ Different problem, no duplicated logic, no storage clash:
   `price_move_remainder_bps_num` on the crank) / **#710** (head `1c342ece`, resets that
   remainder on an EWMA mark target change) fix *motion*: under the 3%/slot cap a price
   below 34 atoms cannot move by a whole atom, so the sub-atom step carry has to persist.
-* This PR fixes *representation*: a feed price below 1e-6 is read as 0 and refused before
-  the engine ever sees it, and composite legs lose precision by being floored to E6 first.
-* They are complementary. A lot market lifts the atom count (e.g. $3e-7 at `lot_exp = 6`
-  is 300_000 atoms), so the cap-freeze region (< 34 atoms) is never reached and the
+* This PR fixes *representation*: composite legs lose precision by being floored to E6 first
+  (and, under #711 only, a feed price below 1e-6 was read; *[INV-038: it is refused again]*).
+* They are complementary. A lot market lifts the atom count (e.g. $0.000005 at `lot_exp = 5`
+  is 500_000 atoms), so the cap-freeze region (< 34 atoms) is never reached and the
   remainder carry is irrelevant for it; lot-0 markets with prices of 1..33 atoms still need
   #357 / #706 / #710. `tests/tiny_price_format.rs` pins this interaction through
   `clamp_toward_engine_dt` (unchanged by #706 / #710).
@@ -144,9 +144,9 @@ Different problem, no duplicated logic, no storage clash:
 
 ## Open risks
 
-* Same-publish-time equivocation check compares the stored E6 floor; for a leg `< 1e-6`
-  the stored value is 0 and the check is skipped (only the publish-time monotonicity
-  holds). A follow-up could store E12 legs if a layout change is ever taken.
+* *[Closed by INV-038 for new readings: a leg `< 1e-6` is refused, so a stored leg is never
+  0.]* Under #711 the same-publish-time equivocation check compared the stored E6 floor, and
+  for a leg `< 1e-6` the stored value was 0 and the check was skipped.
 * Feeds with expo finer than -12 are truncated at E12 (tested).
 * Off-chain consumers that assume price = per-token E6 will misprice lot markets until the
   SDK / indexer follow-ups land. No existing market changes.
