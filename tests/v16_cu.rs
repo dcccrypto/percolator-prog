@@ -30235,3 +30235,41 @@ fn cu_probe_v22_table() {
         }
     }
 }
+
+// Single-case probes for per-function tracing (measurement only): the last transaction in each
+// is the one of interest. `cu_probe_trace_trade_add`: TradeNoCpi adding to an open leg.
+// `cu_probe_trace_batch_add_4`: BatchTradeNoCpi adding to 4 open legs.
+#[test]
+#[ignore = "measurement probe; run explicitly with --ignored --nocapture"]
+fn cu_probe_trace_trade_add() {
+    let mut env = V16CuEnv::new();
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let pa = env.create_portfolio(&a);
+    let pb = env.create_portfolio(&b);
+    env.deposit(&a, pa, 1_000_000);
+    env.deposit(&b, pb, 1_000_000);
+    let size = (10 * POS_SCALE) as i128;
+    env.svm.expire_blockhash();
+    env.try_trade_asset_with_cu(0, &a, pa, &b, pb, size, 100, 100)
+        .expect("open");
+    env.svm.expire_blockhash();
+    let cu = env.try_trade_asset_with_cu(0, &a, pa, &b, pb, size, 100, 100);
+    cutable("trace_trade_nocpi_add", 1, 0, cu);
+}
+
+#[test]
+#[ignore = "measurement probe; run explicitly with --ignored --nocapture"]
+fn cu_probe_trace_batch_add_4() {
+    let mut env = V16CuEnv::new_with_market_params_and_price_move(4, 5_000, 10_000, 1_000);
+    let a = Keypair::new();
+    let b = Keypair::new();
+    let pa = env.create_portfolio(&a);
+    let pb = env.create_portfolio(&b);
+    env.deposit(&a, pa, 100_000_000);
+    env.deposit(&b, pb, 100_000_000);
+    let size = (POS_SCALE / 100) as i128;
+    cu_probe_batch_nocpi(&mut env, &a, pa, &b, pb, 4, size).expect("open");
+    let cu = cu_probe_batch_nocpi(&mut env, &a, pa, &b, pb, 4, size);
+    cutable("trace_batch_nocpi_add", 4, 0, cu);
+}
