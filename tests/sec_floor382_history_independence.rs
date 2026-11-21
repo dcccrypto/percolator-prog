@@ -727,6 +727,8 @@ const R: u128 = 50_000_000;
 const X2: u128 = 60_000_000;
 /// Starting collateral balance of each actor's source token account (see `ready_vault` / `new_actor`).
 const START_BAL: u128 = 100_000_000_000;
+/// Genesis dead-share floor: counted in `total_lp_shares_outstanding`, minted to nobody.
+const DEAD: u128 = percolator_prog::constants::LP_VAULT_MINIMUM_LIQUIDITY;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum History {
@@ -761,6 +763,12 @@ struct Observed {
     price_e9_after_a: u128,
     supply_end: u128,
     vault_token_end: u128,
+    /// Custom code tag 77 refused B's redemption with (0 = paid).
+    b_redeem_refused_code: u32,
+}
+
+fn has_code(e: &str, code: u32) -> bool {
+    e.contains(&format!("Custom({code})"))
 }
 
 /// Ledger counters as stored right before redemption. These are farm-facing and are EXPECTED to
@@ -806,6 +814,10 @@ fn exit_nav(env: &Env, v: &Vault) -> u128 {
     nav
 }
 
+fn floor_mul_div(a: u128, b: u128, c: u128) -> u128 {
+    a.checked_mul(b).expect("test values fit u128") / c
+}
+
 fn price_e9(nav: u128, supply: u128) -> u128 {
     if supply == 0 {
         0
@@ -834,7 +846,8 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     let nav = exit_nav(&env, &a);
     let supply = registry_shares(&env, &a);
     let (a_shares, b_shares) = (shares_of(&env, a.lp_ata), shares_of(&env, b.lp_ata));
-    assert_eq!(a_shares + b_shares, supply, "every share is held by A or B");
+    // The genesis dead-share floor is counted in supply but minted to nobody.
+    assert_eq!(a_shares + b_shares + DEAD, supply, "every live share is held by A or B");
     let g = market_group(&env);
     let pb = &g.source_backing_buckets[DOMAIN as usize];
     let l = ledger_of(&env.svm, a.ledger);
@@ -859,12 +872,23 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     let price_e9_after_a = price_e9(exit_nav(&env, &a), registry_shares(&env, &a));
 
     // B redeems everything (if B holds anything).
+    // A redemption worth 0 atoms (B's single share at d = 1) is refused by tag 77 with
+    // Custom(34) `LpVaultZeroAmount`; that is recorded, and must also match across histories.
     let mut b_payout = 0u128;
+    let mut b_redeem_refused_code = 0u32;
     if b_shares != 0 {
         let b_before = token_amount(&env.svm, b.dest) as u128;
         request(&mut env, &b, b_shares);
-        execute(&mut env, &b, DOMAIN).expect("B's redemption");
-        b_payout = token_amount(&env.svm, b.dest) as u128 - b_before;
+        match execute(&mut env, &b, DOMAIN) {
+            Ok(()) => b_payout = token_amount(&env.svm, b.dest) as u128 - b_before,
+            Err(e) => {
+                assert!(
+                    has_code(&e, 34) && floor_mul_div(nav, b_shares, supply) == 0,
+                    "B's redemption failed unexpectedly: {e}"
+                );
+                b_redeem_refused_code = 34;
+            }
+        }
     }
 
     let obs = Observed {
@@ -882,6 +906,7 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
         price_e9_after_a,
         supply_end: registry_shares(&env, &a),
         vault_token_end: token_amount(&env.svm, env.vault_token) as u128,
+        b_redeem_refused_code,
     };
 
     // Owner + protocol conservation, per history. Into the vault: A's 2P, B's deposit, the loser's
@@ -898,9 +923,12 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
         2 * P + b_in + R - X - X2,
         "{h:?}: owner payouts + what stays in the vault == inflows - winner withdrawals"
     );
-    // No owner is paid more than the vault holds for owners: the pot's physical value net of
-    // claims. Nothing left in the vault may be a stranded owner claim either: all shares redeemed.
-    assert_eq!(obs.supply_end, 0, "{h:?}: all shares redeemed");
+    // Every live share was redeemed (except a refused 0-atom one); the dead floor remains.
+    let b_left = if b_redeem_refused_code != 0 { b_shares } else { 0 };
+    assert_eq!(obs.supply_end, DEAD + b_left, "{h:?}: all live shares redeemed");
+    // Each holder is paid its pro-rata share of the exit NAV (floor); nobody is paid more.
+    assert!(a_payout <= floor_mul_div(nav, a_shares, supply), "{h:?}: A overpaid");
+    assert!(a_payout + 1 >= floor_mul_div(nav, a_shares, supply), "{h:?}: A underpaid");
     eprintln!("#382 {h:?} d={d}: {obs:?}");
     eprintln!("#382 {h:?} d={d}: ledger counters before redemption {counters:?}");
     (obs, counters)
@@ -950,7 +978,7 @@ fn floor382_one_atom_checkpoint_vs_no_depositor_action() {
     let (none, none_c) = run_history(History::None, 1);
     assert_eq!(none.b_shares, 0);
     assert_eq!(none.exit_nav, 2 * P + R - X - X2);
-    assert_eq!(none.a_payout, none.exit_nav, "sole holder is paid the full exit NAV");
+    assert!(none.a_payout <= none.exit_nav, "sole live holder is paid at most the exit NAV");
     assert!(
         cp.a_payout.abs_diff(none.a_payout) <= 1,
         "A: checkpointed {} vs no action {}",
