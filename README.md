@@ -165,6 +165,7 @@ This section describes intent and operational ordering, not argument-by-argument
   - authenticates clock/oracle state in the wrapper, then delegates bounded public progress to the engine
   - candidate accounts are untrusted hints, not a liveness precondition; honest keepers should include the worst known stale/bankrupt/liquidatable accounts, but the engine also makes cursored progress
   - may perform bounded catchup/recovery, liquidation, touch-only settlement, round-robin lifecycle progress, and empty-account reclaim
+  - the market header is validated before every crank commits, also when no position changed; if the engine reports no progress after the wrapper accrued the market, the accrual is committed only when the engine moved no fee (insurance moved only by the holding rent it charged) and no position (INV-081, upstream fdd2519c)
   - liquidation rewards are optional: when `liquidation_cranker_fee_share_bps > 0`, a keeper may append its writable Percolator portfolio account as the final account in the instruction. Oracle accounts remain immediately after the target portfolio account; the reward portfolio, if present, is last. If no reward portfolio is supplied, the full retained liquidation penalty stays in insurance.
 - **SyncMaintenanceFee** (tag 48)
   - permissionless per-portfolio maintenance-fee realization for the supplied portfolio account
@@ -211,6 +212,7 @@ This section describes intent and operational ordering, not argument-by-argument
   - **unit change, unchanged wire layout:** the field was `b_delta_budget` and against the deployed engine (`9483ee90`) the same bytes bounded the B-index *delta*. A legacy B-index-scale value now forfeits that many ATOMS — larger by `SOCIAL_LOSS_DEN / loss_weight` — which can turn a bounded chunk into a terminal forfeit that spends principal and detaches the leg. Re-derive every off-repo caller in atoms.
 - **RebalanceReduce** (tag 44)
   - owner-signed risk-reducing rebalance against the wrapper-authenticated effective price vector
+  - the market header is validated before the instruction commits (INV-081)
 - **ClaimResolvedPayoutTopup** (tag 46)
   - permissionless resolved-payout top-up claim; pays only the stored owner receipt token account
 - **RefineResolvedUnreceiptedBound** (tag 47)
