@@ -17,8 +17,11 @@
 //!
 //! The fault is a harness input: one header total that only `validate_shape` reads is raised by
 //! one unit in the market account, which nothing in the engine does. Everything else is public
-//! System, SPL and program setup. On the program before this check the crank accepted the same
-//! fixture and committed it.
+//! System, SPL and program setup. Upstream's control (its first test below) fails on its previous
+//! program. In this fork it passes there too, because an observed crank validates the header when
+//! it stages the oracle target, before any engine work; the second, fork-specific test reaches the
+//! commit-time check through an observation-free refresh crank, and that one fails on the program
+//! before this port (the crank commits the fixture).
 
 use super::*;
 use percolator_prog::constants::MARKET_GROUP_OFF;
@@ -171,4 +174,135 @@ fn v16_program_crank_and_rebalance_reduce_cannot_commit_a_header_that_fails_a_sh
         .expect("rebalance reduce on the canonical market");
     assert_eq!(header_shape(&env), Ok(()));
     println!("INV-081 CU: refresh crank (no position change) {crank_cu}, RebalanceReduce {reduce_cu}");
+}
+
+/// Fork-specific companion. In this fork a crank that carries an oracle observation stages the
+/// asset's raw oracle target first (`set_asset_raw_oracle_target_not_atomic`), and that engine
+/// call ends in `validate_shape`, so a header that was already bad when the crank started is
+/// refused before any engine work, and the upstream test above passes on the program before this
+/// port as well. What the commit-time check adds is a check AFTER the engine's refresh. This test
+/// reaches that point: an observation-free crank (the F1 follow-on form) refreshes an account
+/// whose asset another crank has already advanced, so nothing before the engine validates the
+/// header. Control: on the program before this port the crank commits the fixture.
+#[test]
+fn v16_program_observation_free_refresh_crank_cannot_commit_a_header_that_fails_a_shape_check() {
+    const CAPITAL: u128 = 10_000;
+    const OPEN_Q: u128 = 2 * POS_SCALE;
+
+    let mut env = V16CuEnv::new();
+    env.configure_auth_mark_with_cu(0, 100);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long = env.create_portfolio(&long_owner);
+    let short = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long, CAPITAL);
+    env.deposit(&short_owner, short, CAPITAL);
+    env.trade_asset_with_cu(
+        0,
+        &long_owner,
+        long,
+        &short_owner,
+        short,
+        OPEN_Q as i128,
+        100,
+        0,
+    );
+
+    // Move the mark and advance the asset with an observed crank of the long. The short's leg is
+    // now behind its asset's K index, so a crank of it has a real refresh to do.
+    let crank_slot = env.svm.get_sysvar::<Clock>().slot + 1;
+    env.svm.warp_to_slot(crank_slot);
+    env.push_auth_mark_for_asset_as_admin(0, crank_slot, 101);
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: crank_slot,
+            observations: crank_observations(0),
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(long, false),
+        ],
+        &[],
+    )
+    .expect("observed crank of the long");
+    assert_eq!(header_shape(&env), Ok(()));
+
+    let refresh = ProgInstruction::PermissionlessCrank {
+        now_slot: crank_slot,
+        observations: vec![],
+    };
+    let refresh_accounts = |env: &V16CuEnv| {
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(short, false),
+        ]
+    };
+
+    // Same fixture as the upstream test.
+    let canonical = env.svm.get_account(&env.market).expect("market account");
+    let bound = header_u128(
+        &canonical.data,
+        core::mem::offset_of!(
+            percolator::MarketGroupV16HeaderAccount,
+            pnl_pos_bound_tot_num
+        ),
+    );
+    let mut broken = canonical.clone();
+    let field = MARKET_GROUP_OFF
+        + core::mem::offset_of!(
+            percolator::MarketGroupV16HeaderAccount,
+            source_claim_bound_total_num
+        );
+    broken.data[field..field + 16].copy_from_slice(&(bound + 1).to_le_bytes());
+    env.svm
+        .set_account(env.market, broken)
+        .expect("install the header fixture");
+    assert_eq!(header_shape(&env), Err(percolator::V16Error::InvalidConfig));
+    let before = [env.market, long, short].map(|key| env.svm.get_account(&key));
+    env.svm.expire_blockhash();
+    let accounts = refresh_accounts(&env);
+    let error = env
+        .send(refresh.clone(), accounts, &[])
+        .expect_err("an observation-free refresh crank must not commit the fixture");
+    assert!(
+        error.contains(&format!(
+            "Custom({})",
+            PercolatorError::EngineInvalidConfig as u32
+        )),
+        "the refresh crank must fail on the header check: {error}"
+    );
+    assert_eq!(
+        [env.market, long, short].map(|key| env.svm.get_account(&key)),
+        before,
+        "the refresh crank must roll back exactly"
+    );
+
+    // On the canonical market the same crank is a real refresh step: it succeeds, settles the
+    // short's leg to its asset's K index, and leaves the position vector alone.
+    env.svm
+        .set_account(env.market, canonical)
+        .expect("restore the canonical market");
+    let position = |env: &V16CuEnv| {
+        [long, short].map(|key| {
+            let leg = active_leg_for_asset(&env.portfolio_state(key), 0);
+            (leg.side, leg.basis_pos_q)
+        })
+    };
+    let positions_before = position(&env);
+    let short_k_before = active_leg_for_asset(&env.portfolio_state(short), 0).k_snap;
+    env.svm.expire_blockhash();
+    let accounts = refresh_accounts(&env);
+    let refresh_cu = env
+        .send(refresh, accounts, &[])
+        .expect("observation-free refresh crank on the canonical market");
+    assert_ne!(
+        active_leg_for_asset(&env.portfolio_state(short), 0).k_snap,
+        short_k_before,
+        "the crank refreshed the short"
+    );
+    assert_eq!(position(&env), positions_before, "the refresh moved no position");
+    assert_eq!(header_shape(&env), Ok(()));
+    println!("INV-081 CU: observation-free refresh crank {refresh_cu}");
 }
