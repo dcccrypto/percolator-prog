@@ -30287,6 +30287,17 @@ pub mod processor {
             profile.oracle_target_price_e6 = mark_e6;
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
+            // ADOPT upstream (aeyakovenko/percolator-prog `reset_price_move_remainder_on_target_change_view`),
+            // same as `handle_push_ewma_mark` (#710): a target change must not carry the previous
+            // target's price-move-cap remainder. AUTH_MARK is price-managed and shares the bounded
+            // catch-up remainder, so the EWMA-only port left this fork-only push path carrying a
+            // stale `price_move_remainder_bps_num` into the next target's first catch-up step.
+            reset_price_move_remainder_on_target_change_view(
+                &mut profile,
+                &group,
+                asset_index_usize,
+                mark_e6,
+            )?;
             write_oracle_profile_to_view(&mut group, asset_index_usize, &profile)?;
             // v2.2 growth overnight §1.3 (G8): record the depth on a growth asset (a 35-byte
             // push zeroes it). Growth OFF: nothing is written (the record stays all-zero).
