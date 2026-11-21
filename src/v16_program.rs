@@ -31090,6 +31090,14 @@ pub mod processor {
             let insurance_before = group.header.insurance.get();
             // v2.2: rent charged inside this action is the vault LP's claim, not a fee.
             let rent_unrouted_before = group.rent_unrouted_total().map_err(map_v16_error)?;
+            // INV-081 (ADOPT upstream fdd2519c, #485): the position vector before the engine's
+            // crank, for the guard on the commit after `NonProgress` below. That arm is reached
+            // only when the wrapper accrued the market, so the snapshot is taken only then.
+            let positions_before = if market_accrual_performed {
+                Some(portfolio_position_vector_view(&portfolio))
+            } else {
+                None
+            };
             // bigtest-2026-11-05 finding 2: a liquidation is matched against the market's bound
             // vault LP (engine `permissionless_auto_crank_s10_with_counterparty_not_atomic`)
             // instead of closed unilaterally through quantity ADL, which would latch the asset
@@ -31146,7 +31154,34 @@ pub mod processor {
                     }
                 }
                 Ok(result) => Some(result),
-                Err(V16Error::NonProgress) if market_accrual_performed => None,
+                Err(V16Error::NonProgress) if market_accrual_performed => {
+                    // INV-081 (ADOPT upstream fdd2519c, #485): the engine's crank is not atomic:
+                    // it can return NonProgress after a completed refresh (a liquidation that
+                    // found nothing to do). That state is kept. A state in which the engine took
+                    // a fee or moved a position before giving up is not.
+                    // Adapted: in this fork a refresh settles holding rent into insurance
+                    // (`charge_account_rent_current_not_atomic`); that rent is the vault LP's
+                    // claim, not a fee (the same netting as `retained_fee` below), so insurance
+                    // may move by exactly the rent charged and no more.
+                    let insurance_after_net_of_rent = group
+                        .header
+                        .insurance
+                        .get()
+                        .checked_add(rent_unrouted_before)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    let insurance_before_plus_rent = group
+                        .rent_unrouted_total()
+                        .map_err(map_v16_error)?
+                        .checked_add(insurance_before)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    if insurance_after_net_of_rent != insurance_before_plus_rent
+                        || positions_before.as_ref()
+                            != Some(&portfolio_position_vector_view(&portfolio))
+                    {
+                        return Err(PercolatorError::EngineNonProgress.into());
+                    }
+                    None
+                }
                 Err(V16Error::NonProgress) => {
                     log_portfolio_lagging_assets(&group, &portfolio, authenticated_now_slot);
                     return Err(PercolatorError::EngineNonProgress.into());
@@ -31323,9 +31358,12 @@ pub mod processor {
                     selected_fee_asset,
                     retained_fee,
                 )?;
-                if selected_liquidation {
-                    group.validate_shape().map_err(map_v16_error)?;
-                }
+                // INV-081 (ADOPT upstream fdd2519c, #485): the engine's refresh, B-chunk and
+                // pending-close steps validate the market shape only in audit builds, so a crank
+                // that is not a liquidation would otherwise commit a header that nothing has
+                // checked. A header that fails here aborts this instruction instead of every
+                // later one. (The cranker-reward branch above already validates.)
+                group.validate_shape().map_err(map_v16_error)?;
             }
             cfg_after = cfg;
         }
@@ -31399,6 +31437,28 @@ pub mod processor {
         };
         let eff = i128::try_from(eff_abs).ok()?;
         Some((idx as u16, if long { eff } else { -eff }))
+    }
+
+    /// INV-081 (ADOPT upstream fdd2519c, #485): the position vector of a portfolio VIEW, in the
+    /// same shape as `snapshot_position_vector` (active legs' `(asset_index, market_id, side,
+    /// basis_pos_q)`, AUD-S1-23). Raw POD reads: the surrounding validated view makes them
+    /// sufficient. Heap, not a 16-entry stack array, to keep the crank handler's SBF frame flat.
+    #[inline(never)]
+    fn portfolio_position_vector_view(
+        portfolio: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> PositionVector {
+        let mut out: PositionVector = Vec::with_capacity(percolator::V16_MAX_PORTFOLIO_ASSETS_N);
+        for leg in portfolio.header.legs.iter() {
+            if leg.active != 0 {
+                out.push((
+                    leg.asset_index.get(),
+                    leg.market_id.get(),
+                    leg.side,
+                    leg.basis_pos_q.get(),
+                ));
+            }
+        }
+        out
     }
 
     /// v2.2 fill events: the ADL-effective signed size of every active leg, in one pass over the
