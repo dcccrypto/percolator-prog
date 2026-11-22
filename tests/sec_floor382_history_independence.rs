@@ -1,15 +1,17 @@
 // Skip this integration-test binary when Kani builds the test suite.
 #![cfg(not(kani))]
 #![allow(dead_code)]
-//! Upstream aeyakovenko/percolator-prog #382 ("automatic source-claim protection floor"), engine
-//! fix aeyakovenko/percolator #271, program fix #486: a backing-domain loss that is claimed,
+//! Upstream issue 382 ("automatic source-claim protection floor"), upstream engine fix PR 271,
+//! upstream program fix PR 486: a backing-domain loss that is claimed,
 //! refilled by a loser payment and consumed again BETWEEN two depositor actions nets out in the
 //! ledger's watermark counters (`cumulative_loss_atoms` / `cumulative_recovery_atoms`), so a
 //! payout that read those counters depended on WHEN anyone looked.
 //!
 //! Our LP vault (Earn, tag 75 / tag 77) prices shares from the same backing-domain ledger
 //! (`lp_vault_nav_atoms_floored`, `lp_vault_domain_available_principal_atoms` in
-//! src/v16_program.rs). This file checks, on the real BPF program, that two histories with the
+//! src/v16_program.rs), but for exits it should read only the ledger's principal: the available
+//! term is `nonbound_available_e3` (physical) and the counter arguments are passed as 0. This
+//! file checks, on the real BPF program, that two histories with the
 //! same loss -> refill -> second loss give the same NAV, share price and withdrawal payouts
 //! whether or not a depositor action checkpointed the pot's ledger after the first loss, and that
 //! owner + protocol value is conserved in both.
@@ -34,8 +36,9 @@
 //! shape) would price those two pots 50M apart. The counter-rewrite probe goes further: it
 //! rewrites loss / recovery on one ledger before redemption (net impairment moved both ways)
 //! and requires identical payouts, which fails for any pricing that reads either counter, net
-//! or gross (within the not-over-impaired range: tag 77's over-impaired predicate does read
-//! `loss - recovery`, and the probe's values stay well below the principal).
+//! or gross. (The over-impaired predicate that does read `loss - recovery` guards tags 75 and
+//! 91, not this tag 77 path, and the probe's values stay well below the principal anyway; the
+//! Resolved terminal path of tag 77 reads the counters but is not exercised here.)
 //!
 //! Harness copied from tests/nonbound_nav_floor.rs (same fixtures for physical consumption and
 //! refill). Test only: no source change.
