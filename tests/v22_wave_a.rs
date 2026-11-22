@@ -773,8 +773,9 @@ fn combined_tags_decode_to_distinct_variants() {
 /// Mainnet condition 1 (Wave A approval, 2026-10-06): InitMarket refuses `public_b_chunk_atoms`
 /// below `PUBLIC_B_CHUNK_ATOMS_MIN` (1e9 atoms) -- the chunk is a market-kill threshold (a bust
 /// whose residual exceeds it resolves the market; ledger/finding-bankrupt-chunk-wedge-
-/// 2026-10-06.md). Legacy and growth forms alike. CONTROL: the floor itself and the seed default
-/// 1e12 are accepted.
+/// 2026-10-06.md). Legacy and growth forms alike. Upstream ebcded5: also refused above
+/// `MAX_VAULT_TVL` (B-settlement overflow). CONTROL: the floor, `MAX_VAULT_TVL` and the seed
+/// default 1e12 are accepted.
 #[test]
 fn init_market_refuses_a_public_b_chunk_below_the_floor() {
     let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;

@@ -902,7 +902,8 @@ pub mod constants {
     /// market Live -> Recovery -> Resolved (permissionlessly). InitMarket refuses a chunk below
     /// 1e9 atoms (1,000 USDC at 6 dp), so no creator can pick a chunk any small bust resolves.
     /// The seed default is 1e12. Refused with EngineInvalidConfig (Custom 14), like the other
-    /// InitMarket config bounds.
+    /// InitMarket config bounds. The chunk is also bounded above by `percolator::MAX_VAULT_TVL`
+    /// (upstream ebcded5): a larger chunk overflows B-settlement of any loss-weighted account.
     pub const PUBLIC_B_CHUNK_ATOMS_MIN: u128 = 1_000_000_000;
     pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
