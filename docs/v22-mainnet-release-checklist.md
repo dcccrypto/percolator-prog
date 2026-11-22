@@ -59,7 +59,10 @@ A mismatch at any step stops the release.
 - `tests/v16_cu.rs` (the 11-leg batch budget).
 - Sibling programs rebuilt against the v2.2 layout in the same flag day (stake offsets and a
   VERSION == 19 guard; NFT re-vendor with the exact portfolio length). Off-chain decoders
-  (SDK, keeper, indexer) guard on VERSION == 19.
+  (SDK, keeper, indexer) guard on VERSION == 19 and, for a portfolio, on the engine
+  `layout_discriminator` == 20 (account byte 114) and the 10,607 B length. The portfolio
+  layout moved 19 -> 20 without a VERSION bump, so VERSION alone also admits a layout-19
+  (10,603 B) portfolio.
 - Kani: the B-series design run once on the final code, every harness SUCCESSFUL with its
   covers satisfied.
 - D-1 founder sign-off recorded in the ledger.
