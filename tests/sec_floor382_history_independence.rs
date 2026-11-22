@@ -33,7 +33,9 @@
 //! R = 50M against loss 70M / recovery 0. A pricing rule that read the gross loss (the #382
 //! shape) would price those two pots 50M apart. The counter-rewrite probe goes further: it
 //! rewrites loss / recovery on one ledger before redemption (net impairment moved both ways)
-//! and requires identical payouts, which fails for ANY pricing that reads either counter.
+//! and requires identical payouts, which fails for any pricing that reads either counter, net
+//! or gross (within the not-over-impaired range: tag 77's over-impaired predicate does read
+//! `loss - recovery`, and the probe's values stay well below the principal).
 //!
 //! Harness copied from tests/nonbound_nav_floor.rs (same fixtures for physical consumption and
 //! refill). Test only: no source change.
@@ -797,7 +799,7 @@ fn has_code(e: &str, code: u32) -> bool {
 
 /// Ledger counters of the lossy pot right before redemption. `loss` / `recovery` / `watermark`
 /// are as stored; `synced_*` are what `sync_backing_domain_ledger` (run by tag 77 before it
-/// prices) turns them into against the current bucket. Farm-facing; pricing never reads them.
+/// prices) turns them into against the current bucket. Farm-facing; exit pricing does not read them.
 #[derive(Clone, Copy, Debug)]
 struct Counters {
     loss: u128,
@@ -1094,8 +1096,8 @@ fn assert_history_independent(d: u128) {
     // Limit of this comparison: the stored counters above are stale snapshots. The sync tag 77
     // runs before pricing brings all three to the SAME ledger (loss X - R + X2, recovery 0), and
     // there `principal - (loss - recovery)` equals the E3 value too, so these three histories
-    // cannot tell E3 pricing from counter pricing. `assert_counters_not_read` and the rewrite
-    // probe below are the checks that can.
+    // cannot tell E3 pricing from counter pricing. `assert_gross_loss_not_read` catches
+    // gross-loss pricing; only the rewrite probe below also catches net-counter pricing.
     for c in [cp_c, dl_c, cr_c] {
         assert_eq!((c.synced_loss, c.synced_recovery), (X - R + X2, 0), "synced counters");
     }
@@ -1129,7 +1131,7 @@ fn net_counter_value(c: &Counters) -> u128 {
 /// runs before pricing, the lossy pot's ledgers still differ (loss 120M / recovery 50M against
 /// loss 70M / recovery 0). The program's payouts must be identical anyway, and must be the E3
 /// value (the ±1 bounds in `run_history`), which the gross-loss reading misses by R here.
-fn assert_counters_not_read(d: u128) {
+fn assert_gross_loss_not_read(d: u128) {
     let (two, two_c) = run_history(History::TwoCheckpoints, d);
     let (dl2, dl2_c) = run_history(History::DelayedTwice, d);
     // The ledger state tag 77 prices against really differs between the two histories.
@@ -1146,8 +1148,8 @@ fn assert_counters_not_read(d: u128) {
         "a gross-loss price would undervalue the two-checkpoint vault by R"
     );
     // ...and yet everything a holder can observe is identical.
-    assert_eq!(two.exit_nav, dl2.exit_nav, "exit NAV reads the counters");
-    assert_eq!(two.price_e9, dl2.price_e9, "share price reads the counters");
+    assert_eq!(two.exit_nav, dl2.exit_nav, "same physical NAV (test E3)");
+    assert_eq!(two.price_e9, dl2.price_e9, "same price (test E3)");
     assert_eq!(two.a_payout, dl2.a_payout, "A's payout reads the counters");
     assert_eq!(two.b_payout, dl2.b_payout, "B's payout reads the counters");
     assert_eq!(two, dl2);
@@ -1156,12 +1158,12 @@ fn assert_counters_not_read(d: u128) {
 
 #[test]
 fn floor382_two_checkpoints_vs_delayed_twice_one_atom_deposit() {
-    assert_counters_not_read(1);
+    assert_gross_loss_not_read(1);
 }
 
 #[test]
 fn floor382_two_checkpoints_vs_delayed_twice_one_token_deposit() {
-    assert_counters_not_read(1_000_000);
+    assert_gross_loss_not_read(1_000_000);
 }
 
 /// Counter-rewrite probe: the same history, with the lossy pot's loss / recovery overwritten just
