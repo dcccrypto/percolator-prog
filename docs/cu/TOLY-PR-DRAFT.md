@@ -28,7 +28,7 @@ litesvm `BatchTradeCpi` probe (`cu_probe_trade_cpi_legs`), 3 runs x 3 samples pe
 | 4 | 316672 | 307508 | -9164 (-2.9%) |
 
 The best (min) samples drop by 10664 CU at every leg count. So the saving is a flat ~10.7k CU per transaction,
-not per leg; the percentage shrinks as legs are added because the base cost grows. Sample jitter is about 1.5k CU.
+not per leg; the percentage shrinks as legs are added because the base cost grows. Sample jitter is about 1.5k CU; a later single rerun of the 1-leg case gave 152740 -> 145076 (median), 143576 (min), so read the saving as roughly 8-10.7k CU.
 
 Repro: build the program and the `auth_matcher` fixture with `cargo build-sbf`, then
 `cargo test --test v16_cu cu_probe_trade_cpi_legs -- --ignored --nocapture` and read the `CUPROBE` lines,
