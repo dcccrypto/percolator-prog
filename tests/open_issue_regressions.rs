@@ -58,17 +58,19 @@ fn issue438_insurance_withdrawal_respects_both_domain_barriers() {
         .try_withdraw_insurance_asset_with_authority(&admin, 0, 150)
         .expect("barrier-free withdrawal succeeds");
     eprintln!("issue438 control WithdrawInsuranceAsset CU = {cu}");
+    // Run both sides before asserting, so a failure reports every side that is not blocked.
+    let mut wrong = Vec::new();
     for short_side in [false, true] {
         let mut env = funded_env();
         market_with_barrier(&mut env, short_side);
         let admin = env.admin.insecure_clone();
-        let err = env
-            .try_withdraw_insurance_asset_with_authority(&admin, 0, 150)
-            .expect_err("a pending barrier must block the two-domain debit");
-        assert_eq!(
-            custom_code(&err),
-            Some(ENGINE_LOCK_ACTIVE),
-            "short_side={short_side}: expected EngineLockActive, got {err}"
-        );
+        match env.try_withdraw_insurance_asset_with_authority(&admin, 0, 150) {
+            Err(err) if custom_code(&err) == Some(ENGINE_LOCK_ACTIVE) => {}
+            other => wrong.push(format!("short_side={short_side}: {other:?}")),
+        }
     }
+    assert!(
+        wrong.is_empty(),
+        "a pending barrier must block the two-domain debit with EngineLockActive: {wrong:?}"
+    );
 }
