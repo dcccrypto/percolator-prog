@@ -29225,6 +29225,18 @@ pub mod processor {
         // `authority_epoch` lane, read directly since no view is in scope.
         let sequences = state::read_asset_control_sequences(&market_ai.try_borrow_data()?, 0)?;
         state::require_current_authority_epoch(sequences.authority_epoch, expected_authority_epoch)?;
+        // The deposits-only ceiling is a running total of the deposits tag 9 makes WHILE it is
+        // on. Switching it on over an existing reserve, or after Resolve (tag 9 is Live-only),
+        // leaves that total short of what insurers really deposited, and tag 41 then refuses
+        // their terminal withdrawal for good. So it may only be switched on while the market is
+        // Live and holds no insurance yet. Switching it off only loosens it and stays allowed.
+        if deposits_only != 0 && cfg.insurance_withdraw_deposits_only == 0 {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let (_, group) = state::market_view_mut(&mut data)?;
+            if group.header.mode != 0 || group.header.insurance.get() != 0 {
+                return Err(PercolatorError::EngineLockActive.into());
+            }
+        }
         cfg.insurance_withdraw_deposits_only = deposits_only;
         cfg.insurance_withdraw_cooldown_slots = cooldown_slots;
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)
