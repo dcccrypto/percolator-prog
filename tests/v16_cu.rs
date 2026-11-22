@@ -30227,9 +30227,12 @@ fn v16_bpf_hybrid_split_catchup_omitted_refresh_rejects_partial_price() {
 // makes. Measuring it against the lagging raw target would see target == effective == current,
 // pass with zero funding, and let a hint-less crank refresh the exposed victim at the old price
 // while the matured mark the crank would actually feed has moved.
+// Slot-3 authenticated move: +0.5%, inside one 100 bps/slot step, so the asset settles on it.
+const ROW762_MOVED_PRICE_E6: u64 = 1_005_000;
+
 fn row762_matured_hybrid_params() -> V16CuMarketParams {
     // Same zero-funding envelope as row461 (so only the price leg can make the guard reject), but
-    // an accrual window wide enough that the slot-10 crank catches the 8-slot idle gap up in one
+    // an accrual window wide enough that the slot-10 crank catches the 7-slot idle gap (3 -> 10) up in one
     // step (the engine requires min_funding_lifetime_slots >= max_accrual_dt_slots).
     V16CuMarketParams {
         max_accrual_dt_slots: 10,
@@ -30284,12 +30287,49 @@ fn v16_bpf_hybrid_matured_omitted_refresh_rejects_trade_moved_mark() {
         0,
     )
     .expect("open victim long vs maker short at the opening mark");
+    // A second pair, opened now so that its later after-hours trade can be risk-REDUCING on both
+    // sides: the slot-3 move leaves the asset loss-stale, which refuses risk-increasing trades
+    // (EngineLossStale) until losers are recertified, and recertifying would touch the victim.
+    let long2_owner = Keypair::new();
+    let short2_owner = Keypair::new();
+    let long2 = env.create_portfolio(&long2_owner);
+    let short2 = env.create_portfolio(&short2_owner);
+    env.deposit(&long2_owner, long2, 10_000_000);
+    env.deposit(&short2_owner, short2, 10_000_000);
+    env.try_trade_asset_with_cu(
+        0,
+        &long2_owner,
+        long2,
+        &short2_owner,
+        short2,
+        2 * POS_SCALE as i128,
+        ROW461_PRICE_E6,
+        0,
+    )
+    .expect("open second long/short pair at the opening mark");
 
-    // Slot 10: no newer report (same publish time), so last_good_oracle_slot stays at 2 and the
-    // Hybrid profile is soft-stale-matured (10 - 2 >= 3). A hinted crank with the unchanged report
+    // Slot 3, still fresh: a small authenticated move (within one 100 bps step) so the victim's
+    // position is stale against the asset and the crank must actually recertify it (an unmoved
+    // asset leaves the victim current and the engine answers NoAction before the guard runs).
+    set_test_clock(&mut env, 3, 102);
+    let moved = env.set_pyth_price(&feed, ROW762_MOVED_PRICE_E6 as i64, -6, 102);
+    env.crank_with_oracle_tail(
+        keeper,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 3,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 1,
+            }],
+        },
+        std::slice::from_ref(&moved),
+    );
+
+    // Slot 10: no newer report (same publish time), so last_good_oracle_slot stays at 3 and the
+    // Hybrid profile is soft-stale-matured (10 - 3 >= 3). A hinted crank with the unchanged report
     // catches the asset up to slot 10 at the unchanged price.
     let matured_slot = 10;
-    set_test_clock(&mut env, matured_slot, 101);
+    set_test_clock(&mut env, matured_slot, 102);
     env.crank_with_oracle_tail(
         keeper,
         ProgInstruction::PermissionlessCrank {
@@ -30299,33 +30339,28 @@ fn v16_bpf_hybrid_matured_omitted_refresh_rejects_trade_moved_mark() {
                 oracle_accounts: 1,
             }],
         },
-        std::slice::from_ref(&fresh),
+        std::slice::from_ref(&moved),
     );
 
     // A matured (after-hours) trade above the index moves the fallback EWMA mark, leaving the
-    // effective price and the committed raw target where they were.
-    let buyer_owner = Keypair::new();
-    let seller_owner = Keypair::new();
-    let buyer = env.create_portfolio(&buyer_owner);
-    let seller = env.create_portfolio(&seller_owner);
-    env.deposit(&buyer_owner, buyer, 10_000_000);
-    env.deposit(&seller_owner, seller, 10_000_000);
+    // effective price and the committed raw target where they were. short2 buys back half from
+    // long2: risk-reducing for both, and the victim is not touched.
     env.try_trade_asset_with_cu(
         0,
-        &buyer_owner,
-        buyer,
-        &seller_owner,
-        seller,
+        &short2_owner,
+        short2,
+        &long2_owner,
+        long2,
         POS_SCALE as i128,
-        ROW461_PRICE_E6 * 150 / 100,
+        ROW762_MOVED_PRICE_E6 * 150 / 100,
         0,
     )
-    .expect("matured after-hours trade above the index");
+    .expect("matured risk-reducing after-hours trade above the index");
 
     let (cfg_before, group_before) = env.market_state();
     let current = group_before.assets[0].effective_price;
-    assert_eq!(cfg_before.last_good_oracle_slot, 2, "no newer report may land");
-    assert_eq!(current, ROW461_PRICE_E6, "after-hours trade must not move the index");
+    assert_eq!(cfg_before.last_good_oracle_slot, 3, "no newer report may land");
+    assert_eq!(current, ROW762_MOVED_PRICE_E6, "after-hours trade must not move the index");
     assert_eq!(
         group_before.assets[0].raw_oracle_target_price, current,
         "the committed raw target lags the matured mark (it equals the unchanged index)"
@@ -30339,7 +30374,7 @@ fn v16_bpf_hybrid_matured_omitted_refresh_rejects_trade_moved_mark() {
     // Slot 11: a hint-less crank on the exposed victim. The crank would feed the matured mark, so
     // the omission is pending price progress and must reject with exact rollback.
     let attack_slot = matured_slot + 1;
-    set_test_clock(&mut env, attack_slot, 101);
+    set_test_clock(&mut env, attack_slot, 102);
     let before = env.svm.get_account(&env.market);
     let victim_before = env.svm.get_account(&victim);
     let result = env.send(
