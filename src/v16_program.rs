@@ -14941,11 +14941,13 @@ pub mod processor {
         //   to `raw_oracle_target_price` would blind the multi-leg gate to a just-pushed mark move
         //   on an un-observed leg.
         //
-        // - HYBRID once soft-stale-MATURED: the crank falls back to `mark_ewma_e6` (stale or absent
-        //   report), and an after-hours trade moves that mark via `update_hybrid_mark_after_trade_view`
-        //   without touching `raw_oracle_target_price`. Measure it against the mark, the same split
-        //   `stored_mark_target_for_zero_move_accrual_view` makes; the raw target would lag the mark
-        //   and let a hint-less crank refresh an exposed account at the old price.
+        // - HYBRID once soft-stale-MATURED: an omitted (hint-less) crank supplies no report, so the
+        //   crank falls back to `mark_ewma_e6` (a hinted crank with a still-readable report feeds
+        //   that report instead), and an after-hours trade moves the mark via
+        //   `update_hybrid_mark_after_trade_view` without touching `raw_oracle_target_price`.
+        //   Measure it against the mark, the same split `stored_mark_target_for_zero_move_accrual_view`
+        //   makes; the raw target would lag the mark and let a hint-less crank refresh an exposed
+        //   account at the old price.
         let target = if oracle_v16::profile_is_hybrid(&profile)
             && !oracle_v16::profile_hybrid_soft_stale_matured(&profile, now_slot)
         {
