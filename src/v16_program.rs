@@ -17337,6 +17337,10 @@ pub mod processor {
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
             || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
+            // Upstream ebcded5 (engine 80f8f0b4): a chunk above the largest vault overflows
+            // every B-settlement step of an account with a loss weight (from ~3.4e17 atoms),
+            // freezing a side after a social loss. Our engine checks only `== 0`; bound it here.
+            || public_b_chunk_atoms > percolator::MAX_VAULT_TVL
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
