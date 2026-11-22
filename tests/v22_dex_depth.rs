@@ -632,6 +632,9 @@ impl Env {
     /// asset, the upgrade-authority ProgramData mock, and every fixture account loaded.
     fn new(collateral: Pubkey) -> Self {
         let mut svm = LiteSVM::new();
+        let mut clock: solana_sdk::clock::Clock = svm.get_sysvar();
+        clock.unix_timestamp = 1_760_000_000;
+        svm.set_sysvar(&clock);
         let program_id = percolator_prog::id();
         svm.add_program(program_id, &std::fs::read(program_path()).expect("read wrapper BPF"));
         let payer = seeded_keypair(1);
@@ -1576,4 +1579,106 @@ fn pool_claim_one_market_per_pool() {
     env.warp(1);
     env.set_source(chill()).expect("unclaimed pool pins");
     assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes());
+}
+
+// P01: a pre-open Raydium CPMM pool must not supply tradeable depth.
+// Expected: RED on the vulnerable RC23 SBF binary.
+#[test]
+fn p01_preopen_cpmm_must_not_supply_positive_depth() {
+    let mut env = Env::new(pk(USDC_MINT));
+
+    let k = PoolKeys {
+        pool: pk(NEAR_POOL),
+        base_vault: pk(NEAR_VAULT0),
+        quote_vault: pk(NEAR_VAULT1),
+        base_mint: pk(NEAR_MINT),
+        quote_mint: pk(USDC_MINT),
+    };
+
+    // Raydium PoolState.open_time at offset 373.
+    // Year 2100: safely ahead of the test clock.
+    let mut pool = env.svm.get_account(&k.pool).unwrap();
+    pool.data[373..381]
+        .copy_from_slice(&4_102_444_800u64.to_le_bytes());
+    env.svm.set_account(k.pool, pool).unwrap();
+
+    // A fix may refuse the pin itself.
+    if let Err(e) = env.set_source(k) {
+        assert!(
+            e.contains(&code(PercolatorError::DepthSourceInvalid)),
+            "unexpected pin rejection: {e}"
+        );
+        return;
+    }
+
+    env.warp(1);
+    let accounts = env.dex_accounts(k);
+    let result = env.push(2, 0, &accounts);
+
+    match result {
+        Err(e) => assert!(
+            e.contains(&code(PercolatorError::DepthSourceInvalid)),
+            "unexpected push rejection: {e}"
+        ),
+        Ok(_) => assert_eq!(
+            env.growth().depth_e6,
+            0,
+            "P01 RED: pre-open Raydium pool supplied positive DEX depth"
+        ),
+    }
+}
+
+// P01: independently exercise the PushAuthMark guard.
+// The pool is initially open and successfully pinned.
+// A synthetic pre-open pool state must then be rejected.
+#[test]
+fn p01_post_pin_preopen_push_rejected() {
+    let mut env = Env::new(pk(USDC_MINT));
+
+    let k = PoolKeys {
+        pool: pk(NEAR_POOL),
+        base_vault: pk(NEAR_VAULT0),
+        quote_vault: pk(NEAR_VAULT1),
+        base_mint: pk(NEAR_MINT),
+        quote_mint: pk(USDC_MINT),
+    };
+
+    // Positive control: the original pool is open.
+    env.set_source(k).expect("initial pin must succeed");
+
+    let original = env.svm.get_account(&k.pool).unwrap();
+    let mut future = original.clone();
+
+    // Simulate a pool that cannot swap yet.
+    future.data[373..381]
+        .copy_from_slice(&4_102_444_800u64.to_le_bytes());
+
+    env.svm.set_account(k.pool, future).unwrap();
+    env.warp(1);
+
+    let before = env.snapshot();
+    let accounts = env.dex_accounts(k);
+
+    // This specifically tests the post-pin push guard.
+    let err = env.push(2, 0, &accounts)
+        .expect_err("pre-open depth push must be refused");
+
+    assert!(
+        err.contains(&code(PercolatorError::DepthSourceInvalid)),
+        "unexpected error: {err}"
+    );
+
+    // Failed push must not mutate the oracle/market state.
+    assert_eq!(env.snapshot(), before);
+
+    // Restore a tradeable pool: positive control.
+    env.svm.set_account(k.pool, original).unwrap();
+    env.warp(1);
+
+    env.push(2, 0, &accounts)
+        .expect("open pool must be accepted");
+
+    assert_eq!(env.growth().depth_e6, 13_568_919_694);
+
+    println!("P01_POST_PIN_PUSH_GUARD=PASS");
 }
