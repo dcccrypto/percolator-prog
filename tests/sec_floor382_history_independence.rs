@@ -19,9 +19,21 @@
 //!                 its ledger); loser refill R; second loss X2.
 //!   AFTER REFILL: A seeds both pots; loss X; loser refill R; B deposits d; second loss X2.
 //!   DELAYED:      A seeds both pots; loss X; loser refill R; second loss X2; B deposits d.
+//!   TWO CHECKPOINTS: A seeds both pots; loss X; B deposits d; loser refill R; B deposits d
+//!                 again; second loss X2.
+//!   DELAYED TWICE: A seeds both pots; loss X; loser refill R; second loss X2; B deposits d twice.
 //! Then A and B each redeem all of their shares (tag 77). Entries (75) price at par (H-1), so
 //! B's share count is timing-independent by construction; the property under test is the EXIT
 //! side (NAV, share price, payouts) plus conservation.
+//!
+//! Why the two-checkpoint pair matters: with one checkpoint, the sync that tag 77 runs before
+//! pricing brings every history to the same ledger (loss 70M, recovery 0), so equal payouts
+//! there prove nothing about the counters. With two checkpoints the second one books the refill
+//! as RECOVERY, and after that same sync the ledgers still differ: loss X + X2 = 120M / recovery
+//! R = 50M against loss 70M / recovery 0. A pricing rule that read the gross loss (the #382
+//! shape) would price those two pots 50M apart. The counter-rewrite probe goes further: it
+//! rewrites loss / recovery on one ledger before redemption (net impairment moved both ways)
+//! and requires identical payouts, which fails for ANY pricing that reads either counter.
 //!
 //! Harness copied from tests/nonbound_nav_floor.rs (same fixtures for physical consumption and
 //! refill). Test only: no source change.
@@ -743,6 +755,12 @@ enum History {
     CheckpointedAfterRefill,
     /// The same deposit lands only after the second loss: the ledger sees one net observation.
     Delayed,
+    /// Two deposits of d: one right after the first loss, one after the refill. The second
+    /// checkpoint books the refill as recovery, so the gross counters still differ from
+    /// `DelayedTwice` after the pre-pricing sync.
+    TwoCheckpoints,
+    /// The same two deposits, both after the second loss (one net observation, then a no-op).
+    DelayedTwice,
     /// No depositor action at all between seed and redemption.
     None,
 }
@@ -777,13 +795,44 @@ fn has_code(e: &str, code: u32) -> bool {
     e.contains(&format!("Custom({code})"))
 }
 
-/// Ledger counters as stored right before redemption. These are farm-facing and are asserted to
-/// DIFFER between histories (proof each checkpoint happened); pricing never reads them.
+/// Ledger counters of the lossy pot right before redemption. `loss` / `recovery` / `watermark`
+/// are as stored; `synced_*` are what `sync_backing_domain_ledger` (run by tag 77 before it
+/// prices) turns them into against the current bucket. Farm-facing; pricing never reads them.
 #[derive(Clone, Copy, Debug)]
 struct Counters {
     loss: u128,
     recovery: u128,
     watermark: u128,
+    synced_loss: u128,
+    synced_recovery: u128,
+    synced_watermark: u128,
+    principal: u128,
+}
+
+/// Rewrite the stored loss / recovery counters of `ledger` (watermark and principal untouched,
+/// so the next sync books nothing new on top). Used by the counter-rewrite probe.
+fn rewrite_counters(env: &mut Env, ledger: Pubkey, loss: u128, recovery: u128) {
+    let mut acct = env.svm.get_account(&ledger).expect("ledger");
+    let mut l = state::read_backing_domain_ledger(&acct.data).expect("decode");
+    l.cumulative_loss_atoms = loss;
+    l.cumulative_recovery_atoms = recovery;
+    state::write_backing_domain_ledger(&mut acct.data, &l).expect("encode");
+    env.svm.set_account(ledger, acct).unwrap();
+}
+
+/// The test's copy of `sync_backing_domain_ledger`'s counter step: the move in unavailable
+/// principal since the watermark is booked as loss (up) or recovery (down).
+fn sync_counters(
+    l: &state::BackingDomainLedgerAccountV16,
+    b: &percolator::BackingBucketV16,
+) -> (u128, u128, u128) {
+    let unavailable = (b.consumed_liened_backing_num + b.impaired_liened_backing_num) / BOUND_SCALE;
+    let w = l.last_observed_unavailable_principal_atoms;
+    if unavailable >= w {
+        (l.cumulative_loss_atoms + (unavailable - w), l.cumulative_recovery_atoms, unavailable)
+    } else {
+        (l.cumulative_loss_atoms, l.cumulative_recovery_atoms + (w - unavailable), unavailable)
+    }
 }
 
 /// Exit NAV of the non-bound vault computed from the public pricing functions the program uses
@@ -833,6 +882,11 @@ fn price_e9(nav: u128, supply: u128) -> u128 {
 }
 
 fn run_history(h: History, d: u128) -> (Observed, Counters) {
+    run_history_with(h, d, None)
+}
+
+/// `rewrite`: if set, the lossy pot's stored (loss, recovery) are overwritten just before pricing.
+fn run_history_with(h: History, d: u128, rewrite: Option<(u128, u128)>) -> (Observed, Counters) {
     let mut env = setup();
     let a = vault(&mut env);
     deposit(&mut env, &a, P, DOMAIN);
@@ -840,31 +894,45 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     let b = new_actor(&mut env, &a);
 
     // B's deposit into the lossy pot. It must really checkpoint the pot ledger: tag 75 syncs it
-    // (booking the unavailable principal seen so far as loss; no earlier sync happened, so the
-    // watermark was 0) and re-baselines the watermark to the bucket AFTER the receivable paydown.
-    let checkpoint = |env: &mut Env, booked: u128| {
+    // (booking the move in unavailable principal since the watermark as loss or recovery) and
+    // re-baselines the watermark to the bucket AFTER the receivable paydown.
+    let unavailable_now = |env: &Env| {
+        let pb = market_group(env).source_backing_buckets[DOMAIN as usize];
+        (pb.consumed_liened_backing_num + pb.impaired_liened_backing_num) / BOUND_SCALE
+    };
+    let checkpoint = |env: &mut Env, loss: u128, recovery: u128| {
+        let before = unavailable_now(env);
         try_deposit(env, &b, d, DOMAIN).expect("checkpoint deposit");
         let l = ledger_of(&env.svm, a.ledger);
-        let pb = market_group(env).source_backing_buckets[DOMAIN as usize];
-        let unavailable =
-            (pb.consumed_liened_backing_num + pb.impaired_liened_backing_num) / BOUND_SCALE;
-        assert_eq!(l.cumulative_loss_atoms, booked, "{h:?}: checkpoint booked the loss");
-        assert_eq!(l.cumulative_recovery_atoms, 0, "{h:?}: no recovery booked");
+        let unavailable = unavailable_now(env);
+        assert_eq!(l.cumulative_loss_atoms, loss, "{h:?}: checkpoint booked the loss");
+        assert_eq!(l.cumulative_recovery_atoms, recovery, "{h:?}: checkpoint booked the recovery");
         assert_eq!(l.last_observed_unavailable_principal_atoms, unavailable, "{h:?}: re-baselined");
-        assert_eq!(unavailable, booked - d, "{h:?}: the deposit paid the receivable down by d");
+        assert_eq!(unavailable, before - d, "{h:?}: the deposit paid the receivable down by d");
     };
 
     consume_pot_backing(&mut env, DOMAIN, X); // loss 1 (claimed)
-    if h == History::Checkpointed {
-        checkpoint(&mut env, X);
+    if matches!(h, History::Checkpointed | History::TwoCheckpoints) {
+        checkpoint(&mut env, X, 0);
     }
     recover_pot_backing(&mut env, DOMAIN, R); // loser payment refills the pot
     if h == History::CheckpointedAfterRefill {
-        checkpoint(&mut env, X - R);
+        checkpoint(&mut env, X - R, 0);
+    }
+    if h == History::TwoCheckpoints {
+        // The watermark sat at X - d; the refill moved unavailable to X - d - R: booked as recovery.
+        checkpoint(&mut env, X, R);
     }
     consume_pot_backing(&mut env, DOMAIN, X2); // consumed again
-    if h == History::Delayed {
-        checkpoint(&mut env, X - R + X2);
+    if matches!(h, History::Delayed | History::DelayedTwice) {
+        checkpoint(&mut env, X - R + X2, 0);
+    }
+    if h == History::DelayedTwice {
+        // Nothing moved since the first deposit's re-baseline: this sync books nothing.
+        checkpoint(&mut env, X - R + X2, 0);
+    }
+    if let Some((loss, recovery)) = rewrite {
+        rewrite_counters(&mut env, a.ledger, loss, recovery);
     }
 
     let nav = exit_nav(&env, &a);
@@ -875,10 +943,15 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     let g = market_group(&env);
     let pb = &g.source_backing_buckets[DOMAIN as usize];
     let l = ledger_of(&env.svm, a.ledger);
+    let (synced_loss, synced_recovery, synced_watermark) = sync_counters(&l, pb);
     let counters = Counters {
         loss: l.cumulative_loss_atoms,
         recovery: l.cumulative_recovery_atoms,
         watermark: l.last_observed_unavailable_principal_atoms,
+        synced_loss,
+        synced_recovery,
+        synced_watermark,
+        principal: l.total_principal_atoms,
     };
     let pot_principal = l.total_principal_atoms;
     let sib_principal = ledger_of(&env.svm, a.sibling_ledger).total_principal_atoms;
@@ -892,6 +965,14 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     request(&mut env, &a, a_shares);
     execute(&mut env, &a, DOMAIN).expect("A's redemption");
     let a_payout = token_amount(&env.svm, a.dest) as u128 - a_before;
+    // Tag 77 synced the lossy pot's ledger before pricing and wrote it back: its counters are
+    // exactly the `synced_*` values above (the redemption itself books no loss or recovery).
+    let l_after_a = ledger_of(&env.svm, a.ledger);
+    assert_eq!(
+        (l_after_a.cumulative_loss_atoms, l_after_a.cumulative_recovery_atoms),
+        (synced_loss, synced_recovery),
+        "{h:?}: the counters tag 77 priced against"
+    );
 
     let (nav_after_a, supply_after_a) = (exit_nav(&env, &a), registry_shares(&env, &a));
     let price_e9_after_a = price_e9(nav_after_a, supply_after_a);
@@ -939,7 +1020,11 @@ fn run_history(h: History, d: u128) -> (Observed, Counters) {
     // This token identity is bookkeeping (tokens only move by SPL transfer); the checks that the
     // program could get wrong follow it: pro-rata payouts, engine vault counter, residual == NAV
     // of the shares still outstanding.
-    let b_in = if h == History::None { 0 } else { d };
+    let b_in = match h {
+        History::None => 0,
+        History::TwoCheckpoints | History::DelayedTwice => 2 * d,
+        _ => d,
+    };
     assert_eq!(
         START_BAL - token_amount(&env.svm, a.source) as u128,
         2 * P,
@@ -1004,11 +1089,16 @@ fn assert_history_independent(d: u128) {
     assert_eq!(cp.price_e9_after_a, dl.price_e9_after_a, "share price after A's exit");
     assert_eq!(cp.vault_token_end, dl.vault_token_end, "vault residual");
     assert_eq!(cp, dl);
-    // The exit NAV is exactly the physical value the pots hold for the vault (E3), not the
-    // counter-derived `principal - (loss - recovery)`.
+    // The exit NAV is the physical value the pots hold for the vault (E3).
     assert_eq!(cp.exit_nav, 2 * P + d + R - X - X2);
-    // The stored counters are stale snapshots (the next sync brings each to the same net
-    // loss - recovery); pricing does not read them (`lp_vault_domain_nav_atoms` passes 0, 0).
+    // Limit of this comparison: the stored counters above are stale snapshots. The sync tag 77
+    // runs before pricing brings all three to the SAME ledger (loss X - R + X2, recovery 0), and
+    // there `principal - (loss - recovery)` equals the E3 value too, so these three histories
+    // cannot tell E3 pricing from counter pricing. `assert_counters_not_read` and the rewrite
+    // probe below are the checks that can.
+    for c in [cp_c, dl_c, cr_c] {
+        assert_eq!((c.synced_loss, c.synced_recovery), (X - R + X2, 0), "synced counters");
+    }
     eprintln!(
         "#382 d={d}: counters checkpointed={cp_c:?} after_refill={cr_c:?} delayed={dl_c:?}"
     );
@@ -1022,6 +1112,78 @@ fn floor382_checkpointed_vs_delayed_one_atom_deposit() {
 #[test]
 fn floor382_checkpointed_vs_delayed_one_token_deposit() {
     assert_history_independent(1_000_000);
+}
+
+/// Lossy-pot value under the #382 shape: `principal - loss` on the SYNCED gross loss.
+fn gross_counter_value(c: &Counters) -> u128 {
+    c.principal.saturating_sub(c.synced_loss)
+}
+
+/// Lossy-pot value under a net-counter rule: `principal - (loss - recovery)`, synced.
+fn net_counter_value(c: &Counters) -> u128 {
+    c.principal.saturating_sub(c.synced_loss.saturating_sub(c.synced_recovery))
+}
+
+/// Two checkpoints (after loss 1 and after the refill) against the same two deposits made after
+/// loss 2. Same principal (P + 2d), same physical backing, same shares; but after the sync tag 77
+/// runs before pricing, the lossy pot's ledgers still differ (loss 120M / recovery 50M against
+/// loss 70M / recovery 0). The program's payouts must be identical anyway, and must be the E3
+/// value (the ±1 bounds in `run_history`), which the gross-loss reading misses by R here.
+fn assert_counters_not_read(d: u128) {
+    let (two, two_c) = run_history(History::TwoCheckpoints, d);
+    let (dl2, dl2_c) = run_history(History::DelayedTwice, d);
+    // The ledger state tag 77 prices against really differs between the two histories.
+    assert_eq!((two_c.synced_loss, two_c.synced_recovery), (X + X2, R), "two checkpoints, synced");
+    assert_eq!((dl2_c.synced_loss, dl2_c.synced_recovery), (X - R + X2, 0), "delayed twice, synced");
+    assert_eq!(two_c.synced_watermark, dl2_c.synced_watermark, "same bucket");
+    assert_eq!((two_c.principal, dl2_c.principal), (P + 2 * d, P + 2 * d), "same principal");
+    // The gross-loss reading prices the two lossy pots R apart (and below their physical value).
+    assert_eq!(gross_counter_value(&dl2_c) - gross_counter_value(&two_c), R);
+    assert_eq!(two.exit_nav, 2 * P + 2 * d + R - X - X2, "E3: physical value");
+    assert_eq!(
+        two.exit_nav - (gross_counter_value(&two_c) + two.sib_principal),
+        R,
+        "a gross-loss price would undervalue the two-checkpoint vault by R"
+    );
+    // ...and yet everything a holder can observe is identical.
+    assert_eq!(two.exit_nav, dl2.exit_nav, "exit NAV reads the counters");
+    assert_eq!(two.price_e9, dl2.price_e9, "share price reads the counters");
+    assert_eq!(two.a_payout, dl2.a_payout, "A's payout reads the counters");
+    assert_eq!(two.b_payout, dl2.b_payout, "B's payout reads the counters");
+    assert_eq!(two, dl2);
+    eprintln!("#382 d={d}: counters two_checkpoints={two_c:?} delayed_twice={dl2_c:?}");
+}
+
+#[test]
+fn floor382_two_checkpoints_vs_delayed_twice_one_atom_deposit() {
+    assert_counters_not_read(1);
+}
+
+#[test]
+fn floor382_two_checkpoints_vs_delayed_twice_one_token_deposit() {
+    assert_counters_not_read(1_000_000);
+}
+
+/// Counter-rewrite probe: the same history, with the lossy pot's loss / recovery overwritten just
+/// before redemption (watermark and principal untouched, so the sync adds nothing). Net
+/// impairment goes from 70M to 120M (a counter price would underpay by 50M) and to 20M
+/// (overpay by 50M). Payouts must not move. Fails for any pricing that reads either counter,
+/// net or gross.
+#[test]
+fn floor382_payouts_ignore_rewritten_counters() {
+    let d = 1_000_000;
+    let (base, base_c) = run_history(History::DelayedTwice, d);
+    assert_eq!(net_counter_value(&base_c) + base.sib_principal, base.exit_nav, "baseline");
+    for (loss, recovery) in [(X + X2, 0), (X + X2, 2 * R)] {
+        let (probe, probe_c) = run_history_with(History::DelayedTwice, d, Some((loss, recovery)));
+        assert_eq!((probe_c.synced_loss, probe_c.synced_recovery), (loss, recovery), "rewritten");
+        assert_eq!(
+            (net_counter_value(&probe_c) + probe.sib_principal).abs_diff(base.exit_nav),
+            R,
+            "a counter price would move by R"
+        );
+        assert_eq!(probe, base, "payouts moved when only loss/recovery were rewritten ({loss}, {recovery})");
+    }
 }
 
 /// The minimal (1-atom) checkpoint against NO depositor action at all: the incumbent's payout
