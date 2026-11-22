@@ -44640,11 +44640,6 @@ pub mod processor {
     const TOKEN_2022_PROGRAM_ID: Pubkey =
         solana_program::pubkey!("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb");
 
-    /// Read (mint, owner, amount, initialized) from an SPL OR Token-2022 token
-    /// account's base layout (identical first 165 bytes; Token-2022 extensions
-    /// follow). The classic-only `unpack_token_account` (requires owner ==
-    /// spl_token::ID) cannot read a Token-2022 NFT ATA, so E2 uses this for the
-    /// NFT-holder token account.
     /// Token-2022 `AccountType::Account`, the byte at offset `Account::LEN` of an
     /// extended token account.
     const TOKEN_2022_ACCOUNT_TYPE_ACCOUNT: u8 = 2;
@@ -44667,6 +44662,14 @@ pub mod processor {
             && data[base] == TOKEN_2022_ACCOUNT_TYPE_ACCOUNT
     }
 
+    /// Read (mint, owner, amount, initialized) from an SPL OR Token-2022 token
+    /// account's base layout (identical first 165 bytes; Token-2022 extensions
+    /// follow). The classic-only `unpack_token_account` (requires owner ==
+    /// spl_token::ID) cannot read a Token-2022 NFT ATA, so E2 uses this for the
+    /// NFT-holder token account.
+    /// The layout check accepts any 165-byte account regardless of state; the
+    /// `initialized` flag returned here (byte 108 == 1) is enforced downstream by
+    /// `nft_holder_auth_decision`.
     fn read_nft_holder_token_account(
         ai: &AccountInfo,
     ) -> Result<([u8; 32], [u8; 32], u64, bool), ProgramError> {
