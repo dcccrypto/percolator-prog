@@ -658,6 +658,9 @@ a deploy candidate.
 # Requires platform-tools v1.52 or newer; review any stack-frame diagnostics
 # before treating this artifact as deployable.
 cargo build-sbf --tools-version v1.52
+# The release profile in Cargo.toml turns overflow checks on for every crate, the
+# engine included (an overflow aborts the transaction); the comment there says why
+# this fork does not follow upstream in leaving the engine unchecked.
 
 # Legacy local compatibility build without the Anchor v2 entrypoint.
 cargo build-sbf --no-default-features
