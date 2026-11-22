@@ -30229,9 +30229,11 @@ fn v16_bpf_hybrid_split_catchup_omitted_refresh_rejects_partial_price() {
 // while the matured mark the crank would actually feed has moved.
 fn row762_matured_hybrid_params() -> V16CuMarketParams {
     // Same zero-funding envelope as row461 (so only the price leg can make the guard reject), but
-    // an accrual window wide enough that the slot-10 crank catches the idle asset up in one step.
+    // an accrual window wide enough that the slot-10 crank catches the 8-slot idle gap up in one
+    // step (the engine requires min_funding_lifetime_slots >= max_accrual_dt_slots).
     V16CuMarketParams {
-        max_accrual_dt_slots: 100,
+        max_accrual_dt_slots: 10,
+        min_funding_lifetime_slots: 10,
         ..row461_omitted_hybrid_catchup_params()
     }
 }
