@@ -24,12 +24,20 @@ fn funded_env() -> V16CuEnv {
 
 /// Injects a pending domain loss barrier on asset 0's long (domain 0) or short (domain 1) side.
 fn market_with_barrier(env: &mut V16CuEnv, short_side: bool) {
-    use percolator_prog::constants::{ASSET_ORACLE_WRAPPER_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
+    use percolator_prog::constants::{
+        ASSET_ORACLE_WRAPPER_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF,
+    };
     let engine = MARKET_GROUP_OFF + MARKET_GROUP_LEN + ASSET_ORACLE_WRAPPER_LEN;
     let field = if short_side {
-        core::mem::offset_of!(percolator::EngineAssetSlotV16Account, pending_domain_loss_barrier_short)
+        core::mem::offset_of!(
+            percolator::EngineAssetSlotV16Account,
+            pending_domain_loss_barrier_short
+        )
     } else {
-        core::mem::offset_of!(percolator::EngineAssetSlotV16Account, pending_domain_loss_barrier_long)
+        core::mem::offset_of!(
+            percolator::EngineAssetSlotV16Account,
+            pending_domain_loss_barrier_long
+        )
     };
     let mut account = env.svm.get_account(&env.market).unwrap();
     account.data[engine + field..engine + field + 8].copy_from_slice(&1u64.to_le_bytes());
