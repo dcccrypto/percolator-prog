@@ -29977,6 +29977,7 @@ fn v16_bpf_swap_secondary_for_primary_rejects_non_authority_signer() {
     assert_eq!(custom_code(&err), Some(PercolatorError::Unauthorized as u32), "{err}");
     assert_eq!(swap_balances(&env, &a), before);
     assert_eq!(env.svm.get_account(&env.market).unwrap().data, market_before);
+}
 
 /// Asset 1 is activated with a third-party insurer, which funds its insurance with tag 56.
 /// `arm` decides when the creator tries to switch on the deposits-only ceiling (tag 92):
