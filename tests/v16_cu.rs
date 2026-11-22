@@ -30218,3 +30218,155 @@ fn v16_bpf_hybrid_split_catchup_omitted_refresh_rejects_partial_price() {
         Err(other) => panic!("unexpected error from hint-less victim crank: {other}"),
     }
 }
+
+// Issue #762 follow-up: the soft-stale-MATURED Hybrid arm of the omitted-observation guard. Once
+// Hybrid has matured into the mark fallback, the crank feeds `mark_ewma_e6` (the oracle read is
+// stale or absent) and a trade moves that mark through `update_hybrid_mark_after_trade_view`
+// without touching `raw_oracle_target_price`. The guard must therefore keep measuring a matured
+// Hybrid omission against the mark, the same split `stored_mark_target_for_zero_move_accrual_view`
+// makes. Measuring it against the lagging raw target would see target == effective == current,
+// pass with zero funding, and let a hint-less crank refresh the exposed victim at the old price
+// while the matured mark the crank would actually feed has moved.
+fn row762_matured_hybrid_params() -> V16CuMarketParams {
+    // Same zero-funding envelope as row461 (so only the price leg can make the guard reject), but
+    // an accrual window wide enough that the slot-10 crank catches the idle asset up in one step.
+    V16CuMarketParams {
+        max_accrual_dt_slots: 100,
+        ..row461_omitted_hybrid_catchup_params()
+    }
+}
+
+#[test]
+fn v16_bpf_hybrid_matured_omitted_refresh_rejects_trade_moved_mark() {
+    let mut env = V16CuEnv::new_with_init_params(row762_matured_hybrid_params());
+    let feed = row461_single_pyth_feed();
+    let mut feeds = [[0u8; 32]; 3];
+    feeds[0] = feed;
+
+    // Configure at slot 1 with a 3-slot soft-stale threshold, then prime a fresh mark at slot 2.
+    set_test_clock(&mut env, 1, 100);
+    let initial = env.set_pyth_price(&feed, ROW461_PRICE_E6 as i64, -6, 100);
+    env.try_configure_hybrid_with_cu(1, 0, feeds, std::slice::from_ref(&initial), 1, 100, 0, 0, 3)
+        .expect("configure single-leg hybrid oracle");
+    set_test_clock(&mut env, 2, 101);
+    let fresh = env.set_pyth_price(&feed, ROW461_PRICE_E6 as i64, -6, 101);
+    let keeper_owner = Keypair::new();
+    let keeper = env.create_portfolio(&keeper_owner);
+    env.crank_with_oracle_tail(
+        keeper,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: 2,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 1,
+            }],
+        },
+        std::slice::from_ref(&fresh),
+    );
+
+    // Exposed victim long vs maker short at the opening mark, while the oracle is still fresh.
+    let victim_owner = Keypair::new();
+    let maker_owner = Keypair::new();
+    let victim = env.create_portfolio(&victim_owner);
+    let maker = env.create_portfolio(&maker_owner);
+    env.deposit(&victim_owner, victim, 10_000_000);
+    env.deposit(&maker_owner, maker, 10_000_000);
+    env.try_trade_asset_with_cu(
+        0,
+        &victim_owner,
+        victim,
+        &maker_owner,
+        maker,
+        POS_SCALE as i128,
+        ROW461_PRICE_E6,
+        0,
+    )
+    .expect("open victim long vs maker short at the opening mark");
+
+    // Slot 10: no newer report (same publish time), so last_good_oracle_slot stays at 2 and the
+    // Hybrid profile is soft-stale-matured (10 - 2 >= 3). A hinted crank with the unchanged report
+    // catches the asset up to slot 10 at the unchanged price.
+    let matured_slot = 10;
+    set_test_clock(&mut env, matured_slot, 101);
+    env.crank_with_oracle_tail(
+        keeper,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: matured_slot,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 1,
+            }],
+        },
+        std::slice::from_ref(&fresh),
+    );
+
+    // A matured (after-hours) trade above the index moves the fallback EWMA mark, leaving the
+    // effective price and the committed raw target where they were.
+    let buyer_owner = Keypair::new();
+    let seller_owner = Keypair::new();
+    let buyer = env.create_portfolio(&buyer_owner);
+    let seller = env.create_portfolio(&seller_owner);
+    env.deposit(&buyer_owner, buyer, 10_000_000);
+    env.deposit(&seller_owner, seller, 10_000_000);
+    env.try_trade_asset_with_cu(
+        0,
+        &buyer_owner,
+        buyer,
+        &seller_owner,
+        seller,
+        POS_SCALE as i128,
+        ROW461_PRICE_E6 * 150 / 100,
+        0,
+    )
+    .expect("matured after-hours trade above the index");
+
+    let (cfg_before, group_before) = env.market_state();
+    let current = group_before.assets[0].effective_price;
+    assert_eq!(cfg_before.last_good_oracle_slot, 2, "no newer report may land");
+    assert_eq!(current, ROW461_PRICE_E6, "after-hours trade must not move the index");
+    assert_eq!(
+        group_before.assets[0].raw_oracle_target_price, current,
+        "the committed raw target lags the matured mark (it equals the unchanged index)"
+    );
+    assert!(
+        cfg_before.mark_ewma_e6 > current,
+        "the matured trade must move the fallback mark above the index: mark={} index={current}",
+        cfg_before.mark_ewma_e6
+    );
+
+    // Slot 11: a hint-less crank on the exposed victim. The crank would feed the matured mark, so
+    // the omission is pending price progress and must reject with exact rollback.
+    let attack_slot = matured_slot + 1;
+    set_test_clock(&mut env, attack_slot, 101);
+    let before = env.svm.get_account(&env.market);
+    let victim_before = env.svm.get_account(&victim);
+    let result = env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: attack_slot,
+            observations: Vec::new(),
+        },
+        vec![
+            AccountMeta::new(env.payer.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(victim, false),
+        ],
+        &[],
+    );
+    match result {
+        Err(error) if custom_code(&error) == Some(PercolatorError::EngineNonProgress as u32) => {
+            assert_eq!(env.svm.get_account(&env.market), before, "market must roll back exactly");
+            assert_eq!(env.svm.get_account(&victim), victim_before, "victim must roll back exactly");
+        }
+        Ok(_) => {
+            let (_, group_after) = env.market_state();
+            panic!(
+                "matured-Hybrid omission was ACCEPTED: the guard measured against the lagging \
+                 raw_oracle_target_price instead of the matured mark ({}); asset advanced to slot {} \
+                 at price {}",
+                cfg_before.mark_ewma_e6, group_after.assets[0].slot_last,
+                group_after.assets[0].effective_price,
+            );
+        }
+        Err(other) => panic!("unexpected error from hint-less victim crank: {other}"),
+    }
+}

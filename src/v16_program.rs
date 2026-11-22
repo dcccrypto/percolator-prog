@@ -14940,7 +14940,15 @@ pub mod processor {
         //   lags a freshly-pushed mark. Keep measuring these against `mark_ewma_e6`; swapping them
         //   to `raw_oracle_target_price` would blind the multi-leg gate to a just-pushed mark move
         //   on an un-observed leg.
-        let target = if oracle_v16::profile_is_hybrid(&profile) {
+        //
+        // - HYBRID once soft-stale-MATURED: the crank falls back to `mark_ewma_e6` (stale or absent
+        //   report), and an after-hours trade moves that mark via `update_hybrid_mark_after_trade_view`
+        //   without touching `raw_oracle_target_price`. Measure it against the mark, the same split
+        //   `stored_mark_target_for_zero_move_accrual_view` makes; the raw target would lag the mark
+        //   and let a hint-less crank refresh an exposed account at the old price.
+        let target = if oracle_v16::profile_is_hybrid(&profile)
+            && !oracle_v16::profile_hybrid_soft_stale_matured(&profile, now_slot)
+        {
             let stored = asset.raw_oracle_target_price.get();
             if stored == 0 {
                 asset.effective_price.get()
