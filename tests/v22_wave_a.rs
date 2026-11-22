@@ -808,3 +808,41 @@ fn init_market_refuses_a_public_b_chunk_below_the_floor() {
         assert_eq!(g.config.public_b_chunk_atoms, 1_000_000_000_000);
     }
 }
+
+/// Upstream sync (aeyakovenko/percolator-prog a3baf51, engine aeyakovenko/percolator d9798d6a,
+/// 2026-11-21): InitMarket also refuses `public_b_chunk_atoms` ABOVE `MAX_VAULT_TVL`. From
+/// 340_282_366_920_938_463 atoms on, `(chunk + 1) * SOCIAL_LOSS_DEN` overflows u128, so every
+/// B-settlement step of an account with a loss weight fails with ArithmeticOverflow and a market
+/// created with such a chunk freezes every position on a side after one social loss. No chunk
+/// can usefully exceed the largest vault. CONTROL: `MAX_VAULT_TVL` itself is accepted.
+#[test]
+fn init_market_refuses_a_public_b_chunk_above_the_largest_vault() {
+    let max = percolator::MAX_VAULT_TVL;
+    let with_chunk = |ix: ProgInstruction, chunk: u128| -> ProgInstruction {
+        let set = |m: &mut ProgInstruction| {
+            if let ProgInstruction::InitMarket { public_b_chunk_atoms, .. } = m {
+                *public_b_chunk_atoms = chunk;
+            }
+        };
+        match ix {
+            ProgInstruction::InitMarketV19 { mut market, growth_r_gap_bps, growth_l_launch_x100 } => {
+                set(&mut market);
+                ProgInstruction::InitMarketV19 { market, growth_r_gap_bps, growth_l_launch_x100 }
+            }
+            mut m => {
+                set(&mut m);
+                m
+            }
+        }
+    };
+    let mut env = V16CuEnv::new();
+    for (label, ix) in [("legacy", base_init(LOT_PRICE_FLOOR_E6)), ("growth", growth_init(LOT_PRICE_FLOOR_E6, None))] {
+        for bad in [max + 1, 340_282_366_920_938_463u128, u128::MAX] {
+            let r = init_on_fresh(&mut env, with_chunk(ix.clone(), bad));
+            assert_eq!(code(&r), Some(14), "{label}: chunk {bad} must be refused: {r:?}");
+        }
+        init_on_fresh(&mut env, with_chunk(ix.clone(), max)).unwrap_or_else(|e| panic!("{label}: MAX_VAULT_TVL accepted: {e}"));
+        let (_, g) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
+        assert_eq!(g.config.public_b_chunk_atoms, max);
+    }
+}
