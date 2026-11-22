@@ -45,6 +45,15 @@ fn release_profile_does_not_uncheck_dependencies() {
         .map(str::trim)
         .filter(|l| !l.starts_with('#') && l.starts_with("[profile.release.package"))
         .collect();
+    // The same override can be written as a key inside `[profile.release]`.
+    let release = manifest.split("[profile.release]").nth(1).unwrap_or("");
+    let section = &release[..release.find("\n[").unwrap_or(release.len())];
+    let inline: Vec<&str> = section
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("package"))
+        .collect();
+    let overrides: Vec<&str> = overrides.into_iter().chain(inline).collect();
 
     assert!(
         overrides.is_empty(),

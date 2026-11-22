@@ -103,8 +103,9 @@ unexpected_cfgs = { level = "warn", check-cfg = [
 # Overflow checks are on for ALL crates: an overflow in the program OR the engine aborts
 # the transaction instead of wrapping. Upstream (aeyakovenko cd8a446a) instead adds
 # `[profile.release.package."*"] overflow-checks = false`, because with its engine checked
-# its 14-leg INV-073 atomic exit exceeds the 1.4M CU limit. This fork caps a portfolio at 4
-# legs and has deliberately kept the engine checked; do not add that override without a
-# security sign-off. tests/build_profile.rs guards both points.
+# its 14-leg INV-073 atomic exit exceeds the 1.4M CU limit. This fork has shipped with the
+# engine checked since #425 (measured then: compute up ~2.6% on average, every CU guardrail
+# kept wide headroom). Do not add that override without a security sign-off.
+# tests/build_profile.rs guards both points.
 [profile.release]
 overflow-checks = true
