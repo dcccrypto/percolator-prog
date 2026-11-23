@@ -46,11 +46,13 @@ pub const V22_LEG_REM_EXTRA: usize = 32;
 ///
 /// DERIVED from the engine struct, not a literal: everything from `kf_drift_long` to the end of
 /// the slot was appended after the deployed layout (#277 drift tail 160 B, #282 R1 equity-cadence
-/// words 32 B, S10 provider-principal mirror 32 B). A later appended field grows it automatically;
-/// the assertion below names what the tail is made of today and fails loudly when that changes.
+/// words 32 B, S10 provider-principal mirror 32 B, engine #317 cpbind `standing_counterparty_id`
+/// 32 B). A later appended field grows it automatically; the assertion below names what the tail
+/// is made of today and fails loudly when that changes. A zero cpbind word = no binding, which is
+/// what a slab bound before #317 carries (tag 126 writes it).
 pub const FUNDING_SCALE_TAIL: usize = core::mem::size_of::<EngineAssetSlotV16Account>()
     - core::mem::offset_of!(EngineAssetSlotV16Account, kf_drift_long);
-const _: () = assert!(FUNDING_SCALE_TAIL == 160 + 32 + 32);
+const _: () = assert!(FUNDING_SCALE_TAIL == 160 + 32 + 32 + 32);
 
 fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let new_header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();

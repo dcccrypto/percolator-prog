@@ -56,7 +56,17 @@ fn main() {
 
     let bypass = std::env::var(BYPASS_ENV).map(|v| v == "1").unwrap_or(false);
 
-    match verify(&engine, &refs) {
+    let manifest = manifest_dir.join("Cargo.toml");
+    println!("cargo:rerun-if-changed={}", manifest.display());
+    let result = match engine_git_revs(&manifest) {
+        // cpbind (2026-11-13): the engine may be a `git = ..., rev = ...` dependency. Cargo.lock
+        // content-pins that commit, so the sibling checkout is not what gets compiled; what is
+        // checked instead is that every `percolator = { git ... }` line carries ENGINE_CI_SIBLING.
+        Ok(Some(revs)) => verify_git_rev(&revs, &refs),
+        Ok(None) => verify(&engine, &refs),
+        Err(e) => Err(e),
+    };
+    match result {
         Ok(head) => {
             // Visible only with -vv; the success path stays quiet.
             eprintln!("percolator-prog: engine sibling verified at {head} ({PIN_KEY})");
@@ -84,6 +94,60 @@ fn main() {
             std::process::exit(1);
         }
     }
+}
+
+/// The `rev` of every `percolator = { git = ... }` dependency line in Cargo.toml, or `None` when
+/// the engine is a path dependency. A git line without a full 40-hex `rev` is an error.
+fn engine_git_revs(manifest: &Path) -> Result<Option<Vec<String>>, String> {
+    let text = std::fs::read_to_string(manifest)
+        .map_err(|e| format!("cannot read {}: {e}", manifest.display()))?;
+    let mut revs = Vec::new();
+    let mut in_patch = false;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_patch = line.starts_with("[patch");
+        }
+        // Only the inline form is parsed; any other way of naming the engine fails closed.
+        if line.contains("dependencies.percolator]") || (in_patch && line.starts_with("percolator")) {
+            return Err(format!("unsupported engine dependency form in Cargo.toml: {line}"));
+        }
+        if !line.starts_with("percolator =") || !line.contains("git =") {
+            continue;
+        }
+        let rev = line
+            .split("rev =")
+            .nth(1)
+            .and_then(|r| r.trim().strip_prefix('"'))
+            .and_then(|r| r.split('"').next())
+            .ok_or_else(|| format!("engine git dependency without a rev: {line}"))?;
+        if rev.len() != 40 || !rev.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(format!("engine git rev must be a full 40-hex commit id, got '{rev}'"));
+        }
+        revs.push(rev.to_ascii_lowercase());
+    }
+    Ok(if revs.is_empty() { None } else { Some(revs) })
+}
+
+fn verify_git_rev(revs: &[String], refs: &Path) -> Result<String, String> {
+    let pin = read_pin(refs)?;
+    // A `.cargo/config` `paths` override would compile a local engine instead of the rev.
+    let root = refs.parent().and_then(|p| p.parent()).unwrap_or(refs);
+    for cfg in [".cargo/config", ".cargo/config.toml"] {
+        if let Ok(t) = std::fs::read_to_string(root.join(cfg)) {
+            if t.lines().any(|l| l.trim_start().starts_with("paths")) {
+                return Err(format!("{cfg} sets `paths`, which overrides the engine git rev"));
+            }
+        }
+    }
+    for rev in revs {
+        if *rev != pin {
+            return Err(format!(
+                "{PIN_KEY} is {pin} but Cargo.toml pins the engine at git rev {rev}"
+            ));
+        }
+    }
+    Ok(pin)
 }
 
 fn verify(engine: &Path, refs: &Path) -> Result<String, String> {

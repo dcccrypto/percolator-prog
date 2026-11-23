@@ -67,7 +67,10 @@ num-traits = "0.2"
 # v17 engine (zero-copy only, fork-facade enabled for re-expressed fork
 # features: A-1/A-4/A-6/A-9/A-10 + lp_vault module). runtime-vec-api DROPPED
 # per v17 convergence Standing Decision 1.
-percolator = { path = "../percolator", features = ["fork-facade"] }
+# cpbind (2026-11-13): pinned by git rev to dcccrypto/percolator#317 (stacked on #314, not merged
+# yet) instead of `path = "../percolator"`. Cargo.lock content-pins the commit; build.rs checks the
+# rev equals ENGINE_CI_SIBLING. Both lines below must carry the same rev.
+percolator = { git = "https://github.com/dcccrypto/percolator", rev = "57085cd0827f694ca2366bdfefc71fbd7ff54791", features = ["fork-facade"] }
 anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e3cf760826fa0a60f247635ea0572e59861ec9b5", package = "anchor-lang-v2", default-features = false, features = ["alloc", "guardrails"], optional = true }
 
 [target.'cfg(not(target_os = "solana"))'.dependencies]
@@ -76,7 +79,7 @@ anchor-lang-v2 = { git = "https://github.com/solana-foundation/anchor", rev = "e
 # audit-scan: enables validate_dynamic_market_slot_shape_at in the engine for
 # host-only test builds so that validate_unconfigured_market_tail exercises
 # the full tail-corruption check. Excluded from SBF target (no cfg(solana)).
-percolator = { path = "../percolator", features = ["fork-facade", "audit-scan"] }
+percolator = { git = "https://github.com/dcccrypto/percolator", rev = "57085cd0827f694ca2366bdfefc71fbd7ff54791", features = ["fork-facade", "audit-scan"] }
 
 [dev-dependencies]
 bincode = "1"
