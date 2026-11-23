@@ -329,8 +329,8 @@ fn flag_sets(legs: usize) -> &'static [u8] {
 /// The composition against the reference for one, two and three legs, every
 /// multiply/divide pattern, with and without inversion, and unit scales of 1, 7 and
 /// 1,000,000: equal where the reference has a price, refused where it has none.
-/// Same 40,000 leg sets as upstream, through the public profile reader (ours has no
-/// public `compose_price_e6`).
+/// 40,000 leg sets, as upstream (not the same sets: `leg_e12` has an extra sub-tick
+/// branch), through the public profile reader (ours has no public `compose_price_e6`).
 #[test]
 fn v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_twelve_decimal_legs() {
     let mut rng = Rng(0x4620);
@@ -377,10 +377,11 @@ fn v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_twelve_decimal
         priced > 100_000 && refused > 100_000 && three_multiplied > 2_000 && sub_tick_leg > 4_000
     );
 
-    // A leg outside the admissible range is refused as before. Upstream also refuses
-    // 0.000000999999 (one below an e6 tick); ours admits it (the divergence below).
+    // A leg outside the admissible range is refused as before. 0.000000999999 (one below
+    // an e6 tick) is refused in both of upstream's shapes too, but here for a different
+    // reason: ours admits the leg and the final price floors to 0 (the divergence below).
     let max_e12 = (MAX_E6 as i64 + 1) * E12_PER_E6 as i64;
-    for bad in [0i64, max_e12] {
+    for bad in [0i64, E12_PER_E6 as i64 - 1, max_e12] {
         assert_eq!(
             compose_through_profile(&[(bad, -12)], 0, 0, 1),
             Err(PercolatorError::OracleInvalid.into())
