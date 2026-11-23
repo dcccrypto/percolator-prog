@@ -17345,6 +17345,13 @@ pub mod processor {
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
             || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
+            // Upstream engine d9798d6a (toly prog a3baf51, 2026-11-21): a chunk is a number of
+            // collateral atoms, so none usefully exceeds the largest vault. The bound also keeps
+            // `(chunk + 1) * SOCIAL_LOSS_DEN` inside u128: from 340_282_366_920_938_463 atoms on,
+            // every B-settlement step of an account with a loss weight fails with
+            // ArithmeticOverflow, freezing every position on a side after one social loss.
+            // Mirrored here because our fork engine (ENGINE_CI_SIBLING) does not carry d9798d6a yet.
+            || public_b_chunk_atoms > percolator::MAX_VAULT_TVL
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
