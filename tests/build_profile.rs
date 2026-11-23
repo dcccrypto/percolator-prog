@@ -32,6 +32,37 @@ fn release_profile_declares_overflow_checks() {
     );
 }
 
+/// Upstream commit cd8a446a turns overflow checks off for every
+/// dependency (`[profile.release.package."*"] overflow-checks = false`), so the engine's
+/// plain arithmetic wraps in its deployed build. This fork keeps the engine checked. A
+/// per-package override of any kind would silently undo that for the engine, so this
+/// test fails if the manifest declares one; an upstream sync cannot drop it in unnoticed.
+#[test]
+fn release_profile_does_not_uncheck_dependencies() {
+    let manifest = include_str!("../Cargo.toml");
+    let overrides: Vec<&str> = manifest
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with('#') && l.starts_with("[profile.release.package"))
+        .collect();
+    // The same override can be written as a key inside `[profile.release]`.
+    let release = manifest.split("[profile.release]").nth(1).unwrap_or("");
+    let section = &release[..release.find("\n[").unwrap_or(release.len())];
+    let inline: Vec<&str> = section
+        .lines()
+        .map(str::trim)
+        .filter(|l| l.starts_with("package"))
+        .collect();
+    let overrides: Vec<&str> = overrides.into_iter().chain(inline).collect();
+
+    assert!(
+        overrides.is_empty(),
+        "Cargo.toml declares per-package release overrides {overrides:?}. This fork builds \
+         the engine with overflow checks on; turning them off for dependencies (upstream \
+         cd8a446a) needs a security sign-off, not a sync."
+    );
+}
+
 /// Integer overflow must trap rather than wrap in the profile the program ships
 /// with. Without `overflow-checks = true` in this crate's `[profile.release]`,
 /// a wrapping add silently produces a wrong value instead of aborting.

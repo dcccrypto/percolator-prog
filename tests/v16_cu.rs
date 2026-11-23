@@ -41,6 +41,9 @@ mod inv_031_live_exit_loss_stale_gate;
 #[path = "invariants/cu/inv_031_provider_exit_principal.rs"]
 mod inv_031_provider_exit_principal;
 
+#[path = "invariants/cu/inv_045_staged_target_cap_anchor.rs"]
+mod inv_045_staged_target_cap_anchor;
+
 #[path = "invariants/cu/inv_031_provider_protection_floor.rs"]
 mod inv_031_provider_protection_floor;
 

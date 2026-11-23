@@ -686,6 +686,16 @@ cargo kani --tests --features devnet -Z stubbing -Z function-contracts
 (cd kani/growth && cargo kani -Z stubbing -Z function-contracts)   # also kani/contlev, kani/p3, kani/p3-engine
 ```
 
+**Release profile: the engine stays overflow-checked.** Cargo applies only the root
+manifest's profiles, so `[profile.release] overflow-checks = true` in `Cargo.toml` reaches
+every crate in a build rooted here, the engine included (#425): an overflow in the program
+or the engine aborts the transaction instead of wrapping. Upstream (commit `cd8a446a`)
+instead adds `[profile.release.package."*"] overflow-checks = false`, because with its
+engine checked its 14-leg INV-073 atomic exit exceeds the 1.4M CU limit. This fork has
+shipped with the engine checked since #425 (measured then: compute up about 2.6% on
+average, every CU guardrail kept wide headroom). Do not add that override without a
+security sign-off. `tests/build_profile.rs` guards both points.
+
 ---
 
 ## Devnet Deployments
