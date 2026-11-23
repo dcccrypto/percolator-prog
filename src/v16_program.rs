@@ -48707,9 +48707,9 @@ pub mod processor {
             return Ok(base);
         }
         let now_slot = authenticated_market_slot_or_fallback_view(group);
-        if oracle_v16::profile_is_hybrid(profile)
-            && !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
-        {
+        // ADOPT upstream aac89b9e (INV-046): a print that cannot move the mark (an unmatured
+        // Hybrid, or any asset in Recovery) pays no mark-externality fee.
+        if !trade_updates_mark_view(profile, group, asset_index, now_slot) {
             return Ok(base);
         }
         if asset_index >= group.header.config.max_market_slots.get() as usize
@@ -49514,6 +49514,27 @@ pub mod processor {
                 && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot))
     }
 
+    /// ADOPT upstream aac89b9e ("ignore a trade print on a Recovery asset", INV-046): a trade
+    /// print discovers the mark only for a trade-driven profile on an asset whose mark can still
+    /// move. Shutdown freezes a Recovery asset's mark, so there the print is ignored, as for an
+    /// authenticated mark: no mark-externality fee and no EWMA move. Our fork has no trade-driven
+    /// target push, so upstream's revert (`EngineLockActive`) cannot occur here; the port keeps
+    /// the frozen-mark semantics and drops the mark fee on a Recovery reduction.
+    fn trade_updates_mark_view(
+        profile: &state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+    ) -> bool {
+        profile_updates_mark_from_trade_view(profile, now_slot)
+            && group.markets.get(asset_index).is_some_and(|market| {
+                matches!(
+                    market.engine.asset.lifecycle,
+                    ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+                )
+            })
+    }
+
     fn liquidation_penalty_reclaimable_from_profile_view(
         profile: &state::AssetOracleProfileV16,
         now_slot: u64,
@@ -50249,9 +50270,10 @@ pub mod processor {
         fee_paid: u128,
     ) -> Result<(), ProgramError> {
         let now_slot = authenticated_market_slot_or_fallback_view(group);
-        let ewma_updates_from_trade = oracle_v16::profile_is_ewma_mark(profile)
-            || (oracle_v16::profile_is_hybrid(profile)
-                && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot));
+        // ADOPT upstream aac89b9e (INV-046): shutdown freezes a Recovery asset's mark, so a
+        // trade print there leaves the average (and its funding checkpoint) unchanged.
+        let ewma_updates_from_trade =
+            trade_updates_mark_view(profile, group, asset_index, now_slot);
         if !ewma_updates_from_trade
             || asset_index >= group.header.config.max_market_slots.get() as usize
         {
