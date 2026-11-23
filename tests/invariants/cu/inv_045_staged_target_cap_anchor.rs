@@ -51,8 +51,8 @@ fn short_value(env: &V16CuEnv, portfolio: Pubkey) -> i128 {
     let account = env.portfolio_state(portfolio);
     let leg = active_leg_for_asset(&account, 0);
     let unsettled = leg.basis_pos_q.abs() * (asset.k_short - leg.k_snap);
-    account.capital.get() as i128
-        + account.pnl.get()
+    account.capital as i128
+        + account.pnl
         + unsettled / (POS_SCALE as i128 * ADL_ONE as i128)
 }
 
