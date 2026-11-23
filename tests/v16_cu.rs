@@ -30265,12 +30265,19 @@ fn v16_bpf_low_mark_same_slot_recrank_keeps_the_carry() {
 
 /// INV-045 for the path branch: after a long walk on the carry path the engine's cap anchor
 /// (`fund_px_last`) is still the price the walk started at. A reversed target must restart it
-/// at the mark, so one slot moves the mark by at most the cap of the mark, whether the new
-/// target is staged by a later-slot crank or by a second crank in the same slot (dt = 0).
+/// at the mark, so the mark then moves by the cap of the mark and no more. Three ways the new
+/// target can be staged: by the next slot's crank, by a second crank in the same slot (dt = 0),
+/// and by a crank after a gap long enough that the single segment could move the price.
 #[test]
 fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
     const START: u64 = 90;
-    for same_slot_staging in [false, true] {
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Staging {
+        NextSlot,
+        SameSlot,
+        AfterGap,
+    }
+    for staging in [Staging::NextSlot, Staging::SameSlot, Staging::AfterGap] {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             initial_price: START,
             max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
@@ -30309,7 +30316,7 @@ fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
 
         // Reverse the target. A kept anchor of 90 would allow 0.9 atoms a slot (one atom by
         // the second slot); the cap of the mark is 0.36 (one atom only by the third).
-        if same_slot_staging {
+        if staging == Staging::SameSlot {
             env.svm.expire_blockhash();
             env.push_auth_mark_with_cu(60, 1_000);
             // The asset is already at slot 60: this crank only stages the new target.
@@ -30319,23 +30326,32 @@ fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
             assert_eq!(staged.effective_price, mark);
             assert_eq!(staged.fund_px_last, mark, "staging a new target restarts the anchor");
         }
-        for n in 1..=3u64 {
+        // Slots since the walk's last slot at which the mark is checked. After the gap the
+        // single segment could move 3 atoms (36 * 100 * 10 / 10_000); the changed target still
+        // goes through the path accrual because the anchor is off the mark.
+        let checks: [u64; 3] = if staging == Staging::AfterGap {
+            [10, 11, 12]
+        } else {
+            [1, 2, 3]
+        };
+        for (i, n) in checks.into_iter().enumerate() {
             let slot = 60 + n;
-            if n == 1 && !same_slot_staging {
+            if i == 0 && staging != Staging::SameSlot {
                 env.svm.warp_to_slot(slot);
                 env.push_auth_mark_with_cu(slot, 1_000);
             }
             low_pin_crank(&mut env, long_account, slot);
             let asset = env.market_state().1.assets[0];
+            assert_eq!(asset.slot_last, slot, "{staging:?}");
             assert_eq!(
                 asset.fund_px_last, mark,
-                "same_slot_staging={same_slot_staging}: the reversal restarts the anchor at the mark"
+                "{staging:?}: the reversal restarts the anchor at the mark"
             );
             assert_eq!(
                 asset.effective_price - mark,
                 cap_of_mark(n),
-                "same_slot_staging={same_slot_staging}: {n} slot(s) after the reversal the mark \
-                 has moved by the cap of the mark at the reversal, no more"
+                "{staging:?}: {n} slot(s) after the reversal the mark has moved by the cap of \
+                 the mark at the reversal, no more"
             );
         }
     }

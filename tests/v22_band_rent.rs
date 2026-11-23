@@ -2327,7 +2327,7 @@ fn v22_band_markets_are_growth_markets_so_wave_a_floor_binds() {
 fn v22_band_floor_keeps_exits_open() {
     // d = 50 bps: the width floor sits at 3,200 ticks, where the 4 bps/slot cap still moves
     // >= 1 tick per slot (at d = 100 the floor, 1,600, is below the cap's own 2,500-tick
-    // dead zone and nothing would move at all).
+    // dead zone, where a segment moves under one tick and the mark only creeps on the carry).
     const D: u64 = 50;
     let mut env = Env::new(Cfg { slots: 1, phase4: Some(phase4(D as u16, RENT_MAX)), r_gap: 0 });
     env.auth_mark();

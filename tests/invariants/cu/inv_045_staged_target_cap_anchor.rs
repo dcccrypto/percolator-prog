@@ -23,9 +23,10 @@
 //! sync cannot bring in a stale-anchor route unnoticed.
 //!
 //! One crank route does read the anchor since #793: a mark whose single-segment step floors to
-//! 0 atoms is priced by the path accrual (`crank_accrue_asset_view`). That route never stages a
-//! target through the setter while the asset has open interest. A changed target goes through
-//! the path accrual itself (also for a same-slot crank), which restarts the anchor at the mark.
+//! 0 atoms is priced by the path accrual (`crank_accrue_asset_view`). A path walk leaves the
+//! anchor at the walk's start, so while the anchor is off the mark a changed target is never
+//! staged through the setter: it goes through the path accrual itself (also for a same-slot
+//! crank, and after a long gap), which restarts the anchor at the mark.
 //! `v16_bpf_low_mark_reversal_restarts_the_cap_anchor` in `tests/v16_cu.rs` is this guard for it.
 //!
 //! Changes from upstream, because this harness runs the SBF program in a debug-mode runner:

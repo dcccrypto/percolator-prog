@@ -49332,7 +49332,8 @@ pub mod processor {
     /// builds it: the canonical one-slot path (`canonical_accrual_path_for_target_view`), where
     /// each step may move `floor((anchor * cap + carry) / 10_000)` and the sub-atom carry is
     /// kept in the oracle profile across cranks. One path call commits at most
-    /// `V16_MAX_ACCRUAL_PATH_STEPS` slots.
+    /// `V16_MAX_ACCRUAL_PATH_STEPS` slots. The same route stages a changed target while a path
+    /// walk has left the engine's cap anchor away from the mark (see `anchor_off_mark` below).
     ///
     /// Every other case keeps the single-segment accrual: it already moves the price there (or
     /// the price is at its target, or the asset has no open interest and the cap does not bind).
@@ -49372,7 +49373,18 @@ pub mod processor {
         );
         // The segment is stuck below one atom: take the carry path. (A zero cap means the
         // price is held on purpose, and with no open interest the segment goes to the target.)
-        let path = if exposed && cap_bps != 0 && target != current && segment_price == current {
+        // A second crank in the same slot (dt = 0) is stuck too, on purpose: its empty path
+        // keeps the carry, where the single-segment branch would drop it.
+        let stuck = exposed && cap_bps != 0 && segment_price == current;
+        // A path walk leaves the engine's cap anchor (`fund_px_last`) at the price the walk
+        // started from. The single-segment branch stages a changed target through the engine
+        // setter, which keeps that anchor (INV-045); if the band then held the price in place,
+        // a later path step would run from the stale anchor. So while the anchor is off the
+        // mark a changed target is also staged by the path accrual, which restarts the anchor
+        // at the mark. Off the path the anchor always equals the mark and this is never taken.
+        let anchor_off_mark = asset.fund_px_last.get() != current
+            && asset.raw_oracle_target_price.get() != target;
+        let path = if target != current && (stuck || anchor_off_mark) {
             Some(canonical_accrual_path_for_target_view(
                 profile,
                 group,
