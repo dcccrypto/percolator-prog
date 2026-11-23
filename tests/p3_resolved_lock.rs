@@ -4684,7 +4684,10 @@ fn p3_diluted_receipts_without_post_101_topup_stay_reserved() {
     let r = w.wind_down();
     std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
     let moved = w.legacy_orphan_moved.expect("vacuity: the wind-down reached the resolve step");
-    assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
+    // #698 (upstream 18f3ae94): the eedb ops price along the canonical path (linear from the stable
+    // anchor, funding per step), so d1's netted support is 4,972 (was 4,875 with one clamped step
+    // per crank). The constant only identifies the legacy state; the assertions below are unchanged.
+    assert!(moved == 0 || moved == 4_972, "legacy #175 fixture: unexpected d1 backing {moved}");
     let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0) as u128;
     let haircut = *w.stats.soft.get("close_resolved_haircut_atoms").unwrap_or(&0);
     eprintln!("{label} (no sweep): {:?} open receipt owed {owed} haircut {haircut} residual {}", r.as_ref().err().map(|e| e.chars().take(160).collect::<String>()), w.claim_free_residual());
@@ -4714,7 +4717,8 @@ fn p3_legacy_orphan_injected_while_live_is_repaired_by_the_refresh_crank() {
         w.check().expect("invariants");
     }
     let moved = inject_legacy_175_orphan(&mut w);
-    assert_eq!(moved, 4_875, "vacuity: the orphan was injected (d1 had 4,875 of fresh backing)");
+    // #698: 4,972 under the canonical path (was 4,875), see `p3_diluted_receipts_without_post_101_topup_stay_reserved`.
+    assert_eq!(moved, 4_972, "vacuity: the orphan was injected (d1 had 4,972 of fresh backing)");
     let r = w.wind_down();
     std::env::remove_var("ANVIL_NO_KEEPER_TOPUP");
     let owed = *w.stats.soft.get("open_receipt_owed_atoms").unwrap_or(&0);
@@ -4875,7 +4879,10 @@ fn escrow_winner_run(mode: EscrowMode) -> (Result<(), String>, u128, u128, u128,
     let r = w.wind_down();
     if mode == EscrowMode::SweepOnceThenIdle {
         let moved = w.legacy_orphan_moved.expect("vacuity: the wind-down reached the resolve step");
-        assert!(moved == 0 || moved == 4_875, "legacy #175 fixture: unexpected d1 backing {moved}");
+        // #698 (upstream 18f3ae94): the eedb ops price along the canonical path (linear from the stable
+    // anchor, funding per step), so d1's netted support is 4,972 (was 4,875 with one clamped step
+    // per crank). The constant only identifies the legacy state; the assertions below are unchanged.
+    assert!(moved == 0 || moved == 4_972, "legacy #175 fixture: unexpected d1 backing {moved}");
     }
     let holder_got = w.holdings_of(&holder);
     let owner_got = w.holdings_of(&original_owner).saturating_sub(owner_before);

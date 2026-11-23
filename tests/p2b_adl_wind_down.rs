@@ -275,10 +275,12 @@ impl Fork {
         self.send(ix)
     }
 
-    /// Repeat tag 104 until it stops making price-catch-up-only progress (the single accrual
-    /// segment is capped at max_accrual_dt_slots, exactly as the crank is).
+    /// Repeat tag 104 until it stops making price-catch-up-only progress (the accrual path is
+    /// capped at min(max_accrual_dt_slots, V16_MAX_ACCRUAL_PATH_STEPS = 32), exactly as the
+    /// crank is). #698: a 9,000-slot episode gap is ~282 calls at 32 slots each, so the bound
+    /// is CATCHUP_CALLS, not 64.
     fn wind_down_settled(&mut self, k: &Pubkey) -> Result<(), TransactionError> {
-        for _ in 0..64 {
+        for _ in 0..CATCHUP_CALLS {
             let before = self.leg(k);
             let slot_last_before = self.group().assets[0].slot_last;
             self.wind_down(k)?;
@@ -392,6 +394,12 @@ impl Fork {
     }
 }
 
+/// #698 (upstream 18f3ae94): one crank / tag-104 refresh accrues at most
+/// V16_MAX_ACCRUAL_PATH_STEPS (32) slots, so catching up the 9,000-slot default episode bound
+/// takes ~282 calls (it used to be bounded by max_accrual_dt_slots per call). The loops stop as
+/// soon as no progress is made, so this is only an upper bound.
+const CATCHUP_CALLS: usize = 1_024;
+
 fn custom(r: &Result<(), TransactionError>) -> Option<u32> {
     match r {
         Err(TransactionError::InstructionError(_, InstructionError::Custom(c))) => Some(*c),
@@ -453,7 +461,7 @@ fn p2b_tag104_arms_then_waits_for_the_episode_bound() {
         .encode(),
     };
     // Drain the price catch-up through the ordinary crank so the binding check answers.
-    for _ in 0..64 {
+    for _ in 0..CATCHUP_CALLS {
         let s = f.group().assets[0].slot_last;
         let _ = f.crank(&target);
         if f.group().assets[0].slot_last == s {
@@ -679,7 +687,7 @@ fn p2b_tag104_refuses_a_lagging_or_stale_mark() {
     f.push_same_mark();
     // Catch the asset fully up to the clock first (bounded segments), re-pushing so the mark
     // stays fresh, so the next push lands with dt = 0 and the effective price cannot move.
-    for _ in 0..256 {
+    for _ in 0..CATCHUP_CALLS {
         if f.group().assets[0].slot_last >= f.clock.slot {
             break;
         }
