@@ -16112,7 +16112,9 @@ pub mod processor {
     ///   victims per AUD-S1-23, the vault LP / taker invalidated.
     /// Every OTHER instruction is swept: whatever handler or helper moved a writable portfolio's
     /// position vector (an engine Refresh clearing a side-reset leg, a liquidation, a wind-down,
-    /// a resolved close, ...), it did so outside that portfolio's matcher.
+    /// a resolved close, ...), it did so outside that portfolio's matcher. One account is left
+    /// out: PermissionlessCrank's matched-liquidation counterparty (the bound vault LP), which the
+    /// crank handler treats like the band forced closes do (`crank_vault_lp_counterparty_key`).
     pub(crate) fn instruction_manages_own_position_policy(ix: &Instruction) -> bool {
         match ix {
             Instruction::TradeNoCpi { .. }
@@ -16145,11 +16147,15 @@ pub mod processor {
         if instruction_manages_own_position_policy(ix) {
             return out;
         }
+        let crank_counterparty = crank_vault_lp_counterparty_key(program_id, accounts, ix);
         for (i, ai) in accounts.iter().enumerate() {
             if ai.owner != program_id || !ai.is_writable {
                 continue;
             }
             if accounts[..i].iter().any(|prev| prev.key == ai.key) {
+                continue;
+            }
+            if crank_counterparty.as_ref() == Some(ai.key) {
                 continue;
             }
             let Ok(data) = ai.try_borrow_data() else {
@@ -16164,6 +16170,32 @@ pub mod processor {
             out.push((i, epoch, vector));
         }
         out
+    }
+
+    /// The PermissionlessCrank's matched-liquidation counterparty, if this instruction carries one:
+    /// the market's bound vault-LP portfolio as the LAST account, other than the cranked portfolio
+    /// itself (the same rule as `split_vault_lp_counterparty`). The crank handler applies the
+    /// band-forced-close policy to it (matcher capability invalidated, `position_epoch` NOT
+    /// advanced), so the sweep leaves it alone instead of advancing its epoch anyway, which would
+    /// refuse every trade signed against the vault LP before an unrelated liquidation. Any read
+    /// failure returns `None`, and the account is then swept exactly as before.
+    fn crank_vault_lp_counterparty_key(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo<'_>],
+        ix: &Instruction,
+    ) -> Option<Pubkey> {
+        if !matches!(ix, Instruction::PermissionlessCrank { .. }) || accounts.len() < 4 {
+            return None;
+        }
+        let (market_ai, portfolio_ai, last) = (&accounts[1], &accounts[2], accounts.last()?);
+        if market_ai.owner != program_id || last.owner != program_id || last.key == portfolio_ai.key {
+            return None;
+        }
+        let mut market_data = market_ai.try_borrow_mut_data().ok()?;
+        let (_cfg, group) = state::market_view_mut(&mut market_data).ok()?;
+        let asset = market_bound_vault_asset(&group).ok()??;
+        let bound = read_asset_vault_lp_from_view(&group, asset).ok()?.vault_lp_portfolio;
+        (bound == last.key.to_bytes()).then_some(*last.key)
     }
 
     /// port135: after the instruction succeeded, every swept portfolio whose position vector

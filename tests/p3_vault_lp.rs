@@ -7415,6 +7415,61 @@ fn f2_world2() -> (Env, Lp, Vec<Trader>, Trader) {
     (env, lp, ts, h)
 }
 
+/// A matched liquidation (tag 5 with the bound vault LP appended) reshapes the vault LP outside
+/// any matcher. The crank handler applies the band-forced-close policy to it (matcher capability
+/// invalidated, `position_epoch` NOT advanced); the instruction-level port135 sweep must not then
+/// advance it anyway. Otherwise every trade a user signed against the vault LP's epoch before an
+/// unrelated liquidation is refused with `EngineStale`, on every liquidation in a cascade.
+#[test]
+fn f2_matched_liquidation_keeps_the_vault_lp_position_epoch() {
+    let (mut env, lp, t) = f2_world();
+    // A second user builds a TradeCpi against the vault LP before the liquidation lands.
+    let u = env.new_trader(5_000_000);
+    let (u_id, _, u_epoch) = env.identity(u.portfolio);
+    let (lp_id, lp_seq, lp_epoch0) = env.identity(lp.portfolio);
+    let lp_pos0 = env.position(lp.portfolio);
+    f2_liquidate(&mut env, &t, Some(lp.portfolio));
+    assert_ne!(env.position(lp.portfolio), lp_pos0, "fixture: the close was matched against the vault LP");
+    // The user's trade, built against the pre-liquidation epoch, still lands.
+    let (cfg, _) = env.market_state();
+    let market_id =
+        state::read_market_trade_preflight(&env.svm.get_account(&env.market).unwrap().data, 0).unwrap().3;
+    let kp = u.kp.insecure_clone();
+    env.svm.expire_blockhash();
+    env.send(
+        ProgInstruction::TradeCpi {
+            account_a_portfolio_id: u_id,
+            account_a_position_epoch: u_epoch,
+            account_b_portfolio_id: lp_id,
+            account_b_position_epoch: lp_epoch0,
+            market_id,
+            account_b_matcher_sequence: lp_seq,
+            asset_index: 0,
+            size_q: POS,
+            fee_bps: cfg.trade_fee_base_bps,
+            limit_price: 0,
+            backing_fee_cap_bps: 10_000,
+        },
+        vec![
+            AccountMeta::new(u.kp.pubkey(), true),
+            AccountMeta::new(env.market, false),
+            AccountMeta::new(u.portfolio, false),
+            AccountMeta::new(lp.portfolio, false),
+            AccountMeta::new_readonly(env.matcher, false),
+            AccountMeta::new(lp.ctx, false),
+            AccountMeta::new_readonly(lp.delegate, false),
+        ],
+        &[&kp],
+    )
+    .expect("a trade signed against the vault LP before the liquidation still lands");
+    let (_, _, lp_epoch1) = env.identity(lp.portfolio);
+    assert_eq!(
+        lp_epoch1, lp_epoch0,
+        "a matched liquidation must not advance the vault LP's position_epoch"
+    );
+    env.assert_conserved("matched liquidation keeps the LP epoch");
+}
+
 #[test]
 fn f2_regression_tag5_sequential_matched_liquidations_then_opens_both_ways() {
     let (mut env, lp, ts, h) = f2_world2();
