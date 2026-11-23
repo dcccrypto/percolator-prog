@@ -50478,6 +50478,10 @@ pub mod processor {
         Ok(())
     }
 
+    // Deliberately no freeze-authority check (here or in `unpack_mint`): collateral mints
+    // with a freeze authority (e.g. USDC) are allowed, not rejected or allowlisted. The
+    // issuer can freeze the vault or user token accounts and so stop deposits and
+    // withdrawals for that mint; Percolator can't prevent this. See README "Trust boundaries".
     fn verify_mint(mint_ai: &AccountInfo) -> Result<(), ProgramError> {
         if mint_ai.owner != &spl_token::ID {
             return Err(PercolatorError::InvalidMint.into());
