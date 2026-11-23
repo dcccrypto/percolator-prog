@@ -46135,11 +46135,11 @@ pub mod processor {
             gd.frozen_l_x100 = l_now;
             gd.frozen_n_q = n_now.to_le_bytes();
             solana_program::log::sol_log(&alloc::format!(
-                "lev_guard_trip kind={} px={} last={} ref={}",
+                "lev_guard_trip kind={} px={} last={} mark0={}",
                 if trip == lg::Trip::Breaker { "breaker" } else { "freeze" },
                 price,
                 before.last_px_e6,
-                before.ref_px_e6
+                before.marks_px_e6[0]
             ));
         }
         gd.set_price_band(&pb);
