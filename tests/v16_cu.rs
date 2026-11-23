@@ -29822,6 +29822,56 @@ fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
     );
 }
 
+/// AUTH_MARK twin of `v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder`.
+/// #710 ported upstream `reset_price_move_remainder_on_target_change_view` into
+/// `handle_push_ewma_mark` ONLY. `handle_push_auth_mark` runs the identical target-change
+/// sequence; AUTH_MARK is a fork-only price-managed mode that shares the bounded catch-up
+/// remainder, so a `PushAuthMark` that changes the target must drop the previous target's
+/// `price_move_remainder_bps_num` too, or the next catch-up starts from a stale sub-unit carry.
+/// RED on rc23 before the `handle_push_auth_mark` reset; GREEN with it.
+#[test]
+fn v16_bpf_push_auth_mark_target_change_resets_price_move_remainder() {
+    const INITIAL_PRICE: u64 = 9_000;
+    const STALE: u16 = 4_321;
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: INITIAL_PRICE,
+        max_price_move_bps_per_slot: 1,
+        max_accrual_dt_slots: 50,
+        max_abs_funding_e9_per_slot: 10_000,
+        min_funding_lifetime_slots: 50,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_auth_mark_with_cu(0, INITIAL_PRICE);
+    let read = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+    };
+    // Plant a stale remainder accrued toward the CURRENT target (raw target == initial price).
+    let mut account = env.svm.get_account(&env.market).unwrap();
+    let mut profile = read(&env);
+    profile.price_move_remainder_bps_num = STALE;
+    state::write_asset_oracle_profile(&mut account.data, 0, &profile).unwrap();
+    env.svm.set_account(env.market, account).unwrap();
+    assert_eq!(read(&env).price_move_remainder_bps_num, STALE, "setup");
+
+    // Same target as the engine's raw target: the remainder is the same accrual's carry. Kept.
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, INITIAL_PRICE);
+    assert_eq!(read(&env).price_move_remainder_bps_num, STALE);
+
+    // A different target: the remainder must not carry across.
+    env.svm.warp_to_slot(2);
+    env.svm.expire_blockhash();
+    env.push_auth_mark_with_cu(2, INITIAL_PRICE + 40);
+    assert_ne!(read(&env).oracle_target_price_e6, INITIAL_PRICE, "target must have changed");
+    assert_eq!(
+        read(&env).price_move_remainder_bps_num,
+        0,
+        "a target change must not carry the previous target's price-move remainder"
+    );
+}
+
 // ── SwapSecondaryForPrimary (tag 60-family) real-path BPF tests ──────────────
 //
 // `handle_swap_secondary_for_primary` (src/v16_program.rs) checks, in order:
