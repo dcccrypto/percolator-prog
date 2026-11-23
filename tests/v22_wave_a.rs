@@ -773,8 +773,9 @@ fn combined_tags_decode_to_distinct_variants() {
 /// Mainnet condition 1 (Wave A approval, 2026-10-06): InitMarket refuses `public_b_chunk_atoms`
 /// below `PUBLIC_B_CHUNK_ATOMS_MIN` (1e9 atoms) -- the chunk is a market-kill threshold (a bust
 /// whose residual exceeds it resolves the market; ledger/finding-bankrupt-chunk-wedge-
-/// 2026-10-06.md). Legacy and growth forms alike. CONTROL: the floor itself and the seed default
-/// 1e12 are accepted.
+/// 2026-10-06.md). Legacy and growth forms alike. Upstream ebcded5: also refused above
+/// `MAX_VAULT_TVL` (B-settlement overflow). CONTROL: the floor, `MAX_VAULT_TVL` and the seed
+/// default 1e12 are accepted.
 #[test]
 fn init_market_refuses_a_public_b_chunk_below_the_floor() {
     let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
@@ -803,6 +804,13 @@ fn init_market_refuses_a_public_b_chunk_below_the_floor() {
             assert_eq!(code(&r), Some(14), "{label}: chunk {bad} must be refused: {r:?}");
         }
         init_on_fresh(&mut env, with_chunk(ix.clone(), floor)).unwrap_or_else(|e| panic!("{label}: floor accepted: {e}"));
+        // Upstream ebcded5: the chunk is also bounded above by the largest vault.
+        for bad in [percolator::MAX_VAULT_TVL + 1, 340_282_366_920_938_463u128, u128::MAX] {
+            let r = init_on_fresh(&mut env, with_chunk(ix.clone(), bad));
+            assert_eq!(code(&r), Some(14), "{label}: chunk {bad} above MAX_VAULT_TVL must be refused: {r:?}");
+        }
+        init_on_fresh(&mut env, with_chunk(ix.clone(), percolator::MAX_VAULT_TVL))
+            .unwrap_or_else(|e| panic!("{label}: chunk == MAX_VAULT_TVL accepted: {e}"));
         init_on_fresh(&mut env, with_chunk(ix.clone(), 1_000_000_000_000)).unwrap_or_else(|e| panic!("{label}: seed default 1e12 accepted: {e}"));
         let (_, g) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
         assert_eq!(g.config.public_b_chunk_atoms, 1_000_000_000_000);
