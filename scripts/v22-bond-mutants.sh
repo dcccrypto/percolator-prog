@@ -6,7 +6,7 @@
 #   scripts/v22-bond-mutants.sh pure   # MP1..MP7 against tests/v22_bonds_pure.rs (native)
 #   scripts/v22-bond-mutants.sh bpf    # MB1..MB4: build a mutant BPF, run one LiteSVM test on it
 #   scripts/v22-bond-mutants.sh pure571  # GH#571 M571a..g against tests/v22_bond_carry_571_pure.rs
-#   scripts/v22-bond-mutants.sh bpf571   # GH#571 MB571a..h: mutant BPF vs the gh571_* / att649_* LiteSVM tests
+#   scripts/v22-bond-mutants.sh bpf571   # GH#571 MB571a..m: mutant BPF vs the gh571_* / att649_* LiteSVM tests
 #
 # Exit 0 iff EVERY mutant was killed. Logs: $MUT_LOG_DIR (default ../logs/mutants).
 set -uo pipefail
@@ -272,6 +272,35 @@ att649_f1b_round_trip_cannot_reset_the_one_year_cap
 '        let open = open_now && bond_interval_clean(&t, st);' \
 '        let open = open_now; let _ = bond_interval_clean(&t, st);' \
 gh571_no_accrual_while_drawn_or_impaired_and_settled_arrears_are_kept
+  # MB571i (#571 follow-up, #678): the Resolved 110 skips the catch-up to resolved_slot: the
+  # Live stretch since the last settlement is forfeited again.
+  run_bpf MB571i_110_no_resolve_catch_up $W \
+'                bond_settle_to_resolve(&mut t, &st, resolved_slot)?;' \
+'                let _ = resolved_slot;' \
+gh571_followup_tag19_resolve_settles_the_live_stretch
+  # MB571j (#571 follow-up, #678): 102 Resolved reserves the stored K only: the junior can
+  # sweep the stretch before any settlement runs.
+  run_bpf MB571j_102_reserves_stored_k_only $W \
+'                Some((_, t)) => bond_claim_at_resolve(&t, &st, state::market_resolved_slot(&market_ai.try_borrow_data()?)?)?,' \
+'                Some((_, t)) => t.claim_total()?,' \
+gh571_followup_102_first_reserves_it
+  # MB571k (#571 follow-up, #678): terminal 78 skips the catch-up to resolved_slot.
+  run_bpf MB571k_78_no_resolve_catch_up $W \
+'                bond_settle_to_resolve(&mut t, st, state::market_resolved_slot(&d)?)?;' \
+'                let _ = st;' \
+gh571_followup_terminal78_first_then_idempotent
+  # MB571l (#571 follow-up, #678): the catch-up ignores the F2 interval rule (a stretch that
+  # started with the gate closed accrues anyway).
+  run_bpf MB571l_catch_up_ignores_f2 $W \
+'            Some(end) if end > t.last_coupon_slot => bond_settle_coupon_to(t, st, end, t.c_b_atoms > 0, false),' \
+'            Some(end) if end > t.last_coupon_slot => { t.coupon_gate_seen = bond_gate_seen(st, true); bond_settle_coupon_to(t, st, end, t.c_b_atoms > 0, false) },' \
+gh571_followup_closed_at_last_settlement_forfeits
+  # MB571m (#571 follow-up, #678): the Recovery route is not treated as resolved (no catch-up
+  # once Recovery finalizes): the stretch to the finalize slot is forfeited.
+  run_bpf MB571m_recovery_route_not_resolved $W \
+'        Ok(Some(h.resolved_slot.get()))' \
+'        if h.recovery_reason.try_to_runtime().ok().flatten().is_some() { return Ok(None); } Ok(Some(h.resolved_slot.get()))' \
+gh571_followup_recovery_route_settles_to_the_finalize_slot
   ;;
 esac
 rm -rf "$BAK"
