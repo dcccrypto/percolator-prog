@@ -33161,7 +33161,7 @@ pub mod processor {
     ///
     /// AUDIT MIRROR: the backing decrement sequence mirrors handle_withdraw_backing_bucket.
     /// The RESYNC 5ebd136 dual-withdraw gate is preserved: source watermark is
-    /// checked post-decrement; EngineLockActive if credit_rate_num < CREDIT_RATE_SCALE.
+    /// checked post-decrement; EngineLockActive if available backing < positive_claim_bound.
     #[inline(never)]
     /// LP Vault — RebalanceLpVaultBacking (tag 91).
     ///
@@ -33407,7 +33407,7 @@ pub mod processor {
             }
             source.credit_rate_num =
                 expected_source_credit_rate_num(source).map_err(map_v16_error)?;
-            if source.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source).map_err(map_v16_error)? {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             source.credit_epoch = source
@@ -34388,7 +34388,7 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
             source_after.credit_rate_num =
                 expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-            if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
                 return Err(PercolatorError::EarnExitWouldUnderBackClaims.into());
             }
             source = source_after;
@@ -36068,7 +36068,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source_after.credit_epoch = source_after
@@ -42431,7 +42431,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= backing_num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source = source_after;
@@ -44353,6 +44353,15 @@ pub mod processor {
             .checked_sub(state.valid_liened_backing_num)
             .and_then(|v| v.checked_add(state.insurance_credit_reserved_num - insurance_encumbered))
             .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    /// Provider exit gate for the backing-withdraw paths (port of upstream 596b3d98, #250):
+    /// the unliened backing left behind must cover the whole claim bound, lien-covered face
+    /// included. On the pinned engine's rate this is exactly "the rate stays full". Once the
+    /// rate becomes lien-aware it is full as soon as total backing covers the claims, so the
+    /// gate states its watermark directly instead of going through the rate.
+    fn source_backing_covers_claim_bound(state: SourceCreditStateV16) -> Result<bool, V16Error> {
+        Ok(source_credit_available_backing_num(state)? >= state.positive_claim_bound_num)
     }
 
     fn expected_source_credit_rate_num(state: SourceCreditStateV16) -> Result<u128, V16Error> {
@@ -50922,6 +50931,68 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        fn gate_state(bound: u128, fresh: u128, lien: u128) -> SourceCreditStateV16 {
+            SourceCreditStateV16 {
+                positive_claim_bound_num: bound,
+                exact_positive_claim_num: bound,
+                fresh_reserved_backing_num: fresh,
+                valid_liened_backing_num: lien,
+                ..SourceCreditStateV16::EMPTY
+            }
+        }
+
+        /// Port of upstream 596b3d98 (#250): the provider withdraw gate keeps the
+        /// `available >= positive_claim_bound` watermark beside a lien. Upstream's numbers:
+        /// 300 of backing, 200 of claims, 75 liened. 25 may leave, 26 may not; the other 75
+        /// only after the lien is released.
+        #[test]
+        fn withdraw_gate_watermark_beside_a_lien() {
+            let after = |fresh: u128, lien: u128, x: u128| {
+                source_backing_covers_claim_bound(gate_state(200, fresh - x, lien)).unwrap()
+            };
+            assert!(after(300, 75, 25));
+            assert!(!after(300, 75, 26));
+            assert!(!after(300, 75, 100));
+            // Lien released: its 75 is unliened again.
+            assert!(after(275, 0, 75));
+            assert!(!after(275, 0, 76));
+            // No claims: any unliened backing may leave.
+            assert!(source_backing_covers_claim_bound(gate_state(0, 0, 0)).unwrap());
+        }
+
+        /// On the pinned engine's rate the new gate is exactly the old "rate stays full"
+        /// check, errors included, so the four withdraw handlers behave the same.
+        #[test]
+        fn withdraw_gate_matches_full_rate_on_pinned_formula() {
+            let vals = [0u128, 1, 2, 3, 74, 75, 76, 199, 200, 201, 225, 300, u64::MAX as u128];
+            let mut n = 0u32;
+            for &bound in &vals {
+                for &fresh in &vals {
+                    for &lien in &vals {
+                        for &(ins, ins_lien) in &[(0u128, 0u128), (50, 0), (50, 20), (10, 30)] {
+                            let mut s = gate_state(bound, fresh, lien);
+                            s.insurance_credit_reserved_num = ins;
+                            s.valid_liened_insurance_num = ins_lien;
+                            let rate = expected_source_credit_rate_num(s);
+                            let gate = source_backing_covers_claim_bound(s);
+                            match rate {
+                                Ok(r) => {
+                                    assert_eq!(
+                                        gate.unwrap(),
+                                        r == percolator::CREDIT_RATE_SCALE,
+                                        "{s:?}"
+                                    );
+                                    n += 1;
+                                }
+                                Err(_) => assert!(gate.is_err(), "{s:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(n > 1000);
+        }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
         /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
