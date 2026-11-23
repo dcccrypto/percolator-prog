@@ -21,6 +21,11 @@
 //!   through the public `read_pyth_price_e12` / `read_pyth_price_e6`, the arithmetic
 //!   tuples through the public `read_external_price_e6_profile`. The two limb-routine
 //!   bigint fuzzers have no counterpart to run against and are not ported.
+//! - Also not ported: `v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_
+//!   twelve_decimal_legs` and `v16_program_composite_price_of_six_decimal_legs_is_unchanged`.
+//!   Their references refuse a composite whose per-leg intermediate leaves
+//!   `1..=MAX_ORACLE_PRICE`; #711 dropped that intermediate gate here (only legs and the
+//!   final price are range-checked), so the references do not describe our code.
 //! - Reference values are computed in `u128` (`checked_mul`; an overflow is a value
 //!   far above `MAX_ORACLE_PRICE`), so no `num-bigint` dev-dependency is added.
 //!
@@ -347,7 +352,7 @@ fn v16_program_composite_target_does_not_move_on_the_rounding_of_a_low_priced_le
 /// Adapted bound: upstream also asserts `fine_cu >= coarse_cu`. Our Pyth reader
 /// scales by one `checked_mul(10^(exponent + 12))` for every exponent >= -12, so the
 /// finer report may cost the same or a few CU less (a smaller power of ten); the
-/// bound here is `|fine - coarse| <= 1,000`.
+/// bound here is only upstream's upper one, `fine <= coarse + 1,000`.
 #[test]
 fn v16_program_composite_from_finer_reports_costs_a_bounded_amount_more() {
     const VALUES_E6: [i64; 3] = [3_000_000, 150_000_000, 200_000_000];
@@ -395,7 +400,7 @@ fn v16_program_composite_from_finer_reports_costs_a_bounded_amount_more() {
     assert_eq!(fine_target, coarse_target);
     println!("three-leg composite crank: {coarse_cu} CU from exponent -6, {fine_cu} from -10");
     assert!(
-        fine_cu.abs_diff(coarse_cu) <= 1_000,
+        fine_cu <= coarse_cu + 1_000,
         "finer reports cost {fine_cu} against {coarse_cu}"
     );
 }
