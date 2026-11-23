@@ -90,7 +90,15 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
     let owners = [Keypair::new(), Keypair::new(), Keypair::new()];
     let long = funded_actor(&mut env, &owners[0], 1_000_000_000_000);
     let other = funded_actor(&mut env, &owners[1], 1_000_000_000_000);
-    env.trade_with_cu(&owners[0], long, &owners[1], other, POS_SCALE as i128, p0, 0);
+    env.trade_with_cu(
+        &owners[0],
+        long,
+        &owners[1],
+        other,
+        POS_SCALE as i128,
+        p0,
+        0,
+    );
     env.push_auth_mark_with_cu(0, far);
 
     let mut slot = 0u64;
@@ -128,9 +136,20 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
         (unlocked.raw_oracle_target_price, unlocked.effective_price),
         (mark, mark)
     );
-    assert_eq!(unlocked.fund_px_last, mark, "the anchor is the mark at the push");
+    assert_eq!(
+        unlocked.fund_px_last, mark,
+        "the anchor is the mark at the push"
+    );
     let short = funded_actor(&mut env, &owners[2], short_principal);
-    env.trade_with_cu(&owners[0], long, &owners[2], short, POS_SCALE as i128, mark, 0);
+    env.trade_with_cu(
+        &owners[0],
+        long,
+        &owners[2],
+        short,
+        POS_SCALE as i128,
+        mark,
+        0,
+    );
     assert_eq!(short_value(&env, short), short_principal as i128);
 
     slot += 1;
@@ -149,5 +168,8 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
     );
     // A kept start anchor would allow p0 * cap per slot, at least a quarter more than this.
     assert!(moved * 10_000 * 5 < p0 * cap_bps * 4);
-    assert_eq!(short_value(&env, short), short_principal as i128 - moved as i128);
+    assert_eq!(
+        short_value(&env, short),
+        short_principal as i128 - moved as i128
+    );
 }
