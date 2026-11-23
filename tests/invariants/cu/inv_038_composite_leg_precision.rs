@@ -21,13 +21,18 @@
 //!   through the public `read_pyth_price_e12` / `read_pyth_price_e6`, the arithmetic
 //!   tuples through the public `read_external_price_e6_profile`. The two limb-routine
 //!   bigint fuzzers have no counterpart to run against and are not ported.
-//! - Also not ported: `v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_
-//!   twelve_decimal_legs` and `v16_program_composite_price_of_six_decimal_legs_is_unchanged`.
-//!   Their references refuse a composite whose per-leg intermediate leaves
-//!   `1..=MAX_ORACLE_PRICE`; #711 dropped that intermediate gate here (only legs and the
-//!   final price are range-checked), so the references do not describe our code.
-//! - Reference values are computed in `u128` (`checked_mul`; an overflow is a value
-//!   far above `MAX_ORACLE_PRICE`), so no `num-bigint` dev-dependency is added.
+//! - `v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_twelve_decimal_legs`
+//!   is ported with two changes to its arbitrary-precision reference, both from #711:
+//!   no per-leg intermediate gate (only legs and the final price are range-checked
+//!   here), and legs admitted from 1 at twelve decimals (the sub-tick divergence
+//!   below). Legs enter as Pyth reports at exponent -12, which carry every E12 leg
+//!   exactly (the largest, just below 10^18, fits `i64`).
+//! - Not ported: `v16_program_composite_price_of_six_decimal_legs_is_unchanged`. Its
+//!   "as before" reference is the gated six-decimal composition #711 replaced; e6-aligned
+//!   legs are one of the leg shapes the ported property test draws.
+//! - The leg-reader reference is computed in `u128` (`checked_mul`; an overflow is a
+//!   value far above `MAX_ORACLE_PRICE`). The composite reference uses `num-bigint`
+//!   (dev-dependency only, already in Cargo.lock), independent of the U256 under test.
 //!
 //! Deliberate divergence (pinned below, see
 //! `v16_program_composite_admits_a_leg_below_one_e6_tick_divergence_from_upstream`):
@@ -37,6 +42,7 @@
 //! (`read_pyth_price_e6`) still refuses it, exactly as upstream does.
 
 use super::*;
+use num_bigint::BigUint;
 use percolator_prog::constants::ORACLE_MODE_HYBRID_AFTER_HOURS;
 use solana_program::{account_info::AccountInfo, program_error::ProgramError};
 
@@ -58,6 +64,27 @@ impl Rng {
 
     fn below(&mut self, n: u64) -> u64 {
         self.next() % n
+    }
+
+    /// Upstream's leg at twelve decimals, anywhere in the admissible range and beside
+    /// its edges, plus (ours only) legs below one e6 tick, which #711 admits.
+    fn leg_e12(&mut self) -> u64 {
+        let per_e6 = E12_PER_E6 as u64;
+        let max = (MAX_E6 + 1) * per_e6 - 1;
+        match self.below(11) {
+            0 => per_e6 + self.below(3),
+            1 => max - self.below(3),
+            2 => (1 + self.below(2_000)) * per_e6,
+            // a few significant digits, at any magnitude
+            3..=5 => {
+                let digits = 1 + self.below(9_999);
+                let scaled = digits * 10u64.pow(self.below(15) as u32);
+                scaled.clamp(per_e6, max)
+            }
+            // ours only: 0.000000000001 ..= 0.000000999999
+            10 => 1 + self.below(per_e6 - 1),
+            _ => per_e6 + self.next() % (max - per_e6 + 1),
+        }
     }
 }
 
@@ -251,6 +278,136 @@ fn v16_program_composite_of_a_low_priced_leg_follows_the_cross_rate() {
     );
 }
 
+/// What the composite must be, in arbitrary precision (upstream's `reference`): the legs
+/// at twelve decimals as exact fractions, multiplied or divided, inverted if
+/// configured, scaled to six decimals and floored once; then the unit scale. `None`
+/// where the program refuses: a final price outside `1..=MAX_ORACLE_PRICE`.
+/// Adapted to #711: upstream also refuses an intermediate outside that range; ours has
+/// no intermediate gate.
+fn reference(legs_e12: &[u64], flags: u8, invert: u8, unit_scale: u32) -> Option<u64> {
+    let one = BigUint::from(1_000_000_000_000u64);
+    let max = BigUint::from(MAX_E6);
+    let zero = BigUint::from(0u8);
+    // price at six decimals = numerator / denominator
+    let mut numerator = BigUint::from(legs_e12[0]);
+    let mut denominator = BigUint::from(E12_PER_E6 as u64);
+    for (index, leg) in legs_e12.iter().enumerate().skip(1) {
+        let divides = match index {
+            1 => flags & DIVIDE_LEG2 != 0,
+            _ => flags & DIVIDE_LEG3 != 0,
+        };
+        if divides {
+            numerator *= &one;
+            denominator *= BigUint::from(*leg);
+        } else {
+            numerator *= BigUint::from(*leg);
+            denominator *= &one;
+        }
+    }
+    let mut price = if invert != 0 {
+        (denominator * BigUint::from(1_000_000_000_000u64)) / numerator
+    } else {
+        numerator / denominator
+    };
+    if unit_scale > 1 {
+        price /= BigUint::from(unit_scale);
+    }
+    if price == zero || price > max {
+        return None;
+    }
+    u64::try_from(&price).ok()
+}
+
+fn flag_sets(legs: usize) -> &'static [u8] {
+    match legs {
+        1 => &[0],
+        2 => &[0, DIVIDE_LEG2],
+        _ => &[0, DIVIDE_LEG2, DIVIDE_LEG3, DIVIDE_LEG2 | DIVIDE_LEG3],
+    }
+}
+
+/// The composition against the reference for one, two and three legs, every
+/// multiply/divide pattern, with and without inversion, and unit scales of 1, 7 and
+/// 1,000,000: equal where the reference has a price, refused where it has none.
+/// Same 40,000 leg sets as upstream, through the public profile reader (ours has no
+/// public `compose_price_e6`).
+#[test]
+fn v16_program_composite_price_is_the_floor_of_the_exact_ratio_of_twelve_decimal_legs() {
+    let mut rng = Rng(0x4620);
+    let (mut priced, mut refused, mut three_multiplied, mut sub_tick_leg) =
+        (0u32, 0u32, 0u32, 0u32);
+    for _ in 0..40_000 {
+        let legs: Vec<u64> = (0..1 + rng.below(3)).map(|_| rng.leg_e12()).collect();
+        let reports: Vec<(i64, i32)> = legs.iter().map(|leg| (*leg as i64, -12)).collect();
+        let has_sub_tick = legs.iter().any(|leg| (*leg as u128) < E12_PER_E6);
+        for flags in flag_sets(legs.len()) {
+            for invert in [0u8, 1] {
+                for unit_scale in [1u32, 7, 1_000_000] {
+                    let expected = reference(&legs, *flags, invert, unit_scale);
+                    let got = compose_through_profile(&reports, *flags, invert, unit_scale);
+                    match expected {
+                        Some(price) => {
+                            assert_eq!(
+                                got,
+                                Ok(price),
+                                "{legs:?} flags {flags} invert {invert} scale {unit_scale}"
+                            );
+                            priced += 1;
+                            three_multiplied += u32::from(legs.len() == 3 && *flags == 0);
+                            sub_tick_leg += u32::from(has_sub_tick);
+                        }
+                        None => {
+                            assert_eq!(
+                                got,
+                                Err(PercolatorError::OracleInvalid.into()),
+                                "{legs:?} flags {flags} invert {invert} scale {unit_scale}"
+                            );
+                            refused += 1;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    println!(
+        "composite: {priced} priced, {refused} refused, {three_multiplied} three-leg products, \
+         {sub_tick_leg} priced with a sub-tick leg"
+    );
+    assert!(
+        priced > 100_000 && refused > 100_000 && three_multiplied > 2_000 && sub_tick_leg > 4_000
+    );
+
+    // A leg outside the admissible range is refused as before. Upstream also refuses
+    // 0.000000999999 (one below an e6 tick); ours admits it (the divergence below).
+    let max_e12 = (MAX_E6 as i64 + 1) * E12_PER_E6 as i64;
+    for bad in [0i64, max_e12] {
+        assert_eq!(
+            compose_through_profile(&[(bad, -12)], 0, 0, 1),
+            Err(PercolatorError::OracleInvalid.into())
+        );
+        assert_eq!(
+            compose_through_profile(&[(1_000_000_000_000, -12), (bad, -12)], 0, 0, 1),
+            Err(PercolatorError::OracleInvalid.into())
+        );
+    }
+    // A malformed configuration is refused as before. Upstream's empty and four-leg
+    // cases cannot be built through a profile (count 0 and 4 are refused earlier).
+    let one = (1_000_000_000_000i64, -12);
+    let malformed: [(&[(i64, i32)], u8, u8); 4] = [
+        (&[one], DIVIDE_LEG2, 0),
+        (&[one, one], DIVIDE_LEG3, 0),
+        (&[one], 0, 2),
+        (&[one], 8, 0),
+    ];
+    for (legs, flags, invert) in malformed {
+        assert_eq!(
+            compose_through_profile(legs, flags, invert, 1),
+            Err(PercolatorError::EngineInvalidConfig.into()),
+            "{legs:?} flags {flags} invert {invert}"
+        );
+    }
+}
+
 fn crank_with_reports(
     env: &mut V16CuEnv,
     portfolio: Pubkey,
@@ -351,8 +508,10 @@ fn v16_program_composite_target_does_not_move_on_the_rounding_of_a_low_priced_le
 ///
 /// Adapted bound: upstream also asserts `fine_cu >= coarse_cu`. Our Pyth reader
 /// scales by one `checked_mul(10^(exponent + 12))` for every exponent >= -12, so the
-/// finer report may cost the same or a few CU less (a smaller power of ten); the
-/// bound here is only upstream's upper one, `fine <= coarse + 1,000`.
+/// finer report costs the same or less: measured 59,341 CU at exponent -10 against
+/// 59,515 at -6 (174 CU, about 58 per leg, from fewer steps of `10u128.pow`), so
+/// upstream's `fine_cu >= coarse_cu` fails here. Only upstream's upper bound is kept,
+/// `fine <= coarse + 1,000`.
 #[test]
 fn v16_program_composite_from_finer_reports_costs_a_bounded_amount_more() {
     const VALUES_E6: [i64; 3] = [3_000_000, 150_000_000, 200_000_000];
