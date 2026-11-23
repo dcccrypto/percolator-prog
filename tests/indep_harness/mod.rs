@@ -394,7 +394,6 @@ pub struct V16CuMarketParams {
     pub max_account_b_settlement_chunks: u64,
     pub max_bankrupt_close_chunks: u64,
     pub max_bankrupt_close_lifetime_slots: u64,
-    pub public_b_chunk_atoms: u128,
     pub maintenance_fee_per_slot: u128,
 }
 
@@ -421,7 +420,6 @@ impl Default for V16CuMarketParams {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
         }
     }
@@ -481,19 +479,6 @@ impl V16CuEnv {
     /// Fallible form (S10-X1): InitMarket's error string and whether the market account was left
     /// byte-identical, instead of a panic.
     pub fn try_new_with_init_params(params: V16CuMarketParams) -> Result<Self, InitRefusal> {
-        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`. Fixtures
-        // that study sub-floor chunk dynamics (B-settlement chunking, the C-7 immediate-Recovery
-        // path) init at the floor and then set the requested chunk by a test-only STATE POKE of
-        // the engine config (no instruction can set it; this reproduces pre-v2.2 markets).
-        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
-        if params.public_b_chunk_atoms < floor {
-            let mut env = Self::new_with_init_params(V16CuMarketParams {
-                public_b_chunk_atoms: floor,
-                ..params
-            });
-            env.poke_public_b_chunk_atoms(params.public_b_chunk_atoms);
-            return Ok(env);
-        }
         let mut svm = LiteSVM::new();
         let program_id = harness_program_id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -578,7 +563,6 @@ impl V16CuEnv {
                 max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms: params.public_b_chunk_atoms,
                 maintenance_fee_per_slot: params.maintenance_fee_per_slot,
             },
             vec![
@@ -628,28 +612,6 @@ impl V16CuEnv {
 
     pub fn create_portfolio(&mut self, owner: &Keypair) -> Pubkey {
         self.create_portfolio_with_cu(owner).0
-    }
-
-    /// Test-only STATE POKE: set the engine config's `public_b_chunk_atoms` (sub-floor
-    /// fixtures; see `new_with_init_params`). Byte-surgical: only the bytes that differ between
-    /// a no-op rewrite and the mutated rewrite are copied back.
-    pub fn poke_public_b_chunk_atoms(&mut self, chunk: u128) {
-        let original = self.svm.get_account(&self.market).expect("market");
-        let (cfg, mut g) = state::read_market(&original.data).expect("read market");
-        let mut noop = original.data.clone();
-        state::write_market(&mut noop, &cfg, &g).unwrap();
-        g.config.public_b_chunk_atoms = chunk;
-        let mut mutated = original.data.clone();
-        state::write_market(&mut mutated, &cfg, &g).unwrap();
-        let mut acct = original;
-        for i in 0..acct.data.len() {
-            if mutated[i] != noop[i] {
-                acct.data[i] = mutated[i];
-            }
-        }
-        self.svm.set_account(self.market, acct).unwrap();
-        let (_, check) = state::read_market(&self.svm.get_account(&self.market).unwrap().data).unwrap();
-        assert_eq!(check.config.public_b_chunk_atoms, chunk, "chunk poke applied");
     }
 
     pub fn create_portfolio_with_cu(&mut self, owner: &Keypair) -> (Pubkey, u64) {

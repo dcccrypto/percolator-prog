@@ -85,7 +85,6 @@ fn swordcat() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         // tag 53, 2o6ud5cL…
@@ -142,7 +141,6 @@ fn backpack() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 1,
@@ -1016,7 +1014,6 @@ fn r2_market() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 0,
@@ -3381,7 +3378,6 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
 /// real bust leaves pending socialized-loss settlement across several touches.
 fn chunked_b_market() -> LiveMarket {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
     lm
 }
 
@@ -3574,7 +3570,6 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = 2_000_000;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
@@ -3688,7 +3683,6 @@ fn multi_asset_keeper_exit_needs_every_asset_loss_current() {
 
 fn sec_bust_world(chunk: u64, lev_notional: i128, capital: u64) -> (Replay, Keypair, Pubkey, Vec<Pubkey>, Pubkey) {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = chunk as u128;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");

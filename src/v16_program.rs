@@ -896,14 +896,11 @@ pub mod constants {
     /// is refused up front (InvalidInstruction). Those 14-leg figures are historical: with the cap at 4 a
     /// 4-leg refresh weighs 7 and the budget admits 4 of them (28 units); see the S10-X1 ledger.
     pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
-    /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
-    /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
-    /// MARKET-KILL threshold -- a single bankruptcy whose residual exceeds it takes the whole
-    /// market Live -> Recovery -> Resolved (permissionlessly). InitMarket refuses a chunk below
-    /// 1e9 atoms (1,000 USDC at 6 dp), so no creator can pick a chunk any small bust resolves.
-    /// The seed default is 1e12. Refused with EngineInvalidConfig (Custom 14), like the other
-    /// InitMarket config bounds.
-    pub const PUBLIC_B_CHUNK_ATOMS_MIN: u128 = 1_000_000_000;
+    // Mainnet condition 1 (Wave A, 2026-10-06; ledger/finding-bankrupt-chunk-wedge-2026-10-06.md)
+    // floored the market's public B chunk at 1e9 atoms, because a bust whose residual exceeds the
+    // chunk takes the market to Recovery. Since upstream 083a0d08 the chunk is the engine constant
+    // `percolator::PUBLIC_B_CHUNK_ATOMS` (= MAX_VAULT_TVL, 1e16), no longer an InitMarket field,
+    // so the floor (PUBLIC_B_CHUNK_ATOMS_MIN) is gone with it.
     pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
@@ -8952,7 +8949,6 @@ pub mod ix {
             max_account_b_settlement_chunks: u64,
             max_bankrupt_close_chunks: u64,
             max_bankrupt_close_lifetime_slots: u64,
-            public_b_chunk_atoms: u128,
             maintenance_fee_per_slot: u128,
         },
         InitPortfolio,
@@ -9451,10 +9447,10 @@ pub mod ix {
         ///
         /// `b_loss_atom_budget` is a **collateral-atom** budget: the maximum loss, in
         /// account atoms, that this call may settle out of the leg's outstanding B debt.
-        /// It is min'd with the market's `public_b_chunk_atoms` and converted to a B-index
+        /// It is min'd with the public B chunk (`percolator::PUBLIC_B_CHUNK_ATOMS`) and converted to a B-index
         /// delta exactly once, inside the engine
         /// (`percolator 2c38570a:src/v16.rs:14149-14166`, "Both limits are collateral
-        /// atoms"), so nothing is ever settled beyond `min(public_b_chunk_atoms,
+        /// atoms"), so nothing is ever settled beyond `min(PUBLIC_B_CHUNK_ATOMS,
         /// b_remaining)`.
         ///
         /// UNIT CHANGE — the field was called `b_delta_budget` and, against the deployed
@@ -10102,7 +10098,6 @@ pub mod ix {
                         max_account_b_settlement_chunks: read_u64(&mut rest)?,
                         max_bankrupt_close_chunks: read_u64(&mut rest)?,
                         max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
-                        public_b_chunk_atoms: read_u128(&mut rest)?,
                         maintenance_fee_per_slot: read_u128(&mut rest)?,
                     };
                     if rest.is_empty() {
@@ -10998,7 +10993,6 @@ pub mod ix {
                     max_account_b_settlement_chunks,
                     max_bankrupt_close_chunks,
                     max_bankrupt_close_lifetime_slots,
-                    public_b_chunk_atoms,
                     maintenance_fee_per_slot,
                 } => {
                     out.push(0);
@@ -11022,7 +11016,6 @@ pub mod ix {
                     push_u64(&mut out, max_account_b_settlement_chunks);
                     push_u64(&mut out, max_bankrupt_close_chunks);
                     push_u64(&mut out, max_bankrupt_close_lifetime_slots);
-                    push_u128(&mut out, public_b_chunk_atoms);
                     push_u128(&mut out, maintenance_fee_per_slot);
                 }
                 Self::InitPortfolio => out.push(1),
@@ -16053,7 +16046,6 @@ pub mod processor {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
             } => handle_init_market(
                 program_id,
@@ -16078,7 +16070,6 @@ pub mod processor {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
                 growth,
                 lot_exp,
@@ -17322,7 +17313,6 @@ pub mod processor {
         max_account_b_settlement_chunks: u64,
         max_bankrupt_close_chunks: u64,
         max_bankrupt_close_lifetime_slots: u64,
-        public_b_chunk_atoms: u128,
         maintenance_fee_per_slot: u128,
         // growth-v19: `(r_gap_bps, l_launch_x100)` from the optional trailing block.
         growth: Option<(u16, u16)>,
@@ -17344,7 +17334,6 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
-            || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
@@ -17372,7 +17361,6 @@ pub mod processor {
         cfg.max_account_b_settlement_chunks = max_account_b_settlement_chunks;
         cfg.max_bankrupt_close_chunks = max_bankrupt_close_chunks;
         cfg.max_bankrupt_close_lifetime_slots = max_bankrupt_close_lifetime_slots;
-        cfg.public_b_chunk_atoms = public_b_chunk_atoms;
         if initial_price == 0 || initial_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
@@ -26678,7 +26666,7 @@ pub mod processor {
     /// for the unit, its bound, and the legacy-value hazard (a B-index-scale number forfeits
     /// that many ATOMS). The handler validates only that the budget is nonzero — scale is the
     /// caller's to get right, and the engine caps the settled amount at
-    /// `min(public_b_chunk_atoms, b_remaining)`.
+    /// `min(PUBLIC_B_CHUNK_ATOMS, b_remaining)`.
     #[inline(never)]
     fn handle_forfeit_recovery_leg<'a>(
         program_id: &Pubkey,
