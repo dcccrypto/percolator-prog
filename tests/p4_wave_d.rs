@@ -653,7 +653,6 @@ fn market_params() -> V16CuMarketParams {
             max_accrual_dt_slots: 20,
             max_abs_funding_e9_per_slot: 1_000,
             min_funding_lifetime_slots: 10_000_000,
-            public_b_chunk_atoms: TL_BCHUNK.with(|c| c.get()),
             ..V16CuMarketParams::default()
         }
     }
