@@ -82,7 +82,7 @@ Percolator enforces three layers with distinct responsibilities:
 
 ### Outside Percolator: the collateral mint issuer (freeze authority)
 - Markets may use a collateral mint that has a freeze authority (for example USDC). This is allowed on purpose: Percolator does not reject or allowlist such mints.
-- The issuer can freeze the market vault token account or any user's token account. If it does, deposits and withdrawals in that mint stop until the issuer unfreezes the account.
+- The issuer can freeze the market vault token account or any user's token account. If the vault is frozen, nothing can move into or out of it for that mint (deposits, withdrawals, insurance and LP payouts). If a user's account is frozen, that user can't deposit or withdraw. This lasts until the issuer unfreezes the account.
 - Percolator can't prevent this. Users of a market take on the issuer's freeze risk for that mint.
 
 ---
