@@ -107,8 +107,9 @@ one U256 mul/div chain. Far below the 1.4M per-transaction limit.
 * `tests/tiny_price_format.rs` (new): round trip, expo finer than E12, composite with lot,
   lot cap at MAX, leg range, three-leg U256 extremes, proptest lot 0 == old composition,
   proptest lot scales exactly, Hybrid / EWMA lot validation, and the #706 interaction
-  (`clamp_toward_engine_dt`: at lot 0 a 1-tick price is frozen by the 1 bps cap while at lot 6
-  it moves +50 per slot, so the remainder carry is not needed for lot markets).
+  (`clamp_toward_engine_dt`: at lot 0 a 1-tick price is frozen by the 1 bps cap while a
+  $0.000005 token at lot 5 (500_000 e6) moves +50 per slot, so the remainder carry is not
+  needed for lot markets).
 * `tests/v22_wave_a.rs`: proptests updated for Hybrid now accepting a lot.
 
 ## Overlap with engine #357 and prog #706 / #710
@@ -144,9 +145,12 @@ Different problem, no duplicated logic, no storage clash:
 
 ## Open risks
 
-* *[Closed by INV-038 for new readings: a leg `< 1e-6` is refused, so a stored leg is never
-  0.]* Under #711 the same-publish-time equivocation check compared the stored E6 floor, and
-  for a leg `< 1e-6` the stored value was 0 and the check was skipped.
+* Same-publish-time equivocation: under #711 the check compared the stored E6 floor, and for
+  a leg `< 1e-6` the stored value was 0 and the check was skipped. INV-038 narrows this (a leg
+  `< 1e-6` is refused, so a stored leg is never 0) but does not close it: the check still
+  compares only the E6 floor, so two same-publish-time readings of one leg that differ by
+  less than one tick (e.g. 0.00041000 vs 0.00041099) both pass and can compose to slightly
+  different targets. Follow-up: store E12 legs and compare those.
 * Feeds with expo finer than -12 are truncated at E12 (tested).
 * Off-chain consumers that assume price = per-token E6 will misprice lot markets until the
   SDK / indexer follow-ups land. No existing market changes.
