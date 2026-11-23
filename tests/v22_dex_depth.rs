@@ -1577,3 +1577,21 @@ fn pool_claim_one_market_per_pool() {
     env.set_source(chill()).expect("unclaimed pool pins");
     assert_eq!(env.claim(&pool).unwrap().market, env.market.to_bytes());
 }
+
+/// CU probe: a mode-2 push on a DEX-pinned market with the pool's base reserve poked to a range of
+/// sizes. `cargo test --features devnet --test v22_dex_depth cu_probe -- --nocapture`
+#[test]
+fn cu_probe_mode2_by_reserve_size() {
+    let mut env = Env::new(Pubkey::new_from_array([0x12; 32]));
+    env.set_source(chill()).expect("SetDepthSource");
+    let dex = env.dex_accounts(chill());
+    env.warp(2);
+    for amount in [0u64, 1_000, 1_000_000_000, 1_000_000_000_000, 1u64 << 40, 1u64 << 52, u64::MAX] {
+        let mut bv = env.svm.get_account(&pk(CHILL_BASE_VAULT)).unwrap();
+        bv.data[64..72].copy_from_slice(&amount.to_le_bytes());
+        env.svm.set_account(pk(CHILL_BASE_VAULT), bv).unwrap();
+        env.warp(1);
+        let cu = env.push(2, 0, &dex).expect("mode 2 push");
+        eprintln!("CUPROBE base_reserve={amount} cu={cu} depth={}", env.growth().depth_e6);
+    }
+}
