@@ -25202,7 +25202,10 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     // Victim opens a leg on asset 0 AND asset 1 (both long, against the same
     // counterparty) -- a genuinely multi-leg portfolio, the precondition d63c4dc9's
     // gate exists for.
-    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+    // The victim is SHORT asset 0, so the 100 -> 400 push below is a real loss. (It used to be
+    // long, which only read as liquidatable while the unbacked gain was ignored; engine #356
+    // counts the in-flight counterparty backing, and a long here is a solvent hedge.)
+    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, -(POS_SCALE as i128), 100, 0);
     env.trade_asset_with_cu(1, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
 
     // Certify both legs at a healthy baseline first (bounded loop: cert currentness on a
@@ -25318,10 +25321,15 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     // reduced by the follow-on -- never neither (that would mean the complete set re-certified it
     // healthy, i.e. the scenario is vacuous).
     let after_complete = env.portfolio_state(victim);
-    let reduced_in_this_call = active_leg_for_asset(&after_complete, 0)
-        .basis_pos_q
-        .unsigned_abs()
-        < asset0_size_before;
+    // A full close of the toxic leg (it can be bankrupt at this move) removes it: size 0.
+    let asset0_size = |st: &PortfolioAccountV16| {
+        if has_active_leg_for_asset(st, 0) {
+            active_leg_for_asset(st, 0).basis_pos_q.unsigned_abs()
+        } else {
+            0
+        }
+    };
+    let reduced_in_this_call = asset0_size(&after_complete) < asset0_size_before;
     assert!(
         after_complete.health_cert.certified_liq_deficit > 0 || reduced_in_this_call,
         "victim must now be certified as genuinely liquidatable after the complete-observation \
@@ -25376,10 +25384,7 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
          bounded number of calls"
     );
     assert!(
-        active_leg_for_asset(&env.portfolio_state(victim), 0)
-            .basis_pos_q
-            .unsigned_abs()
-            < asset0_size_before,
+        asset0_size(&env.portfolio_state(victim)) < asset0_size_before,
         "the engine-selected liquidation must strictly reduce the toxic (asset 0) leg's exposure"
     );
 }
