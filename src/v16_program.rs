@@ -21861,6 +21861,39 @@ pub mod processor {
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(source_balance, amount_u64)?;
+        let cfg_after = top_up_insurance_book(
+            market_ai,
+            signer,
+            ledger_ai,
+            units_ai,
+            expected_market_id,
+            intent_id,
+            expected_authority_epoch,
+            amount,
+        )?;
+        transfer_tokens(token_program, source_token, vault_token, signer, amount_u64)?;
+        if let Some(cfg) = cfg_after {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
+        }
+        Ok(())
+    }
+
+    /// The market-view block of `handle_top_up_insurance`, out of line so the market view
+    /// (152 B since engine #385's `protection_observed`) does not sit in the handler's SBF
+    /// frame. Same checks in the same order, same errors, same writes; an error here returns
+    /// from the handler exactly as the inline block did. Returns `cfg_after`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn top_up_insurance_book<'a>(
+        market_ai: &AccountInfo<'a>,
+        signer: &AccountInfo<'a>,
+        ledger_ai: Option<&AccountInfo<'a>>,
+        units_ai: Option<&AccountInfo<'a>>,
+        expected_market_id: u64,
+        intent_id: u64,
+        expected_authority_epoch: u64,
+        amount: u128,
+    ) -> Result<Option<WrapperConfigV16>, ProgramError> {
         let mut cfg_after = None;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -21943,11 +21976,7 @@ pub mod processor {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
         }
-        transfer_tokens(token_program, source_token, vault_token, signer, amount_u64)?;
-        if let Some(cfg) = cfg_after {
-            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
-        }
-        Ok(())
+        Ok(cfg_after)
     }
 
     #[inline(never)]
@@ -28161,238 +28190,26 @@ pub mod processor {
         if action == ASSET_ACTION_ACTIVATE
             && (asset_index == configured_slots_pre || permissionless_reuse_target)
         {
-            let authenticated_slot = authenticated_slot_or_fallback(now_slot);
-            let append_activation = asset_index == configured_slots_pre;
-            if append_activation && cfg_pre.free_market_slot_count != 0 {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            let init_fee = if is_asset_authority {
-                0
-            } else {
-                let fee = permissionless_market_init_fee_for_asset(
-                    cfg_pre.permissionless_market_init_fee,
-                    asset_index,
-                )?;
-                if fee == 0 || fee > max_init_fee {
-                    return Err(PercolatorError::Unauthorized.into());
-                }
-                fee
-            };
-            let transfer_accounts = if init_fee == 0 {
-                None
-            } else {
-                let source_token = account(accounts, 2)?;
-                let vault_token = account(accounts, 3)?;
-                let token_program = account(accounts, 4)?;
-                expect_writable(source_token)?;
-                expect_writable(vault_token)?;
-                verify_token_program(token_program)?;
-                let mint = primary_collateral_mint(&cfg_pre);
-                let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-                let source_balance =
-                    verify_user_token_account(source_token, authority.key, &mint)?;
-                verify_vault_token_account(vault_token, &vault_authority, &mint)?;
-                let amount_u64 = amount_to_u64(init_fee)?;
-                require_token_balance(source_balance, amount_u64)?;
-                Some((source_token, vault_token, token_program, amount_u64))
-            };
-            if asset_index >= capacity_pre {
-                let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
-                market_ai.realloc(new_len, true)?;
-            }
-            // CEI fix: transfer the init fee BEFORE mutating engine state.
-            // A Token-2022 transfer hook fires during the CPI and could re-enter this program
-            // while seeing already-committed engine effects (active slot, decremented
-            // free_market_slot_count). Performing the transfer first means the hook fires against
-            // the pre-activation state, eliminating the re-entrancy window.
-            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
-            {
-                transfer_tokens(
-                    token_program,
-                    source_token,
-                    vault_token,
-                    authority,
-                    amount_u64,
-                )?;
-            }
-            {
-                let mut data = market_ai.try_borrow_mut_data()?;
-                let mut reuse_cfg_after = None;
-                let mut reuse_activated = false;
-                {
-                    let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
-                    require_asset_lifecycle_generation_view(
-                        &group,
-                        asset_index,
-                        true,
-                        expected_market_id,
-                    )?;
-                    let still_asset_authority =
-                        cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
-                    if still_asset_authority {
-                        // W3A-2: ADOPT upstream `dd958393` -- market-authority reuse of a
-                        // free slot is authority-consent, so it is bound to the LIVE asset-0
-                        // authority_epoch exactly like the other two call sites below.
-                        require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
-                    } else {
-                        // W3A-2: ADOPT upstream `dd958393` -- the permissionless reuse path
-                        // below is generation- and fee-bound, not authority consent. Requiring
-                        // the canonical zero value here (rather than skipping the check)
-                        // prevents this wire lane from becoming an unaudited caller-controlled
-                        // payload once `authority_epoch` exists on the wire at all.
-                        state::require_current_authority_epoch(0, expected_authority_epoch)?;
-                        let expected_fee = permissionless_market_init_fee_for_asset(
-                            cfg.permissionless_market_init_fee,
-                            asset_index,
-                        )?;
-                        if expected_fee == 0
-                            || expected_fee > max_init_fee
-                            || expected_fee != init_fee
-                        {
-                            return Err(PercolatorError::Unauthorized.into());
-                        }
-                    }
-                    if group.header.mode != 0 {
-                        return Err(PercolatorError::EngineLockActive.into());
-                    }
-                    let configured_slots = group.header.config.max_market_slots.get() as usize;
-                    if asset_index == configured_slots {
-                        if cfg.free_market_slot_count != 0 {
-                            return Err(PercolatorError::EngineLockActive.into());
-                        }
-                    } else if !still_asset_authority
-                        && asset_index < configured_slots
-                        && cfg.free_market_slot_count != 0
-                    {
-                        if group.markets[asset_index].engine.asset.lifecycle
-                            != ASSET_LIFECYCLE_RETIRED
-                        {
-                            // Slot is below max_market_slots and NOT retired. If it is
-                            // one of the three IN-SERVICE lifecycles, say so precisely;
-                            // anything else keeps the prior generic code so no other
-                            // rejection is silently reclassified.
-                            return Err(match group.markets[asset_index].engine.asset.lifecycle {
-                                ASSET_LIFECYCLE_ACTIVE
-                                | ASSET_LIFECYCLE_DRAIN_ONLY
-                                | ASSET_LIFECYCLE_RECOVERY => {
-                                    PercolatorError::AssetSlotAlreadyConfigured.into()
-                                }
-                                _ => PercolatorError::EngineLockActive.into(),
-                            });
-                        }
-                        // Reject zero domain authorities, mirroring the append path
-                        // (activate_dynamic_asset_slot, ~line 1475). A zero
-                        // insurance_authority makes that domain's insurance budget
-                        // withdrawable by nobody (terminal_insurance_remaining rejects a
-                        // zero authority), permanently bricking CloseSlab (Finding F).
-                        if !domain_authority_fields_complete(
-                            insurance_authority,
-                            insurance_operator,
-                            backing_bucket_authority,
-                            oracle_authority,
-                        ) {
-                            return Err(PercolatorError::InvalidInstruction.into());
-                        }
-                        group
-                            .header
-                            .activate_empty_market_slot_not_atomic(
-                                asset_index as u32,
-                                &mut group.markets[asset_index],
-                                initial_price,
-                                authenticated_slot,
-                            )
-                            .map_err(map_v16_error)?;
-                        cfg.free_market_slot_count = cfg
-                            .free_market_slot_count
-                            .checked_sub(1)
-                            .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                        let mut profile =
-                            state::manual_asset_oracle_profile(initial_price, authenticated_slot);
-                        profile.insurance_authority = insurance_authority;
-                        profile.insurance_operator = insurance_operator;
-                        profile.backing_bucket_authority = backing_bucket_authority;
-                        profile.oracle_authority = oracle_authority;
-                        // Per-asset cold-storage admin: bootstrap to the activator; it can later be
-                        // rotated to a cold key or burned via UpdateAssetAuthority.
-                        profile.asset_admin = authority.key.to_bytes();
-                        write_oracle_profile_to_view_if_separate(
-                            &mut group,
-                            asset_index,
-                            &profile,
-                        )?;
-                        // P2b (review L-1): a reused slot starts with no ADL episode.
-                        state::clear_adl_episode_in_wrapper_bytes(
-                            &mut group.markets[asset_index].wrapper[..],
-                        )?;
-                        // Security review I-1 (path 2/4, slot reuse): nor graduation state.
-                        let engine_imr = group.header.config.initial_margin_bps.get();
-                        state::reset_asset_growth_graduation_in_wrapper_bytes(
-                            &mut group.markets[asset_index].wrapper[..],
-                            engine_imr,
-                            authenticated_slot,
-                        )?;
-                        group.validate_shape().map_err(map_v16_error)?;
-                        reuse_cfg_after = Some(cfg);
-                        reuse_activated = true;
-                    } else {
-                        return Err(PercolatorError::EngineLockActive.into());
-                    }
-                }
-                if let Some(cfg) = reuse_cfg_after {
-                    state::write_wrapper_config(&mut data, &cfg)?;
-                }
-                if reuse_activated && init_fee != 0 {
-                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                    deposit_market_zero_insurance_view(&mut group, init_fee)?;
-                    group.validate_shape().map_err(map_v16_error)?;
-                }
-                let (_cfg, _mode, configured_slots, _) =
-                    state::read_market_config_mode_and_capacity(&data)?;
-                if !reuse_activated && asset_index == configured_slots {
-                    let mut profile = state::activate_dynamic_asset_slot(
-                        &mut data,
-                        asset_index,
-                        authenticated_slot,
-                        initial_price,
-                        insurance_authority,
-                        insurance_operator,
-                        backing_bucket_authority,
-                        oracle_authority,
-                    )?;
-                    // Per-asset cold-storage admin: bootstrap to the activator (the permissionless
-                    // creator or the asset_authority); rotatable / burnable via UpdateAssetAuthority.
-                    profile.asset_admin = authority.key.to_bytes();
-                    state::write_asset_oracle_profile(&mut data, asset_index, &profile)?;
-                    // P2b (review L-1): a newly activated slot starts with no ADL episode.
-                    let limits = state::read_asset_risk_limits(&data, asset_index)?;
-                    state::write_asset_risk_limits(
-                        &mut data,
-                        asset_index,
-                        &state::clear_adl_episode(limits),
-                    )?;
-                    state::clear_p2b_senior_floor(&mut data, asset_index)?;
-                    // Security review I-1 (path 3/4, append activation): no graduation state.
-                    {
-                        let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                        let engine_imr = group.header.config.initial_margin_bps.get();
-                        let market = group
-                            .markets
-                            .get_mut(asset_index)
-                            .ok_or(PercolatorError::InvalidInstruction)?;
-                        state::reset_asset_growth_graduation_in_wrapper_bytes(
-                            &mut market.wrapper[..],
-                            engine_imr,
-                            authenticated_slot,
-                        )?;
-                    }
-                    if init_fee != 0 {
-                        let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                        deposit_market_zero_insurance_view(&mut group, init_fee)?;
-                        group.validate_shape().map_err(map_v16_error)?;
-                    }
-                }
-            }
-            return Ok(());
+            return update_asset_lifecycle_activate(
+                program_id,
+                accounts,
+                authority,
+                market_ai,
+                &cfg_pre,
+                configured_slots_pre,
+                capacity_pre,
+                is_asset_authority,
+                asset_index,
+                expected_market_id,
+                expected_authority_epoch,
+                now_slot,
+                initial_price,
+                max_init_fee,
+                insurance_authority,
+                insurance_operator,
+                backing_bucket_authority,
+                oracle_authority,
+            );
         }
         if action == ASSET_ACTION_SHUTDOWN {
             if now_slot == 0 || initial_price != 0 || cfg_pre.force_close_delay_slots == 0 {
@@ -28512,6 +28329,268 @@ pub mod processor {
             is_activation,
             expected_market_id,
         )
+    }
+
+    /// The ACTIVATE branch of `handle_update_asset_lifecycle` (append, or reuse of a free
+    /// slot), out of line so its market views (152 B each since engine #385's
+    /// `protection_observed`) do not sit in the handler's SBF frame. The body is the inline
+    /// branch unchanged: same checks in the same order, same errors, same transfer-before-
+    /// mutation order, same writes; the handler returns whatever this returns, exactly as the
+    /// branch's own `return Ok(())` / `?` did.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn update_asset_lifecycle_activate<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        authority: &'a AccountInfo<'a>,
+        market_ai: &'a AccountInfo<'a>,
+        cfg_pre: &WrapperConfigV16,
+        configured_slots_pre: usize,
+        capacity_pre: usize,
+        is_asset_authority: bool,
+        asset_index: usize,
+        expected_market_id: u64,
+        expected_authority_epoch: u64,
+        now_slot: u64,
+        initial_price: u64,
+        max_init_fee: u128,
+        insurance_authority: [u8; 32],
+        insurance_operator: [u8; 32],
+        backing_bucket_authority: [u8; 32],
+        oracle_authority: [u8; 32],
+    ) -> ProgramResult {
+        let authenticated_slot = authenticated_slot_or_fallback(now_slot);
+        let append_activation = asset_index == configured_slots_pre;
+        if append_activation && cfg_pre.free_market_slot_count != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let init_fee = if is_asset_authority {
+            0
+        } else {
+            let fee = permissionless_market_init_fee_for_asset(
+                cfg_pre.permissionless_market_init_fee,
+                asset_index,
+            )?;
+            if fee == 0 || fee > max_init_fee {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            fee
+        };
+        let transfer_accounts = if init_fee == 0 {
+            None
+        } else {
+            let source_token = account(accounts, 2)?;
+            let vault_token = account(accounts, 3)?;
+            let token_program = account(accounts, 4)?;
+            expect_writable(source_token)?;
+            expect_writable(vault_token)?;
+            verify_token_program(token_program)?;
+            let mint = primary_collateral_mint(&cfg_pre);
+            let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+            let source_balance =
+                verify_user_token_account(source_token, authority.key, &mint)?;
+            verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+            let amount_u64 = amount_to_u64(init_fee)?;
+            require_token_balance(source_balance, amount_u64)?;
+            Some((source_token, vault_token, token_program, amount_u64))
+        };
+        if asset_index >= capacity_pre {
+            let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
+            market_ai.realloc(new_len, true)?;
+        }
+        // CEI fix: transfer the init fee BEFORE mutating engine state.
+        // A Token-2022 transfer hook fires during the CPI and could re-enter this program
+        // while seeing already-committed engine effects (active slot, decremented
+        // free_market_slot_count). Performing the transfer first means the hook fires against
+        // the pre-activation state, eliminating the re-entrancy window.
+        if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
+        {
+            transfer_tokens(
+                token_program,
+                source_token,
+                vault_token,
+                authority,
+                amount_u64,
+            )?;
+        }
+        {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let mut reuse_cfg_after = None;
+            let mut reuse_activated = false;
+            {
+                let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
+                require_asset_lifecycle_generation_view(
+                    &group,
+                    asset_index,
+                    true,
+                    expected_market_id,
+                )?;
+                let still_asset_authority =
+                    cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
+                if still_asset_authority {
+                    // W3A-2: ADOPT upstream `dd958393` -- market-authority reuse of a
+                    // free slot is authority-consent, so it is bound to the LIVE asset-0
+                    // authority_epoch exactly like the other two call sites below.
+                    require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+                } else {
+                    // W3A-2: ADOPT upstream `dd958393` -- the permissionless reuse path
+                    // below is generation- and fee-bound, not authority consent. Requiring
+                    // the canonical zero value here (rather than skipping the check)
+                    // prevents this wire lane from becoming an unaudited caller-controlled
+                    // payload once `authority_epoch` exists on the wire at all.
+                    state::require_current_authority_epoch(0, expected_authority_epoch)?;
+                    let expected_fee = permissionless_market_init_fee_for_asset(
+                        cfg.permissionless_market_init_fee,
+                        asset_index,
+                    )?;
+                    if expected_fee == 0
+                        || expected_fee > max_init_fee
+                        || expected_fee != init_fee
+                    {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
+                }
+                if group.header.mode != 0 {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                let configured_slots = group.header.config.max_market_slots.get() as usize;
+                if asset_index == configured_slots {
+                    if cfg.free_market_slot_count != 0 {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                } else if !still_asset_authority
+                    && asset_index < configured_slots
+                    && cfg.free_market_slot_count != 0
+                {
+                    if group.markets[asset_index].engine.asset.lifecycle
+                        != ASSET_LIFECYCLE_RETIRED
+                    {
+                        // Slot is below max_market_slots and NOT retired. If it is
+                        // one of the three IN-SERVICE lifecycles, say so precisely;
+                        // anything else keeps the prior generic code so no other
+                        // rejection is silently reclassified.
+                        return Err(match group.markets[asset_index].engine.asset.lifecycle {
+                            ASSET_LIFECYCLE_ACTIVE
+                            | ASSET_LIFECYCLE_DRAIN_ONLY
+                            | ASSET_LIFECYCLE_RECOVERY => {
+                                PercolatorError::AssetSlotAlreadyConfigured.into()
+                            }
+                            _ => PercolatorError::EngineLockActive.into(),
+                        });
+                    }
+                    // Reject zero domain authorities, mirroring the append path
+                    // (activate_dynamic_asset_slot, ~line 1475). A zero
+                    // insurance_authority makes that domain's insurance budget
+                    // withdrawable by nobody (terminal_insurance_remaining rejects a
+                    // zero authority), permanently bricking CloseSlab (Finding F).
+                    if !domain_authority_fields_complete(
+                        insurance_authority,
+                        insurance_operator,
+                        backing_bucket_authority,
+                        oracle_authority,
+                    ) {
+                        return Err(PercolatorError::InvalidInstruction.into());
+                    }
+                    group
+                        .header
+                        .activate_empty_market_slot_not_atomic(
+                            asset_index as u32,
+                            &mut group.markets[asset_index],
+                            initial_price,
+                            authenticated_slot,
+                        )
+                        .map_err(map_v16_error)?;
+                    cfg.free_market_slot_count = cfg
+                        .free_market_slot_count
+                        .checked_sub(1)
+                        .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                    let mut profile =
+                        state::manual_asset_oracle_profile(initial_price, authenticated_slot);
+                    profile.insurance_authority = insurance_authority;
+                    profile.insurance_operator = insurance_operator;
+                    profile.backing_bucket_authority = backing_bucket_authority;
+                    profile.oracle_authority = oracle_authority;
+                    // Per-asset cold-storage admin: bootstrap to the activator; it can later be
+                    // rotated to a cold key or burned via UpdateAssetAuthority.
+                    profile.asset_admin = authority.key.to_bytes();
+                    write_oracle_profile_to_view_if_separate(
+                        &mut group,
+                        asset_index,
+                        &profile,
+                    )?;
+                    // P2b (review L-1): a reused slot starts with no ADL episode.
+                    state::clear_adl_episode_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                    )?;
+                    // Security review I-1 (path 2/4, slot reuse): nor graduation state.
+                    let engine_imr = group.header.config.initial_margin_bps.get();
+                    state::reset_asset_growth_graduation_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                        engine_imr,
+                        authenticated_slot,
+                    )?;
+                    group.validate_shape().map_err(map_v16_error)?;
+                    reuse_cfg_after = Some(cfg);
+                    reuse_activated = true;
+                } else {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+            }
+            if let Some(cfg) = reuse_cfg_after {
+                state::write_wrapper_config(&mut data, &cfg)?;
+            }
+            if reuse_activated && init_fee != 0 {
+                let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                deposit_market_zero_insurance_view(&mut group, init_fee)?;
+                group.validate_shape().map_err(map_v16_error)?;
+            }
+            let (_cfg, _mode, configured_slots, _) =
+                state::read_market_config_mode_and_capacity(&data)?;
+            if !reuse_activated && asset_index == configured_slots {
+                let mut profile = state::activate_dynamic_asset_slot(
+                    &mut data,
+                    asset_index,
+                    authenticated_slot,
+                    initial_price,
+                    insurance_authority,
+                    insurance_operator,
+                    backing_bucket_authority,
+                    oracle_authority,
+                )?;
+                // Per-asset cold-storage admin: bootstrap to the activator (the permissionless
+                // creator or the asset_authority); rotatable / burnable via UpdateAssetAuthority.
+                profile.asset_admin = authority.key.to_bytes();
+                state::write_asset_oracle_profile(&mut data, asset_index, &profile)?;
+                // P2b (review L-1): a newly activated slot starts with no ADL episode.
+                let limits = state::read_asset_risk_limits(&data, asset_index)?;
+                state::write_asset_risk_limits(
+                    &mut data,
+                    asset_index,
+                    &state::clear_adl_episode(limits),
+                )?;
+                state::clear_p2b_senior_floor(&mut data, asset_index)?;
+                // Security review I-1 (path 3/4, append activation): no graduation state.
+                {
+                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                    let engine_imr = group.header.config.initial_margin_bps.get();
+                    let market = group
+                        .markets
+                        .get_mut(asset_index)
+                        .ok_or(PercolatorError::InvalidInstruction)?;
+                    state::reset_asset_growth_graduation_in_wrapper_bytes(
+                        &mut market.wrapper[..],
+                        engine_imr,
+                        authenticated_slot,
+                    )?;
+                }
+                if init_fee != 0 {
+                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                    deposit_market_zero_insurance_view(&mut group, init_fee)?;
+                    group.validate_shape().map_err(map_v16_error)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // sync/w2-tb3: same 11-argument shape as the caller this was extracted
@@ -32707,6 +32786,79 @@ pub mod processor {
         )?;
 
         // ── Phase 3: backing-bucket + ledger update. ──
+        deposit_to_lp_vault_book(
+            market_ai,
+            target_ledger_ai,
+            &registry_pda,
+            target_domain,
+            domain,
+            backing_num,
+            amount,
+        )?;
+
+        // ── Phase 4: mint LP shares to depositor (registry PDA signs). ──
+        let mint_ix = spl_token::instruction::mint_to(
+            token_program.key,
+            mint_ai.key,
+            depositor_lp_ata.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &mint_ix,
+            &[
+                mint_ai.clone(),
+                depositor_lp_ata.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Phase 5: bump outstanding shares. ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_add(shares)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+        // ── Phase 6 (P3, bound vaults only): the senior claim grows by exactly the deposit. ──
+        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+            // Genesis (no shares existed): C restarts at exactly the deposit, so any orphaned
+            // claim dust left by an earlier full exit stays with the junior, never the newcomer.
+            st.senior_claim_atoms = if registry.total_lp_shares_outstanding == 0 {
+                amount
+            } else {
+                st.senior_claim_atoms
+                    .checked_add(amount)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            };
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 of `handle_deposit_to_lp_vault` (backing-bucket + ledger update), out of line so
+    /// the market view (152 B since engine #385's `protection_observed`) does not sit in the
+    /// handler's SBF frame. Same checks in the same order, same errors, same writes; an error
+    /// here returns from the handler exactly as the inline block did.
+    #[inline(never)]
+    fn deposit_to_lp_vault_book<'a>(
+        market_ai: &AccountInfo<'a>,
+        target_ledger_ai: &AccountInfo<'a>,
+        registry_pda: &Pubkey,
+        target_domain: u16,
+        domain: usize,
+        backing_num: u128,
+        amount: u128,
+    ) -> ProgramResult {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -32771,53 +32923,6 @@ pub mod processor {
             group.header.vault = percolator::V16PodU128::new(next_vault);
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
-        }
-
-        // ── Phase 4: mint LP shares to depositor (registry PDA signs). ──
-        let mint_ix = spl_token::instruction::mint_to(
-            token_program.key,
-            mint_ai.key,
-            depositor_lp_ata.key,
-            &registry_pda,
-            &[],
-            shares_u64,
-        )?;
-        invoke_signed(
-            &mint_ix,
-            &[
-                mint_ai.clone(),
-                depositor_lp_ata.clone(),
-                registry_ai.clone(),
-                token_program.clone(),
-            ],
-            &[&[
-                crate::constants::LP_VAULT_REGISTRY_SEED,
-                market_ai.key.as_ref(),
-                &[registry_bump],
-            ]],
-        )?;
-
-        // ── Phase 5: bump outstanding shares. ──
-        {
-            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-            reg.total_lp_shares_outstanding = reg
-                .total_lp_shares_outstanding
-                .checked_add(shares)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
-        }
-        // ── Phase 6 (P3, bound vaults only): the senior claim grows by exactly the deposit. ──
-        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
-            // Genesis (no shares existed): C restarts at exactly the deposit, so any orphaned
-            // claim dust left by an earlier full exit stays with the junior, never the newcomer.
-            st.senior_claim_atoms = if registry.total_lp_shares_outstanding == 0 {
-                amount
-            } else {
-                st.senior_claim_atoms
-                    .checked_add(amount)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-            };
-            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         }
         Ok(())
     }
@@ -34245,6 +34350,147 @@ pub mod processor {
         };
 
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
+        execute_redemption_withdraw_view(
+            market_ai,
+            ledger_ai,
+            source_ledger_ai,
+            sibling_ledger_ai,
+            &registry,
+            &registry_pda,
+            source_domain,
+            domain,
+            asset_index,
+            bound_tail.is_some(),
+            atoms,
+            principal_portion,
+            earnings_portion,
+            gross_consumed,
+            backing_num,
+        )?;
+
+        // ── Transfer vault → redeemer (vault_authority PDA signs). ──
+        let vault_bump_arr = [vault_bump];
+        let vault_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &vault_bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            redeemer_dest,
+            vault_authority_ai,
+            atoms_u64,
+            vault_seeds,
+        )?;
+
+        // ── Burn the escrowed shares (registry PDA signs as escrow owner). ──
+        let shares_u64 = u64::try_from(redemption.shares)
+            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let burn_ix = spl_token::instruction::burn(
+            token_program.key,
+            escrow_ai.key,
+            lp_mint.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &burn_ix,
+            &[
+                escrow_ai.clone(),
+                lp_mint.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Decrement outstanding shares (mirrors the burn). ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            // P3: the senior claim loses exactly the redeemed pro-rata slice (rounded down, so
+            // the remaining holders' per-share claim never falls). Uses S BEFORE the burn.
+            if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+                st.senior_claim_atoms = vault_lp_v18::senior_claim_after_redemption(
+                    st.senior_claim_atoms,
+                    redemption.shares,
+                    reg.total_lp_shares_outstanding,
+                )
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+            }
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_sub(redemption.shares)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+
+        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
+        //
+        // GH#412: the rent goes to the REDEEMER, not the cranker.
+        //
+        // It used to go to whoever cranked, while `CancelRedemption` returned it to
+        // the redeemer — the same lamports, two different recipients depending on
+        // how the request ended. The rent was the redeemer's money either way; the
+        // cranker's incentive is a separate question and does not get funded out of
+        // someone else's rent deposit by accident of which path ran.
+        //
+        // Pinned to the RECORDED redeemer, so this cannot become a caller-chosen
+        // payout: `redemption.redeemer` was written at request time and is the same
+        // value `verify_user_token_account` already checks `redeemer_dest` against.
+        if redeemer_rent_dest.key.to_bytes() != redemption.redeemer {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        expect_writable(redeemer_rent_dest)?;
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **redeemer_rent_dest.try_borrow_mut_lamports()? = redeemer_rent_dest
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // v2.2 move event (tag 77): the principal / earnings split of the paid amount (the total
+        // is the vault->redeemer token transfer; the split is decided on chain and appears in no
+        // balance) and the shares burned. Emitted last, after the payout and burn succeeded.
+        fill_events_v22::emit_move(
+            fill_events_v22::TAG_EXECUTE_REDEMPTION,
+            &market_ai.key.to_bytes(),
+            fill_events_v22::MOVE_EARN_EXIT,
+            fill_events_v22::NO_ASSET,
+            fill_events_v22::sat_u64(principal_portion),
+            fill_events_v22::sat_u64(earnings_portion),
+            shares_u64,
+        );
+        Ok(())
+    }
+
+    /// The inline withdraw of `handle_execute_redemption` (mirrors
+    /// `handle_withdraw_backing_bucket`), out of line so the market view (152 B since engine
+    /// #385's `protection_observed`) does not sit in the handler's SBF frame. The body is the
+    /// inline block unchanged except that `bound` is `bound_tail.is_some()` (the block only
+    /// ever asked that); same checks in the same order, same errors, same writes, and an error
+    /// returns from the handler exactly as the inline block's `?` / `return Err` did.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_redemption_withdraw_view<'a>(
+        market_ai: &AccountInfo<'a>,
+        ledger_ai: &AccountInfo<'a>,
+        source_ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        source_domain: u16,
+        domain: usize,
+        asset_index: usize,
+        bound: bool,
+        atoms: u128,
+        principal_portion: u128,
+        earnings_portion: u128,
+        gross_consumed: u128,
+        backing_num: u128,
+    ) -> ProgramResult {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             // `group` is mut: the LPVAULT-359 stub credit (#381) calls the &mut self engine
@@ -34289,9 +34535,9 @@ pub mod processor {
                 backing_num,
                 source_ledger_ai,
                 other_ledger_ai,
-                if bound_tail.is_some() { None } else { Some(principal_portion) },
+                if bound { None } else { Some(principal_portion) },
             )?;
-            if bound_tail.is_none() {
+            if !bound {
                 vault_pot_earnings_top_up_from_sibling(
                     &mut group,
                     market_ai.key.to_bytes(),
@@ -34334,8 +34580,8 @@ pub mod processor {
             // PHYSICAL fresh backing (checked below); the ledger principal can trail it (the
             // engine's resolved close can return backing to the pot without a wrapper ledger
             // write), so it is not a gate there and is decremented saturating.
-            let ledger_gate = !(bound_tail.is_some() && group.header.mode == 1);
-            let ledger_cap = if bound_tail.is_some() {
+            let ledger_gate = !(bound && group.header.mode == 1);
+            let ledger_cap = if bound {
                 ledger.total_principal_atoms
             } else {
                 vault_lp_v18::nonbound_pot_available(ledger.total_principal_atoms, e3_physical)
@@ -34343,7 +34589,7 @@ pub mod processor {
             if ledger_gate && principal_portion > ledger_cap {
                 // B24 / gate-100: on a LIVE bound vault the chosen pot cannot fund this payout —
                 // name it (recall or redeem less), before any generic counter error.
-                if bound_tail.is_some() && group.header.mode == 0 {
+                if bound && group.header.mode == 0 {
                     return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
                 }
                 return Err(PercolatorError::EngineCounterUnderflow.into());
@@ -34366,12 +34612,12 @@ pub mod processor {
             // waterfall: V = pots + LP value). A payout the chosen pot cannot fund is NOT lent
             // out; it needs a recall (98, permissionless, LP flat) first, or a smaller
             // redemption. Name it instead of a generic 21.
-            let bound_live = bound_tail.is_some() && group.header.mode == 0;
+            let bound_live = bound && group.header.mode == 0;
             // Security INFO (PR #522): on a NON-bound vault a lapsed source pot is not payable
             // either (W-21, the same predicate tag 50 / 91 / the sibling top-up use): its
             // principal is tag 89's to forfeit, and which instruction lands first must not
             // decide where it goes. Bound pots keep their sentinel-expiry handling (F-14).
-            let source_lapsed = bound_tail.is_none()
+            let source_lapsed = !bound
                 && !policy_v16::backing_principal_withdrawal_is_fresh(
                     bucket.expiry_slot,
                     source_check_slot,
@@ -34425,7 +34671,7 @@ pub mod processor {
             // (accept path) and execute_redemption_oi_reservation_violation_rejects
             // (genuine-lien reject path, solvency-preserving) in
             // tests/v16_fork_lp_vault_redeem.rs.
-            let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
+            let bound_resolved_withdraw = bound && group.header.mode == 1;
             if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
                 // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
                 // P3U (2026-10-20): a BOUND pot's available principal is the B24 reading the
@@ -34437,7 +34683,7 @@ pub mod processor {
                 // underflowed: a full senior exit got 25 for as long as the counters stood.
                 execute_redemption_oi_reservation_check(
                     &ledger,
-                    if bound_tail.is_some() {
+                    if bound {
                         vault_lp_v18::bound_pot_available_principal(
                             ledger.total_principal_atoms,
                             bucket.fresh_unliened_backing_num,
@@ -34629,102 +34875,6 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
         }
-
-        // ── Transfer vault → redeemer (vault_authority PDA signs). ──
-        let vault_bump_arr = [vault_bump];
-        let vault_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &vault_bump_arr]];
-        transfer_tokens_signed(
-            token_program,
-            vault_token,
-            redeemer_dest,
-            vault_authority_ai,
-            atoms_u64,
-            vault_seeds,
-        )?;
-
-        // ── Burn the escrowed shares (registry PDA signs as escrow owner). ──
-        let shares_u64 = u64::try_from(redemption.shares)
-            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
-        let burn_ix = spl_token::instruction::burn(
-            token_program.key,
-            escrow_ai.key,
-            lp_mint.key,
-            &registry_pda,
-            &[],
-            shares_u64,
-        )?;
-        invoke_signed(
-            &burn_ix,
-            &[
-                escrow_ai.clone(),
-                lp_mint.clone(),
-                registry_ai.clone(),
-                token_program.clone(),
-            ],
-            &[&[
-                crate::constants::LP_VAULT_REGISTRY_SEED,
-                market_ai.key.as_ref(),
-                &[registry_bump],
-            ]],
-        )?;
-
-        // ── Decrement outstanding shares (mirrors the burn). ──
-        {
-            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-            // P3: the senior claim loses exactly the redeemed pro-rata slice (rounded down, so
-            // the remaining holders' per-share claim never falls). Uses S BEFORE the burn.
-            if let Some((vault_lp_ai, _, mut st)) = bound_tail {
-                st.senior_claim_atoms = vault_lp_v18::senior_claim_after_redemption(
-                    st.senior_claim_atoms,
-                    redemption.shares,
-                    reg.total_lp_shares_outstanding,
-                )
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-            }
-            reg.total_lp_shares_outstanding = reg
-                .total_lp_shares_outstanding
-                .checked_sub(redemption.shares)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
-        }
-
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
-        //
-        // GH#412: the rent goes to the REDEEMER, not the cranker.
-        //
-        // It used to go to whoever cranked, while `CancelRedemption` returned it to
-        // the redeemer — the same lamports, two different recipients depending on
-        // how the request ended. The rent was the redeemer's money either way; the
-        // cranker's incentive is a separate question and does not get funded out of
-        // someone else's rent deposit by accident of which path ran.
-        //
-        // Pinned to the RECORDED redeemer, so this cannot become a caller-chosen
-        // payout: `redemption.redeemer` was written at request time and is the same
-        // value `verify_user_token_account` already checks `redeemer_dest` against.
-        if redeemer_rent_dest.key.to_bytes() != redemption.redeemer {
-            return Err(PercolatorError::Unauthorized.into());
-        }
-        expect_writable(redeemer_rent_dest)?;
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **redeemer_rent_dest.try_borrow_mut_lamports()? = redeemer_rent_dest
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // v2.2 move event (tag 77): the principal / earnings split of the paid amount (the total
-        // is the vault->redeemer token transfer; the split is decided on chain and appears in no
-        // balance) and the shares burned. Emitted last, after the payout and burn succeeded.
-        fill_events_v22::emit_move(
-            fill_events_v22::TAG_EXECUTE_REDEMPTION,
-            &market_ai.key.to_bytes(),
-            fill_events_v22::MOVE_EARN_EXIT,
-            fill_events_v22::NO_ASSET,
-            fill_events_v22::sat_u64(principal_portion),
-            fill_events_v22::sat_u64(earnings_portion),
-            shares_u64,
-        );
         Ok(())
     }
 
@@ -38291,6 +38441,114 @@ pub mod processor {
             return Err(PercolatorError::RentExemptRequired.into());
         }
 
+        let (senior_claim, pinned_caps, growth_on) = init_vault_lp_bind_view(
+            market_ai,
+            lp_portfolio_ai,
+            own_ledger_ai,
+            sibling_ledger_ai,
+            &registry,
+            &registry_pda,
+            &canonical_matcher,
+            asset_index,
+            max_market_slots,
+            l_launch_x100,
+        )?;
+
+        let market_bytes = market_ai.key.to_bytes();
+        let bump_bytes = [vault_lp_bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::VAULT_LP_STATE_SEED,
+            market_bytes.as_ref(),
+            bump_bytes.as_ref(),
+        ];
+        create_pda_account(
+            admin,
+            vault_lp_ai,
+            system_program_ai,
+            state::vault_lp_state_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let st = state::VaultLpStateV18 {
+            market_group: market_bytes,
+            registry: registry_pda.to_bytes(),
+            lp_portfolio: lp_portfolio_ai.key.to_bytes(),
+            junior_owner: admin.key.to_bytes(),
+            senior_claim_atoms: senior_claim,
+            junior_deposited_atoms: 0,
+            junior_withdrawn_atoms: 0,
+            senior_fee_credited_atoms: 0,
+            recalled_atoms: 0,
+            asset_index: asset_index as u16,
+            junior_floor_bps,
+            senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
+            version: crate::constants::VAULT_LP_STATE_VERSION,
+            bump: vault_lp_bump,
+            backstop_outstanding_atoms: 0,
+            senior_drawn_atoms: 0,
+            senior_draw_outstanding_atoms: 0,
+        };
+        state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        state::set_registry_vault_lp_bound(&mut registry);
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+
+        // Auto-pin the matcher context (SetMatcherConfig + InitMatcherCtx for the registry-owned
+        // LP) with PROTOCOL parameters only.
+        let expected_sequence = state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
+        let asset_generation_frontier =
+            state::read_market_asset_generation_frontier(&market_ai.try_borrow_data()?)?;
+        pin_vault_lp_matcher_ctx(
+            program_id,
+            market_ai,
+            lp_portfolio_ai,
+            &registry_pda,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            VaultLpMatcherParams {
+                expected_sequence,
+                asset_generation_frontier,
+                trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
+                expiry_slot: u64::MAX,
+                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
+                kind: if growth_on {
+                    growth_v19::GROWTH_PIN_MATCHER_KIND
+                } else {
+                    vault_lp_v18::PIN_MATCHER_KIND
+                },
+                trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
+                base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
+                max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
+                impact_k_bps: vault_lp_v18::PIN_IMPACT_K_BPS,
+                liquidity_notional_e6: pinned_caps.liquidity_notional_e6,
+                max_fill_abs: pinned_caps.max_fill_abs,
+                max_inventory_abs: pinned_caps.max_inventory_abs,
+                fee_to_insurance_bps: vault_lp_v18::PIN_FEE_TO_INSURANCE_BPS,
+                skew_spread_mult_bps: vault_lp_v18::PIN_SKEW_SPREAD_MULT_BPS,
+            },
+        )
+    }
+
+    /// The market-view block of `handle_init_vault_lp` (bind checks, NAV -> senior claim, LP
+    /// portfolio init + registration, growth bind, vault-LP record, skew defaults, pinned caps),
+    /// out of line so the market view (152 B since engine #385's `protection_observed`) does not
+    /// sit in the handler's SBF frame. Same checks in the same order, same errors, same writes;
+    /// an error here returns from the handler exactly as the inline block did. Returns
+    /// `(senior_claim, pinned_caps, growth_on)`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn init_vault_lp_bind_view<'a>(
+        market_ai: &AccountInfo<'a>,
+        lp_portfolio_ai: &AccountInfo<'a>,
+        own_ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        canonical_matcher: &Pubkey,
+        asset_index: usize,
+        max_market_slots: usize,
+        l_launch_x100: Option<u16>,
+    ) -> Result<(u128, vault_lp_v18::PinnedMatcherCaps, bool), ProgramError> {
         let senior_claim = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -38396,81 +38654,7 @@ pub mod processor {
             };
             (senior_claim, caps, growth_on)
         };
-        let (senior_claim, pinned_caps, growth_on) = senior_claim;
-
-        let market_bytes = market_ai.key.to_bytes();
-        let bump_bytes = [vault_lp_bump];
-        let seeds: &[&[u8]] = &[
-            crate::constants::VAULT_LP_STATE_SEED,
-            market_bytes.as_ref(),
-            bump_bytes.as_ref(),
-        ];
-        create_pda_account(
-            admin,
-            vault_lp_ai,
-            system_program_ai,
-            state::vault_lp_state_account_len(),
-            program_id,
-            seeds,
-        )?;
-        let st = state::VaultLpStateV18 {
-            market_group: market_bytes,
-            registry: registry_pda.to_bytes(),
-            lp_portfolio: lp_portfolio_ai.key.to_bytes(),
-            junior_owner: admin.key.to_bytes(),
-            senior_claim_atoms: senior_claim,
-            junior_deposited_atoms: 0,
-            junior_withdrawn_atoms: 0,
-            senior_fee_credited_atoms: 0,
-            recalled_atoms: 0,
-            asset_index: asset_index as u16,
-            junior_floor_bps,
-            senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
-            version: crate::constants::VAULT_LP_STATE_VERSION,
-            bump: vault_lp_bump,
-            backstop_outstanding_atoms: 0,
-            senior_drawn_atoms: 0,
-            senior_draw_outstanding_atoms: 0,
-        };
-        state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-        state::set_registry_vault_lp_bound(&mut registry);
-        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
-
-        // Auto-pin the matcher context (SetMatcherConfig + InitMatcherCtx for the registry-owned
-        // LP) with PROTOCOL parameters only.
-        let expected_sequence = state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
-        let asset_generation_frontier =
-            state::read_market_asset_generation_frontier(&market_ai.try_borrow_data()?)?;
-        pin_vault_lp_matcher_ctx(
-            program_id,
-            market_ai,
-            lp_portfolio_ai,
-            &registry_pda,
-            matcher_prog,
-            matcher_ctx,
-            matcher_delegate,
-            VaultLpMatcherParams {
-                expected_sequence,
-                asset_generation_frontier,
-                trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
-                expiry_slot: u64::MAX,
-                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
-                kind: if growth_on {
-                    growth_v19::GROWTH_PIN_MATCHER_KIND
-                } else {
-                    vault_lp_v18::PIN_MATCHER_KIND
-                },
-                trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
-                base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
-                max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
-                impact_k_bps: vault_lp_v18::PIN_IMPACT_K_BPS,
-                liquidity_notional_e6: pinned_caps.liquidity_notional_e6,
-                max_fill_abs: pinned_caps.max_fill_abs,
-                max_inventory_abs: pinned_caps.max_inventory_abs,
-                fee_to_insurance_bps: vault_lp_v18::PIN_FEE_TO_INSURANCE_BPS,
-                skew_spread_mult_bps: vault_lp_v18::PIN_SKEW_SPREAD_MULT_BPS,
-            },
-        )
+        Ok(senior_claim)
     }
 
     /// Phase 2b: tag 94's skew-funding defaults for the just-bound asset.
