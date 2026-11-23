@@ -133,6 +133,16 @@ fn fork() -> Fork {
         }
         svm.set_account(k, acc).unwrap();
     }
+    // #386: the deployed bytes have no raw-basis sums; rebuild them (and each side's A) from the
+    // fixture's portfolios.
+    {
+        let datas: Vec<Vec<u8>> =
+            portfolios.iter().map(|k| svm.get_account(k).unwrap().data).collect();
+        let datas: Vec<&[u8]> = datas.iter().map(|d| d.as_slice()).collect();
+        let mut acc = svm.get_account(&slab).unwrap();
+        v21_upgrade::fill_raw_basis_sums(&mut acc.data, &datas);
+        svm.set_account(slab, acc).unwrap();
+    }
     svm.set_sysvar(&clock);
     let obs_seq = state::read_asset_control_sequences(&svm.get_account(&slab).unwrap().data, 0)
         .map(|c| c.oracle_observation)

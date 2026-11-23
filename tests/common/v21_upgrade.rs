@@ -14,6 +14,17 @@
 //! `PortfolioAccountV16Account`. A v2.1 portfolio has no record, which is exactly
 //! `LOSS_PROVENANCE_NONE` (0): the upgrader inserts those 4 zero bytes at the end of the engine
 //! body (before the wrapper's matcher-config tail), the projection removes them and asserts zero.
+//!
+//! Engine #395 (58466a0d, upstream 083a0d08) removed `V16ConfigAccount::public_b_chunk_atoms`
+//! (u128, right before `max_recovery_fallback_deviation_bps`): the chunk is now the engine
+//! constant `PUBLIC_B_CHUNK_ATOMS`. The upgrader drops those 16 bytes; the projection puts the
+//! constant back (what a v2.1 InitMarket built by `v21_init_market_data` stores).
+//!
+//! Engine #386 (e936c62d, upstream c030aa40) inserted `raw_basis_sum_{long,short}_q` (2 x u128)
+//! after `oi_eff_short_q` in `AssetStateV16Account`, and #385 (9ed6f921, upstream e18a3b98)
+//! appended `provider_protection_floor_{long,short}_num` (2 x u128) to the end of every engine
+//! slot. The upgrader inserts the raw-basis sums as zeros and `fill_raw_basis_sums` rebuilds
+//! them from the fixture's portfolios; the floor is part of the appended tail.
 #![allow(dead_code)]
 
 use percolator::{
@@ -50,21 +61,67 @@ pub const V22_LEG_REM_EXTRA: usize = 32;
 /// the assertion below names what the tail is made of today and fails loudly when that changes.
 pub const FUNDING_SCALE_TAIL: usize = core::mem::size_of::<EngineAssetSlotV16Account>()
     - core::mem::offset_of!(EngineAssetSlotV16Account, kf_drift_long);
-const _: () = assert!(FUNDING_SCALE_TAIL == 160 + 32 + 32);
+/// #277 drift tail 160 B + #282 R1 words 32 B + S10 provider mirror 32 B + #385 provider-protection
+/// floor 32 B (upstream e18a3b98).
+const _: () = assert!(FUNDING_SCALE_TAIL == 160 + 32 + 32 + 32);
+/// #395 (upstream 083a0d08): the v2.1 config's `public_b_chunk_atoms` (u128), gone from v2.2.
+pub const V21_CONFIG_CHUNK_LEN: usize = 16;
+/// #386 (upstream c030aa40): `raw_basis_sum_{long,short}_q`, inserted after `oi_eff_short_q`.
+pub const V22_RAW_BASIS_SUM_EXTRA: usize = 2 * 16;
+const _: () = assert!(
+    core::mem::offset_of!(AssetStateV16Account, raw_basis_sum_short_q)
+        == core::mem::offset_of!(AssetStateV16Account, raw_basis_sum_long_q) + 16
+        && core::mem::offset_of!(AssetStateV16Account, raw_basis_sum_long_q)
+            == core::mem::offset_of!(AssetStateV16Account, oi_eff_short_q) + 16
+);
+/// Bytes a v2.2 market header has over a v2.1 one (band/rent config words minus the dropped chunk).
+pub const V22_HEADER_GROWTH: usize = V22_CONFIG_EXTRA - V21_CONFIG_CHUNK_LEN;
+/// Bytes a v2.2 engine asset (and so every slot) has over a v2.1 one, outside the appended tail.
+pub const V22_ASSET_GROWTH: usize = V22_ASSET_EXTRA + V22_RAW_BASIS_SUM_EXTRA;
+
+/// Offset of the v2.1 `public_b_chunk_atoms` inside the market header (= where
+/// `max_recovery_fallback_deviation_bps` sits in v2.2).
+fn chunk_off() -> usize {
+    core::mem::offset_of!(MarketGroupV16HeaderAccount, config)
+        + core::mem::offset_of!(V16ConfigAccount, max_recovery_fallback_deviation_bps)
+}
+
+fn raw_sum_off() -> usize {
+    core::mem::offset_of!(AssetStateV16Account, raw_basis_sum_long_q)
+}
+
+/// A v2.2 `InitMarket` (no trailer, 203 B) re-encoded for the v2.1 program (219 B): the
+/// `public_b_chunk_atoms` u128 goes back in before the final `maintenance_fee_per_slot`, set to
+/// the engine constant this build uses for every market.
+pub fn v21_init_market_data(v22: Vec<u8>) -> Vec<u8> {
+    assert_eq!(v22[0], 0, "InitMarket tag");
+    assert_eq!(v22.len(), 203, "plain InitMarket (no trailer)");
+    let cut = v22.len() - 16;
+    let mut out = Vec::with_capacity(v22.len() + V21_CONFIG_CHUNK_LEN);
+    out.extend_from_slice(&v22[..cut]);
+    out.extend_from_slice(&percolator::PUBLIC_B_CHUNK_ATOMS.to_le_bytes());
+    out.extend_from_slice(&v22[cut..]);
+    out
+}
 
 fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let new_header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();
-    let old_header_len = new_header_len - V22_CONFIG_EXTRA;
+    let old_header_len = new_header_len - V22_HEADER_GROWTH;
     let config_off = core::mem::offset_of!(MarketGroupV16HeaderAccount, config);
-    let old_config_end = config_off + core::mem::size_of::<V16ConfigAccount>() - V22_CONFIG_EXTRA;
+    let old_config_end = config_off + core::mem::size_of::<V16ConfigAccount>() - V22_CONFIG_EXTRA
+        + V21_CONFIG_CHUNK_LEN;
+    let chunk_off = chunk_off();
     let new_slot_len = core::mem::size_of::<EngineAssetSlotV16Account>();
-    let old_slot_len = new_slot_len - V22_ASSET_EXTRA;
-    let old_asset_len = core::mem::size_of::<AssetStateV16Account>() - V22_ASSET_EXTRA;
+    let old_slot_len = new_slot_len - V22_ASSET_GROWTH;
+    let old_asset_len = core::mem::size_of::<AssetStateV16Account>() - V22_ASSET_GROWTH;
+    let raw_sum_off = raw_sum_off();
     let old_stride = ASSET_ORACLE_WRAPPER_LEN + old_slot_len;
     let mut out = Vec::with_capacity(old.len() + 4096);
     out.extend_from_slice(&old[..MARKET_GROUP_OFF]);
     let header = &old[MARKET_GROUP_OFF..MARKET_GROUP_OFF + old_header_len];
-    out.extend_from_slice(&header[..old_config_end]);
+    // #395: the v2.1 chunk is dropped (v2.2 uses the engine constant).
+    out.extend_from_slice(&header[..chunk_off]);
+    out.extend_from_slice(&header[chunk_off + V21_CONFIG_CHUNK_LEN..old_config_end]);
     out.extend_from_slice(&[0u8; V22_CONFIG_EXTRA]);
     out.extend_from_slice(&header[old_config_end..]);
     let rest = &old[MARKET_GROUP_OFF + old_header_len..];
@@ -80,7 +137,10 @@ fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     for slot in rest.chunks(stride) {
         out.extend_from_slice(&slot[..ASSET_ORACLE_WRAPPER_LEN]);
         let engine = &slot[ASSET_ORACLE_WRAPPER_LEN..];
-        out.extend_from_slice(&engine[..old_asset_len]);
+        // #386: zero raw-basis sums (`fill_raw_basis_sums` rebuilds them from the portfolios).
+        out.extend_from_slice(&engine[..raw_sum_off]);
+        out.extend_from_slice(&[0u8; V22_RAW_BASIS_SUM_EXTRA]);
+        out.extend_from_slice(&engine[raw_sum_off..old_asset_len]);
         out.extend_from_slice(&[0u8; V22_ASSET_EXTRA]);
         out.extend_from_slice(&engine[old_asset_len..]);
         if bare {
@@ -146,9 +206,69 @@ pub fn upgrade_v21_account(wrapper_id: &Pubkey, owner: &Pubkey, data: Vec<u8>) -
     out
 }
 
+/// #386 (upstream c030aa40), after `upgrade_v21_account`: a v2.1 slab has no raw-basis sums, so
+/// the upgrader leaves them zero. Each side's sum is the absolute raw basis of its current-epoch
+/// legs, so it is rebuilt here from the fixture's portfolios (every materialized portfolio of the
+/// market), and each side's A index is re-derived from the two totals as the engine does after
+/// every change: `max(1, floor(ADL_ONE * oi_eff / raw_basis_sum))`, `ADL_ONE` when they are equal,
+/// unchanged when the side has no basis. Mirrors the engine's `tests/p2b_live_replay.rs`
+/// (`fill_raw_basis_sums`, engine 2d2691f2). `slab` and `portfolios` are v2.2-layout bytes.
+pub fn fill_raw_basis_sums(slab: &mut [u8], portfolios: &[&[u8]]) {
+    use percolator::{SideV16, ADL_ONE};
+    assert_eq!(slab[10], KIND_MARKET, "slab");
+    let header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();
+    let asset_len = core::mem::size_of::<AssetStateV16Account>();
+    let stride = ASSET_ORACLE_WRAPPER_LEN + core::mem::size_of::<EngineAssetSlotV16Account>();
+    let base = MARKET_GROUP_OFF + header_len;
+    assert_eq!((slab.len() - base) % stride, 0, "v2.2 slab length");
+    let body_len = core::mem::size_of::<PortfolioAccountV16Account>();
+    let legs: Vec<percolator::PortfolioLegV16> = portfolios
+        .iter()
+        .flat_map(|p| {
+            assert_eq!(p[10], KIND_PORTFOLIO, "portfolio");
+            let acct: PortfolioAccountV16Account =
+                bytemuck::pod_read_unaligned(&p[HEADER_LEN..HEADER_LEN + body_len]);
+            acct.legs.map(|l| l.try_to_runtime().expect("leg decodes"))
+        })
+        .collect();
+    for i in 0..(slab.len() - base) / stride {
+        let at = base + i * stride + ASSET_ORACLE_WRAPPER_LEN;
+        let raw: AssetStateV16Account = bytemuck::pod_read_unaligned(&slab[at..at + asset_len]);
+        let mut asset = raw.try_to_runtime().expect("asset decodes");
+        let (mut long, mut short) = (0u128, 0u128);
+        for leg in &legs {
+            if !leg.active || leg.asset_index as usize != i || leg.basis_pos_q == 0 {
+                continue;
+            }
+            match leg.side {
+                SideV16::Long if leg.epoch_snap == asset.epoch_long => {
+                    long += leg.basis_pos_q.unsigned_abs()
+                }
+                SideV16::Short if leg.epoch_snap == asset.epoch_short => {
+                    short += leg.basis_pos_q.unsigned_abs()
+                }
+                _ => {}
+            }
+        }
+        asset.raw_basis_sum_long_q = long;
+        asset.raw_basis_sum_short_q = short;
+        let derive = |oi: u128, raw: u128, a: u128| match raw {
+            0 => a,
+            r if oi == r => ADL_ONE,
+            r => (ADL_ONE * oi / r).max(1),
+        };
+        asset.a_long = derive(asset.oi_eff_long_q, long, asset.a_long);
+        asset.a_short = derive(asset.oi_eff_short_q, short, asset.a_short);
+        slab[at..at + asset_len]
+            .copy_from_slice(bytemuck::bytes_of(&AssetStateV16Account::from_runtime(&asset)));
+    }
+}
+
 /// v2.2 -> v2.1 projection (the inverse of `upgrade_v21_account`): drops the appended band/rent
-/// words, ASSERTING they are all zero (a band-off, rent-off market must never write them), and
-/// restores the v2.1 discriminator and header VERSION. Used by the growth-off byte-parity test
+/// words, ASSERTING they are all zero (a band-off, rent-off market must never write them), drops
+/// the #386 raw-basis sums (live state the v2.1 layout has no place for), puts the #395 chunk
+/// back as the engine constant, and restores the v2.1 discriminator and header VERSION. The
+/// appended tail (incl. the #385 floor) is kept. Used by the growth-off byte-parity test
 /// to compare a v2.2 run against the deployed v2.1-layout program.
 pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
     if data.len() < HEADER_LEN || data[..8] != MAGIC.to_le_bytes() {
@@ -175,7 +295,10 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(data.len());
             out.extend_from_slice(&data[..MARKET_GROUP_OFF]);
             let header = &data[MARKET_GROUP_OFF..MARKET_GROUP_OFF + header_len];
-            out.extend_from_slice(&header[..config_end - V22_CONFIG_EXTRA]);
+            let chunk_off = chunk_off();
+            out.extend_from_slice(&header[..chunk_off]);
+            out.extend_from_slice(&percolator::PUBLIC_B_CHUNK_ATOMS.to_le_bytes());
+            out.extend_from_slice(&header[chunk_off..config_end - V22_CONFIG_EXTRA]);
             zero(&header[config_end - V22_CONFIG_EXTRA..config_end], "config");
             out.extend_from_slice(&header[config_end..]);
             let rest = &data[MARKET_GROUP_OFF + header_len..];
@@ -188,7 +311,11 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
             for slot in rest.chunks(stride) {
                 out.extend_from_slice(&slot[..ASSET_ORACLE_WRAPPER_LEN]);
                 let engine = &slot[ASSET_ORACLE_WRAPPER_LEN..];
-                out.extend_from_slice(&engine[..asset_len - V22_ASSET_EXTRA]);
+                let raw_sum_off = raw_sum_off();
+                out.extend_from_slice(&engine[..raw_sum_off]);
+                out.extend_from_slice(
+                    &engine[raw_sum_off + V22_RAW_BASIS_SUM_EXTRA..asset_len - V22_ASSET_EXTRA],
+                );
                 zero(&engine[asset_len - V22_ASSET_EXTRA..asset_len], "asset");
                 out.extend_from_slice(&engine[asset_len..]);
             }
@@ -234,7 +361,7 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
 
 /// v2.1 account lengths for the same capacity (v2.2 length minus the appended words).
 pub fn v21_market_len(v22_len: usize, slots: usize) -> usize {
-    v22_len - V22_CONFIG_EXTRA - slots * V22_ASSET_EXTRA
+    v22_len - V22_HEADER_GROWTH - slots * V22_ASSET_GROWTH
 }
 
 pub fn v21_portfolio_len(v22_len: usize) -> usize {
@@ -242,5 +369,5 @@ pub fn v21_portfolio_len(v22_len: usize) -> usize {
 }
 
 pub fn deployed_market_len(v22_len: usize, slots: usize) -> usize {
-    v22_len - V22_CONFIG_EXTRA - slots * (V22_ASSET_EXTRA + FUNDING_SCALE_TAIL)
+    v22_len - V22_HEADER_GROWTH - slots * (V22_ASSET_GROWTH + FUNDING_SCALE_TAIL)
 }
