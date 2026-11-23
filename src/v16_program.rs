@@ -6532,6 +6532,67 @@ pub mod state {
         Ok((current_market_id, header.next_market_id.get()))
     }
 
+    /// What the engine records about one backing domain's provider, read from the market
+    /// account's bytes. Amounts are `BOUND_SCALE`-scaled. Port of upstream `d667c3ed`
+    /// (upstream PR 486; engine #385 = upstream e18a3b98 + 560e05fa, percolator-prog#382).
+    ///
+    /// `protection_num` is the provider principal that neither a claim on the domain nor an
+    /// unrepaid consumption has taken. `floor_num` is the lowest protection the domain has had
+    /// in this generation of its asset, moved only by the provider's own top-ups and principal
+    /// withdrawals: a loss that the domain's losers later refill stays recorded, and spending
+    /// that refill again down to the floor records nothing. A program that keeps depositor
+    /// shares over one provider position therefore charges every loss exactly once whenever it
+    /// reads: its books expect `floor + top-ups - withdrawals` since the last read, and what is
+    /// missing is the loss since then. `market_id` changes when the asset is restarted, which
+    /// starts the floor again from zero.
+    ///
+    /// Accounting only: no instruction is gated on these values, and no instruction needs an
+    /// extra account to keep them. Every instruction that changes a domain's source credit or
+    /// backing keeps them current.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProviderProtectionV16 {
+        pub market_id: u64,
+        pub principal_num: u128,
+        pub protection_num: u128,
+        pub floor_num: u128,
+    }
+
+    /// Reads `ProviderProtectionV16` for `domain` (`2 * asset_index` long, `+ 1` short, the
+    /// engine's own mapping). A domain whose asset index is at or past the market's configured
+    /// slot count is refused with `InvalidInstruction`.
+    pub fn read_provider_protection(
+        data: &[u8],
+        domain: usize,
+    ) -> Result<ProviderProtectionV16, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_market_dynamic_len(data)?;
+        let asset_index = domain / 2;
+        if asset_index >= market_header(data)?.config.max_market_slots.get() as usize {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let slot = asset_slot_wire(data, asset_index)?;
+        let (side, principal_num) = if domain % 2 == 0 {
+            (
+                percolator::SideV16::Long,
+                slot.provider_principal_long.get(),
+            )
+        } else {
+            (
+                percolator::SideV16::Short,
+                slot.provider_principal_short.get(),
+            )
+        };
+        // The stored floor is brought up to date at the domain's next write. Until then the
+        // engine's reader returns the lower of it and the current protection.
+        let (protection_num, floor_num) = slot.provider_protection_and_floor_num(side);
+        Ok(ProviderProtectionV16 {
+            market_id: slot.asset.market_id.get(),
+            principal_num,
+            protection_num,
+            floor_num,
+        })
+    }
+
     pub fn read_market_trade_preflight(
         data: &[u8],
         asset_index: usize,

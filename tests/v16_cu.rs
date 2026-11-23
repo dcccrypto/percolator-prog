@@ -41,6 +41,9 @@ mod inv_031_live_exit_loss_stale_gate;
 #[path = "invariants/cu/inv_031_provider_exit_principal.rs"]
 mod inv_031_provider_exit_principal;
 
+#[path = "invariants/cu/inv_031_provider_protection_floor.rs"]
+mod inv_031_provider_protection_floor;
+
 
 thread_local! {
     /// v2.2 fill events: logs of the last transaction (success or failure) sent by this test thread.
