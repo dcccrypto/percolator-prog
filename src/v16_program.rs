@@ -19537,8 +19537,11 @@ pub mod processor {
         account_b: &percolator::PortfolioV16ViewMut<'_>,
     ) -> ProgramResult {
         for (account, before) in [(account_a, before_a), (account_b, before_b)] {
-            for source in account.header.source_domains.iter() {
+            for (i, source) in account.header.source_domains.iter().enumerate() {
                 if !source.is_occupied() {
+                    if source_domain_tail_is_zero(&account.header.source_domains, i) {
+                        break;
+                    }
                     continue;
                 }
                 let domain = source.domain.get();
@@ -19555,6 +19558,25 @@ pub mod processor {
             }
         }
         Ok(())
+    }
+
+    /// True iff every source-domain slot from `from` on is all-zero bytes, i.e. equal to
+    /// `PortfolioSourceDomainV16Account::default()` and so not occupied. One overlapping byte
+    /// compare (`b[0] == 0 && b[..n-1] == b[1..]`, one `sol_memcmp_` on SBF) instead of testing
+    /// every field of up to 32 slots. The scans below only act on occupied slots, so stopping at
+    /// such a tail leaves their result unchanged.
+    #[doc(hidden)]
+    #[inline]
+    pub fn source_domain_tail_is_zero(
+        domains: &[percolator::PortfolioSourceDomainV16Account],
+        from: usize,
+    ) -> bool {
+        let tail = match domains.get(from..) {
+            Some(tail) if !tail.is_empty() => tail,
+            _ => return true,
+        };
+        let bytes: &[u8] = bytemuck::cast_slice(tail);
+        bytes[0] == 0 && bytes[..bytes.len() - 1] == bytes[1..]
     }
 
     // Sparse before/after trade snapshots: one (domain, value) entry per OCCUPIED source-domain slot
@@ -19574,10 +19596,14 @@ pub mod processor {
         account: &percolator::PortfolioV16ViewMut<'_>,
     ) -> Result<alloc::boxed::Box<[(u32, u128)]>, ProgramError> {
         let mut out = Vec::new();
-        for slot in account.header.source_domains.iter() {
-            if slot.is_occupied() {
-                out.push((slot.domain.get(), slot.source_lien_effective_reserved.get()));
+        for (i, slot) in account.header.source_domains.iter().enumerate() {
+            if !slot.is_occupied() {
+                if source_domain_tail_is_zero(&account.header.source_domains, i) {
+                    break;
+                }
+                continue;
             }
+            out.push((slot.domain.get(), slot.source_lien_effective_reserved.get()));
         }
         Ok(out.into_boxed_slice())
     }
@@ -19652,14 +19678,18 @@ pub mod processor {
             domains: [0u32; percolator::PORTFOLIO_SOURCE_DOMAIN_CAP],
             len: 0,
         };
-        for slot in account.header.source_domains.iter() {
-            if slot.is_occupied() {
-                if out.len >= out.domains.len() {
-                    return Err(PercolatorError::InvalidInstruction.into());
+        for (i, slot) in account.header.source_domains.iter().enumerate() {
+            if !slot.is_occupied() {
+                if source_domain_tail_is_zero(&account.header.source_domains, i) {
+                    break;
                 }
-                out.domains[out.len] = slot.domain.get();
-                out.len += 1;
+                continue;
             }
+            if out.len >= out.domains.len() {
+                return Err(PercolatorError::InvalidInstruction.into());
+            }
+            out.domains[out.len] = slot.domain.get();
+            out.len += 1;
         }
         // Other active legs retain both future settlement domains. A leg fully closed
         // by this trade can release its latent pair, but never its occupied claims.
@@ -48325,13 +48355,17 @@ pub mod processor {
         account: &percolator::PortfolioV16ViewMut<'_>,
     ) -> Result<SourceBackingSnapshot, ProgramError> {
         let mut out = Vec::new();
-        for slot in account.header.source_domains.iter() {
-            if slot.is_occupied() {
-                out.push((
-                    slot.domain.get(),
-                    slot.source_lien_counterparty_backing_num.get(),
-                ));
+        for (i, slot) in account.header.source_domains.iter().enumerate() {
+            if !slot.is_occupied() {
+                if source_domain_tail_is_zero(&account.header.source_domains, i) {
+                    break;
+                }
+                continue;
             }
+            out.push((
+                slot.domain.get(),
+                slot.source_lien_counterparty_backing_num.get(),
+            ));
         }
         Ok(out.into_boxed_slice())
     }
@@ -48394,8 +48428,11 @@ pub mod processor {
         // counterparty-backing increase vs the before snapshot (looked up by domain) and charge the
         // backing fee. O(active source-domains), independent of N.
         let mut total = 0u128;
-        for slot in account.header.source_domains.iter() {
+        for (i, slot) in account.header.source_domains.iter().enumerate() {
             if !slot.is_occupied() {
+                if source_domain_tail_is_zero(&account.header.source_domains, i) {
+                    break;
+                }
                 continue;
             }
             let domain = slot.domain.get();
