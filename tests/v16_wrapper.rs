@@ -29634,3 +29634,148 @@ mod acct_sub;
 
 // J-20261114-PROG-WITHDRAW-SUB: unsigned-path substitution cells (tests/acct_sub_unsigned/mod.rs).
 mod acct_sub_unsigned;
+
+/// ADOPT upstream aac89b9e (INV-046, "ignore a trade print on a Recovery asset"): shutdown
+/// freezes a Recovery asset's mark, so a risk-reducing trade print there must not move the
+/// trade-driven EWMA (nor its funding-mark checkpoint) and pays no mark-externality fee.
+/// Before the port the Recovery reduction itself reverted (`EngineInvalidConfig`, Custom 14): the
+/// mark-externality fee was quoted against a mark the trade could no longer move.
+#[test]
+fn v16_wrapper_recovery_reduction_ignores_the_trade_print_on_an_ewma_asset() {
+    let mut admin = signer();
+    let mut insurance_authority = signer();
+    let mut insurance_operator = signer();
+    let mut backing_authority = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+    let _mint = init_market(&mut admin, &mut market);
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
+            stale_slots: 9000,
+            force_close_delay_slots: 5,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        insurance_authority.key.to_bytes(),
+        insurance_operator.key.to_bytes(),
+        backing_authority.key.to_bytes(),
+    )
+    .unwrap();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
+    let trade = |size_q: i128,
+                 long_account: &TestAccount,
+                 short_account: &TestAccount,
+                 market: &TestAccount| {
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(long_account).0,
+            account_a_position_epoch: portfolio_identity(long_account).2,
+            account_b_portfolio_id: portfolio_identity(short_account).0,
+            account_b_position_epoch: portfolio_identity(short_account).2,
+            market_id: state::read_market_trade_preflight(&market.data, 1)
+                .map(|t| t.3)
+                .unwrap_or(0),
+            asset_index: 1,
+            size_q,
+            exec_price: 150,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        }
+    };
+    run_ix(
+        trade((POS_SCALE * 2) as i128, &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_SHUTDOWN,
+        1,
+        2,
+        0,
+    )
+    .unwrap();
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(group.assets[1].lifecycle, AssetLifecycleV16::Recovery);
+    assert_eq!(group.assets[1].effective_price, 150);
+
+    // Make asset 1 a trade-driven (EWMA_MARK) asset whose stored average sits away from the
+    // frozen price, so a print that is not ignored visibly moves it.
+    let mut profile = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+    profile.oracle_mode = ORACLE_MODE_EWMA_MARK;
+    profile.oracle_leg_count = 0;
+    profile.oracle_leg_flags = 0;
+    profile.invert = 0;
+    profile.unit_scale = 0;
+    profile.conf_filter_bps = 0;
+    profile.max_staleness_secs = 0;
+    profile.hybrid_soft_stale_slots = 0;
+    profile.oracle_leg_feeds = [[0u8; 32]; ORACLE_LEG_CAP];
+    profile.oracle_leg_prices_e6 = [0u64; ORACLE_LEG_CAP];
+    profile.oracle_leg_publish_times = [0i64; ORACLE_LEG_CAP];
+    profile.mark_ewma_e6 = 140;
+    profile.oracle_target_price_e6 = 140;
+    profile.mark_ewma_last_slot = 0;
+    // halflife 1 with dt >= 1 gives the print at least half weight: 140 -> >= 145.
+    profile.mark_ewma_halflife_slots = 1;
+    profile.mark_min_fee = 0;
+    state::write_asset_oracle_profile(&mut market.data, 1, &profile).unwrap();
+    let before = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+
+    run_ix(
+        trade(-(POS_SCALE as i128), &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+    let after = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+    assert_eq!(
+        active_leg_for_asset(&state::read_portfolio(&long_account.data).unwrap(), 1)
+            .basis_pos_q
+            .unsigned_abs(),
+        POS_SCALE,
+        "the Recovery reduction itself must land"
+    );
+    assert_eq!(
+        after.mark_ewma_e6, before.mark_ewma_e6,
+        "a Recovery asset's frozen mark must ignore the trade print"
+    );
+    assert_eq!(after.mark_ewma_last_slot, before.mark_ewma_last_slot);
+    assert_eq!(after.funding_mark_e6, before.funding_mark_e6);
+    assert_eq!(after.funding_mark_pending_e6, before.funding_mark_pending_e6);
+    assert_eq!(after.funding_mark_pending_slot, before.funding_mark_pending_slot);
+    assert_eq!(
+        after.effective_price_provenance, before.effective_price_provenance,
+        "an ignored print must not taint the price provenance"
+    );
+}
