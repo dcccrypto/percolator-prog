@@ -80,6 +80,11 @@ Percolator enforces three layers with distinct responsibilities:
 - trusted **only by the LP that registered it**, not by the protocol as a whole
 - Percolator treats matcher as adversarial except for LP-chosen semantics and validates strict ABI constraints.
 
+### Outside Percolator: the collateral mint issuer (freeze authority)
+- Markets may use a collateral mint that has a freeze authority (for example USDC). This is allowed on purpose: Percolator does not reject or allowlist such mints.
+- The issuer can freeze the market vault token account or any user's token account. If it does, deposits and withdrawals in that mint stop until the issuer unfreezes the account.
+- Percolator can't prevent this. Users of a market take on the issuer's freeze risk for that mint.
+
 ---
 
 ## Account model
