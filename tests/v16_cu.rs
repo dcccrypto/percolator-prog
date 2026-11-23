@@ -9090,7 +9090,7 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // this call" case: `collect_maintenance_fee_before_value_debit_view` -> engine
 // `sync_account_fee_to_slot_not_atomic` (percolator `src/v16.rs:20356`) calls
 // `settle_account_side_effects_not_atomic`, which for a B-backlog exceeding one bounded
-// `public_b_chunk_atoms` chunk computes `Ok(AccountBChunk(_))` -- durably marking the account
+// public B chunk computes `Ok(AccountBChunk(_))` -- durably marking the account
 // B-stale and consuming one chunk on the SAME zero-copy view the rest of the instruction uses --
 // but then CONVERTS that outcome into `Err(V16Error::BStale)` (`src/v16.rs:20386-20394`) instead
 // of returning it. The prior code let that `Err` propagate via `?`, reverting the WHOLE
@@ -9098,8 +9098,11 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // chunk progress and the B-stale mark that had already landed. Every subsequent
 // Refresh(0)/Liquidate(1)/SettleB(2) call therefore re-enters with `b_stale_state` still 0,
 // re-hits the identical error, and reverts again -- a PERMANENT LIVELOCK reachable whenever
-// `public_b_chunk_atoms` (an admin knob with no minimum validation) is bounded below an
-// account's B-backlog. An underwater account stuck this way could never be liquidated, because
+// the public B chunk is bounded below an account's B-backlog. (Upstream 083a0d08 made the chunk the
+// engine constant `PUBLIC_B_CHUNK_ATOMS = MAX_VAULT_TVL` = 1e16 atoms, so the backlog that
+// triggers it is now one whose settled LOSS exceeds 1e16 atoms: the fixtures seed a B index
+// debt of `DEBT_B` = 4.5e31 on a 1-unit leg, a loss of 4.5e16 atoms = 4.5 chunks.)
+// An underwater account stuck this way could never be liquidated, because
 // even the crank's own designated remedy action, SettleB(2), was blocked by this SAME shared
 // fee-collection preamble on its very first call.
 //
@@ -9113,15 +9116,22 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // drains, and a genuinely liquidatable account can still be liquidated afterward) with the fix.
 #[test]
 fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() {
-    // Bounded (NOT `MAX_VAULT_TVL`/u128::MAX) per-call atom budget -- an admin could plausibly
-    // configure a small value like this, and it is exactly the case the old code livelocked on.
-    const CHUNK_ATOMS: u128 = 2;
-    // A LONG/SHORT-domain B-index debt that needs several `CHUNK_ATOMS`-sized chunks to fully
-    // settle (>1 chunk is the whole point -- a single-chunk backlog never diverges between the
-    // old and new code, since `settle_account_side_effects_not_atomic` only returns
-    // `AccountBChunk` when `remaining_after != 0` after one chunk).
-    const DEBT_B: u128 = 7_000_000_000_000_000;
+    // The per-call B chunk is the engine constant (1e16 atoms), no longer an admin knob.
+    let chunk_atoms: u128 = percolator::PUBLIC_B_CHUNK_ATOMS;
+    // A LONG/SHORT-domain B-index debt whose settled loss needs several chunks to fully settle
+    // (>1 chunk is the whole point -- a single-chunk backlog never diverges between the old and
+    // new code, since `settle_account_side_effects_not_atomic` only returns `AccountBChunk` when
+    // `remaining_after != 0` after one chunk). A 1-unit (POS_SCALE) leg has loss weight POS_SCALE,
+    // so a B-index debt of D costs `POS_SCALE * D / SOCIAL_LOSS_DEN` atoms: 4.5e31 -> 4.5e16.
+    const DEBT_B: u128 = 45_000_000_000_000_000_000_000_000_000_000;
+    // Phase 3's backlog (loss 7 atoms, under one chunk).
+    const DEBT_B_SUB_CHUNK: u128 = 7_000_000_000_000_000;
     const MAX_PROGRESS_CALLS: usize = 12;
+    // Non-vacuity of the fixture: the backlog really exceeds one chunk.
+    assert!(
+        (POS_SCALE * DEBT_B / percolator::SOCIAL_LOSS_DEN) > 2 * chunk_atoms,
+        "fixture: the backlog's loss must span more than two chunks"
+    );
 
     // ---- Phase 1: Refresh(0) progresses a b_stale_state==0, backlog-exceeding account
     // instead of reverting on every call. ----
@@ -9179,9 +9189,11 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         );
 
         let mut cleared = false;
+        let mut calls = 0usize;
         for i in 0..MAX_PROGRESS_CALLS {
             let slot = accrual_slot + i as u64;
             env.svm.warp_to_slot(slot);
+            calls += 1;
             let result = env.send(
 ProgInstruction::PermissionlessCrank {
                     now_slot: slot,
@@ -9209,6 +9221,12 @@ ProgInstruction::PermissionlessCrank {
             cleared,
             "Refresh(0) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
              instead of livelocking"
+        );
+        // (a call settles a bounded number of chunks; a 4.5-chunk backlog does not fit in one)
+        assert!(
+            calls >= 2,
+            "non-vacuity: a backlog of {} chunks cannot clear in one crank call, got {calls} call(s)",
+            (POS_SCALE * DEBT_B / percolator::SOCIAL_LOSS_DEN).div_ceil(chunk_atoms)
         );
         assert_eq!(
             env.portfolio_state(victim).legs[0].b_snap,
@@ -9258,9 +9276,11 @@ ProgInstruction::PermissionlessCrank {
         assert!(!env.portfolio_state(victim).b_stale_state);
 
         let mut cleared = false;
+        let mut calls = 0usize;
         for i in 0..MAX_PROGRESS_CALLS {
             let slot = accrual_slot + i as u64;
             env.svm.warp_to_slot(slot);
+            calls += 1;
             let result = env.send(
 ProgInstruction::PermissionlessCrank {
                     now_slot: slot,
@@ -9287,6 +9307,10 @@ ProgInstruction::PermissionlessCrank {
             cleared,
             "SettleB(2) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
              instead of livelocking"
+        );
+        assert!(
+            calls >= 2,
+            "non-vacuity: a multi-chunk backlog cannot clear in one crank call, got {calls} call(s)"
         );
     }
 
@@ -9330,10 +9354,12 @@ ProgInstruction::PermissionlessCrank {
                 .accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true)
                 .unwrap();
         });
-        // Seed a real, outstanding SHORT-domain B debt on the victim's leg, exceeding one
-        // chunk.
+        // Seed a real, outstanding SHORT-domain B debt on the victim's leg. It is deliberately
+        // SUB-chunk (a healthy account cannot carry a multi-chunk backlog: a settled loss above
+        // one chunk, 1e16 atoms, exceeds any capital the vault may hold). The multi-chunk
+        // property is pinned by phases 1 and 2; this phase pins liquidation after the drain.
         env.mutate_market(|_cfg, group| {
-            group.assets[0].b_short_num = DEBT_B;
+            group.assets[0].b_short_num = DEBT_B_SUB_CHUNK;
         });
         assert!(
             !env.portfolio_state(short_account).b_stale_state,
@@ -9374,12 +9400,9 @@ ProgInstruction::PermissionlessCrank {
              account can be meaningfully liquidated"
         );
 
-        // (This phase used to restore a bounded `public_b_chunk_atoms` to MAX_VAULT_TVL here; the
-        // chunk is now the constant PUBLIC_B_CHUNK_ATOMS = MAX_VAULT_TVL, upstream 083a0d08.)
-
         // Drive the account genuinely bankrupt via a SECOND, much larger B-domain debt (same
         // engine-native settlement path already proven above, not a raw pnl/capital write): with
-        // `public_b_chunk_atoms` now unbounded, this settles fully in one crank call and
+        // the chunk being the 1e16-atom engine constant, this settles fully in one crank call and
         // realizes real, conservation-safe loss into pnl via
         // `set_account_pnl_after_domain_first_source_claim_burn` -- unlike a direct pnl poke,
         // this keeps `c_tot` and the domain/insurance ledgers internally consistent, which a raw

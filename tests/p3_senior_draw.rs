@@ -643,10 +643,13 @@ fn market_params() -> V16CuMarketParams {
         }
     }
 }
-// (Anvil, copy only) C-7: the seeded market's small public B chunk makes a large bankrupt
-// residual exceed the single-step capacity, which is the engine's IMMEDIATE-Recovery path.
-thread_local! { static C7_BCHUNK: std::cell::Cell<u128> = const { std::cell::Cell::new(50_000) }; }
-thread_local! { static TL_BCHUNK: std::cell::Cell<u128> = const { std::cell::Cell::new(percolator::MAX_VAULT_TVL) }; }
+// (Anvil, copy only) C-7 note: these fixtures used to seed a small public B chunk (50_000 atoms) so
+// a large bankrupt residual exceeded the single-step capacity, the engine's IMMEDIATE-Recovery
+// path. Upstream 083a0d08 made the chunk the engine constant `PUBLIC_B_CHUNK_ATOMS` (1e16
+// atoms), so at this fixture's scale (<= 1e7 atoms of backing) the loss is always booked in one
+// step and that path is NOT reached here; the C-7 wind-down tests below now cover the
+// single-step-booked wind-down. The Recovery path itself is pinned at chunk scale in
+// `earn_drain_replay` (wedge_residual_above_chunk_*).
 
 impl P3 {
     /// 75 into an explicit domain (0 or 1).
@@ -1738,7 +1741,6 @@ fn p3_b24_live_senior_redeems_full_claim_after_a_converted_win() {
 /// nine +450 bps pushes ~524 slots apart with ONLY the trader cranked. Returns before any LP crank.
 fn c7_world(senior: u64, junior: u64) -> (P3, (Keypair, Pubkey), (Keypair, Pubkey), (Keypair, Pubkey)) {
     TL_IM.with(|c| c.set(2_000));
-    TL_BCHUNK.with(|c| c.set(C7_BCHUNK.with(|b| b.get())));
     let mut w = P3::new();
     w.create_vault();
     let s0 = Keypair::new();
@@ -1790,6 +1792,7 @@ fn c7_world(senior: u64, junior: u64) -> (P3, (Keypair, Pubkey), (Keypair, Pubke
 thread_local! { static C7_STALE_RESOLVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 thread_local! { static C7_A1: std::cell::Cell<Pubkey> = std::cell::Cell::new(Pubkey::default()); }
 thread_local! { static C7_D1_SENIOR: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+thread_local! { static C7_MODE0: std::cell::Cell<percolator::MarketModeV16> = const { std::cell::Cell::new(percolator::MarketModeV16::Live) }; }
 thread_local! { static C7_WINNER_HOLDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 
 fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) -> (u128, u128, u128, u128) {
@@ -1813,6 +1816,7 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
         let _ = w.crank(lp);
     }
     let mode0 = w.env.market_state().1.mode;
+    C7_MODE0.with(|c| c.set(mode0));
     eprintln!("C7 mode after the move: {mode0:?}; hlock {}", w.env.market_state().1.bankruptcy_hlock_active);
     // Live: the winner closes, converts and withdraws.
     let m = w.env.market;
@@ -1858,9 +1862,10 @@ fn c7_winddown(w: &mut P3, s0: &Keypair, a0: Pubkey, t: &Keypair, tp: Pubkey) ->
     // Resolved wind-down, rehearsal order.
     let jo = admin.pubkey();
     let nft = Pubkey::find_program_address(&[b"nft_registry", m.as_ref()], &w.env.program_id).0;
-    // C-7 ROOT CAUSE: nothing is locked; every resolved bankruptcy step is CHUNKED by the market's
-    // `public_b_chunk_atoms` (the vault LP's resolved bankrupt close in 101, the winner's B-loss
-    // settlement in CloseResolved), and each exit waits on the one before it. The permissionless
+    // C-7 ROOT CAUSE: nothing is locked; every resolved bankruptcy step is chunked by the public B
+    // chunk (the vault LP's resolved bankrupt close in 101, the winner's B-loss settlement in
+    // CloseResolved), and each exit waits on the one before it. The chunk is now the engine
+    // constant PUBLIC_B_CHUNK_ATOMS (1e16 atoms), so at this scale each step is a single call. The permissionless
     // order is: repeat 101/0 until the vault LP's close finalizes, then repeat CloseResolved.
     for _ in 0..200 {
         let l = w.env.portfolio_state(w.lp);
@@ -1923,13 +1928,17 @@ fn p3_rehearsal23_seniors_exit_after_stranger_stale_resolve() {
     assert!(left <= 2_000, "stranded {left}");
 }
 
-/// C-7 (b): senior backing EXHAUSTED (tiny seniors) — whatever path the engine takes (immediate
-/// Recovery included), the Resolved wind-down completes: everyone exits, nothing is locked.
+/// C-7 (b): senior backing EXHAUSTED (tiny seniors) — the Resolved wind-down completes: everyone
+/// exits, nothing is locked. At the engine-constant public B chunk (1e16 atoms, upstream 083a0d08)
+/// the loss is booked in one step, so the market stays Live after the move (pinned below) and the
+/// wind-down runs from an admin resolve; the immediate-Recovery entry (residual above the chunk) is
+/// not reachable at this scale and is pinned in `earn_drain_replay`.
 #[test]
 fn p3_c7_winddown_completes_when_seniors_are_exhausted() {
     let (mut w, (s0, a0), (t, tp), _) = c7_world(50_000, 300_000);
     let v0 = w.tok(&w.env.vault) as u128;
     let (winner, senior, junior, left) = c7_winddown(&mut w, &s0, a0, &t, tp);
+    assert_eq!(C7_MODE0.with(|c| c.get()), percolator::MarketModeV16::Live, "no Recovery at this scale: the loss is booked in one step");
     eprintln!("C7-b: vault {v0}: winner {winner} senior {senior} junior {junior} left {left}");
     conserved(&w, "c7-b");
     assert!(winner > 2_000_000, "the winner is paid (at least its capital and the junior)");
@@ -1972,7 +1981,6 @@ fn p3_draw_exhausted_seniors_winddown_completes() {
 #[test]
 #[ignore]
 fn p3_valve_fires_only_after_senior_backing_is_exhausted() {
-    C7_BCHUNK.with(|b| b.set(percolator::MAX_VAULT_TVL));
     let (mut w, (s0, a0), (t, tp), _) = c7_world(50_000, 300_000);
     let lp = w.lp;
     let stranger = Keypair::new();

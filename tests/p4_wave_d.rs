@@ -657,10 +657,11 @@ fn market_params() -> V16CuMarketParams {
         }
     }
 }
-// (Anvil, copy only) C-7: the seeded market's small public B chunk makes a large bankrupt
-// residual exceed the single-step capacity, which is the engine's IMMEDIATE-Recovery path.
-thread_local! { static C7_BCHUNK: std::cell::Cell<u128> = const { std::cell::Cell::new(50_000) }; }
-thread_local! { static TL_BCHUNK: std::cell::Cell<u128> = const { std::cell::Cell::new(percolator::MAX_VAULT_TVL) }; }
+// (Anvil, copy only) C-7 note: this copy of the P3 harness once seeded a small public B chunk
+// (50_000 atoms) for the C-7 wind-down fixtures; upstream 083a0d08 made the chunk the engine
+// constant `PUBLIC_B_CHUNK_ATOMS` (1e16 atoms) and the seed (and its thread-locals) is gone. No test
+// in this file reaches the immediate-Recovery path through a chunk; that path is pinned at chunk
+// scale in `earn_drain_replay` (wedge_residual_above_chunk_*).
 
 impl P3 {
     /// 75 into an explicit domain (0 or 1).
