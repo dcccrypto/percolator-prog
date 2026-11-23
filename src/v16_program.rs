@@ -17342,6 +17342,17 @@ pub mod processor {
         expect_signer(market_ai)?;
         expect_writable(market_ai)?;
         expect_owner(market_ai, program_id)?;
+        // review/zerolamport-1119 (the #668 class, for the market): `owner == program_id` does
+        // not prove the market will exist after this transaction. A 0-lamport account handed to
+        // this program by `createAccount(lamports = 0)` or `Allocate` + `Assign` IS owned by it
+        // for the rest of the transaction, and the runtime stores it as the default account
+        // (System-owned, no data) at commit while keeping every other write -- so a market
+        // initialised here could be used (portfolios registered, PDAs keyed on it created) and
+        // then vanish. `lamports > 0` is sufficient: a non-zero balance below rent-exemption
+        // already fails the runtime's post-transaction rent-state check.
+        if market_ai.lamports() == 0 {
+            return Err(PercolatorError::RentExemptRequired.into());
+        }
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
             || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
