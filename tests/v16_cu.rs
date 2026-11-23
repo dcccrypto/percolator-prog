@@ -30263,6 +30263,84 @@ fn v16_bpf_low_mark_same_slot_recrank_keeps_the_carry() {
     assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE + 20);
 }
 
+/// INV-045 for the path branch: after a long walk on the carry path the engine's cap anchor
+/// (`fund_px_last`) is still the price the walk started at. A reversed target must restart it
+/// at the mark, so one slot moves the mark by at most the cap of the mark, whether the new
+/// target is staged by a later-slot crank or by a second crank in the same slot (dt = 0).
+#[test]
+fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
+    const START: u64 = 90;
+    for same_slot_staging in [false, true] {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: START,
+            max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
+            max_accrual_dt_slots: 10,
+            min_funding_lifetime_slots: 10,
+            ..V16CuMarketParams::default()
+        });
+        env.svm.warp_to_slot(0);
+        env.configure_auth_mark_with_cu(0, START);
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long_account = env.create_portfolio(&long_owner);
+        let short_account = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long_account, 10_000_000);
+        env.deposit(&short_owner, short_account, 10_000_000);
+        env.trade_with_cu(
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            START,
+            0,
+        );
+        // Walk down for 60 slots: 0.9 atoms a slot from the anchor at 90.
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 10);
+        for slot in 1..=60u64 {
+            low_pin_crank(&mut env, long_account, slot);
+        }
+        let walked = env.market_state().1.assets[0];
+        let mark = walked.effective_price;
+        assert_eq!(mark, START - 54, "60 slots at 0.9 atoms a slot");
+        assert_eq!(walked.fund_px_last, START, "the walk keeps its start anchor");
+        let cap_of_mark = |slots: u64| mark * LOW_PIN_CAP_BPS * slots / 10_000;
+
+        // Reverse the target. A kept anchor of 90 would allow 0.9 atoms a slot (one atom by
+        // the second slot); the cap of the mark is 0.36 (one atom only by the third).
+        if same_slot_staging {
+            env.svm.expire_blockhash();
+            env.push_auth_mark_with_cu(60, 1_000);
+            // The asset is already at slot 60: this crank only stages the new target.
+            low_pin_crank(&mut env, short_account, 60);
+            let staged = env.market_state().1.assets[0];
+            assert_eq!(staged.raw_oracle_target_price, 1_000);
+            assert_eq!(staged.effective_price, mark);
+            assert_eq!(staged.fund_px_last, mark, "staging a new target restarts the anchor");
+        }
+        for n in 1..=3u64 {
+            let slot = 60 + n;
+            if n == 1 && !same_slot_staging {
+                env.svm.warp_to_slot(slot);
+                env.push_auth_mark_with_cu(slot, 1_000);
+            }
+            low_pin_crank(&mut env, long_account, slot);
+            let asset = env.market_state().1.assets[0];
+            assert_eq!(
+                asset.fund_px_last, mark,
+                "same_slot_staging={same_slot_staging}: the reversal restarts the anchor at the mark"
+            );
+            assert_eq!(
+                asset.effective_price - mark,
+                cap_of_mark(n),
+                "same_slot_staging={same_slot_staging}: {n} slot(s) after the reversal the mark \
+                 has moved by the cap of the mark at the reversal, no more"
+            );
+        }
+    }
+}
+
 /// The oracle keeps rising but reports a new price only every third slot. A new target
 /// restarts the carry, so the mark gains one atom per three slots instead of none.
 #[test]
