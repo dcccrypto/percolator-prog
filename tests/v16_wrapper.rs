@@ -14427,39 +14427,40 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
         "asset 1 must be empty so oracle reconfiguration is targeted"
     );
 
-    // v17: reset_empty_asset_oracle_anchor_not_atomic requires the entire group to have
-    // no positions (any asset with OI prevents reconfiguration). This is a stricter guard
-    // than the old per-asset check; it preserves the fee-anchor non-advancement invariant
-    // by blocking the operation rather than allowing it with a narrow carve-out.
-    // Matrix row: v17-oracle-reconfigure-group-wide-guard (PR #v17-convergence).
-    //
-    // With positions on asset 0, configuring asset 1 is blocked entirely — the fee anchor
-    // (slot_last) is NOT advanced because the instruction is rejected.
-    let before_blocked = market.data.clone();
-    assert_err_and_market_unchanged(
-        run_ix(
-            Instruction::ConfigureEwmaMark {
+    // Engine #359 (158dc188, matching upstream percolator-prog 780e1138 #447): the empty-asset
+    // anchor reset's quiet check is scoped to the TARGET asset. Asset 1 is empty, so configuring it
+    // is permitted while asset 0 holds a position (the v17 group-wide guard that used to refuse it
+    // is gone; asset 0 itself keeps the market-wide rule). The invariant this test is named for
+    // still has to hold WITH the configure going through: it moves the market clock, but asset 0's
+    // own fee anchor (`asset.slot_last`, read by `account_fee_anchor_for_loss_currentness`) and
+    // every other asset-0 field stay untouched, so no fee is skipped or invented for asset 0.
+    let asset0_before = before_configure.assets[0].clone();
+    run_ix(
+        Instruction::ConfigureEwmaMark {
             market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
-                asset_index: 1,
-                now_slot: 100,
-                initial_mark_e6: 250,
-                mark_ewma_halflife_slots: 10,
-                mark_min_fee: 0,
-                observation_sequence: state::read_asset_control_sequences(&market.data, 1)
-                    .unwrap()
-                    .oracle_observation
-                    + 1,
-            },
-            &mut [&mut admin, &mut market],
-        ),
-        &market,
-        &before_blocked,
-    );
-    // slot_last is still 0: the blocked configure did not advance the fee anchor.
-    let (_, blocked_group) = state::read_market(&market.data).unwrap();
+            asset_index: 1,
+            now_slot: 100,
+            initial_mark_e6: 250,
+            mark_ewma_halflife_slots: 10,
+            mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("configuring the EMPTY asset 1 is allowed while asset 0 is positioned (engine #359)");
+    let (_, configured_with_exposure) = state::read_market(&market.data).unwrap();
+    assert_eq!(configured_with_exposure.assets[1].effective_price, 250, "asset 1 was really configured");
+    assert_eq!(configured_with_exposure.current_slot, 100, "the market clock moved");
     assert_eq!(
-        blocked_group.slot_last, 0,
-        "blocked configure must not advance the fee anchor"
+        configured_with_exposure.assets[0].slot_last, asset0_before.slot_last,
+        "configuring asset 1 must not advance asset 0's fee anchor"
+    );
+    assert_eq!(
+        configured_with_exposure.assets[0], asset0_before,
+        "configuring asset 1 must not touch any asset-0 field"
     );
 
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.

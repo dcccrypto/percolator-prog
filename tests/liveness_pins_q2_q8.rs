@@ -126,6 +126,12 @@ fn q8_engine_liquidation_refusal_surface_is_pinned() {
     assert_eq!(
         helpers,
         [
+            // engine #356 (3b61ad0e, haircut-order B): the certified equity the liquidation records is
+            // `account_liquidation_equity` (in-flight counterparty backing counts). Reviewed against
+            // `f1_follow_on_wanted` 2026-11-23: READ-ONLY, same body as the haircut equity it replaces
+            // (`account_equity_inner`), refuses only ArithmeticOverflow / InvalidLeg (pinned above,
+            // structural), so the follow-on screen needs no new input.
+            "account_liquidation_equity",
             "advance_close_progress_ledger",
             "asset_state",
             "begin_close_progress_ledger",
