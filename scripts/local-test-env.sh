@@ -87,7 +87,7 @@ checkout() { # path repo pin
 echo "== sibling checkouts in $WS (ci/deployed-refs.env)"
 checkout percolator                    percolator       "$ENGINE_CI_SIBLING"
 checkout percolator-nft                percolator-nft   "$NFT_CI_SIBLING"
-checkout percolator-stake              percolator-stake "$STAKE_DEPLOYED"
+checkout percolator-stake              percolator-stake "$STAKE_CI_SIBLING"
 checkout percolator-match              percolator-match "$MATCHER_DEPLOYED"
 checkout percolator-match-p2           percolator-match "$MATCHER_P2_CI_SIBLING"
 checkout percolator-match-v1           percolator-match "$MATCHER_V1_CI_SIBLING"

@@ -257,9 +257,11 @@ jobs:
       - name: checkout growth base engine (its path dependency)
         uses: actions/checkout@v4
         with: { repository: dcccrypto/percolator, path: growth-base/percolator, ref: '${{ steps.refs.outputs.GROWTH_BASE_ENGINE }}', token: '${{ secrets.GITHUB_TOKEN }}' }
-      - name: checkout stake (pinned to the deployed commit)
+      # STAKE_CI_SIBLING, not STAKE_DEPLOYED, for the 083a0d08 header flag day (engine header 806 -> 790):
+      # the deployed stake reads the old offsets. Revert to STAKE_DEPLOYED once they deploy together.
+      - name: checkout stake (CI sibling for the 790-byte engine header)
         uses: actions/checkout@v4
-        with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_DEPLOYED }}', token: '${{ secrets.GITHUB_TOKEN }}' }
+        with: { repository: dcccrypto/percolator-stake, path: percolator-stake, ref: '${{ steps.refs.outputs.STAKE_CI_SIBLING }}', token: '${{ secrets.GITHUB_TOKEN }}' }
 
       # Pinned: stable 1.100.0 (2026-11-09) fails to compile solana-client (E0277, rust-lang/rust#148922).
       - uses: dtolnay/rust-toolchain@1.99.1
