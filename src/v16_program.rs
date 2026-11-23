@@ -12553,19 +12553,24 @@ pub mod oracle_v16 {
     }
 
     /// Tiny-price format (docs/fixes/tiny-price-format.md): one oracle leg is read at E12
-    /// (10^-12 USD) precision so a leg below one e6 tick, or a small leg of a composite, is not
-    /// truncated before composition. `LEG_E12_PER_E6` converts between the two.
+    /// (10^-12 USD) precision so a small leg of a composite is not truncated to six decimals
+    /// before composition. `LEG_E12_PER_E6` converts between the two.
     pub const LEG_E12_PER_E6: u128 = 1_000_000;
 
-    /// A leg read at E12 is valid when it is non-zero and its e6 floor is at most
-    /// `MAX_ORACLE_PRICE` (the same upper bound the e6 reader always applied).
+    /// A leg read at E12 is admissible when its six-decimal floor is in `1..=MAX_ORACLE_PRICE`:
+    /// the six-decimal value decides whether a feed is admissible, exactly as the e6 readers
+    /// always did, and only the composition uses the extra digits (INV-038; ported from upstream
+    /// aeyakovenko/percolator-prog b2f3ffe7, #462). A leg below one e6 tick is refused, alone or
+    /// inside a composite and at every lot exponent; #711 admitted it (any non-zero E12 value).
     #[inline]
     fn leg_e12_in_range(out: u128) -> bool {
-        out != 0 && out / LEG_E12_PER_E6 <= percolator::MAX_ORACLE_PRICE as u128
+        let floor_e6 = out / LEG_E12_PER_E6;
+        floor_e6 != 0 && floor_e6 <= percolator::MAX_ORACLE_PRICE as u128
     }
 
     /// e6 view of an E12 leg: the e6 floor, refusing a leg below one e6 tick exactly as the e6
-    /// readers always did. Kept for direct e6 callers; composition reads the E12 value.
+    /// readers always did (the E12 readers now refuse it too, via `leg_e12_in_range`). Kept for
+    /// direct e6 callers; composition reads the E12 value.
     #[inline]
     fn leg_e12_to_e6(out: u128) -> Result<u64, ProgramError> {
         let e6 = out / LEG_E12_PER_E6;
@@ -12886,7 +12891,8 @@ pub mod oracle_v16 {
     // ("round composite oracle prices once").
     //
     // Tiny-price format (docs/fixes/tiny-price-format.md): the legs arrive at E12, not e6, so a
-    // small leg is no longer truncated before composition; the rational is carried in U256
+    // small leg is no longer truncated before composition (a leg is still only admissible when
+    // its six-decimal floor is in `1..=MAX_ORACLE_PRICE`, INV-038 / upstream b2f3ffe7); the rational is carried in U256
     // (bounded: legs <= 10^18, so the numerator stays <= 10^75 < 2^256); the per-leg
     // intermediate range gate is gone (only legs and the final price are range-checked); and the
     // asset's lot exponent multiplies the final price by 10^lot_exp (the market quotes one lot
@@ -12988,7 +12994,8 @@ pub mod oracle_v16 {
                 config.max_staleness_secs,
                 config.conf_filter_bps,
             )?;
-            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            // the stored per-leg record stays e6 (its floor; at least 1: a sub-tick leg was
+            // refused by the reader, INV-038)
             let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = config.oracle_leg_publish_times[i];
             let prev_price = config.oracle_leg_prices_e6[i];
@@ -13053,7 +13060,8 @@ pub mod oracle_v16 {
                 profile.max_staleness_secs,
                 profile.conf_filter_bps,
             )?;
-            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            // the stored per-leg record stays e6 (its floor; at least 1: a sub-tick leg was
+            // refused by the reader, INV-038)
             let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = profile.oracle_leg_publish_times[i];
             let prev_price = profile.oracle_leg_prices_e6[i];
