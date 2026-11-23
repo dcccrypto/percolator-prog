@@ -35103,7 +35103,7 @@ pub mod processor {
         // rather than the trade-fee sites' opt-in `cfg_after` pattern.
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         if let Some((_, _, st)) = bound_tail.as_ref() {
-            // Phase 2b G6 + the senior credit, out of line (this frame is frozen at 3,968 B).
+            // Phase 2b G6 + the senior credit, out of line (this frame is pinned, ci/sbf-frame-baseline.txt).
             let _ = no_real_seniors;
             p2b_credit_bound_fee_leg(program_id, accounts, st, available)?;
         }
