@@ -29822,6 +29822,160 @@ fn v16_bpf_push_ewma_mark_target_change_resets_price_move_remainder() {
     );
 }
 
+/// #738 equivalence proof: the batch TradeCpi path must leave byte-identical post-state (market,
+/// both portfolios, matcher ctx, signers) under the base wrapper and the shape-only head wrapper.
+/// Run: BASE_SO=<base .so> NEW_SO=<head .so> SYNC_MATCHER_SO=<matcher .so> cargo test --features devnet
+/// --test v16_cu v16_738_batch_trade_cpi_poststate -- --nocapture. Skips (prints SKIP) when unset.
+#[test]
+fn v16_738_batch_trade_cpi_poststate_identical_base_vs_head() {
+    fn one(legs_n: u16, so: &str) -> (u64, Vec<Vec<u8>>) {
+        std::env::set_var("P1_WRAPPER_SO", so);
+        let mut env = V16CuEnv::new_with_market_params_and_price_move(legs_n, 1_000, 1_000, 500);
+        for a in 0..legs_n { env.configure_auth_mark_for_asset_as_admin(a, legs_n as u64 + 1, 100); }
+        let matcher_program = Pubkey::new_unique();
+        let bytes = std::fs::read(matcher_program_path()).unwrap();
+        env.svm.add_program(matcher_program, &bytes);
+        let taker = Keypair::new();
+        let lp = Keypair::new();
+        let taker_account = env.create_portfolio(&taker);
+        let lp_account = env.create_portfolio(&lp);
+        env.deposit(&taker, taker_account, 100_000_000);
+        env.deposit(&lp, lp_account, 100_000_000);
+        let (ctx, delegate, _) = env.init_matcher_context(&lp, matcher_program, lp_account);
+        let legs: Vec<percolator_prog::ix::BatchTradeCpiLeg> = (0..legs_n).map(|a| percolator_prog::ix::BatchTradeCpiLeg { market_id: a as u64 + 1, asset_index: a, size_q: POS_SCALE as i128, fee_bps: 100, limit_price: 0 }).collect();
+        let tail = Pubkey::new_unique();
+        env.svm.set_account(tail, Account { lamports: 1_000_000_000, data: vec![0u8; 8], owner: Pubkey::default(), executable: false, rent_epoch: 0 }).unwrap();
+        env.svm.expire_blockhash();
+        let (tid, _, tep) = env.portfolio_identity(taker_account);
+        let (lid, lseq, lep) = env.portfolio_identity(lp_account);
+        let cu = env.send(
+            ProgInstruction::BatchTradeCpi { account_a_portfolio_id: tid, account_a_position_epoch: tep, account_b_portfolio_id: lid, account_b_position_epoch: lep, account_b_matcher_sequence: lseq, max_slippage_atoms: u128::MAX, max_fee_atoms: u128::MAX, legs },
+            vec![
+                AccountMeta::new(taker.pubkey(), true), AccountMeta::new(env.market, false), AccountMeta::new(taker_account, false), AccountMeta::new(lp_account, false),
+                AccountMeta::new_readonly(matcher_program, false), AccountMeta::new(ctx, false), AccountMeta::new_readonly(delegate, false), AccountMeta::new_readonly(tail, false),
+            ],
+            &[&taker],
+        ).unwrap();
+        // Named non-deterministic mask: every key the harness draws at random (Keypair::new /
+        // Pubkey::new_unique) is rewritten to a fixed per-role tag byte (0xA0 + index) before
+        // comparing. That includes the env's own admin/payer/mint/vault keys: the base-vs-base
+        // control showed `WrapperConfigV16.marketauth` (market offset 16..48 = the random admin)
+        // differing run to run because it was not in this list.
+        let keys: Vec<Pubkey> = vec![
+            taker.pubkey(), lp.pubkey(), taker_account, lp_account, matcher_program, ctx, delegate, env.market, tail,
+            env.admin.pubkey(), env.payer.pubkey(), env.mint, env.vault, env.vault_authority,
+        ];
+        let mut out = Vec::new();
+        let names = ["market", "taker_portfolio", "lp_portfolio", "matcher_ctx", "taker_signer", "lp_signer"];
+        for (ai, k) in [env.market, taker_account, lp_account, ctx, taker.pubkey(), lp.pubkey()].into_iter().enumerate() {
+            let mut d = env.svm.get_account(&k).unwrap().data;
+            let mut hits: Vec<(usize, usize)> = Vec::new(); // (offset, key index)
+            for (i, key) in keys.iter().enumerate() {
+                let kb = key.to_bytes();
+                let mut j = 0;
+                while j + 32 <= d.len() { if d[j..j + 32] == kb { for b in d[j..j + 32].iter_mut() { *b = 0xA0 + i as u8; } hits.push((j, i)); j += 32; } else { j += 1; } }
+            }
+            // Named mask 2: matcher ctx `lp_account_id` (CTX_VAMM_OFFSET 64 + 160 = 224..232) is the
+            // first 8 bytes of the random delegate PDA (`matcher_lp_account_id`), a truncated key the
+            // 32-byte scan above cannot see.
+            if ai == 3 && d.len() >= 232 && d[224..232] == delegate.to_bytes()[0..8] {
+                for b in d[224..232].iter_mut() { *b = 0xBF; }
+                println!("  NAMEDMASK legs={legs_n} so={so} matcher_ctx[224..232] lp_account_id=delegate[0..8] bytes=8");
+            }
+            hits.sort();
+            println!("  KEYMASK legs={legs_n} so={so} acct{ai}({}) len={} key_bytes_masked={} (offset,key#)={hits:?}", names[ai], d.len(), hits.len() * 32);
+            out.push(d);
+        }
+        (cu, out)
+    }
+    let (Some(base), Some(new)) = (std::env::var_os("BASE_SO"), std::env::var_os("NEW_SO")) else {
+        eprintln!("SKIP v16_738 equivalence: set BASE_SO=<base .so> NEW_SO=<head .so> (+ SYNC_MATCHER_SO)");
+        return;
+    };
+    let base = base.to_str().unwrap().to_string();
+    let new = new.to_str().unwrap().to_string();
+    assert_ne!(
+        std::fs::read(&base).unwrap(),
+        std::fs::read(&new).unwrap(),
+        "BASE_SO and NEW_SO are the same binary; the comparison would be vacuous"
+    );
+    for n in [1u16, 2, 4] {
+        let (c0, a) = one(n, &base);
+        let (c1, b) = one(n, &new);
+        let (_, a2) = one(n, &base);
+        // Control: base-vs-base marks the bytes the harness itself makes non-deterministic (e.g. keys
+        // I could not normalise). Base-vs-head must be byte-identical everywhere outside that mask.
+        let mut masked = 0usize;
+        let mut total = 0usize;
+        for (i, ((x, y), z)) in a.iter().zip(b.iter()).zip(a2.iter()).enumerate() {
+            assert_eq!(x.len(), y.len(), "legs={n} acct{i} length differs base vs head");
+            total += x.len();
+            let mut bad: Vec<usize> = Vec::new();
+            for o in 0..x.len() {
+                if x[o] != z[o] { masked += 1; } else if x[o] != y[o] { bad.push(o); }
+            }
+            // Residual control diffs (after key normalisation), as contiguous [start, end) ranges.
+            let mut runs: Vec<(usize, usize)> = Vec::new();
+            for o in (0..x.len()).filter(|&o| x[o] != z[o]) {
+                match runs.last_mut() { Some(r) if r.1 + 8 >= o => r.1 = o + 1, _ => runs.push((o, o + 1)) }
+            }
+            if !runs.is_empty() { println!("  control-nondeterministic legs={n} acct{i} ranges={runs:?}"); }
+            assert!(bad.is_empty(), "legs={n} acct{i} post-state differs base vs head at {} offsets, first: {:?}", bad.len(), &bad[..bad.len().min(12)]);
+        }
+        assert!(masked * 100 <= total, "legs={n}: control mask too large ({masked}/{total}); comparison too weak");
+        println!("POSTSTATE legs={n} base_cu={c0} head_cu={c1} identical=true compared_bytes={} masked_nondeterministic_bytes={masked}", total - masked);
+    }
+}
+
+/// #738 gate: `try_to_runtime_shape` (no solvency-envelope check) may only appear in the four
+/// read-only preflight readers. Any state writer switched to shape-only fails this test.
+#[test]
+fn v16_738_shape_only_decode_confined_to_read_only_readers() {
+    let src = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/v16_program.rs")).unwrap();
+    let allowed = [
+        "read_market_config_mode_and_capacity",
+        "read_engine_funding_bounds",
+        "read_market_trade_preflight",
+        "read_asset_effective_prices",
+    ];
+    // Split into top-level-ish `pub fn`/`fn` items by tracking the most recent fn signature.
+    let mut cur: Option<(String, String)> = None; // (name, signature text)
+    let mut hits: Vec<(String, String)> = Vec::new();
+    let mut sigs: std::collections::BTreeMap<String, String> = Default::default();
+    let mut sig_buf: Option<(String, String)> = None;
+    for line in src.lines() {
+        let t = line.trim_start();
+        let rest = t.strip_prefix("pub fn ").or_else(|| t.strip_prefix("pub(crate) fn ")).or_else(|| t.strip_prefix("fn "));
+        if let Some(r) = rest {
+            let name: String = r.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            sig_buf = Some((name.clone(), String::new()));
+            cur = Some((name, String::new()));
+        }
+        if let Some((n, s)) = sig_buf.as_mut() {
+            s.push_str(line);
+            s.push('\n');
+            if line.contains('{') {
+                sigs.insert(n.clone(), s.clone());
+                sig_buf = None;
+            }
+        }
+        if t.starts_with("//") { continue; }
+        if t.contains("try_to_runtime_shape()") {
+            hits.push((cur.as_ref().map(|c| c.0.clone()).unwrap_or_default(), t.to_string()));
+        }
+    }
+    assert!(!hits.is_empty(), "scan found no shape-only decode at all; scanner is broken");
+    for (name, _) in &hits {
+        assert!(allowed.contains(&name.as_str()), "shape-only decode in `{name}`: only read-only preflight readers may skip the envelope check");
+    }
+    for a in allowed {
+        let sig = sigs.get(a).unwrap_or_else(|| panic!("allowed reader `{a}` not found"));
+        assert!(sig.contains("data: &[u8]"), "`{a}` must stay read-only (`data: &[u8]`), got: {sig}");
+        assert!(!sig.contains("&mut"), "`{a}` must not take a mutable borrow");
+        assert!(hits.iter().any(|(n, _)| n == a), "`{a}` no longer uses shape decode; update the allowlist");
+    }
+}
+
 // ── SwapSecondaryForPrimary (tag 60-family) real-path BPF tests ──────────────
 //
 // `handle_swap_secondary_for_primary` (src/v16_program.rs) checks, in order:
