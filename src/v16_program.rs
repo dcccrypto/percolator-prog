@@ -12553,19 +12553,24 @@ pub mod oracle_v16 {
     }
 
     /// Tiny-price format (docs/fixes/tiny-price-format.md): one oracle leg is read at E12
-    /// (10^-12 USD) precision so a leg below one e6 tick, or a small leg of a composite, is not
-    /// truncated before composition. `LEG_E12_PER_E6` converts between the two.
+    /// (10^-12 USD) precision so a small leg of a composite is not truncated to six decimals
+    /// before composition. `LEG_E12_PER_E6` converts between the two.
     pub const LEG_E12_PER_E6: u128 = 1_000_000;
 
-    /// A leg read at E12 is valid when it is non-zero and its e6 floor is at most
-    /// `MAX_ORACLE_PRICE` (the same upper bound the e6 reader always applied).
+    /// A leg read at E12 is admissible when its six-decimal floor is in `1..=MAX_ORACLE_PRICE`:
+    /// the six-decimal value decides whether a feed is admissible, exactly as the e6 readers
+    /// always did, and only the composition uses the extra digits (INV-038; ported from upstream
+    /// aeyakovenko/percolator-prog b2f3ffe7, #462). A leg below one e6 tick is refused, alone or
+    /// inside a composite and at every lot exponent; #711 admitted it (any non-zero E12 value).
     #[inline]
     fn leg_e12_in_range(out: u128) -> bool {
-        out != 0 && out / LEG_E12_PER_E6 <= percolator::MAX_ORACLE_PRICE as u128
+        let floor_e6 = out / LEG_E12_PER_E6;
+        floor_e6 != 0 && floor_e6 <= percolator::MAX_ORACLE_PRICE as u128
     }
 
     /// e6 view of an E12 leg: the e6 floor, refusing a leg below one e6 tick exactly as the e6
-    /// readers always did. Kept for direct e6 callers; composition reads the E12 value.
+    /// readers always did (the E12 readers now refuse it too, via `leg_e12_in_range`). Kept for
+    /// direct e6 callers; composition reads the E12 value.
     #[inline]
     fn leg_e12_to_e6(out: u128) -> Result<u64, ProgramError> {
         let e6 = out / LEG_E12_PER_E6;
@@ -12886,7 +12891,8 @@ pub mod oracle_v16 {
     // ("round composite oracle prices once").
     //
     // Tiny-price format (docs/fixes/tiny-price-format.md): the legs arrive at E12, not e6, so a
-    // small leg is no longer truncated before composition; the rational is carried in U256
+    // small leg is no longer truncated before composition (a leg is still only admissible when
+    // its six-decimal floor is in `1..=MAX_ORACLE_PRICE`, INV-038 / upstream b2f3ffe7); the rational is carried in U256
     // (bounded: legs <= 10^18, so the numerator stays <= 10^75 < 2^256); the per-leg
     // intermediate range gate is gone (only legs and the final price are range-checked); and the
     // asset's lot exponent multiplies the final price by 10^lot_exp (the market quotes one lot
@@ -12988,7 +12994,8 @@ pub mod oracle_v16 {
                 config.max_staleness_secs,
                 config.conf_filter_bps,
             )?;
-            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            // the stored per-leg record stays e6 (its floor; at least 1: a sub-tick leg was
+            // refused by the reader, INV-038)
             let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = config.oracle_leg_publish_times[i];
             let prev_price = config.oracle_leg_prices_e6[i];
@@ -13053,7 +13060,8 @@ pub mod oracle_v16 {
                 profile.max_staleness_secs,
                 profile.conf_filter_bps,
             )?;
-            // the stored per-leg record stays e6 (its floor; 0 for a sub-tick leg)
+            // the stored per-leg record stays e6 (its floor; at least 1: a sub-tick leg was
+            // refused by the reader, INV-038)
             let price = (price_e12 / LEG_E12_PER_E6) as u64;
             let prev_time = profile.oracle_leg_publish_times[i];
             let prev_price = profile.oracle_leg_prices_e6[i];
@@ -33161,7 +33169,7 @@ pub mod processor {
     ///
     /// AUDIT MIRROR: the backing decrement sequence mirrors handle_withdraw_backing_bucket.
     /// The RESYNC 5ebd136 dual-withdraw gate is preserved: source watermark is
-    /// checked post-decrement; EngineLockActive if credit_rate_num < CREDIT_RATE_SCALE.
+    /// checked post-decrement; EngineLockActive if available backing < positive_claim_bound.
     #[inline(never)]
     /// LP Vault — RebalanceLpVaultBacking (tag 91).
     ///
@@ -33407,7 +33415,7 @@ pub mod processor {
             }
             source.credit_rate_num =
                 expected_source_credit_rate_num(source).map_err(map_v16_error)?;
-            if source.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source).map_err(map_v16_error)? {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             source.credit_epoch = source
@@ -34388,7 +34396,7 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
             source_after.credit_rate_num =
                 expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-            if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
                 return Err(PercolatorError::EarnExitWouldUnderBackClaims.into());
             }
             source = source_after;
@@ -36068,7 +36076,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source_after.credit_epoch = source_after
@@ -42431,7 +42439,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= backing_num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source = source_after;
@@ -44353,6 +44361,15 @@ pub mod processor {
             .checked_sub(state.valid_liened_backing_num)
             .and_then(|v| v.checked_add(state.insurance_credit_reserved_num - insurance_encumbered))
             .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    /// Provider exit gate for the backing-withdraw paths (port of upstream 596b3d98, #250):
+    /// the unliened backing left behind must cover the whole claim bound, lien-covered face
+    /// included. On the pinned engine's rate this is exactly "the rate stays full". Once the
+    /// rate becomes lien-aware it is full as soon as total backing covers the claims, so the
+    /// gate states its watermark directly instead of going through the rate.
+    fn source_backing_covers_claim_bound(state: SourceCreditStateV16) -> Result<bool, V16Error> {
+        Ok(source_credit_available_backing_num(state)? >= state.positive_claim_bound_num)
     }
 
     fn expected_source_credit_rate_num(state: SourceCreditStateV16) -> Result<u128, V16Error> {
@@ -48735,9 +48752,9 @@ pub mod processor {
             return Ok(base);
         }
         let now_slot = authenticated_market_slot_or_fallback_view(group);
-        if oracle_v16::profile_is_hybrid(profile)
-            && !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
-        {
+        // ADOPT upstream aac89b9e (INV-046): a print that cannot move the mark (an unmatured
+        // Hybrid, or any asset in Recovery) pays no mark-externality fee.
+        if !trade_updates_mark_view(profile, group, asset_index, now_slot) {
             return Ok(base);
         }
         if asset_index >= group.header.config.max_market_slots.get() as usize
@@ -49542,6 +49559,27 @@ pub mod processor {
                 && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot))
     }
 
+    /// ADOPT upstream aac89b9e ("ignore a trade print on a Recovery asset", INV-046): a trade
+    /// print discovers the mark only for a trade-driven profile on an asset whose mark can still
+    /// move. Shutdown freezes a Recovery asset's mark, so there the print is ignored, as for an
+    /// authenticated mark: no mark-externality fee and no EWMA move. Our fork has no trade-driven
+    /// target push, so upstream's revert (`EngineLockActive`) cannot occur here; the port keeps
+    /// the frozen-mark semantics and drops the mark fee on a Recovery reduction.
+    fn trade_updates_mark_view(
+        profile: &state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+    ) -> bool {
+        profile_updates_mark_from_trade_view(profile, now_slot)
+            && group.markets.get(asset_index).is_some_and(|market| {
+                matches!(
+                    market.engine.asset.lifecycle,
+                    ASSET_LIFECYCLE_ACTIVE | ASSET_LIFECYCLE_DRAIN_ONLY
+                )
+            })
+    }
+
     fn liquidation_penalty_reclaimable_from_profile_view(
         profile: &state::AssetOracleProfileV16,
         now_slot: u64,
@@ -50277,9 +50315,10 @@ pub mod processor {
         fee_paid: u128,
     ) -> Result<(), ProgramError> {
         let now_slot = authenticated_market_slot_or_fallback_view(group);
-        let ewma_updates_from_trade = oracle_v16::profile_is_ewma_mark(profile)
-            || (oracle_v16::profile_is_hybrid(profile)
-                && oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot));
+        // ADOPT upstream aac89b9e (INV-046): shutdown freezes a Recovery asset's mark, so a
+        // trade print there leaves the average (and its funding checkpoint) unchanged.
+        let ewma_updates_from_trade =
+            trade_updates_mark_view(profile, group, asset_index, now_slot);
         if !ewma_updates_from_trade
             || asset_index >= group.header.config.max_market_slots.get() as usize
         {
@@ -50506,6 +50545,10 @@ pub mod processor {
         Ok(())
     }
 
+    // Deliberately no freeze-authority check (here or in `unpack_mint`): collateral mints
+    // with a freeze authority (e.g. USDC) are allowed, not rejected or allowlisted. The
+    // issuer can freeze the vault or user token accounts and so stop deposits and
+    // withdrawals for that mint; Percolator can't prevent this. See README "Trust boundaries".
     fn verify_mint(mint_ai: &AccountInfo) -> Result<(), ProgramError> {
         if mint_ai.owner != &spl_token::ID {
             return Err(PercolatorError::InvalidMint.into());
@@ -50971,6 +51014,68 @@ pub mod processor {
             multisig[base] = TOKEN_2022_ACCOUNT_TYPE_ACCOUNT;
             assert!(!token_account_layout_is_account(true, &multisig));
             assert!(!token_account_layout_is_account(true, &vec![0u8; base - 1]));
+        }
+
+        fn gate_state(bound: u128, fresh: u128, lien: u128) -> SourceCreditStateV16 {
+            SourceCreditStateV16 {
+                positive_claim_bound_num: bound,
+                exact_positive_claim_num: bound,
+                fresh_reserved_backing_num: fresh,
+                valid_liened_backing_num: lien,
+                ..SourceCreditStateV16::EMPTY
+            }
+        }
+
+        /// Port of upstream 596b3d98 (#250): the provider withdraw gate keeps the
+        /// `available >= positive_claim_bound` watermark beside a lien. Upstream's numbers:
+        /// 300 of backing, 200 of claims, 75 liened. 25 may leave, 26 may not; the other 75
+        /// only after the lien is released.
+        #[test]
+        fn withdraw_gate_watermark_beside_a_lien() {
+            let after = |fresh: u128, lien: u128, x: u128| {
+                source_backing_covers_claim_bound(gate_state(200, fresh - x, lien)).unwrap()
+            };
+            assert!(after(300, 75, 25));
+            assert!(!after(300, 75, 26));
+            assert!(!after(300, 75, 100));
+            // Lien released: its 75 is unliened again.
+            assert!(after(275, 0, 75));
+            assert!(!after(275, 0, 76));
+            // No claims: any unliened backing may leave.
+            assert!(source_backing_covers_claim_bound(gate_state(0, 0, 0)).unwrap());
+        }
+
+        /// On the pinned engine's rate the new gate is exactly the old "rate stays full"
+        /// check, errors included, so the four withdraw handlers behave the same.
+        #[test]
+        fn withdraw_gate_matches_full_rate_on_pinned_formula() {
+            let vals = [0u128, 1, 2, 3, 74, 75, 76, 199, 200, 201, 225, 300, u64::MAX as u128];
+            let mut n = 0u32;
+            for &bound in &vals {
+                for &fresh in &vals {
+                    for &lien in &vals {
+                        for &(ins, ins_lien) in &[(0u128, 0u128), (50, 0), (50, 20), (10, 30)] {
+                            let mut s = gate_state(bound, fresh, lien);
+                            s.insurance_credit_reserved_num = ins;
+                            s.valid_liened_insurance_num = ins_lien;
+                            let rate = expected_source_credit_rate_num(s);
+                            let gate = source_backing_covers_claim_bound(s);
+                            match rate {
+                                Ok(r) => {
+                                    assert_eq!(
+                                        gate.unwrap(),
+                                        r == percolator::CREDIT_RATE_SCALE,
+                                        "{s:?}"
+                                    );
+                                    n += 1;
+                                }
+                                Err(_) => assert!(gate.is_err(), "{s:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(n > 1000);
         }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound

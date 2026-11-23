@@ -80,6 +80,11 @@ Percolator enforces three layers with distinct responsibilities:
 - trusted **only by the LP that registered it**, not by the protocol as a whole
 - Percolator treats matcher as adversarial except for LP-chosen semantics and validates strict ABI constraints.
 
+### Outside Percolator: the collateral mint issuer (freeze authority)
+- Markets may use a collateral mint that has a freeze authority (for example USDC). This is allowed on purpose: Percolator does not reject or allowlist such mints.
+- The issuer can freeze the market vault token account or any user's token account. If the vault is frozen, nothing can move into or out of it for that mint (deposits, withdrawals, insurance and LP payouts). If a user's account is frozen, that user can't deposit or withdraw. This lasts until the issuer unfreezes the account.
+- Percolator can't prevent this. Users of a market take on the issuer's freeze risk for that mint.
+
 ---
 
 ## Account model
@@ -680,6 +685,16 @@ cargo kani --lib --features devnet -Z stubbing
 cargo kani --tests --features devnet -Z stubbing -Z function-contracts
 (cd kani/growth && cargo kani -Z stubbing -Z function-contracts)   # also kani/contlev, kani/p3, kani/p3-engine
 ```
+
+**Release profile: the engine stays overflow-checked.** Cargo applies only the root
+manifest's profiles, so `[profile.release] overflow-checks = true` in `Cargo.toml` reaches
+every crate in a build rooted here, the engine included (#425): an overflow in the program
+or the engine aborts the transaction instead of wrapping. Upstream (commit `cd8a446a`)
+instead adds `[profile.release.package."*"] overflow-checks = false`, because with its
+engine checked its 14-leg INV-073 atomic exit exceeds the 1.4M CU limit. This fork has
+shipped with the engine checked since #425 (measured then: compute up about 2.6% on
+average, every CU guardrail kept wide headroom). Do not add that override without a
+security sign-off. `tests/build_profile.rs` guards both points.
 
 ---
 
