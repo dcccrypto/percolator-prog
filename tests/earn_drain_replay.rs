@@ -85,7 +85,6 @@ fn swordcat() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         // tag 53, 2o6ud5cL…
@@ -142,7 +141,6 @@ fn backpack() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 1,
@@ -1016,7 +1014,6 @@ fn r2_market() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 0,
@@ -3422,7 +3419,6 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
 /// real bust leaves pending socialized-loss settlement across several touches.
 fn chunked_b_market() -> LiveMarket {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
     lm
 }
 
@@ -3499,7 +3495,6 @@ fn a5_explore_real_chunked_bankruptcy() {
 /// of the residual per call, then the winners are paid.
 fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubkey)>) {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = chunk;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
@@ -3523,7 +3518,7 @@ fn chunk_bust_world(chunk: u128) -> (Replay, Pubkey, Keypair, Vec<(Keypair, Pubk
 
 #[test]
 fn wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes() {
-    let (mut r, bp, bk, shorts) = chunk_bust_world(percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN);
+    let (mut r, bp, bk, shorts) = chunk_bust_world(percolator::PUBLIC_B_CHUNK_ATOMS);
     let mode = |r: &Replay| format!("{:?}", r.env.market_state().1.mode);
     assert_eq!(mode(&r), "Live", "non-vacuity: Live before the bust crank");
     let mut seen = vec![];
@@ -3721,7 +3716,6 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
     let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
     let mut r = Replay::new(lm);
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");

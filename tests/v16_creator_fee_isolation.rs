@@ -313,7 +313,6 @@ fn default_init_market_ix_with_assets(max_portfolio_assets: u16) -> Instruction 
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }

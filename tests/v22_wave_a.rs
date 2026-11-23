@@ -235,7 +235,6 @@ fn base_init(price: u64) -> ProgInstruction {
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }
@@ -770,41 +769,46 @@ fn combined_tags_decode_to_distinct_variants() {
     assert!(percolator_prog::constants::ALL_NAMED_TAGS.len() > 30);
 }
 
-/// Mainnet condition 1 (Wave A approval, 2026-10-06): InitMarket refuses `public_b_chunk_atoms`
-/// below `PUBLIC_B_CHUNK_ATOMS_MIN` (1e9 atoms) -- the chunk is a market-kill threshold (a bust
-/// whose residual exceeds it resolves the market; ledger/finding-bankrupt-chunk-wedge-
-/// 2026-10-06.md). Legacy and growth forms alike. CONTROL: the floor itself and the seed default
-/// 1e12 are accepted.
+/// Upstream 083a0d08 / c8ddbb6e: the public B chunk is the engine constant
+/// `percolator::PUBLIC_B_CHUNK_ATOMS` (= MAX_VAULT_TVL), not an InitMarket field, so the Wave A
+/// floor (1e9 atoms) went with the field. The old wire format (16 chunk bytes at offset 187,
+/// before `maintenance_fee_per_slot`) is refused in every trailer form the grammar has; the new
+/// format decodes, and both legacy and growth markets init.
 #[test]
-fn init_market_refuses_a_public_b_chunk_below_the_floor() {
-    let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
-    assert_eq!(floor, 1_000_000_000);
-    let with_chunk = |ix: ProgInstruction, chunk: u128| -> ProgInstruction {
-        let set = |m: &mut ProgInstruction| {
-            if let ProgInstruction::InitMarket { public_b_chunk_atoms, .. } = m {
-                *public_b_chunk_atoms = chunk;
-            }
-        };
-        match ix {
-            ProgInstruction::InitMarketV19 { mut market, growth_r_gap_bps, growth_l_launch_x100 } => {
-                set(&mut market);
-                ProgInstruction::InitMarketV19 { market, growth_r_gap_bps, growth_l_launch_x100 }
-            }
-            mut m => {
-                set(&mut m);
-                m
-            }
-        }
-    };
+fn init_market_old_chunk_format_is_refused_and_the_chunk_is_a_constant() {
+    assert_eq!(percolator::PUBLIC_B_CHUNK_ATOMS, percolator::MAX_VAULT_TVL);
+    let base = base_init(LOT_PRICE_FLOOR_E6).encode();
+    assert_eq!(base.len(), 203, "tag + base fields, no chunk");
+    let growth: [u8; 4] = [10, 0, 100, 0];
+    let lot: [u8; 1] = [3];
+    let rent: [u8; 6] = [1, 0, 0, 0, 0x10, 0x27];
+    let band: [u8; 18] = [50, 0, 10, 0, 0, 0, 10, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0];
+    let trailers: [Vec<u8>; 7] = [
+        vec![],
+        growth.to_vec(),
+        [&growth[..], &lot[..]].concat(),
+        [&growth[..], &rent[..]].concat(),
+        [&growth[..], &lot[..], &rent[..]].concat(),
+        [&growth[..], &rent[..], &band[..]].concat(),
+        [&growth[..], &lot[..], &rent[..], &band[..]].concat(),
+    ];
+    for trailer in &trailers {
+        let new_fmt = [&base[..], &trailer[..]].concat();
+        assert!(
+            ProgInstruction::decode(&new_fmt).is_ok(),
+            "new format, trailer {}: decodes",
+            trailer.len()
+        );
+        let mut old_fmt = new_fmt.clone();
+        old_fmt.splice(187..187, 1_000_000_000_000u128.to_le_bytes());
+        assert!(
+            ProgInstruction::decode(&old_fmt).is_err(),
+            "old format (chunk field), trailer {}: refused",
+            trailer.len()
+        );
+    }
     let mut env = V16CuEnv::new();
     for (label, ix) in [("legacy", base_init(LOT_PRICE_FLOOR_E6)), ("growth", growth_init(LOT_PRICE_FLOOR_E6, None))] {
-        for bad in [1u128, 1_000_000, floor - 1] {
-            let r = init_on_fresh(&mut env, with_chunk(ix.clone(), bad));
-            assert_eq!(code(&r), Some(14), "{label}: chunk {bad} must be refused: {r:?}");
-        }
-        init_on_fresh(&mut env, with_chunk(ix.clone(), floor)).unwrap_or_else(|e| panic!("{label}: floor accepted: {e}"));
-        init_on_fresh(&mut env, with_chunk(ix.clone(), 1_000_000_000_000)).unwrap_or_else(|e| panic!("{label}: seed default 1e12 accepted: {e}"));
-        let (_, g) = state::read_market(&env.svm.get_account(&env.market).unwrap().data).unwrap();
-        assert_eq!(g.config.public_b_chunk_atoms, 1_000_000_000_000);
+        init_on_fresh(&mut env, ix).unwrap_or_else(|e| panic!("{label}: init: {e}"));
     }
 }

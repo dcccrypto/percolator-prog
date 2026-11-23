@@ -728,7 +728,6 @@ fn market_params() -> V16CuMarketParams {
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
             // rehearse.sh seeds the h-lock market with SEED_PUBLIC_B_CHUNK_ATOMS=1_000_000 (HLOCK_B_CHUNK).
-            public_b_chunk_atoms: 1_000,
             maintenance_fee_per_slot: 0,
         };
     }
