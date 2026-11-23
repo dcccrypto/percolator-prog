@@ -1014,7 +1014,6 @@ fn default_init_market_ix() -> Instruction {
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }
@@ -1639,7 +1638,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
                 ..
             } = ix
@@ -1661,7 +1659,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 *max_account_b_settlement_chunks = 3;
                 *max_bankrupt_close_chunks = 4;
                 *max_bankrupt_close_lifetime_slots = 50;
-                *public_b_chunk_atoms = 1_000_012_345; // >= PUBLIC_B_CHUNK_ATOMS_MIN (v2.2)
                 *maintenance_fee_per_slot = 7;
             }
         }),
@@ -1688,7 +1685,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
     assert_eq!(group.config.max_account_b_settlement_chunks, 3);
     assert_eq!(group.config.max_bankrupt_close_chunks, 4);
     assert_eq!(group.config.max_bankrupt_close_lifetime_slots, 50);
-    assert_eq!(group.config.public_b_chunk_atoms, 1_000_012_345);
 }
 
 #[test]
@@ -26369,7 +26365,6 @@ struct Cw03Forfeit {
     detached: bool,
     loss_weight: u128,
     b_debt: u128,
-    public_b_chunk_atoms: u128,
 }
 
 fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
@@ -26456,7 +26451,6 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
         detached,
         loss_weight: before_leg.loss_weight,
         b_debt,
-        public_b_chunk_atoms: group.config.public_b_chunk_atoms,
     };
     (result, out)
 }
@@ -26523,16 +26517,16 @@ fn cw03_tag43_budget_is_collateral_atoms_under_the_new_name() {
     assert!(max.detached);
     assert_eq!(
         max.delta_b, max.b_debt,
-        "u128::MAX collapses to public_b_chunk_atoms and settles the whole debt in one call"
+        "u128::MAX collapses to PUBLIC_B_CHUNK_ATOMS and settles the whole debt in one call"
     );
     assert!(
         max.loss_booked_atoms >= 4_000_000,
         "the whole 4e21 B debt at loss_weight=POS_SCALE is 4_000_000 atoms of loss"
     );
     println!(
-        "[cw03] public_b_chunk_atoms={} -- the budget only ever enters through a min(), so \
-nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
-        max.public_b_chunk_atoms
+        "[cw03] PUBLIC_B_CHUNK_ATOMS={} -- the budget only ever enters through a min(), so \
+nothing settles beyond min(PUBLIC_B_CHUNK_ATOMS, b_remaining)",
+        percolator::PUBLIC_B_CHUNK_ATOMS
     );
 }
 

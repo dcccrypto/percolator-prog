@@ -58,10 +58,9 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
     let max_account_b_settlement_chunks: u64 = kani::any();
     let max_bankrupt_close_chunks: u64 = kani::any();
     let max_bankrupt_close_lifetime_slots: u64 = kani::any();
-    let public_b_chunk_atoms: u128 = kani::any();
     let maintenance_fee_per_slot: u128 = kani::any();
 
-    let mut data = [0u8; 219];
+    let mut data = [0u8; 203];
     data[0] = 0;
     data[1..3].copy_from_slice(&max_portfolio_assets.to_le_bytes());
     data[3..11].copy_from_slice(&h_min.to_le_bytes());
@@ -83,8 +82,7 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
     data[163..171].copy_from_slice(&max_account_b_settlement_chunks.to_le_bytes());
     data[171..179].copy_from_slice(&max_bankrupt_close_chunks.to_le_bytes());
     data[179..187].copy_from_slice(&max_bankrupt_close_lifetime_slots.to_le_bytes());
-    data[187..203].copy_from_slice(&public_b_chunk_atoms.to_le_bytes());
-    data[203..219].copy_from_slice(&maintenance_fee_per_slot.to_le_bytes());
+    data[187..203].copy_from_slice(&maintenance_fee_per_slot.to_le_bytes());
 
     match Instruction::decode(&data).unwrap() {
         Instruction::InitMarket {
@@ -108,7 +106,6 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
             max_account_b_settlement_chunks: got_b_chunks,
             max_bankrupt_close_chunks: got_bankrupt_chunks,
             max_bankrupt_close_lifetime_slots: got_bankrupt_lifetime,
-            public_b_chunk_atoms: got_public_b,
             maintenance_fee_per_slot: got_maintenance_fee,
         } => {
             assert_eq!(got_max_assets, max_portfolio_assets);
@@ -131,7 +128,6 @@ fn kani_v16_init_market_decode_preserves_wire_fields() {
             assert_eq!(got_b_chunks, max_account_b_settlement_chunks);
             assert_eq!(got_bankrupt_chunks, max_bankrupt_close_chunks);
             assert_eq!(got_bankrupt_lifetime, max_bankrupt_close_lifetime_slots);
-            assert_eq!(got_public_b, public_b_chunk_atoms);
             assert_eq!(got_maintenance_fee, maintenance_fee_per_slot);
         }
         _ => unreachable!(),
@@ -1516,7 +1512,6 @@ fn kani_v16_init_market_payload_rejects_trailing_byte() {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
         },
         extra,

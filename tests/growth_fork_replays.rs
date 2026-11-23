@@ -132,6 +132,17 @@ fn load(name: &str) -> Fixture {
         })
         .collect();
     let slab: Pubkey = v["slab"].as_str().unwrap().parse().unwrap();
+    let mut accounts: Vec<(Pubkey, Account)> = accounts;
+    // #386: the deployed bytes have no raw-basis sums; rebuild them (and each side's A) from
+    // the fixture's portfolios.
+    let portfolios: Vec<Vec<u8>> = accounts
+        .iter()
+        .filter(|(_, a)| a.owner == WRAPPER_ID && a.data.len() > 10 && a.data[10] == KIND_PORTFOLIO)
+        .map(|(_, a)| a.data.clone())
+        .collect();
+    let portfolios: Vec<&[u8]> = portfolios.iter().map(|d| d.as_slice()).collect();
+    let (_, slab_acct) = accounts.iter_mut().find(|(k, _)| *k == slab).expect("slab in fixture");
+    v21_upgrade::fill_raw_basis_sums(&mut slab_acct.data, &portfolios);
     Fixture {
         name: name.to_string(),
         slab,

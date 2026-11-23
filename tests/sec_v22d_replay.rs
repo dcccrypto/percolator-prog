@@ -85,7 +85,6 @@ fn swordcat() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         // tag 53, 2o6ud5cL…
@@ -142,7 +141,6 @@ fn backpack() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 1,
@@ -1016,7 +1014,6 @@ fn r2_market() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 0,

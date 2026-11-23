@@ -44,6 +44,9 @@ mod inv_031_provider_exit_principal;
 #[path = "invariants/cu/inv_045_staged_target_cap_anchor.rs"]
 mod inv_045_staged_target_cap_anchor;
 
+#[path = "invariants/cu/inv_031_provider_protection_floor.rs"]
+mod inv_031_provider_protection_floor;
+
 
 thread_local! {
     /// v2.2 fill events: logs of the last transaction (success or failure) sent by this test thread.
@@ -401,7 +404,6 @@ struct V16CuMarketParams {
     max_account_b_settlement_chunks: u64,
     max_bankrupt_close_chunks: u64,
     max_bankrupt_close_lifetime_slots: u64,
-    public_b_chunk_atoms: u128,
     maintenance_fee_per_slot: u128,
     /// v2.2: create the market account with a REAL top-level system `createAccount` (client path)
     /// instead of injecting it with `svm.set_account`.
@@ -431,7 +433,6 @@ impl Default for V16CuMarketParams {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
             system_created_market: false,
         }
@@ -492,31 +493,6 @@ impl V16CuEnv {
     /// Fallible form (S10-X1): InitMarket's error string and whether the market account was left
     /// byte-identical, instead of a panic.
     fn try_new_with_init_params(params: V16CuMarketParams) -> Result<Self, InitRefusal> {
-        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`; sub-floor
-        // chunk fixtures init at the floor, then a test-only STATE POKE sets the requested chunk.
-        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
-        if params.public_b_chunk_atoms < floor {
-            let env = Self::new_with_init_params(V16CuMarketParams {
-                public_b_chunk_atoms: floor,
-                ..params
-            });
-            let original = env.svm.get_account(&env.market).expect("market");
-            let (cfg, mut g) = state::read_market(&original.data).expect("read market");
-            let mut noop = original.data.clone();
-            state::write_market(&mut noop, &cfg, &g).unwrap();
-            g.config.public_b_chunk_atoms = params.public_b_chunk_atoms;
-            let mut mutated = original.data.clone();
-            state::write_market(&mut mutated, &cfg, &g).unwrap();
-            let mut acct = original;
-            for i in 0..acct.data.len() {
-                if mutated[i] != noop[i] {
-                    acct.data[i] = mutated[i];
-                }
-            }
-            let mut env = env;
-            env.svm.set_account(env.market, acct).unwrap();
-            return Ok(env);
-        }
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -616,7 +592,6 @@ impl V16CuEnv {
                 max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms: params.public_b_chunk_atoms,
                 maintenance_fee_per_slot: params.maintenance_fee_per_slot,
             },
             vec![
@@ -4638,7 +4613,6 @@ fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
         },
         vec![
@@ -9157,7 +9131,6 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
     {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9254,7 +9227,6 @@ ProgInstruction::PermissionlessCrank {
     {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9333,7 +9305,6 @@ ProgInstruction::PermissionlessCrank {
     for inject_bankruptcy_debt in [false, true] {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9406,16 +9377,8 @@ ProgInstruction::PermissionlessCrank {
              account can be meaningfully liquidated"
         );
 
-        // Restore `public_b_chunk_atoms` to its unbounded default before driving the account
-        // bankrupt and liquidating it. A BOUNDED chunk budget is exactly what this phase needed
-        // above to prove the crank drains a real backlog without livelocking; it is orthogonal
-        // to (and, empirically, a confound for) the liquidation-sizing math this phase exercises
-        // next -- with no outstanding B-backlog left (`cleared` above), nothing here still
-        // depends on the bound, so restoring it isolates "does Liquidate(1) still work post-fix"
-        // from that unrelated interaction.
-        env.mutate_market(|_cfg, group| {
-            group.config.public_b_chunk_atoms = percolator::MAX_VAULT_TVL;
-        });
+        // (This phase used to restore a bounded `public_b_chunk_atoms` to MAX_VAULT_TVL here; the
+        // chunk is now the constant PUBLIC_B_CHUNK_ATOMS = MAX_VAULT_TVL, upstream 083a0d08.)
 
         // Drive the account genuinely bankrupt via a SECOND, much larger B-domain debt (same
         // engine-native settlement path already proven above, not a raw pnl/capital write): with
@@ -15809,7 +15772,6 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
             max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
             max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
             max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-            public_b_chunk_atoms: params.public_b_chunk_atoms,
             maintenance_fee_per_slot: params.maintenance_fee_per_slot,
         },
         vec![
@@ -19512,7 +19474,6 @@ fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String
             max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
             max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
             max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-            public_b_chunk_atoms: params.public_b_chunk_atoms,
             maintenance_fee_per_slot: params.maintenance_fee_per_slot,
         }
         .encode(),
@@ -28847,7 +28808,6 @@ fn d26_init_market_and_init_portfolio_refuse_an_account_that_did_not_sign() {
         max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
         max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
         max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-        public_b_chunk_atoms: params.public_b_chunk_atoms,
         maintenance_fee_per_slot: params.maintenance_fee_per_slot,
     };
     let before = svm.get_account(&market).unwrap().data;

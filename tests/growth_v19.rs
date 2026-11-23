@@ -277,7 +277,6 @@ fn init_market_ix(c: &MarketCfg) -> ProgInstruction {
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     };
     match c.growth {
@@ -427,8 +426,11 @@ impl Env {
                 )
                 .unwrap();
         }
-        env.send(
-            init_market_ix(&cfg),
+        // #395 (upstream 083a0d08): the v2.1 program still reads `public_b_chunk_atoms`.
+        let data = init_market_ix(&cfg).encode();
+        let data = if v21_layout { v21_upgrade::v21_init_market_data(data) } else { data };
+        env.send_data(
+            data,
             vec![
                 AccountMeta::new(admin.pubkey(), true),
                 AccountMeta::new(market, true),
@@ -461,10 +463,19 @@ impl Env {
         accounts: Vec<AccountMeta>,
         signers: &[&Keypair],
     ) -> Result<u64, String> {
+        self.send_data(ix.encode(), accounts, signers)
+    }
+
+    fn send_data(
+        &mut self,
+        data: Vec<u8>,
+        accounts: Vec<AccountMeta>,
+        signers: &[&Keypair],
+    ) -> Result<u64, String> {
         let instruction = Instruction {
             program_id: self.program_id,
             accounts,
-            data: ix.encode(),
+            data,
         };
         let mut all = vec![&self.payer];
         all.extend_from_slice(signers);
@@ -1593,13 +1604,13 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
     // v2.1 layout plus the appended tail (`v21_upgrade::FUNDING_SCALE_TAIL`) on every slot.
     use percolator_prog::constants::{MARKET_ASSET_SLOT_LEN, MARKET_GROUP_LEN, MARKET_GROUP_OFF};
     let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
-        - v21_upgrade::V22_ASSET_EXTRA
+        - v21_upgrade::V22_ASSET_GROWTH
         - LEGACY_ENGINE_SLOT_LEN;
     if !is_market || appended == 0 {
         return (data.to_vec(), false);
     }
-    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_CONFIG_EXTRA;
-    let stride = MARKET_ASSET_SLOT_LEN - v21_upgrade::V22_ASSET_EXTRA;
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_HEADER_GROWTH;
+    let stride = MARKET_ASSET_SLOT_LEN - v21_upgrade::V22_ASSET_GROWTH;
     assert_eq!((data.len() - head) % stride, 0);
     let mut out = data[..head].to_vec();
     let mut tail_nonzero = false;
@@ -1771,10 +1782,10 @@ fn growth_off_is_byte_for_byte_legacy() {
     assert!(!zero_tail, "zero-cohort case leaves the drift tail zero");
     assert!(cohort_stale > 0, "cohort case really leaves stale positions");
     let appended = core::mem::size_of::<percolator::EngineAssetSlotV16Account>()
-        - v21_upgrade::V22_ASSET_EXTRA
+        - v21_upgrade::V22_ASSET_GROWTH
         - LEGACY_ENGINE_SLOT_LEN;
     // the appended tail, from the shared layout support (derived from the engine struct:
-    // #277 160 B + #282 32 B + S10 provider-principal mirror 32 B)
+    // #277 160 B + #282 32 B + S10 provider-principal mirror 32 B + #385 protection floor 32 B)
     assert_eq!(appended, v21_upgrade::FUNDING_SCALE_TAIL);
     assert!(cohort_tail, "cohort case: the drift tail is live (non-zero) on this layout");
     eprintln!("legacy parity: {} lines identical to the deployed v2.1 program (zero + live cohort)", lines.len());

@@ -190,7 +190,6 @@ fn init_market_with(max_price_move_bps_per_slot: u64, initial_margin_bps: u64) -
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }

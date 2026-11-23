@@ -896,14 +896,11 @@ pub mod constants {
     /// is refused up front (InvalidInstruction). Those 14-leg figures are historical: with the cap at 4 a
     /// 4-leg refresh weighs 7 and the budget admits 4 of them (28 units); see the S10-X1 ledger.
     pub const REDEMPTION_REFRESH_BASE_WEIGHT: u32 = 3;
-    /// Mainnet condition 1 (security approval of Wave A, 2026-10-06;
-    /// ledger/finding-bankrupt-chunk-wedge-2026-10-06.md): `public_b_chunk_atoms` is a
-    /// MARKET-KILL threshold -- a single bankruptcy whose residual exceeds it takes the whole
-    /// market Live -> Recovery -> Resolved (permissionlessly). InitMarket refuses a chunk below
-    /// 1e9 atoms (1,000 USDC at 6 dp), so no creator can pick a chunk any small bust resolves.
-    /// The seed default is 1e12. Refused with EngineInvalidConfig (Custom 14), like the other
-    /// InitMarket config bounds.
-    pub const PUBLIC_B_CHUNK_ATOMS_MIN: u128 = 1_000_000_000;
+    // Mainnet condition 1 (Wave A, 2026-10-06; ledger/finding-bankrupt-chunk-wedge-2026-10-06.md)
+    // floored the market's public B chunk at 1e9 atoms, because a bust whose residual exceeds the
+    // chunk takes the market to Recovery. Since upstream 083a0d08 the chunk is the engine constant
+    // `percolator::PUBLIC_B_CHUNK_ATOMS` (= MAX_VAULT_TVL, 1e16), no longer an InitMarket field,
+    // so the floor (PUBLIC_B_CHUNK_ATOMS_MIN) is gone with it.
     pub const REDEMPTION_REFRESH_WEIGHT_BUDGET: u32 = 34;
     pub const SWITCHBOARD_RESULT_SCALE: u128 = 1_000_000_000_000;
     pub const DEFAULT_MARK_EWMA_HALFLIFE_SLOTS: u64 = 600;
@@ -6535,6 +6532,67 @@ pub mod state {
         Ok((current_market_id, header.next_market_id.get()))
     }
 
+    /// What the engine records about one backing domain's provider, read from the market
+    /// account's bytes. Amounts are `BOUND_SCALE`-scaled. Port of upstream `d667c3ed`
+    /// (upstream PR 486; engine #385 = upstream e18a3b98 + 560e05fa, percolator-prog#382).
+    ///
+    /// `protection_num` is the provider principal that neither a claim on the domain nor an
+    /// unrepaid consumption has taken. `floor_num` is the lowest protection the domain has had
+    /// in this generation of its asset, moved only by the provider's own top-ups and principal
+    /// withdrawals: a loss that the domain's losers later refill stays recorded, and spending
+    /// that refill again down to the floor records nothing. A program that keeps depositor
+    /// shares over one provider position therefore charges every loss exactly once whenever it
+    /// reads: its books expect `floor + top-ups - withdrawals` since the last read, and what is
+    /// missing is the loss since then. `market_id` changes when the asset is restarted, which
+    /// starts the floor again from zero.
+    ///
+    /// Accounting only: no instruction is gated on these values, and no instruction needs an
+    /// extra account to keep them. Every instruction that changes a domain's source credit or
+    /// backing keeps them current.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct ProviderProtectionV16 {
+        pub market_id: u64,
+        pub principal_num: u128,
+        pub protection_num: u128,
+        pub floor_num: u128,
+    }
+
+    /// Reads `ProviderProtectionV16` for `domain` (`2 * asset_index` long, `+ 1` short, the
+    /// engine's own mapping). A domain whose asset index is at or past the market's configured
+    /// slot count is refused with `InvalidInstruction`.
+    pub fn read_provider_protection(
+        data: &[u8],
+        domain: usize,
+    ) -> Result<ProviderProtectionV16, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_market_dynamic_len(data)?;
+        let asset_index = domain / 2;
+        if asset_index >= market_header(data)?.config.max_market_slots.get() as usize {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        let slot = asset_slot_wire(data, asset_index)?;
+        let (side, principal_num) = if domain % 2 == 0 {
+            (
+                percolator::SideV16::Long,
+                slot.provider_principal_long.get(),
+            )
+        } else {
+            (
+                percolator::SideV16::Short,
+                slot.provider_principal_short.get(),
+            )
+        };
+        // The stored floor is brought up to date at the domain's next write. Until then the
+        // engine's reader returns the lower of it and the current protection.
+        let (protection_num, floor_num) = slot.provider_protection_and_floor_num(side);
+        Ok(ProviderProtectionV16 {
+            market_id: slot.asset.market_id.get(),
+            principal_num,
+            protection_num,
+            floor_num,
+        })
+    }
+
     pub fn read_market_trade_preflight(
         data: &[u8],
         asset_index: usize,
@@ -8952,7 +9010,6 @@ pub mod ix {
             max_account_b_settlement_chunks: u64,
             max_bankrupt_close_chunks: u64,
             max_bankrupt_close_lifetime_slots: u64,
-            public_b_chunk_atoms: u128,
             maintenance_fee_per_slot: u128,
         },
         InitPortfolio,
@@ -9451,10 +9508,10 @@ pub mod ix {
         ///
         /// `b_loss_atom_budget` is a **collateral-atom** budget: the maximum loss, in
         /// account atoms, that this call may settle out of the leg's outstanding B debt.
-        /// It is min'd with the market's `public_b_chunk_atoms` and converted to a B-index
+        /// It is min'd with the public B chunk (`percolator::PUBLIC_B_CHUNK_ATOMS`) and converted to a B-index
         /// delta exactly once, inside the engine
         /// (`percolator 2c38570a:src/v16.rs:14149-14166`, "Both limits are collateral
-        /// atoms"), so nothing is ever settled beyond `min(public_b_chunk_atoms,
+        /// atoms"), so nothing is ever settled beyond `min(PUBLIC_B_CHUNK_ATOMS,
         /// b_remaining)`.
         ///
         /// UNIT CHANGE — the field was called `b_delta_budget` and, against the deployed
@@ -10102,7 +10159,6 @@ pub mod ix {
                         max_account_b_settlement_chunks: read_u64(&mut rest)?,
                         max_bankrupt_close_chunks: read_u64(&mut rest)?,
                         max_bankrupt_close_lifetime_slots: read_u64(&mut rest)?,
-                        public_b_chunk_atoms: read_u128(&mut rest)?,
                         maintenance_fee_per_slot: read_u128(&mut rest)?,
                     };
                     if rest.is_empty() {
@@ -10998,7 +11054,6 @@ pub mod ix {
                     max_account_b_settlement_chunks,
                     max_bankrupt_close_chunks,
                     max_bankrupt_close_lifetime_slots,
-                    public_b_chunk_atoms,
                     maintenance_fee_per_slot,
                 } => {
                     out.push(0);
@@ -11022,7 +11077,6 @@ pub mod ix {
                     push_u64(&mut out, max_account_b_settlement_chunks);
                     push_u64(&mut out, max_bankrupt_close_chunks);
                     push_u64(&mut out, max_bankrupt_close_lifetime_slots);
-                    push_u128(&mut out, public_b_chunk_atoms);
                     push_u128(&mut out, maintenance_fee_per_slot);
                 }
                 Self::InitPortfolio => out.push(1),
@@ -16053,7 +16107,6 @@ pub mod processor {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
             } => handle_init_market(
                 program_id,
@@ -16078,7 +16131,6 @@ pub mod processor {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
                 growth,
                 lot_exp,
@@ -17322,7 +17374,6 @@ pub mod processor {
         max_account_b_settlement_chunks: u64,
         max_bankrupt_close_chunks: u64,
         max_bankrupt_close_lifetime_slots: u64,
-        public_b_chunk_atoms: u128,
         maintenance_fee_per_slot: u128,
         // growth-v19: `(r_gap_bps, l_launch_x100)` from the optional trailing block.
         growth: Option<(u16, u16)>,
@@ -17344,7 +17395,6 @@ pub mod processor {
         expect_owner(market_ai, program_id)?;
         verify_mint(mint_ai)?;
         if trade_fee_base_bps > max_trading_fee_bps
-            || public_b_chunk_atoms < constants::PUBLIC_B_CHUNK_ATOMS_MIN
             || max_portfolio_assets == 0
             || max_portfolio_assets > constants::WRAPPER_MAX_PORTFOLIO_ASSETS
             || h_max as u128 > BOUND_SCALE
@@ -17372,7 +17422,6 @@ pub mod processor {
         cfg.max_account_b_settlement_chunks = max_account_b_settlement_chunks;
         cfg.max_bankrupt_close_chunks = max_bankrupt_close_chunks;
         cfg.max_bankrupt_close_lifetime_slots = max_bankrupt_close_lifetime_slots;
-        cfg.public_b_chunk_atoms = public_b_chunk_atoms;
         if initial_price == 0 || initial_price > percolator::MAX_ORACLE_PRICE {
             return Err(PercolatorError::EngineInvalidConfig.into());
         }
@@ -21812,6 +21861,39 @@ pub mod processor {
         verify_vault_token_account(vault_token, &vault_authority, &mint)?;
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(source_balance, amount_u64)?;
+        let cfg_after = top_up_insurance_book(
+            market_ai,
+            signer,
+            ledger_ai,
+            units_ai,
+            expected_market_id,
+            intent_id,
+            expected_authority_epoch,
+            amount,
+        )?;
+        transfer_tokens(token_program, source_token, vault_token, signer, amount_u64)?;
+        if let Some(cfg) = cfg_after {
+            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
+        }
+        Ok(())
+    }
+
+    /// The market-view block of `handle_top_up_insurance`, out of line so the market view
+    /// (152 B since engine #385's `protection_observed`) does not sit in the handler's SBF
+    /// frame. Same checks in the same order, same errors, same writes; an error here returns
+    /// from the handler exactly as the inline block did. Returns `cfg_after`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn top_up_insurance_book<'a>(
+        market_ai: &AccountInfo<'a>,
+        signer: &AccountInfo<'a>,
+        ledger_ai: Option<&AccountInfo<'a>>,
+        units_ai: Option<&AccountInfo<'a>>,
+        expected_market_id: u64,
+        intent_id: u64,
+        expected_authority_epoch: u64,
+        amount: u128,
+    ) -> Result<Option<WrapperConfigV16>, ProgramError> {
         let mut cfg_after = None;
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
@@ -21894,11 +21976,7 @@ pub mod processor {
                 write_or_init_insurance_ledger(data, ledger, *initialized)?;
             }
         }
-        transfer_tokens(token_program, source_token, vault_token, signer, amount_u64)?;
-        if let Some(cfg) = cfg_after {
-            state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg)?;
-        }
-        Ok(())
+        Ok(cfg_after)
     }
 
     #[inline(never)]
@@ -26120,28 +26198,14 @@ pub mod processor {
         // scan's `ScanProgress`), because the refusal below would otherwise roll it back. Only
         // reachable on a terminal-empty Resolved market, after the same authority + epoch
         // checks the close itself performs.
-        {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            {
-                let (cfg, group) = state::market_view_mut(&mut market_data)?;
-                expect_live_authority(&cfg.marketauth, admin_dest.key)?;
-                require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
-            }
-            let rebooked = {
-                let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-                let moved = terminal_empty_resolved_view(&group)
-                    && rebook_orphaned_fee_legs_view(
-                        program_id, market_ai, accounts, &mut cfg, &mut group,
-                    )?;
-                if moved {
-                    group.validate_shape().map_err(map_v16_error)?;
-                }
-                moved.then_some(cfg)
-            };
-            if let Some(cfg) = rebooked {
-                state::write_wrapper_config(&mut market_data, &cfg)?;
-                return Ok(());
-            }
+        if close_slab_rebook_orphaned_fee_legs(
+            program_id,
+            accounts,
+            admin_dest,
+            market_ai,
+            expected_authority_epoch,
+        )? {
+            return Ok(());
         }
 
         // S2 audit 2026-10-17 (fee routing): this gate used to run FIRST, so on every market with an Earn
@@ -26150,27 +26214,8 @@ pub mod processor {
         // the protocol leg stayed unclaimable for ever. The re-book only relabels owed atoms (no token moves,
         // same authority + epoch checks, terminal-empty Resolved only), so it is safe to run first; the close
         // itself is still refused by the floor, unchanged.
-        let lp_vault_dead_share_floor_present = {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (_, group) = state::market_view_mut(&mut market_data)?;
-            let configured_domains =
-                v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
-                    .map_err(map_v16_error)?;
-            let mut found = false;
-            for domain in 0..configured_domains {
-                let (_, bucket) = backing_domain_parts_view(&group, domain)?;
-                let funded = bucket.status != BackingBucketStatusV16::Empty
-                    || bucket.fresh_unliened_backing_num > 0
-                    || bucket.valid_liened_backing_num > 0
-                    || bucket.consumed_liened_backing_num > 0
-                    || bucket.impaired_liened_backing_num > 0;
-                if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
-                    found = true;
-                    break;
-                }
-            }
-            found
-        };
+        let lp_vault_dead_share_floor_present =
+            close_slab_lp_vault_dead_share_floor_present(market_ai)?;
         if lp_vault_dead_share_floor_present {
             return Err(PercolatorError::EngineLockActive.into());
         }
@@ -26181,173 +26226,17 @@ pub mod processor {
             vault_balance,
             secondary_close,
             native_residue_authority,
-        ) = {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            expect_live_authority(&cfg.marketauth, admin_dest.key)?;
-            // W3A-1: strictly precedes every mutation below (the mode check, the
-            // scan, and the fund sweep) -- matches upstream `238436c5`'s position,
-            // right after the authority check it binds. CHECK-ONLY (asset-0's
-            // `authority_epoch` is not advanced here): CloseSlab is terminal --
-            // once it succeeds the market's own reserve invariant guards the rest
-            // of teardown, so there is no future rotation on THIS market left to
-            // protect against a still-held stale intent.
-            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
-            if group.header.mode != 1 {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            if group.header.c_tot.get() != 0 || group.header.materialized_portfolio_count.get() != 0
-            {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            // P1 F4: never burn an owed fee leg. The terminal retirement below SPL-burns (or
-            // escheats) ALL unbudgeted insurance, and the four fee legs live exactly there.
-            // Refuse until each is claimed: protocol (tag 84) and creator (tag 90) are
-            // claimable while Resolved; the LP + staker legs are swept by tag 87 on this
-            // terminal-empty state (see `handle_withdraw_insurance_reserve_to_stake`).
-            //
-            // Refuse only while an owed leg is still BACKED by atoms the retirement would burn:
-            // the fee legs are at-risk claims on the unbudgeted insurance pool (they are not
-            // senior to loss coverage), so if losses already consumed that pool the unbacked
-            // remainder is unpayable by anyone and must not wedge the close forever.
-            let unbudgeted_pool = group
-                .header
-                .insurance
-                .get()
-                .saturating_sub(
-                    group
-                        .header
-                        .source_insurance_credit_reserved_total_atoms
-                        .get(),
-                )
-                .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
-                // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
-                // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
-                .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
-            if risk_limits_v17::close_refused_for_fees(
-                outstanding_fee_legs_view(&cfg, &group)?,
-                unbudgeted_pool,
-            ) {
-                return Err(PercolatorError::CloseSlabFeesOutstanding.into());
-            }
-            let primary_mint = primary_collateral_mint(&cfg);
-            let vault_balance =
-                verify_vault_token_account(vault_token, &vault_authority, &primary_mint)?;
-            verify_user_token_account(dest_token, admin_dest.key, &primary_mint)?;
-            let secondary_close = if cfg.secondary_collateral_mint != [0u8; 32] {
-                let secondary_vault_token = account(accounts, 6)?;
-                let secondary_dest_token = account(accounts, 7)?;
-                expect_writable(secondary_vault_token)?;
-                expect_writable(secondary_dest_token)?;
-                if secondary_vault_token.key == vault_token.key
-                    || secondary_dest_token.key == dest_token.key
-                {
-                    return Err(PercolatorError::InvalidVaultAccount.into());
-                }
-                let secondary_mint = secondary_collateral_mint(&cfg)?;
-                let secondary_vault_balance = verify_vault_token_account(
-                    secondary_vault_token,
-                    &vault_authority,
-                    &secondary_mint,
-                )?;
-                verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
-                Some((
-                    secondary_vault_token,
-                    secondary_dest_token,
-                    secondary_vault_balance,
-                ))
-            } else {
-                None
-            };
-
-            // Cursor storage: carved into asset-0's `AssetOracleProfileV16` spare
-            // tail (`terminal_slab_scan_progress`), NOT `WrapperConfigV16` --
-            // upstream's offset-160 field collides byte-exact with our LIVE
-            // `insurance_withdraw_deposit_remaining` (KL-FIELD-01). Writing via
-            // `write_oracle_profile_to_view` mutates `group`'s own backing bytes
-            // directly (zero-copy), so no separate `write_wrapper_config` call is
-            // needed the way upstream's cfg-based cursor requires.
-            let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
-            let configured_assets = group.header.config.max_market_slots.get() as usize;
-            let mut cursor_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
-            let scan_start = terminal_slab_scan_start(
-                cursor_profile.terminal_slab_scan_progress,
-                configured_assets,
-            )?;
-            // FORK-only engine 3rd parameter (`35ac35c4`/`0efa8f22`, "terminal
-            // retirement fails closed on a protocol-fee reserve" -- absent
-            // upstream, whose call site takes only 2 args). Pass 0: this wrapper
-            // does not reserve a protocol fee out of terminal retirement, so this
-            // is upstream-equivalent behavior (see the engine's own doc comment
-            // on `advance_terminal_slab_not_atomic`: "Pass `0` for upstream
-            // behavior").
-            // W-S2 (v2.2 growth overnight, stake builder finding): CloseSlab does NOT read the
-            // item-6 `InsuranceUnitsV20` ledger. That is safe only because the retirement below
-            // refuses with `EngineLockActive` (21) while ANY insurance domain budget remains
-            // (`insurance_domain_budget_remaining_total != 0`, engine
-            // `retire_terminal_unbudgeted_insurance_delta`), and every unit is minted by a
-            // budget-crediting top-up (tag 9 on asset 0) or by the genesis that the unit hook
-            // re-runs on budget credited while no unit exists (`ins_units_genesis_due`). So while
-            // a unit holder still has value
-            // in the fund the close waits; holders exit through terminal tag 41 (units burned)
-            // first. If units remain after the budget is spent to 0 (losses), they are worth 0
-            // and nothing of theirs is retired. Pinned by `ws2_close_slab_refuses_21_while_a_
-            // unitised_insurance_budget_remains` (tests/v16_cu.rs). Any change that lets this
-            // close proceed with a budget outstanding MUST read the units ledger first.
-            let retired = match group
-                .advance_terminal_slab_not_atomic(authenticated_slot, scan_start, 0)
-                .map_err(map_v16_error)?
-            {
-                TerminalSlabOutcomeV16::ScanProgress { next_asset_index } => {
-                    cursor_profile.terminal_slab_scan_progress =
-                        encode_terminal_slab_scan_progress(next_asset_index, configured_assets)?;
-                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
-                    return Ok(());
-                }
-                TerminalSlabOutcomeV16::BackingExpired { .. } => {
-                    // ADOPT upstream `547847ed`: reset to 0 (full rescan) rather
-                    // than resuming at `domain / 2`. Expiring a backing bucket can
-                    // retroactively make a LOWER-indexed, already-scanned-past
-                    // asset newly recreditable; resuming above it would silently
-                    // skip it forever. Covered by `d134c64d`'s
-                    // `inv_070_terminal_scan_recredit` test (ported below as
-                    // `terminal_scan_prefix_invalidated_after_backing_expiry`).
-                    cursor_profile.terminal_slab_scan_progress = 0;
-                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
-                    return Ok(());
-                }
-                TerminalSlabOutcomeV16::InsuranceRecredited { asset_index, .. } => {
-                    cursor_profile.terminal_slab_scan_progress =
-                        encode_terminal_slab_scan_progress(asset_index, configured_assets)?;
-                    write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
-                    return Ok(());
-                }
-                TerminalSlabOutcomeV16::ReadyToClose { retired } => retired,
-            };
-            cursor_profile.terminal_slab_scan_progress = 0;
-            write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
-            // ADOPT upstream `236b4f85` "retire native booked residue without burn"
-            // (Wave-3 W3C-residue, completing the `NOT ported` gap this fork's
-            // 547847ed/d134c64d port (Wave-1 S1a) left flagged below the account
-            // list at the top of this function). Native SPL tokens (wrapped SOL,
-            // `spl_token::native_mint::id()`) CANNOT be burned -- the real
-            // spl-token program's `process_burn` unconditionally rejects a
-            // native source account with `TokenError::NativeNotSupported`
-            // (Custom(10)). A market whose primary collateral is the native
-            // mint that ever accumulates unbudgeted terminal residue would
-            // permanently fail this CPI, bricking `CloseSlab` for that market
-            // forever (no other code path clears `retired_unbudgeted_insurance`
-            // once the scan reaches `ReadyToClose`). Mirrors upstream exactly:
-            // decide HERE, while `group`/`cfg` are still in scope, whether the
-            // retirement below must escheat via transfer instead of burn.
-            let native_residue_authority = if retired != 0
-                && primary_mint == spl_token::native_mint::id()
-            {
-                Some(domain_authorities_from_view(&group, &cfg, 0)?.insurance_authority)
-            } else {
-                None
-            };
-            (cfg, retired, vault_balance, secondary_close, native_residue_authority)
+        ) = match close_slab_scan_and_check(
+            accounts,
+            admin_dest,
+            market_ai,
+            vault_token,
+            dest_token,
+            &vault_authority,
+            expected_authority_epoch,
+        )? {
+            Some(v) => v,
+            None => return Ok(()),
         };
 
         let primary_mint = primary_collateral_mint(&cfg_pre);
@@ -26506,6 +26395,262 @@ pub mod processor {
             .checked_add(refunded_lamports)
             .ok_or(PercolatorError::EngineArithmeticOverflow)?;
         Ok(())
+    }
+
+    /// CloseSlab's authority/epoch/fee-leg checks, terminal-slab scan step and sweep-account
+    /// checks, moved out of `handle_close_slab` unchanged so the market view lives in this frame
+    /// (engine #385 grew it; the handler was 4160 B, past the 4096 B SBF frame). `Ok(None)` = a
+    /// scan step was persisted and the handler returns `Ok(())` without closing, exactly as the
+    /// inline `return Ok(())` arms did; `Ok(Some(..))` carries the values the close needs.
+    #[inline(never)]
+    #[allow(clippy::type_complexity)]
+    fn close_slab_scan_and_check<'a>(
+        accounts: &'a [AccountInfo<'a>],
+        admin_dest: &AccountInfo,
+        market_ai: &AccountInfo,
+        vault_token: &AccountInfo,
+        dest_token: &AccountInfo,
+        vault_authority: &Pubkey,
+        expected_authority_epoch: u64,
+    ) -> Result<
+        Option<(
+            WrapperConfigV16,
+            u128,
+            u64,
+            Option<(&'a AccountInfo<'a>, &'a AccountInfo<'a>, u64)>,
+            Option<[u8; 32]>,
+        )>,
+        ProgramError,
+    > {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        expect_live_authority(&cfg.marketauth, admin_dest.key)?;
+        // W3A-1: strictly precedes every mutation below (the mode check, the
+        // scan, and the fund sweep) -- matches upstream `238436c5`'s position,
+        // right after the authority check it binds. CHECK-ONLY (asset-0's
+        // `authority_epoch` is not advanced here): CloseSlab is terminal --
+        // once it succeeds the market's own reserve invariant guards the rest
+        // of teardown, so there is no future rotation on THIS market left to
+        // protect against a still-held stale intent.
+        require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+        if group.header.mode != 1 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if group.header.c_tot.get() != 0 || group.header.materialized_portfolio_count.get() != 0
+        {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        // P1 F4: never burn an owed fee leg. The terminal retirement below SPL-burns (or
+        // escheats) ALL unbudgeted insurance, and the four fee legs live exactly there.
+        // Refuse until each is claimed: protocol (tag 84) and creator (tag 90) are
+        // claimable while Resolved; the LP + staker legs are swept by tag 87 on this
+        // terminal-empty state (see `handle_withdraw_insurance_reserve_to_stake`).
+        //
+        // Refuse only while an owed leg is still BACKED by atoms the retirement would burn:
+        // the fee legs are at-risk claims on the unbudgeted insurance pool (they are not
+        // senior to loss coverage), so if losses already consumed that pool the unbacked
+        // remainder is unpayable by anyone and must not wedge the close forever.
+        let unbudgeted_pool = group
+            .header
+            .insurance
+            .get()
+            .saturating_sub(
+                group
+                    .header
+                    .source_insurance_credit_reserved_total_atoms
+                    .get(),
+            )
+            .saturating_sub(group.header.insurance_domain_budget_remaining_total.get())
+            // v2.2 rent: unrouted holding-fee rent is the vault LP's claim on insurance
+            // (I_free = I - rent_unrouted); the engine's surplus withdrawal excludes it too.
+            .saturating_sub(group.rent_unrouted_total().unwrap_or(u128::MAX));
+        if risk_limits_v17::close_refused_for_fees(
+            outstanding_fee_legs_view(&cfg, &group)?,
+            unbudgeted_pool,
+        ) {
+            return Err(PercolatorError::CloseSlabFeesOutstanding.into());
+        }
+        let primary_mint = primary_collateral_mint(&cfg);
+        let vault_balance =
+            verify_vault_token_account(vault_token, vault_authority, &primary_mint)?;
+        verify_user_token_account(dest_token, admin_dest.key, &primary_mint)?;
+        let secondary_close = if cfg.secondary_collateral_mint != [0u8; 32] {
+            let secondary_vault_token = account(accounts, 6)?;
+            let secondary_dest_token = account(accounts, 7)?;
+            expect_writable(secondary_vault_token)?;
+            expect_writable(secondary_dest_token)?;
+            if secondary_vault_token.key == vault_token.key
+                || secondary_dest_token.key == dest_token.key
+            {
+                return Err(PercolatorError::InvalidVaultAccount.into());
+            }
+            let secondary_mint = secondary_collateral_mint(&cfg)?;
+            let secondary_vault_balance = verify_vault_token_account(
+                secondary_vault_token,
+                vault_authority,
+                &secondary_mint,
+            )?;
+            verify_user_token_account(secondary_dest_token, admin_dest.key, &secondary_mint)?;
+            Some((
+                secondary_vault_token,
+                secondary_dest_token,
+                secondary_vault_balance,
+            ))
+        } else {
+            None
+        };
+
+        // Cursor storage: carved into asset-0's `AssetOracleProfileV16` spare
+        // tail (`terminal_slab_scan_progress`), NOT `WrapperConfigV16` --
+        // upstream's offset-160 field collides byte-exact with our LIVE
+        // `insurance_withdraw_deposit_remaining` (KL-FIELD-01). Writing via
+        // `write_oracle_profile_to_view` mutates `group`'s own backing bytes
+        // directly (zero-copy), so no separate `write_wrapper_config` call is
+        // needed the way upstream's cfg-based cursor requires.
+        let authenticated_slot = authenticated_market_slot_or_fallback_view(&group);
+        let configured_assets = group.header.config.max_market_slots.get() as usize;
+        let mut cursor_profile = read_oracle_profile_from_view(&group, &cfg, 0)?;
+        let scan_start = terminal_slab_scan_start(
+            cursor_profile.terminal_slab_scan_progress,
+            configured_assets,
+        )?;
+        // FORK-only engine 3rd parameter (`35ac35c4`/`0efa8f22`, "terminal
+        // retirement fails closed on a protocol-fee reserve" -- absent
+        // upstream, whose call site takes only 2 args). Pass 0: this wrapper
+        // does not reserve a protocol fee out of terminal retirement, so this
+        // is upstream-equivalent behavior (see the engine's own doc comment
+        // on `advance_terminal_slab_not_atomic`: "Pass `0` for upstream
+        // behavior").
+        // W-S2 (v2.2 growth overnight, stake builder finding): CloseSlab does NOT read the
+        // item-6 `InsuranceUnitsV20` ledger. That is safe only because the retirement below
+        // refuses with `EngineLockActive` (21) while ANY insurance domain budget remains
+        // (`insurance_domain_budget_remaining_total != 0`, engine
+        // `retire_terminal_unbudgeted_insurance_delta`), and every unit is minted by a
+        // budget-crediting top-up (tag 9 on asset 0) or by the genesis that the unit hook
+        // re-runs on budget credited while no unit exists (`ins_units_genesis_due`). So while
+        // a unit holder still has value
+        // in the fund the close waits; holders exit through terminal tag 41 (units burned)
+        // first. If units remain after the budget is spent to 0 (losses), they are worth 0
+        // and nothing of theirs is retired. Pinned by `ws2_close_slab_refuses_21_while_a_
+        // unitised_insurance_budget_remains` (tests/v16_cu.rs). Any change that lets this
+        // close proceed with a budget outstanding MUST read the units ledger first.
+        let retired = match group
+            .advance_terminal_slab_not_atomic(authenticated_slot, scan_start, 0)
+            .map_err(map_v16_error)?
+        {
+            TerminalSlabOutcomeV16::ScanProgress { next_asset_index } => {
+                cursor_profile.terminal_slab_scan_progress =
+                    encode_terminal_slab_scan_progress(next_asset_index, configured_assets)?;
+                write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                return Ok(None);
+            }
+            TerminalSlabOutcomeV16::BackingExpired { .. } => {
+                // ADOPT upstream `547847ed`: reset to 0 (full rescan) rather
+                // than resuming at `domain / 2`. Expiring a backing bucket can
+                // retroactively make a LOWER-indexed, already-scanned-past
+                // asset newly recreditable; resuming above it would silently
+                // skip it forever. Covered by `d134c64d`'s
+                // `inv_070_terminal_scan_recredit` test (ported below as
+                // `terminal_scan_prefix_invalidated_after_backing_expiry`).
+                cursor_profile.terminal_slab_scan_progress = 0;
+                write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                return Ok(None);
+            }
+            TerminalSlabOutcomeV16::InsuranceRecredited { asset_index, .. } => {
+                cursor_profile.terminal_slab_scan_progress =
+                    encode_terminal_slab_scan_progress(asset_index, configured_assets)?;
+                write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+                return Ok(None);
+            }
+            TerminalSlabOutcomeV16::ReadyToClose { retired } => retired,
+        };
+        cursor_profile.terminal_slab_scan_progress = 0;
+        write_oracle_profile_to_view(&mut group, 0, &cursor_profile)?;
+        // ADOPT upstream `236b4f85` "retire native booked residue without burn"
+        // (Wave-3 W3C-residue, completing the `NOT ported` gap this fork's
+        // 547847ed/d134c64d port (Wave-1 S1a) left flagged below the account
+        // list at the top of this function). Native SPL tokens (wrapped SOL,
+        // `spl_token::native_mint::id()`) CANNOT be burned -- the real
+        // spl-token program's `process_burn` unconditionally rejects a
+        // native source account with `TokenError::NativeNotSupported`
+        // (Custom(10)). A market whose primary collateral is the native
+        // mint that ever accumulates unbudgeted terminal residue would
+        // permanently fail this CPI, bricking `CloseSlab` for that market
+        // forever (no other code path clears `retired_unbudgeted_insurance`
+        // once the scan reaches `ReadyToClose`). Mirrors upstream exactly:
+        // decide HERE, while `group`/`cfg` are still in scope, whether the
+        // retirement below must escheat via transfer instead of burn.
+        let native_residue_authority = if retired != 0
+            && primary_mint == spl_token::native_mint::id()
+        {
+            Some(domain_authorities_from_view(&group, &cfg, 0)?.insurance_authority)
+        } else {
+            None
+        };
+        Ok(Some((cfg, retired, vault_balance, secondary_close, native_residue_authority)))
+    }
+
+    /// CloseSlab's P1 F4 orphaned-fee-leg re-book step, moved out of `handle_close_slab`
+    /// unchanged (engine #385 grew the market view; the handler was 4160 B, past the 4096 B SBF
+    /// frame). `Ok(true)` = the re-book ran and was persisted, so the handler returns `Ok(())`
+    /// without closing, exactly as the inline block did.
+    #[inline(never)]
+    fn close_slab_rebook_orphaned_fee_legs(
+        program_id: &Pubkey,
+        accounts: &[AccountInfo],
+        admin_dest: &AccountInfo,
+        market_ai: &AccountInfo,
+        expected_authority_epoch: u64,
+    ) -> Result<bool, ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        {
+            let (cfg, group) = state::market_view_mut(&mut market_data)?;
+            expect_live_authority(&cfg.marketauth, admin_dest.key)?;
+            require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+        }
+        let rebooked = {
+            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+            let moved = terminal_empty_resolved_view(&group)
+                && rebook_orphaned_fee_legs_view(
+                    program_id, market_ai, accounts, &mut cfg, &mut group,
+                )?;
+            if moved {
+                group.validate_shape().map_err(map_v16_error)?;
+            }
+            moved.then_some(cfg)
+        };
+        if let Some(cfg) = rebooked {
+            state::write_wrapper_config(&mut market_data, &cfg)?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// CloseSlab's LP-vault dead-share-floor scan, moved out of `handle_close_slab` unchanged
+    /// (same frame reason as `close_slab_rebook_orphaned_fee_legs`).
+    #[inline(never)]
+    fn close_slab_lp_vault_dead_share_floor_present(
+        market_ai: &AccountInfo,
+    ) -> Result<bool, ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (_, group) = state::market_view_mut(&mut market_data)?;
+        let configured_domains =
+            v16_domain_count_for_market_slots(group.header.config.max_market_slots.get())
+                .map_err(map_v16_error)?;
+        let mut found = false;
+        for domain in 0..configured_domains {
+            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+            let funded = bucket.status != BackingBucketStatusV16::Empty
+                || bucket.fresh_unliened_backing_num > 0
+                || bucket.valid_liened_backing_num > 0
+                || bucket.consumed_liened_backing_num > 0
+                || bucket.impaired_liened_backing_num > 0;
+            if funded && bucket.expiry_slot == crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT {
+                found = true;
+                break;
+            }
+        }
+        Ok(found)
     }
 
     #[inline(never)]
@@ -26678,7 +26823,7 @@ pub mod processor {
     /// for the unit, its bound, and the legacy-value hazard (a B-index-scale number forfeits
     /// that many ATOMS). The handler validates only that the budget is nonzero — scale is the
     /// caller's to get right, and the engine caps the settled amount at
-    /// `min(public_b_chunk_atoms, b_remaining)`.
+    /// `min(PUBLIC_B_CHUNK_ATOMS, b_remaining)`.
     #[inline(never)]
     fn handle_forfeit_recovery_leg<'a>(
         program_id: &Pubkey,
@@ -28045,238 +28190,26 @@ pub mod processor {
         if action == ASSET_ACTION_ACTIVATE
             && (asset_index == configured_slots_pre || permissionless_reuse_target)
         {
-            let authenticated_slot = authenticated_slot_or_fallback(now_slot);
-            let append_activation = asset_index == configured_slots_pre;
-            if append_activation && cfg_pre.free_market_slot_count != 0 {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            let init_fee = if is_asset_authority {
-                0
-            } else {
-                let fee = permissionless_market_init_fee_for_asset(
-                    cfg_pre.permissionless_market_init_fee,
-                    asset_index,
-                )?;
-                if fee == 0 || fee > max_init_fee {
-                    return Err(PercolatorError::Unauthorized.into());
-                }
-                fee
-            };
-            let transfer_accounts = if init_fee == 0 {
-                None
-            } else {
-                let source_token = account(accounts, 2)?;
-                let vault_token = account(accounts, 3)?;
-                let token_program = account(accounts, 4)?;
-                expect_writable(source_token)?;
-                expect_writable(vault_token)?;
-                verify_token_program(token_program)?;
-                let mint = primary_collateral_mint(&cfg_pre);
-                let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
-                let source_balance =
-                    verify_user_token_account(source_token, authority.key, &mint)?;
-                verify_vault_token_account(vault_token, &vault_authority, &mint)?;
-                let amount_u64 = amount_to_u64(init_fee)?;
-                require_token_balance(source_balance, amount_u64)?;
-                Some((source_token, vault_token, token_program, amount_u64))
-            };
-            if asset_index >= capacity_pre {
-                let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
-                market_ai.realloc(new_len, true)?;
-            }
-            // CEI fix: transfer the init fee BEFORE mutating engine state.
-            // A Token-2022 transfer hook fires during the CPI and could re-enter this program
-            // while seeing already-committed engine effects (active slot, decremented
-            // free_market_slot_count). Performing the transfer first means the hook fires against
-            // the pre-activation state, eliminating the re-entrancy window.
-            if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
-            {
-                transfer_tokens(
-                    token_program,
-                    source_token,
-                    vault_token,
-                    authority,
-                    amount_u64,
-                )?;
-            }
-            {
-                let mut data = market_ai.try_borrow_mut_data()?;
-                let mut reuse_cfg_after = None;
-                let mut reuse_activated = false;
-                {
-                    let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
-                    require_asset_lifecycle_generation_view(
-                        &group,
-                        asset_index,
-                        true,
-                        expected_market_id,
-                    )?;
-                    let still_asset_authority =
-                        cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
-                    if still_asset_authority {
-                        // W3A-2: ADOPT upstream `dd958393` -- market-authority reuse of a
-                        // free slot is authority-consent, so it is bound to the LIVE asset-0
-                        // authority_epoch exactly like the other two call sites below.
-                        require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
-                    } else {
-                        // W3A-2: ADOPT upstream `dd958393` -- the permissionless reuse path
-                        // below is generation- and fee-bound, not authority consent. Requiring
-                        // the canonical zero value here (rather than skipping the check)
-                        // prevents this wire lane from becoming an unaudited caller-controlled
-                        // payload once `authority_epoch` exists on the wire at all.
-                        state::require_current_authority_epoch(0, expected_authority_epoch)?;
-                        let expected_fee = permissionless_market_init_fee_for_asset(
-                            cfg.permissionless_market_init_fee,
-                            asset_index,
-                        )?;
-                        if expected_fee == 0
-                            || expected_fee > max_init_fee
-                            || expected_fee != init_fee
-                        {
-                            return Err(PercolatorError::Unauthorized.into());
-                        }
-                    }
-                    if group.header.mode != 0 {
-                        return Err(PercolatorError::EngineLockActive.into());
-                    }
-                    let configured_slots = group.header.config.max_market_slots.get() as usize;
-                    if asset_index == configured_slots {
-                        if cfg.free_market_slot_count != 0 {
-                            return Err(PercolatorError::EngineLockActive.into());
-                        }
-                    } else if !still_asset_authority
-                        && asset_index < configured_slots
-                        && cfg.free_market_slot_count != 0
-                    {
-                        if group.markets[asset_index].engine.asset.lifecycle
-                            != ASSET_LIFECYCLE_RETIRED
-                        {
-                            // Slot is below max_market_slots and NOT retired. If it is
-                            // one of the three IN-SERVICE lifecycles, say so precisely;
-                            // anything else keeps the prior generic code so no other
-                            // rejection is silently reclassified.
-                            return Err(match group.markets[asset_index].engine.asset.lifecycle {
-                                ASSET_LIFECYCLE_ACTIVE
-                                | ASSET_LIFECYCLE_DRAIN_ONLY
-                                | ASSET_LIFECYCLE_RECOVERY => {
-                                    PercolatorError::AssetSlotAlreadyConfigured.into()
-                                }
-                                _ => PercolatorError::EngineLockActive.into(),
-                            });
-                        }
-                        // Reject zero domain authorities, mirroring the append path
-                        // (activate_dynamic_asset_slot, ~line 1475). A zero
-                        // insurance_authority makes that domain's insurance budget
-                        // withdrawable by nobody (terminal_insurance_remaining rejects a
-                        // zero authority), permanently bricking CloseSlab (Finding F).
-                        if !domain_authority_fields_complete(
-                            insurance_authority,
-                            insurance_operator,
-                            backing_bucket_authority,
-                            oracle_authority,
-                        ) {
-                            return Err(PercolatorError::InvalidInstruction.into());
-                        }
-                        group
-                            .header
-                            .activate_empty_market_slot_not_atomic(
-                                asset_index as u32,
-                                &mut group.markets[asset_index],
-                                initial_price,
-                                authenticated_slot,
-                            )
-                            .map_err(map_v16_error)?;
-                        cfg.free_market_slot_count = cfg
-                            .free_market_slot_count
-                            .checked_sub(1)
-                            .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                        let mut profile =
-                            state::manual_asset_oracle_profile(initial_price, authenticated_slot);
-                        profile.insurance_authority = insurance_authority;
-                        profile.insurance_operator = insurance_operator;
-                        profile.backing_bucket_authority = backing_bucket_authority;
-                        profile.oracle_authority = oracle_authority;
-                        // Per-asset cold-storage admin: bootstrap to the activator; it can later be
-                        // rotated to a cold key or burned via UpdateAssetAuthority.
-                        profile.asset_admin = authority.key.to_bytes();
-                        write_oracle_profile_to_view_if_separate(
-                            &mut group,
-                            asset_index,
-                            &profile,
-                        )?;
-                        // P2b (review L-1): a reused slot starts with no ADL episode.
-                        state::clear_adl_episode_in_wrapper_bytes(
-                            &mut group.markets[asset_index].wrapper[..],
-                        )?;
-                        // Security review I-1 (path 2/4, slot reuse): nor graduation state.
-                        let engine_imr = group.header.config.initial_margin_bps.get();
-                        state::reset_asset_growth_graduation_in_wrapper_bytes(
-                            &mut group.markets[asset_index].wrapper[..],
-                            engine_imr,
-                            authenticated_slot,
-                        )?;
-                        group.validate_shape().map_err(map_v16_error)?;
-                        reuse_cfg_after = Some(cfg);
-                        reuse_activated = true;
-                    } else {
-                        return Err(PercolatorError::EngineLockActive.into());
-                    }
-                }
-                if let Some(cfg) = reuse_cfg_after {
-                    state::write_wrapper_config(&mut data, &cfg)?;
-                }
-                if reuse_activated && init_fee != 0 {
-                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                    deposit_market_zero_insurance_view(&mut group, init_fee)?;
-                    group.validate_shape().map_err(map_v16_error)?;
-                }
-                let (_cfg, _mode, configured_slots, _) =
-                    state::read_market_config_mode_and_capacity(&data)?;
-                if !reuse_activated && asset_index == configured_slots {
-                    let mut profile = state::activate_dynamic_asset_slot(
-                        &mut data,
-                        asset_index,
-                        authenticated_slot,
-                        initial_price,
-                        insurance_authority,
-                        insurance_operator,
-                        backing_bucket_authority,
-                        oracle_authority,
-                    )?;
-                    // Per-asset cold-storage admin: bootstrap to the activator (the permissionless
-                    // creator or the asset_authority); rotatable / burnable via UpdateAssetAuthority.
-                    profile.asset_admin = authority.key.to_bytes();
-                    state::write_asset_oracle_profile(&mut data, asset_index, &profile)?;
-                    // P2b (review L-1): a newly activated slot starts with no ADL episode.
-                    let limits = state::read_asset_risk_limits(&data, asset_index)?;
-                    state::write_asset_risk_limits(
-                        &mut data,
-                        asset_index,
-                        &state::clear_adl_episode(limits),
-                    )?;
-                    state::clear_p2b_senior_floor(&mut data, asset_index)?;
-                    // Security review I-1 (path 3/4, append activation): no graduation state.
-                    {
-                        let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                        let engine_imr = group.header.config.initial_margin_bps.get();
-                        let market = group
-                            .markets
-                            .get_mut(asset_index)
-                            .ok_or(PercolatorError::InvalidInstruction)?;
-                        state::reset_asset_growth_graduation_in_wrapper_bytes(
-                            &mut market.wrapper[..],
-                            engine_imr,
-                            authenticated_slot,
-                        )?;
-                    }
-                    if init_fee != 0 {
-                        let (_cfg, mut group) = state::market_view_mut(&mut data)?;
-                        deposit_market_zero_insurance_view(&mut group, init_fee)?;
-                        group.validate_shape().map_err(map_v16_error)?;
-                    }
-                }
-            }
-            return Ok(());
+            return update_asset_lifecycle_activate(
+                program_id,
+                accounts,
+                authority,
+                market_ai,
+                &cfg_pre,
+                configured_slots_pre,
+                capacity_pre,
+                is_asset_authority,
+                asset_index,
+                expected_market_id,
+                expected_authority_epoch,
+                now_slot,
+                initial_price,
+                max_init_fee,
+                insurance_authority,
+                insurance_operator,
+                backing_bucket_authority,
+                oracle_authority,
+            );
         }
         if action == ASSET_ACTION_SHUTDOWN {
             if now_slot == 0 || initial_price != 0 || cfg_pre.force_close_delay_slots == 0 {
@@ -28396,6 +28329,268 @@ pub mod processor {
             is_activation,
             expected_market_id,
         )
+    }
+
+    /// The ACTIVATE branch of `handle_update_asset_lifecycle` (append, or reuse of a free
+    /// slot), out of line so its market views (152 B each since engine #385's
+    /// `protection_observed`) do not sit in the handler's SBF frame. The body is the inline
+    /// branch unchanged: same checks in the same order, same errors, same transfer-before-
+    /// mutation order, same writes; the handler returns whatever this returns, exactly as the
+    /// branch's own `return Ok(())` / `?` did.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn update_asset_lifecycle_activate<'a>(
+        program_id: &Pubkey,
+        accounts: &'a [AccountInfo<'a>],
+        authority: &'a AccountInfo<'a>,
+        market_ai: &'a AccountInfo<'a>,
+        cfg_pre: &WrapperConfigV16,
+        configured_slots_pre: usize,
+        capacity_pre: usize,
+        is_asset_authority: bool,
+        asset_index: usize,
+        expected_market_id: u64,
+        expected_authority_epoch: u64,
+        now_slot: u64,
+        initial_price: u64,
+        max_init_fee: u128,
+        insurance_authority: [u8; 32],
+        insurance_operator: [u8; 32],
+        backing_bucket_authority: [u8; 32],
+        oracle_authority: [u8; 32],
+    ) -> ProgramResult {
+        let authenticated_slot = authenticated_slot_or_fallback(now_slot);
+        let append_activation = asset_index == configured_slots_pre;
+        if append_activation && cfg_pre.free_market_slot_count != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        let init_fee = if is_asset_authority {
+            0
+        } else {
+            let fee = permissionless_market_init_fee_for_asset(
+                cfg_pre.permissionless_market_init_fee,
+                asset_index,
+            )?;
+            if fee == 0 || fee > max_init_fee {
+                return Err(PercolatorError::Unauthorized.into());
+            }
+            fee
+        };
+        let transfer_accounts = if init_fee == 0 {
+            None
+        } else {
+            let source_token = account(accounts, 2)?;
+            let vault_token = account(accounts, 3)?;
+            let token_program = account(accounts, 4)?;
+            expect_writable(source_token)?;
+            expect_writable(vault_token)?;
+            verify_token_program(token_program)?;
+            let mint = primary_collateral_mint(&cfg_pre);
+            let (vault_authority, _) = derive_vault_authority(program_id, market_ai.key);
+            let source_balance =
+                verify_user_token_account(source_token, authority.key, &mint)?;
+            verify_vault_token_account(vault_token, &vault_authority, &mint)?;
+            let amount_u64 = amount_to_u64(init_fee)?;
+            require_token_balance(source_balance, amount_u64)?;
+            Some((source_token, vault_token, token_program, amount_u64))
+        };
+        if asset_index >= capacity_pre {
+            let new_len = state::market_account_len_for_capacity(asset_index + 1)?;
+            market_ai.realloc(new_len, true)?;
+        }
+        // CEI fix: transfer the init fee BEFORE mutating engine state.
+        // A Token-2022 transfer hook fires during the CPI and could re-enter this program
+        // while seeing already-committed engine effects (active slot, decremented
+        // free_market_slot_count). Performing the transfer first means the hook fires against
+        // the pre-activation state, eliminating the re-entrancy window.
+        if let Some((source_token, vault_token, token_program, amount_u64)) = transfer_accounts
+        {
+            transfer_tokens(
+                token_program,
+                source_token,
+                vault_token,
+                authority,
+                amount_u64,
+            )?;
+        }
+        {
+            let mut data = market_ai.try_borrow_mut_data()?;
+            let mut reuse_cfg_after = None;
+            let mut reuse_activated = false;
+            {
+                let (mut cfg, mut group) = state::market_view_mut(&mut data)?;
+                require_asset_lifecycle_generation_view(
+                    &group,
+                    asset_index,
+                    true,
+                    expected_market_id,
+                )?;
+                let still_asset_authority =
+                    cfg.marketauth != [0u8; 32] && cfg.marketauth == authority.key.to_bytes();
+                if still_asset_authority {
+                    // W3A-2: ADOPT upstream `dd958393` -- market-authority reuse of a
+                    // free slot is authority-consent, so it is bound to the LIVE asset-0
+                    // authority_epoch exactly like the other two call sites below.
+                    require_authority_epoch_view(&group, 0, expected_authority_epoch)?;
+                } else {
+                    // W3A-2: ADOPT upstream `dd958393` -- the permissionless reuse path
+                    // below is generation- and fee-bound, not authority consent. Requiring
+                    // the canonical zero value here (rather than skipping the check)
+                    // prevents this wire lane from becoming an unaudited caller-controlled
+                    // payload once `authority_epoch` exists on the wire at all.
+                    state::require_current_authority_epoch(0, expected_authority_epoch)?;
+                    let expected_fee = permissionless_market_init_fee_for_asset(
+                        cfg.permissionless_market_init_fee,
+                        asset_index,
+                    )?;
+                    if expected_fee == 0
+                        || expected_fee > max_init_fee
+                        || expected_fee != init_fee
+                    {
+                        return Err(PercolatorError::Unauthorized.into());
+                    }
+                }
+                if group.header.mode != 0 {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+                let configured_slots = group.header.config.max_market_slots.get() as usize;
+                if asset_index == configured_slots {
+                    if cfg.free_market_slot_count != 0 {
+                        return Err(PercolatorError::EngineLockActive.into());
+                    }
+                } else if !still_asset_authority
+                    && asset_index < configured_slots
+                    && cfg.free_market_slot_count != 0
+                {
+                    if group.markets[asset_index].engine.asset.lifecycle
+                        != ASSET_LIFECYCLE_RETIRED
+                    {
+                        // Slot is below max_market_slots and NOT retired. If it is
+                        // one of the three IN-SERVICE lifecycles, say so precisely;
+                        // anything else keeps the prior generic code so no other
+                        // rejection is silently reclassified.
+                        return Err(match group.markets[asset_index].engine.asset.lifecycle {
+                            ASSET_LIFECYCLE_ACTIVE
+                            | ASSET_LIFECYCLE_DRAIN_ONLY
+                            | ASSET_LIFECYCLE_RECOVERY => {
+                                PercolatorError::AssetSlotAlreadyConfigured.into()
+                            }
+                            _ => PercolatorError::EngineLockActive.into(),
+                        });
+                    }
+                    // Reject zero domain authorities, mirroring the append path
+                    // (activate_dynamic_asset_slot, ~line 1475). A zero
+                    // insurance_authority makes that domain's insurance budget
+                    // withdrawable by nobody (terminal_insurance_remaining rejects a
+                    // zero authority), permanently bricking CloseSlab (Finding F).
+                    if !domain_authority_fields_complete(
+                        insurance_authority,
+                        insurance_operator,
+                        backing_bucket_authority,
+                        oracle_authority,
+                    ) {
+                        return Err(PercolatorError::InvalidInstruction.into());
+                    }
+                    group
+                        .header
+                        .activate_empty_market_slot_not_atomic(
+                            asset_index as u32,
+                            &mut group.markets[asset_index],
+                            initial_price,
+                            authenticated_slot,
+                        )
+                        .map_err(map_v16_error)?;
+                    cfg.free_market_slot_count = cfg
+                        .free_market_slot_count
+                        .checked_sub(1)
+                        .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                    let mut profile =
+                        state::manual_asset_oracle_profile(initial_price, authenticated_slot);
+                    profile.insurance_authority = insurance_authority;
+                    profile.insurance_operator = insurance_operator;
+                    profile.backing_bucket_authority = backing_bucket_authority;
+                    profile.oracle_authority = oracle_authority;
+                    // Per-asset cold-storage admin: bootstrap to the activator; it can later be
+                    // rotated to a cold key or burned via UpdateAssetAuthority.
+                    profile.asset_admin = authority.key.to_bytes();
+                    write_oracle_profile_to_view_if_separate(
+                        &mut group,
+                        asset_index,
+                        &profile,
+                    )?;
+                    // P2b (review L-1): a reused slot starts with no ADL episode.
+                    state::clear_adl_episode_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                    )?;
+                    // Security review I-1 (path 2/4, slot reuse): nor graduation state.
+                    let engine_imr = group.header.config.initial_margin_bps.get();
+                    state::reset_asset_growth_graduation_in_wrapper_bytes(
+                        &mut group.markets[asset_index].wrapper[..],
+                        engine_imr,
+                        authenticated_slot,
+                    )?;
+                    group.validate_shape().map_err(map_v16_error)?;
+                    reuse_cfg_after = Some(cfg);
+                    reuse_activated = true;
+                } else {
+                    return Err(PercolatorError::EngineLockActive.into());
+                }
+            }
+            if let Some(cfg) = reuse_cfg_after {
+                state::write_wrapper_config(&mut data, &cfg)?;
+            }
+            if reuse_activated && init_fee != 0 {
+                let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                deposit_market_zero_insurance_view(&mut group, init_fee)?;
+                group.validate_shape().map_err(map_v16_error)?;
+            }
+            let (_cfg, _mode, configured_slots, _) =
+                state::read_market_config_mode_and_capacity(&data)?;
+            if !reuse_activated && asset_index == configured_slots {
+                let mut profile = state::activate_dynamic_asset_slot(
+                    &mut data,
+                    asset_index,
+                    authenticated_slot,
+                    initial_price,
+                    insurance_authority,
+                    insurance_operator,
+                    backing_bucket_authority,
+                    oracle_authority,
+                )?;
+                // Per-asset cold-storage admin: bootstrap to the activator (the permissionless
+                // creator or the asset_authority); rotatable / burnable via UpdateAssetAuthority.
+                profile.asset_admin = authority.key.to_bytes();
+                state::write_asset_oracle_profile(&mut data, asset_index, &profile)?;
+                // P2b (review L-1): a newly activated slot starts with no ADL episode.
+                let limits = state::read_asset_risk_limits(&data, asset_index)?;
+                state::write_asset_risk_limits(
+                    &mut data,
+                    asset_index,
+                    &state::clear_adl_episode(limits),
+                )?;
+                state::clear_p2b_senior_floor(&mut data, asset_index)?;
+                // Security review I-1 (path 3/4, append activation): no graduation state.
+                {
+                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                    let engine_imr = group.header.config.initial_margin_bps.get();
+                    let market = group
+                        .markets
+                        .get_mut(asset_index)
+                        .ok_or(PercolatorError::InvalidInstruction)?;
+                    state::reset_asset_growth_graduation_in_wrapper_bytes(
+                        &mut market.wrapper[..],
+                        engine_imr,
+                        authenticated_slot,
+                    )?;
+                }
+                if init_fee != 0 {
+                    let (_cfg, mut group) = state::market_view_mut(&mut data)?;
+                    deposit_market_zero_insurance_view(&mut group, init_fee)?;
+                    group.validate_shape().map_err(map_v16_error)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // sync/w2-tb3: same 11-argument shape as the caller this was extracted
@@ -32591,6 +32786,79 @@ pub mod processor {
         )?;
 
         // ── Phase 3: backing-bucket + ledger update. ──
+        deposit_to_lp_vault_book(
+            market_ai,
+            target_ledger_ai,
+            &registry_pda,
+            target_domain,
+            domain,
+            backing_num,
+            amount,
+        )?;
+
+        // ── Phase 4: mint LP shares to depositor (registry PDA signs). ──
+        let mint_ix = spl_token::instruction::mint_to(
+            token_program.key,
+            mint_ai.key,
+            depositor_lp_ata.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &mint_ix,
+            &[
+                mint_ai.clone(),
+                depositor_lp_ata.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Phase 5: bump outstanding shares. ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_add(shares)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+        // ── Phase 6 (P3, bound vaults only): the senior claim grows by exactly the deposit. ──
+        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+            // Genesis (no shares existed): C restarts at exactly the deposit, so any orphaned
+            // claim dust left by an earlier full exit stays with the junior, never the newcomer.
+            st.senior_claim_atoms = if registry.total_lp_shares_outstanding == 0 {
+                amount
+            } else {
+                st.senior_claim_atoms
+                    .checked_add(amount)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
+            };
+            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        }
+        Ok(())
+    }
+
+    /// Phase 3 of `handle_deposit_to_lp_vault` (backing-bucket + ledger update), out of line so
+    /// the market view (152 B since engine #385's `protection_observed`) does not sit in the
+    /// handler's SBF frame. Same checks in the same order, same errors, same writes; an error
+    /// here returns from the handler exactly as the inline block did.
+    #[inline(never)]
+    fn deposit_to_lp_vault_book<'a>(
+        market_ai: &AccountInfo<'a>,
+        target_ledger_ai: &AccountInfo<'a>,
+        registry_pda: &Pubkey,
+        target_domain: u16,
+        domain: usize,
+        backing_num: u128,
+        amount: u128,
+    ) -> ProgramResult {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -32655,53 +32923,6 @@ pub mod processor {
             group.header.vault = percolator::V16PodU128::new(next_vault);
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
-        }
-
-        // ── Phase 4: mint LP shares to depositor (registry PDA signs). ──
-        let mint_ix = spl_token::instruction::mint_to(
-            token_program.key,
-            mint_ai.key,
-            depositor_lp_ata.key,
-            &registry_pda,
-            &[],
-            shares_u64,
-        )?;
-        invoke_signed(
-            &mint_ix,
-            &[
-                mint_ai.clone(),
-                depositor_lp_ata.clone(),
-                registry_ai.clone(),
-                token_program.clone(),
-            ],
-            &[&[
-                crate::constants::LP_VAULT_REGISTRY_SEED,
-                market_ai.key.as_ref(),
-                &[registry_bump],
-            ]],
-        )?;
-
-        // ── Phase 5: bump outstanding shares. ──
-        {
-            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-            reg.total_lp_shares_outstanding = reg
-                .total_lp_shares_outstanding
-                .checked_add(shares)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
-        }
-        // ── Phase 6 (P3, bound vaults only): the senior claim grows by exactly the deposit. ──
-        if let Some((vault_lp_ai, _, mut st)) = bound_tail {
-            // Genesis (no shares existed): C restarts at exactly the deposit, so any orphaned
-            // claim dust left by an earlier full exit stays with the junior, never the newcomer.
-            st.senior_claim_atoms = if registry.total_lp_shares_outstanding == 0 {
-                amount
-            } else {
-                st.senior_claim_atoms
-                    .checked_add(amount)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?
-            };
-            state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
         }
         Ok(())
     }
@@ -34129,6 +34350,147 @@ pub mod processor {
         };
 
         // ── Inline withdraw — MIRRORS handle_withdraw_backing_bucket. ──
+        execute_redemption_withdraw_view(
+            market_ai,
+            ledger_ai,
+            source_ledger_ai,
+            sibling_ledger_ai,
+            &registry,
+            &registry_pda,
+            source_domain,
+            domain,
+            asset_index,
+            bound_tail.is_some(),
+            atoms,
+            principal_portion,
+            earnings_portion,
+            gross_consumed,
+            backing_num,
+        )?;
+
+        // ── Transfer vault → redeemer (vault_authority PDA signs). ──
+        let vault_bump_arr = [vault_bump];
+        let vault_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &vault_bump_arr]];
+        transfer_tokens_signed(
+            token_program,
+            vault_token,
+            redeemer_dest,
+            vault_authority_ai,
+            atoms_u64,
+            vault_seeds,
+        )?;
+
+        // ── Burn the escrowed shares (registry PDA signs as escrow owner). ──
+        let shares_u64 = u64::try_from(redemption.shares)
+            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
+        let burn_ix = spl_token::instruction::burn(
+            token_program.key,
+            escrow_ai.key,
+            lp_mint.key,
+            &registry_pda,
+            &[],
+            shares_u64,
+        )?;
+        invoke_signed(
+            &burn_ix,
+            &[
+                escrow_ai.clone(),
+                lp_mint.clone(),
+                registry_ai.clone(),
+                token_program.clone(),
+            ],
+            &[&[
+                crate::constants::LP_VAULT_REGISTRY_SEED,
+                market_ai.key.as_ref(),
+                &[registry_bump],
+            ]],
+        )?;
+
+        // ── Decrement outstanding shares (mirrors the burn). ──
+        {
+            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
+            // P3: the senior claim loses exactly the redeemed pro-rata slice (rounded down, so
+            // the remaining holders' per-share claim never falls). Uses S BEFORE the burn.
+            if let Some((vault_lp_ai, _, mut st)) = bound_tail {
+                st.senior_claim_atoms = vault_lp_v18::senior_claim_after_redemption(
+                    st.senior_claim_atoms,
+                    redemption.shares,
+                    reg.total_lp_shares_outstanding,
+                )
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+                state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+            }
+            reg.total_lp_shares_outstanding = reg
+                .total_lp_shares_outstanding
+                .checked_sub(redemption.shares)
+                .ok_or(PercolatorError::EngineCounterUnderflow)?;
+            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
+        }
+
+        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
+        //
+        // GH#412: the rent goes to the REDEEMER, not the cranker.
+        //
+        // It used to go to whoever cranked, while `CancelRedemption` returned it to
+        // the redeemer — the same lamports, two different recipients depending on
+        // how the request ended. The rent was the redeemer's money either way; the
+        // cranker's incentive is a separate question and does not get funded out of
+        // someone else's rent deposit by accident of which path ran.
+        //
+        // Pinned to the RECORDED redeemer, so this cannot become a caller-chosen
+        // payout: `redemption.redeemer` was written at request time and is the same
+        // value `verify_user_token_account` already checks `redeemer_dest` against.
+        if redeemer_rent_dest.key.to_bytes() != redemption.redeemer {
+            return Err(PercolatorError::Unauthorized.into());
+        }
+        expect_writable(redeemer_rent_dest)?;
+        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
+        let reclaim = redemption_ai.lamports();
+        **redemption_ai.try_borrow_mut_lamports()? = 0;
+        **redeemer_rent_dest.try_borrow_mut_lamports()? = redeemer_rent_dest
+            .lamports()
+            .checked_add(reclaim)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // v2.2 move event (tag 77): the principal / earnings split of the paid amount (the total
+        // is the vault->redeemer token transfer; the split is decided on chain and appears in no
+        // balance) and the shares burned. Emitted last, after the payout and burn succeeded.
+        fill_events_v22::emit_move(
+            fill_events_v22::TAG_EXECUTE_REDEMPTION,
+            &market_ai.key.to_bytes(),
+            fill_events_v22::MOVE_EARN_EXIT,
+            fill_events_v22::NO_ASSET,
+            fill_events_v22::sat_u64(principal_portion),
+            fill_events_v22::sat_u64(earnings_portion),
+            shares_u64,
+        );
+        Ok(())
+    }
+
+    /// The inline withdraw of `handle_execute_redemption` (mirrors
+    /// `handle_withdraw_backing_bucket`), out of line so the market view (152 B since engine
+    /// #385's `protection_observed`) does not sit in the handler's SBF frame. The body is the
+    /// inline block unchanged except that `bound` is `bound_tail.is_some()` (the block only
+    /// ever asked that); same checks in the same order, same errors, same writes, and an error
+    /// returns from the handler exactly as the inline block's `?` / `return Err` did.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn execute_redemption_withdraw_view<'a>(
+        market_ai: &AccountInfo<'a>,
+        ledger_ai: &AccountInfo<'a>,
+        source_ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        source_domain: u16,
+        domain: usize,
+        asset_index: usize,
+        bound: bool,
+        atoms: u128,
+        principal_portion: u128,
+        earnings_portion: u128,
+        gross_consumed: u128,
+        backing_num: u128,
+    ) -> ProgramResult {
         {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             // `group` is mut: the LPVAULT-359 stub credit (#381) calls the &mut self engine
@@ -34173,9 +34535,9 @@ pub mod processor {
                 backing_num,
                 source_ledger_ai,
                 other_ledger_ai,
-                if bound_tail.is_some() { None } else { Some(principal_portion) },
+                if bound { None } else { Some(principal_portion) },
             )?;
-            if bound_tail.is_none() {
+            if !bound {
                 vault_pot_earnings_top_up_from_sibling(
                     &mut group,
                     market_ai.key.to_bytes(),
@@ -34218,8 +34580,8 @@ pub mod processor {
             // PHYSICAL fresh backing (checked below); the ledger principal can trail it (the
             // engine's resolved close can return backing to the pot without a wrapper ledger
             // write), so it is not a gate there and is decremented saturating.
-            let ledger_gate = !(bound_tail.is_some() && group.header.mode == 1);
-            let ledger_cap = if bound_tail.is_some() {
+            let ledger_gate = !(bound && group.header.mode == 1);
+            let ledger_cap = if bound {
                 ledger.total_principal_atoms
             } else {
                 vault_lp_v18::nonbound_pot_available(ledger.total_principal_atoms, e3_physical)
@@ -34227,7 +34589,7 @@ pub mod processor {
             if ledger_gate && principal_portion > ledger_cap {
                 // B24 / gate-100: on a LIVE bound vault the chosen pot cannot fund this payout —
                 // name it (recall or redeem less), before any generic counter error.
-                if bound_tail.is_some() && group.header.mode == 0 {
+                if bound && group.header.mode == 0 {
                     return Err(PercolatorError::VaultLpRedeemNeedsRecall.into());
                 }
                 return Err(PercolatorError::EngineCounterUnderflow.into());
@@ -34250,12 +34612,12 @@ pub mod processor {
             // waterfall: V = pots + LP value). A payout the chosen pot cannot fund is NOT lent
             // out; it needs a recall (98, permissionless, LP flat) first, or a smaller
             // redemption. Name it instead of a generic 21.
-            let bound_live = bound_tail.is_some() && group.header.mode == 0;
+            let bound_live = bound && group.header.mode == 0;
             // Security INFO (PR #522): on a NON-bound vault a lapsed source pot is not payable
             // either (W-21, the same predicate tag 50 / 91 / the sibling top-up use): its
             // principal is tag 89's to forfeit, and which instruction lands first must not
             // decide where it goes. Bound pots keep their sentinel-expiry handling (F-14).
-            let source_lapsed = bound_tail.is_none()
+            let source_lapsed = !bound
                 && !policy_v16::backing_principal_withdrawal_is_fresh(
                     bucket.expiry_slot,
                     source_check_slot,
@@ -34309,7 +34671,7 @@ pub mod processor {
             // (accept path) and execute_redemption_oi_reservation_violation_rejects
             // (genuine-lien reject path, solvency-preserving) in
             // tests/v16_fork_lp_vault_redeem.rs.
-            let bound_resolved_withdraw = bound_tail.is_some() && group.header.mode == 1;
+            let bound_resolved_withdraw = bound && group.header.mode == 1;
             if registry.oi_reservation_threshold_bps != 0 && !bound_resolved_withdraw {
                 // Out of line (SBF frame): tag 77 sits at 4,032 of the 4,096-byte frame.
                 // P3U (2026-10-20): a BOUND pot's available principal is the B24 reading the
@@ -34321,7 +34683,7 @@ pub mod processor {
                 // underflowed: a full senior exit got 25 for as long as the counters stood.
                 execute_redemption_oi_reservation_check(
                     &ledger,
-                    if bound_tail.is_some() {
+                    if bound {
                         vault_lp_v18::bound_pot_available_principal(
                             ledger.total_principal_atoms,
                             bucket.fresh_unliened_backing_num,
@@ -34513,102 +34875,6 @@ pub mod processor {
             group.validate_shape().map_err(map_v16_error)?;
             write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
         }
-
-        // ── Transfer vault → redeemer (vault_authority PDA signs). ──
-        let vault_bump_arr = [vault_bump];
-        let vault_seeds: &[&[&[u8]]] = &[&[b"vault", market_ai.key.as_ref(), &vault_bump_arr]];
-        transfer_tokens_signed(
-            token_program,
-            vault_token,
-            redeemer_dest,
-            vault_authority_ai,
-            atoms_u64,
-            vault_seeds,
-        )?;
-
-        // ── Burn the escrowed shares (registry PDA signs as escrow owner). ──
-        let shares_u64 = u64::try_from(redemption.shares)
-            .map_err(|_| PercolatorError::EngineArithmeticOverflow)?;
-        let burn_ix = spl_token::instruction::burn(
-            token_program.key,
-            escrow_ai.key,
-            lp_mint.key,
-            &registry_pda,
-            &[],
-            shares_u64,
-        )?;
-        invoke_signed(
-            &burn_ix,
-            &[
-                escrow_ai.clone(),
-                lp_mint.clone(),
-                registry_ai.clone(),
-                token_program.clone(),
-            ],
-            &[&[
-                crate::constants::LP_VAULT_REGISTRY_SEED,
-                market_ai.key.as_ref(),
-                &[registry_bump],
-            ]],
-        )?;
-
-        // ── Decrement outstanding shares (mirrors the burn). ──
-        {
-            let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
-            // P3: the senior claim loses exactly the redeemed pro-rata slice (rounded down, so
-            // the remaining holders' per-share claim never falls). Uses S BEFORE the burn.
-            if let Some((vault_lp_ai, _, mut st)) = bound_tail {
-                st.senior_claim_atoms = vault_lp_v18::senior_claim_after_redemption(
-                    st.senior_claim_atoms,
-                    redemption.shares,
-                    reg.total_lp_shares_outstanding,
-                )
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-                state::write_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-            }
-            reg.total_lp_shares_outstanding = reg
-                .total_lp_shares_outstanding
-                .checked_sub(redemption.shares)
-                .ok_or(PercolatorError::EngineCounterUnderflow)?;
-            state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &reg)?;
-        }
-
-        // ── Consume the redemption PDA (zero magic — replay guard) + reclaim rent. ──
-        //
-        // GH#412: the rent goes to the REDEEMER, not the cranker.
-        //
-        // It used to go to whoever cranked, while `CancelRedemption` returned it to
-        // the redeemer — the same lamports, two different recipients depending on
-        // how the request ended. The rent was the redeemer's money either way; the
-        // cranker's incentive is a separate question and does not get funded out of
-        // someone else's rent deposit by accident of which path ran.
-        //
-        // Pinned to the RECORDED redeemer, so this cannot become a caller-chosen
-        // payout: `redemption.redeemer` was written at request time and is the same
-        // value `verify_user_token_account` already checks `redeemer_dest` against.
-        if redeemer_rent_dest.key.to_bytes() != redemption.redeemer {
-            return Err(PercolatorError::Unauthorized.into());
-        }
-        expect_writable(redeemer_rent_dest)?;
-        state::consume_lp_redemption(&mut redemption_ai.try_borrow_mut_data()?)?;
-        let reclaim = redemption_ai.lamports();
-        **redemption_ai.try_borrow_mut_lamports()? = 0;
-        **redeemer_rent_dest.try_borrow_mut_lamports()? = redeemer_rent_dest
-            .lamports()
-            .checked_add(reclaim)
-            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-        // v2.2 move event (tag 77): the principal / earnings split of the paid amount (the total
-        // is the vault->redeemer token transfer; the split is decided on chain and appears in no
-        // balance) and the shares burned. Emitted last, after the payout and burn succeeded.
-        fill_events_v22::emit_move(
-            fill_events_v22::TAG_EXECUTE_REDEMPTION,
-            &market_ai.key.to_bytes(),
-            fill_events_v22::MOVE_EARN_EXIT,
-            fill_events_v22::NO_ASSET,
-            fill_events_v22::sat_u64(principal_portion),
-            fill_events_v22::sat_u64(earnings_portion),
-            shares_u64,
-        );
         Ok(())
     }
 
@@ -34957,314 +35223,17 @@ pub mod processor {
 
         // Sync the ledger from the live bucket, persist, read current earnings,
         // and compute/consume the wrapper-side LP fee claim.
-        let (total_earnings, available, cfg_after) = {
-            let mut market_data = market_ai.try_borrow_mut_data()?;
-            let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
-            // MODE GATE (Finding 1) -- modelled on `handle_deposit_to_lp_vault`
-            // mode gate, NOT on `handle_withdraw_protocol_fee`'s `live_mode`
-            // / `resolved_mode` block, and deliberately the STRICTER of the two.
-            //
-            // Rationale. What this crank does is functionally a DEPOSIT into the
-            // LP backing domain: it calls the same
-            // `add_fresh_counterparty_backing_view` with the same
-            // `LP_VAULT_BACKING_EXPIRY_SLOT` and credits the same
-            // `ledger.total_principal_atoms`. It differs from a real deposit only
-            // in where the atoms come from (senior insurance rather than the
-            // depositor's token account) and in that NOBODY has to authorise it --
-            // tag 78 carries no authority signature at all, only
-            // `expect_signer(cranker)` on an arbitrary fee payer. A handler that
-            // anyone can fire at any moment should not be reachable in more market
-            // states than the same operation performed by its own beneficiary.
-            //
-            // Why not the protocol-fee model. `handle_withdraw_protocol_fee` may
-            // run in Resolved because it (a) requires the protocol fee authority's
-            // signature, and (b) EXTINGUISHES the claim -- atoms leave to an
-            // authority-owned token account and no downstream obligation survives,
-            // which is why the `materialized_portfolio_count == 0 && c_tot == 0`
-            // precondition is sufficient there. This crank does the opposite: it
-            // CONVERTS senior insurance into a junior LP claim that must still be
-            // paid out later through `RequestRedeemLpShares` -> `ExecuteRedemption`.
-            // "Safe to drain now" therefore does not transfer, and creating fresh
-            // backing on a market that is winding down is meaningless.
-            //
-            // Concretely blocked:
-            //   * Recovery (mode 2) -- the failure in the finding. Post-solvency-
-            //     event, `header.insurance` IS the recovery buffer; any signer
-            //     could otherwise convert up to `lp_fee_accrued - lp_fee_withdrawn`
-            //     of it into junior LP backing and have LPs redeem it out.
-            //   * Resolved (mode 1) -- same conversion, before trader portfolios
-            //     are materialised.
-            //   * Live-but-matured -- `reject_permissionless_resolve_matured_live_view`
-            //     is what `handle_deposit_to_lp_vault` uses to stop permissionless
-            //     writes to a market that is past its stale-resolve horizon and is
-            //     merely awaiting someone to resolve it.
-            //
-            // The claim is NOT lost in any of these states: nothing is marked
-            // withdrawn on a rejected crank, so `lp_fee_accrued - lp_fee_withdrawn`
-            // stays fully claimable if the market returns to Live.
-            // P3 (Earn redeem-lock fix, 2026-09-30): on a BOUND vault, a Resolved market that is
-            // TERMINAL-FLAT (no materialized portfolio, c_tot == 0 — exactly the state in which
-            // Resolved Earn redemption is allowed, #377) may harvest the LP fee leg into backing
-            // and the senior claim. Otherwise fees accrued before resolution could never reach
-            // NAV and bound redemption (which requires H == 0) would be locked forever. At
-            // terminal-flat no trader payout can still draw on insurance, so the Finding-1
-            // hazard (converting insurance that still backs traders) cannot arise; the clamp in
-            // `lp_vault_harvestable_fee_atoms` keeps reserved/budgeted insurance untouched.
-            // Earn-drain §5 (2026-10-04): NON-bound vaults get the same terminal-flat harvest. On
-            // a non-bound market the stranded value (claim-free engine Residual, and pot backing
-            // the ledger books as loss although it is physically there) otherwise stays in the
-            // vault forever: 77 prices from the ledger and nothing else can reach it. At
-            // terminal-flat no trader can draw on insurance or on the pots, so the Finding-1
-            // hazard does not arise here either; open receipts keep their reserved residual
-            // (`nonbound_terminal_absorb` only reconciles pot backing then).
-            let (terminal_flat, receipts_open) = resolved_terminal_flat(&group)?;
-            let resolved_terminal_harvest = terminal_flat;
-            if group.header.mode != 0 && !resolved_terminal_harvest {
-                return Err(PercolatorError::EngineLockActive.into());
-            }
-            if !resolved_terminal_harvest {
-                reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
-            }
-            // PROG-1: verify the vault is still the backing authority for this domain.
-            // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
-            // without the check here, a fee crank after an asset_admin authority rotation
-            // inflates insurance_fee_snapshot_atoms with earnings the vault does not own,
-            // causing LP holders to lose claim to fees in the gap when authority is restored.
-            let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
-            if authorities.backing_bucket_authority != registry_pda.to_bytes() {
-                return Err(PercolatorError::LpVaultAuthorityMismatch.into());
-            }
-            let (_, bucket) = backing_domain_parts_view(&group, domain)?;
-            let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
-            let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
-                &ledger_data,
-                market_ai.key.to_bytes(),
-                registry_pda.to_bytes(),
-                target_domain,
-                &bucket,
-            )?;
-            sync_backing_domain_ledger(&mut ledger, &bucket)?;
-            let te = ledger.total_earnings_atoms;
-
-            // Claim capacity. Monotonic invariant:
-            // lp_fee_withdrawn_atoms <= lp_fee_accrued_atoms, always — so the
-            // subtraction can only underflow on a corrupt config, which fails
-            // closed.
-            // #411: computed by `lp_vault_harvestable_fee_atoms`, which
-            // `handle_deposit_to_lp_vault` also calls. Deliberately shared — a deposit must
-            // be priced against exactly what a crank in the same slot would realize, and
-            // two separate copies of this clamp would drift and reopen that bug. The
-            // reasoning that used to live here (three legs share one surplus pool with no
-            // cross-leg accounting, so an unclamped claim makes the last leg to crank fail
-            // out of the engine) now lives on the helper.
-            let available = lp_vault_harvestable_fee_atoms(&cfg, &group)?;
-            // F-14 (P3-d): on a TERMINAL claim-free Resolved bound market, first let the engine
-            // run its own claim-free recredit for this asset (insurance's entitled overlap,
-            // upstream 76a86f48), then absorb whatever claim-free RESIDUAL is left
-            // (vault - c_tot - insurance - provider earnings - fresh backing: tokens nobody's
-            // counter owns, created when outside winners were paid from these pots and the
-            // loss side refilled them) into the vault's OWN pot. Seniors then take it first
-            // through min(physical, C); the junior only what is left over C (tag 102).
-            let absorbed = if resolved_terminal_harvest && bound_tail.is_none() {
-                nonbound_terminal_absorb(&mut group, domain, &mut ledger, receipts_open)?
-            } else if resolved_terminal_harvest && receipts_open {
-                // P3 option (b): receipts are open, so the residual is reserved for them (no
-                // engine recredit, no residual absorption); only the stray (claim-free POT
-                // backing, never receipt value) becomes the vault's.
-                let stray = vault_absorb_terminal_stray(&mut group, domain)?;
-                if stray != 0 {
-                    let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
-                    ledger.last_observed_unavailable_principal_atoms =
-                        backing_unavailable_principal_atoms(&bucket_after)?;
-                    ledger.total_principal_atoms = ledger
-                        .total_principal_atoms
-                        .checked_add(stray)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                }
-                stray
-            } else if resolved_terminal_harvest {
-                // F-1: every configured asset's insurance recredit runs before the slab-global
-                // residual is absorbed (`terminal_recredit_all_assets`).
-                match terminal_recredit_all_assets(&mut group, domain / 2).map(|ready| {
-                    if ready { Ok(()) } else { Err(percolator::V16Error::LockActive) }
-                })? {
-                    Ok(_) => {
-                        let residual = vault_terminal_residual_atoms(&group)?;
-                        if residual != 0 {
-                            add_fresh_counterparty_backing_view(
-                                &mut group,
-                                domain,
-                                residual
-                                    .checked_mul(BOUND_SCALE)
-                                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
-                                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
-                            )?;
-                            {
-                                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
-                                ledger.last_observed_unavailable_principal_atoms =
-                                    backing_unavailable_principal_atoms(&bucket_after)?;
-                            }
-                            ledger.total_principal_atoms = ledger
-                                .total_principal_atoms
-                                .checked_add(residual)
-                                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                            group.validate_shape().map_err(map_v16_error)?;
-                        }
-                        // Stranded pot backing: loss backing whose winners all exited sits in a
-                        // pot the vault never funded (often ledger-less). Make it the vault's.
-                        let stray = vault_absorb_terminal_stray(&mut group, domain)?;
-                        if stray != 0 {
-                            let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
-                            ledger.last_observed_unavailable_principal_atoms =
-                                backing_unavailable_principal_atoms(&bucket_after)?;
-                            ledger.total_principal_atoms = ledger
-                                .total_principal_atoms
-                                .checked_add(stray)
-                                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                        }
-                        residual
-                            .checked_add(stray)
-                            .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                    }
-                    Err(percolator::V16Error::LockActive) => 0,
-                    Err(e) => return Err(map_v16_error(e)),
-                }
-            } else {
-                0
-            };
-            // Zero case: nothing accrued, or the surplus pool is currently dry
-            // (another leg got there first). Same error either way — the claim
-            // is NOT marked withdrawn, so it stays fully claimable next crank.
-            // Deadlock fix (frontend-lane review): on a terminal Resolved bound market the
-            // crank is also the residual step 77 waits for; if the engine's own recredit cleared
-            // the residual (or nothing was pending), succeed as a no-op instead of reverting it.
-            if available == 0 && absorbed == 0 && !resolved_terminal_harvest && !draw_booked {
-                return Err(PercolatorError::LpVaultNoFeesToCrank.into());
-            }
-            if available == 0 {
-                write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
-                (te, 0u128, cfg)
-            } else {
-
-            // ── Reclassify `available` atoms: senior insurance → LP backing. ──
-            // No token moves. See the MECHANISM block on this handler.
-            let v_before = group.header.vault.get();
-            group
-                .withdraw_insurance_surplus_not_atomic(available) // I−a, V−a
-                .map_err(map_v16_error)?;
-            group.header.vault = percolator::V16PodU128::new(v_before); // restore V
-            // Lane MEDIUM (2026-09-30): on a BOUND vault the seniors' claim is pooled across both
-            // pots, but every redemption draws from ONE pot, so a harvest booked into one pot
-            // left the other pot's seniors short of their fee share. Split the harvest pro rata
-            // to the two pots' principal (when the other ledger is passed writable).
-            let other_ledger_ai = if ledger_ai.key == own_ledger_ai.key {
-                sibling_ledger_ai
-            } else {
-                own_ledger_ai
-            };
-            let other_domain = sibling_domain(domain as u16) as usize;
-            let other_part = if bound_tail.is_some()
-                && other_ledger_ai.is_writable
-                && !other_ledger_ai.data_is_empty()
-            {
-                let od = other_ledger_ai.try_borrow_data()?;
-                let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
-                let (ol, _) = read_or_new_backing_domain_ledger(
-                    &od,
-                    market_ai.key.to_bytes(),
-                    registry_pda.to_bytes(),
-                    other_domain as u16,
-                    &ob,
-                )?;
-                let p_t = ledger.total_principal_atoms;
-                let p_o = ol.total_principal_atoms;
-                match p_t.checked_add(p_o) {
-                    Some(tot) if tot != 0 && p_o != 0 => {
-                        vault_lp_v18::mul_div_floor(available, p_o, tot)
-                            .ok_or(PercolatorError::EngineArithmeticOverflow)?
-                    }
-                    _ => 0,
-                }
-            } else {
-                0
-            };
-            let target_part = available - other_part;
-            if target_part != 0 {
-                add_fresh_counterparty_backing_view(
-                    &mut group,
-                    domain,
-                    target_part
-                        .checked_mul(BOUND_SCALE)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?, // FB += a·BOUND_SCALE
-                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
-                )?;
-            }
-            if other_part != 0 {
-                let mut od = other_ledger_ai.try_borrow_mut_data()?;
-                let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
-                let (mut ol, oinit) = read_or_new_backing_domain_ledger(
-                    &od,
-                    market_ai.key.to_bytes(),
-                    registry_pda.to_bytes(),
-                    other_domain as u16,
-                    &ob,
-                )?;
-                sync_backing_domain_ledger(&mut ol, &ob)?;
-                let expiry = if ob.status == BackingBucketStatusV16::Fresh {
-                    ob.expiry_slot
-                } else {
-                    crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
-                };
-                add_fresh_counterparty_backing_view(
-                    &mut group,
-                    other_domain,
-                    other_part
-                        .checked_mul(BOUND_SCALE)
-                        .ok_or(PercolatorError::EngineArithmeticOverflow)?,
-                    expiry,
-                )?;
-                let (_, ob_after) = backing_domain_parts_view(&group, other_domain)?;
-                ol.last_observed_unavailable_principal_atoms =
-                    backing_unavailable_principal_atoms(&ob_after)?;
-                ol.total_principal_atoms = ol
-                    .total_principal_atoms
-                    .checked_add(other_part)
-                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-                write_or_init_backing_domain_ledger(&mut od, &ol, oinit)?;
-            }
-            // #413: re-baseline before booking the principal — same reasoning as the
-            // deposit and rebalance paths. The refill above lowers
-            // `consumed_liened_backing_num`, and the NEXT sync would otherwise read that
-            // drop as `cumulative_recovery_atoms` while these same atoms are also being
-            // added as principal directly below. The sync at the top of this handler ran
-            // against the pre-refill bucket, so pinning the watermark here is what keeps
-            // the two from counting the same value twice.
-            {
-                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
-                ledger.last_observed_unavailable_principal_atoms =
-                    backing_unavailable_principal_atoms(&bucket_after)?;
-            }
-            // The LP-visible half: same shares, more principal ⇒ higher NAV ⇒ a
-            // strictly larger redeemable claim for every existing LP.
-            ledger.total_principal_atoms = ledger
-                .total_principal_atoms
-                .checked_add(target_part)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            // Conservation: C + (I−a) + E + (FB+a) = S against an unchanged V.
-            group.validate_shape().map_err(map_v16_error)?;
-            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
-
-            // Mark withdrawn by exactly the CLAMPED `available` that was just
-            // applied — never `claim_capacity`. A clamped (partial) crank leaves
-            // `claim_capacity - available` claimable on the next crank rather
-            // than marking it paid without paying it.
-            cfg.lp_fee_withdrawn_atoms = cfg
-                .lp_fee_withdrawn_atoms
-                .checked_add(available)
-                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
-            (te, available, cfg)
-            }
-        };
+        let (total_earnings, available, cfg_after) = lp_vault_crank_fees_book(
+            market_ai,
+            ledger_ai,
+            own_ledger_ai,
+            sibling_ledger_ai,
+            &registry_pda,
+            target_domain,
+            domain,
+            bound_tail.is_some(),
+            draw_booked,
+        )?;
 
         {
             let mut reg = state::read_lp_vault_registry(&registry_ai.try_borrow_data()?)?;
@@ -35284,11 +35253,337 @@ pub mod processor {
         // rather than the trade-fee sites' opt-in `cfg_after` pattern.
         state::write_wrapper_config(&mut market_ai.try_borrow_mut_data()?, &cfg_after)?;
         if let Some((_, _, st)) = bound_tail.as_ref() {
-            // Phase 2b G6 + the senior credit, out of line (this frame is frozen at 3,968 B).
+            // Phase 2b G6 + the senior credit, out of line (this frame is pinned, ci/sbf-frame-baseline.txt).
             let _ = no_real_seniors;
             p2b_credit_bound_fee_leg(program_id, accounts, st, available)?;
         }
         Ok(())
+    }
+
+    /// Tag 78's ledger sync + fee booking, moved out of `handle_lp_vault_crank_fees` unchanged so
+    /// the market view (which engine #385 grew by its `protection_observed` array) lives in this
+    /// frame instead of the handler's (the handler was 4224 B, past the 4096 B SBF frame).
+    /// Returns `(total_earnings, available, cfg_after)` exactly as the inline block did.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn lp_vault_crank_fees_book<'a>(
+        market_ai: &AccountInfo<'a>,
+        ledger_ai: &AccountInfo<'a>,
+        own_ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry_pda: &Pubkey,
+        target_domain: u16,
+        domain: usize,
+        bound: bool,
+        draw_booked: bool,
+    ) -> Result<(u128, u128, WrapperConfigV16), ProgramError> {
+        let mut market_data = market_ai.try_borrow_mut_data()?;
+        let (mut cfg, mut group) = state::market_view_mut(&mut market_data)?;
+        // MODE GATE (Finding 1) -- modelled on `handle_deposit_to_lp_vault`
+        // mode gate, NOT on `handle_withdraw_protocol_fee`'s `live_mode`
+        // / `resolved_mode` block, and deliberately the STRICTER of the two.
+        //
+        // Rationale. What this crank does is functionally a DEPOSIT into the
+        // LP backing domain: it calls the same
+        // `add_fresh_counterparty_backing_view` with the same
+        // `LP_VAULT_BACKING_EXPIRY_SLOT` and credits the same
+        // `ledger.total_principal_atoms`. It differs from a real deposit only
+        // in where the atoms come from (senior insurance rather than the
+        // depositor's token account) and in that NOBODY has to authorise it --
+        // tag 78 carries no authority signature at all, only
+        // `expect_signer(cranker)` on an arbitrary fee payer. A handler that
+        // anyone can fire at any moment should not be reachable in more market
+        // states than the same operation performed by its own beneficiary.
+        //
+        // Why not the protocol-fee model. `handle_withdraw_protocol_fee` may
+        // run in Resolved because it (a) requires the protocol fee authority's
+        // signature, and (b) EXTINGUISHES the claim -- atoms leave to an
+        // authority-owned token account and no downstream obligation survives,
+        // which is why the `materialized_portfolio_count == 0 && c_tot == 0`
+        // precondition is sufficient there. This crank does the opposite: it
+        // CONVERTS senior insurance into a junior LP claim that must still be
+        // paid out later through `RequestRedeemLpShares` -> `ExecuteRedemption`.
+        // "Safe to drain now" therefore does not transfer, and creating fresh
+        // backing on a market that is winding down is meaningless.
+        //
+        // Concretely blocked:
+        //   * Recovery (mode 2) -- the failure in the finding. Post-solvency-
+        //     event, `header.insurance` IS the recovery buffer; any signer
+        //     could otherwise convert up to `lp_fee_accrued - lp_fee_withdrawn`
+        //     of it into junior LP backing and have LPs redeem it out.
+        //   * Resolved (mode 1) -- same conversion, before trader portfolios
+        //     are materialised.
+        //   * Live-but-matured -- `reject_permissionless_resolve_matured_live_view`
+        //     is what `handle_deposit_to_lp_vault` uses to stop permissionless
+        //     writes to a market that is past its stale-resolve horizon and is
+        //     merely awaiting someone to resolve it.
+        //
+        // The claim is NOT lost in any of these states: nothing is marked
+        // withdrawn on a rejected crank, so `lp_fee_accrued - lp_fee_withdrawn`
+        // stays fully claimable if the market returns to Live.
+        // P3 (Earn redeem-lock fix, 2026-09-30): on a BOUND vault, a Resolved market that is
+        // TERMINAL-FLAT (no materialized portfolio, c_tot == 0 — exactly the state in which
+        // Resolved Earn redemption is allowed, #377) may harvest the LP fee leg into backing
+        // and the senior claim. Otherwise fees accrued before resolution could never reach
+        // NAV and bound redemption (which requires H == 0) would be locked forever. At
+        // terminal-flat no trader payout can still draw on insurance, so the Finding-1
+        // hazard (converting insurance that still backs traders) cannot arise; the clamp in
+        // `lp_vault_harvestable_fee_atoms` keeps reserved/budgeted insurance untouched.
+        // Earn-drain §5 (2026-10-04): NON-bound vaults get the same terminal-flat harvest. On
+        // a non-bound market the stranded value (claim-free engine Residual, and pot backing
+        // the ledger books as loss although it is physically there) otherwise stays in the
+        // vault forever: 77 prices from the ledger and nothing else can reach it. At
+        // terminal-flat no trader can draw on insurance or on the pots, so the Finding-1
+        // hazard does not arise here either; open receipts keep their reserved residual
+        // (`nonbound_terminal_absorb` only reconciles pot backing then).
+        let (terminal_flat, receipts_open) = resolved_terminal_flat(&group)?;
+        let resolved_terminal_harvest = terminal_flat;
+        if group.header.mode != 0 && !resolved_terminal_harvest {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
+        if !resolved_terminal_harvest {
+            reject_permissionless_resolve_matured_live_view(&cfg, &group)?;
+        }
+        // PROG-1: verify the vault is still the backing authority for this domain.
+        // handle_deposit_to_lp_vault and handle_execute_redemption both enforce this;
+        // without the check here, a fee crank after an asset_admin authority rotation
+        // inflates insurance_fee_snapshot_atoms with earnings the vault does not own,
+        // causing LP holders to lose claim to fees in the gap when authority is restored.
+        let authorities = domain_authorities_from_view(&group, &cfg, domain)?;
+        if authorities.backing_bucket_authority != registry_pda.to_bytes() {
+            return Err(PercolatorError::LpVaultAuthorityMismatch.into());
+        }
+        let (_, bucket) = backing_domain_parts_view(&group, domain)?;
+        let mut ledger_data = ledger_ai.try_borrow_mut_data()?;
+        let (mut ledger, initialized) = read_or_new_backing_domain_ledger(
+            &ledger_data,
+            market_ai.key.to_bytes(),
+            registry_pda.to_bytes(),
+            target_domain,
+            &bucket,
+        )?;
+        sync_backing_domain_ledger(&mut ledger, &bucket)?;
+        let te = ledger.total_earnings_atoms;
+
+        // Claim capacity. Monotonic invariant:
+        // lp_fee_withdrawn_atoms <= lp_fee_accrued_atoms, always — so the
+        // subtraction can only underflow on a corrupt config, which fails
+        // closed.
+        // #411: computed by `lp_vault_harvestable_fee_atoms`, which
+        // `handle_deposit_to_lp_vault` also calls. Deliberately shared — a deposit must
+        // be priced against exactly what a crank in the same slot would realize, and
+        // two separate copies of this clamp would drift and reopen that bug. The
+        // reasoning that used to live here (three legs share one surplus pool with no
+        // cross-leg accounting, so an unclamped claim makes the last leg to crank fail
+        // out of the engine) now lives on the helper.
+        let available = lp_vault_harvestable_fee_atoms(&cfg, &group)?;
+        // F-14 (P3-d): on a TERMINAL claim-free Resolved bound market, first let the engine
+        // run its own claim-free recredit for this asset (insurance's entitled overlap,
+        // upstream 76a86f48), then absorb whatever claim-free RESIDUAL is left
+        // (vault - c_tot - insurance - provider earnings - fresh backing: tokens nobody's
+        // counter owns, created when outside winners were paid from these pots and the
+        // loss side refilled them) into the vault's OWN pot. Seniors then take it first
+        // through min(physical, C); the junior only what is left over C (tag 102).
+        let absorbed = if resolved_terminal_harvest && !bound {
+            nonbound_terminal_absorb(&mut group, domain, &mut ledger, receipts_open)?
+        } else if resolved_terminal_harvest && receipts_open {
+            // P3 option (b): receipts are open, so the residual is reserved for them (no
+            // engine recredit, no residual absorption); only the stray (claim-free POT
+            // backing, never receipt value) becomes the vault's.
+            let stray = vault_absorb_terminal_stray(&mut group, domain)?;
+            if stray != 0 {
+                let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                ledger.last_observed_unavailable_principal_atoms =
+                    backing_unavailable_principal_atoms(&bucket_after)?;
+                ledger.total_principal_atoms = ledger
+                    .total_principal_atoms
+                    .checked_add(stray)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            }
+            stray
+        } else if resolved_terminal_harvest {
+            // F-1: every configured asset's insurance recredit runs before the slab-global
+            // residual is absorbed (`terminal_recredit_all_assets`).
+            match terminal_recredit_all_assets(&mut group, domain / 2).map(|ready| {
+                if ready { Ok(()) } else { Err(percolator::V16Error::LockActive) }
+            })? {
+                Ok(_) => {
+                    let residual = vault_terminal_residual_atoms(&group)?;
+                    if residual != 0 {
+                        add_fresh_counterparty_backing_view(
+                            &mut group,
+                            domain,
+                            residual
+                                .checked_mul(BOUND_SCALE)
+                                .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                            crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+                        )?;
+                        {
+                            let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                            ledger.last_observed_unavailable_principal_atoms =
+                                backing_unavailable_principal_atoms(&bucket_after)?;
+                        }
+                        ledger.total_principal_atoms = ledger
+                            .total_principal_atoms
+                            .checked_add(residual)
+                            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                        group.validate_shape().map_err(map_v16_error)?;
+                    }
+                    // Stranded pot backing: loss backing whose winners all exited sits in a
+                    // pot the vault never funded (often ledger-less). Make it the vault's.
+                    let stray = vault_absorb_terminal_stray(&mut group, domain)?;
+                    if stray != 0 {
+                        let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+                        ledger.last_observed_unavailable_principal_atoms =
+                            backing_unavailable_principal_atoms(&bucket_after)?;
+                        ledger.total_principal_atoms = ledger
+                            .total_principal_atoms
+                            .checked_add(stray)
+                            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+                    }
+                    residual
+                        .checked_add(stray)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                }
+                Err(percolator::V16Error::LockActive) => 0,
+                Err(e) => return Err(map_v16_error(e)),
+            }
+        } else {
+            0
+        };
+        // Zero case: nothing accrued, or the surplus pool is currently dry
+        // (another leg got there first). Same error either way — the claim
+        // is NOT marked withdrawn, so it stays fully claimable next crank.
+        // Deadlock fix (frontend-lane review): on a terminal Resolved bound market the
+        // crank is also the residual step 77 waits for; if the engine's own recredit cleared
+        // the residual (or nothing was pending), succeed as a no-op instead of reverting it.
+        if available == 0 && absorbed == 0 && !resolved_terminal_harvest && !draw_booked {
+            return Err(PercolatorError::LpVaultNoFeesToCrank.into());
+        }
+        let booked = if available == 0 {
+            write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+            (te, 0u128, cfg)
+        } else {
+
+        // ── Reclassify `available` atoms: senior insurance → LP backing. ──
+        // No token moves. See the MECHANISM block on this handler.
+        let v_before = group.header.vault.get();
+        group
+            .withdraw_insurance_surplus_not_atomic(available) // I−a, V−a
+            .map_err(map_v16_error)?;
+        group.header.vault = percolator::V16PodU128::new(v_before); // restore V
+        // Lane MEDIUM (2026-09-30): on a BOUND vault the seniors' claim is pooled across both
+        // pots, but every redemption draws from ONE pot, so a harvest booked into one pot
+        // left the other pot's seniors short of their fee share. Split the harvest pro rata
+        // to the two pots' principal (when the other ledger is passed writable).
+        let other_ledger_ai = if ledger_ai.key == own_ledger_ai.key {
+            sibling_ledger_ai
+        } else {
+            own_ledger_ai
+        };
+        let other_domain = sibling_domain(domain as u16) as usize;
+        let other_part = if bound
+            && other_ledger_ai.is_writable
+            && !other_ledger_ai.data_is_empty()
+        {
+            let od = other_ledger_ai.try_borrow_data()?;
+            let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
+            let (ol, _) = read_or_new_backing_domain_ledger(
+                &od,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                other_domain as u16,
+                &ob,
+            )?;
+            let p_t = ledger.total_principal_atoms;
+            let p_o = ol.total_principal_atoms;
+            match p_t.checked_add(p_o) {
+                Some(tot) if tot != 0 && p_o != 0 => {
+                    vault_lp_v18::mul_div_floor(available, p_o, tot)
+                        .ok_or(PercolatorError::EngineArithmeticOverflow)?
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        let target_part = available - other_part;
+        if target_part != 0 {
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                domain,
+                target_part
+                    .checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?, // FB += a·BOUND_SCALE
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT,
+            )?;
+        }
+        if other_part != 0 {
+            let mut od = other_ledger_ai.try_borrow_mut_data()?;
+            let (_, ob) = backing_domain_parts_view(&group, other_domain)?;
+            let (mut ol, oinit) = read_or_new_backing_domain_ledger(
+                &od,
+                market_ai.key.to_bytes(),
+                registry_pda.to_bytes(),
+                other_domain as u16,
+                &ob,
+            )?;
+            sync_backing_domain_ledger(&mut ol, &ob)?;
+            let expiry = if ob.status == BackingBucketStatusV16::Fresh {
+                ob.expiry_slot
+            } else {
+                crate::constants::LP_VAULT_BACKING_EXPIRY_SLOT
+            };
+            add_fresh_counterparty_backing_view(
+                &mut group,
+                other_domain,
+                other_part
+                    .checked_mul(BOUND_SCALE)
+                    .ok_or(PercolatorError::EngineArithmeticOverflow)?,
+                expiry,
+            )?;
+            let (_, ob_after) = backing_domain_parts_view(&group, other_domain)?;
+            ol.last_observed_unavailable_principal_atoms =
+                backing_unavailable_principal_atoms(&ob_after)?;
+            ol.total_principal_atoms = ol
+                .total_principal_atoms
+                .checked_add(other_part)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            write_or_init_backing_domain_ledger(&mut od, &ol, oinit)?;
+        }
+        // #413: re-baseline before booking the principal — same reasoning as the
+        // deposit and rebalance paths. The refill above lowers
+        // `consumed_liened_backing_num`, and the NEXT sync would otherwise read that
+        // drop as `cumulative_recovery_atoms` while these same atoms are also being
+        // added as principal directly below. The sync at the top of this handler ran
+        // against the pre-refill bucket, so pinning the watermark here is what keeps
+        // the two from counting the same value twice.
+        {
+            let (_, bucket_after) = backing_domain_parts_view(&group, domain)?;
+            ledger.last_observed_unavailable_principal_atoms =
+                backing_unavailable_principal_atoms(&bucket_after)?;
+        }
+        // The LP-visible half: same shares, more principal ⇒ higher NAV ⇒ a
+        // strictly larger redeemable claim for every existing LP.
+        ledger.total_principal_atoms = ledger
+            .total_principal_atoms
+            .checked_add(target_part)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        // Conservation: C + (I−a) + E + (FB+a) = S against an unchanged V.
+        group.validate_shape().map_err(map_v16_error)?;
+        write_or_init_backing_domain_ledger(&mut ledger_data, &ledger, initialized)?;
+
+        // Mark withdrawn by exactly the CLAMPED `available` that was just
+        // applied — never `claim_capacity`. A clamped (partial) crank leaves
+        // `claim_capacity - available` claimable on the next crank rather
+        // than marking it paid without paying it.
+        cfg.lp_fee_withdrawn_atoms = cfg
+            .lp_fee_withdrawn_atoms
+            .checked_add(available)
+            .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+        (te, available, cfg)
+        };
+        Ok(booked)
     }
 
     /// Tag 78's bound tail: split the harvested leg (G6 waterfall when the ext exists, else all to
@@ -38146,6 +38441,114 @@ pub mod processor {
             return Err(PercolatorError::RentExemptRequired.into());
         }
 
+        let (senior_claim, pinned_caps, growth_on) = init_vault_lp_bind_view(
+            market_ai,
+            lp_portfolio_ai,
+            own_ledger_ai,
+            sibling_ledger_ai,
+            &registry,
+            &registry_pda,
+            &canonical_matcher,
+            asset_index,
+            max_market_slots,
+            l_launch_x100,
+        )?;
+
+        let market_bytes = market_ai.key.to_bytes();
+        let bump_bytes = [vault_lp_bump];
+        let seeds: &[&[u8]] = &[
+            crate::constants::VAULT_LP_STATE_SEED,
+            market_bytes.as_ref(),
+            bump_bytes.as_ref(),
+        ];
+        create_pda_account(
+            admin,
+            vault_lp_ai,
+            system_program_ai,
+            state::vault_lp_state_account_len(),
+            program_id,
+            seeds,
+        )?;
+        let st = state::VaultLpStateV18 {
+            market_group: market_bytes,
+            registry: registry_pda.to_bytes(),
+            lp_portfolio: lp_portfolio_ai.key.to_bytes(),
+            junior_owner: admin.key.to_bytes(),
+            senior_claim_atoms: senior_claim,
+            junior_deposited_atoms: 0,
+            junior_withdrawn_atoms: 0,
+            senior_fee_credited_atoms: 0,
+            recalled_atoms: 0,
+            asset_index: asset_index as u16,
+            junior_floor_bps,
+            senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
+            version: crate::constants::VAULT_LP_STATE_VERSION,
+            bump: vault_lp_bump,
+            backstop_outstanding_atoms: 0,
+            senior_drawn_atoms: 0,
+            senior_draw_outstanding_atoms: 0,
+        };
+        state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
+        state::set_registry_vault_lp_bound(&mut registry);
+        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
+
+        // Auto-pin the matcher context (SetMatcherConfig + InitMatcherCtx for the registry-owned
+        // LP) with PROTOCOL parameters only.
+        let expected_sequence = state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
+        let asset_generation_frontier =
+            state::read_market_asset_generation_frontier(&market_ai.try_borrow_data()?)?;
+        pin_vault_lp_matcher_ctx(
+            program_id,
+            market_ai,
+            lp_portfolio_ai,
+            &registry_pda,
+            matcher_prog,
+            matcher_ctx,
+            matcher_delegate,
+            VaultLpMatcherParams {
+                expected_sequence,
+                asset_generation_frontier,
+                trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
+                expiry_slot: u64::MAX,
+                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
+                kind: if growth_on {
+                    growth_v19::GROWTH_PIN_MATCHER_KIND
+                } else {
+                    vault_lp_v18::PIN_MATCHER_KIND
+                },
+                trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
+                base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
+                max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
+                impact_k_bps: vault_lp_v18::PIN_IMPACT_K_BPS,
+                liquidity_notional_e6: pinned_caps.liquidity_notional_e6,
+                max_fill_abs: pinned_caps.max_fill_abs,
+                max_inventory_abs: pinned_caps.max_inventory_abs,
+                fee_to_insurance_bps: vault_lp_v18::PIN_FEE_TO_INSURANCE_BPS,
+                skew_spread_mult_bps: vault_lp_v18::PIN_SKEW_SPREAD_MULT_BPS,
+            },
+        )
+    }
+
+    /// The market-view block of `handle_init_vault_lp` (bind checks, NAV -> senior claim, LP
+    /// portfolio init + registration, growth bind, vault-LP record, skew defaults, pinned caps),
+    /// out of line so the market view (152 B since engine #385's `protection_observed`) does not
+    /// sit in the handler's SBF frame. Same checks in the same order, same errors, same writes;
+    /// an error here returns from the handler exactly as the inline block did. Returns
+    /// `(senior_claim, pinned_caps, growth_on)`.
+    #[inline(never)]
+    #[allow(clippy::too_many_arguments)]
+    fn init_vault_lp_bind_view<'a>(
+        market_ai: &AccountInfo<'a>,
+        lp_portfolio_ai: &AccountInfo<'a>,
+        own_ledger_ai: &AccountInfo<'a>,
+        sibling_ledger_ai: &AccountInfo<'a>,
+        registry: &state::LpVaultRegistryV16,
+        registry_pda: &Pubkey,
+        canonical_matcher: &Pubkey,
+        asset_index: usize,
+        max_market_slots: usize,
+        l_launch_x100: Option<u16>,
+    ) -> Result<(u128, vault_lp_v18::PinnedMatcherCaps, bool), ProgramError> {
         let senior_claim = {
             let mut market_data = market_ai.try_borrow_mut_data()?;
             let (cfg_v, mut group) = state::market_view_mut(&mut market_data)?;
@@ -38251,81 +38654,7 @@ pub mod processor {
             };
             (senior_claim, caps, growth_on)
         };
-        let (senior_claim, pinned_caps, growth_on) = senior_claim;
-
-        let market_bytes = market_ai.key.to_bytes();
-        let bump_bytes = [vault_lp_bump];
-        let seeds: &[&[u8]] = &[
-            crate::constants::VAULT_LP_STATE_SEED,
-            market_bytes.as_ref(),
-            bump_bytes.as_ref(),
-        ];
-        create_pda_account(
-            admin,
-            vault_lp_ai,
-            system_program_ai,
-            state::vault_lp_state_account_len(),
-            program_id,
-            seeds,
-        )?;
-        let st = state::VaultLpStateV18 {
-            market_group: market_bytes,
-            registry: registry_pda.to_bytes(),
-            lp_portfolio: lp_portfolio_ai.key.to_bytes(),
-            junior_owner: admin.key.to_bytes(),
-            senior_claim_atoms: senior_claim,
-            junior_deposited_atoms: 0,
-            junior_withdrawn_atoms: 0,
-            senior_fee_credited_atoms: 0,
-            recalled_atoms: 0,
-            asset_index: asset_index as u16,
-            junior_floor_bps,
-            senior_fee_share_bps: crate::constants::VAULT_LP_SENIOR_FEE_SHARE_BPS,
-            version: crate::constants::VAULT_LP_STATE_VERSION,
-            bump: vault_lp_bump,
-            backstop_outstanding_atoms: 0,
-            senior_drawn_atoms: 0,
-            senior_draw_outstanding_atoms: 0,
-        };
-        state::init_vault_lp_state(&mut vault_lp_ai.try_borrow_mut_data()?, &st)?;
-        state::set_registry_vault_lp_bound(&mut registry);
-        state::write_lp_vault_registry(&mut registry_ai.try_borrow_mut_data()?, &registry)?;
-
-        // Auto-pin the matcher context (SetMatcherConfig + InitMatcherCtx for the registry-owned
-        // LP) with PROTOCOL parameters only.
-        let expected_sequence = state::read_portfolio_matcher_sequence(&lp_portfolio_ai.try_borrow_data()?)?;
-        let asset_generation_frontier =
-            state::read_market_asset_generation_frontier(&market_ai.try_borrow_data()?)?;
-        pin_vault_lp_matcher_ctx(
-            program_id,
-            market_ai,
-            lp_portfolio_ai,
-            &registry_pda,
-            matcher_prog,
-            matcher_ctx,
-            matcher_delegate,
-            VaultLpMatcherParams {
-                expected_sequence,
-                asset_generation_frontier,
-                trade_fee_cap_bps: vault_lp_v18::PIN_TRADE_FEE_CAP_BPS,
-                expiry_slot: u64::MAX,
-                // G4: a growth asset's vault LP quotes with the v2 adaptive matcher (kind 2).
-                kind: if growth_on {
-                    growth_v19::GROWTH_PIN_MATCHER_KIND
-                } else {
-                    vault_lp_v18::PIN_MATCHER_KIND
-                },
-                trading_fee_bps: vault_lp_v18::PIN_TRADING_FEE_BPS,
-                base_spread_bps: vault_lp_v18::PIN_BASE_SPREAD_BPS,
-                max_total_bps: vault_lp_v18::PIN_MAX_TOTAL_BPS,
-                impact_k_bps: vault_lp_v18::PIN_IMPACT_K_BPS,
-                liquidity_notional_e6: pinned_caps.liquidity_notional_e6,
-                max_fill_abs: pinned_caps.max_fill_abs,
-                max_inventory_abs: pinned_caps.max_inventory_abs,
-                fee_to_insurance_bps: vault_lp_v18::PIN_FEE_TO_INSURANCE_BPS,
-                skew_spread_mult_bps: vault_lp_v18::PIN_SKEW_SPREAD_MULT_BPS,
-            },
-        )
+        Ok(senior_claim)
     }
 
     /// Phase 2b: tag 94's skew-funding defaults for the just-bound asset.

@@ -7,7 +7,13 @@
 #
 # PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
 # never allowed to grow; each should be brought under 3840 in its own change):
-3968 percolator_prog::processor::handle_lp_vault_crank_fees pin
+#   (none left: handle_lp_vault_crank_fees, the last one, is now pinned below at 2304 B)
+#
+# ENGINE over-budget function (engine code; it can only be shrunk in the engine repo).
+# 2026-11-23, engine pin 2d2691f2: 3712 -> 3904 B. Engine #385 (upstream e18a3b98) added the 128 B
+# `protection_observed` set to MarketGroupV16ViewMut (24 -> 152 B), and this accrual holds the view.
+# 192 B under the 4096 B frame. Frozen here at the measured value; it may not grow.
+3904 percolator::v16::MarketGroupV16ViewMut$LT$T$GT$::accrue_asset_to_with_rent_not_atomic
 #
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
 # handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the
@@ -17,9 +23,32 @@
 # RebalanceReduce tag 44). The growth went unseen because this gate could not install its toolchain.
 # The DEPLOYED devnet wrapper aca02ba6 already runs at 3712 B; 384 B under the 4096 B frame. Re-pinned
 # at the deployed value (no code change); any further growth still fails.
-3712 percolator_prog::processor::handle_trade_nocpi_zero_copy pin
-3584 percolator_prog::processor::handle_batch_execute_zero_copy pin
+# 2026-11-23, engine pin 2d2691f2: engine #385 grew the market view 24 -> 152 B (the 128 B
+# `protection_observed` set). These three hold one view across their whole body (no separable
+# block to move out of line, unlike the handlers below), so they grew with it, no code change:
+# handle_trade_nocpi_zero_copy 3712 -> 3776, handle_batch_execute_zero_copy 3584 -> 3712,
+# p1_cpi_preflight_before_matcher 1536 -> 1664. Re-pinned at the measured values (>= 320 B under
+# 4096); shrinking the trade executors is a hot-path change for its own PR. Any further growth fails.
+3776 percolator_prog::processor::handle_trade_nocpi_zero_copy pin
+3712 percolator_prog::processor::handle_batch_execute_zero_copy pin
 1664 percolator_prog::processor::handle_trade_cpi pin
 2048 percolator_prog::processor::handle_batch_trade_cpi pin
-1536 percolator_prog::processor::p1_cpi_preflight_before_matcher pin
-3776 percolator_prog::processor::handle_init_vault_lp pin
+1664 percolator_prog::processor::p1_cpi_preflight_before_matcher pin
+# 2026-11-23, engine pin 2d2691f2: handle_init_vault_lp 3776 -> 4032 B with the grown view; its view
+# block now runs in init_vault_lp_bind_view (#[inline(never)], same code) and the handler is
+# re-pinned at the measured 2496 B. Same treatment, unpinned (now at or under 3840): handle_top_up_insurance
+# 4032 -> 1600 (top_up_insurance_book 3136), handle_deposit_to_lp_vault 4032 -> 3776
+# (deposit_to_lp_vault_book 1472), handle_update_asset_lifecycle 3968 -> 3840 (exactly the limit: any
+# growth fails; its SHUTDOWN view block is the next one to move out) (update_asset_lifecycle_activate
+# 2112), handle_execute_redemption 3904 -> 2752
+# (execute_redemption_withdraw_view 1728).
+2496 percolator_prog::processor::handle_init_vault_lp pin
+2816 percolator_prog::processor::init_vault_lp_bind_view pin
+# 2026-11-23: handle_lp_vault_crank_fees 3968 -> 2304 B (was a pre-existing over-budget entry). Engine #385
+# grew the market view and took it to 4224 B, and handle_close_slab to 4160 B (past 4096). Their view work
+# now runs in #[inline(never)] helpers (same code); the handlers and the two big helpers are pinned at the
+# measured sizes so the gain cannot be lost silently.
+2304 percolator_prog::processor::handle_lp_vault_crank_fees pin
+3264 percolator_prog::processor::lp_vault_crank_fees_book pin
+1920 percolator_prog::processor::handle_close_slab pin
+3648 percolator_prog::processor::close_slab_scan_and_check pin
