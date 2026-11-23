@@ -8105,7 +8105,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // `max_delta = INITIAL_PRICE * CAP_BPS * 50 / 10_000 = 125,000`, far more
     // than the ~100,000-atom distance to the pushed mark, so price fully
     // converges in this one call. Because the CHECKPOINT-advance inside
-    // `hybrid_effective_price_for_crank_view` uses the asset's PRE-crank
+    // `hybrid_target_for_crank_view` uses the asset's PRE-crank
     // `slot_last` (0), which is still `< PUSH_SLOT (51)`, the pending mark
     // does NOT promote during this crank -- `funding_mark_e6` stays at
     // INITIAL_PRICE even though `effective_price` has now moved to the new
@@ -29992,8 +29992,9 @@ const LOW_PIN_PRICE: u64 = 50;
 const LOW_PIN_CAP_BPS: u64 = 100;
 
 /// AUTH_MARK market at 50 with a 100 bps cap and one open long/short pair (the cap only binds
-/// while the asset has open interest). Returns the env and the long account to crank.
-fn low_pin_world() -> (V16CuEnv, Pubkey) {
+/// while the asset has open interest). Returns the env, the long account to crank and the
+/// short account.
+fn low_pin_world() -> (V16CuEnv, Pubkey, Pubkey) {
     let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
         initial_price: LOW_PIN_PRICE,
         max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
@@ -30018,7 +30019,7 @@ fn low_pin_world() -> (V16CuEnv, Pubkey) {
         LOW_PIN_PRICE,
         0,
     );
-    (env, long_account)
+    (env, long_account, short_account)
 }
 
 fn low_pin_crank(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> u64 {
@@ -30044,7 +30045,7 @@ fn low_pin_mark(env: &V16CuEnv) -> u64 {
 /// second slot (the cap anchor stays at 50 for the life of the target).
 #[test]
 fn v16_bpf_low_mark_fixed_target_moves_under_one_slot_cranks() {
-    let (mut env, account) = low_pin_world();
+    let (mut env, account, _) = low_pin_world();
     env.svm.warp_to_slot(1);
     env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
     let mut max_cu = 0;
@@ -30060,11 +30061,53 @@ fn v16_bpf_low_mark_fixed_target_moves_under_one_slot_cranks() {
     );
 }
 
+/// A second crank in the same slot (dt = 0) must keep the carry. It takes the path branch with
+/// an empty path; if it took the single-segment branch instead it would drop the carry, and
+/// anyone could hold a low mark in place by cranking twice per slot.
+#[test]
+fn v16_bpf_low_mark_same_slot_recrank_keeps_the_carry() {
+    let (mut env, long_account, short_account) = low_pin_world();
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    let carry = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .price_move_remainder_bps_num
+    };
+    let mut committed_recranks = 0;
+    for slot in 1..=40u64 {
+        low_pin_crank(&mut env, long_account, slot);
+        let (mark, kept) = (low_pin_mark(&env), carry(&env));
+        // Same slot, the other account: the asset has nothing left to accrue.
+        env.svm.expire_blockhash();
+        let recrank = env.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(short_account, false),
+            ],
+            &[],
+        );
+        committed_recranks += u32::from(recrank.is_ok());
+        assert_eq!(low_pin_mark(&env), mark, "slot {slot}");
+        assert_eq!(carry(&env), kept, "slot {slot}: the re-crank dropped the carry");
+    }
+    assert!(committed_recranks > 0, "no same-slot crank committed");
+    assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE + 20);
+}
+
 /// The oracle keeps rising but reports a new price only every third slot. A new target
 /// restarts the carry, so the mark gains one atom per three slots instead of none.
 #[test]
 fn v16_bpf_low_mark_moves_while_the_target_changes_every_third_slot() {
-    let (mut env, account) = low_pin_world();
+    let (mut env, account, _) = low_pin_world();
     for slot in 1..=60u64 {
         env.svm.warp_to_slot(slot);
         if slot % 3 == 1 {
@@ -30086,7 +30129,7 @@ fn v16_bpf_low_mark_moves_while_the_target_changes_every_third_slot() {
 #[test]
 #[ignore = "needs engine #393 behind ENGINE_CI_SIBLING (carry kept on a same-side target change)"]
 fn v16_bpf_low_mark_moves_while_the_target_changes_every_slot() {
-    let (mut env, account) = low_pin_world();
+    let (mut env, account, _) = low_pin_world();
     for slot in 1..=60u64 {
         env.svm.warp_to_slot(slot);
         env.svm.expire_blockhash();
@@ -30175,7 +30218,7 @@ fn v16_bpf_low_mark_carry_accumulates_across_32_slot_cranks() {
 /// `v16_bpf_low_mark_moves_while_the_target_changes_every_slot`, and turn this test around.
 #[test]
 fn v16_engine_pin_restarts_the_carry_on_a_same_side_target_change() {
-    let (mut env, account) = low_pin_world();
+    let (mut env, account, _) = low_pin_world();
     env.svm.warp_to_slot(1);
     env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
     low_pin_crank(&mut env, account, 1);
