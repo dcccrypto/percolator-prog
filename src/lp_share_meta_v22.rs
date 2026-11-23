@@ -108,24 +108,46 @@ const B58: &[u8; 58] = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvw
 
 /// Base58 of a 32-byte key (the string every explorer shows): the bytes and their count
 /// (32..=44).
+///
+/// The key is eight big-endian u32 limbs; each pass divides the whole number by 58^5 (fits a
+/// u32) and the remainder yields five digits, so 9 passes over at most 8 limbs replace the
+/// per-byte, per-digit carry loop.
 pub fn base58_encode(key: &[u8; 32]) -> ([u8; 44], usize) {
-    // Little-endian base-58 digits; 32 bytes need at most 44.
+    const D: u64 = 58 * 58 * 58 * 58 * 58;
+    let mut limbs = [0u32; 8];
+    let mut i = 0usize;
+    while i < 8 {
+        limbs[i] = u32::from_be_bytes([key[4 * i], key[4 * i + 1], key[4 * i + 2], key[4 * i + 3]]);
+        i += 1;
+    }
+    // Little-endian base-58 digits, five per pass; 9 passes at most.
     let mut digits = [0u8; 45];
     let mut len = 0usize;
-    for &byte in key.iter() {
-        let mut carry = byte as u32;
-        let mut i = 0usize;
-        while i < len {
-            carry += (digits[i] as u32) << 8;
-            digits[i] = (carry % 58) as u8;
-            carry /= 58;
-            i += 1;
+    let mut start = 0usize;
+    while start < 8 {
+        if limbs[start] == 0 {
+            start += 1;
+            continue;
         }
-        while carry > 0 {
-            digits[len] = (carry % 58) as u8;
-            carry /= 58;
+        let mut rem = 0u64;
+        let mut j = start;
+        while j < 8 {
+            let cur = (rem << 32) | limbs[j] as u64;
+            limbs[j] = (cur / D) as u32;
+            rem = cur % D;
+            j += 1;
+        }
+        let mut r = rem as u32;
+        let mut c = 0;
+        while c < 5 {
+            digits[len] = (r % 58) as u8;
+            r /= 58;
             len += 1;
+            c += 1;
         }
+    }
+    while len > 0 && digits[len - 1] == 0 {
+        len -= 1;
     }
     let zeros = key.iter().take_while(|b| **b == 0).count();
     let mut out = [b'1'; 44];
@@ -199,11 +221,27 @@ pub fn share_uri_with_base(base: &str, market: &[u8; 32]) -> Vec<u8> {
 /// Name, symbol and uri for `market`: the ticker form when `ticker` is non-empty, else the
 /// generic form. `None` for a ticker that is not `ticker_ok`.
 pub fn share_identity(market: &[u8; 32], ticker: &[u8]) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
-    let uri = share_uri(market);
-    if ticker.is_empty() {
-        return Some((generic_name(market).to_vec(), LP_SHARE_GENERIC_SYMBOL.to_vec(), uri));
+    if !ticker.is_empty() && !ticker_ok(ticker) {
+        return None;
     }
-    Some((ticker_name(market, ticker)?, ticker_symbol(ticker)?, uri))
+    // One base58 pass feeds both the name fragment and the uri.
+    let (b58, n) = base58_encode(market);
+    let mut uri = Vec::with_capacity(LP_SHARE_URI_BASE.len() + LP_SHARE_URI_PATH.len() + n);
+    uri.extend_from_slice(LP_SHARE_URI_BASE.as_bytes());
+    uri.extend_from_slice(LP_SHARE_URI_PATH.as_bytes());
+    uri.extend_from_slice(&b58[..n]);
+    if ticker.is_empty() {
+        let mut name = Vec::with_capacity(LP_SHARE_GENERIC_NAME_LEN);
+        name.extend_from_slice(LP_SHARE_NAME_PREFIX);
+        name.extend_from_slice(&b58[..LP_SHARE_NAME_MARKET_CHARS]);
+        return Some((name, LP_SHARE_GENERIC_SYMBOL.to_vec(), uri));
+    }
+    let mut name = Vec::with_capacity(MPL_MAX_NAME_LEN);
+    name.extend_from_slice(LP_SHARE_TICKER_NAME_PREFIX);
+    name.extend_from_slice(ticker);
+    name.push(b' ');
+    name.extend_from_slice(&b58[..LP_SHARE_TICKER_NAME_MARKET_CHARS]);
+    Some((name, ticker_symbol(ticker)?, uri))
 }
 
 fn push_str(out: &mut Vec<u8>, s: &[u8]) {
@@ -400,6 +438,107 @@ mod tests {
         let want = Pubkey::new_from_array(key).to_string();
         let (got, n) = base58_encode(&key);
         assert_eq!(s(&got[..n]), want, "key {key:?}");
+    }
+
+    /// The pre-limb encoder, verbatim: the byte-for-byte reference for the faster one.
+    fn base58_old(key: &[u8; 32]) -> ([u8; 44], usize) {
+        let mut digits = [0u8; 45];
+        let mut len = 0usize;
+        for &byte in key.iter() {
+            let mut carry = byte as u32;
+            let mut i = 0usize;
+            while i < len {
+                carry += (digits[i] as u32) << 8;
+                digits[i] = (carry % 58) as u8;
+                carry /= 58;
+                i += 1;
+            }
+            while carry > 0 {
+                digits[len] = (carry % 58) as u8;
+                carry /= 58;
+                len += 1;
+            }
+        }
+        let zeros = key.iter().take_while(|b| **b == 0).count();
+        let mut out = [b'1'; 44];
+        let mut k = zeros;
+        let mut d = len;
+        while d > 0 {
+            d -= 1;
+            out[k] = B58[digits[d] as usize];
+            k += 1;
+        }
+        (out, k)
+    }
+
+    #[test]
+    fn base58_limb_encoder_equals_reference_on_20k_keys() {
+        let mut st: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        let mut n = 0u32;
+        for i in 0..20_000u32 {
+            let mut k = [0u8; 32];
+            for b in k.iter_mut() {
+                *b = next() as u8;
+            }
+            // Shape the key: leading zero bytes, zero limbs, saturated limbs.
+            match i % 5 {
+                1 => k[..(next() % 33) as usize].iter_mut().for_each(|b| *b = 0),
+                2 => k[(next() % 8 * 4) as usize..][..4].iter_mut().for_each(|b| *b = 0),
+                3 => k[(next() % 8 * 4) as usize..][..4].iter_mut().for_each(|b| *b = 0xff),
+                4 => k[(next() % 32) as usize..].iter_mut().for_each(|b| *b = 0),
+                _ => {}
+            }
+            let (a, la) = base58_encode(&k);
+            let (b, lb) = base58_old(&k);
+            assert_eq!((&a[..la], la), (&b[..lb], lb), "key {k:?}");
+            assert_eq!(s(&a[..la]), Pubkey::new_from_array(k).to_string(), "key {k:?}");
+            n += 1;
+        }
+        assert_eq!(n, 20_000);
+    }
+
+    fn lp(b: &[u8]) -> Vec<u8> {
+        let mut v = (b.len() as u32).to_le_bytes().to_vec();
+        v.extend_from_slice(b);
+        v
+    }
+
+    /// Full CPI data for both forms, assembled by hand from `Pubkey` Display.
+    #[test]
+    fn full_cpi_bytes_are_pinned_for_both_forms() {
+        for key in [[0u8; 32], [0xff; 32], [7u8; 32], Pubkey::new_unique().to_bytes()] {
+            let b58 = Pubkey::new_from_array(key).to_string();
+            let uri = std::format!("{LP_SHARE_URI_BASE}/api/earn-share/{b58}");
+            // generic
+            let (n, sy, u) = share_identity(&key, b"").unwrap();
+            let name = std::format!("Percolator Earn Share {}", &b58[..8]);
+            let mut want = vec![33u8];
+            want.extend(lp(name.as_bytes()));
+            want.extend(lp(b"pEARN"));
+            want.extend(lp(uri.as_bytes()));
+            want.extend([0, 0, 0, 0, 0, 1, 0]);
+            assert_eq!(create_metadata_v3_data(&n, &sy, &u, true), want);
+            // ticker
+            let (n, sy, u) = share_identity(&key, b"ABCDEFGH").unwrap();
+            let name = std::format!("Percolator Earn ABCDEFGH {}", &b58[..6]);
+            let mut want = vec![33u8];
+            want.extend(lp(name.as_bytes()));
+            want.extend(lp(b"peABCDEFGH"));
+            want.extend(lp(uri.as_bytes()));
+            want.extend([0, 0, 0, 0, 0, 0, 0]);
+            assert_eq!(create_metadata_v3_data(&n, &sy, &u, false), want);
+            assert!(share_identity(&key, b"abc").is_none());
+            // the single-encode path equals the composed helpers
+            assert_eq!(share_identity(&key, b"").unwrap().0, generic_name(&key).to_vec());
+            assert_eq!(share_identity(&key, b"XY").unwrap().0, ticker_name(&key, b"XY").unwrap());
+            assert_eq!(share_identity(&key, b"XY").unwrap().2, share_uri(&key));
+        }
     }
 
     #[test]
