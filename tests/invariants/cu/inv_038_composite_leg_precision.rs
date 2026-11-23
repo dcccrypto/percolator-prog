@@ -81,7 +81,16 @@ fn read_pyth_leg(
     let owner = oracle_v16::PYTH_RECEIVER_PROGRAM_ID;
     let mut data = make_pyth_data(feed, mantissa, exponent, 0, now);
     let mut lamports = 1u64;
-    let info = AccountInfo::new(&key, false, false, &mut lamports, &mut data, &owner, false, 0);
+    let info = AccountInfo::new(
+        &key,
+        false,
+        false,
+        &mut lamports,
+        &mut data,
+        &owner,
+        false,
+        0,
+    );
     (
         oracle_v16::read_pyth_price_e12(&info, feed, now, 60, 10_000),
         oracle_v16::read_pyth_price_e6(&info, feed, now, 60, 10_000),
@@ -189,8 +198,7 @@ fn compose_through_profile(
         .zip(lamports.iter_mut())
         .map(|((k, d), lam)| AccountInfo::new(k, false, false, lam, d, &owner, false, 0))
         .collect();
-    oracle_v16::read_external_price_e6_profile(&mut profile, &infos, NOW)
-        .map(|(price, _, _)| price)
+    oracle_v16::read_external_price_e6_profile(&mut profile, &infos, NOW).map(|(price, _, _)| price)
 }
 
 /// Upstream's two feed tuples. Their cross-rate is the same to seven digits:
@@ -214,9 +222,8 @@ fn v16_program_composite_of_a_low_priced_leg_follows_the_cross_rate() {
             Ok(exact_floor),
             "{x}e{x_expo} * {jpy}e{jpy_expo}"
         );
-        let to_e6 = |mantissa: i64, expo: i32| {
-            floor_scaled(mantissa as u64, expo + 6).unwrap() as i64
-        };
+        let to_e6 =
+            |mantissa: i64, expo: i32| floor_scaled(mantissa as u64, expo + 6).unwrap() as i64;
         assert_eq!(
             compose_through_profile(
                 &[(to_e6(x, x_expo), -6), (to_e6(jpy, jpy_expo), -6)],
