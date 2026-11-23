@@ -202,7 +202,7 @@ than bump noise (1,500), identical pass/fail set on `v16_cu`, and the engine/wra
   the flow; only the cost of a check may change, never whether or when it runs.
 - Upstream S1-CU restructures (72bfb065 / abe4c54c in the 13 Nov notes): not behaviour-identical.
 
-## 8. Status, 23 Nov 2026 (resumed 05:46 GMT; updated 12:30 GMT)
+## 8. Status, 23 Nov 2026 (resumed 05:46 GMT; updated 16:00 GMT)
 
 Baselines (same harness and method as section 1; raw logs and tables in `reports/cu-cuts-1121.d/`):
 - base2 = wrapper `4a5065f5` + probes (`506d0158`) on engine `67a4c5b9` (after #382, #383, #384);
@@ -230,13 +230,15 @@ Baselines (same harness and method as section 1; raw logs and tables in `reports
 | R13 | source-credit rate in u128 | merged, engine #392 (lien+ADL n=4 settle -42,500) |
 | R7a | asset-state wire-only validation, 3 readers | merged, engine #394 (Kani-proved same errors) |
 | C3 (#319 idea) | skip `compact_source_domains` when already compact | merged, engine #396 (TradeNoCpi -21,642, TradeCpi -30,356, refresh -18,035) |
-| new | u128 mul-div: a==d / b==d shortcut, ceil remainder by multiply | engine #397, gating (4-leg batch add -17,124) |
-| R7b | `asset_state_wire` for ~15 raw-field readers | engine #398, gating (4-leg batch -7k..-9.5k, trade -2,982) |
-| new | inactive-leg emptiness on raw bytes in validate_with_market / refresh | engine #399, gating (TradeCpi -5,620, SyncFee -6,624; Kani-proved) |
+| new | u128 mul-div: a==d / b==d shortcut, ceil remainder by multiply | merged, engine #397 (4-leg batch add -17,124) |
+| R7b | `asset_state_wire` for ~15 raw-field readers | engine #398, gate PASS, waiting for the merge loop (4-leg batch -7k..-9.5k, trade -2,982) |
+| new | inactive-leg emptiness on raw bytes in validate_with_market / refresh | merged, engine #399 (TradeCpi -5,620, SyncFee -6,624; Kani-proved) |
 | R10 | division-free loss-weight floor | dropped: no win after #384 (measured +12..+820) |
 | R5 / C8 | shape-only config decode on the trade read path (CUSHAPE on rc23) | parked for Khubair (drops a read-path re-validation; overlaps Toly work) |
 | R6, R8 | repeated validate_active_leg / config shape decode | parked: removes repeated checks |
 | R11, R12 | wrapper leg lookup / bitmap-only leg scans | parked: changes which check reports a corrupt slot |
-| next | same raw emptiness test in `PositionSlotMapV16::from_account` (src/v16.rs:7548) | after #399 |
+| new | same raw emptiness test in `PositionSlotMapV16::from_account` | merged, engine #404 (trade -1,376) |
+
+Measurement note: the rc23 wrapper (4a5065f5) does not build against engine >= #395 (`V16Config::public_b_chunk_atoms` removed); #404 was measured with prog PR #794's head + probes as the wrapper.
 
 All engine savings reach the wrapper only after `ENGINE_CI_SIBLING` (ci/deployed-refs.env, still `db019142`) moves; that pin move is not part of this work.
