@@ -201,3 +201,35 @@ than bump noise (1,500), identical pass/fail set on `v16_cu`, and the engine/wra
 - Dropping or merging any `validate_*` call, even when it looks repeated: each is a safety check at a point in
   the flow; only the cost of a check may change, never whether or when it runs.
 - Upstream S1-CU restructures (72bfb065 / abe4c54c in the 13 Nov notes): not behaviour-identical.
+
+## 8. Status, 23 Nov 2026 (resumed 05:46 GMT)
+
+New baseline "base2": wrapper `4a5065f5` + probes (`506d0158`) on engine rc23 head `67a4c5b9` (after #382, #383, #384).
+Same harness and method as section 1. Raw logs and tables: `reports/cu-cuts-1121.d/` (`probe_base2_med.txt`,
+`cmp_base2_<cut>.txt`).
+
+| shape | 21 Nov base | base2 (67a4c5b9) |
+|---|---|---|
+| TradeNoCpi, 1 asset, open | 127,138 | 108,528 |
+| BatchTradeNoCpi, 4 legs already open | 520,707 | 250,321 |
+| BatchTradeCpi, 4 legs (probe) | 569,288 | 299,124 [297,624..306,624] |
+| crank refresh, 1 open leg | 99,282 | 71,892 |
+| lien+ADL n=3 liquidation (largest tx) | 1,064,818 | 738,309 |
+| worst crank at the leg cap | 655,088 | 430,934 |
+| InitPortfolio / Deposit (min) | 26,371 / 37,227 | 18,689 / 29,545 |
+
+| plan item | what | state |
+|---|---|---|
+| C1 (Fable R2) | leg loss weight in u128 | merged, engine #384 |
+| C2 (Fable R4a) | engine zero-tail source-domain scans | merged, engine #383 |
+| C4 (Fable R4b) | wrapper zero-tail scans | prog #766 open, CI green, gate re-run (earlier runs failed on lock waits only) |
+| C3 | old #315 / #319 / #320 | not gated: no fail-before test file; left for Khubair |
+| C7a (Fable R3) | atom-alignment modulo without `__umodti3` | engine #391: largest tx -120,836, lien+ADL n=4 settle -150,973 |
+| C7b (Fable R13) | source-credit rate in u128 | engine #392: lien+ADL n=4 settle -42,500, largest tx -32,856 |
+| C7c (Fable R10+R10b) | division-free loss-weight floor in `validate_active_leg` | measured, PR next |
+| C5 (Fable R7, part) | asset-state wire-only validation at 3 raw-field readers | measured next, PR after |
+| C7d (new) | u128 mul-div helpers: a==d / b==d shortcut, ceil remainder by multiply | measured next, PR after |
+| C8 / R5 | shape-only config decode on the trade read path (CUSHAPE idea on rc23) | parked for Khubair: ~92k per CPI trade on a 10%-margin market (Fable p10), but it drops a read-path re-validation and overlaps the Toly work |
+| R6, R8 | repeated `validate_active_leg` / config shape decode | parked: removes repeated checks |
+| R11, R12 | wrapper leg lookup / bitmap-only leg scans | parked: changes which check reports a corrupt slot |
+| C6, C9 | per-leg batch cost, custody fixed costs | re-profile on the stacked build next |
