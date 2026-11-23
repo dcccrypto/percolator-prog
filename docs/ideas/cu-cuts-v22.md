@@ -202,34 +202,41 @@ than bump noise (1,500), identical pass/fail set on `v16_cu`, and the engine/wra
   the flow; only the cost of a check may change, never whether or when it runs.
 - Upstream S1-CU restructures (72bfb065 / abe4c54c in the 13 Nov notes): not behaviour-identical.
 
-## 8. Status, 23 Nov 2026 (resumed 05:46 GMT)
+## 8. Status, 23 Nov 2026 (resumed 05:46 GMT; updated 12:30 GMT)
 
-New baseline "base2": wrapper `4a5065f5` + probes (`506d0158`) on engine rc23 head `67a4c5b9` (after #382, #383, #384).
-Same harness and method as section 1. Raw logs and tables: `reports/cu-cuts-1121.d/` (`probe_base2_med.txt`,
-`cmp_base2_<cut>.txt`).
+Baselines (same harness and method as section 1; raw logs and tables in `reports/cu-cuts-1121.d/`):
+- base2 = wrapper `4a5065f5` + probes (`506d0158`) on engine `67a4c5b9` (after #382, #383, #384);
+- base3 = same wrapper on engine `e2169177` (after #391, #392, #393, #394).
+- stack3 = engine `e2169177` + COMPACT + MULDIV + ASSETWIRE2, wrapper + #766 (measurement build, not a PR).
 
-| shape | 21 Nov base | base2 (67a4c5b9) |
+| shape | 21 Nov base | base2 | stack3 |
+|---|---|---|---|
+| TradeNoCpi, 1 asset | 127,138 | 108,528 | 64,908 |
+| TradeCpi, non-zero asset | 154,223 | 133,461 | 84,129 |
+| BatchTradeNoCpi, 4 legs already open | 520,707 | 250,321 | 183,716 |
+| BatchTradeCpi, 4 legs (probe) | 569,288 | 299,124 | 227,279 |
+| refresh crank (flat) | 55,934 | 55,934 | 34,828 |
+| liquidation crank, final call | 268,422 | 191,727 | 135,670 |
+| lien+ADL n=3 liquidation (largest tx) | 1,064,818 | 738,309 | 519,853 |
+| worst crank at the leg cap | 655,088 | 430,934 | 293,852 |
+| InitPortfolio / Deposit (custody test) | 26,371 / 40,227 | 18,689 / 32,545 | 15,096 / 25,952 |
+
+| item | what | state |
 |---|---|---|
-| TradeNoCpi, 1 asset, open | 127,138 | 108,528 |
-| BatchTradeNoCpi, 4 legs already open | 520,707 | 250,321 |
-| BatchTradeCpi, 4 legs (probe) | 569,288 | 299,124 [297,624..306,624] |
-| crank refresh, 1 open leg | 99,282 | 71,892 |
-| lien+ADL n=3 liquidation (largest tx) | 1,064,818 | 738,309 |
-| worst crank at the leg cap | 655,088 | 430,934 |
-| InitPortfolio / Deposit (min) | 26,371 / 37,227 | 18,689 / 29,545 |
-
-| plan item | what | state |
-|---|---|---|
-| C1 (Fable R2) | leg loss weight in u128 | merged, engine #384 |
-| C2 (Fable R4a) | engine zero-tail source-domain scans | merged, engine #383 |
-| C4 (Fable R4b) | wrapper zero-tail scans | prog #766 open, CI green, gate re-run (earlier runs failed on lock waits only) |
-| C3 | old #315 / #319 / #320 | not gated: no fail-before test file; left for Khubair |
-| C7a (Fable R3) | atom-alignment modulo without `__umodti3` | engine #391: largest tx -120,836, lien+ADL n=4 settle -150,973 |
-| C7b (Fable R13) | source-credit rate in u128 | engine #392: lien+ADL n=4 settle -42,500, largest tx -32,856 |
-| C7c (Fable R10+R10b) | division-free loss-weight floor in `validate_active_leg` | measured, PR next |
-| C5 (Fable R7, part) | asset-state wire-only validation at 3 raw-field readers | measured next, PR after |
-| C7d (new) | u128 mul-div helpers: a==d / b==d shortcut, ceil remainder by multiply | measured next, PR after |
-| C8 / R5 | shape-only config decode on the trade read path (CUSHAPE idea on rc23) | parked for Khubair: ~92k per CPI trade on a 10%-margin market (Fable p10), but it drops a read-path re-validation and overlaps the Toly work |
-| R6, R8 | repeated `validate_active_leg` / config shape decode | parked: removes repeated checks |
+| C1 (R2) | leg loss weight in u128 | merged, engine #384 |
+| C2 (R4a) | engine zero-tail source-domain scans | merged, engine #383 |
+| C4 (R4b) | wrapper zero-tail scans | prog #766 open, CI green; three gate runs lost to lane contention / an external kill; auto-merge loop has it queued |
+| R3 | atom-alignment modulo without `__umodti3` | merged, engine #391 (largest tx -120,836 vs base2) |
+| R13 | source-credit rate in u128 | merged, engine #392 (lien+ADL n=4 settle -42,500) |
+| R7a | asset-state wire-only validation, 3 readers | merged, engine #394 (Kani-proved same errors) |
+| C3 (#319 idea) | skip `compact_source_domains` when already compact | merged, engine #396 (TradeNoCpi -21,642, TradeCpi -30,356, refresh -18,035) |
+| new | u128 mul-div: a==d / b==d shortcut, ceil remainder by multiply | engine #397, gating (4-leg batch add -17,124) |
+| R7b | `asset_state_wire` for ~15 raw-field readers | engine #398, gating (4-leg batch -7k..-9.5k, trade -2,982) |
+| new | inactive-leg emptiness on raw bytes in validate_with_market / refresh | engine #399, gating (TradeCpi -5,620, SyncFee -6,624; Kani-proved) |
+| R10 | division-free loss-weight floor | dropped: no win after #384 (measured +12..+820) |
+| R5 / C8 | shape-only config decode on the trade read path (CUSHAPE on rc23) | parked for Khubair (drops a read-path re-validation; overlaps Toly work) |
+| R6, R8 | repeated validate_active_leg / config shape decode | parked: removes repeated checks |
 | R11, R12 | wrapper leg lookup / bitmap-only leg scans | parked: changes which check reports a corrupt slot |
-| C6, C9 | per-leg batch cost, custody fixed costs | re-profile on the stacked build next |
+| next | same raw emptiness test in `PositionSlotMapV16::from_account` (src/v16.rs:7548) | after #399 |
+
+All engine savings reach the wrapper only after `ENGINE_CI_SIBLING` (ci/deployed-refs.env, still `db019142`) moves; that pin move is not part of this work.
