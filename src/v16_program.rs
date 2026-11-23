@@ -17928,6 +17928,7 @@ pub mod processor {
             &vault_authority,
             &cfg,
             false,
+            false,
         )?;
         // FIX (ADOPT upstream a84b45dd, folded with d1bff017): the balance check below moves
         // past the fee-crystallization block and is re-derived from the ACTUAL withdrawn
@@ -22909,6 +22910,7 @@ pub mod processor {
             &vault_authority,
             &cfg,
             !authority.is_signer,
+            false,
         )?;
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_balance, amount_u64)?;
@@ -23845,6 +23847,7 @@ pub mod processor {
             &vault_authority,
             &cfg_pre,
             true,
+            false,
         )?;
 
         // F-1 / F-2: persist the policy update (cooldown slot + deposits-only ceiling decrement).
@@ -24151,6 +24154,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
                 false,
+                false,
             )?;
             // §1.3/N2 clamp: crank rewards (`credit_account_from_insurance_not_atomic`
             // callers) used to share the same unbudgeted-surplus gap the
@@ -24378,6 +24382,7 @@ pub mod processor {
                     &vault_authority,
                     &cfg,
                     false,
+                    false,
                 )?,
                 Some(payee) => {
                     // Permissionless payout: the destination is FIXED, the payee's canonical ATA
@@ -24391,6 +24396,10 @@ pub mod processor {
                         vault_token,
                         &vault_authority,
                         &cfg,
+                        true,
+                        // The payee route is permissionless: the payout is made in the primary mint
+                        // (#477, the rule of upstream 0b06131f). The signed `asset_admin`
+                        // route above keeps either mint.
                         true,
                     )?;
                     if *dest_token.key != canonical_vault_address(&payee, &dest_mint) {
@@ -25670,6 +25679,9 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
                 true,
+                // Permissionless: the stake pool signs nothing, so the payout is made in
+                // the primary mint (#477, the rule of upstream 0b06131f).
+                true,
             )?;
 
             // Claim capacity. Monotonic invariant
@@ -26391,6 +26403,7 @@ pub mod processor {
                     vault_authority_ai.key,
                     &cfg_pre,
                     true,
+                    false,
                 )?;
                 transfer_tokens_signed(
                     token_program,
@@ -30472,6 +30485,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg_after,
                 true,
+                !owner.is_signer,
             )?;
             // GH#496: this payout is permissionless and its destination is bound to an
             // UNSIGNED `owner` key. An NFT-escrowed portfolio's owner is the NFT
@@ -30592,6 +30606,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg,
                 true,
+                !owner.is_signer,
             )?;
             // GH#496 — see the mirror in `handle_close_resolved` above and the doc on
             // `require_signer_for_escrowed_terminal_payout`. Same shape, same trio base.
@@ -38755,6 +38770,7 @@ pub mod processor {
             &vault_authority,
             &cfg,
             false,
+            false,
         )?;
         let amount_u64 = amount_to_u64(amount)?;
         require_token_balance(vault_balance, amount_u64)?;
@@ -42092,6 +42108,7 @@ pub mod processor {
             &vault_authority,
             &cfg0,
             true,
+            false,
         )?;
         // P3 senior draw: fund an insolvent vault LP and book any pending draw FIRST.
         vault_lp_draw_then_book(
@@ -42715,6 +42732,7 @@ pub mod processor {
                 &vault_authority,
                 &cfg0,
                 true,
+                false,
             )?;
             let amount_u64 = amount_to_u64(amount)?;
             require_token_balance(vault_balance, amount_u64)?;
@@ -43775,6 +43793,7 @@ pub mod processor {
             vault_token,
             &vault_authority,
             &cfg,
+            false,
             false,
         )?;
         let live = match mode {
@@ -50709,6 +50728,12 @@ pub mod processor {
         Ok(())
     }
 
+    // `require_primary_mint` is set for a resolved payout to a portfolio whose owner did not
+    // sign. Value enters in the primary mint alone; `marketauth` names the secondary mint,
+    // and its vault holds whatever was sent there. If a third party could have an owner paid
+    // in it, the owner's claim would be cleared while its deposit stayed in the primary vault
+    // as `CloseSlab` surplus (#477, upstream 0b06131f). With its signature the owner takes
+    // either mint. Reserve payouts pass `false`: their beneficiaries may have dropped their keys.
     // sync(W4-TOKEN22, adopt upstream cb1dfd43): `require_unencumbered_dest` folds in what
     // used to be the separate `verify_permissionless_payout_dest_token_account` call (W5 /
     // upstream b7b6688e / #154) -- same obligation, same three call sites (CloseResolved,
@@ -50727,6 +50752,7 @@ pub mod processor {
         expected_vault_owner: &Pubkey,
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
+        require_primary_mint: bool,
     ) -> Result<u64, ProgramError> {
         verify_withdrawable_token_accounts_with_mint(
             dest_token_ai,
@@ -50735,6 +50761,7 @@ pub mod processor {
             expected_vault_owner,
             cfg,
             require_unencumbered_dest,
+            require_primary_mint,
         )
         .map(|(vault_balance, _mint)| vault_balance)
     }
@@ -50750,6 +50777,7 @@ pub mod processor {
         expected_vault_owner: &Pubkey,
         cfg: &WrapperConfigV16,
         require_unencumbered_dest: bool,
+        require_primary_mint: bool,
     ) -> Result<(u64, Pubkey), ProgramError> {
         // Hardening (security review of d1fb6023): a payout never lands back in the vault.
         if dest_token_ai.key == vault_token_ai.key {
@@ -50758,6 +50786,9 @@ pub mod processor {
         let dest = unpack_token_account(dest_token_ai)?;
         let vault = unpack_token_account(vault_token_ai)?;
         if dest.mint != vault.mint || !is_withdrawable_collateral_mint(cfg, &dest.mint) {
+            return Err(PercolatorError::InvalidMint.into());
+        }
+        if require_primary_mint && dest.mint.to_bytes() != cfg.collateral_mint {
             return Err(PercolatorError::InvalidMint.into());
         }
         if dest.owner != *expected_dest_owner
