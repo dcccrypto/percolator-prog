@@ -41,6 +41,12 @@ mod inv_031_live_exit_loss_stale_gate;
 #[path = "invariants/cu/inv_031_provider_exit_principal.rs"]
 mod inv_031_provider_exit_principal;
 
+#[path = "invariants/cu/inv_066_bankrupt_shortfall_close_order.rs"]
+mod inv_066_bankrupt_shortfall_close_order;
+
+#[path = "invariants/cu/inv_014_batch_cpi_leg_fee_cap.rs"]
+mod inv_014_batch_cpi_leg_fee_cap;
+
 
 thread_local! {
     /// v2.2 fill events: logs of the last transaction (success or failure) sent by this test thread.
