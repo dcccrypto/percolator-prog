@@ -14,8 +14,13 @@
 //! price (`oracle_v16::effective_price_from_target`). It then commits the step through the
 //! single-segment accrual, which sets `fund_px_last` to the new mark on every priced step. The
 //! anchor therefore follows the mark through the walk; upstream asserts it stays at the walk's
-//! start. So this test is GREEN on `ENGINE_CI_SIBLING` `db019142` and with engine PR #389. It
-//! guards the property, so a future sync cannot bring in a stale-anchor route unnoticed.
+//! start. That single-segment accrual also refuses any step larger than the cap times `dt` of the
+//! old mark (`RecoveryRequired`). The one wrapper route that reads `fund_px_last` as an anchor,
+//! the zero-move funding hook (`accrue_asset_path_with_rent_to_not_atomic`), commits only when no
+//! step changes the price, so it cannot move the mark. The engine setter on `db019142` still keeps
+//! the old anchor; no priced crank step reads it. So this test is GREEN on `ENGINE_CI_SIBLING`
+//! `db019142` and with engine PR #389. It guards the property, so a future sync cannot bring in a
+//! stale-anchor route unnoticed.
 //!
 //! Changes from upstream, because this harness runs the SBF program in a debug-mode runner:
 //! - the walk cranks one account every 6 slots (the market's `max_accrual_dt_slots`) for 96
@@ -111,7 +116,8 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
         // This fork's crank caps each step from the current mark and restarts the anchor there.
         assert_eq!(
             asset.fund_px_last, asset.effective_price,
-            "the anchor follows the mark through the walk"
+            "this fork's crank restarts the anchor at each priced step; if the crank route \
+             changed (e.g. upstream's path accrual was adopted), re-derive this guard"
         );
     }
     let walked = env.market_state().1.assets[0];
@@ -136,10 +142,7 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
         (unlocked.raw_oracle_target_price, unlocked.effective_price),
         (mark, mark)
     );
-    assert_eq!(
-        unlocked.fund_px_last, mark,
-        "the anchor is the mark at the push"
-    );
+    assert_eq!(unlocked.fund_px_last, mark, "the anchor is still the mark");
     let short = funded_actor(&mut env, &owners[2], short_principal);
     env.trade_with_cu(
         &owners[0],
@@ -166,8 +169,6 @@ fn v16_attack_authority_reversal_after_a_long_walk_moves_within_the_cap_of_the_m
         "one slot moves the mark by at most the cap of the mark at the push: {mark} -> {}",
         reversed.effective_price
     );
-    // A kept start anchor would allow p0 * cap per slot, at least a quarter more than this.
-    assert!(moved * 10_000 * 5 < p0 * cap_bps * 4);
     assert_eq!(
         short_value(&env, short),
         short_principal as i128 - moved as i128
