@@ -48793,7 +48793,9 @@ pub mod processor {
             / 10_000;
         // (1) Cap dead zone: a 0-tick step cannot move the price in EITHER direction, pinned or
         //     not (a certified book keeps re-anchoring at the same price there, which resets
-        //     the pin clock every epoch, so the pin cannot be required for this case).
+        //     the pin clock every epoch, so the pin cannot be required for this case). The
+        //     crank carries the sub-tick remainder there (`crank_accrue_asset_view`), so the
+        //     mark still creeps toward a target that holds still; exits stay open as before.
         // (2) Width floor (round-2 re-review tightening): the engine's pin clock must be running
         //     as well, i.e. the price sits at the edge of the last wide band with the target
         //     beyond it and the re-anchor refused. While a sub-threshold price can still move
