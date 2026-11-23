@@ -32,7 +32,7 @@ fn release_profile_declares_overflow_checks() {
     );
 }
 
-/// Upstream aeyakovenko/percolator-prog cd8a446a turns overflow checks off for every
+/// Upstream commit cd8a446a turns overflow checks off for every
 /// dependency (`[profile.release.package."*"] overflow-checks = false`), so the engine's
 /// plain arithmetic wraps in its deployed build. This fork keeps the engine checked. A
 /// per-package override of any kind would silently undo that for the engine, so this
