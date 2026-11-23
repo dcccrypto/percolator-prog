@@ -7,7 +7,10 @@
 #
 # PRE-EXISTING over-budget functions (unchanged since the deployed base 7c906e45; frozen here,
 # never allowed to grow; each should be brought under 3840 in its own change):
-3968 percolator_prog::processor::handle_lp_vault_crank_fees pin
+# 2026-11-23: handle_lp_vault_crank_fees 3968 -> 2304 B. Engine #385 grew the market view and took it
+# to 4224 B (past 4096); its ledger sync + fee booking now runs in lp_vault_crank_fees_book (3264 B,
+# #[inline(never)], same code). Re-pinned at the measured value so the gain cannot be lost silently.
+2304 percolator_prog::processor::handle_lp_vault_crank_fees pin
 #
 # PINNED hot paths (the trade executors and their routes): may not grow at all.
 # handle_trade_nocpi_zero_copy was 4096 B at cbf68530 (deployed base: 4032); F-1 moved the
