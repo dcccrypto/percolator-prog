@@ -658,9 +658,6 @@ a deploy candidate.
 # Requires platform-tools v1.52 or newer; review any stack-frame diagnostics
 # before treating this artifact as deployable.
 cargo build-sbf --tools-version v1.52
-# The release profile in Cargo.toml turns overflow checks on for every crate, the
-# engine included (an overflow aborts the transaction); the comment there says why
-# this fork does not follow upstream in leaving the engine unchecked.
 
 # Legacy local compatibility build without the Anchor v2 entrypoint.
 cargo build-sbf --no-default-features
@@ -683,6 +680,16 @@ cargo kani --lib --features devnet -Z stubbing
 cargo kani --tests --features devnet -Z stubbing -Z function-contracts
 (cd kani/growth && cargo kani -Z stubbing -Z function-contracts)   # also kani/contlev, kani/p3, kani/p3-engine
 ```
+
+**Release profile: the engine stays overflow-checked.** Cargo applies only the root
+manifest's profiles, so `[profile.release] overflow-checks = true` in `Cargo.toml` reaches
+every crate in a build rooted here, the engine included (#425): an overflow in the program
+or the engine aborts the transaction instead of wrapping. Upstream (commit `cd8a446a`)
+instead adds `[profile.release.package."*"] overflow-checks = false`, because with its
+engine checked its 14-leg INV-073 atomic exit exceeds the 1.4M CU limit. This fork has
+shipped with the engine checked since #425 (measured then: compute up about 2.6% on
+average, every CU guardrail kept wide headroom). Do not add that override without a
+security sign-off. `tests/build_profile.rs` guards both points.
 
 ---
 
