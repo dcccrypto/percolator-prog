@@ -967,6 +967,11 @@ pub mod constants {
     // upstream's formula `WRAPPER_MAX_PORTFOLIO_ASSETS * 2`; the VALUE differs from upstream and from this fork's
     // earlier 28 because the cap is now 4 (S10-X1): 8 domains per trade-admission pass.
     pub const WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS: usize = WRAPPER_MAX_PORTFOLIO_ASSETS as usize * 2;
+    /// INV-077 (upstream `b7990033`): per active leg weight in the source-lien refresh work bound.
+    pub const WRAPPER_SOURCE_LIEN_REFRESH_LEG_WEIGHT: usize = 6;
+    /// INV-077 (upstream `b7990033`): max source-lien refresh work (liened domains + 6 * active legs)
+    /// one trade may leave on an account. Upstream value kept; unreachable at cap 4 (max 32).
+    pub const WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK: usize = 72;
 
     // ── Protocol-fee program change ─────────────────────────────────────
     // See ~/v17/PROTOCOL-FEE-DESIGN.md §0/§2. `PROTOCOL_FEE_BPS` is the
@@ -18332,6 +18337,8 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            let refresh_work_before_a = source_lien_refresh_work_view(&account_a)?;
+            let refresh_work_before_b = source_lien_refresh_work_view(&account_b)?;
             // Taker-only (design §1A): account_a is always the taker/fee-payer
             // (§1A.2). Whether account_a occupies the engine's first
             // (long_account) or second (short_account) positional slot
@@ -18518,6 +18525,15 @@ pub mod processor {
             ensure_source_domain_growth_within_wrapper_bound(
                 source_lien_before_b.len(),
                 source_lien_after_b.len(),
+            )?;
+            // INV-077 (upstream `b7990033`): bound the per-account source-lien refresh work.
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                refresh_work_before_a,
+                source_lien_refresh_work_view(&account_a)?,
+            )?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                refresh_work_before_b,
+                source_lien_refresh_work_view(&account_b)?,
             )?;
         }
         if let Some(cfg) = cfg_after {
@@ -18981,6 +18997,8 @@ pub mod processor {
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_a)?;
             let source_lien_before_b =
                 source_lien_effective_reserved_snapshot_for_trade_view(&account_b)?;
+            let refresh_work_before_a = source_lien_refresh_work_view(&account_a)?;
+            let refresh_work_before_b = source_lien_refresh_work_view(&account_b)?;
 
             // Taker-only (design §1A.3): batches never reorder -- account_a is
             // always the engine's first (long_account) positional slot for
@@ -19270,6 +19288,15 @@ pub mod processor {
             ensure_source_domain_growth_within_wrapper_bound(
                 source_lien_before_b.len(),
                 source_lien_after_b.len(),
+            )?;
+            // INV-077 (upstream `b7990033`): bound the per-account source-lien refresh work.
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                refresh_work_before_a,
+                source_lien_refresh_work_view(&account_a)?,
+            )?;
+            ensure_source_lien_refresh_work_within_wrapper_bound(
+                refresh_work_before_b,
+                source_lien_refresh_work_view(&account_b)?,
             )?;
             collect_batch_fills(fills_out, &requests, &leg_ctx);
         }
@@ -19725,6 +19752,42 @@ pub mod processor {
             return Ok(delta_q > 0 || post_q < 0);
         }
         Ok(delta_q < 0 || post_q > 0)
+    }
+
+    /// INV-077 (upstream `b7990033`): refresh work = liened source domains + weight * active legs.
+    fn source_lien_refresh_work_from_counts(liened_domains: usize, active_legs: usize) -> usize {
+        liened_domains
+            .saturating_add(constants::WRAPPER_SOURCE_LIEN_REFRESH_LEG_WEIGHT.saturating_mul(active_legs))
+    }
+
+    fn source_lien_refresh_work_view(
+        account: &percolator::PortfolioV16ViewMut<'_>,
+    ) -> Result<usize, ProgramError> {
+        let mut liened = 0usize;
+        for slot in account.header.source_domains.iter() {
+            if slot.is_occupied() && slot.source_lien_effective_reserved.get() != 0 {
+                liened += 1;
+            }
+        }
+        let mut legs = 0usize;
+        for pod in &account.header.legs {
+            if pod.try_to_runtime().map_err(map_v16_error)?.active {
+                legs += 1;
+            }
+        }
+        Ok(source_lien_refresh_work_from_counts(liened, legs))
+    }
+
+    fn ensure_source_lien_refresh_work_within_wrapper_bound(
+        before_work: usize,
+        after_work: usize,
+    ) -> ProgramResult {
+        if after_work > before_work
+            && after_work > constants::WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK
+        {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(())
     }
 
     fn ensure_source_domain_growth_within_wrapper_bound(
@@ -50952,6 +51015,27 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        /// INV-077 (upstream `b7990033`): the source-lien refresh work bound (72 = liens + 6 * legs).
+        /// Synthetic counts: 9 legs + 18 liens = 72 is the edge (admitted); 19 liens = 73 is refused.
+        #[test]
+        fn inv077_source_lien_refresh_work_bound() {
+            let w = source_lien_refresh_work_from_counts;
+            assert_eq!(constants::WRAPPER_MAX_SOURCE_LIEN_REFRESH_WORK, 72);
+            assert_eq!(w(18, 9), 72);
+            assert_eq!(w(19, 9), 73);
+            // edge passes
+            assert!(ensure_source_lien_refresh_work_within_wrapper_bound(w(10, 9), w(18, 9)).is_ok());
+            // past the bound while growing: refused
+            assert!(ensure_source_lien_refresh_work_within_wrapper_bound(w(18, 9), w(19, 9)).is_err());
+            assert!(ensure_source_lien_refresh_work_within_wrapper_bound(w(0, 9), w(0, 13)).is_err());
+            // not growing (already over, trade only shrinks or holds): admitted
+            assert!(ensure_source_lien_refresh_work_within_wrapper_bound(w(19, 9), w(19, 9)).is_ok());
+            assert!(ensure_source_lien_refresh_work_within_wrapper_bound(w(20, 9), w(19, 9)).is_ok());
+            // fork's cap 4 can never reach it: 8 domains + 6 * 4 legs
+            let cap = constants::WRAPPER_MAX_PORTFOLIO_ASSETS as usize;
+            assert!(w(constants::WRAPPER_MAX_BOUNDED_SOURCE_DOMAINS, cap) <= 72);
+        }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
         /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and
