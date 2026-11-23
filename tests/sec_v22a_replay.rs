@@ -930,6 +930,14 @@ fn swordcat_replay_report() {
         r.peak_earn_loss as f64 / 1e6
     );
     assert_eq!(r.push_err, 0, "every live push must replay");
+    // Pinned measurement (#698 review low): exactly 5 keeper cranks are rejected with custom
+    // code 22 on this replay. A drift in either number means crank behaviour changed.
+    assert_eq!(r.crank_err, 5, "swordcat crank errors drifted: {:?}", r.crank_codes);
+    assert_eq!(
+        r.crank_codes,
+        std::collections::BTreeMap::from([(22u32, 5usize)]),
+        "swordcat crank error codes drifted"
+    );
 }
 
 /// E1 acceptance on the live path: after every keeper settlement of the one swordcat position, the
@@ -1443,6 +1451,27 @@ fn backpack_replay_report() {
         w.residual_spent_principal_atoms_total,
         w.residual_received_atoms_total,
         w.source_claim_bound_num
+    );
+    // Pinned end state (#698 review low, measured 15 Nov 2026 on the #698 wrapper): a silent
+    // drift in balances, consumed, or the accounting snapshot now fails here. If a deliberate
+    // change moves these, re-measure and update them together with the reason.
+    assert_eq!(r.push_err, 0, "every live push must replay");
+    assert_eq!(r.crank_err, 1574, "backpack crank errors drifted: {:?}", r.crank_codes);
+    assert_eq!(
+        r.crank_codes,
+        std::collections::BTreeMap::from([(22u32, 1574usize)]),
+        "backpack crank error codes drifted"
+    );
+    assert!(r.user_err.is_empty(), "backpack user errors: {:?}", r.user_err);
+    assert_eq!(
+        (end.trader_cap, end.trader_pnl, lp.capital, end.consumed),
+        (811_525_856u128, 903_426_791i128, 333_946_933u128, [18_456_987u128, 144_072_614u128]),
+        "backpack end state (winner cap/pnl, LP cap, consumed) drifted"
+    );
+    assert_eq!(
+        (end.vault, end.c_tot, end.ppt, end.insurance),
+        (4_234_338_076u128, 1_204_469_457u128, 928_888_754u128, 100_979_860u128),
+        "backpack accounting snapshot (vault, c_tot, pnl_pos_tot, insurance) drifted"
     );
 }
 
