@@ -36,10 +36,11 @@
 1664 percolator_prog::processor::p1_cpi_preflight_before_matcher pin
 # 2026-11-23, engine pin 2d2691f2: handle_init_vault_lp 3776 -> 4032 B with the grown view; its view
 # block now runs in init_vault_lp_bind_view (#[inline(never)], same code) and the handler is
-# re-pinned at the measured 2496 B. Same treatment, unpinned (now under 3840): handle_top_up_insurance
+# re-pinned at the measured 2496 B. Same treatment, unpinned (now at or under 3840): handle_top_up_insurance
 # 4032 -> 1600 (top_up_insurance_book 3136), handle_deposit_to_lp_vault 4032 -> 3776
-# (deposit_to_lp_vault_book 1472), handle_update_asset_lifecycle 3968 -> 3840
-# (update_asset_lifecycle_activate 2112), handle_execute_redemption 3904 -> 2752
+# (deposit_to_lp_vault_book 1472), handle_update_asset_lifecycle 3968 -> 3840 (exactly the limit: any
+# growth fails; its SHUTDOWN view block is the next one to move out) (update_asset_lifecycle_activate
+# 2112), handle_execute_redemption 3904 -> 2752
 # (execute_redemption_withdraw_view 1728).
 2496 percolator_prog::processor::handle_init_vault_lp pin
 2816 percolator_prog::processor::init_vault_lp_bind_view pin
