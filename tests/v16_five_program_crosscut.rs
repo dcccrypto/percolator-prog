@@ -3109,6 +3109,96 @@ fn x0_e2_escrowed_position_rejects_non_holder_at_mainnet() {
     assert_eq!(env.token_amount(dest), 0, "no funds moved to the attacker");
 }
 
+/// #660 / finding 4114: the NFT-holder proof must read a real token ACCOUNT. Each impostor
+/// below is owned by a token program, carries the bound mint, the signer as owner, amount 1
+/// and the Initialized state byte at the base-layout offsets, but is laid out as something
+/// other than a token account (Multisig length, extended Mint, classic over-length). Each
+/// must be refused with InvalidTokenAccount (Custom(11)) and move nothing. The genuine
+/// holder ATA then withdraws, so the rest of the E2 trio was valid throughout.
+#[test]
+fn x0_e2_nft_holder_proof_rejects_non_account_token_layouts() {
+    let mut env = CrosscutEnv::new();
+    let registry = env.register_nft_program();
+    let (mint_auth, _) = mint_auth_pda();
+    let holder = Keypair::new();
+    env.svm.airdrop(&holder.pubkey(), 10_000_000_000).unwrap();
+
+    let portfolio = env.create_portfolio(&holder);
+    let amount = 1_000u128;
+    env.deposit(&holder, portfolio, amount);
+    let (nft_pda, nft_mint, holder_nft_ata) =
+        attach_nft_to_portfolio(&mut env, &holder, portfolio, 7);
+    reown_portfolio(&mut env, portfolio, &mint_auth.to_bytes());
+    let dest = make_dest_ata(&mut env, holder.pubkey());
+
+    let impostor = |len: usize, type_byte: Option<u8>| -> Vec<u8> {
+        let mut d = vec![0u8; len];
+        d[0..32].copy_from_slice(nft_mint.as_ref());
+        d[32..64].copy_from_slice(holder.pubkey().as_ref());
+        d[64..72].copy_from_slice(&1u64.to_le_bytes());
+        d[108] = 1; // AccountState::Initialized
+        if let Some(t) = type_byte {
+            d[165] = t;
+        }
+        d
+    };
+    let cases: [(&str, Pubkey, Vec<u8>); 4] = [
+        // Multisig length (355), even with the Account type byte at offset 165.
+        ("token-2022 multisig-length", TOKEN_2022, impostor(355, Some(2))),
+        ("classic multisig-length", spl_token_classic_id(), impostor(355, None)),
+        // Token-2022 extended Mint: AccountType::Mint (1) at offset 165.
+        ("token-2022 extended mint", TOKEN_2022, impostor(200, Some(1))),
+        // Classic SPL token accounts are exactly 165 bytes.
+        ("classic over-length", spl_token_classic_id(), impostor(166, Some(2))),
+    ];
+    for (label, owner, data) in cases {
+        let fake = Pubkey::new_unique();
+        env.svm
+            .set_account(
+                fake,
+                Account {
+                    lamports: 10_000_000,
+                    data,
+                    owner,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+        let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
+        let res = env.try_wrapper(
+            ProgInstruction::Withdraw {
+                portfolio_id,
+                expected_sequence,
+                amount,
+            },
+            e2_withdraw_accounts(&env, &holder, portfolio, dest, registry, nft_pda, fake),
+            &[&holder],
+        );
+        let err = res.expect_err(&format!("{label}: a non-account layout must not prove holding"));
+        assert!(
+            format!("{err:?}").contains("Custom(11)"),
+            "{label}: rejection must be InvalidTokenAccount, got: {err:?}"
+        );
+        assert_eq!(env.portfolio(portfolio).capital, amount, "{label}: capital untouched");
+        assert_eq!(env.token_amount(dest), 0, "{label}: no funds moved");
+    }
+
+    // Control: the genuine Token-2022 holder ATA still proves holding.
+    let (portfolio_id, expected_sequence, _) = env.portfolio_identity(portfolio);
+    let res = env.try_wrapper(
+        ProgInstruction::Withdraw {
+            portfolio_id,
+            expected_sequence,
+            amount,
+        },
+        e2_withdraw_accounts(&env, &holder, portfolio, dest, registry, nft_pda, holder_nft_ata),
+        &[&holder],
+    );
+    assert!(res.is_ok(), "the genuine holder ATA must still withdraw: {res:?}");
+    assert_eq!(env.token_amount(dest), amount as u64, "funds routed to the holder");
+}
+
 // ── Phase 4 item 6 (stake v5): the v4 flush / rotate-out flows above are REMOVED by design. ──
 // Deployment is the permissionless SyncInsuranceDeployment (stake tag 31), exercised against the
 // real stake v5 .so in `tests/p4_wave_d.rs` (xprog_*). These replacements pin the removal in the
