@@ -1328,7 +1328,7 @@ pub mod constants {
     // the matching `declare_id!` arm in percolator-stake, in the same change.
     #[cfg(feature = "devnet")]
     pub const STAKE_PROGRAM_ID: solana_program::pubkey::Pubkey =
-        solana_program::pubkey!("7JrgAUHi4PxaRv5JKHoGAxodDFbozYexpERei66Xgq4V");
+        solana_program::pubkey!("GcWRfTvsgkdrRybFoo3MoxKixDaAbSLG75ERt8oBMqLq");
     // v2.2 item 4: the MAINNET arm. `feature = "mainnet-ids"` (never together with `devnet`)
     // pins the stake id AND the wrapper id from `src/mainnet_ids.rs`, where a build-time
     // assertion refuses a build with either still a placeholder. The pair is changed in one
