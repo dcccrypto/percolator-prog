@@ -10,7 +10,7 @@
 //! anchor / mark times the per-slot cap in one slot.
 //!
 //! This fork's crank does not take that route. For an auth-mark or EWMA-mark asset,
-//! `hybrid_effective_price_for_crank_view` caps each step from the asset's *current* effective
+//! the crank (`crank_accrue_asset_view`) caps each step from the asset's *current* effective
 //! price (`oracle_v16::effective_price_from_target`). It then commits the step through the
 //! single-segment accrual, which sets `fund_px_last` to the new mark on every priced step. The
 //! anchor therefore follows the mark through the walk; upstream asserts it stays at the walk's
@@ -18,9 +18,16 @@
 //! old mark (`RecoveryRequired`). The one wrapper route that reads `fund_px_last` as an anchor,
 //! the zero-move funding hook (`accrue_asset_path_with_rent_to_not_atomic`), commits only when no
 //! step changes the price, so it cannot move the mark. The engine setter on `db019142` still keeps
-//! the old anchor; no priced crank step reads it. So this test is GREEN on `ENGINE_CI_SIBLING`
-//! `db019142` and with engine PR #389. It guards the property, so a future sync cannot bring in a
-//! stale-anchor route unnoticed.
+//! the old anchor; no priced crank step on this route reads it. So this test is GREEN on
+//! `ENGINE_CI_SIBLING` `db019142` and with engine PR #389. It guards the property, so a future
+//! sync cannot bring in a stale-anchor route unnoticed.
+//!
+//! One crank route does read the anchor since #793: a mark whose single-segment step floors to
+//! 0 atoms is priced by the path accrual (`crank_accrue_asset_view`). A path walk leaves the
+//! anchor at the walk's start, so while the anchor is off the mark a changed target is never
+//! staged through the setter: it goes through the path accrual itself (also for a same-slot
+//! crank, and after a long gap), which restarts the anchor at the mark.
+//! `v16_bpf_low_mark_reversal_restarts_the_cap_anchor` in `tests/v16_cu.rs` is this guard for it.
 //!
 //! Changes from upstream, because this harness runs the SBF program in a debug-mode runner:
 //! - the walk cranks one account every 6 slots (the market's `max_accrual_dt_slots`) for 96

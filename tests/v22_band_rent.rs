@@ -2327,7 +2327,7 @@ fn v22_band_markets_are_growth_markets_so_wave_a_floor_binds() {
 fn v22_band_floor_keeps_exits_open() {
     // d = 50 bps: the width floor sits at 3,200 ticks, where the 4 bps/slot cap still moves
     // >= 1 tick per slot (at d = 100 the floor, 1,600, is below the cap's own 2,500-tick
-    // dead zone and nothing would move at all).
+    // dead zone, where a segment moves under one tick and the mark only creeps on the carry).
     const D: u64 = 50;
     let mut env = Env::new(Cfg { slots: 1, phase4: Some(phase4(D as u16, RENT_MAX)), r_gap: 0 });
     env.auth_mark();
@@ -2378,8 +2378,9 @@ fn v22_band_floor_keeps_exits_open() {
 
 
 /// N-2 companion: at d = 100 the width floor (1,600) is below the cap law's own dead zone
-/// (4 bps/slot moves 0 ticks under 2,500), so the price stops there instead; exits must stay
-/// open there too. Control: the same favourable close is refused at a price that can move.
+/// (4 bps/slot is under one tick below 2,500), so one accrual segment cannot move the price
+/// there; exits must stay open there too. The crank no longer freezes in the dead zone: it
+/// carries the sub-tick remainder, so the mark still creeps toward the target.
 #[test]
 fn v22_band_cap_dead_zone_keeps_exits_open() {
     let mut env = Env::new(band_cfg());
@@ -2394,10 +2395,13 @@ fn v22_band_cap_dead_zone_keeps_exits_open() {
     let _ = env.crank(long.1);
     let _ = env.crank(lp.account);
     let a = env.engine_asset();
-    assert_eq!(a.effective_price, 1_660, "the cap law cannot move 1,660 at 4 bps/slot");
+    // 4 bps of 1,660 is 0.664 ticks a slot. The asset was two slots behind, so the two cranks
+    // above each accrued one slot: 1.328 ticks, one tick moved and the rest carried. Before
+    // the carry each segment rounded to 0 and the mark stayed at 1,660 for good.
+    assert_eq!(a.effective_price, 1_659, "two slots at 0.664 ticks a slot move one tick");
     assert!(a.raw_oracle_target_price < a.effective_price, "lagged");
-    // A 0-tick cap step cannot move the price in either direction, pinned or not (a certified
-    // book keeps re-anchoring at the same price, so no pin clock can be required here).
+    // A segment's cap step is still 0 ticks here, pinned or not (a certified book keeps
+    // re-anchoring, so no pin clock can be required), and that is what keeps exits open.
     let r = env.trade_cpi(&long.0, long.1, &lp, -20_000 * POS_SCALE as i128);
     assert!(r.is_ok(), "exit in the cap dead zone lands: {r:?}");
     env.assert_conservation();

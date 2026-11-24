@@ -14770,14 +14770,14 @@ pub mod processor {
     /// #569 follow-up (#666): the raw target the NEXT crank commits for `asset_index`.
     /// PushAuthMark / PushAuthMarkDepth / PushEwmaMark (and an EWMA_MARK trade) write the oracle
     /// profile, never the engine's target; the crank (tag 5, and the tag-104 / settle-rent
-    /// refresh) then commits exactly `profile.mark_ewma_e6` (`hybrid_effective_price_for_crank_view`)
-    /// through `set_asset_raw_oracle_target_not_atomic`. Until then the engine's raw target is the
+    /// refresh) then commits exactly `profile.mark_ewma_e6` (`hybrid_target_for_crank_view`) as
+    /// the asset's raw target (`crank_accrue_asset_view`). Until then the engine's raw target is the
     /// pre-push value and a push bumps no epoch, so a payout priced from the engine fields alone
     /// depended on whether anyone had cranked first. This reads `mark_ewma_e6` (on EWMA_MARK the
     /// stored blend, which a trade can also move), never `oracle_target_price_e6` or the pushed
     /// input. Hybrid keeps its pending price in the external feed account, which the valuation
     /// paths do not take (a soft-stale Hybrid crank commits `mark_ewma_e6` instead,
-    /// `hybrid_effective_price_for_crank_view`; this helper still returns the committed target
+    /// `hybrid_target_for_crank_view`; this helper still returns the committed target
     /// there, as before), and outside Live mode or an Active / DrainOnly lifecycle the crank
     /// commits no target: all of these return the committed one. One corner never commits: a
     /// push followed by no crank until `permissionless_resolve_stale_slots` has passed. The crank
@@ -24821,11 +24821,10 @@ pub mod processor {
 
     /// Refresh one asset's oracle target and accrue it to `now_slot`, EXACTLY as one
     /// `PermissionlessCrank` observation hint does for that asset (same primitives, same
-    /// order: resolve-maturity gate, `hybrid_effective_price_for_crank_view`, permissionless
-    /// funding, raw target, asset-0 config mirror, profile write-back, single-segment
-    /// `accrue_asset_to_not_atomic`). This is the price path liquidation uses. Returns
-    /// whether the asset is now fully caught up to `now_slot` (the single segment is capped at
-    /// `max_accrual_dt_slots`; when it is not, the caller must commit and stop, like the
+    /// order: resolve-maturity gate, then `crank_accrue_asset_view`). This is the price path
+    /// liquidation uses. Returns whether the asset is now fully caught up to `now_slot` (one
+    /// call is capped at `max_accrual_dt_slots`, and at `V16_MAX_ACCRUAL_PATH_STEPS` on the
+    /// carry path; when it is not, the caller must commit and stop, like the
     /// crank's `bounded_market_catchup_only` return).
     #[inline(never)]
     fn adl_wind_down_refresh_asset_price_view(
@@ -24851,7 +24850,7 @@ pub mod processor {
                 .oracle_target_publish_time
                 .saturating_add(i64::try_from(elapsed_slots).unwrap_or(i64::MAX))
         });
-        let crank_price = hybrid_effective_price_for_crank_view(
+        let (_, observation) = crank_accrue_asset_view(
             cfg,
             &mut oracle_profile,
             group,
@@ -24860,69 +24859,9 @@ pub mod processor {
             now_unix_ts,
             oracle_accounts,
         )?;
-        let funding_rate_e9 = permissionless_funding_rate_e9_view(
-            &oracle_profile,
-            group,
-            asset_index,
-            authenticated_now_slot,
-            crank_price,
-        )?;
-        group
-            .set_asset_raw_oracle_target_not_atomic(
-                asset_index,
-                oracle_profile.oracle_target_price_e6,
-            )
-            .map_err(map_v16_error)?;
-        if asset_index == 0 {
-            cfg.last_good_oracle_slot =
-                core::cmp::max(cfg.last_good_oracle_slot, oracle_profile.last_good_oracle_slot);
-        }
-        if asset_index == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
-            cfg.oracle_mode = oracle_profile.oracle_mode;
-            cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
-            cfg.oracle_leg_flags = oracle_profile.oracle_leg_flags;
-            cfg.invert = oracle_profile.invert;
-            cfg.unit_scale = oracle_profile.unit_scale;
-            cfg.conf_filter_bps = oracle_profile.conf_filter_bps;
-            cfg.max_staleness_secs = oracle_profile.max_staleness_secs;
-            cfg.hybrid_soft_stale_slots = oracle_profile.hybrid_soft_stale_slots;
-            cfg.mark_ewma_e6 = oracle_profile.mark_ewma_e6;
-            cfg.mark_ewma_last_slot = oracle_profile.mark_ewma_last_slot;
-            cfg.mark_ewma_halflife_slots = oracle_profile.mark_ewma_halflife_slots;
-            cfg.mark_min_fee = oracle_profile.mark_min_fee;
-            cfg.oracle_target_price_e6 = oracle_profile.oracle_target_price_e6;
-            cfg.oracle_target_publish_time = oracle_profile.oracle_target_publish_time;
-            cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
-            cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
-            cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
-        }
-        write_oracle_profile_to_view(group, asset_index, &oracle_profile)?;
-        // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move).
-        let (crank_price, funding_rate_e9, rent_long, rent_short) = band_rent_accrual_inputs_view(
-            group,
-            asset_index,
-            authenticated_now_slot,
-            crank_price,
-            funding_rate_e9,
-        )?;
-        group
-            .accrue_asset_to_with_rent_not_atomic(
-                asset_index,
-                authenticated_now_slot,
-                crank_price,
-                funding_rate_e9,
-                rent_long,
-                rent_short,
-                true,
-            )
-            .map_err(map_v16_error)?;
         Ok((
             group.markets[asset_index].engine.asset.slot_last.get() >= authenticated_now_slot,
-            AutoCrankObservationV16 {
-                asset_index,
-                effective_price: crank_price,
-                funding_rate_e9,
-            },
+            observation,
         ))
     }
 
@@ -30702,12 +30641,11 @@ pub mod processor {
         // engine crate, `permissionless_auto_crank_not_atomic`) picks the action and the asset.
         // See adopt_autocrank_observation.md for the full analysis. Adaptations vs. upstream's
         // current-tip shape (documented at each site below, not silent):
-        //   (1) uses this fork's existing single-segment `hybrid_effective_price_for_crank_view`
-        //       + `accrue_asset_to_not_atomic` crank-price primitive, NOT upstream's later
-        //       path-based `hybrid_target_for_crank_view` / `canonical_accrual_path_for_target_view`
-        //       refinement -- that refinement is a separate, currently-fully-absent subsystem on
-        //       this fork (0 hits), matching the same adaptation this fork's Wave-1 #4 "zero-move
-        //       funding" unit already made for the identical reason.
+        //   (1) keeps this fork's single-segment crank price + accrual wherever that segment can
+        //       move the price. Where it cannot (an asset with open interest whose step floors to
+        //       0 atoms), the price is built the way upstream builds it, through
+        //       `hybrid_target_for_crank_view` + `canonical_accrual_path_for_target_view` and the
+        //       engine's path accrual, with the carry (`crank_accrue_asset_view`).
         //   (2) does not port upstream's resolve-matured terminal-settlement branch
         //       (`required_market_resolve_accrual_for_profile_view`) -- instead reuses the
         //       existing `reject_permissionless_resolve_matured_live_for_profile_view` gate
@@ -30882,8 +30820,8 @@ pub mod processor {
 
             // Per-hint oracle-reading loop: turns each caller-supplied `CrankObservationHint`
             // into a real `AutoCrankObservationV16`, committing that asset's price/funding
-            // forward via this fork's existing single-segment crank-price primitive (adaptation
-            // (1) above). Every hinted asset's evidence is applied here, independent of which
+            // forward via `crank_accrue_asset_view` (adaptation (1) above). Every hinted
+            // asset's evidence is applied here, independent of which
             // ONE asset the engine's plan selector ultimately picks a bounded action for below.
             let mut observations: alloc::vec::Vec<AutoCrankObservationV16> =
                 alloc::vec::Vec::with_capacity(percolator::V16_MAX_PORTFOLIO_ASSETS_N);
@@ -30891,9 +30829,9 @@ pub mod processor {
             // GATE-2 FIX (bounded_market_catchup_only, ported from upstream
             // `aeyakovenko/percolator-prog` src/v16_program.rs, handler
             // `handle_permissionless_crank_zero_copy`, lines ~13925/14096/14141 at
-            // upstream/main commit a657d195): tracks whether pass-1's own
-            // single-segment `accrue_asset_to_not_atomic` call (capped at
-            // `config.max_accrual_dt_slots`, adaptation (1) above) fully caught any
+            // upstream/main commit a657d195): tracks whether pass-1's own accrual
+            // (capped at `config.max_accrual_dt_slots`, and at
+            // `V16_MAX_ACCRUAL_PATH_STEPS` when it takes the carry path) fully caught any
             // hinted asset up to `authenticated_now_slot`. If the cap bit and any
             // hinted asset is left short (`asset_slot_after < authenticated_now_slot`),
             // this crank instruction must stop HERE -- see the early-return check
@@ -30956,87 +30894,22 @@ pub mod processor {
                         .oracle_target_publish_time
                         .saturating_add(i64::try_from(elapsed_slots).unwrap_or(i64::MAX))
                 });
-                let crank_price = hybrid_effective_price_for_crank_view(
-                    &cfg,
+                let (accrual, observation) = crank_accrue_asset_view(
+                    &mut cfg,
                     &mut oracle_profile,
-                    &group,
+                    &mut group,
                     hint_asset_index,
                     authenticated_now_slot,
                     now_unix_ts,
                     hint_oracle_accounts,
                 )?;
-                let computed_funding_rate_e9 = permissionless_funding_rate_e9_view(
-                    &oracle_profile,
-                    &group,
-                    hint_asset_index,
-                    authenticated_now_slot,
-                    crank_price,
-                )?;
-                group
-                    .set_asset_raw_oracle_target_not_atomic(
-                        hint_asset_index,
-                        oracle_profile.oracle_target_price_e6,
-                    )
-                    .map_err(map_v16_error)?;
-                // #379/#501: base-only, as above. NOTE the existing guard below also requires
-                // `profile_is_price_managed`, so this cannot simply move into it — that would
-                // newly withhold the clock from a base asset that is not price-managed.
-                if hint_asset_index == 0 {
-                    cfg.last_good_oracle_slot = core::cmp::max(
-                        cfg.last_good_oracle_slot,
-                        oracle_profile.last_good_oracle_slot,
-                    );
-                }
-                if hint_asset_index == 0 && oracle_v16::profile_is_price_managed(&oracle_profile) {
-                    cfg.oracle_mode = oracle_profile.oracle_mode;
-                    cfg.oracle_leg_count = oracle_profile.oracle_leg_count;
-                    cfg.oracle_leg_flags = oracle_profile.oracle_leg_flags;
-                    cfg.invert = oracle_profile.invert;
-                    cfg.unit_scale = oracle_profile.unit_scale;
-                    cfg.conf_filter_bps = oracle_profile.conf_filter_bps;
-                    cfg.max_staleness_secs = oracle_profile.max_staleness_secs;
-                    cfg.hybrid_soft_stale_slots = oracle_profile.hybrid_soft_stale_slots;
-                    cfg.mark_ewma_e6 = oracle_profile.mark_ewma_e6;
-                    cfg.mark_ewma_last_slot = oracle_profile.mark_ewma_last_slot;
-                    cfg.mark_ewma_halflife_slots = oracle_profile.mark_ewma_halflife_slots;
-                    cfg.mark_min_fee = oracle_profile.mark_min_fee;
-                    cfg.oracle_target_price_e6 = oracle_profile.oracle_target_price_e6;
-                    cfg.oracle_target_publish_time = oracle_profile.oracle_target_publish_time;
-                    cfg.oracle_leg_feeds = oracle_profile.oracle_leg_feeds;
-                    cfg.oracle_leg_prices_e6 = oracle_profile.oracle_leg_prices_e6;
-                    cfg.oracle_leg_publish_times = oracle_profile.oracle_leg_publish_times;
-                }
-                write_oracle_profile_to_view(&mut group, hint_asset_index, &oracle_profile)?;
-
-                // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move). The
-                // observation below carries the same values, so the engine's own refresh /
-                // liquidation step certifies at exactly the committed P_last.
-                let (crank_price, computed_funding_rate_e9, rent_long, rent_short) =
-                    band_rent_accrual_inputs_view(
-                        &group,
-                        hint_asset_index,
-                        authenticated_now_slot,
-                        crank_price,
-                        computed_funding_rate_e9,
-                    )?;
-                let accrual = group
-                    .accrue_asset_to_with_rent_not_atomic(
-                        hint_asset_index,
-                        authenticated_now_slot,
-                        crank_price,
-                        computed_funding_rate_e9,
-                        rent_long,
-                        rent_short,
-                        true,
-                    )
-                    .map_err(map_v16_error)?;
                 let asset_after = group.markets[hint_asset_index].engine.asset;
                 market_accrual_performed |= accrual.dt != 0
                     || asset_after.raw_oracle_target_price.get() != asset_before_raw_target
                     || asset_after.effective_price.get() != asset_before_effective
                     || oracle_profile != oracle_profile_before;
                 // Mirrors upstream's own post-accrual check (same call site as above):
-                // pass-1's single-segment accrual is capped at `max_accrual_dt_slots`,
+                // pass-1's accrual is capped (see above),
                 // so a large enough wall-clock gap leaves `slot_last` short of
                 // `authenticated_now_slot` for THIS asset even though the call
                 // succeeded. Sticky across the whole loop (`|=`) -- one short asset is
@@ -31044,11 +30917,7 @@ pub mod processor {
                 bounded_market_catchup_only |=
                     asset_after.slot_last.get() < authenticated_now_slot;
 
-                observations.push(AutoCrankObservationV16 {
-                    asset_index: hint_asset_index,
-                    effective_price: crank_price,
-                    funding_rate_e9: computed_funding_rate_e9,
-                });
+                observations.push(observation);
             }
             if !oracle_tail.is_empty() {
                 return Err(PercolatorError::InvalidInstruction.into());
@@ -49065,7 +48934,9 @@ pub mod processor {
             / 10_000;
         // (1) Cap dead zone: a 0-tick step cannot move the price in EITHER direction, pinned or
         //     not (a certified book keeps re-anchoring at the same price there, which resets
-        //     the pin clock every epoch, so the pin cannot be required for this case).
+        //     the pin clock every epoch, so the pin cannot be required for this case). The
+        //     crank carries the sub-tick remainder there (`crank_accrue_asset_view`), so the
+        //     mark still creeps toward a target that holds still; exits stay open as before.
         // (2) Width floor (round-2 re-review tightening): the engine's pin clock must be running
         //     as well, i.e. the price sits at the edge of the last wide band with the target
         //     beyond it and the re-anchor refused. While a sub-threshold price can still move
@@ -49486,7 +49357,12 @@ pub mod processor {
         Ok(())
     }
 
-    fn hybrid_effective_price_for_crank_view(
+    /// The target one crank observation moves `asset_index` toward, and whether it is a fresh
+    /// external oracle read. Hybrid reads the oracle (or falls back to the EWMA mark once
+    /// soft-stale has matured), EWMA_MARK / AUTH_MARK use the pushed mark, any other profile
+    /// holds its committed price. The price is derived by the caller
+    /// (`crank_accrue_asset_view`).
+    fn hybrid_target_for_crank_view(
         cfg: &WrapperConfigV16,
         profile: &mut state::AssetOracleProfileV16,
         group: &state::MarketViewMutV16<'_>,
@@ -49494,7 +49370,7 @@ pub mod processor {
         now_slot: u64,
         now_unix_ts: i64,
         oracle_accounts: &[AccountInfo],
-    ) -> Result<u64, ProgramError> {
+    ) -> Result<(u64, bool), ProgramError> {
         if asset_index >= group.header.config.max_market_slots.get() as usize {
             return Err(PercolatorError::InvalidInstruction.into());
         }
@@ -49510,17 +49386,6 @@ pub mod processor {
             if target == 0 {
                 return Err(PercolatorError::OracleInvalid.into());
             }
-            let asset = group.markets[asset_index].engine.asset;
-            let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-            let price = oracle_v16::effective_price_from_target(
-                asset.effective_price.get(),
-                target,
-                group.header.config.max_price_move_bps_per_slot.get(),
-                asset_segment_dt_view(group, asset_index, now_slot)?,
-                exposed,
-            );
-            // v2.2 band: the staircase price, then the band (edge / duration pin).
-            let (price, _) = band_shape_price_view(group, asset_index, now_slot, price)?;
             profile.oracle_target_price_e6 = target;
             // FIX (ADOPT upstream 01ec6161, adapted): a crank that reads the
             // authenticated EWMA/auth-mark target directly (no external oracle
@@ -49534,7 +49399,7 @@ pub mod processor {
             // past trade.
             profile.effective_price_provenance =
                 constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
-            return Ok(price);
+            return Ok((target, false));
         }
         if !oracle_v16::profile_is_hybrid(profile) {
             let price = group.markets[asset_index]
@@ -49546,7 +49411,7 @@ pub mod processor {
                 return Err(PercolatorError::OracleInvalid.into());
             }
             profile.oracle_target_price_e6 = price;
-            return Ok(price);
+            return Ok((price, false));
         }
         if cfg.permissionless_resolve_stale_slots != 0
             && now_slot.saturating_sub(profile.last_good_oracle_slot)
@@ -49561,7 +49426,7 @@ pub mod processor {
             Err(ProgramError::NotEnoughAccountKeys)
         };
         // FIX (ADOPT upstream 01ec6161, adapted): remembered for the provenance
-        // reset below -- `read` is consumed by the `match` immediately after.
+        // reset in the caller -- `read` is consumed by the `match` immediately after.
         // Port of 257db166: a read that rule A replaces with the average (soft-stale, not
         // advanced) is the fallback, not a fresh read, and must not clear the trade taint.
         let mut fresh_oracle_read = read.is_ok();
@@ -49600,50 +49465,198 @@ pub mod processor {
         if target == 0 {
             return Err(PercolatorError::OracleInvalid.into());
         }
+        profile.oracle_target_price_e6 = target;
+        Ok((target, fresh_oracle_read))
+    }
+
+    /// One crank observation of `asset_index`: read the target, move the price toward it and
+    /// accrue the asset to `now_slot` (bounded per call). Shared by the permissionless crank
+    /// (the price path liquidation uses) and the ADL / settle-rent refresh.
+    ///
+    /// The single-segment price is `floor(P * cap * dt / 10_000)` toward the target, with no
+    /// carry. Once `P * cap * dt < 10_000` that is 0, so a low mark that was cranked every slot
+    /// never moved, whatever the target did. When the segment cannot move an asset that has open
+    /// interest and is off its target, the price is instead built the way upstream's crank
+    /// builds it: the canonical one-slot path (`canonical_accrual_path_for_target_view`), where
+    /// each step may move `floor((anchor * cap + carry) / 10_000)` and the sub-atom carry is
+    /// kept in the oracle profile across cranks. One path call commits at most
+    /// `V16_MAX_ACCRUAL_PATH_STEPS` slots. The same route stages a changed target while a path
+    /// walk has left the engine's cap anchor away from the mark (see `anchor_off_mark` below).
+    ///
+    /// Every other case keeps the single-segment accrual: it already moves the price there (or
+    /// the price is at its target, or the asset has no open interest and the cap does not bind).
+    ///
+    /// Returns the engine outcome and the observation for the engine's plan. When the asset
+    /// did not reach `now_slot` the caller must commit and stop.
+    #[inline(never)]
+    fn crank_accrue_asset_view(
+        cfg: &mut WrapperConfigV16,
+        profile: &mut state::AssetOracleProfileV16,
+        group: &mut state::MarketViewMutV16<'_>,
+        asset_index: usize,
+        now_slot: u64,
+        now_unix_ts: i64,
+        oracle_accounts: &[AccountInfo],
+    ) -> Result<(percolator::AccrueAssetOutcomeV16, AutoCrankObservationV16), ProgramError> {
+        let (target, fresh_oracle_read) = hybrid_target_for_crank_view(
+            cfg,
+            profile,
+            group,
+            asset_index,
+            now_slot,
+            now_unix_ts,
+            oracle_accounts,
+        )?;
         let asset = group.markets[asset_index].engine.asset;
+        let asset_slot = asset.slot_last.get();
+        let current = asset.effective_price.get();
         let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-        let price = oracle_v16::effective_price_from_target(
-            asset.effective_price.get(),
+        let cap_bps = group.header.config.max_price_move_bps_per_slot.get();
+        let segment_price = oracle_v16::effective_price_from_target(
+            current,
             target,
-            group.header.config.max_price_move_bps_per_slot.get(),
+            cap_bps,
             asset_segment_dt_view(group, asset_index, now_slot)?,
             exposed,
         );
-        // v2.2 band: the staircase price, then the band (edge / duration pin).
-        let (price, _) = band_shape_price_view(group, asset_index, now_slot, price)?;
-        profile.oracle_target_price_e6 = target;
-        // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward
-        // provenance", adapted): at the time this hunk was ported, our fork had no
-        // `canonical_accrual_path_for_target_view` (upstream's home for this
-        // hunk -- subsystem (2), then lacking entirely per
-        // ADOPT_HYBRID_REWARD_RECLAIM.md); `canonical_accrual_path_for_target_view`
-        // has since been ADOPTED (upstream `18f3ae94`/`2669bf1b`, W3C-accrual) for
-        // the SEPARATE zero-move-funding "before position change" hook below, but
-        // that instance owns only the stationary-interval case and is not wired
-        // into this ordinary crank-price path -- this remains the structurally
-        // equivalent, still-independent site here. Clear the trade-driven taint
-        // only once we
-        // took a genuinely FRESH oracle read (not the soft-stale EWMA fallback below)
-        // AND the engine's effective price has fully walked all the way to that fresh
-        // target -- a partial catch-up (clamped by `max_price_move_bps_per_slot`/
-        // `max_accrual_dt_slots`) must NOT re-enable the reward while the position that
-        // gets liquidated is still being evaluated against a price that has not fully
-        // caught up to the authenticated feed.
+        // The segment is stuck below one atom: take the carry path. (A zero cap means the
+        // price is held on purpose, and with no open interest the segment goes to the target.)
+        // A second crank in the same slot (dt = 0) is stuck too, on purpose: its empty path
+        // keeps the carry, where the single-segment branch would drop it.
+        let stuck = exposed && cap_bps != 0 && segment_price == current;
+        // A path walk leaves the engine's cap anchor (`fund_px_last`) at the price the walk
+        // started from. The single-segment branch stages a changed target through the engine
+        // setter, which keeps that anchor (INV-045); if the band then held the price in place,
+        // a later path step would run from the stale anchor. So while the anchor is off the
+        // mark a changed target is also staged by the path accrual, which restarts the anchor
+        // at the mark. Off the path the anchor always equals the mark and this is never taken.
+        let anchor_off_mark = asset.fund_px_last.get() != current
+            && asset.raw_oracle_target_price.get() != target;
+        let path = if target != current && (stuck || anchor_off_mark) {
+            Some(canonical_accrual_path_for_target_view(
+                profile,
+                group,
+                asset_index,
+                now_slot,
+                target,
+                asset_slot.saturating_add(1),
+            )?)
+        } else {
+            None
+        };
+        let price = match path.as_ref() {
+            Some(path) => path.last().map_or(current, |step| step.effective_price),
+            None => {
+                // v2.2 band: the staircase price, then the band (edge / duration pin).
+                let (price, _) = band_shape_price_view(group, asset_index, now_slot, segment_price)?;
+                if oracle_v16::profile_is_hybrid(profile)
+                    && !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
+                    && price != profile.mark_ewma_e6
+                {
+                    // FIX (ADOPT upstream 06192caa, adapted): same non-retroactive checkpoint
+                    // recording as the push-mark handlers and the trade-time mark update.
+                    record_funding_mark_transition_view(profile, asset_slot, price, now_slot)?;
+                    profile.mark_ewma_e6 = price;
+                    profile.mark_ewma_last_slot = now_slot;
+                }
+                // The segment keeps no sub-atom carry, and a carry left by an earlier path
+                // belongs to that path's trajectory: drop it, so a later path starts clean.
+                set_price_move_remainder_bps_num_view(profile, 0)?;
+                price
+            }
+        };
+        // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance",
+        // adapted): clear the trade-driven taint only after a genuinely FRESH oracle read (not
+        // the soft-stale EWMA fallback) AND once the price has walked all the way to that
+        // target. A partial catch-up must not re-enable the reward.
         if fresh_oracle_read && price == target {
             profile.effective_price_provenance =
                 constants::EFFECTIVE_PRICE_PROVENANCE_AUTHENTICATED;
         }
-        // FIX (ADOPT upstream 06192caa, adapted): route the Hybrid crank-price
-        // mark update through the same non-retroactive checkpoint recording as
-        // the push-mark handlers and the trade-time mark update below.
-        if !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
-            && price != profile.mark_ewma_e6
-        {
-            record_funding_mark_transition_view(profile, asset_slot, price, now_slot)?;
-            profile.mark_ewma_e6 = price;
-            profile.mark_ewma_last_slot = now_slot;
+        // #379/#501: the market-wide stale clock is the BASE asset's. This write is separate
+        // from the mirror below, which also requires `profile_is_price_managed`.
+        if asset_index == 0 {
+            cfg.last_good_oracle_slot =
+                core::cmp::max(cfg.last_good_oracle_slot, profile.last_good_oracle_slot);
         }
-        Ok(price)
+        if asset_index == 0 && oracle_v16::profile_is_price_managed(profile) {
+            cfg.oracle_mode = profile.oracle_mode;
+            cfg.oracle_leg_count = profile.oracle_leg_count;
+            cfg.oracle_leg_flags = profile.oracle_leg_flags;
+            cfg.invert = profile.invert;
+            cfg.unit_scale = profile.unit_scale;
+            cfg.conf_filter_bps = profile.conf_filter_bps;
+            cfg.max_staleness_secs = profile.max_staleness_secs;
+            cfg.hybrid_soft_stale_slots = profile.hybrid_soft_stale_slots;
+            cfg.mark_ewma_e6 = profile.mark_ewma_e6;
+            cfg.mark_ewma_last_slot = profile.mark_ewma_last_slot;
+            cfg.mark_ewma_halflife_slots = profile.mark_ewma_halflife_slots;
+            cfg.mark_min_fee = profile.mark_min_fee;
+            cfg.oracle_target_price_e6 = profile.oracle_target_price_e6;
+            cfg.oracle_target_publish_time = profile.oracle_target_publish_time;
+            cfg.oracle_leg_feeds = profile.oracle_leg_feeds;
+            cfg.oracle_leg_prices_e6 = profile.oracle_leg_prices_e6;
+            cfg.oracle_leg_publish_times = profile.oracle_leg_publish_times;
+        }
+        let Some(path) = path else {
+            let funding_rate_e9 =
+                permissionless_funding_rate_e9_view(profile, group, asset_index, now_slot, price)?;
+            group
+                .set_asset_raw_oracle_target_not_atomic(asset_index, target)
+                .map_err(map_v16_error)?;
+            write_oracle_profile_to_view(group, asset_index, profile)?;
+            // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move). The
+            // observation carries the same values, so the engine's own refresh / liquidation
+            // step certifies at exactly the committed P_last.
+            let (price, funding_rate_e9, rent_long, rent_short) =
+                band_rent_accrual_inputs_view(group, asset_index, now_slot, price, funding_rate_e9)?;
+            let accrual = group
+                .accrue_asset_to_with_rent_not_atomic(
+                    asset_index,
+                    now_slot,
+                    price,
+                    funding_rate_e9,
+                    rent_long,
+                    rent_short,
+                    true,
+                )
+                .map_err(map_v16_error)?;
+            return Ok((
+                accrual,
+                AutoCrankObservationV16 {
+                    asset_index,
+                    effective_price: price,
+                    funding_rate_e9,
+                },
+            ));
+        };
+        write_oracle_profile_to_view(group, asset_index, profile)?;
+        // The path accrual stages the raw target itself (and restarts the cap anchor when the
+        // target changed), so it is not staged separately here. The engine re-derives every
+        // step and applies rent to each step that is not duration-pinned.
+        let (rent_long, rent_short) = rent_rates_view(group, asset_index)?;
+        let accrual = group
+            .accrue_asset_path_with_rent_to_not_atomic(
+                asset_index,
+                now_slot,
+                target,
+                &path,
+                rent_long,
+                rent_short,
+                true,
+            )
+            .map_err(map_v16_error)?;
+        // The engine's plan accrues this asset again at `now_slot`, a zero-length segment that
+        // reads no funding rate (a caller stops before the plan when the path fell short of
+        // `now_slot`). A non-zero rate there would only trip the duration-pin check.
+        Ok((
+            accrual,
+            AutoCrankObservationV16 {
+                asset_index,
+                effective_price: price,
+                funding_rate_e9: 0,
+            },
+        ))
     }
 
     /// FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward

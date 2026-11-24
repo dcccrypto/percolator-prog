@@ -8108,7 +8108,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // `max_delta = INITIAL_PRICE * CAP_BPS * 50 / 10_000 = 125,000`, far more
     // than the ~100,000-atom distance to the pushed mark, so price fully
     // converges in this one call. Because the CHECKPOINT-advance inside
-    // `hybrid_effective_price_for_crank_view` uses the asset's PRE-crank
+    // `hybrid_target_for_crank_view` uses the asset's PRE-crank
     // `slot_last` (0), which is still `< PUSH_SLOT (51)`, the pending mark
     // does NOT promote during this crank -- `funding_mark_e6` stays at
     // INITIAL_PRICE even though `effective_price` has now moved to the new
@@ -8177,6 +8177,7 @@ ProgInstruction::PermissionlessCrank {
         INITIAL_PRICE,
         0,
     );
+    println!("v16 zero-move funding close trade CU: {close_cu}");
     assert_cu_within(
         "zero-move funding settled on close trade (no further crank)",
         close_cu,
@@ -30362,4 +30363,374 @@ fn v16_attack_soft_stale_hybrid_target_does_not_depend_on_the_writer() {
     let newer = env.set_pyth_price_with_conf(&feed, P1 as i64, -6, 0, 109);
     inv046_hybrid_crank(&mut env, portfolios[0], newer, 8);
     assert_eq!(env.market_state().1.assets[0].raw_oracle_target_price, P1);
+}
+
+// ── Low-price pin: a mark with price * cap below one atom, cranked every slot ──────────────
+//
+// At price 50 and a 100 bps cap one slot allows 50 * 100 / 10_000 = 0.5 atoms. The crank
+// priced with `clamp_toward_engine_dt` (floor(price * cap * dt / 10_000), no carry), so with
+// dt = 1 the step was always 0 and the mark never moved, whatever the target did. When that
+// segment cannot move the price the crank now builds the canonical one-slot path and carries
+// the sub-atom remainder in the oracle profile.
+
+const LOW_PIN_PRICE: u64 = 50;
+const LOW_PIN_CAP_BPS: u64 = 100;
+
+/// AUTH_MARK market at 50 with a 100 bps cap and one open long/short pair (the cap only binds
+/// while the asset has open interest). Returns the env, the long account to crank and the
+/// short account.
+fn low_pin_world() -> (V16CuEnv, Pubkey, Pubkey) {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: LOW_PIN_PRICE,
+        max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
+        max_accrual_dt_slots: 10,
+        min_funding_lifetime_slots: 10,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_auth_mark_with_cu(0, LOW_PIN_PRICE);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 10_000_000);
+    env.deposit(&short_owner, short_account, 10_000_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        LOW_PIN_PRICE,
+        0,
+    );
+    (env, long_account, short_account)
+}
+
+fn low_pin_crank(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> u64 {
+    env.svm.warp_to_slot(slot);
+    env.svm.expire_blockhash();
+    env.crank(
+        portfolio,
+        ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 0,
+            }],
+        },
+    )
+}
+
+fn low_pin_mark(env: &V16CuEnv) -> u64 {
+    env.market_state().1.assets[0].effective_price
+}
+
+/// Fixed target, one crank per slot. Half an atom per slot must add up to one atom every
+/// second slot (the cap anchor stays at 50 for the life of the target).
+#[test]
+fn v16_bpf_low_mark_fixed_target_moves_under_one_slot_cranks() {
+    let (mut env, account, _) = low_pin_world();
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    let mut max_cu = 0;
+    for slot in 1..=40 {
+        max_cu = max_cu.max(low_pin_crank(&mut env, account, slot));
+    }
+    println!("v16 low-mark crank, 1-slot gap max CU: {max_cu}");
+    assert_cu_within("low-mark crank, 1-slot gap", max_cu, CRANK_CU_LIMIT);
+    assert_eq!(
+        low_pin_mark(&env),
+        LOW_PIN_PRICE + 20,
+        "40 one-slot cranks at half an atom per slot must move the mark 20 atoms"
+    );
+}
+
+/// A second crank in the same slot (dt = 0) must keep the carry. It takes the path branch with
+/// an empty path; if it took the single-segment branch instead it would drop the carry, and
+/// anyone could hold a low mark in place by cranking twice per slot.
+#[test]
+fn v16_bpf_low_mark_same_slot_recrank_keeps_the_carry() {
+    let (mut env, long_account, short_account) = low_pin_world();
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    let carry = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .price_move_remainder_bps_num
+    };
+    let mut committed_recranks = 0;
+    for slot in 1..=40u64 {
+        low_pin_crank(&mut env, long_account, slot);
+        let (mark, kept) = (low_pin_mark(&env), carry(&env));
+        // Same slot, the other account: the asset has nothing left to accrue.
+        env.svm.expire_blockhash();
+        let recrank = env.send(
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            vec![
+                AccountMeta::new(env.payer.pubkey(), true),
+                AccountMeta::new(env.market, false),
+                AccountMeta::new(short_account, false),
+            ],
+            &[],
+        );
+        committed_recranks += u32::from(recrank.is_ok());
+        assert_eq!(low_pin_mark(&env), mark, "slot {slot}");
+        assert_eq!(carry(&env), kept, "slot {slot}: the re-crank dropped the carry");
+    }
+    assert!(committed_recranks > 0, "no same-slot crank committed");
+    assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE + 20);
+}
+
+/// INV-045 for the path branch: after a long walk on the carry path the engine's cap anchor
+/// (`fund_px_last`) is still the price the walk started at. A reversed target must restart it
+/// at the mark, so the mark then moves by the cap of the mark and no more. Three ways the new
+/// target can be staged: by the next slot's crank, by a second crank in the same slot (dt = 0),
+/// and by a crank after a gap long enough that the single segment could move the price.
+#[test]
+fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
+    const START: u64 = 90;
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Staging {
+        NextSlot,
+        SameSlot,
+        AfterGap,
+    }
+    for staging in [Staging::NextSlot, Staging::SameSlot, Staging::AfterGap] {
+        let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+            initial_price: START,
+            max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
+            max_accrual_dt_slots: 10,
+            min_funding_lifetime_slots: 10,
+            ..V16CuMarketParams::default()
+        });
+        env.svm.warp_to_slot(0);
+        env.configure_auth_mark_with_cu(0, START);
+        let long_owner = Keypair::new();
+        let short_owner = Keypair::new();
+        let long_account = env.create_portfolio(&long_owner);
+        let short_account = env.create_portfolio(&short_owner);
+        env.deposit(&long_owner, long_account, 10_000_000);
+        env.deposit(&short_owner, short_account, 10_000_000);
+        env.trade_with_cu(
+            &long_owner,
+            long_account,
+            &short_owner,
+            short_account,
+            POS_SCALE as i128,
+            START,
+            0,
+        );
+        // Walk down for 60 slots: 0.9 atoms a slot from the anchor at 90.
+        env.svm.warp_to_slot(1);
+        env.push_auth_mark_with_cu(1, 10);
+        for slot in 1..=60u64 {
+            low_pin_crank(&mut env, long_account, slot);
+        }
+        let walked = env.market_state().1.assets[0];
+        let mark = walked.effective_price;
+        assert_eq!(mark, START - 54, "60 slots at 0.9 atoms a slot");
+        assert_eq!(walked.fund_px_last, START, "the walk keeps its start anchor");
+        let cap_of_mark = |slots: u64| mark * LOW_PIN_CAP_BPS * slots / 10_000;
+
+        // Reverse the target. A kept anchor of 90 would allow 0.9 atoms a slot (one atom by
+        // the second slot); the cap of the mark is 0.36 (one atom only by the third).
+        if staging == Staging::SameSlot {
+            env.svm.expire_blockhash();
+            env.push_auth_mark_with_cu(60, 1_000);
+            // The asset is already at slot 60: this crank only stages the new target.
+            low_pin_crank(&mut env, short_account, 60);
+            let staged = env.market_state().1.assets[0];
+            assert_eq!(staged.raw_oracle_target_price, 1_000);
+            assert_eq!(staged.effective_price, mark);
+            assert_eq!(staged.fund_px_last, mark, "staging a new target restarts the anchor");
+        }
+        // Slots since the walk's last slot at which the mark is checked. After the gap the
+        // single segment could move 3 atoms (36 * 100 * 10 / 10_000); the changed target still
+        // goes through the path accrual because the anchor is off the mark.
+        let checks: [u64; 3] = if staging == Staging::AfterGap {
+            [10, 11, 12]
+        } else {
+            [1, 2, 3]
+        };
+        for (i, n) in checks.into_iter().enumerate() {
+            let slot = 60 + n;
+            if i == 0 && staging != Staging::SameSlot {
+                env.svm.warp_to_slot(slot);
+                env.push_auth_mark_with_cu(slot, 1_000);
+            }
+            low_pin_crank(&mut env, long_account, slot);
+            let asset = env.market_state().1.assets[0];
+            assert_eq!(asset.slot_last, slot, "{staging:?}");
+            assert_eq!(
+                asset.fund_px_last, mark,
+                "{staging:?}: the reversal restarts the anchor at the mark"
+            );
+            assert_eq!(
+                asset.effective_price - mark,
+                cap_of_mark(n),
+                "{staging:?}: {n} slot(s) after the reversal the mark has moved by the cap of \
+                 the mark at the reversal, no more"
+            );
+        }
+    }
+}
+
+/// The oracle keeps rising but reports a new price only every third slot. A new target
+/// restarts the carry, so the mark gains one atom per three slots instead of none.
+#[test]
+fn v16_bpf_low_mark_moves_while_the_target_changes_every_third_slot() {
+    let (mut env, account, _) = low_pin_world();
+    for slot in 1..=60u64 {
+        env.svm.warp_to_slot(slot);
+        if slot % 3 == 1 {
+            env.svm.expire_blockhash();
+            env.push_auth_mark_with_cu(slot, 2 * LOW_PIN_PRICE + slot);
+        }
+        low_pin_crank(&mut env, account, slot);
+    }
+    let mark = low_pin_mark(&env);
+    assert!(
+        mark >= LOW_PIN_PRICE + 20,
+        "mark {mark} stayed pinned while the target rose every third slot"
+    );
+}
+
+/// The oracle reports a new, higher price every slot. Still pinned on the engine this branch
+/// pins: it refuses a carried remainder after any target change. Needs engine #393 (keep the
+/// carry on a same-side target change) behind `ENGINE_CI_SIBLING`; see the tripwire below.
+#[test]
+#[ignore = "needs engine #393 behind ENGINE_CI_SIBLING (carry kept on a same-side target change)"]
+fn v16_bpf_low_mark_moves_while_the_target_changes_every_slot() {
+    let (mut env, account, _) = low_pin_world();
+    for slot in 1..=60u64 {
+        env.svm.warp_to_slot(slot);
+        env.svm.expire_blockhash();
+        env.push_auth_mark_with_cu(slot, 2 * LOW_PIN_PRICE + slot);
+        low_pin_crank(&mut env, account, slot);
+    }
+    let mark = low_pin_mark(&env);
+    assert!(
+        mark > LOW_PIN_PRICE,
+        "mark {mark} stayed pinned while the target rose every slot"
+    );
+}
+
+/// A 1 bps cap at price 50 allows 0.005 atoms per slot, so a crank every 32 slots is stuck too
+/// (floor(50 * 1 * 32 / 10_000) = 0). Each such crank commits the full 32-step path
+/// (`V16_MAX_ACCRUAL_PATH_STEPS`, the most one call does) and carries 1_600 forward; the 7th
+/// crank crosses one atom.
+#[test]
+fn v16_bpf_low_mark_carry_accumulates_across_32_slot_cranks() {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: LOW_PIN_PRICE,
+        max_price_move_bps_per_slot: 1,
+        max_accrual_dt_slots: 32,
+        min_funding_lifetime_slots: 32,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_auth_mark_with_cu(0, LOW_PIN_PRICE);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 10_000_000);
+    env.deposit(&short_owner, short_account, 10_000_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        LOW_PIN_PRICE,
+        0,
+    );
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    let mut max_cu = 0;
+    for n in 1..=7u64 {
+        let slot = 32 * n;
+        env.svm.warp_to_slot(slot);
+        env.svm.expire_blockhash();
+        // The same mark again: keeps the pushed mark fresh, the target does not change.
+        env.push_auth_mark_with_cu(slot, 2 * LOW_PIN_PRICE);
+        let cu = env.crank(
+            long_account,
+            ProgInstruction::PermissionlessCrank {
+                now_slot: slot,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+        );
+        max_cu = max_cu.max(cu);
+        let (_, group) = env.market_state();
+        assert_eq!(group.assets[0].slot_last, slot, "one crank covers a 32-slot gap");
+    }
+    println!("v16 low-mark crank, 32-slot gap (full path) max CU: {max_cu}");
+    assert_eq!(
+        low_pin_mark(&env),
+        LOW_PIN_PRICE + 1,
+        "224 slots at 0.005 atoms per slot cross one atom"
+    );
+    let carry = state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+        .unwrap()
+        .price_move_remainder_bps_num;
+    assert_eq!(carry, 1_200, "50 * 1 * 224 = 11_200: one atom moved, 1_200 carried");
+    assert_cu_within("low-mark crank, 32-slot gap", max_cu, CRANK_CU_LIMIT);
+}
+
+/// Engine pin tripwire for the test above. The engine at `ENGINE_CI_SIBLING` refuses a carried
+/// remainder on the first step after ANY target change, so the path builder restarts the carry
+/// there. Engine #393 (69abb997) keeps it when the new target is on the same side of the mark.
+/// When the pin moves to an engine with #393 this test fails. Then: make
+/// `canonical_accrual_path_for_target_view` and `reset_price_move_remainder_on_target_change_view`
+/// keep the carry on a same-side change, un-ignore
+/// `v16_bpf_low_mark_moves_while_the_target_changes_every_slot`, and turn this test around.
+#[test]
+fn v16_engine_pin_restarts_the_carry_on_a_same_side_target_change() {
+    let (mut env, account, _) = low_pin_world();
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    low_pin_crank(&mut env, account, 1);
+    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let carry = state::read_asset_oracle_profile(&data, 0)
+        .unwrap()
+        .price_move_remainder_bps_num;
+    assert_eq!(carry, 5_000, "one slot at 50 * 100 bps leaves half an atom");
+    assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE);
+    // Slot 2, target 100 -> 101 (still above the mark). Control: with the carry dropped the
+    // step is 50 * 100 / 10_000 = 0 atoms and the engine accepts it.
+    let mut control = data.clone();
+    let (_cfg, mut group) = state::market_view_mut(&mut control).unwrap();
+    let restarted = percolator::AccrualStepV16 {
+        effective_price: LOW_PIN_PRICE,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: 0,
+        price_move_remainder_after_bps_num: carry,
+    };
+    group
+        .accrue_asset_path_to_not_atomic(0, 2, 2 * LOW_PIN_PRICE + 1, &[restarted], true)
+        .expect("a restarted carry is accepted after a target change");
+    // With the carry kept the step is exactly one atom: (50 * 100 + 5_000) / 10_000.
+    let (_cfg, mut group) = state::market_view_mut(&mut data).unwrap();
+    let carried = percolator::AccrualStepV16 {
+        effective_price: LOW_PIN_PRICE + 1,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: carry,
+        price_move_remainder_after_bps_num: 0,
+    };
+    let res = group.accrue_asset_path_to_not_atomic(0, 2, 2 * LOW_PIN_PRICE + 1, &[carried], true);
+    assert!(
+        matches!(res, Err(percolator::V16Error::InvalidConfig)),
+        "the pinned engine now accepts a carry across a same-side target change: see the doc comment"
+    );
 }
