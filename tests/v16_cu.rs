@@ -30567,8 +30567,8 @@ fn v16_bpf_low_mark_reversal_restarts_the_cap_anchor() {
     }
 }
 
-/// The oracle keeps rising but reports a new price only every third slot. A new target
-/// restarts the carry, so the mark gains one atom per three slots instead of none.
+/// The oracle keeps rising but reports a new price only every third slot. A new target above
+/// the mark keeps the carry (engine #393), so the mark keeps moving between reports.
 #[test]
 fn v16_bpf_low_mark_moves_while_the_target_changes_every_third_slot() {
     let (mut env, account, _) = low_pin_world();
@@ -30587,24 +30587,115 @@ fn v16_bpf_low_mark_moves_while_the_target_changes_every_third_slot() {
     );
 }
 
-/// The oracle reports a new, higher price every slot. Still pinned on the engine this branch
-/// pins: it refuses a carried remainder after any target change. Needs engine #393 (keep the
-/// carry on a same-side target change) behind `ENGINE_CI_SIBLING`; see the tripwire below.
+/// The oracle reports a new, higher price every slot. Each change is on the same side of the
+/// mark, so the carry is kept (engine #393): each slot moves the cap of the mark plus the carry,
+/// and the cap anchor restarts at the mark every slot. 60 slots compound 50 to 90.
 #[test]
-#[ignore = "needs engine #393 behind ENGINE_CI_SIBLING (carry kept on a same-side target change)"]
 fn v16_bpf_low_mark_moves_while_the_target_changes_every_slot() {
     let (mut env, account, _) = low_pin_world();
+    let mut max_cu = 0;
     for slot in 1..=60u64 {
         env.svm.warp_to_slot(slot);
         env.svm.expire_blockhash();
         env.push_auth_mark_with_cu(slot, 2 * LOW_PIN_PRICE + slot);
-        low_pin_crank(&mut env, account, slot);
+        max_cu = max_cu.max(low_pin_crank(&mut env, account, slot));
     }
+    println!("v16 low-mark crank, target changes every slot, max CU: {max_cu}");
+    assert_cu_within("low-mark crank, target changes every slot", max_cu, CRANK_CU_LIMIT);
     let mark = low_pin_mark(&env);
-    assert!(
-        mark > LOW_PIN_PRICE,
-        "mark {mark} stayed pinned while the target rose every slot"
+    assert_eq!(
+        mark, 90,
+        "mark {mark}: the target rose every slot, the carry must survive each change"
     );
+}
+
+/// The other half of the carry rule: a target that flips to the other side of the mark
+/// restarts the carry in the path builder. `PushAuthMark` leaves the carry alone, so the builder
+/// alone decides. The engine refuses a carried first step on a reversal, so a builder that kept
+/// it would fail the crank; a restarted carry moves 0 atoms and leaves half an atom.
+#[test]
+fn v16_bpf_low_mark_reversal_restarts_the_carry() {
+    let (mut env, account, _) = low_pin_world();
+    env.svm.warp_to_slot(1);
+    env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    low_pin_crank(&mut env, account, 1);
+    let carry = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .price_move_remainder_bps_num
+    };
+    assert_eq!(carry(&env), 5_000, "one slot at 50 * 100 bps leaves half an atom");
+    // Target 100 -> 20: now below the mark.
+    env.svm.warp_to_slot(2);
+    env.svm.expire_blockhash();
+    env.push_auth_mark_with_cu(2, 20);
+    assert_eq!(carry(&env), 5_000, "setup: the push does not touch the carry");
+    low_pin_crank(&mut env, account, 2);
+    let asset = env.market_state().1.assets[0];
+    assert_eq!(asset.slot_last, 2);
+    assert_eq!(asset.raw_oracle_target_price, 20);
+    assert_eq!(asset.effective_price, LOW_PIN_PRICE, "a restarted carry moves 0 atoms");
+    assert_eq!(carry(&env), 5_000, "half an atom toward the new target");
+}
+
+/// `PushEwmaMark` drops the carry on a target change unless the new target is on the same side
+/// of the mark as the engine's stored target (the rule the engine and the path builder use).
+#[test]
+fn v16_bpf_low_mark_ewma_push_keeps_the_carry_on_a_same_side_target_change() {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: LOW_PIN_PRICE,
+        max_price_move_bps_per_slot: LOW_PIN_CAP_BPS,
+        max_accrual_dt_slots: 10,
+        min_funding_lifetime_slots: 10,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    // Half-life 1: a push one slot later moves the target halfway to the pushed price.
+    env.configure_ewma_mark_with_cu(0, LOW_PIN_PRICE, 1, 0);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 10_000_000);
+    env.deposit(&short_owner, short_account, 10_000_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        LOW_PIN_PRICE,
+        0,
+    );
+    let carry = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .price_move_remainder_bps_num
+    };
+    env.svm.warp_to_slot(1);
+    env.push_ewma_mark_with_cu(1, 2 * LOW_PIN_PRICE);
+    low_pin_crank(&mut env, long_account, 1);
+    let target = |env: &V16CuEnv| {
+        state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
+            .unwrap()
+            .oracle_target_price_e6
+    };
+    let stored = env.market_state().1.assets[0].raw_oracle_target_price;
+    assert_eq!(stored, 75, "setup: the EWMA moved halfway from 50 to 100");
+    assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE, "setup");
+    assert_eq!(carry(&env), 5_000, "setup: half an atom carried");
+    // Stored target 75, new target about 88: both above the mark. Kept.
+    env.svm.warp_to_slot(2);
+    env.svm.expire_blockhash();
+    env.push_ewma_mark_with_cu(2, 2 * LOW_PIN_PRICE + 1);
+    assert!(target(&env) > LOW_PIN_PRICE && target(&env) != stored, "setup");
+    assert_eq!(carry(&env), 5_000, "a same-side target change keeps the carry");
+    // Stored target still 75 (no crank since), new target below the mark. Dropped.
+    env.svm.warp_to_slot(3);
+    env.svm.expire_blockhash();
+    env.push_ewma_mark_with_cu(3, 1);
+    assert!(target(&env) < LOW_PIN_PRICE, "setup: {}", target(&env));
+    assert_eq!(carry(&env), 0, "a reversed target drops the carry");
 }
 
 /// A 1 bps cap at price 50 allows 0.005 atoms per slot, so a crank every 32 slots is stuck too
@@ -30673,29 +30764,54 @@ fn v16_bpf_low_mark_carry_accumulates_across_32_slot_cranks() {
     assert_cu_within("low-mark crank, 32-slot gap", max_cu, CRANK_CU_LIMIT);
 }
 
-/// Engine pin tripwire for the test above. The engine at `ENGINE_CI_SIBLING` refuses a carried
-/// remainder on the first step after ANY target change, so the path builder restarts the carry
-/// there. Engine #393 (69abb997) keeps it when the new target is on the same side of the mark.
-/// When the pin moves to an engine with #393 this test fails. Then: make
-/// `canonical_accrual_path_for_target_view` and `reset_price_move_remainder_on_target_change_view`
-/// keep the carry on a same-side change, un-ignore
-/// `v16_bpf_low_mark_moves_while_the_target_changes_every_slot`, and turn this test around.
+/// Engine pin check for the carry rule the path builder follows. The engine at
+/// `ENGINE_CI_SIBLING` (with engine #393, 69abb997) keeps the carry on the first step after a
+/// target change to the same side of the mark, and still refuses it after a reversal. If a pin
+/// move flips either answer, `canonical_accrual_path_for_target_view` and
+/// `reset_price_move_remainder_on_target_change_view` (`target_change_keeps_price_move_carry`)
+/// must follow.
 #[test]
-fn v16_engine_pin_restarts_the_carry_on_a_same_side_target_change() {
+fn v16_engine_pin_keeps_the_carry_on_a_same_side_target_change() {
     let (mut env, account, _) = low_pin_world();
     env.svm.warp_to_slot(1);
     env.push_auth_mark_with_cu(1, 2 * LOW_PIN_PRICE);
     low_pin_crank(&mut env, account, 1);
-    let mut data = env.svm.get_account(&env.market).unwrap().data;
+    let data = env.svm.get_account(&env.market).unwrap().data;
     let carry = state::read_asset_oracle_profile(&data, 0)
         .unwrap()
         .price_move_remainder_bps_num;
     assert_eq!(carry, 5_000, "one slot at 50 * 100 bps leaves half an atom");
     assert_eq!(low_pin_mark(&env), LOW_PIN_PRICE);
-    // Slot 2, target 100 -> 101 (still above the mark). Control: with the carry dropped the
-    // step is 50 * 100 / 10_000 = 0 atoms and the engine accepts it.
-    let mut control = data.clone();
-    let (_cfg, mut group) = state::market_view_mut(&mut control).unwrap();
+    // Slot 2, target 100 -> 101 (still above the mark). With the carry kept the step is
+    // exactly one atom: (50 * 100 + 5_000) / 10_000.
+    let mut same_side = data.clone();
+    let (_cfg, mut group) = state::market_view_mut(&mut same_side).unwrap();
+    let carried_up = percolator::AccrualStepV16 {
+        effective_price: LOW_PIN_PRICE + 1,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: carry,
+        price_move_remainder_after_bps_num: 0,
+    };
+    group
+        .accrue_asset_path_to_not_atomic(0, 2, 2 * LOW_PIN_PRICE + 1, &[carried_up], true)
+        .expect("the pinned engine keeps the carry across a same-side target change");
+    // Slot 2, target 100 -> 20 (now below the mark): a carried step is refused, a restarted
+    // one (0 atoms, half an atom left) is accepted.
+    let mut reversal = data.clone();
+    let (_cfg, mut group) = state::market_view_mut(&mut reversal).unwrap();
+    let carried_down = percolator::AccrualStepV16 {
+        effective_price: LOW_PIN_PRICE - 1,
+        funding_rate_e9: 0,
+        price_move_remainder_before_bps_num: carry,
+        price_move_remainder_after_bps_num: 0,
+    };
+    let res = group.accrue_asset_path_to_not_atomic(0, 2, 20, &[carried_down], true);
+    assert!(
+        matches!(res, Err(percolator::V16Error::InvalidConfig)),
+        "the pinned engine must refuse a carry across a reversal: {res:?}"
+    );
+    let mut reversal = data.clone();
+    let (_cfg, mut group) = state::market_view_mut(&mut reversal).unwrap();
     let restarted = percolator::AccrualStepV16 {
         effective_price: LOW_PIN_PRICE,
         funding_rate_e9: 0,
@@ -30703,19 +30819,6 @@ fn v16_engine_pin_restarts_the_carry_on_a_same_side_target_change() {
         price_move_remainder_after_bps_num: carry,
     };
     group
-        .accrue_asset_path_to_not_atomic(0, 2, 2 * LOW_PIN_PRICE + 1, &[restarted], true)
-        .expect("a restarted carry is accepted after a target change");
-    // With the carry kept the step is exactly one atom: (50 * 100 + 5_000) / 10_000.
-    let (_cfg, mut group) = state::market_view_mut(&mut data).unwrap();
-    let carried = percolator::AccrualStepV16 {
-        effective_price: LOW_PIN_PRICE + 1,
-        funding_rate_e9: 0,
-        price_move_remainder_before_bps_num: carry,
-        price_move_remainder_after_bps_num: 0,
-    };
-    let res = group.accrue_asset_path_to_not_atomic(0, 2, 2 * LOW_PIN_PRICE + 1, &[carried], true);
-    assert!(
-        matches!(res, Err(percolator::V16Error::InvalidConfig)),
-        "the pinned engine now accepts a carry across a same-side target change: see the doc comment"
-    );
+        .accrue_asset_path_to_not_atomic(0, 2, 20, &[restarted], true)
+        .expect("a restarted carry is accepted after a reversal");
 }
