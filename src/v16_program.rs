@@ -31035,21 +31035,24 @@ pub mod processor {
             let had_open_legs = !percolator::active_bitmap_is_empty(
                 portfolio.header.active_bitmap.map(percolator::V16PodU64::get),
             );
-            match collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)
-            {
-                Ok(_) => {}
-                Err(e) if e == ProgramError::from(PercolatorError::EngineBStale) => {}
-                Err(e) => return Err(e),
-            }
+            let fee_collection_completed =
+                match collect_maintenance_fee_before_value_debit_view(&cfg, &mut group, &mut portfolio)
+                {
+                    Ok(_) => true,
+                    Err(e) if e == ProgramError::from(PercolatorError::EngineBStale) => false,
+                    Err(e) => return Err(e),
+                };
             // PORT upstream 81a8a8ec (INV-077): a collection that advanced the fee cursor is
             // progress of its own. A fee sync with nothing to settle keeps a current certificate
             // (engine #405 / upstream 9cb7d67f, 06b7e5be), so the engine may then find nothing
             // else to do; the collection still stands, as it did when the sync voided the
             // certificate and the engine refreshed it. Upstream collects here only for an account
             // with open legs; this fork collects unconditionally, so a flat account's cursor move
-            // is not counted (its crank keeps the old refusal when nothing else happened).
-            let maintenance_collected =
-                had_open_legs && portfolio.header.last_fee_slot.get() != fee_cursor_before;
+            // is not counted (its crank keeps the old refusal when nothing else happened). A
+            // collection cut short by EngineBStale is not counted either.
+            let maintenance_collected = fee_collection_completed
+                && had_open_legs
+                && portfolio.header.last_fee_slot.get() != fee_cursor_before;
 
             // P3 senior draw (loss rule 2026-09-30): when THIS crank targets the bound vault LP and
             // the (already accrued) engine state makes it liquidatable, refresh it and draw its
@@ -31147,6 +31150,17 @@ pub mod processor {
                 }
                 _ => None,
             };
+            // Upstream 81a8a8ec keeps a NonProgress state only when the engine took no fee and
+            // moved no position before giving up. Applied here to the case this port adds (a
+            // crank whose only prior work is the collection); the accrual case is unchanged.
+            let fee_only_legs_before = if maintenance_collected && !market_accrual_performed {
+                Some(match &liq_legs_before {
+                    Some(legs) => legs.clone(),
+                    None => snapshot_effective_legs_view(&group, &portfolio),
+                })
+            } else {
+                None
+            };
             let crank_work = AutoCrankWorkV16 {
                 now_slot: authenticated_now_slot,
                 observations: observations.as_slice(),
@@ -31182,7 +31196,16 @@ pub mod processor {
                     }
                 }
                 Ok(result) => Some(result),
-                Err(V16Error::NonProgress) if market_accrual_performed || maintenance_collected => None,
+                Err(V16Error::NonProgress) if market_accrual_performed => None,
+                Err(V16Error::NonProgress)
+                    if maintenance_collected
+                        && group.header.insurance.get() == insurance_before
+                        && fee_only_legs_before.as_ref().map_or(false, |legs| {
+                            *legs == snapshot_effective_legs_view(&group, &portfolio)
+                        }) =>
+                {
+                    None
+                }
                 Err(V16Error::NonProgress) => {
                     log_portfolio_lagging_assets(&group, &portfolio, authenticated_now_slot);
                     return Err(PercolatorError::EngineNonProgress.into());

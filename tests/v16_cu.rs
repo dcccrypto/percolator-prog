@@ -9026,7 +9026,6 @@ fn v16_program_crank_whose_only_work_is_a_due_fee_collects_it() {
         0,
     );
     let target = portfolios[0];
-    let before = env.portfolio_state(target);
     // Only the empty keeper observes time: the market reaches COLLECT_SLOT, so a crank on a trader
     // at that slot has no accrual of its own to do.
     for slot in START_SLOT + 1..=COLLECT_SLOT {
@@ -9049,14 +9048,13 @@ fn v16_program_crank_whose_only_work_is_a_due_fee_collects_it() {
     assert_eq!(account.capital, capital_before - fee);
     assert_eq!(group.insurance, insurance_before + fee);
     assert!(account.health_cert.valid, "the healthy account keeps (or is re-issued) its certificate");
-    assert!(before.capital >= capital_before);
 
     let err = j81a_crank(&mut env, target, COLLECT_SLOT)
         .expect_err("with the fee collected, the crank has nothing left and is refused");
     let after = env.portfolio_state(target);
     assert_eq!(after.capital, account.capital, "the refused crank rolls back exactly");
     assert_eq!(after.last_fee_slot, account.last_fee_slot);
-    assert!(!err.is_empty());
+    assert!(err.contains("Custom(22)"), "refused with EngineNonProgress, got {err}");
 }
 
 // ── w1-aa84b45dd-v2: ADOPT upstream a84b45dd "collect maintenance before value debits", FOLDED
