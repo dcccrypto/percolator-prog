@@ -30269,3 +30269,136 @@ fn unsigned_reserve_payout_is_primary_mint_only() {
         assert_eq!(env.token_amount(junk_dest), 1_000_000, "signed beneficiary took secondary by choice");
     }
 }
+
+// ADOPT upstream 257db166 (INV-046 second read, finding 1; the owner's rule A of 2026-11-23): a
+// hybrid asset past its soft-stale window whose feed has not advanced, but whose last reading is
+// still within `max_staleness_secs`. The staged target must not depend on who writes: a crank
+// that carries the oracle account, or a trade. Otherwise a permissionless caller picks the target,
+// each pick moves the target-lag penalty from one side to the other, and a crank in the same
+// transaction liquidates the side it chose. Past the window the trade average owns the target
+// until the feed publishes a newer reading.
+// On our fork a trade never stages the engine target, so upstream's crank/trade flip did not
+// reproduce; before the port the crank kept re-staging the already-observed feed reading
+// (1,100,000) while the trade-time accrual (`stored_mark_target_for_zero_move_accrual_view`)
+// priced at the average (~1,010,098). This test fails there on the rule-A assertion.
+fn inv046_hybrid_crank(env: &mut V16CuEnv, portfolio: Pubkey, oracle: Pubkey, slot: u64) {
+    env.svm.expire_blockhash();
+    let accounts = vec![
+        AccountMeta::new(env.payer.pubkey(), true),
+        AccountMeta::new(env.market, false),
+        AccountMeta::new(portfolio, false),
+        AccountMeta::new_readonly(oracle, false),
+    ];
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![CrankObservationHint {
+                asset_index: 0,
+                oracle_accounts: 1,
+            }],
+        },
+        accounts,
+        &[],
+    )
+    .expect("hybrid crank");
+}
+
+#[test]
+fn v16_attack_soft_stale_hybrid_target_does_not_depend_on_the_writer() {
+    const P0: u64 = 1_000_000;
+    const P1: u64 = 1_100_000;
+    const SOFT_STALE_SLOTS: u64 = 3;
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: P0,
+        max_abs_funding_e9_per_slot: 0,
+        ..production_risk_params()
+    });
+    set_test_clock(&mut env, 1, 100);
+    let feed = [0x46; 32];
+    let initial = env.set_pyth_price_with_conf(&feed, P0 as i64, -6, 0, 100);
+    env.try_configure_hybrid_asset_with_conf_filter_cu(
+        0,
+        1,
+        0,
+        [feed, [0; 32], [0; 32]],
+        &[initial],
+        1,
+        100,
+        0,
+        0,
+        SOFT_STALE_SLOTS,
+        0,
+    )
+    .expect("configure the hybrid asset");
+    let owners: [Keypair; 2] = std::array::from_fn(|_| Keypair::new());
+    let portfolios = owners.each_ref().map(|owner| env.create_portfolio(owner));
+    for i in 0..2 {
+        env.deposit(&owners[i], portfolios[i], 1_000_000_000);
+    }
+    env.try_trade_asset_with_cu(
+        0,
+        &owners[0],
+        portfolios[0],
+        &owners[1],
+        portfolios[1],
+        (10 * POS_SCALE) as i128,
+        P0,
+        0,
+    )
+    .expect("open an exposed pair");
+
+    // The feed's last fresh reading: P1, published at unix 101, applied by a crank at slot 2.
+    set_test_clock(&mut env, 2, 101);
+    let oracle = env.set_pyth_price_with_conf(&feed, P1 as i64, -6, 0, 101);
+    inv046_hybrid_crank(&mut env, portfolios[0], oracle, 2);
+    assert_eq!(env.market_state().1.assets[0].raw_oracle_target_price, P1);
+
+    // Past the soft-stale window in slots, the reading still within `max_staleness_secs` in time
+    // and not advanced: every writer must stage the same target.
+    let mut targets = Vec::new();
+    let record = |env: &V16CuEnv, writer: &'static str, targets: &mut Vec<_>| {
+        let (cfg, group) = env.market_state();
+        targets.push((
+            writer,
+            group.assets[0].raw_oracle_target_price,
+            cfg.mark_ewma_e6,
+            group.oracle_epoch,
+        ));
+    };
+    set_test_clock(&mut env, 6, 107);
+    inv046_hybrid_crank(&mut env, portfolios[0], oracle, 6);
+    record(&env, "crank with the feed", &mut targets);
+    // A one-unit reduction of both exposed accounts, in the same slot.
+    let mark = env.market_state().1.assets[0].effective_price;
+    env.try_trade_asset_with_cu(
+        0,
+        &owners[1],
+        portfolios[1],
+        &owners[0],
+        portfolios[0],
+        POS_SCALE as i128,
+        mark,
+        0,
+    )
+    .expect("a one-unit reducing trade");
+    record(&env, "reducing trade", &mut targets);
+    set_test_clock(&mut env, 7, 108);
+    inv046_hybrid_crank(&mut env, portfolios[0], oracle, 7);
+    record(&env, "crank with the feed", &mut targets);
+    assert!(
+        targets.windows(2).all(|pair| pair[0].1 == pair[1].1),
+        "the staged target flips with the writer (writer, target, average, oracle epoch): {targets:?}"
+    );
+    assert!(
+        targets
+            .iter()
+            .all(|(_, target, average, _)| target == average),
+        "past the soft-stale window the target is the trade average: {targets:?}"
+    );
+
+    // A newer reading restores the feed price and restarts the window.
+    set_test_clock(&mut env, 8, 109);
+    let newer = env.set_pyth_price_with_conf(&feed, P1 as i64, -6, 0, 109);
+    inv046_hybrid_crank(&mut env, portfolios[0], newer, 8);
+    assert_eq!(env.market_state().1.assets[0].raw_oracle_target_price, P1);
+}
