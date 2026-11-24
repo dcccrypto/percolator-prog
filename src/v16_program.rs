@@ -6513,6 +6513,19 @@ pub mod state {
         bound_market_id == expected_market_id
     }
 
+    /// The lifecycle byte of one asset, read from the market account's bytes (port of upstream
+    /// 257db166, INV-046 second read: the CPI trade routes' staleness gate needs it before the view
+    /// is built).
+    pub fn read_asset_lifecycle(data: &[u8], asset_index: usize) -> Result<u8, ProgramError> {
+        check_header(data, KIND_MARKET)?;
+        validate_market_dynamic_len(data)?;
+        let header = market_header(data)?;
+        if asset_index >= header.config.max_market_slots.get() as usize {
+            return Err(PercolatorError::InvalidInstruction.into());
+        }
+        Ok(asset_slot_wire(data, asset_index)?.asset.lifecycle)
+    }
+
     /// Preflight generation read for `UpdateAssetLifecycle`: an activation binds
     /// against the market's `next_market_id` frontier (the generation about to be
     /// assigned), any other action binds against the slot's current `market_id`.
@@ -14477,6 +14490,52 @@ pub mod processor {
         Ok(())
     }
 
+    /// ADOPT upstream 257db166 (INV-046 second read, finding 4; the owner's decision of
+    /// 2026-11-23): the staleness gate of a trade route. A Recovery asset trades only reductions
+    /// (the engine refuses any risk increase off an Active asset), at the price shutdown froze
+    /// (`trade_updates_mark_view`), so its own oracle's staleness cannot move the trade's price
+    /// and does not refuse it: shutdown freezes its `last_good_oracle_slot`, and without this a
+    /// reduction was refused (`OracleStale`) from shutdown + `permissionless_resolve_stale_slots`
+    /// until the force close. Market-wide staleness still refuses every trade.
+    fn trade_resolve_matured_at_slot(
+        cfg: &WrapperConfigV16,
+        profile: &state::AssetOracleProfileV16,
+        asset_lifecycle: u8,
+        now_slot: u64,
+    ) -> bool {
+        if asset_lifecycle == ASSET_LIFECYCLE_RECOVERY {
+            oracle_v16::permissionless_stale_matured(cfg, now_slot)
+        } else {
+            global_or_profile_resolve_matured_at_slot(cfg, profile, now_slot)
+        }
+    }
+
+    fn reject_trade_resolve_matured_live_view(
+        cfg: &WrapperConfigV16,
+        profile: &state::AssetOracleProfileV16,
+        group: &state::MarketViewMutV16<'_>,
+        asset_index: usize,
+    ) -> ProgramResult {
+        let lifecycle = group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine
+            .asset
+            .lifecycle;
+        if group.header.mode == 0
+            && trade_resolve_matured_at_slot(
+                cfg,
+                profile,
+                lifecycle,
+                authenticated_market_slot_or_fallback_view(group),
+            )
+        {
+            return Err(PercolatorError::OracleStale.into());
+        }
+        Ok(())
+    }
+
     fn shutdown_asset_matured_at_slot_view(
         cfg: &WrapperConfigV16,
         group: &state::MarketViewMutV16<'_>,
@@ -18131,10 +18190,11 @@ pub mod processor {
             require_asset_generation_view(&group, asset_index as usize, expected_market_id)?;
             let mut oracle_profile =
                 read_oracle_profile_from_view(&group, &cfg, asset_index as usize)?;
-            reject_permissionless_resolve_matured_live_for_profile_view(
+            reject_trade_resolve_matured_live_view(
                 &cfg,
                 &oracle_profile,
                 &group,
+                asset_index as usize,
             )?;
             let mut account_a_data = account_a_ai.try_borrow_mut_data()?;
             let mut account_b_data = account_b_ai.try_borrow_mut_data()?;
@@ -18802,11 +18862,7 @@ pub mod processor {
                 }
                 require_asset_generation_view(&group, asset_index, leg.market_id)?;
                 let mut oracle_profile = read_oracle_profile_from_view(&group, &cfg, asset_index)?;
-                reject_permissionless_resolve_matured_live_for_profile_view(
-                    &cfg,
-                    &oracle_profile,
-                    &group,
-                )?;
+                reject_trade_resolve_matured_live_view(&cfg, &oracle_profile, &group, asset_index)?;
                 if leg.size_q == i128::MIN || leg.size_q == 0 {
                     return Err(PercolatorError::InvalidInstruction.into());
                 }
@@ -20068,14 +20124,17 @@ pub mod processor {
         if mode_pre != MarketModeV16::Live {
             return Err(PercolatorError::EngineLockActive.into());
         }
-        let oracle_profile_pre = read_oracle_profile_for_asset(
-            &market_ai.try_borrow_data()?,
-            &cfg_pre,
-            asset_index as usize,
-        )?;
-        let stale_matured = global_or_profile_resolve_matured_at_slot(
+        let (oracle_profile_pre, lifecycle_pre) = {
+            let market_data = market_ai.try_borrow_data()?;
+            (
+                read_oracle_profile_for_asset(&market_data, &cfg_pre, asset_index as usize)?,
+                state::read_asset_lifecycle(&market_data, asset_index as usize)?,
+            )
+        };
+        let stale_matured = trade_resolve_matured_at_slot(
             &cfg_pre,
             &oracle_profile_pre,
+            lifecycle_pre,
             authenticated_slot_or_fallback(current_slot_pre),
         );
         if stale_matured {
@@ -21267,9 +21326,10 @@ pub mod processor {
             for &asset_index in &asset_indices {
                 let oracle_profile_pre =
                     read_oracle_profile_for_asset(&market_data, &cfg_pre, asset_index as usize)?;
-                if global_or_profile_resolve_matured_at_slot(
+                if trade_resolve_matured_at_slot(
                     &cfg_pre,
                     &oracle_profile_pre,
+                    state::read_asset_lifecycle(&market_data, asset_index as usize)?,
                     authenticated_slot,
                 ) {
                     stale_matured = true;
@@ -33038,7 +33098,7 @@ pub mod processor {
     ///
     /// AUDIT MIRROR: the backing decrement sequence mirrors handle_withdraw_backing_bucket.
     /// The RESYNC 5ebd136 dual-withdraw gate is preserved: source watermark is
-    /// checked post-decrement; EngineLockActive if credit_rate_num < CREDIT_RATE_SCALE.
+    /// checked post-decrement; EngineLockActive if available backing < positive_claim_bound.
     #[inline(never)]
     /// LP Vault — RebalanceLpVaultBacking (tag 91).
     ///
@@ -33284,7 +33344,7 @@ pub mod processor {
             }
             source.credit_rate_num =
                 expected_source_credit_rate_num(source).map_err(map_v16_error)?;
-            if source.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source).map_err(map_v16_error)? {
                 return Err(PercolatorError::EngineLockActive.into());
             }
             source.credit_epoch = source
@@ -34265,7 +34325,7 @@ pub mod processor {
                 .ok_or(PercolatorError::EngineCounterUnderflow)?;
             source_after.credit_rate_num =
                 expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-            if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+            if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
                 return Err(PercolatorError::EarnExitWouldUnderBackClaims.into());
             }
             source = source_after;
@@ -35945,7 +36005,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source_after.credit_epoch = source_after
@@ -42308,7 +42368,7 @@ pub mod processor {
         source_after.fresh_reserved_backing_num -= backing_num;
         source_after.credit_rate_num =
             expected_source_credit_rate_num(source_after).map_err(map_v16_error)?;
-        if source_after.credit_rate_num != percolator::CREDIT_RATE_SCALE {
+        if !source_backing_covers_claim_bound(source_after).map_err(map_v16_error)? {
             return Err(PercolatorError::EngineLockActive.into());
         }
         source = source_after;
@@ -44230,6 +44290,15 @@ pub mod processor {
             .checked_sub(state.valid_liened_backing_num)
             .and_then(|v| v.checked_add(state.insurance_credit_reserved_num - insurance_encumbered))
             .ok_or(V16Error::ArithmeticOverflow)
+    }
+
+    /// Provider exit gate for the backing-withdraw paths (port of upstream 596b3d98, #250):
+    /// the unliened backing left behind must cover the whole claim bound, lien-covered face
+    /// included. On the pinned engine's rate this is exactly "the rate stays full". Once the
+    /// rate becomes lien-aware it is full as soon as total backing covers the claims, so the
+    /// gate states its watermark directly instead of going through the rate.
+    fn source_backing_covers_claim_bound(state: SourceCreditStateV16) -> Result<bool, V16Error> {
+        Ok(source_credit_available_backing_num(state)? >= state.positive_claim_bound_num)
     }
 
     fn expected_source_credit_rate_num(state: SourceCreditStateV16) -> Result<u128, V16Error> {
@@ -49292,16 +49361,31 @@ pub mod processor {
         } else {
             Err(ProgramError::NotEnoughAccountKeys)
         };
-        // `read` is consumed by the `match` below; remembered for the provenance reset.
-        let fresh_oracle_read = read.is_ok();
+        // FIX (ADOPT upstream 01ec6161, adapted): remembered for the provenance
+        // reset in the caller -- `read` is consumed by the `match` immediately after.
+        // Port of 257db166: a read that rule A replaces with the average (soft-stale, not
+        // advanced) is the fallback, not a fresh read, and must not clear the trade taint.
+        let mut fresh_oracle_read = read.is_ok();
         let target = match read {
             Ok((price, publish_time, advanced)) => {
-                profile.oracle_target_price_e6 = price;
-                profile.oracle_target_publish_time = publish_time;
                 if advanced {
                     profile.last_good_oracle_slot = now_slot;
                 }
-                price
+                // ADOPT upstream 257db166 (INV-046 second read, finding 1; the owner's rule A of
+                // 2026-11-23): past the soft-stale window the trade average owns a hybrid's
+                // target until the feed publishes a newer reading. A reading already observed
+                // (`!advanced`) is then not staged again: the crank stages the average, as the
+                // trade-time accrual does (`stored_mark_target_for_zero_move_accrual_view`), so
+                // the target does not depend on which writer acts last. A newer reading restarts
+                // the window.
+                if oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot) {
+                    fresh_oracle_read = false;
+                    profile.mark_ewma_e6
+                } else {
+                    profile.oracle_target_price_e6 = price;
+                    profile.oracle_target_publish_time = publish_time;
+                    price
+                }
             }
             Err(e)
                 if e == ProgramError::from(PercolatorError::OracleStale)
@@ -50964,6 +51048,68 @@ pub mod processor {
         use super::*;
         use alloc::vec;
         use percolator::HealthCertV16;
+
+        fn gate_state(bound: u128, fresh: u128, lien: u128) -> SourceCreditStateV16 {
+            SourceCreditStateV16 {
+                positive_claim_bound_num: bound,
+                exact_positive_claim_num: bound,
+                fresh_reserved_backing_num: fresh,
+                valid_liened_backing_num: lien,
+                ..SourceCreditStateV16::EMPTY
+            }
+        }
+
+        /// Port of upstream 596b3d98 (#250): the provider withdraw gate keeps the
+        /// `available >= positive_claim_bound` watermark beside a lien. Upstream's numbers:
+        /// 300 of backing, 200 of claims, 75 liened. 25 may leave, 26 may not; the other 75
+        /// only after the lien is released.
+        #[test]
+        fn withdraw_gate_watermark_beside_a_lien() {
+            let after = |fresh: u128, lien: u128, x: u128| {
+                source_backing_covers_claim_bound(gate_state(200, fresh - x, lien)).unwrap()
+            };
+            assert!(after(300, 75, 25));
+            assert!(!after(300, 75, 26));
+            assert!(!after(300, 75, 100));
+            // Lien released: its 75 is unliened again.
+            assert!(after(275, 0, 75));
+            assert!(!after(275, 0, 76));
+            // No claims: any unliened backing may leave.
+            assert!(source_backing_covers_claim_bound(gate_state(0, 0, 0)).unwrap());
+        }
+
+        /// On the pinned engine's rate the new gate is exactly the old "rate stays full"
+        /// check, errors included, so the four withdraw handlers behave the same.
+        #[test]
+        fn withdraw_gate_matches_full_rate_on_pinned_formula() {
+            let vals = [0u128, 1, 2, 3, 74, 75, 76, 199, 200, 201, 225, 300, u64::MAX as u128];
+            let mut n = 0u32;
+            for &bound in &vals {
+                for &fresh in &vals {
+                    for &lien in &vals {
+                        for &(ins, ins_lien) in &[(0u128, 0u128), (50, 0), (50, 20), (10, 30)] {
+                            let mut s = gate_state(bound, fresh, lien);
+                            s.insurance_credit_reserved_num = ins;
+                            s.valid_liened_insurance_num = ins_lien;
+                            let rate = expected_source_credit_rate_num(s);
+                            let gate = source_backing_covers_claim_bound(s);
+                            match rate {
+                                Ok(r) => {
+                                    assert_eq!(
+                                        gate.unwrap(),
+                                        r == percolator::CREDIT_RATE_SCALE,
+                                        "{s:?}"
+                                    );
+                                    n += 1;
+                                }
+                                Err(_) => assert!(gate.is_err(), "{s:?}"),
+                            }
+                        }
+                    }
+                }
+            }
+            assert!(n > 1000);
+        }
 
         /// v2.2 item 4: the stake pin per build flavour. Default (no pin): nothing is ever bound
         /// to a stake pool and `STAKE_PINNED` is false (tags 87 / 116 fail closed). `devnet` and

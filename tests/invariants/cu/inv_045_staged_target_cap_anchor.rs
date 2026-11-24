@@ -10,7 +10,7 @@
 //! anchor / mark times the per-slot cap in one slot.
 //!
 //! This fork's crank does not take that route. For an auth-mark or EWMA-mark asset,
-//! `hybrid_effective_price_for_crank_view` caps each step from the asset's *current* effective
+//! the crank (`crank_accrue_asset_view`) caps each step from the asset's *current* effective
 //! price (`oracle_v16::effective_price_from_target`). It then commits the step through the
 //! single-segment accrual, which sets `fund_px_last` to the new mark on every priced step. The
 //! anchor therefore follows the mark through the walk; upstream asserts it stays at the walk's
