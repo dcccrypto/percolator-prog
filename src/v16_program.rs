@@ -30818,8 +30818,8 @@ pub mod processor {
             // `aeyakovenko/percolator-prog` src/v16_program.rs, handler
             // `handle_permissionless_crank_zero_copy`, lines ~13925/14096/14141 at
             // upstream/main commit a657d195): tracks whether pass-1's own accrual
-            // (capped at `config.max_accrual_dt_slots`, and at
-            // `V16_MAX_ACCRUAL_PATH_STEPS` when it takes the carry path) fully caught any
+            // (capped at `min(config.max_accrual_dt_slots, V16_MAX_ACCRUAL_PATH_STEPS)`: every
+            // crank commits the canonical path since full crank routing) fully caught any
             // hinted asset up to `authenticated_now_slot`. If the cap bit and any
             // hinted asset is left short (`asset_slot_after < authenticated_now_slot`),
             // this crank instruction must stop HERE -- see the early-return check
@@ -48772,7 +48772,7 @@ pub mod processor {
     //     edge clamp, or `P_last` once the epoch window elapsed);
     //   * `rent_rates_view`: the per-side rent rate from the growth record's
     //     `N_cap` snapshot and the users' OI (never caller input, spec §9.1);
-    //   * `band_rent_accrual_inputs_view`: price + funding + rent for one
+    //   * (removed with full crank routing) `band_rent_accrual_inputs_view`: price + funding + rent for one
     //     single-segment accrual (a pinned accrual carries no funding / rent).
     // ══════════════════════════════════════════════════════════════════════
 
@@ -48872,25 +48872,6 @@ pub mod processor {
             growth_v19::rent_side_rate_e9(users_long, n_cap, g.rent_kink_bps, rent_max, count_long, side_cap),
             growth_v19::rent_side_rate_e9(users_short, n_cap, g.rent_kink_bps, rent_max, count_short, side_cap),
         ))
-    }
-
-    /// v2.2: the inputs of one single-segment accrual: `(price, funding, rent_long,
-    /// rent_short)`. A duration-pinned accrual is no-move: `P_last`, no funding, no rent
-    /// (the engine refuses anything else with `BandPinned`, Custom(104)).
-    #[inline(never)]
-    fn band_rent_accrual_inputs_view(
-        group: &state::MarketViewMutV16<'_>,
-        asset_index: usize,
-        now_slot: u64,
-        price: u64,
-        funding_rate_e9: i128,
-    ) -> Result<(u64, i128, u64, u64), ProgramError> {
-        let (price, pinned) = band_shape_price_view(group, asset_index, now_slot, price)?;
-        if pinned {
-            return Ok((price, 0, 0, 0));
-        }
-        let (rent_long, rent_short) = rent_rates_view(group, asset_index)?;
-        Ok((price, funding_rate_e9, rent_long, rent_short))
     }
 
     /// v2.2 band (re-review N-2, tightened in round 2): the asset's price can no longer move
@@ -49461,18 +49442,15 @@ pub mod processor {
     /// accrue the asset to `now_slot` (bounded per call). Shared by the permissionless crank
     /// (the price path liquidation uses) and the ADL / settle-rent refresh.
     ///
-    /// The single-segment price is `floor(P * cap * dt / 10_000)` toward the target, with no
-    /// carry. Once `P * cap * dt < 10_000` that is 0, so a low mark that was cranked every slot
-    /// never moved, whatever the target did. When the segment cannot move an asset that has open
-    /// interest and is off its target, the price is instead built the way upstream's crank
-    /// builds it: the canonical one-slot path (`canonical_accrual_path_for_target_view`), where
-    /// each step may move `floor((anchor * cap + carry) / 10_000)` and the sub-atom carry is
-    /// kept in the oracle profile across cranks. One path call commits at most
-    /// `V16_MAX_ACCRUAL_PATH_STEPS` slots. The same route stages a changed target while a path
-    /// walk has left the engine's cap anchor away from the mark (see `anchor_off_mark` below).
-    ///
-    /// Every other case keeps the single-segment accrual: it already moves the price there (or
-    /// the price is at its target, or the asset has no open interest and the cap does not bind).
+    /// Full routing (upstream's crank): EVERY crank builds the canonical one-slot path
+    /// (`canonical_accrual_path_for_target_view`) and commits it with the engine's path accrual.
+    /// Each step may move `floor((anchor * cap + carry) / 10_000)`, where the cap anchor
+    /// (`fund_px_last`) restarts at the mark only when the target changes, and the sub-atom
+    /// carry is kept in the oracle profile across cranks. So the price law is linear from the
+    /// anchor while the target holds, and does not depend on how a keeper splits the slots into
+    /// cranks; funding is sampled per slot. One path call commits at most
+    /// `min(max_accrual_dt_slots, V16_MAX_ACCRUAL_PATH_STEPS)` slots: an asset further behind
+    /// leaves the crank in `bounded_market_catchup_only` and the keeper sends another crank.
     ///
     /// Returns the engine outcome and the observation for the engine's plan. When the asset
     /// did not reach `now_slot` the caller must commit and stop.
@@ -49498,61 +49476,17 @@ pub mod processor {
         let asset = group.markets[asset_index].engine.asset;
         let asset_slot = asset.slot_last.get();
         let current = asset.effective_price.get();
-        let exposed = asset.oi_eff_long_q.get() != 0 || asset.oi_eff_short_q.get() != 0;
-        let cap_bps = group.header.config.max_price_move_bps_per_slot.get();
-        let segment_price = oracle_v16::effective_price_from_target(
-            current,
+        // The path stages the raw target itself (and restarts the cap anchor when it changed);
+        // a dt = 0 re-crank builds an empty path and keeps the carry.
+        let path = canonical_accrual_path_for_target_view(
+            profile,
+            group,
+            asset_index,
+            now_slot,
             target,
-            cap_bps,
-            asset_segment_dt_view(group, asset_index, now_slot)?,
-            exposed,
-        );
-        // The segment is stuck below one atom: take the carry path. (A zero cap means the
-        // price is held on purpose, and with no open interest the segment goes to the target.)
-        // A second crank in the same slot (dt = 0) is stuck too, on purpose: its empty path
-        // keeps the carry, where the single-segment branch would drop it.
-        let stuck = exposed && cap_bps != 0 && segment_price == current;
-        // A path walk leaves the engine's cap anchor (`fund_px_last`) at the price the walk
-        // started from. The single-segment branch stages a changed target through the engine
-        // setter, which keeps that anchor (INV-045); if the band then held the price in place,
-        // a later path step would run from the stale anchor. So while the anchor is off the
-        // mark a changed target is also staged by the path accrual, which restarts the anchor
-        // at the mark. Off the path the anchor always equals the mark and this is never taken.
-        let anchor_off_mark = asset.fund_px_last.get() != current
-            && asset.raw_oracle_target_price.get() != target;
-        let path = if target != current && (stuck || anchor_off_mark) {
-            Some(canonical_accrual_path_for_target_view(
-                profile,
-                group,
-                asset_index,
-                now_slot,
-                target,
-                asset_slot.saturating_add(1),
-            )?)
-        } else {
-            None
-        };
-        let price = match path.as_ref() {
-            Some(path) => path.last().map_or(current, |step| step.effective_price),
-            None => {
-                // v2.2 band: the staircase price, then the band (edge / duration pin).
-                let (price, _) = band_shape_price_view(group, asset_index, now_slot, segment_price)?;
-                if oracle_v16::profile_is_hybrid(profile)
-                    && !oracle_v16::profile_hybrid_soft_stale_matured(profile, now_slot)
-                    && price != profile.mark_ewma_e6
-                {
-                    // FIX (ADOPT upstream 06192caa, adapted): same non-retroactive checkpoint
-                    // recording as the push-mark handlers and the trade-time mark update.
-                    record_funding_mark_transition_view(profile, asset_slot, price, now_slot)?;
-                    profile.mark_ewma_e6 = price;
-                    profile.mark_ewma_last_slot = now_slot;
-                }
-                // The segment keeps no sub-atom carry, and a carry left by an earlier path
-                // belongs to that path's trajectory: drop it, so a later path starts clean.
-                set_price_move_remainder_bps_num_view(profile, 0)?;
-                price
-            }
-        };
+            asset_slot.saturating_add(1),
+        )?;
+        let price = path.last().map_or(current, |step| step.effective_price);
         // FIX (ADOPT upstream 01ec6161, "preserve Hybrid liquidation reward provenance",
         // adapted): clear the trade-driven taint only after a genuinely FRESH oracle read (not
         // the soft-stale EWMA fallback) AND once the price has walked all the way to that
@@ -49586,38 +49520,6 @@ pub mod processor {
             cfg.oracle_leg_prices_e6 = profile.oracle_leg_prices_e6;
             cfg.oracle_leg_publish_times = profile.oracle_leg_publish_times;
         }
-        let Some(path) = path else {
-            let funding_rate_e9 =
-                permissionless_funding_rate_e9_view(profile, group, asset_index, now_slot, price)?;
-            group
-                .set_asset_raw_oracle_target_not_atomic(asset_index, target)
-                .map_err(map_v16_error)?;
-            write_oracle_profile_to_view(group, asset_index, profile)?;
-            // v2.2: band-shaped, rent-bearing inputs (a pinned accrual is no-move). The
-            // observation carries the same values, so the engine's own refresh / liquidation
-            // step certifies at exactly the committed P_last.
-            let (price, funding_rate_e9, rent_long, rent_short) =
-                band_rent_accrual_inputs_view(group, asset_index, now_slot, price, funding_rate_e9)?;
-            let accrual = group
-                .accrue_asset_to_with_rent_not_atomic(
-                    asset_index,
-                    now_slot,
-                    price,
-                    funding_rate_e9,
-                    rent_long,
-                    rent_short,
-                    true,
-                )
-                .map_err(map_v16_error)?;
-            return Ok((
-                accrual,
-                AutoCrankObservationV16 {
-                    asset_index,
-                    effective_price: price,
-                    funding_rate_e9,
-                },
-            ));
-        };
         write_oracle_profile_to_view(group, asset_index, profile)?;
         // The path accrual stages the raw target itself (and restarts the cap anchor when the
         // target changed), so it is not staged separately here. The engine re-derives every
