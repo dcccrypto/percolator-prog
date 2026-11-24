@@ -85,7 +85,6 @@ fn swordcat() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         // tag 53, 2o6ud5cL…
@@ -142,7 +141,6 @@ fn backpack() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 1,
@@ -1016,7 +1014,6 @@ fn r2_market() -> LiveMarket {
             max_account_b_settlement_chunks: 10,
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
-            public_b_chunk_atoms: 1_000_000_000_000,
             maintenance_fee_per_slot: 0,
         },
         m_kind: 0,
@@ -3377,14 +3374,6 @@ fn sec_s6_cu_eight_liquidating_refreshes() {
     }
 }
 
-/// Market whose bankruptcy residuals and per-account B settlement move in 1-USDC chunks, so a
-/// real bust leaves pending socialized-loss settlement across several touches.
-fn chunked_b_market() -> LiveMarket {
-    let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = std::env::var("A5X_CHUNK").ok().and_then(|v| v.parse().ok()).unwrap_or(1_000_000);
-    lm
-}
-
 impl Replay {
     fn loss_snapshot(&self) -> String {
         let (_, g) = self.env.market_state();
@@ -3399,40 +3388,83 @@ impl Replay {
     }
 }
 
-#[test]
-#[ignore = "exploration: prints the counters through a real chunked bankruptcy"]
-fn a5_explore_real_chunked_bankruptcy() {
-    let mut r = Replay::new(chunked_b_market());
+// ---------------------------------------------------------------------------------------------
+// Bankrupt-close scenarios at the real public B chunk.
+//
+// Upstream 083a0d08 / prog c8ddbb6e: the public B chunk is the engine constant
+// `PUBLIC_B_CHUNK_ATOMS = MAX_VAULT_TVL` (1e16 atoms), no longer a market field. A bust is
+// socialised in ONE step and the market stays Live unless its unpaid residual exceeds that
+// constant (or the B index lacks headroom), in which case the crank declares permissionless
+// Recovery (`ActiveBankruptCloseCannotProgress`). The old 1,700 USDC bust (residual 1.7e9) is far
+// below the chunk now, so the Recovery scenarios run in a market scaled to the chunk: price 1e11
+// (so a position within MAX_POSITION_ABS_Q reaches ~5e16 notional), 2% margin (50x), 0.4% mark
+// moves per slot, 1e15 atoms (1e9 USDC) of trader capital and a 5e15 LP. A 30% walk then leaves a residual
+// of ~1.37e16 > PUBLIC_B_CHUNK_ATOMS; a 20% walk leaves ~8.8e15 < PUBLIC_B_CHUNK_ATOMS (the control).
+// ---------------------------------------------------------------------------------------------
+
+const BIG_PRICE: u64 = 100_000_000_000;
+const BIG_BUST_CAPITAL: u64 = 1_000_000_000_000_000;
+/// 49x on `BIG_BUST_CAPITAL` (inside the 2% initial margin).
+const BIG_BUST_NOTIONAL: i128 = 49_000_000_000_000_000;
+/// The trader's loss is `notional * walk`, its unpaid residual that minus its capital.
+const BIG_BUST_WALK_RECOVERY_PCT: u64 = 70; // -30%: residual 1.37e16 > the chunk
+const BIG_BUST_WALK_SOCIALISED_PCT: u64 = 80; // -20%: residual 8.8e15 < the chunk
+
+fn big_bust_market() -> LiveMarket {
+    let mut lm = r2_market();
+    lm.params.initial_price = BIG_PRICE;
+    lm.params.initial_margin_bps = 200;
+    lm.params.maintenance_margin_bps = 200;
+    // admission: price budget (move x dt) must fit inside the margin
+    lm.params.max_price_move_bps_per_slot = 40;
+    lm.params.max_accrual_dt_slots = 4;
+    lm.open_price_e6 = BIG_PRICE;
+    lm.lp_capital = 5_000_000_000_000_000;
+    lm
+}
+
+/// A fully opened bust world: an LP vault deposit `h` (so exits exist), three small shorts, and a
+/// ~49x levered long `bk`/`bp`, all against the LP. The mark has not moved yet.
+struct BigBust {
+    r: Replay,
+    h: Keypair,
+    h_ata: Pubkey,
+    bk: Keypair,
+    bp: Pubkey,
+    shorts: Vec<(Keypair, Pubkey)>,
+    p0: u64,
+}
+
+fn big_bust_open() -> BigBust {
+    let mut r = Replay::new(big_bust_market());
     let h = Keypair::new();
-    let (_h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
-    let q: i128 = 10 * percolator::POS_SCALE as i128;
+    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
+    let q: i128 = 1_000_000_000;
     let mut shorts = vec![];
     for _ in 0..3 {
-        let (k, p) = r.new_trader(100_000_000);
+        let (k, p) = r.new_trader(10_000_000_000_000);
         r.trade(&k, p, -q).expect("short");
-        shorts.push(p);
+        shorts.push((k, p));
     }
-    let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(20_000_000);
-    r.trade(&bk, bp, qb).expect("levered long");
-    eprintln!("A5X open: {}", r.loss_snapshot());
-    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    eprintln!("A5X after walk: {}", r.loss_snapshot());
-    for i in 0..12 {
-        r.crank_pf(bp);
-        eprintln!("A5X bust crank {i}: {}", r.loss_snapshot());
+    assert_eq!(p0 as u64, BIG_PRICE);
+    let qb = BIG_BUST_NOTIONAL * percolator::POS_SCALE as i128 / p0;
+    let (bk, bp) = r.new_trader(BIG_BUST_CAPITAL);
+    r.trade(&bk, bp, qb).expect("49x levered long");
+    BigBust { r, h, h_ata, bk, bp, shorts, p0: p0 as u64 }
+}
+
+impl BigBust {
+    /// Walk the mark to `pct`% of the opening price, cranking only the LP (the bust goes stale).
+    fn walk(&mut self, pct: u64) {
+        let lp = self.r.lp;
+        walk_only(&mut self.r, self.p0 * pct / 100, &[lp]);
     }
-    for i in 0..6 {
-        r.crank_pf(lp);
-        eprintln!("A5X lp crank {i}: {}", r.loss_snapshot());
-        for p in shorts.iter() {
-            r.crank_pf(*p);
-        }
-        eprintln!("A5X shorts crank {i}: {}", r.loss_snapshot());
+    fn mode(&self) -> String {
+        format!("{:?}", self.r.env.market_state().1.mode)
     }
 }
+
 
 /// A6 round 2: two 14-leg portfolios that are LIQUIDATABLE after an asset-0 drop (a 100-token
 /// asset-0 long + (cap-1) x 10-token legs on $25 capital, asset 0 down 15%). One inline refresh is
@@ -3559,53 +3591,58 @@ fn a6_hybrid_oracle_tail_eight_refreshes_cu() {
     assert!(cu <= 1_260_000, "A6 hybrid: {cu} CU leaves < 10% headroom under 1.4M");
 }
 
-/// A5 round 2, REAL repro (no state poke): a 9.5x-levered long busts on a 15% walk in a market
-/// whose bankruptcy residual exceeds `public_b_chunk_atoms` (2 USDC). After the bust's crank the
-/// account's unabsorbed deficit is pending (`negative_pnl_account_count` = 1) and the shorts are
-/// K/F-stale; the redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused
-/// with 118 and nothing moves.
+/// A5 round 2, REAL repro (no state poke): a 49x-levered long busts on a 30% walk in a market
+/// whose bankruptcy residual (~1.37e16) exceeds `PUBLIC_B_CHUNK_ATOMS` (the engine constant, see
+/// `big_bust_market`). The bust's crank declares permissionless Recovery
+/// (the next crank resolves the market; there is NO wedge, a later Live-style crank fails
+/// Custom(14) only because the market is terminal). With the loss unabsorbed the
+/// redeemer-SIGNED exit, which would otherwise take the dip fallback, is refused by the engine lock
+/// (21) and nothing moves.
 ///
-/// Why not `b_stale_account_count`: measured (`a5_explore_real_chunked_bankruptcy`, ignored), a
-/// residual > `public_b_chunk_atoms` never starts the multi-step close in this harness (every
-/// later crank fails EngineInvalidConfig = 14: an engine-side wedge, recorded in findings.md),
-/// and a residual <= the chunk is socialized through K at once, so every account settles its B
-/// share in one touch: per-account B-staleness is not reachable here. The pending state that IS
-/// reachable is the unabsorbed negative PnL, which the gate now includes.
+/// Why not the old Live-with-pending-deficit window (`negative_pnl_account_count` = 1 while Live):
+/// a bust is now either socialised at once (residual <= chunk, see
+/// `a5_socialised_bust_refuses_on_loss_currency_not_the_recovery_lock` below) or goes straight to
+/// Recovery in its own crank. The same applies to `b_stale_account_count`: in LIVE mode it is not reachable in this
+/// harness.
 #[test]
 fn a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback() {
-    let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = 2_000_000;
-    let mut r = Replay::new(lm);
-    let h = Keypair::new();
-    let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
-    let q: i128 = 10 * percolator::POS_SCALE as i128;
-    for _ in 0..3 {
-        let (k, p) = r.new_trader(100_000_000);
-        r.trade(&k, p, -q).expect("short");
-    }
-    let lp = r.lp;
-    let p0 = r.env.market_state().1.assets[0].effective_price as i128;
-    let qb = 190_000_000i128 * percolator::POS_SCALE as i128 / p0;
-    let (bk, bp) = r.new_trader(20_000_000);
-    r.trade(&bk, bp, qb).expect("levered long");
-    r.request_76(&h, h_ata, None).expect("H 76");
-    walk_only(&mut r, (p0 as u64) * 85 / 100, &[lp]);
-    // v2.2 F1: the bust's crank now refreshes AND takes the liquidation step (equity <= 0 always
-    // continues), whose residual exceeds a single step: the market goes Live -> Recovery in this crank.
-    // The Live-with-pending-deficit window this test used to probe no longer exists for a tag-5 crank;
-    // the property under test is unchanged: with the loss unabsorbed (now in Recovery) the
-    // redeemer-signed exit is refused 118 and nothing moves.
-    r.crank_pf(bp);
-    eprintln!("A5 real: {}", r.loss_snapshot());
-    let (_, g) = r.env.market_state();
-    assert_eq!(format!("{:?}", g.mode), "Recovery", "F1: the bust's crank declared Recovery");
-    assert!(!r.no_genuine_loss_now());
-    let before = r.exit_state(&h.pubkey());
-    let res = r.execute_77(&h, None, true);
-    // v2.2 F1: in Recovery the exit is refused one gate earlier, by the engine lock (21
-    // EngineLockActive), not by the loss-current gate (118): no exit of any kind, so no dip fallback.
+    let mut w = big_bust_open();
+    w.r.request_76(&w.h, w.h_ata, None).expect("H 76");
+    w.walk(BIG_BUST_WALK_RECOVERY_PCT);
+    assert_eq!(w.mode(), "Live", "non-vacuity: Live before the bust crank");
+    let bp = w.bp;
+    w.r.crank_pf(bp);
+    eprintln!("A5 real: {}", w.r.loss_snapshot());
+    assert_eq!(w.mode(), "Recovery", "the bust's crank declared Recovery (residual > the chunk)");
+    assert!(!w.r.no_genuine_loss_now());
+    let before = w.r.exit_state(&w.h.pubkey());
+    let h = w.h.insecure_clone();
+    let res = w.r.execute_77(&h, None, true);
+    // in Recovery the exit is refused by the engine lock (21 EngineLockActive): no exit of any
+    // kind, so no dip fallback
     assert_eq!(code(&res), Some(21), "A5 real: {res:?}");
-    assert_eq!(r.exit_state(&h.pubkey()), before);
+    assert_eq!(w.r.exit_state(&h.pubkey()), before);
+}
+
+/// The other side of the A5 split: the same world with a residual BELOW the chunk (walk -20%). The
+/// bust is socialised in its own crank and the market stays Live with nothing pending, so the
+/// engine lock never engages: the redeemer-signed exit is refused by the loss-current gate (118,
+/// the three shorts are still K/F-stale) and NOT by the Recovery lock (21) that
+/// `a5_real_bust_pending_negative_pnl_refuses_the_signed_fallback` gets above the chunk.
+#[test]
+fn a5_socialised_bust_refuses_on_loss_currency_not_the_recovery_lock() {
+    let mut w = big_bust_open();
+    w.r.request_76(&w.h, w.h_ata, None).expect("H 76");
+    w.walk(BIG_BUST_WALK_SOCIALISED_PCT);
+    let bp = w.bp;
+    w.r.crank_pf(bp);
+    assert_eq!(w.mode(), "Live", "residual below the chunk: socialised, still Live");
+    assert_eq!(w.r.env.market_state().1.negative_pnl_account_count, 0, "nothing left pending");
+    let before = w.r.exit_state(&w.h.pubkey());
+    let h = w.h.insecure_clone();
+    let res = w.r.execute_77(&h, None, true);
+    assert_eq!(code(&res), Some(ERR_NOT_LOSS_CURRENT), "stale shorts, no Recovery lock: {res:?}");
+    assert_eq!(w.r.exit_state(&h.pubkey()), before);
 }
 
 /// Round 2 multi-asset: the vault (asset 0) is loss-current, asset 1 is not (a trader holds
@@ -3686,10 +3723,8 @@ fn multi_asset_keeper_exit_needs_every_asset_loss_current() {
 // ROUND 3 reviewer tests: is negative_pnl_account_count a liveness grief?
 // =============================================================================================
 
-fn sec_bust_world(chunk: u64, lev_notional: i128, capital: u64) -> (Replay, Keypair, Pubkey, Vec<Pubkey>, Pubkey) {
-    let mut lm = r2_market();
-    lm.params.public_b_chunk_atoms = chunk as u128;
-    let mut r = Replay::new(lm);
+fn sec_bust_world(lev_notional: i128, capital: u64) -> (Replay, Keypair, Pubkey, Vec<Pubkey>, Pubkey) {
+    let mut r = Replay::new(r2_market());
     let h = Keypair::new();
     let (h_ata, _) = r.deposit_shares(&h, R3M1_DEPOSIT, 0).expect("H 75");
     let q: i128 = 10 * percolator::POS_SCALE as i128;
@@ -3718,7 +3753,7 @@ fn sec_report(tag: &str, r: &mut Replay, h: &Keypair, all: &[Pubkey]) {
 #[test]
 fn sec_r3_n1_solvent_underwater_account_does_not_count() {
     // 5x long (100e6 notional on 20e6), walk -10%: loss 10e6 < 20e6 capital, equity 10e6 > MM.
-    let (mut r, h, _ha, shorts, bp) = sec_bust_world(1_000_000_000_000, 100_000_000, 20_000_000);
+    let (mut r, h, _ha, shorts, bp) = sec_bust_world(100_000_000, 20_000_000);
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price;
     walk_only(&mut r, p0 * 90 / 100, &[lp]);
@@ -3729,34 +3764,48 @@ fn sec_r3_n1_solvent_underwater_account_does_not_count() {
     let _ = shorts;
 }
 
-/// N2/N3: a bust. Default chunk (1e12) and the builder's small chunk (2e6). After the bust,
-/// keep cranking everyone for 40 slots; report the counters and whether a signed exit works.
+/// N2/N3: a bust, then 40 slots of full cranks and a signed exit with full refresh. N2 is the
+/// small-world bust (residual 8.5e6 atoms, far below `PUBLIC_B_CHUNK_ATOMS`): socialised at once, the
+/// market stays Live. N3 is the same persistence run on the world scaled past the chunk
+/// (`big_bust_open`, residual 1.37e16 > `PUBLIC_B_CHUNK_ATOMS`): the bust declares Recovery.
+/// (The old N3 ran a "2e6 chunk" builder knob that no longer exists, so it was a copy of N2.)
 #[test]
-fn sec_r3_n2_bust_persistence_default_chunk() {
-    sec_bust_persistence("default chunk", 1_000_000_000_000);
-}
-#[test]
-fn sec_r3_n3_bust_persistence_small_chunk() {
-    sec_bust_persistence("small chunk 2e6", 2_000_000);
-}
-fn sec_bust_persistence(tag: &str, chunk: u64) {
-    let (mut r, h, _ha, shorts, bp) = sec_bust_world(chunk, 190_000_000, 20_000_000);
+fn sec_r3_n2_bust_persistence_below_chunk_stays_live() {
+    let (mut r, h, _ha, shorts, bp) = sec_bust_world(190_000_000, 20_000_000);
     let lp = r.lp;
     let p0 = r.env.market_state().1.assets[0].effective_price;
     walk_only(&mut r, p0 * 85 / 100, &[lp]);
     r.crank_pf(bp);
-    eprintln!("SEC-R3 [{tag}] after bust crank: {}", r.loss_snapshot());
+    assert_eq!(format!("{:?}", r.env.market_state().1.mode), "Live", "residual below the chunk is socialised in Live");
     let mut all = shorts.clone();
     all.push(bp);
     all.push(lp);
+    sec_bust_persistence("below chunk", &mut r, &h, &all);
+}
+#[test]
+fn sec_r3_n3_bust_persistence_above_chunk_goes_recovery() {
+    let mut w = big_bust_open();
+    w.r.request_76(&w.h, w.h_ata, None).expect("H 76");
+    w.walk(BIG_BUST_WALK_RECOVERY_PCT);
+    let (bp, lp) = (w.bp, w.r.lp);
+    w.r.crank_pf(bp);
+    assert_eq!(w.mode(), "Recovery", "residual above the chunk declares Recovery on the bust's crank");
+    let mut all: Vec<Pubkey> = w.shorts.iter().map(|(_, p)| *p).collect();
+    all.push(bp);
+    all.push(lp);
+    let h = w.h.insecure_clone();
+    sec_bust_persistence("above chunk", &mut w.r, &h, &all);
+}
+fn sec_bust_persistence(tag: &str, r: &mut Replay, h: &Keypair, all: &[Pubkey]) {
+    eprintln!("SEC-R3 [{tag}] after bust crank: {}", r.loss_snapshot());
     for k in 0..40u64 {
-        r.hold(1, &all);
+        r.hold(1, all);
         if k == 0 || k == 9 || k == 39 {
             eprintln!("SEC-R3 [{tag}] +{} slots of full cranks: {}", k + 1, r.loss_snapshot());
         }
     }
     r.env.svm.warp_to_slot(r.now() + r.lm.earn_cooldown + 1);
-    let res = r.execute_77(&h, Some((1, all.clone())), true);
+    let res = r.execute_77(h, Some((1, all.to_vec())), true);
     eprintln!("SEC-R3 [{tag}] signed exit with full refresh: {:?}", res.as_ref().map(|x| x.0).map_err(|e| custom_code(e)));
 }
 

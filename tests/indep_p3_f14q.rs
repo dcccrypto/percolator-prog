@@ -728,7 +728,6 @@ fn market_params() -> V16CuMarketParams {
             max_bankrupt_close_chunks: 10,
             max_bankrupt_close_lifetime_slots: 500,
             // rehearse.sh seeds the h-lock market with SEED_PUBLIC_B_CHUNK_ATOMS=1_000_000 (HLOCK_B_CHUNK).
-            public_b_chunk_atoms: 1_000,
             maintenance_fee_per_slot: 0,
         };
     }
@@ -1697,30 +1696,39 @@ fn c7_to_terminal(w: &mut P3, lp: Pubkey) {
 /// C-7 (rehearsal-22 TRUMP h-lock drill, real validator, wrapper 58e379f1 built elsewhere):
 /// the vault LP's whole loss (-331,920 beyond a 300k junior, 1/1000 scale) is realised in ONE
 /// liquidating crank after +450 bps x9 pushes that cranked only the trader; with a small public
-/// B chunk the engine goes straight to Recovery (no bankrupt close), a stranger crank takes it to
+/// B chunk the engine went straight to Recovery (no bankrupt close), a stranger crank took it to
 /// Resolved, and the documented wind-down must then pay everyone (new loss rule: winner in full,
 /// seniors absorb exactly the shortfall pro rata, <= dust left).
+/// 2026-11 (upstream 083a0d08): the public B chunk is the engine constant PUBLIC_B_CHUNK_ATOMS
+/// (1e16 atoms), so this 1/1000-scale loss (331,920 atoms) is booked in one step and the engine does
+/// NOT go to Recovery on the liquidating crank any more; `c7_to_terminal` then resolves the market
+/// (admin or stranger) and the same wind-down must pay everyone. The immediate-Recovery path cannot
+/// be reached at this scale (it needs a residual above 1e16 atoms); it is pinned at chunk scale in
+/// `earn_drain_replay` (`wedge_residual_above_chunk_goes_recovery_then_resolved_and_closes`).
 /// Reproduces the rehearsal exactly on 58e379f1 (NEGATIVE CONTROL, fails): 101 Ok, tag 8 on the
 /// vault LP and the winner -> 21, 78 -> 21, 77 -> 84 in both domains, 102 -> 21; 12,300,000 locked.
 #[test]
-fn c7_immediate_recovery_winddown_pays_everyone() { c7_winddown(5_000_000); }
+fn c7_winddown_after_the_lp_loss_pays_everyone() { c7_winddown(5_000_000); }
 
 /// C-7, seniors-exhausted variant: seniors 50k + 50k (C 100k) < the 331,920 loss beyond the
-/// 300k junior, so the draw cannot cover it and the bankrupt/Recovery path (chunked, 1,000-atom
-/// public B chunk) is exercised. The chunked wind-down must COMPLETE when calls repeat: every
-/// portfolio closes, the winner gets capital + junior + all of C, seniors 0, <= dust left.
+/// 300k junior, so the draw cannot cover it and the bankrupt close is booked past the seniors. The
+/// wind-down must COMPLETE: every portfolio closes, the winner gets capital + junior + all of C,
+/// seniors 0, <= dust left. (Before 083a0d08 this ran with a 1,000-atom public B chunk and needed
+/// ~330 calls per step; the chunk is now the 1e16-atom engine constant, so each step is one call
+/// and this no longer exercises a multi-chunk wind-down -- that is unreachable at this scale.)
 #[test]
-fn c7_seniors_exhausted_chunked_winddown_completes() { c7_winddown(50_000); }
+fn c7_seniors_exhausted_winddown_completes() { c7_winddown(50_000); }
 
 struct C7Out { winner_paid: u128, per: Vec<u128>, r77s: Vec<Result<u64, Option<u32>>>, left: u128, closed: bool, v0: u128, acct: (u128, u128, u128, u128) }
 
 /// The looped terminal wind-down of a Resolved C-7 world; `seniors` = (keypair, share ATA, domain).
 fn c7_finish(w: &mut P3, admin: &Keypair, t: &Keypair, tp: Pubkey, seed: &Keypair, seedp: Pubkey, lp: Pubkey, seniors: &[(&Keypair, Pubkey, u16)], v0: u128) -> C7Out {
     let mut w = w;
-    // Documented wind-down, in the rehearsal order -- but each chunked step is REPEATED until it
-    // is done (bounded). The drill called 101 once and CloseResolved 4x; with the h-lock market's
-    // public_b_chunk_atoms (1e6 on-chain, 1_000 here) the vault LP's residual needs ~332 calls of
-    // 101 and the winner ~329 CloseResolved calls (each advances one public B chunk). Bound 1,000.
+    // Documented wind-down, in the rehearsal order -- each step is REPEATED until it is done
+    // (bounded 1,000). The drill called 101 once and CloseResolved 4x. The drill's market had a
+    // small public B chunk (1e6 on-chain) and needed ~332 calls of 101 and ~329 CloseResolved; with
+    // the engine-constant chunk (1e16 atoms) each step finishes in one call, so the loops below
+    // normally run once.
     let jo = admin.pubkey();
     let lp_flat = |w: &P3| w.env.svm.get_account(&lp).and_then(|a| state::read_portfolio(&a.data).ok()).map_or(true, |x| x.pnl >= 0 && x.legs.iter().all(|l| !l.active));
     let mut n101 = 0u32;
@@ -1815,7 +1823,7 @@ fn c7_winddown(senior_per_domain: u64) {
     assert!(winner_paid + 2_000 >= owed, "RULE: winner paid in full while senior backing remains: {winner_paid} < owed {owed}");
     assert!(senior_paid + 2_000 >= exp && senior_paid <= exp + 2_000, "RULE: seniors absorb exactly the shortfall: {senior_paid} vs {exp}");
     if exp > 2_000 { assert!(r77s.iter().all(|r| r.is_ok()), "C-7: a senior's full-share 77 refused in Resolved: {:?}", r77s); }
-    assert!(o.closed, "C-7: the chunked wind-down did not close every portfolio");
+    assert!(o.closed, "C-7: the wind-down did not close every portfolio");
     c7_assert_conservation(&o);
 }
 
@@ -1892,8 +1900,8 @@ fn c7_permissionless_exit_sweep() {
         let s = w.slot() + [1u64, 600, 200_000][round];
         w.env.svm.warp_to_slot(s);
     }
-    // Phase L: 101 advances the vault LP's bankrupt close by one public B chunk per call
-    // (public_b_chunk_atoms). Repeat it (permissionless) until the close finishes.
+    // Phase L: 101 advances the vault LP's bankrupt close one booking step per call (a single call
+    // at the engine-constant public B chunk). Repeat it (permissionless) until the close finishes.
     let mut n101 = 0u32;
     let mut last_err = None;
     for i in 0..2_000u32 {

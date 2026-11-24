@@ -277,7 +277,6 @@ fn init_market_ix(c: &MarketCfg) -> ProgInstruction {
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     };
     match c.growth {
@@ -306,6 +305,9 @@ struct Env {
     vault: Pubkey,
     matcher_program: Pubkey,
     portfolio_account_len: usize,
+    /// The deployed v2.1 program is the target: InitMarket carries the 16-byte `public_b_chunk_atoms`
+    /// the v2.2 wire dropped (upstream c8ddbb6e), inserted by `send` with the value the fixtures always used.
+    legacy_wire: bool,
     /// Deterministic key source (byte-parity runs need identical keys on both programs).
     next_key: u8,
     /// Mocked ProgramData upgrade authority (tag 93).
@@ -395,6 +397,7 @@ impl Env {
                     len
                 }
             },
+            legacy_wire: v21_layout,
             next_key: 0x40,
             bind_growth_lp: cfg.growth.is_some() && cfg.slots == 1,
             upgrade_authority: seeded_keypair(3),
@@ -461,10 +464,18 @@ impl Env {
         accounts: Vec<AccountMeta>,
         signers: &[&Keypair],
     ) -> Result<u64, String> {
+        let mut data = ix.encode();
+        if self.legacy_wire && data[0] == 0 {
+            // InitMarket (tag 0), v2.1 wire: `public_b_chunk_atoms: u128` sat right before the
+            // trailing `maintenance_fee_per_slot: u128` of the base body.
+            assert!(!matches!(ix, ProgInstruction::InitMarketV19 { .. }));
+            let at = data.len() - 16;
+            data.splice(at..at, percolator::MAX_VAULT_TVL.to_le_bytes());
+        }
         let instruction = Instruction {
             program_id: self.program_id,
             accounts,
-            data: ix.encode(),
+            data,
         };
         let mut all = vec![&self.payer];
         all.extend_from_slice(signers);
@@ -1598,7 +1609,7 @@ fn strip_drift_tail(data: &[u8], is_market: bool) -> (Vec<u8>, bool) {
     if !is_market || appended == 0 {
         return (data.to_vec(), false);
     }
-    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_CONFIG_EXTRA;
+    let head = MARKET_GROUP_OFF + MARKET_GROUP_LEN - v21_upgrade::V22_CONFIG_EXTRA + v21_upgrade::V21_CHUNK_LEN;
     let stride = MARKET_ASSET_SLOT_LEN - v21_upgrade::V22_ASSET_EXTRA;
     assert_eq!((data.len() - head) % stride, 0);
     let mut out = data[..head].to_vec();

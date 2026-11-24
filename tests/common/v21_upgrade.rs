@@ -30,6 +30,14 @@ use solana_sdk::pubkey::Pubkey;
 pub const V21_WRAPPER_VERSION: u16 = 18;
 pub const V21_LAYOUT_DISCRIMINATOR: u16 = 18;
 pub const V22_CONFIG_EXTRA: usize = 6 * 8;
+/// Upstream 083a0d08 / prog c8ddbb6e dropped the 16-byte `public_b_chunk_atoms` config field (it sat
+/// right before `max_recovery_fallback_deviation_bps`). v2.1 bytes still carry it: the upgrader cuts it,
+/// the projection re-inserts it as `MAX_VAULT_TVL` (the value every v2.1 fixture and parity run used).
+pub const V21_CHUNK_LEN: usize = 16;
+fn v21_chunk_off() -> usize {
+    core::mem::offset_of!(MarketGroupV16HeaderAccount, config)
+        + core::mem::offset_of!(V16ConfigAccount, max_recovery_fallback_deviation_bps)
+}
 pub const V22_ASSET_EXTRA: usize = 8 * 8 + 3 * 16;
 const V22_LEG_EXTRA: usize = 8 + 1 + 16 + 8;
 /// #299/#302: `PortfolioAccountV16Account::loss_provenance` (u32), the last field of the engine body.
@@ -54,9 +62,11 @@ const _: () = assert!(FUNDING_SCALE_TAIL == 160 + 32 + 32);
 
 fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let new_header_len = core::mem::size_of::<MarketGroupV16HeaderAccount>();
-    let old_header_len = new_header_len - V22_CONFIG_EXTRA;
+    let old_header_len = new_header_len - V22_CONFIG_EXTRA + V21_CHUNK_LEN;
     let config_off = core::mem::offset_of!(MarketGroupV16HeaderAccount, config);
-    let old_config_end = config_off + core::mem::size_of::<V16ConfigAccount>() - V22_CONFIG_EXTRA;
+    let chunk_off = v21_chunk_off();
+    let old_config_end =
+        config_off + core::mem::size_of::<V16ConfigAccount>() - V22_CONFIG_EXTRA + V21_CHUNK_LEN;
     let new_slot_len = core::mem::size_of::<EngineAssetSlotV16Account>();
     let old_slot_len = new_slot_len - V22_ASSET_EXTRA;
     let old_asset_len = core::mem::size_of::<AssetStateV16Account>() - V22_ASSET_EXTRA;
@@ -64,7 +74,8 @@ fn upgrade_slab(old: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(old.len() + 4096);
     out.extend_from_slice(&old[..MARKET_GROUP_OFF]);
     let header = &old[MARKET_GROUP_OFF..MARKET_GROUP_OFF + old_header_len];
-    out.extend_from_slice(&header[..old_config_end]);
+    out.extend_from_slice(&header[..chunk_off]);
+    out.extend_from_slice(&header[chunk_off + V21_CHUNK_LEN..old_config_end]);
     out.extend_from_slice(&[0u8; V22_CONFIG_EXTRA]);
     out.extend_from_slice(&header[old_config_end..]);
     let rest = &old[MARKET_GROUP_OFF + old_header_len..];
@@ -175,7 +186,10 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
             let mut out = Vec::with_capacity(data.len());
             out.extend_from_slice(&data[..MARKET_GROUP_OFF]);
             let header = &data[MARKET_GROUP_OFF..MARKET_GROUP_OFF + header_len];
-            out.extend_from_slice(&header[..config_end - V22_CONFIG_EXTRA]);
+            let chunk_off = v21_chunk_off();
+            out.extend_from_slice(&header[..chunk_off]);
+            out.extend_from_slice(&percolator::MAX_VAULT_TVL.to_le_bytes());
+            out.extend_from_slice(&header[chunk_off..config_end - V22_CONFIG_EXTRA]);
             zero(&header[config_end - V22_CONFIG_EXTRA..config_end], "config");
             out.extend_from_slice(&header[config_end..]);
             let rest = &data[MARKET_GROUP_OFF + header_len..];
@@ -234,7 +248,7 @@ pub fn project_v22_account_to_v21(data: &[u8]) -> Vec<u8> {
 
 /// v2.1 account lengths for the same capacity (v2.2 length minus the appended words).
 pub fn v21_market_len(v22_len: usize, slots: usize) -> usize {
-    v22_len - V22_CONFIG_EXTRA - slots * V22_ASSET_EXTRA
+    v22_len - V22_CONFIG_EXTRA + V21_CHUNK_LEN - slots * V22_ASSET_EXTRA
 }
 
 pub fn v21_portfolio_len(v22_len: usize) -> usize {
@@ -242,5 +256,5 @@ pub fn v21_portfolio_len(v22_len: usize) -> usize {
 }
 
 pub fn deployed_market_len(v22_len: usize, slots: usize) -> usize {
-    v22_len - V22_CONFIG_EXTRA - slots * (V22_ASSET_EXTRA + FUNDING_SCALE_TAIL)
+    v22_len - V22_CONFIG_EXTRA + V21_CHUNK_LEN - slots * (V22_ASSET_EXTRA + FUNDING_SCALE_TAIL)
 }

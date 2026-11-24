@@ -401,7 +401,6 @@ struct V16CuMarketParams {
     max_account_b_settlement_chunks: u64,
     max_bankrupt_close_chunks: u64,
     max_bankrupt_close_lifetime_slots: u64,
-    public_b_chunk_atoms: u128,
     maintenance_fee_per_slot: u128,
     /// v2.2: create the market account with a REAL top-level system `createAccount` (client path)
     /// instead of injecting it with `svm.set_account`.
@@ -431,7 +430,6 @@ impl Default for V16CuMarketParams {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
             system_created_market: false,
         }
@@ -492,31 +490,6 @@ impl V16CuEnv {
     /// Fallible form (S10-X1): InitMarket's error string and whether the market account was left
     /// byte-identical, instead of a panic.
     fn try_new_with_init_params(params: V16CuMarketParams) -> Result<Self, InitRefusal> {
-        // v2.2: InitMarket refuses `public_b_chunk_atoms < PUBLIC_B_CHUNK_ATOMS_MIN`; sub-floor
-        // chunk fixtures init at the floor, then a test-only STATE POKE sets the requested chunk.
-        let floor = percolator_prog::constants::PUBLIC_B_CHUNK_ATOMS_MIN;
-        if params.public_b_chunk_atoms < floor {
-            let env = Self::new_with_init_params(V16CuMarketParams {
-                public_b_chunk_atoms: floor,
-                ..params
-            });
-            let original = env.svm.get_account(&env.market).expect("market");
-            let (cfg, mut g) = state::read_market(&original.data).expect("read market");
-            let mut noop = original.data.clone();
-            state::write_market(&mut noop, &cfg, &g).unwrap();
-            g.config.public_b_chunk_atoms = params.public_b_chunk_atoms;
-            let mut mutated = original.data.clone();
-            state::write_market(&mut mutated, &cfg, &g).unwrap();
-            let mut acct = original;
-            for i in 0..acct.data.len() {
-                if mutated[i] != noop[i] {
-                    acct.data[i] = mutated[i];
-                }
-            }
-            let mut env = env;
-            env.svm.set_account(env.market, acct).unwrap();
-            return Ok(env);
-        }
         let mut svm = LiteSVM::new();
         let program_id = percolator_prog::id();
         let program_bytes = std::fs::read(program_path()).expect("read BPF");
@@ -616,7 +589,6 @@ impl V16CuEnv {
                 max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms: params.public_b_chunk_atoms,
                 maintenance_fee_per_slot: params.maintenance_fee_per_slot,
             },
             vec![
@@ -4638,7 +4610,6 @@ fn v16_bpf_close_slab_then_reinit_same_pubkey_is_rejected() {
             max_account_b_settlement_chunks: 1,
             max_bankrupt_close_chunks: 1,
             max_bankrupt_close_lifetime_slots: 100,
-            public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
             maintenance_fee_per_slot: 0,
         },
         vec![
@@ -9212,7 +9183,7 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // this call" case: `collect_maintenance_fee_before_value_debit_view` -> engine
 // `sync_account_fee_to_slot_not_atomic` (percolator `src/v16.rs:20356`) calls
 // `settle_account_side_effects_not_atomic`, which for a B-backlog exceeding one bounded
-// `public_b_chunk_atoms` chunk computes `Ok(AccountBChunk(_))` -- durably marking the account
+// public B chunk computes `Ok(AccountBChunk(_))` -- durably marking the account
 // B-stale and consuming one chunk on the SAME zero-copy view the rest of the instruction uses --
 // but then CONVERTS that outcome into `Err(V16Error::BStale)` (`src/v16.rs:20386-20394`) instead
 // of returning it. The prior code let that `Err` propagate via `?`, reverting the WHOLE
@@ -9220,8 +9191,11 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // chunk progress and the B-stale mark that had already landed. Every subsequent
 // Refresh(0)/Liquidate(1)/SettleB(2) call therefore re-enters with `b_stale_state` still 0,
 // re-hits the identical error, and reverts again -- a PERMANENT LIVELOCK reachable whenever
-// `public_b_chunk_atoms` (an admin knob with no minimum validation) is bounded below an
-// account's B-backlog. An underwater account stuck this way could never be liquidated, because
+// the public B chunk is bounded below an account's B-backlog. (Upstream 083a0d08 made the chunk the
+// engine constant `PUBLIC_B_CHUNK_ATOMS = MAX_VAULT_TVL` = 1e16 atoms, so the backlog that
+// triggers it is now one whose settled LOSS exceeds 1e16 atoms: the fixtures seed a B index
+// debt of `DEBT_B` = 4.5e31 on a 1-unit leg, a loss of 4.5e16 atoms = 4.5 chunks.)
+// An underwater account stuck this way could never be liquidated, because
 // even the crank's own designated remedy action, SettleB(2), was blocked by this SAME shared
 // fee-collection preamble on its very first call.
 //
@@ -9235,22 +9209,28 @@ fn v16_bpf_tradenocpi_crystallizes_maintenance_fee_before_opening_first_leg() {
 // drains, and a genuinely liquidatable account can still be liquidated afterward) with the fix.
 #[test]
 fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() {
-    // Bounded (NOT `MAX_VAULT_TVL`/u128::MAX) per-call atom budget -- an admin could plausibly
-    // configure a small value like this, and it is exactly the case the old code livelocked on.
-    const CHUNK_ATOMS: u128 = 2;
-    // A LONG/SHORT-domain B-index debt that needs several `CHUNK_ATOMS`-sized chunks to fully
-    // settle (>1 chunk is the whole point -- a single-chunk backlog never diverges between the
-    // old and new code, since `settle_account_side_effects_not_atomic` only returns
-    // `AccountBChunk` when `remaining_after != 0` after one chunk).
-    const DEBT_B: u128 = 7_000_000_000_000_000;
+    // The per-call B chunk is the engine constant (1e16 atoms), no longer an admin knob.
+    let chunk_atoms: u128 = percolator::PUBLIC_B_CHUNK_ATOMS;
+    // A LONG/SHORT-domain B-index debt whose settled loss needs several chunks to fully settle
+    // (>1 chunk is the whole point -- a single-chunk backlog never diverges between the old and
+    // new code, since `settle_account_side_effects_not_atomic` only returns `AccountBChunk` when
+    // `remaining_after != 0` after one chunk). A 1-unit (POS_SCALE) leg has loss weight POS_SCALE,
+    // so a B-index debt of D costs `POS_SCALE * D / SOCIAL_LOSS_DEN` atoms: 4.5e31 -> 4.5e16.
+    const DEBT_B: u128 = 45_000_000_000_000_000_000_000_000_000_000;
+    // Phase 3's backlog (loss 7 atoms, under one chunk).
+    const DEBT_B_SUB_CHUNK: u128 = 7_000_000_000_000_000;
     const MAX_PROGRESS_CALLS: usize = 12;
+    // Non-vacuity of the fixture: the backlog really exceeds one chunk.
+    assert!(
+        (POS_SCALE * DEBT_B / percolator::SOCIAL_LOSS_DEN) > 2 * chunk_atoms,
+        "fixture: the backlog's loss must span more than two chunks"
+    );
 
     // ---- Phase 1: Refresh(0) progresses a b_stale_state==0, backlog-exceeding account
     // instead of reverting on every call. ----
     {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9302,9 +9282,11 @@ fn v16_bpf_permissionless_crank_progresses_bounded_b_backlog_without_livelock() 
         );
 
         let mut cleared = false;
+        let mut calls = 0usize;
         for i in 0..MAX_PROGRESS_CALLS {
             let slot = accrual_slot + i as u64;
             env.svm.warp_to_slot(slot);
+            calls += 1;
             let result = env.send(
 ProgInstruction::PermissionlessCrank {
                     now_slot: slot,
@@ -9333,6 +9315,12 @@ ProgInstruction::PermissionlessCrank {
             "Refresh(0) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
              instead of livelocking"
         );
+        // (a call settles a bounded number of chunks; a 4.5-chunk backlog does not fit in one)
+        assert!(
+            calls >= 2,
+            "non-vacuity: a backlog of {} chunks cannot clear in one crank call, got {calls} call(s)",
+            (POS_SCALE * DEBT_B / percolator::SOCIAL_LOSS_DEN).div_ceil(chunk_atoms)
+        );
         assert_eq!(
             env.portfolio_state(victim).legs[0].b_snap,
             DEBT_B,
@@ -9347,7 +9335,6 @@ ProgInstruction::PermissionlessCrank {
     {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9382,9 +9369,11 @@ ProgInstruction::PermissionlessCrank {
         assert!(!env.portfolio_state(victim).b_stale_state);
 
         let mut cleared = false;
+        let mut calls = 0usize;
         for i in 0..MAX_PROGRESS_CALLS {
             let slot = accrual_slot + i as u64;
             env.svm.warp_to_slot(slot);
+            calls += 1;
             let result = env.send(
 ProgInstruction::PermissionlessCrank {
                     now_slot: slot,
@@ -9412,6 +9401,10 @@ ProgInstruction::PermissionlessCrank {
             "SettleB(2) must fully clear the B-backlog within {MAX_PROGRESS_CALLS} calls \
              instead of livelocking"
         );
+        assert!(
+            calls >= 2,
+            "non-vacuity: a multi-chunk backlog cannot clear in one crank call, got {calls} call(s)"
+        );
     }
 
     // ---- Phase 3: a liquidatable account CAN be liquidated. Drains a B-backlog on the SHORT
@@ -9426,7 +9419,6 @@ ProgInstruction::PermissionlessCrank {
     for inject_bankruptcy_debt in [false, true] {
         let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
             max_portfolio_assets: 1,
-            public_b_chunk_atoms: CHUNK_ATOMS,
             maintenance_fee_per_slot: 1,
             ..V16CuMarketParams::default()
         });
@@ -9455,10 +9447,12 @@ ProgInstruction::PermissionlessCrank {
                 .accrue_asset_to_not_atomic(0, accrual_slot, 100, 0, true)
                 .unwrap();
         });
-        // Seed a real, outstanding SHORT-domain B debt on the victim's leg, exceeding one
-        // chunk.
+        // Seed a real, outstanding SHORT-domain B debt on the victim's leg. It is deliberately
+        // SUB-chunk (a healthy account cannot carry a multi-chunk backlog: a settled loss above
+        // one chunk, 1e16 atoms, exceeds any capital the vault may hold). The multi-chunk
+        // property is pinned by phases 1 and 2; this phase pins liquidation after the drain.
         env.mutate_market(|_cfg, group| {
-            group.assets[0].b_short_num = DEBT_B;
+            group.assets[0].b_short_num = DEBT_B_SUB_CHUNK;
         });
         assert!(
             !env.portfolio_state(short_account).b_stale_state,
@@ -9499,20 +9493,9 @@ ProgInstruction::PermissionlessCrank {
              account can be meaningfully liquidated"
         );
 
-        // Restore `public_b_chunk_atoms` to its unbounded default before driving the account
-        // bankrupt and liquidating it. A BOUNDED chunk budget is exactly what this phase needed
-        // above to prove the crank drains a real backlog without livelocking; it is orthogonal
-        // to (and, empirically, a confound for) the liquidation-sizing math this phase exercises
-        // next -- with no outstanding B-backlog left (`cleared` above), nothing here still
-        // depends on the bound, so restoring it isolates "does Liquidate(1) still work post-fix"
-        // from that unrelated interaction.
-        env.mutate_market(|_cfg, group| {
-            group.config.public_b_chunk_atoms = percolator::MAX_VAULT_TVL;
-        });
-
         // Drive the account genuinely bankrupt via a SECOND, much larger B-domain debt (same
         // engine-native settlement path already proven above, not a raw pnl/capital write): with
-        // `public_b_chunk_atoms` now unbounded, this settles fully in one crank call and
+        // the chunk being the 1e16-atom engine constant, this settles fully in one crank call and
         // realizes real, conservation-safe loss into pnl via
         // `set_account_pnl_after_domain_first_source_claim_burn` -- unlike a direct pnl poke,
         // this keeps `c_tot` and the domain/insurance ledgers internally consistent, which a raw
@@ -15902,7 +15885,6 @@ fn v16_attack_close_slab_rejects_market_as_lamport_destination() {
             max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
             max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
             max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-            public_b_chunk_atoms: params.public_b_chunk_atoms,
             maintenance_fee_per_slot: params.maintenance_fee_per_slot,
         },
         vec![
@@ -19605,7 +19587,6 @@ fn try_init_market_with(params: V16CuMarketParams) -> Result<Vec<String>, String
             max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
             max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
             max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-            public_b_chunk_atoms: params.public_b_chunk_atoms,
             maintenance_fee_per_slot: params.maintenance_fee_per_slot,
         }
         .encode(),
@@ -25314,7 +25295,10 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     // Victim opens a leg on asset 0 AND asset 1 (both long, against the same
     // counterparty) -- a genuinely multi-leg portfolio, the precondition d63c4dc9's
     // gate exists for.
-    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
+    // The victim is SHORT asset 0, so the 100 -> 400 push below is a real loss. (It used to be
+    // long, which only read as liquidatable while the unbacked gain was ignored; engine #356
+    // counts the in-flight counterparty backing, and a long here is a solvent hedge.)
+    env.trade_asset_with_cu(0, &victim_owner, victim, &cp_owner, cp, -(POS_SCALE as i128), 100, 0);
     env.trade_asset_with_cu(1, &victim_owner, victim, &cp_owner, cp, POS_SCALE as i128, 100, 0);
 
     // Certify both legs at a healthy baseline first (bounded loop: cert currentness on a
@@ -25430,10 +25414,15 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
     // reduced by the follow-on -- never neither (that would mean the complete set re-certified it
     // healthy, i.e. the scenario is vacuous).
     let after_complete = env.portfolio_state(victim);
-    let reduced_in_this_call = active_leg_for_asset(&after_complete, 0)
-        .basis_pos_q
-        .unsigned_abs()
-        < asset0_size_before;
+    // A full close of the toxic leg (it can be bankrupt at this move) removes it: size 0.
+    let asset0_size = |st: &PortfolioAccountV16| {
+        if has_active_leg_for_asset(st, 0) {
+            active_leg_for_asset(st, 0).basis_pos_q.unsigned_abs()
+        } else {
+            0
+        }
+    };
+    let reduced_in_this_call = asset0_size(&after_complete) < asset0_size_before;
     assert!(
         after_complete.health_cert.certified_liq_deficit > 0 || reduced_in_this_call,
         "victim must now be certified as genuinely liquidatable after the complete-observation \
@@ -25488,10 +25477,7 @@ fn v16_w2_autocrank_d63c4dc9_liquidation_gated_on_all_active_legs() {
          bounded number of calls"
     );
     assert!(
-        active_leg_for_asset(&env.portfolio_state(victim), 0)
-            .basis_pos_q
-            .unsigned_abs()
-            < asset0_size_before,
+        asset0_size(&env.portfolio_state(victim)) < asset0_size_before,
         "the engine-selected liquidation must strictly reduce the toxic (asset 0) leg's exposure"
     );
 }
@@ -28940,7 +28926,6 @@ fn d26_init_market_and_init_portfolio_refuse_an_account_that_did_not_sign() {
         max_account_b_settlement_chunks: params.max_account_b_settlement_chunks,
         max_bankrupt_close_chunks: params.max_bankrupt_close_chunks,
         max_bankrupt_close_lifetime_slots: params.max_bankrupt_close_lifetime_slots,
-        public_b_chunk_atoms: params.public_b_chunk_atoms,
         maintenance_fee_per_slot: params.maintenance_fee_per_slot,
     };
     let before = svm.get_account(&market).unwrap().data;

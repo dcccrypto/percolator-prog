@@ -1014,7 +1014,6 @@ fn default_init_market_ix() -> Instruction {
         max_account_b_settlement_chunks: 1,
         max_bankrupt_close_chunks: 1,
         max_bankrupt_close_lifetime_slots: 100,
-        public_b_chunk_atoms: percolator::MAX_VAULT_TVL,
         maintenance_fee_per_slot: 0,
     }
 }
@@ -1639,7 +1638,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 max_account_b_settlement_chunks,
                 max_bankrupt_close_chunks,
                 max_bankrupt_close_lifetime_slots,
-                public_b_chunk_atoms,
                 maintenance_fee_per_slot,
                 ..
             } = ix
@@ -1661,7 +1659,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
                 *max_account_b_settlement_chunks = 3;
                 *max_bankrupt_close_chunks = 4;
                 *max_bankrupt_close_lifetime_slots = 50;
-                *public_b_chunk_atoms = 1_000_012_345; // >= PUBLIC_B_CHUNK_ATOMS_MIN (v2.2)
                 *maintenance_fee_per_slot = 7;
             }
         }),
@@ -1688,7 +1685,6 @@ fn v16_wrapper_init_market_ports_full_engine_config_fields() {
     assert_eq!(group.config.max_account_b_settlement_chunks, 3);
     assert_eq!(group.config.max_bankrupt_close_chunks, 4);
     assert_eq!(group.config.max_bankrupt_close_lifetime_slots, 50);
-    assert_eq!(group.config.public_b_chunk_atoms, 1_000_012_345);
 }
 
 #[test]
@@ -14431,39 +14427,40 @@ fn v16_wrapper_configuring_empty_asset_does_not_advance_other_asset_fee_anchor()
         "asset 1 must be empty so oracle reconfiguration is targeted"
     );
 
-    // v17: reset_empty_asset_oracle_anchor_not_atomic requires the entire group to have
-    // no positions (any asset with OI prevents reconfiguration). This is a stricter guard
-    // than the old per-asset check; it preserves the fee-anchor non-advancement invariant
-    // by blocking the operation rather than allowing it with a narrow carve-out.
-    // Matrix row: v17-oracle-reconfigure-group-wide-guard (PR #v17-convergence).
-    //
-    // With positions on asset 0, configuring asset 1 is blocked entirely — the fee anchor
-    // (slot_last) is NOT advanced because the instruction is rejected.
-    let before_blocked = market.data.clone();
-    assert_err_and_market_unchanged(
-        run_ix(
-            Instruction::ConfigureEwmaMark {
+    // Engine #359 (158dc188, matching upstream percolator-prog 780e1138 #447): the empty-asset
+    // anchor reset's quiet check is scoped to the TARGET asset. Asset 1 is empty, so configuring it
+    // is permitted while asset 0 holds a position (the v17 group-wide guard that used to refuse it
+    // is gone; asset 0 itself keeps the market-wide rule). The invariant this test is named for
+    // still has to hold WITH the configure going through: it moves the market clock, but asset 0's
+    // own fee anchor (`asset.slot_last`, read by `account_fee_anchor_for_loss_currentness`) and
+    // every other asset-0 field stay untouched, so no fee is skipped or invented for asset 0.
+    let asset0_before = before_configure.assets[0].clone();
+    run_ix(
+        Instruction::ConfigureEwmaMark {
             market_id: state::read_market_trade_preflight(&market.data, 1).map(|t| t.3).unwrap_or(0),
-                asset_index: 1,
-                now_slot: 100,
-                initial_mark_e6: 250,
-                mark_ewma_halflife_slots: 10,
-                mark_min_fee: 0,
-                observation_sequence: state::read_asset_control_sequences(&market.data, 1)
-                    .unwrap()
-                    .oracle_observation
-                    + 1,
-            },
-            &mut [&mut admin, &mut market],
-        ),
-        &market,
-        &before_blocked,
-    );
-    // slot_last is still 0: the blocked configure did not advance the fee anchor.
-    let (_, blocked_group) = state::read_market(&market.data).unwrap();
+            asset_index: 1,
+            now_slot: 100,
+            initial_mark_e6: 250,
+            mark_ewma_halflife_slots: 10,
+            mark_min_fee: 0,
+            observation_sequence: state::read_asset_control_sequences(&market.data, 1)
+                .unwrap()
+                .oracle_observation
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .expect("configuring the EMPTY asset 1 is allowed while asset 0 is positioned (engine #359)");
+    let (_, configured_with_exposure) = state::read_market(&market.data).unwrap();
+    assert_eq!(configured_with_exposure.assets[1].effective_price, 250, "asset 1 was really configured");
+    assert_eq!(configured_with_exposure.current_slot, 100, "the market clock moved");
     assert_eq!(
-        blocked_group.slot_last, 0,
-        "blocked configure must not advance the fee anchor"
+        configured_with_exposure.assets[0].slot_last, asset0_before.slot_last,
+        "configuring asset 1 must not advance asset 0's fee anchor"
+    );
+    assert_eq!(
+        configured_with_exposure.assets[0], asset0_before,
+        "configuring asset 1 must not touch any asset-0 field"
     );
 
     // Flatten asset 0 positions (trade back to zero OI) so the group is position-free.
@@ -26369,7 +26366,6 @@ struct Cw03Forfeit {
     detached: bool,
     loss_weight: u128,
     b_debt: u128,
-    public_b_chunk_atoms: u128,
 }
 
 fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
@@ -26456,7 +26452,6 @@ fn cw03_run(budget: u128) -> (Result<(), ProgramError>, Cw03Forfeit) {
         detached,
         loss_weight: before_leg.loss_weight,
         b_debt,
-        public_b_chunk_atoms: group.config.public_b_chunk_atoms,
     };
     (result, out)
 }
@@ -26523,16 +26518,16 @@ fn cw03_tag43_budget_is_collateral_atoms_under_the_new_name() {
     assert!(max.detached);
     assert_eq!(
         max.delta_b, max.b_debt,
-        "u128::MAX collapses to public_b_chunk_atoms and settles the whole debt in one call"
+        "u128::MAX collapses to PUBLIC_B_CHUNK_ATOMS and settles the whole debt in one call"
     );
     assert!(
         max.loss_booked_atoms >= 4_000_000,
         "the whole 4e21 B debt at loss_weight=POS_SCALE is 4_000_000 atoms of loss"
     );
     println!(
-        "[cw03] public_b_chunk_atoms={} -- the budget only ever enters through a min(), so \
-nothing settles beyond min(public_b_chunk_atoms, b_remaining)",
-        max.public_b_chunk_atoms
+        "[cw03] PUBLIC_B_CHUNK_ATOMS={} -- the budget only ever enters through a min(), so \
+nothing settles beyond min(PUBLIC_B_CHUNK_ATOMS, b_remaining)",
+        percolator::PUBLIC_B_CHUNK_ATOMS
     );
 }
 
