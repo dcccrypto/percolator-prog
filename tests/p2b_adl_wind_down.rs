@@ -92,6 +92,11 @@ fn b64(s: &str) -> Vec<u8> {
     out
 }
 
+/// Full crank routing: one crank (and one tag-104 refresh) commits at most 32 slots, so catching
+/// up the 9,000-slot episode bound takes ~282 calls. These loops were sized for the old
+/// max_accrual_dt_slots window (64 / 256 calls); they stop as soon as nothing moves.
+const FULLROUTE_CATCHUP_ITERS: usize = 1024;
+
 struct Fork {
     svm: LiteSVM,
     slab: Pubkey,
@@ -275,10 +280,10 @@ impl Fork {
         self.send(ix)
     }
 
-    /// Repeat tag 104 until it stops making price-catch-up-only progress (the single accrual
-    /// segment is capped at max_accrual_dt_slots, exactly as the crank is).
+    /// Repeat tag 104 until it stops making price-catch-up-only progress (the accrual is capped
+    /// at min(max_accrual_dt_slots, 32) per call since full crank routing, exactly as the crank is).
     fn wind_down_settled(&mut self, k: &Pubkey) -> Result<(), TransactionError> {
-        for _ in 0..64 {
+        for _ in 0..FULLROUTE_CATCHUP_ITERS {
             let before = self.leg(k);
             let slot_last_before = self.group().assets[0].slot_last;
             self.wind_down(k)?;
@@ -453,7 +458,7 @@ fn p2b_tag104_arms_then_waits_for_the_episode_bound() {
         .encode(),
     };
     // Drain the price catch-up through the ordinary crank so the binding check answers.
-    for _ in 0..64 {
+    for _ in 0..FULLROUTE_CATCHUP_ITERS {
         let s = f.group().assets[0].slot_last;
         let _ = f.crank(&target);
         if f.group().assets[0].slot_last == s {
@@ -517,7 +522,7 @@ fn p2b_tag104_after_the_bound_winds_down_reopens_and_conserves_value() {
     f.warp(n);
     f.push_same_mark();
     for k in f.portfolios.clone() {
-        for _ in 0..64 {
+        for _ in 0..FULLROUTE_CATCHUP_ITERS {
             let s = f.group().assets[0].slot_last;
             let _ = f.crank(&k);
             if f.group().assets[0].slot_last == s {
@@ -679,7 +684,7 @@ fn p2b_tag104_refuses_a_lagging_or_stale_mark() {
     f.push_same_mark();
     // Catch the asset fully up to the clock first (bounded segments), re-pushing so the mark
     // stays fresh, so the next push lands with dt = 0 and the effective price cannot move.
-    for _ in 0..256 {
+    for _ in 0..FULLROUTE_CATCHUP_ITERS {
         if f.group().assets[0].slot_last >= f.clock.slot {
             break;
         }

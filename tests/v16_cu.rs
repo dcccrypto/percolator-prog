@@ -30773,6 +30773,7 @@ fn fullroute_catch_up(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> (u64,
         if after < slot {
             assert_eq!(after - before, 32, "a crank that stops short commits exactly 32 slots");
         }
+        println!("v16 fullroute catch-up crank {n}: slots {before}..{after}, CU {cu}");
         if after == slot {
             return (n, max_cu, total);
         }
@@ -30788,13 +30789,18 @@ fn v16_bpf_fullroute_catch_up_past_32_slots_takes_ceil_gap_over_32_cranks() {
     let (mut env, account) = fullroute_world(10, 500);
     env.push_auth_mark_with_cu(0, 2 * FULLROUTE_PRICE);
     let mut slot = 0u64;
+    let mut seen = Vec::new();
     for gap in [1u64, 32, 100, 500] {
         slot += gap;
         let price_before = low_pin_mark(&env);
         let (n, max_cu, total) = fullroute_catch_up(&mut env, account, slot);
         println!("v16 fullroute catch-up {gap}-slot gap: {n} crank(s), max CU: {max_cu}, total CU: {total}");
-        assert_eq!(n, gap.div_ceil(32), "{gap}-slot gap");
         assert!(low_pin_mark(&env) > price_before, "the price moved during the catch-up");
+        seen.push((gap, n, max_cu));
+    }
+    // Asserted after all four gaps so a run on the single-segment program still prints its CU.
+    for (gap, n, max_cu) in seen {
+        assert_eq!(n, gap.div_ceil(32), "{gap}-slot gap");
         assert_cu_within(&format!("fullroute catch-up crank, {gap}-slot gap"), max_cu, CRANK_CU_LIMIT);
     }
 }
