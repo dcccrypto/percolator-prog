@@ -8965,6 +8965,98 @@ ProgInstruction::PermissionlessCrank {
     );
 }
 
+// ── PORT upstream 81a8a8ec (INV-077): a crank whose only work is a due maintenance fee ──
+//
+// Engine #405 (upstream 9cb7d67f / 06b7e5be): a fee sync with nothing to settle that leaves the
+// account healthy KEEPS its current certificate instead of voiding it. The crank collects the due
+// fee before the engine plans, so with the certificate kept the engine may find nothing else to do
+// (NoAction / NonProgress). Before the port the wrapper then failed with EngineNonProgress and the
+// collection rolled back; the cursor move is now progress of its own. On an engine that still voids
+// the certificate on every charge (pin db019142) the engine's refresh is the progress, so this test
+// passes there too; it fails without the wrapper change once the pin carries #405.
+fn j81a_crank(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> Result<u64, String> {
+    env.svm.warp_to_slot(slot);
+    env.svm.expire_blockhash();
+    let payer = env.payer.pubkey();
+    let market = env.market;
+    env.send(
+        ProgInstruction::PermissionlessCrank {
+            now_slot: slot,
+            observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+        },
+        vec![
+            AccountMeta::new(payer, true),
+            AccountMeta::new(market, false),
+            AccountMeta::new(portfolio, false),
+        ],
+        &[],
+    )
+}
+
+#[test]
+fn v16_program_crank_whose_only_work_is_a_due_fee_collects_it() {
+    const PRICE: u64 = 100;
+    const START_SLOT: u64 = 1;
+    const COLLECT_SLOT: u64 = 4;
+    const FEE_PER_SLOT: u128 = 37;
+    const DEPOSIT: u128 = 1_000_000;
+    let mut env = V16CuEnv::new_with_market_params_price_move_and_maintenance_fee(
+        1,
+        5_000,
+        10_000,
+        500,
+        FEE_PER_SLOT,
+    );
+    env.svm.warp_to_slot(START_SLOT);
+    env.configure_auth_mark_for_asset_as_admin(0, START_SLOT, PRICE);
+    let owners = [Keypair::new(), Keypair::new()];
+    let portfolios = owners.each_ref().map(|owner| env.create_portfolio(owner));
+    let keeper_owner = Keypair::new();
+    let keeper = env.create_portfolio(&keeper_owner);
+    for party in 0..2 {
+        env.deposit(&owners[party], portfolios[party], DEPOSIT);
+    }
+    env.trade_with_cu(
+        &owners[0],
+        portfolios[0],
+        &owners[1],
+        portfolios[1],
+        POS_SCALE as i128,
+        PRICE,
+        0,
+    );
+    let target = portfolios[0];
+    // Only the empty keeper observes time: the market reaches COLLECT_SLOT, so a crank on a trader
+    // at that slot has no accrual of its own to do.
+    for slot in START_SLOT + 1..=COLLECT_SLOT {
+        j81a_crank(&mut env, keeper, slot).expect("keeper crank accrues the market");
+    }
+    let (_, group_before) = env.market_state();
+    assert_eq!(group_before.assets[0].slot_last, COLLECT_SLOT);
+    let fee_cursor_before = env.portfolio_state(target).last_fee_slot;
+    assert!(fee_cursor_before < COLLECT_SLOT, "the fee is due");
+    let insurance_before = group_before.insurance;
+    let capital_before = env.portfolio_state(target).capital;
+
+    let collect_cu = j81a_crank(&mut env, target, COLLECT_SLOT)
+        .unwrap_or_else(|e| panic!("a crank whose only work is a due fee succeeds: {e}"));
+    assert_cu_within("fee-only crank", collect_cu, CRANK_CU_LIMIT);
+    let (_, group) = env.market_state();
+    let account = env.portfolio_state(target);
+    let fee = FEE_PER_SLOT * u128::from(COLLECT_SLOT - fee_cursor_before);
+    assert_eq!(account.last_fee_slot, COLLECT_SLOT);
+    assert_eq!(account.capital, capital_before - fee);
+    assert_eq!(group.insurance, insurance_before + fee);
+    assert!(account.health_cert.valid, "the healthy account keeps (or is re-issued) its certificate");
+
+    let err = j81a_crank(&mut env, target, COLLECT_SLOT)
+        .expect_err("with the fee collected, the crank has nothing left and is refused");
+    let after = env.portfolio_state(target);
+    assert_eq!(after.capital, account.capital, "the refused crank rolls back exactly");
+    assert_eq!(after.last_fee_slot, account.last_fee_slot);
+    assert!(err.contains("Custom(22)"), "refused with EngineNonProgress, got {err}");
+}
+
 // ── w1-aa84b45dd-v2: ADOPT upstream a84b45dd "collect maintenance before value debits", FOLDED
 // with d1bff017 "crystallize flat first-risk fees" ──
 //
