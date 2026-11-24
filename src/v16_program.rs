@@ -14587,6 +14587,22 @@ pub mod processor {
             return Ok(true);
         }
         reject_permissionless_resolve_matured_live_view(cfg, group)?;
+        // #438 (upstream 6a9439d9's selected-domain clause, which d2e99bc8 relies on): a pending
+        // loss barrier on THIS domain blocks its withdrawal. Even domains are the asset's long
+        // side, odd domains its short side. An out-of-range asset fails closed.
+        let engine_slot = &group
+            .markets
+            .get(asset_index)
+            .ok_or(PercolatorError::InvalidInstruction)?
+            .engine;
+        let pending_domain_loss_barrier = if domain % 2 == 0 {
+            engine_slot.pending_domain_loss_barrier_long.get()
+        } else {
+            engine_slot.pending_domain_loss_barrier_short.get()
+        };
+        if pending_domain_loss_barrier != 0 {
+            return Err(PercolatorError::EngineLockActive.into());
+        }
         // E-LSA: `group.header.loss_stale_active` is a market-wide byte that the engine
         // documents (percolator src/v16.rs:14740-14743) as a summary of ONLY the LAST-TOUCHED
         // asset — "`slot_last` and `loss_stale_active` summarize only the touched asset; safety
@@ -23976,8 +23992,17 @@ pub mod processor {
                 return Err(PercolatorError::InvalidInstruction.into());
             }
             require_asset_generation_view(&group, asset_index, expected_market_id)?;
-            let shutdown_drain =
+            // #438 (upstream d2e99bc8): the debit below draws on both of the asset's insurance
+            // domains, so each domain's loss barrier must be clear: a bankrupt long's close raises
+            // the short (paying) domain's barrier and relies on that budget staying put.
+            let long_shutdown_drain =
                 live_domain_withdraw_health_or_shutdown_view(&cfg, &group, long_domain)?;
+            let short_domain = long_domain
+                .checked_add(1)
+                .ok_or(PercolatorError::EngineArithmeticOverflow)?;
+            let short_shutdown_drain =
+                live_domain_withdraw_health_or_shutdown_view(&cfg, &group, short_domain)?;
+            let shutdown_drain = long_shutdown_drain && short_shutdown_drain;
             let authorities = domain_authorities_from_view(&group, &cfg, long_domain)?;
             let local_authorized =
                 live_authority_matches(&authorities.insurance_operator, operator.key);
