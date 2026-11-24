@@ -29902,7 +29902,8 @@ pub mod processor {
             profile.oracle_target_publish_time = 0;
             profile.last_good_oracle_slot = authenticated_slot;
             // ADOPT upstream (aeyakovenko/percolator-prog `reset_price_move_remainder_on_target_change_view`):
-            // a target change must not carry the previous target's price-move-cap remainder.
+            // a target change drops the price-move-cap carry, unless the new target is on the same
+            // side of the mark as the engine's stored target (engine #393 keeps it there).
             reset_price_move_remainder_on_target_change_view(
                 &mut profile,
                 &group,
@@ -50044,7 +50045,11 @@ pub mod processor {
     /// reversal, a target at the mark, or a first target (`stored_target == 0`). Dropping the
     /// carry on every change pinned a low mark whose `mark * cap` is below one atom while the
     /// oracle reported a new price every slot.
-    fn target_change_keeps_price_move_carry(stored_target: u64, new_target: u64, mark: u64) -> bool {
+    fn target_change_keeps_price_move_carry(
+        stored_target: u64,
+        new_target: u64,
+        mark: u64,
+    ) -> bool {
         stored_target != 0
             && ((stored_target > mark && new_target > mark)
                 || (stored_target < mark && new_target < mark))
