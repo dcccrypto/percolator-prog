@@ -24811,8 +24811,8 @@ pub mod processor {
     /// `PermissionlessCrank` observation hint does for that asset (same primitives, same
     /// order: resolve-maturity gate, then `crank_accrue_asset_view`). This is the price path
     /// liquidation uses. Returns whether the asset is now fully caught up to `now_slot` (one
-    /// call is capped at `max_accrual_dt_slots`, and at `V16_MAX_ACCRUAL_PATH_STEPS` on the
-    /// carry path; when it is not, the caller must commit and stop, like the
+    /// call is capped at `min(max_accrual_dt_slots, V16_MAX_ACCRUAL_PATH_STEPS)`: every crank
+    /// commits the canonical path; when it is not, the caller must commit and stop, like the
     /// crank's `bounded_market_catchup_only` return).
     #[inline(never)]
     fn adl_wind_down_refresh_asset_price_view(
