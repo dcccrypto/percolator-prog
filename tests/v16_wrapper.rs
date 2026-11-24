@@ -29933,4 +29933,26 @@ fn v16_wrapper_recovery_reduction_stays_open_after_the_stale_window() {
     );
     let (_, after) = state::read_market(&market.data).unwrap();
     assert_eq!(after.assets[1].lifecycle, AssetLifecycleV16::Recovery);
+
+    // Market-wide staleness still refuses every trade, Recovery reductions included.
+    {
+        let (cfg, mut group) = state::read_market(&market.data).unwrap();
+        group.current_slot = exit_slot + STALE_SLOTS;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+    let stale = run_ix(
+        trade(-(POS_SCALE as i128), &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert_eq!(
+        stale,
+        Err(ProgramError::Custom(27)),
+        "a stale market refuses the Recovery reduction (OracleStale)"
+    );
 }
