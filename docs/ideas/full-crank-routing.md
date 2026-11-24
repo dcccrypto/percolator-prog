@@ -163,6 +163,11 @@ Reading it:
 
 ## 6. Tests
 
+Full suite (same env as CI's `build + test`, allowlist tests/KNOWN_FAILING.txt, 21 entries):
+- before the test fixes (8a7378d7): 2,343 passed / 55 failed: the 21 allowlisted + 28 new (the set below + the tripwire).
+- at 76a67767 (program + fixes except the three replay copies): local 2,370 / 28, GitHub CI 2,374 / 27; new = only
+  swordcat/backpack in the three replay copies (+ the tripwire, locally only; CI passes it). Fixed in 46b8b622.
+
 New, prog (tests/v16_cu.rs; all three FAIL on the base, pass on the branch):
 - `v16_bpf_fullroute_catch_up_past_32_slots_takes_ceil_gap_over_32_cranks`: gaps 1/32/100/500 on a 500-slot market
   take 1/1/4/16 cranks, each crank that stops short commits exactly 32 slots, each under 325k (base: 1 crank each).
@@ -180,7 +185,7 @@ The tests that full routing broke, and what was done (each reason is also in the
 
 | test(s) | why it broke | fix |
 |---|---|---|
-| earn_drain_replay: swordcat_earn_loss_bounded_by_open_claims, backpack_winner_keeps_k_gain_and_no_unowned_residual | replays the old keeper's cranks; one crank no longer covers the 100-slot window, trades then refused (121) | harness `fullroute_keeper_catch_up`: send the keeper's floor(lag/32) bounded cranks first (what the new keeper does). 49/0 |
+| earn_drain_replay and its three copies sec_v22a_r3, sec_v22a_replay, sec_v22d_replay: swordcat_earn_loss_bounded_by_open_claims, backpack_winner_keeps_k_gain_and_no_unowned_residual | replays the old keeper's cranks; one crank no longer covers the 100-slot window, trades then refused (121) | harness `fullroute_keeper_catch_up`: send the keeper's floor(lag/32) bounded cranks first (what the new keeper does). 49/0, 46/0, 30/0, sec_v22d see RESULT |
 | indep_p3_f14q (18: C-7, race_*, ins_*_relabel_*, s1_5, rehearsal23, roundtrip, atomic_one_tx...) | 500-slot market, one crank per 520-slot warp | crank helper keeps the OLD one-crank meaning: floor(min(lag, window)/32) bounded cranks, and no settling crank when lag > window. 41/0 |
 | p2b_adl_wind_down: tag104_arms_then_waits_for_the_episode_bound, tag104_refuses_a_lagging_or_stale_mark | catch-up loops sized 64/256 calls for the 9,000-slot episode bound at the old window | bound 1,024 (loops stop when nothing moves). 9/0 |
 | p3_resolved_lock: p3_diluted_receipts_without_post_101_topup_stay_reserved, p3_legacy_orphan_injected_while_live_is_repaired_by_the_refresh_crank, p3_open_receipt_reserved_while_seniors_exit_and_claimable_later | window 20 (unchanged), but the pinned fixture value (d1 backing at resolve) follows the price path | expectation 4,875 -> 4,972 (`LEGACY_175_D1_BACKING`). 17/0 |
