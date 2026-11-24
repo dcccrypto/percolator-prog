@@ -29779,3 +29779,158 @@ fn v16_wrapper_recovery_reduction_ignores_the_trade_print_on_an_ewma_asset() {
         "an ignored print must not taint the price provenance"
     );
 }
+
+/// ADOPT upstream 257db166 (INV-046 second read, finding 4; the owner's decision of 2026-11-23:
+/// keep the reductions open). Shutdown freezes a Recovery asset's `last_good_oracle_slot`, so from
+/// shutdown + `permissionless_resolve_stale_slots` a reducing trade on a non-base Recovery asset
+/// was refused (`OracleStale`, Custom 27) and the owner could only forfeit or wait for the
+/// force close. The trade routes' staleness gate now ignores a Recovery asset's own timer while
+/// the market as a whole is fresh; a risk increase is still refused by the engine.
+#[test]
+fn v16_wrapper_recovery_reduction_stays_open_after_the_stale_window() {
+    const STALE_SLOTS: u64 = 9_000;
+    let mut admin = signer();
+    let mut insurance_authority = signer();
+    let mut insurance_operator = signer();
+    let mut backing_authority = signer();
+    let mut market = market_account_with_capacity(2);
+    let mut long_owner = signer();
+    let mut short_owner = signer();
+    let mut long_account = portfolio_account_for_market_slots(2);
+    let mut short_account = portfolio_account_for_market_slots(2);
+    let _mint = init_market(&mut admin, &mut market);
+    run_ix(
+        Instruction::ConfigurePermissionlessResolve {
+            asset_generation_frontier: state::read_asset_generation_frontier(&market.data).unwrap(),
+            stale_slots: STALE_SLOTS,
+            force_close_delay_slots: 1_000,
+            policy_sequence: state::read_asset_control_sequences(&market.data, 0)
+                .unwrap()
+                .permissionless_resolve
+                + 1,
+        },
+        &mut [&mut admin, &mut market],
+    )
+    .unwrap();
+    update_asset_lifecycle_with_authorities(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_ACTIVATE,
+        1,
+        1,
+        150,
+        insurance_authority.key.to_bytes(),
+        insurance_operator.key.to_bytes(),
+        backing_authority.key.to_bytes(),
+    )
+    .unwrap();
+    init_portfolio(&mut long_owner, &mut market, &mut long_account);
+    init_portfolio(&mut short_owner, &mut market, &mut short_account);
+    deposit(&mut long_owner, &mut market, &mut long_account, 10_000);
+    deposit(&mut short_owner, &mut market, &mut short_account, 10_000);
+    let trade = |size_q: i128,
+                 long_account: &TestAccount,
+                 short_account: &TestAccount,
+                 market: &TestAccount| {
+        Instruction::TradeNoCpi {
+            account_a_portfolio_id: portfolio_identity(long_account).0,
+            account_a_position_epoch: portfolio_identity(long_account).2,
+            account_b_portfolio_id: portfolio_identity(short_account).0,
+            account_b_position_epoch: portfolio_identity(short_account).2,
+            market_id: state::read_market_trade_preflight(&market.data, 1)
+                .map(|t| t.3)
+                .unwrap_or(0),
+            asset_index: 1,
+            size_q,
+            exec_price: 150,
+            fee_bps: 0,
+            backing_fee_cap_bps: 10_000,
+        }
+    };
+    run_ix(
+        trade((POS_SCALE * 2) as i128, &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    )
+    .unwrap();
+    update_asset_lifecycle(
+        &mut admin,
+        &mut market,
+        processor::ASSET_ACTION_SHUTDOWN,
+        1,
+        2,
+        0,
+    )
+    .unwrap();
+    let (_, group) = state::read_market(&market.data).unwrap();
+    assert_eq!(group.assets[1].lifecycle, AssetLifecycleV16::Recovery);
+
+    // Make asset 1 price-managed (EWMA_MARK) with its oracle timer frozen at shutdown, then move
+    // the market past shutdown + stale_slots while keeping the market as a whole fresh.
+    let shutdown_slot = group.current_slot.max(1);
+    let exit_slot = shutdown_slot + STALE_SLOTS + 1;
+    let mut profile = state::read_asset_oracle_profile(&market.data, 1).unwrap();
+    profile.oracle_mode = ORACLE_MODE_EWMA_MARK;
+    profile.oracle_leg_count = 0;
+    profile.oracle_leg_flags = 0;
+    profile.invert = 0;
+    profile.unit_scale = 0;
+    profile.conf_filter_bps = 0;
+    profile.max_staleness_secs = 0;
+    profile.hybrid_soft_stale_slots = 0;
+    profile.oracle_leg_feeds = [[0u8; 32]; ORACLE_LEG_CAP];
+    profile.oracle_leg_prices_e6 = [0u64; ORACLE_LEG_CAP];
+    profile.oracle_leg_publish_times = [0i64; ORACLE_LEG_CAP];
+    profile.mark_ewma_e6 = 150;
+    profile.oracle_target_price_e6 = 150;
+    profile.mark_ewma_last_slot = shutdown_slot;
+    profile.mark_ewma_halflife_slots = 1;
+    profile.mark_min_fee = 0;
+    profile.last_good_oracle_slot = shutdown_slot;
+    state::write_asset_oracle_profile(&mut market.data, 1, &profile).unwrap();
+    {
+        let (mut cfg, mut group) = state::read_market(&market.data).unwrap();
+        cfg.last_good_oracle_slot = exit_slot;
+        group.current_slot = exit_slot;
+        state::write_market(&mut market.data, &cfg, &group).unwrap();
+    }
+
+    let increase = run_ix(
+        trade(POS_SCALE as i128, &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert!(increase.is_err(), "a risk increase on a Recovery asset is refused");
+    let reduction = run_ix(
+        trade(-(POS_SCALE as i128), &long_account, &short_account, &market),
+        &mut [
+            &mut long_owner,
+            &mut short_owner,
+            &mut market,
+            &mut long_account,
+            &mut short_account,
+        ],
+    );
+    assert!(
+        reduction.is_ok(),
+        "the Recovery reduction lapses after the stale window: {reduction:?}"
+    );
+    assert_eq!(
+        active_leg_for_asset(&state::read_portfolio(&long_account.data).unwrap(), 1)
+            .basis_pos_q
+            .unsigned_abs(),
+        POS_SCALE
+    );
+    let (_, after) = state::read_market(&market.data).unwrap();
+    assert_eq!(after.assets[1].lifecycle, AssetLifecycleV16::Recovery);
+}
