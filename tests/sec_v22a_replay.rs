@@ -271,6 +271,8 @@ struct Replay {
     user_err: Vec<String>,
     /// (count, sum, max) CU of successful keeper cranks / pushes.
     crank_cu: (u64, u64, u64),
+    /// Full crank routing: bounded catch-up cranks the full-routing keeper adds (see `crank_at`).
+    catchup_cranks: u64,
     push_cu: (u64, u64, u64),
     peak_consumed: u128,
     peak_earn_loss: u128,
@@ -327,6 +329,7 @@ impl Replay {
             crank_codes: Default::default(),
             user_err: Vec::new(),
             crank_cu: (0, 0, 0),
+            catchup_cranks: 0,
             push_cu: (0, 0, 0),
             peak_consumed: 0,
             peak_earn_loss: 0,
@@ -501,6 +504,28 @@ impl Replay {
     fn crank_at(&mut self, live_slot: u64, now_slot: u64, p: Pubkey) {
         self.warp_live(live_slot);
         let payer = self.env.payer.pubkey();
+        // Full crank routing: the replayed keeper crank covered up to max_accrual_dt_slots (100)
+        // on the old wrapper; now one crank covers 32, and the full-routing keeper sends
+        // floor(lag / 32) bounded catch-up cranks first. Replay that keeper (counted apart).
+        // (Same change as tests/earn_drain_replay.rs, which this file copies.)
+        let market = self.env.market;
+        let now_arg = if now_slot == 0 { 0 } else { now_slot.saturating_sub(self.offset) };
+        self.catchup_cranks += fullroute_keeper_catch_up(
+            self,
+            0,
+            |r, a| r.env.asset_lag(a),
+            |r| {
+                r.env.svm.expire_blockhash();
+                r.env.send(
+                    ProgInstruction::PermissionlessCrank {
+                        now_slot: now_arg,
+                        observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }],
+                    },
+                    vec![AccountMeta::new(payer, true), AccountMeta::new(market, false), AccountMeta::new(p, false)],
+                    &[],
+                )
+            },
+        );
         self.env.svm.expire_blockhash();
         let r = self.env.send(
             ProgInstruction::PermissionlessCrank {

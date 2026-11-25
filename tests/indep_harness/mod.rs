@@ -1175,6 +1175,16 @@ impl V16CuEnv {
         state::read_market(&account.data).unwrap()
     }
 
+    /// Full crank routing: slots between the clock and `asset_index`'s `slot_last`. One crank
+    /// commits at most `FULLROUTE_CRANK_WINDOW` of them; the full-routing keeper
+    /// (percolator-oracle-keeper `catchupCrankCount`) sends `floor(lag / 32)` bounded catch-up
+    /// cranks before the crank that accrues to now. Harness helpers that model "one keeper crank"
+    /// do the same through `fullroute_keeper_catch_up`.
+    pub fn asset_lag(&self, asset_index: usize) -> u64 {
+        let now = self.svm.get_sysvar::<Clock>().slot;
+        now.saturating_sub(self.market_state().1.assets[asset_index].slot_last)
+    }
+
     pub fn portfolio_state(&self, portfolio: Pubkey) -> PortfolioAccountV16 {
         let account = self.svm.get_account(&portfolio).expect("portfolio account");
         state::read_portfolio(&account.data).unwrap()
@@ -3929,4 +3939,28 @@ pub fn custom_code(err: &str) -> Option<u32> {
     let start = err.find(marker)? + marker.len();
     let end = start + err[start..].find(')')?;
     err[start..end].parse().ok()
+}
+
+/// Full crank routing: one crank commits at most `V16_MAX_ACCRUAL_PATH_STEPS` slots per asset.
+pub const FULLROUTE_CRANK_WINDOW: u64 = 32;
+
+/// Sends `send` (a bounded catch-up crank, the same observation crank the keeper sends)
+/// `floor(lag / 32)` times, as the full-routing keeper does before its accruing crank (the count
+/// is fixed up front, so a harness that batches instructions into one transaction gets them all).
+/// Stops at the first failure. Returns how many catch-up cranks were sent.
+pub fn fullroute_keeper_catch_up<T, E>(
+    env_of: &mut T,
+    asset_index: usize,
+    lag: impl Fn(&T, usize) -> u64,
+    mut send: impl FnMut(&mut T) -> Result<u64, E>,
+) -> u64 {
+    let count = (lag(env_of, asset_index) / FULLROUTE_CRANK_WINDOW).min(64);
+    let mut n = 0;
+    while n < count {
+        if send(env_of).is_err() {
+            break;
+        }
+        n += 1;
+    }
+    n
 }

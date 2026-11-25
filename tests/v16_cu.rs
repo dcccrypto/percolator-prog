@@ -7836,11 +7836,14 @@ ProgInstruction::PermissionlessCrank {
     );
     let (_, funded_group) = env.market_state();
     assert_eq!(funded_group.funding_epoch, 1);
-    assert_eq!(funded_group.assets[0].effective_price, 1_210_000);
-    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_210_000 = 1.21 price units for the
-    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.21 * ADL_ONE.
-    let exact = 1_000i128 * 1_210_000 * (ADL_ONE / 1_000_000_000) as i128;
-    assert_eq!(exact, 1_210_000_000_000_000);
+    // Full crank routing: the path's cap anchor stays at 1_000_000 (where the target was
+    // staged) while the target holds, so the second slot moves another 100_000 (linear), not 10%
+    // of 1_100_000 (the old single-segment law compounded per crank: 1_210_000).
+    assert_eq!(funded_group.assets[0].effective_price, 1_200_000);
+    // fix/v21-f6: funding is exact. rate 1_000e-9 x price 1_200_000 = 1.2 price units for the
+    // slot; the old engine pre-floored that to 1 unit (ADL_ONE), now it is 1.2 * ADL_ONE.
+    let exact = 1_000i128 * 1_200_000 * (ADL_ONE / 1_000_000_000) as i128;
+    assert_eq!(exact, 1_200_000_000_000_000);
     assert_eq!(funded_group.assets[0].f_long_num, -exact);
     assert_eq!(funded_group.assets[0].f_short_num, exact);
 }
@@ -7989,8 +7992,12 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
     // too small to swing the checkpoint's own stale-mark projection all the
     // way back to it -- see the two `max_delta` computations in the comments
     // at the crank and close sites below.
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // Full crank routing: one crank commits at most 32 slots (the engine path cap), so the
+    // window is 32 (was 50) and the cap 40 bps (was 25) so one setup crank still converges:
+    // linear from the 1_000_000 anchor, 4_000 atoms per slot reach the +100_000 target in 25
+    // slots. The close's stale projection is 3 slots * 40 bps = 12_000, still far short.
+    const CAP_BPS: u64 = 40;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000; // engine cap (v16.rs validate_public_user_fund_shape)
                                                      // `accrue_asset_to_not_atomic` pins the MARKET-WIDE `header.current_slot` to
                                                      // `max(current, now_slot)` using the FULL (uncapped) `now_slot` argument --
@@ -8002,7 +8009,7 @@ fn v16_bpf_zero_move_funding_accrues_across_trade_without_crank() {
                                                      // segment_dt below would be forced huge too. The push and the setup crank
                                                      // run at THE SAME real slot (no warp between them) so the push's own
                                                      // `authenticated_slot_or_fallback` reads the same small value.
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1;
     // asset.slot_last after the setup crank: dt_total = 51 - 0 = 51 exceeds
     // MAX_ACCRUAL_DT_SLOTS (50), so segment_dt is capped at exactly 50.
     const SETUP_CRANK_SLOT_LAST: u64 = MAX_ACCRUAL_DT_SLOTS;
@@ -8108,17 +8115,10 @@ ProgInstruction::PermissionlessCrank {
         "the setup crank must have moved the engine's committed effective_price \
          toward the pushed mark"
     );
-    assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "the setup crank's own segment must charge zero funding -- the \
-         checkpoint has not promoted yet, so both sides of the premium formula \
-         are still anchored to the SAME (pre-push) mark"
-    );
-    assert_eq!(
-        group_after_setup_crank.assets[0].f_long_num, 0,
-        "no funding index movement from the setup crank itself"
-    );
-
+    // Full crank routing: the setup crank is a 32-step path that samples funding PER SLOT,
+    // each step against the stale checkpoint (INITIAL_PRICE) while the price walks up, so it
+    // charges real funding (the old single segment booked one rate, 0, for the whole window).
+    // The close below is therefore checked by its DELTA from this post-setup state.
     // NOW: no crank of any kind runs again for the rest of this test. `slot_last`
     // is frozen at 50 (only an accrual can move it), while `mark_ewma_e6` /
     // `funding_mark_pending_e6` sit at the pushed value and PUSH_SLOT (51) --
@@ -8176,18 +8176,20 @@ ProgInstruction::PermissionlessCrank {
     // case: shorts pay longs, since the converged price acts as the "index"
     // side while the stale checkpoint acts as the "mark" side of the premium
     // formula and stands below it.
+    let df_long = group_after_close.assets[0].f_long_num - group_after_setup_crank.assets[0].f_long_num;
+    let df_short = group_after_close.assets[0].f_short_num - group_after_setup_crank.assets[0].f_short_num;
     assert_ne!(
-        group_after_close.assets[0].f_long_num, 0,
-        "long side funding index must move; pre-fix this stays 0 (zero-funding \
+        df_long, 0,
+        "long side funding index must move on the close; pre-fix it does not (zero-funding \
          arbitrage)"
     );
     assert_ne!(
-        group_after_close.assets[0].f_short_num, 0,
-        "short side funding index must move; pre-fix this stays 0 (zero-funding \
+        df_short, 0,
+        "short side funding index must move on the close; pre-fix it does not (zero-funding \
          arbitrage)"
     );
     assert_eq!(
-        group_after_close.assets[0].f_long_num, -group_after_close.assets[0].f_short_num,
+        df_long, -df_short,
         "funding index must be conserved between the two sides"
     );
     assert_ne!(
@@ -8358,11 +8360,9 @@ fn setup_accrual_carry_world(
         group_after_setup_crank.assets[0].effective_price, initial_price,
         "setup crank must converge effective_price toward the pushed mark"
     );
-    assert_eq!(
-        group_after_setup_crank.funding_epoch, 0,
-        "setup crank's own segment must charge zero funding -- the checkpoint \
-         has not promoted yet"
-    );
+    // Full crank routing: the setup crank's path samples funding per slot against the stale
+    // checkpoint, so it may charge funding; both worlds below share this setup, and the test
+    // compares them with each other.
     let setup_profile =
         state::read_asset_oracle_profile(&env.svm.get_account(&env.market).unwrap().data, 0)
             .unwrap();
@@ -8425,10 +8425,12 @@ fn v16_bpf_canonical_accrual_path_matches_regardless_of_call_split_across_pendin
     const INITIAL_PRICE: u64 = 1_000_000;
     const PUSHED_MARK: u64 = 1_100_000;
     const DEPOSIT: u128 = 10_000_000;
-    const CAP_BPS: u64 = 25;
-    const MAX_ACCRUAL_DT_SLOTS: u64 = 50;
+    // Full crank routing: window 32 (the engine path cap; was 50), cap 40 bps (was 25) so the
+    // setup crank still converges in one call. Steps start at 33, the pending mark's slot.
+    const CAP_BPS: u64 = 40;
+    const MAX_ACCRUAL_DT_SLOTS: u64 = 32;
     const MAX_ABS_FUNDING_E9_PER_SLOT: u64 = 10_000;
-    const PUSH_AND_SETUP_CRANK_SLOT: u64 = 51;
+    const PUSH_AND_SETUP_CRANK_SLOT: u64 = MAX_ACCRUAL_DT_SLOTS + 1;
     // Five 1-slot steps starting exactly at the pending mark's own activation
     // slot (51..=55).
     const STEPS: u64 = 5;
@@ -30821,4 +30823,127 @@ fn v16_engine_pin_keeps_the_carry_on_a_same_side_target_change() {
     group
         .accrue_asset_path_to_not_atomic(0, 2, 20, &[restarted], true)
         .expect("a restarted carry is accepted after a reversal");
+}
+
+// ── Full crank routing (agent/J-20261124-PROG-FULLROUTE) ──────────────────────────────────────
+// Every crank commits the engine's canonical one-slot path. Two consequences pinned below:
+// (1) one crank covers at most V16_MAX_ACCRUAL_PATH_STEPS (32) slots, so a market behind by
+//     more than that needs ceil(gap / 32) cranks (the keeper sends them), each under the 325k
+//     crank guardrail; (2) the price law is linear from the cap anchor while the target holds,
+//     and does not depend on how the slots are split into cranks.
+
+const FULLROUTE_PRICE: u64 = 1_000_000;
+
+fn fullroute_world(cap_bps: u64, max_accrual_dt_slots: u64) -> (V16CuEnv, Pubkey) {
+    let mut env = V16CuEnv::new_with_init_params(V16CuMarketParams {
+        initial_price: FULLROUTE_PRICE,
+        max_price_move_bps_per_slot: cap_bps,
+        max_accrual_dt_slots,
+        min_funding_lifetime_slots: max_accrual_dt_slots,
+        ..V16CuMarketParams::default()
+    });
+    env.svm.warp_to_slot(0);
+    env.configure_auth_mark_with_cu(0, FULLROUTE_PRICE);
+    let long_owner = Keypair::new();
+    let short_owner = Keypair::new();
+    let long_account = env.create_portfolio(&long_owner);
+    let short_account = env.create_portfolio(&short_owner);
+    env.deposit(&long_owner, long_account, 100_000_000);
+    env.deposit(&short_owner, short_account, 100_000_000);
+    env.trade_with_cu(
+        &long_owner,
+        long_account,
+        &short_owner,
+        short_account,
+        POS_SCALE as i128,
+        FULLROUTE_PRICE,
+        0,
+    );
+    (env, long_account)
+}
+
+/// Cranks at `slot` until the asset reaches it; returns (cranks, max CU, total CU).
+fn fullroute_catch_up(env: &mut V16CuEnv, portfolio: Pubkey, slot: u64) -> (u64, u64, u64) {
+    let (mut n, mut max_cu, mut total) = (0u64, 0u64, 0u64);
+    loop {
+        let before = env.market_state().1.assets[0].slot_last;
+        let cu = low_pin_crank(env, portfolio, slot);
+        let after = env.market_state().1.assets[0].slot_last;
+        n += 1;
+        max_cu = max_cu.max(cu);
+        total += cu;
+        assert!(after > before, "every crank makes progress");
+        if after < slot {
+            assert_eq!(after - before, 32, "a crank that stops short commits exactly 32 slots");
+        }
+        println!("v16 fullroute catch-up crank {n}: slots {before}..{after}, CU {cu}");
+        if after == slot {
+            return (n, max_cu, total);
+        }
+        assert!(n < 64, "catch-up did not converge");
+    }
+}
+
+/// Catch-up past 32 slots: a market with max_accrual_dt_slots = 500 that is 1, 32, 100 and 500
+/// slots behind takes ceil(gap / 32) cranks, every one under the crank guardrail. The price
+/// keeps moving toward a target off the mark during the whole catch-up.
+#[test]
+fn v16_bpf_fullroute_catch_up_past_32_slots_takes_ceil_gap_over_32_cranks() {
+    let (mut env, account) = fullroute_world(10, 500);
+    env.push_auth_mark_with_cu(0, 2 * FULLROUTE_PRICE);
+    let mut slot = 0u64;
+    let mut seen = Vec::new();
+    for gap in [1u64, 32, 100, 500] {
+        slot += gap;
+        let price_before = low_pin_mark(&env);
+        let (n, max_cu, total) = fullroute_catch_up(&mut env, account, slot);
+        println!("v16 fullroute catch-up {gap}-slot gap: {n} crank(s), max CU: {max_cu}, total CU: {total}");
+        assert!(low_pin_mark(&env) > price_before, "the price moved during the catch-up");
+        seen.push((gap, n, max_cu));
+    }
+    // Asserted after all four gaps so a run on the single-segment program still prints its CU.
+    for (gap, n, max_cu) in seen {
+        assert_eq!(n, gap.div_ceil(32), "{gap}-slot gap");
+        assert_cu_within(&format!("fullroute catch-up crank, {gap}-slot gap"), max_cu, CRANK_CU_LIMIT);
+    }
+}
+
+/// Linear price law: with a fixed target the cap anchor stays at the price the target was
+/// staged at, so each slot moves anchor * cap / 10_000 = 10_000 atoms (100 bps of 1_000_000).
+/// 20 slots: 1_200_000 up (the old per-slot compounding gave 1_220_182 on the base) and 800_000
+/// down (compounding: about 817_906).
+#[test]
+fn v16_bpf_fullroute_price_law_is_linear_from_the_anchor() {
+    for (target, expected) in [(2 * FULLROUTE_PRICE, 1_200_000u64), (FULLROUTE_PRICE / 2, 800_000)] {
+        let (mut env, account) = fullroute_world(100, 32);
+        env.push_auth_mark_with_cu(0, target);
+        for slot in 1..=20u64 {
+            low_pin_crank(&mut env, account, slot);
+            let p = low_pin_mark(&env);
+            let step = FULLROUTE_PRICE / 100 * slot;
+            let want = if target > FULLROUTE_PRICE { FULLROUTE_PRICE + step } else { FULLROUTE_PRICE - step };
+            assert_eq!(p, want, "slot {slot}: linear from the 1_000_000 anchor");
+        }
+        assert_eq!(low_pin_mark(&env), expected);
+    }
+}
+
+/// The price no longer depends on the crank cadence: cranking every slot, every 5 slots or
+/// once for the 20 slots lands on the same price (1_200_000). Before full routing the
+/// single-segment law compounded per crank: 1_220_182 / 1_215_506 / 1_200_000 (measured on the base).
+#[test]
+fn v16_bpf_fullroute_price_does_not_depend_on_crank_cadence() {
+    let mut finals: Vec<u64> = Vec::new();
+    for every in [1u64, 5, 20] {
+        let (mut env, account) = fullroute_world(100, 32);
+        env.push_auth_mark_with_cu(0, 2 * FULLROUTE_PRICE);
+        let mut slot = 0;
+        while slot < 20 {
+            slot += every;
+            low_pin_crank(&mut env, account, slot);
+        }
+        finals.push(low_pin_mark(&env));
+    }
+    println!("v16 fullroute price after 20 slots by cadence 1/5/20: {finals:?}");
+    assert_eq!(finals, vec![1_200_000, 1_200_000, 1_200_000]);
 }

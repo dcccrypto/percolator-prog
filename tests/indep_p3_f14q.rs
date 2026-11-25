@@ -551,6 +551,41 @@ impl P3 {
         let slot = self.slot();
         let payer = self.env.payer.pubkey();
         let m = self.env.market;
+        // Full crank routing: one crank commits at most 32 slots. This file's cranks model the
+        // OLD wrapper's single crank, which committed min(lag, max_accrual_dt_slots) and settled
+        // the target only when that reached the clock; several scenarios (C-7, S1.5) depend on
+        // the trader NOT being settled while the price moves. So: floor(min(lag, window) / 32)
+        // bounded catch-up cranks first; and when lag > window (the old crank stopped short,
+        // without settling) stop after them, as the old crank did. Windows <= 32 are unchanged.
+        // (A keeper-style catch-up that also settles the trader during the move makes C-7
+        // `c7_seniors_exhausted_winddown_completes` and S1.5 fail on the base program too; see
+        // docs/ideas/full-crank-routing.md.)
+        let window = self.env.market_state().1.config.max_accrual_dt_slots;
+        if window > FULLROUTE_CRANK_WINDOW {
+            let lag = self.env.asset_lag(0);
+            let mut sent = 0u64;
+            let mut last = Ok(0);
+            let n = fullroute_keeper_catch_up(
+                self,
+                0,
+                |w, a| w.env.asset_lag(a).min(window),
+                |w| {
+                    w.env.svm.expire_blockhash();
+                    let r = w.send(
+                        ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
+                        vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(p, false)],
+                        &[],
+                    );
+                    last = r.clone();
+                    r
+                },
+            );
+            sent += n;
+            if lag > window && sent > 0 {
+                return last;
+            }
+        }
+        self.env.svm.expire_blockhash();
         self.send(
             ProgInstruction::PermissionlessCrank { now_slot: slot, observations: vec![CrankObservationHint { asset_index: 0, oracle_accounts: 0 }] },
             vec![AccountMeta::new(payer, true), AccountMeta::new(m, false), AccountMeta::new(p, false)],

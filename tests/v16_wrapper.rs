@@ -17085,6 +17085,29 @@ fn v16_wrapper_liquidation_fee_policy_splits_retained_penalty_to_cranker() {
     // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
     // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
     // now met by the refresh-triggered path.
+    // Full crank routing: one crank commits at most 32 of the 100 slots, so the keeper first sends
+    // floor(100 / 32) = 3 bounded catch-up cranks (they return before the engine dispatch: no
+    // refresh, no liquidation, no fee). At 100 atoms x 3 bps the path moves 0.03 atom per slot
+    // (carried), so after the 100 slots it lands on 103, the same price the old single segment
+    // reached in one crank; the crank below then liquidates as before.
+    for _ in 0..3 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 100,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [
+                &mut cranker_owner,
+                &mut market,
+                &mut short_account,
+                &mut cranker_account,
+            ],
+        )
+        .unwrap();
+    }
     for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
@@ -17337,6 +17360,24 @@ fn v16_wrapper_liquidation_reward_account_is_optional_and_absent_keeps_fee_in_in
     // AND liquidates; a second crank finds nothing (22, or 14 on the flat account). Every fee / reward /
     // insurance assertion below is unchanged: it is the explicit liquidation path's expected value,
     // now met by the refresh-triggered path.
+    // Full crank routing: one crank commits at most 32 of the 100 slots, so the keeper first sends
+    // floor(100 / 32) = 3 bounded catch-up cranks (they return before the engine dispatch: no
+    // refresh, no liquidation, no fee). At 100 atoms x 3 bps the path moves 0.03 atom per slot
+    // (carried), so after the 100 slots it lands on 103, the same price the old single segment
+    // reached in one crank; the crank below then liquidates as before.
+    for _ in 0..3 {
+        run_ix(
+            Instruction::PermissionlessCrank {
+                now_slot: 100,
+                observations: vec![CrankObservationHint {
+                    asset_index: 0,
+                    oracle_accounts: 0,
+                }],
+            },
+            &mut [&mut admin, &mut market, &mut short_account],
+        )
+        .unwrap();
+    }
     for _ in 0..1 {
         run_ix(
             Instruction::PermissionlessCrank {
